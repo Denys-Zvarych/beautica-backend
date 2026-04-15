@@ -1,0 +1,15 @@
+# Production profile — all values injected via environment variables (Railway)
+spring:
+  jpa:
+    show-sql: false
+
+  flyway:
+    enabled: true
+
+server:
+  port: ${PORT:8080}
+
+logging:
+  level:
+    root: INFO
+    com.beautica: INFO

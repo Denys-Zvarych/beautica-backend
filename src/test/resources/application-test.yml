@@ -1,0 +1,25 @@
+# Test profile — placeholder values so Spring context loads without real infrastructure
+spring:
+  datasource:
+    # Overridden at runtime by Testcontainers @ServiceConnection
+    url: jdbc:postgresql://localhost:5432/beautica_test
+    username: test
+    password: test
+  mail:
+    host: localhost
+    port: 25
+    username: test
+    password: test
+
+app:
+  jwt:
+    secret: test-secret-that-is-long-enough-for-hs256-ok-padding-here
+  cloudflare-r2:
+    access-key-id: test
+    secret-access-key: test
+    bucket: test-bucket
+    endpoint: http://localhost:9000
+  firebase:
+    service-account: test
+  frontend:
+    base-url: http://localhost:3000
