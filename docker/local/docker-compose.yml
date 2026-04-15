@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: beautica-postgres
+    environment:
+      POSTGRES_DB: beautica
+      POSTGRES_USER: beautica
+      POSTGRES_PASSWORD: beautica
+    ports:
+      - "5432:5432"
+    volumes:
+      - beautica-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beautica -d beautica"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  beautica-pgdata:

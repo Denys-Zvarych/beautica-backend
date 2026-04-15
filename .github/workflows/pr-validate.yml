@@ -21,35 +21,28 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Build
         run: ./gradlew build -x test
         env:
-          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}         # placeholder
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}                   # placeholder
-          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}   # placeholder
-          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }} # placeholder
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}         # placeholder
-          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}       # placeholder
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
 
       - name: Run tests
         run: ./gradlew test
         env:
-          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}         # placeholder
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}                   # placeholder
-          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}   # placeholder
-          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }} # placeholder
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}         # placeholder
-          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}       # placeholder
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
 
       - name: Upload test reports on failure
         if: failure()
