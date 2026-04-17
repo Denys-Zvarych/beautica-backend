@@ -1,0 +1,33 @@
+# Local development overrides — never commit real values here
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/beautica
+    username: beautica
+    password: beautica
+
+  jpa:
+    show-sql: true
+
+  flyway:
+    enabled: true
+
+  mail:
+    password: local-placeholder
+
+management:
+  health:
+    mail:
+      enabled: false
+
+app:
+  jwt:
+    secret: local-dev-secret-change-in-prod-min-256-bits
+  cloudflare-r2:
+    access-key-id: local-placeholder
+    secret-access-key: local-placeholder
+    bucket: beautica-media-local
+    endpoint: http://localhost:9000
+  firebase:
+    service-account: local-placeholder
+  frontend:
+    base-url: http://localhost:3000

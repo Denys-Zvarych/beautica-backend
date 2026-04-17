@@ -1,7 +1,10 @@
+import org.gradle.testing.jacoco.tasks.JacocoCoverageVerification
+
 plugins {
     java
     id("org.springframework.boot") version "3.3.5"
     id("io.spring.dependency-management") version "1.1.6"
+    jacoco
 }
 
 group = "com.beautica"
@@ -75,4 +78,59 @@ dependencies {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    finalizedBy(tasks.jacocoTestReport)
+}
+
+jacoco {
+    toolVersion = "0.8.12"
+}
+
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
+    }
+}
+
+val coverageVerification = tasks.register<JacocoCoverageVerification>("jacocoCoverageVerification") {
+    dependsOn(tasks.jacocoTestReport)
+    violationRules {
+        rule {
+            limit {
+                counter = "LINE"
+                value   = "COVEREDRATIO"
+                minimum = "0.80".toBigDecimal()   // 80% line coverage minimum
+            }
+        }
+        rule {
+            limit {
+                counter = "BRANCH"
+                value   = "COVEREDRATIO"
+                minimum = "0.70".toBigDecimal()   // 70% branch coverage minimum
+            }
+        }
+    }
+    // Exclude generated code, config classes, and DTOs from coverage measurement.
+    // These classes contain no business logic that can meaningfully fail.
+    classDirectories.setFrom(
+        files(classDirectories.files.map {
+            fileTree(it) {
+                exclude(
+                    "**/config/**",
+                    "**/dto/**",
+                    "**/entity/**",
+                    "**/enums/**",
+                    "**/*Application*",
+                    "**/BeauticaApplication*"
+                )
+            }
+        })
+    )
+}
+
+// Enforce coverage thresholds as part of the standard check lifecycle so CI fails
+// automatically when coverage drops below the minimum without needing an explicit task flag.
+tasks.check {
+    dependsOn(coverageVerification)
 }
