@@ -92,6 +92,11 @@ tasks.withType<Test> {
     // docker-java sends initial probe at 1.32 and gets rejected.
     // Setting DOCKER_API_VERSION forces docker-java to use 1.41 from the start.
     environment("DOCKER_API_VERSION", "1.41")
+    testLogging {
+        events("passed", "skipped", "failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        showStandardStreams = false
+    }
     finalizedBy(tasks.jacocoTestReport)
 }
 

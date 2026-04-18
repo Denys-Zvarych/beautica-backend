@@ -44,8 +44,17 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
 
-      - name: Upload test reports on failure
-        if: failure()
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: JUnit Tests
+          path: build/test-results/test/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Upload test reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
