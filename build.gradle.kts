@@ -25,6 +25,16 @@ repositories {
     mavenCentral()
 }
 
+// Override Spring Boot BOM's Testcontainers 1.19.8 with 1.20.4.
+// Reason: docker-java 3.3.6 (TC 1.19.8) negotiates Docker API version 1.32,
+// which Docker Engine 25+ rejects (minimum supported is 1.40).
+// TC 1.20.x ships docker-java 3.4.x that defaults to API 1.41+.
+dependencyManagement {
+    imports {
+        mavenBom("org.testcontainers:testcontainers-bom:1.20.4")
+    }
+}
+
 dependencies {
     // Web
     implementation("org.springframework.boot:spring-boot-starter-web")
@@ -78,6 +88,10 @@ dependencies {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Docker Engine 25+ requires minimum API version 1.40.
+    // docker-java sends initial probe at 1.32 and gets rejected.
+    // Setting DOCKER_API_VERSION forces docker-java to use 1.41 from the start.
+    environment("DOCKER_API_VERSION", "1.41")
     finalizedBy(tasks.jacocoTestReport)
 }
 

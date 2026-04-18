@@ -21,7 +21,7 @@ management:
 
 app:
   jwt:
-    secret: local-dev-secret-change-in-prod-min-256-bits
+    secret: O3afk2paSYBc0Z7rObB5f9uCaFJsZ+JmSZagE8YuuH8=
   cloudflare-r2:
     access-key-id: local-placeholder
     secret-access-key: local-placeholder
