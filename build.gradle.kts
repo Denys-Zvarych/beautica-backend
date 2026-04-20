@@ -76,6 +76,8 @@ dependencies {
     // Lombok
     compileOnly("org.projectlombok:lombok")
     annotationProcessor("org.projectlombok:lombok")
+    testCompileOnly("org.projectlombok:lombok")
+    testAnnotationProcessor("org.projectlombok:lombok")
 
     // Testing
     testImplementation("org.springframework.boot:spring-boot-starter-test")
@@ -83,19 +85,53 @@ dependencies {
     testImplementation("org.springframework.security:spring-security-test")
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:postgresql")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation("org.junit.platform:junit-platform-launcher")
 }
 
 tasks.withType<Test> {
     useJUnitPlatform()
     // Docker Engine 25+ requires minimum API version 1.40.
-    // docker-java sends initial probe at 1.32 and gets rejected.
-    // Setting DOCKER_API_VERSION forces docker-java to use 1.41 from the start.
-    environment("DOCKER_API_VERSION", "1.41")
+    // Testcontainers 1.20.x ships a shaded docker-java that hardcodes VERSION_1_32 in
+    // DockerClientProviderStrategy.getDockerClient() unless "api.version" is set in the
+    // JVM system properties. The shaded docker-java does NOT read DOCKER_API_VERSION as
+    // an environment variable — it only reads it as a JVM system property keyed "api.version".
+    // -Dapi.version=1.41 causes createDefaultConfigBuilder() to return a non-UNKNOWN version,
+    // which makes DockerClientProviderStrategy skip the unconditional VERSION_1_32 override.
+    //
+    // -XX:+EnableDynamicAgentLoading  : JVM-supported opt-in for Mockito/Byte Buddy's inline
+    //                                   mock maker. Without it, each test run emits a
+    //                                   "A Java agent has been loaded dynamically" warning to
+    //                                   stderr which is unformatted and pollutes the test log.
+    // -Xshare:off                     : disables CDS (class-data sharing). The JDK default
+    //                                   archive is built with the boot classpath only, so when
+    //                                   test agents alter the classpath the JVM prints
+    //                                   "Sharing is only supported for boot loader classes"
+    //                                   to stderr. Turning CDS off is cheaper than whitelisting
+    //                                   every attached agent and removes the warning entirely.
+    jvmArgs(
+        "-Dapi.version=1.41",
+        "-XX:+EnableDynamicAgentLoading",
+        "-Xshare:off"
+    )
+
+    val testLogLevel = (project.findProperty("testLogLevel") as String?) ?: "TRACE"
+    val testRootLogLevel = (project.findProperty("testRootLogLevel") as String?) ?: "INFO"
+    systemProperty("test.log.level", testLogLevel)
+    systemProperty("test.root.log.level", testRootLogLevel)
+
     testLogging {
-        events("passed", "skipped", "failed")
+        // Lifecycle logs come from the SLF4J TestSuiteLoggerListener / TestIntentLoggerExtension,
+        // which write through Logback's ConsoleAppender (System.out). We must forward the
+        // forked test JVM's standard streams so those SLF4J banners reach the Gradle console —
+        // otherwise every test run appears silent. Raw framework noise (Spring Boot banner,
+        // Hibernate SQL, HikariCP startup, etc.) is kept quiet via logback-test.xml, not by
+        // suppressing stdout here. backend-verify.sh parses PASSED/FAILED/SKIPPED lines to count results.
+        events("passed", "failed", "skipped")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
-        showStandardStreams = false
+        showStandardStreams = true
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
     }
     finalizedBy(tasks.jacocoTestReport)
 }

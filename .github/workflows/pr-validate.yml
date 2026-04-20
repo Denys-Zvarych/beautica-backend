@@ -35,7 +35,7 @@ jobs:
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
 
       - name: Run tests
-        run: ./gradlew test
+        run: ./gradlew test -PtestLogLevel=INFO -PtestRootLogLevel=INFO
         env:
           DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}

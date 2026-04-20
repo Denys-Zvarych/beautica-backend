@@ -1,5 +1,8 @@
 # Test profile — placeholder values so Spring context loads without real infrastructure
 spring:
+  main:
+    allow-bean-definition-overriding: true
+    banner-mode: "off"
   datasource:
     # Overridden at runtime by Testcontainers @ServiceConnection
     url: jdbc:postgresql://localhost:5432/beautica_test
@@ -10,6 +13,7 @@ spring:
     port: 25
     username: test
     password: test
+    test-connection: false
 
 app:
   jwt:
@@ -25,3 +29,8 @@ app:
     service-account: test
   frontend:
     base-url: http://localhost:3000
+
+management:
+  health:
+    mail:
+      enabled: false
