@@ -41,3 +41,6 @@ app:
     service-account: ""
   frontend:
     base-url: http://localhost:3000
+  invite:
+    token-expiration-hours: 72
+    from-email: noreply@beautica.app

@@ -86,6 +86,9 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:postgresql")
     testImplementation("org.junit.platform:junit-platform-launcher")
+    // Apache HttpClient 5 — required for TestRestTemplate to support PATCH
+    // (JDK HttpURLConnection rejects PATCH; HttpComponentsClientHttpRequestFactory does not)
+    testImplementation("org.apache.httpcomponents.client5:httpclient5")
 }
 
 tasks.withType<Test> {

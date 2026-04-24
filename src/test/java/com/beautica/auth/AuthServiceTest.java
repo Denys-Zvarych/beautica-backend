@@ -2,6 +2,7 @@ package com.beautica.auth;
 
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
+import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.JwtConfig;
@@ -113,6 +114,52 @@ class AuthServiceTest {
 
         log.debug("Act: calling authService.register expecting BusinessException");
         assertThatThrownBy(() -> authService.register(request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("already registered");
+
+        log.trace("Assert: userRepository.save was never invoked");
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("registerIndependentMaster creates INDEPENDENT_MASTER user and returns tokens")
+    void should_createIndependentMasterUserAndReturnTokens_when_validRegistration() {
+        var request = new RegisterIndependentMasterRequest(
+                "master@example.com", "password123",
+                "Oksana", "Kovalenko", "+380671234567");
+        log.debug("Arrange: seeding independent master request for email={}", request.email());
+
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        log.debug("Act: calling authService.registerIndependentMaster");
+        var response = authService.registerIndependentMaster(request);
+
+        log.trace("Assert: role=INDEPENDENT_MASTER, tokens present");
+        assertThat(response.role()).isEqualTo(Role.INDEPENDENT_MASTER);
+        assertThat(response.email()).isEqualTo("master@example.com");
+        assertThat(response.accessToken()).isNotBlank();
+        assertThat(response.refreshToken()).isNotBlank();
+        assertThat(response.tokenType()).isEqualTo("Bearer");
+    }
+
+    @Test
+    @DisplayName("registerIndependentMaster throws BusinessException when email is already registered")
+    void should_throw409_when_independentMasterEmailAlreadyRegistered() {
+        var request = new RegisterIndependentMasterRequest(
+                "taken@example.com", "password123",
+                null, null, null);
+        log.debug("Arrange: email={} already exists", request.email());
+
+        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
+
+        log.debug("Act: calling authService.registerIndependentMaster expecting BusinessException");
+        assertThatThrownBy(() -> authService.registerIndependentMaster(request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("already registered");
 

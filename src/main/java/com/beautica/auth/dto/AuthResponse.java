@@ -10,7 +10,8 @@ public record AuthResponse(
         String tokenType,
         UUID userId,
         String email,
-        Role role
+        Role role,
+        UUID salonId
 ) {
 
     public static AuthResponse of(
@@ -20,6 +21,17 @@ public record AuthResponse(
             String email,
             Role role
     ) {
-        return new AuthResponse(accessToken, refreshToken, "Bearer", userId, email, role);
+        return new AuthResponse(accessToken, refreshToken, "Bearer", userId, email, role, null);
+    }
+
+    public static AuthResponse of(
+            String accessToken,
+            String refreshToken,
+            UUID userId,
+            String email,
+            Role role,
+            UUID salonId
+    ) {
+        return new AuthResponse(accessToken, refreshToken, "Bearer", userId, email, role, salonId);
     }
 }

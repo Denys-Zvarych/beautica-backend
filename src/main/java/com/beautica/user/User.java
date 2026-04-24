@@ -13,6 +13,7 @@ import jakarta.persistence.Table;
 
 import java.util.UUID;
 
+
 @Entity
 @Table(name = "users")
 public class User extends AuditableEntity {
@@ -44,6 +45,9 @@ public class User extends AuditableEntity {
     @Column(name = "is_active", nullable = false)
     private boolean isActive = true;
 
+    @Column(name = "salon_id")
+    private UUID salonId;
+
     protected User() {
     }
 
@@ -62,6 +66,19 @@ public class User extends AuditableEntity {
         this.lastName = lastName;
         this.phoneNumber = phoneNumber;
         this.isActive = true;
+    }
+
+    public User(
+            String email,
+            String passwordHash,
+            Role role,
+            String firstName,
+            String lastName,
+            String phoneNumber,
+            UUID salonId
+    ) {
+        this(email, passwordHash, role, firstName, lastName, phoneNumber);
+        this.salonId = salonId;
     }
 
     public UUID getId() {
@@ -94,5 +111,21 @@ public class User extends AuditableEntity {
 
     public boolean isActive() {
         return isActive;
+    }
+
+    public UUID getSalonId() {
+        return salonId;
+    }
+
+    public void setFirstName(String firstName) {
+        this.firstName = firstName;
+    }
+
+    public void setLastName(String lastName) {
+        this.lastName = lastName;
+    }
+
+    public void setPhoneNumber(String phoneNumber) {
+        this.phoneNumber = phoneNumber;
     }
 }

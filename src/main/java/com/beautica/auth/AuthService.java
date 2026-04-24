@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
+import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.JwtConfig;
@@ -54,6 +55,25 @@ public class AuthService {
                 request.email(),
                 passwordEncoder.encode(request.password()),
                 Role.CLIENT,
+                request.firstName(),
+                request.lastName(),
+                request.phoneNumber()
+        );
+        var savedUser = userRepository.save(user);
+
+        return buildAuthResponse(savedUser);
+    }
+
+    @Transactional
+    public AuthResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
+        if (userRepository.existsByEmail(request.email())) {
+            throw new BusinessException("Email is already registered");
+        }
+
+        var user = new User(
+                request.email(),
+                passwordEncoder.encode(request.password()),
+                Role.INDEPENDENT_MASTER,
                 request.firstName(),
                 request.lastName(),
                 request.phoneNumber()

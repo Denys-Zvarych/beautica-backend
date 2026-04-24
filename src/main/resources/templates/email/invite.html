@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body>
+<p>You have been invited to join Beautica as a master.</p>
+<p>Click the link below to accept your invitation (valid for <span th:text="${expiresHours}">72</span> hours):</p>
+<a th:href="${inviteLink}" th:text="${inviteLink}">Accept Invitation</a>
+</body>
+</html>

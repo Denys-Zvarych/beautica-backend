@@ -334,6 +334,21 @@ class AuthIntegrationTest {
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
             assertThat(response.getBody().success()).isTrue();
         }
+
+        @Test
+        @DisplayName("returns 400 when firstName exceeds 100 characters")
+        void should_return400_when_firstNameExceedsMaxLength() {
+            registeredEmail = null;
+            var oversizedFirstName = "A".repeat(101);
+            var request = new RegisterRequest(
+                    "oversize@beautica.test", TEST_PASSWORD, oversizedFirstName, TEST_LAST, null);
+
+            log.debug("Act: POST {} with firstName of {} chars", REGISTER_URL, oversizedFirstName.length());
+            var response = post(request);
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(response.getBody().success()).isFalse();
+        }
     }
 
     // ── helper ─────────────────────────────────────────────────────────────────
