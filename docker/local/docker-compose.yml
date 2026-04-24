@@ -15,28 +15,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - beautica-net
-
-  pgadmin:
-    image: dpage/pgadmin4
-    container_name: beautica-pgadmin
-    environment:
-      PGADMIN_DEFAULT_EMAIL: admin@admin.com
-      PGADMIN_DEFAULT_PASSWORD: admin
-      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
-    volumes:
-      - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
-    ports:
-      - "5050:80"
-    depends_on:
-      - postgres
-    networks:
-      - beautica-net
-
-networks:
-  beautica-net:
-    driver: bridge
 
 volumes:
   beautica-pgdata:
