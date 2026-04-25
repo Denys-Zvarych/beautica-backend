@@ -22,11 +22,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.HexFormat;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -47,13 +43,16 @@ class AuthServiceTest {
     private static final String SECRET =
             "test-secret-that-is-long-enough-for-hs256-ok-padding-here";
     private static final long ACCESS_MS = 900_000L;
-    private static final long REFRESH_MS = 2_592_000_000L;
+    private static final long REFRESH_MS = 604_800_000L;
 
     @Mock
     private UserRepository userRepository;
 
     @Mock
     private RefreshTokenRepository refreshTokenRepository;
+
+    @Mock
+    private TokenGenerator tokenGenerator;
 
     private PasswordEncoder passwordEncoder;
     private JwtTokenProvider jwtTokenProvider;
@@ -70,7 +69,8 @@ class AuthServiceTest {
                 refreshTokenRepository,
                 jwtTokenProvider,
                 passwordEncoder,
-                jwtConfig
+                jwtConfig,
+                tokenGenerator
         );
     }
 
@@ -82,6 +82,7 @@ class AuthServiceTest {
                 "John", "Doe", null);
         log.debug("Arrange: seeding register request for email={}", request.email());
 
+        when(tokenGenerator.hash(anyString())).thenReturn("hashed-token");
         when(userRepository.existsByEmail("new@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
@@ -129,6 +130,7 @@ class AuthServiceTest {
                 "Oksana", "Kovalenko", "+380671234567");
         log.debug("Arrange: seeding independent master request for email={}", request.email());
 
+        when(tokenGenerator.hash(anyString())).thenReturn("hashed-token");
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
@@ -176,6 +178,7 @@ class AuthServiceTest {
         var user = buildUser(userId, "login@example.com", hashed, Role.SALON_OWNER);
         log.debug("Arrange: seeding user email=login@example.com role={}", Role.SALON_OWNER);
 
+        when(tokenGenerator.hash(anyString())).thenReturn("hashed-token");
         when(userRepository.findByEmail("login@example.com")).thenReturn(Optional.of(user));
         when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -216,16 +219,38 @@ class AuthServiceTest {
     }
 
     @Test
+    @DisplayName("login throws 401 when user account is inactive")
+    void should_throw401_when_loginWithInactiveUser() {
+        var rawPassword = "correctPass1";
+        var hashed = passwordEncoder.encode(rawPassword);
+        var userId = UUID.randomUUID();
+        var user = buildUser(userId, "inactive@example.com", hashed, Role.CLIENT);
+        ReflectionTestUtils.setField(user, "isActive", false);
+        log.debug("Arrange: user email=inactive@example.com is inactive");
+
+        when(userRepository.findByEmail("inactive@example.com")).thenReturn(Optional.of(user));
+
+        log.debug("Act: calling authService.login with inactive user");
+        assertThatThrownBy(() -> authService.login(new LoginRequest("inactive@example.com", rawPassword)))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
     @DisplayName("refresh returns new token pair on valid refresh token")
     void should_returnNewTokenPair_when_refreshSucceeds() {
         var userId = UUID.randomUUID();
-        var rawToken = jwtTokenProvider.generateRefreshToken(userId);
-        var storedToken = new RefreshToken(sha256Hex(rawToken), userId, Instant.now().plusSeconds(3600));
+        var rawToken = "raw-refresh-token";
+        var hashedToken = "hashed-refresh-token";
+        var storedToken = new RefreshToken(hashedToken, userId, Instant.now().plusSeconds(3600));
         var user = buildUser(userId, "ref@example.com",
                 passwordEncoder.encode("pass"), Role.CLIENT);
         log.debug("Arrange: generated refresh token for userId={}", userId);
 
-        when(refreshTokenRepository.findByToken(sha256Hex(rawToken))).thenReturn(Optional.of(storedToken));
+        when(tokenGenerator.hash(anyString())).thenReturn("hashed-new-jwt-token");
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
         when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -242,12 +267,14 @@ class AuthServiceTest {
     @DisplayName("refresh throws BusinessException when token has been revoked")
     void should_throwBusinessException_when_refreshTokenIsRevoked() {
         var userId = UUID.randomUUID();
-        var rawToken = jwtTokenProvider.generateRefreshToken(userId);
-        var storedToken = new RefreshToken(sha256Hex(rawToken), userId, Instant.now().plusSeconds(3600));
+        var rawToken = "raw-revoked-token";
+        var hashedToken = "hashed-revoked-token";
+        var storedToken = new RefreshToken(hashedToken, userId, Instant.now().plusSeconds(3600));
         storedToken.revoke();
         log.debug("Arrange: stored token for userId={} is revoked", userId);
 
-        when(refreshTokenRepository.findByToken(sha256Hex(rawToken))).thenReturn(Optional.of(storedToken));
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
 
         log.debug("Act: calling authService.refresh with revoked token");
         assertThatThrownBy(() -> authService.refresh(new RefreshRequest(rawToken)))
@@ -258,11 +285,14 @@ class AuthServiceTest {
     @Test
     @DisplayName("refresh throws BusinessException when token is not found")
     void should_throwBusinessException_when_refreshTokenNotFound() {
+        var rawToken = "nonexistent";
         log.debug("Arrange: refreshTokenRepository returns empty for any token lookup");
+
+        when(tokenGenerator.hash(rawToken)).thenReturn("some-hash");
         when(refreshTokenRepository.findByToken(anyString())).thenReturn(Optional.empty());
 
         log.debug("Act: calling authService.refresh with unknown token");
-        assertThatThrownBy(() -> authService.refresh(new RefreshRequest("nonexistent")))
+        assertThatThrownBy(() -> authService.refresh(new RefreshRequest(rawToken)))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("not found");
     }
@@ -278,16 +308,6 @@ class AuthServiceTest {
 
         log.trace("Assert: deleteByUserId called with userId={}", userId);
         verify(refreshTokenRepository).deleteByUserId(userId);
-    }
-
-    private static String sha256Hex(String input) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(input.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 not available", e);
-        }
     }
 
     private User buildUser(UUID id, String email, String passwordHash, Role role) {

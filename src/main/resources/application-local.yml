@@ -29,9 +29,9 @@ spring:
 
 app:
   jwt:
-    secret: local-dev-secret-change-me-in-production-must-be-long-enough
+    secret: dGVzdC1sb2NhbC1kZXYtc2VjcmV0LW5lZWRzLXRvLWJlLXJhbmRvbS0yNTZiaXQh
     access-token-expiration: 900000
-    refresh-token-expiration: 2592000000
+    refresh-token-expiration: 604800000
   cloudflare-r2:
     access-key-id: local
     secret-access-key: local

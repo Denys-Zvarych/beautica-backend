@@ -11,15 +11,12 @@ import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.HexFormat;
 import java.util.UUID;
 
 @Service
@@ -30,25 +27,28 @@ public class AuthService {
     private final JwtTokenProvider jwtTokenProvider;
     private final PasswordEncoder passwordEncoder;
     private final JwtConfig jwtConfig;
+    private final TokenGenerator tokenGenerator;
 
     public AuthService(
             UserRepository userRepository,
             RefreshTokenRepository refreshTokenRepository,
             JwtTokenProvider jwtTokenProvider,
             PasswordEncoder passwordEncoder,
-            JwtConfig jwtConfig
+            JwtConfig jwtConfig,
+            TokenGenerator tokenGenerator
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
         this.jwtTokenProvider = jwtTokenProvider;
         this.passwordEncoder = passwordEncoder;
         this.jwtConfig = jwtConfig;
+        this.tokenGenerator = tokenGenerator;
     }
 
     @Transactional
     public AuthResponse register(RegisterRequest request) {
         if (userRepository.existsByEmail(request.email())) {
-            throw new BusinessException("Email is already registered");
+            throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
         }
 
         var user = new User(
@@ -67,7 +67,7 @@ public class AuthService {
     @Transactional
     public AuthResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
         if (userRepository.existsByEmail(request.email())) {
-            throw new BusinessException("Email is already registered");
+            throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
         }
 
         var user = new User(
@@ -86,10 +86,14 @@ public class AuthService {
     @Transactional
     public AuthResponse login(LoginRequest request) {
         var user = userRepository.findByEmail(request.email())
-                .orElseThrow(() -> new BusinessException("Invalid email or password"));
+                .orElseThrow(() -> new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password"));
 
         if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
-            throw new BusinessException("Invalid email or password");
+            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
+        }
+
+        if (!user.isActive()) {
+            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
         }
 
         return buildAuthResponse(user);
@@ -97,22 +101,26 @@ public class AuthService {
 
     @Transactional
     public AuthResponse refresh(RefreshRequest request) {
-        var storedToken = refreshTokenRepository.findByToken(hashToken(request.refreshToken()))
-                .orElseThrow(() -> new BusinessException("Refresh token not found"));
+        var storedToken = refreshTokenRepository.findByToken(tokenGenerator.hash(request.refreshToken()))
+                .orElseThrow(() -> new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found"));
 
         if (storedToken.isRevoked()) {
-            throw new BusinessException("Refresh token has been revoked");
+            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token has been revoked");
         }
 
         if (storedToken.getExpiresAt().isBefore(Instant.now())) {
-            throw new BusinessException("Refresh token has expired");
+            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token has expired");
         }
 
         storedToken.revoke();
         refreshTokenRepository.save(storedToken);
 
         var user = userRepository.findById(storedToken.getUserId())
-                .orElseThrow(() -> new BusinessException("User not found"));
+                .orElseThrow(() -> new BusinessException(HttpStatus.UNAUTHORIZED, "User not found"));
+
+        if (!user.isActive()) {
+            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found");
+        }
 
         return buildAuthResponse(user);
     }
@@ -122,16 +130,6 @@ public class AuthService {
         refreshTokenRepository.deleteByUserId(userId);
     }
 
-    private String hashToken(String token) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(token.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 not available", e);
-        }
-    }
-
     private AuthResponse buildAuthResponse(User user) {
         String accessToken = jwtTokenProvider.generateAccessToken(
                 user.getId(), user.getEmail(), user.getRole());
@@ -139,7 +137,7 @@ public class AuthService {
         String rawRefreshToken = jwtTokenProvider.generateRefreshToken(user.getId());
 
         var expiresAt = Instant.now().plusMillis(jwtConfig.refreshTokenExpiration());
-        var refreshToken = new RefreshToken(hashToken(rawRefreshToken), user.getId(), expiresAt);
+        var refreshToken = new RefreshToken(tokenGenerator.hash(rawRefreshToken), user.getId(), expiresAt);
         refreshTokenRepository.save(refreshToken);
 
         return AuthResponse.of(accessToken, rawRefreshToken, user.getId(), user.getEmail(), user.getRole());

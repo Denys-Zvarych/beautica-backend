@@ -179,8 +179,8 @@ class InviteControllerIT {
     }
 
     @Test
-    @DisplayName("SALON_OWNER invites already-registered email → 400")
-    void should_return400_when_invitedEmailAlreadyRegistered() throws Exception {
+    @DisplayName("SALON_OWNER invites already-registered email → 409")
+    void should_return409_when_invitedEmailAlreadyRegistered() throws Exception {
         String ownerEmail = uniqueEmail("owner2");
         String alreadyRegistered = uniqueEmail("existing");
         createdEmails.add(ownerEmail);
@@ -205,8 +205,8 @@ class InviteControllerIT {
                 String.class
         );
 
-        log.trace("Assert: status=400");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        log.trace("Assert: status=409");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});

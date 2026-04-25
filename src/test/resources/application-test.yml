@@ -19,7 +19,7 @@ app:
   jwt:
     secret: test-secret-that-is-long-enough-for-hs256-ok-padding-here
     access-token-expiration: 900000
-    refresh-token-expiration: 2592000000
+    refresh-token-expiration: 604800000
   cloudflare-r2:
     access-key-id: test
     secret-access-key: test

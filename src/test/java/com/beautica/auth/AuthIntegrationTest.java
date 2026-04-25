@@ -212,16 +212,16 @@ class AuthIntegrationTest {
     class DuplicateEmail {
 
         @Test
-        @DisplayName("returns 400 when the email is already registered")
-        void should_return400_when_emailIsAlreadyRegistered() {
+        @DisplayName("returns 409 when the email is already registered")
+        void should_return409_when_emailIsAlreadyRegistered() {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
             log.debug("Act: attempt to register the same email again");
             var secondResponse = post(validRequest);
 
-            log.trace("Assert: second attempt is rejected with 400");
-            assertThat(secondResponse.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            log.trace("Assert: second attempt is rejected with 409");
+            assertThat(secondResponse.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
 
             var body = secondResponse.getBody();
             assertThat(body).isNotNull();

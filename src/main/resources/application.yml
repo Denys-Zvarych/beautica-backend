@@ -33,6 +33,7 @@ spring:
 
 server:
   port: 8080
+  forward-headers-strategy: native
 
 management:
   endpoints:
@@ -61,7 +62,7 @@ app:
   jwt:
     secret: ${JWT_SECRET}
     access-token-expiration: 900000       # 15 min in ms
-    refresh-token-expiration: 2592000000  # 30 days in ms
+    refresh-token-expiration: 604800000   # 7 days in ms
   cloudflare-r2:
     access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID}
     secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY}

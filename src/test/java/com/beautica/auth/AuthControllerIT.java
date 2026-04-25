@@ -75,7 +75,7 @@ class AuthControllerIT {
     }
 
     @Test
-    void should_return400_when_registerWithDuplicateEmail() throws Exception {
+    void should_return409_when_registerWithDuplicateEmail() throws Exception {
         log.debug("Arrange: registering email={} twice", "duplicate@beautica.com");
         var request = new RegisterRequest(
                 "duplicate@beautica.com", "password123",
@@ -88,7 +88,7 @@ class AuthControllerIT {
                 "/auth/register", request, String.class);
 
         log.trace("Assert: status={}", secondResponse.getStatusCode());
-        assertThat(secondResponse.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(secondResponse.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
 
         var apiResponse = objectMapper.readValue(
                 secondResponse.getBody(), new TypeReference<ApiResponse<Void>>() {});
@@ -125,7 +125,7 @@ class AuthControllerIT {
     }
 
     @Test
-    void should_return400_when_loginWithBadCredentials() throws Exception {
+    void should_return401_when_loginWithBadCredentials() throws Exception {
         log.debug("Arrange: no pre-existing user");
 
         log.debug("Act: POST /auth/login with unknown email");
@@ -135,7 +135,7 @@ class AuthControllerIT {
                 String.class);
 
         log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
 
         var apiResponse = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
@@ -223,5 +223,43 @@ class AuthControllerIT {
 
         log.trace("Assert: status={}", response.getStatusCode());
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("should return 401 when old refresh token is replayed after rotation")
+    void should_return401_when_oldRefreshTokenReplayedAfterRotation() throws Exception {
+        var email = "replay.user@beautica.com";
+        var password = "replaypass1";
+        log.debug("Arrange: register user email={}", email);
+
+        restTemplate.postForEntity("/auth/register",
+                new RegisterRequest(email, password, null, null, null),
+                String.class);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/auth/login",
+                new LoginRequest(email, password),
+                String.class);
+
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String originalRefreshToken = loginBody.data().refreshToken();
+
+        log.debug("Act: first refresh — rotates the token");
+        restTemplate.postForEntity(
+                "/auth/refresh",
+                new RefreshRequest(originalRefreshToken),
+                String.class);
+
+        log.debug("Act: replay the original refresh token after rotation");
+        ResponseEntity<String> replayResp = restTemplate.postForEntity(
+                "/auth/refresh",
+                new RefreshRequest(originalRefreshToken),
+                String.class);
+
+        log.trace("Assert: replay is rejected with 401");
+        assertThat(replayResp.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        var body = objectMapper.readValue(replayResp.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        assertThat(body.success()).isFalse();
     }
 }

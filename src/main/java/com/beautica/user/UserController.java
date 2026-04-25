@@ -44,6 +44,6 @@ public class UserController {
         if (authentication instanceof UsernamePasswordAuthenticationToken token) {
             return (UUID) token.getDetails();
         }
-        throw new IllegalStateException("Unexpected authentication type");
+        throw new com.beautica.common.exception.ForbiddenException("Not authenticated");
     }
 }

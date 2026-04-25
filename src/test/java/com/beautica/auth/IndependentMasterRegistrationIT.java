@@ -131,8 +131,8 @@ class IndependentMasterRegistrationIT {
     }
 
     @Test
-    @DisplayName("returns 400 when email is already registered as a client")
-    void should_return400_when_emailAlreadyRegisteredAsClient() {
+    @DisplayName("returns 409 when email is already registered as a client")
+    void should_return409_when_emailAlreadyRegisteredAsClient() {
         var clientRequest = new RegisterRequest(
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
 
@@ -144,8 +144,8 @@ class IndependentMasterRegistrationIT {
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
         var response = postIndependentMaster(masterRequest);
 
-        log.trace("Assert: second attempt rejected with 400");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        log.trace("Assert: second attempt rejected with 409");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
 
         var body = response.getBody();
         assertThat(body).isNotNull();

@@ -27,11 +27,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.HexFormat;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -66,6 +62,9 @@ class InviteServiceTest {
     @Mock
     private EmailService emailService;
 
+    @Mock
+    private TokenGenerator tokenGenerator;
+
     private JwtTokenProvider jwtTokenProvider;
     private JwtConfig jwtConfig;
     private PasswordEncoder passwordEncoder;
@@ -84,20 +83,25 @@ class InviteServiceTest {
                 jwtConfig,
                 passwordEncoder,
                 emailService,
+                tokenGenerator,
                 "http://localhost:3000",
                 72L
         );
     }
 
     @Test
-    @DisplayName("sendInvite stores hashed token, not the raw UUID")
+    @DisplayName("sendInvite stores hashed token, not the raw token")
     void should_storeHashedToken_when_sendInviteSucceeds() {
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var request = new InviteRequest("master@example.com", salonId);
         var caller = buildCallerWithSalon(callerId, salonId);
+        var rawToken = "raw-invite-token";
+        var hashedToken = "hashed-invite-token";
         log.debug("Arrange: caller owns salon salonId={}", salonId);
 
+        when(tokenGenerator.generateToken()).thenReturn(rawToken);
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com"))
@@ -110,15 +114,13 @@ class InviteServiceTest {
         inviteService.sendInvite(request, callerId);
 
         InviteToken saved = captor.getValue();
-        log.trace("Assert: saved token is not the raw UUID");
-        assertThat(saved.getToken()).isNotBlank();
+        log.trace("Assert: saved token is the hash, not the raw value");
+        assertThat(saved.getToken()).isEqualTo(hashedToken);
+        assertThat(saved.getToken()).isNotEqualTo(rawToken);
 
         ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendInviteEmail(anyString(), linkCaptor.capture());
-        String rawTokenFromLink = linkCaptor.getValue().substring(linkCaptor.getValue().lastIndexOf('=') + 1);
-
-        assertThat(saved.getToken()).isNotEqualTo(rawTokenFromLink);
-        assertThat(saved.getToken()).isEqualTo(sha256Hex(rawTokenFromLink));
+        assertThat(linkCaptor.getValue()).endsWith(rawToken);
     }
 
     @Test
@@ -130,6 +132,7 @@ class InviteServiceTest {
         var caller = buildCallerWithSalon(callerId, salonId);
         log.debug("Arrange: email={} salonId={}", request.email(), salonId);
 
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com"))
@@ -217,6 +220,7 @@ class InviteServiceTest {
         var expired = buildInviteToken("expired@example.com", Instant.now().minusSeconds(1));
         log.debug("Arrange: expired invite exists for email={}", request.email());
 
+        when(tokenGenerator.generateToken()).thenReturn("new-raw-token");
         when(userRepository.existsByEmail("expired@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("expired@example.com"))
@@ -236,14 +240,16 @@ class InviteServiceTest {
     @Test
     @DisplayName("acceptInvite creates SALON_MASTER user and returns auth response")
     void should_createSalonMasterAndReturnAuthResponse_when_acceptInviteSucceeds() {
-        var rawToken = UUID.randomUUID().toString();
-        var hashedToken = sha256Hex(rawToken);
+        var rawToken = "raw-accept-token";
+        var hashedToken = "hashed-accept-token";
         var salonId = UUID.randomUUID();
         var invite = buildInviteToken("new@example.com", Instant.now().plusSeconds(3600));
         ReflectionTestUtils.setField(invite, "salonId", salonId);
         var request = new InviteAcceptRequest(rawToken, "password123", "Jane", "Doe", null);
         log.debug("Arrange: valid unused token for email=new@example.com salonId={}", salonId);
 
+        when(tokenGenerator.hash(anyString())).thenReturn("hashed-jwt-token");
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("new@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
@@ -275,10 +281,11 @@ class InviteServiceTest {
     @DisplayName("acceptInvite throws NotFoundException when token does not exist")
     void should_throwNotFoundException_when_tokenNotFound() {
         var rawToken = "nonexistent";
-        var hashedToken = sha256Hex(rawToken);
+        var hashedToken = "hashed-nonexistent";
         var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
         log.debug("Arrange: no invite token found");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.empty());
 
         log.debug("Act: calling acceptInvite expecting NotFoundException");
@@ -290,13 +297,14 @@ class InviteServiceTest {
     @Test
     @DisplayName("acceptInvite throws BusinessException when token is already used")
     void should_throwBusinessException_when_tokenAlreadyUsed() {
-        var rawToken = UUID.randomUUID().toString();
-        var hashedToken = sha256Hex(rawToken);
+        var rawToken = "raw-used-token";
+        var hashedToken = "hashed-used-token";
         var invite = buildInviteToken("used@example.com", Instant.now().plusSeconds(3600));
         invite.markUsed();
         var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
         log.debug("Arrange: invite token already marked used");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
 
         log.debug("Act: calling acceptInvite expecting BusinessException");
@@ -308,12 +316,13 @@ class InviteServiceTest {
     @Test
     @DisplayName("acceptInvite throws BusinessException when token is expired")
     void should_throwBusinessException_when_tokenExpired() {
-        var rawToken = UUID.randomUUID().toString();
-        var hashedToken = sha256Hex(rawToken);
+        var rawToken = "raw-expired-token";
+        var hashedToken = "hashed-expired-token";
         var invite = buildInviteToken("expired2@example.com", Instant.now().minusSeconds(1));
         var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
         log.debug("Arrange: invite token is expired");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
 
         log.debug("Act: calling acceptInvite expecting BusinessException");
@@ -325,12 +334,13 @@ class InviteServiceTest {
     @Test
     @DisplayName("acceptInvite throws BusinessException when email already registered")
     void should_throwBusinessException_when_emailAlreadyRegisteredOnAccept() {
-        var rawToken = UUID.randomUUID().toString();
-        var hashedToken = sha256Hex(rawToken);
+        var rawToken = "raw-collision-token";
+        var hashedToken = "hashed-collision-token";
         var invite = buildInviteToken("collision@example.com", Instant.now().plusSeconds(3600));
         var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
         log.debug("Arrange: invite token valid but email collision detected");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("collision@example.com")).thenReturn(true);
 
@@ -343,12 +353,13 @@ class InviteServiceTest {
     @Test
     @DisplayName("previewInvite returns InvitePreviewResponse for a valid token")
     void should_return_previewResponse_when_validToken() {
-        var rawToken = UUID.randomUUID().toString();
-        var hashedToken = sha256Hex(rawToken);
+        var rawToken = "raw-preview-token";
+        var hashedToken = "hashed-preview-token";
         var expiresAt = Instant.now().plusSeconds(3600);
         var invite = buildInviteToken("preview@example.com", expiresAt);
         log.debug("Arrange: valid unused token for email=preview@example.com");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
         log.debug("Act: calling previewInvite");
@@ -364,9 +375,10 @@ class InviteServiceTest {
     @DisplayName("previewInvite throws BusinessException when token does not exist")
     void should_throwNotFound_when_previewTokenNotFound() {
         var rawToken = "unknown-raw-token";
-        var hashedToken = sha256Hex(rawToken);
+        var hashedToken = "hashed-unknown-token";
         log.debug("Arrange: no matching token in repository");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.empty());
 
         log.debug("Act: calling previewInvite expecting BusinessException");
@@ -378,12 +390,13 @@ class InviteServiceTest {
     @Test
     @DisplayName("previewInvite throws BusinessException when token is already used")
     void should_throw400_when_previewTokenAlreadyUsed() {
-        var rawToken = UUID.randomUUID().toString();
-        var hashedToken = sha256Hex(rawToken);
+        var rawToken = "raw-used-preview-token";
+        var hashedToken = "hashed-used-preview-token";
         var invite = buildInviteToken("used@example.com", Instant.now().plusSeconds(3600));
         invite.markUsed();
         log.debug("Arrange: invite token already marked used");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
         log.debug("Act: calling previewInvite expecting BusinessException");
@@ -395,11 +408,12 @@ class InviteServiceTest {
     @Test
     @DisplayName("previewInvite throws BusinessException when token is expired")
     void should_throw400_when_previewTokenExpired() {
-        var rawToken = UUID.randomUUID().toString();
-        var hashedToken = sha256Hex(rawToken);
+        var rawToken = "raw-expired-preview-token";
+        var hashedToken = "hashed-expired-preview-token";
         var invite = buildInviteToken("expired@example.com", Instant.now().minusSeconds(1));
         log.debug("Arrange: invite token is expired");
 
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
         log.debug("Act: calling previewInvite expecting BusinessException");
@@ -416,15 +430,5 @@ class InviteServiceTest {
         var caller = new User("owner@beautica.test", "hash", Role.SALON_OWNER, null, null, null, salonId);
         ReflectionTestUtils.setField(caller, "id", callerId);
         return caller;
-    }
-
-    private String sha256Hex(String input) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(input.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 not available", e);
-        }
     }
 }
