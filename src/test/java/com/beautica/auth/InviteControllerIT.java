@@ -34,6 +34,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -83,13 +84,21 @@ class InviteControllerIT {
     @Autowired
     private TransactionTemplate transactionTemplate;
 
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
     @MockBean
     private EmailService emailService;
 
     private final List<String> createdEmails = new ArrayList<>();
+    private final List<UUID> createdSalonIds = new ArrayList<>();
 
     @AfterEach
     void cleanUp() {
+        for (UUID sid : createdSalonIds) {
+            jdbcTemplate.update("DELETE FROM salons WHERE id = ?", sid);
+        }
+        createdSalonIds.clear();
         transactionTemplate.executeWithoutResult(status -> {
             for (String email : createdEmails) {
                 userRepository.findByEmail(email).ifPresent(user -> {
@@ -222,6 +231,17 @@ class InviteControllerIT {
         log.debug("Arrange: insert valid invite token for email={}", masterEmail);
 
         String rawToken = UUID.randomUUID().toString();
+        String salonOwnerEmail = uniqueEmail("salon-owner");
+        createdEmails.add(salonOwnerEmail);
+        jdbcTemplate.update(
+                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, created_at, updated_at) " +
+                "VALUES (?, 'x', 'SALON_OWNER', 'Owner', 'Test', true, now(), now())",
+                salonOwnerEmail);
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
+                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",
+                salonId, salonOwnerEmail);
+        createdSalonIds.add(salonId);
         saveValidInviteToken(masterEmail, salonId, rawToken);
 
         var request = new InviteAcceptRequest(rawToken, "password123", "Jane", "Doe", null);
@@ -473,6 +493,11 @@ class InviteControllerIT {
     }
 
     private String promoteToSalonOwnerWithSalon(String email, String existingToken, UUID salonId) throws Exception {
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",
+                salonId, email
+        );
+        createdSalonIds.add(salonId);
         transactionTemplate.executeWithoutResult(status ->
                 userRepository.findByEmail(email).ifPresent(user -> {
                     org.springframework.test.util.ReflectionTestUtils.setField(user, "role", Role.SALON_OWNER);
