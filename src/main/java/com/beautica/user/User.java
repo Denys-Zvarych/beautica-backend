@@ -117,6 +117,10 @@ public class User extends AuditableEntity {
         return salonId;
     }
 
+    public void setSalonId(UUID salonId) {
+        this.salonId = salonId;
+    }
+
     public void setFirstName(String firstName) {
         this.firstName = firstName;
     }

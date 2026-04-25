@@ -1,0 +1,140 @@
+package com.beautica.salon.service;
+
+import com.beautica.auth.InviteService;
+import com.beautica.auth.Role;
+import com.beautica.auth.dto.InviteRequest;
+import com.beautica.auth.dto.InviteResponse;
+import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.NotFoundException;
+import com.beautica.master.dto.MasterSummaryResponse;
+import com.beautica.master.repository.MasterRepository;
+import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.dto.SalonResponse;
+import com.beautica.salon.dto.UpdateSalonRequest;
+import com.beautica.salon.entity.Salon;
+import com.beautica.salon.repository.SalonRepository;
+import com.beautica.user.UserRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class SalonService {
+
+    private final SalonRepository salonRepository;
+    private final UserRepository userRepository;
+    private final InviteService inviteService;
+    private final MasterRepository masterRepository;
+
+    @Transactional
+    public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
+        var owner = userRepository.findById(ownerId)
+                .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
+
+        if (owner.getRole() != Role.SALON_OWNER) {
+            throw new ForbiddenException("Only SALON_OWNER may create a salon");
+        }
+
+        if (salonRepository.existsByOwnerId(ownerId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Salon already exists for this owner");
+        }
+
+        var salon = Salon.builder()
+                .owner(owner)
+                .name(request.name())
+                .description(request.description())
+                .city(request.city())
+                .region(request.region())
+                .address(request.address())
+                .phone(request.phone())
+                .instagramUrl(request.instagramUrl())
+                .isActive(true)
+                .build();
+
+        var saved = salonRepository.save(salon);
+        owner.setSalonId(saved.getId());
+        userRepository.save(owner);
+        return SalonResponse.from(saved);
+    }
+
+    @Transactional
+    public SalonResponse updateSalon(UUID ownerId, UUID salonId, UpdateSalonRequest request) {
+        var salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+
+        if (!salon.getOwner().getId().equals(ownerId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        if (request.name() != null) {
+            salon.setName(request.name());
+        }
+        if (request.description() != null) {
+            salon.setDescription(request.description());
+        }
+        if (request.city() != null) {
+            salon.setCity(request.city());
+        }
+        if (request.region() != null) {
+            salon.setRegion(request.region());
+        }
+        if (request.address() != null) {
+            salon.setAddress(request.address());
+        }
+        if (request.phone() != null) {
+            salon.setPhone(request.phone());
+        }
+        if (request.instagramUrl() != null) {
+            salon.setInstagramUrl(request.instagramUrl());
+        }
+
+        var saved = salonRepository.save(salon);
+        return SalonResponse.from(saved);
+    }
+
+    @Transactional(readOnly = true)
+    public SalonResponse getSalon(UUID salonId) {
+        var salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+        return SalonResponse.from(salon);
+    }
+
+    @Transactional
+    public InviteResponse inviteMaster(UUID ownerId, UUID salonId, String email) {
+        var salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+
+        if (!salon.getOwner().getId().equals(ownerId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        var inviteRequest = new InviteRequest(email, salonId);
+        return inviteService.sendInvite(inviteRequest, ownerId);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<MasterSummaryResponse> getMastersBySalon(UUID salonId, Pageable pageable) {
+        return masterRepository.findBySalonIdAndIsActiveTrue(salonId, pageable)
+                .map(MasterSummaryResponse::from);
+    }
+
+    @Transactional
+    public void deactivateSalon(UUID ownerId, UUID salonId) {
+        var salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+
+        if (!salon.getOwner().getId().equals(ownerId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        salon.setActive(false);
+        salonRepository.save(salon);
+    }
+}

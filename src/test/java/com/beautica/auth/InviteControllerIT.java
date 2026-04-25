@@ -353,7 +353,7 @@ class InviteControllerIT {
         String rawToken = UUID.randomUUID().toString();
         log.debug("Arrange: save valid invite token for email={}", masterEmail);
 
-        saveValidInviteToken(masterEmail, salonId, rawToken);
+        saveValidInviteToken(masterEmail, null, rawToken);
 
         log.debug("Act: GET /auth/invite/validate?token={}", rawToken);
         ResponseEntity<String> response = restTemplate.getForEntity(
@@ -437,7 +437,7 @@ class InviteControllerIT {
         String rawToken = UUID.randomUUID().toString();
         log.debug("Arrange: valid token, no auth header — endpoint must be public");
 
-        saveValidInviteToken(masterEmail, UUID.randomUUID(), rawToken);
+        saveValidInviteToken(masterEmail, null, rawToken);
 
         log.debug("Act: GET /auth/invite/validate without credentials");
         ResponseEntity<String> response = restTemplate.getForEntity(
@@ -530,7 +530,7 @@ class InviteControllerIT {
         var token = new InviteToken(
                 sha256Hex(rawToken),
                 email,
-                UUID.randomUUID(),
+                null,
                 Role.SALON_MASTER,
                 Instant.now().minusSeconds(1)
         );
@@ -541,7 +541,7 @@ class InviteControllerIT {
         var token = new InviteToken(
                 sha256Hex(rawToken),
                 email,
-                UUID.randomUUID(),
+                null,
                 Role.SALON_MASTER,
                 Instant.now().plusSeconds(3600)
         );
