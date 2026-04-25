@@ -20,10 +20,10 @@ spring:
     locations: classpath:db/migration
 
   mail:
-    host: smtp.sendgrid.net
+    host: smtp-relay.brevo.com
     port: 587
-    username: apikey
-    password: ${SENDGRID_API_KEY}
+    username: ${BREVO_SMTP_LOGIN}
+    password: ${BREVO_SMTP_KEY}
     properties:
       mail:
         smtp:
@@ -33,15 +33,24 @@ spring:
 
 server:
   port: 8080
+  forward-headers-strategy: native
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health
   endpoint:
     health:
       show-details: when-authorized
+
+logging:
+  level:
+    root: INFO
+    com.beautica: INFO
+    org.springframework: WARN
+    org.hibernate: WARN
+    org.flywaydb: INFO
 
 springdoc:
   api-docs:
@@ -53,7 +62,7 @@ app:
   jwt:
     secret: ${JWT_SECRET}
     access-token-expiration: 900000       # 15 min in ms
-    refresh-token-expiration: 2592000000  # 30 days in ms
+    refresh-token-expiration: 604800000   # 7 days in ms
   cloudflare-r2:
     access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID}
     secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY}
@@ -63,3 +72,6 @@ app:
     service-account: ${FIREBASE_SERVICE_ACCOUNT}
   frontend:
     base-url: ${FRONTEND_BASE_URL:http://localhost:3000}
+  invite:
+    token-expiration-hours: 72
+    from-email: noreply@beautica.app
