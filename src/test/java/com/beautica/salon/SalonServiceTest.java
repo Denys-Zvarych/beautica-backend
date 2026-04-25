@@ -1,0 +1,211 @@
+package com.beautica.salon;
+
+import com.beautica.auth.InviteService;
+import com.beautica.auth.Role;
+import com.beautica.auth.dto.InviteRequest;
+import com.beautica.auth.dto.InviteResponse;
+import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.NotFoundException;
+import com.beautica.master.repository.MasterRepository;
+import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.dto.SalonResponse;
+import com.beautica.salon.dto.UpdateSalonRequest;
+import com.beautica.salon.entity.Salon;
+import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.service.SalonService;
+import com.beautica.user.User;
+import com.beautica.user.UserRepository;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpStatus;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.time.Instant;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+@DisplayName("SalonService — unit")
+class SalonServiceTest {
+
+    @Mock
+    private SalonRepository salonRepository;
+
+    @Mock
+    private UserRepository userRepository;
+
+    @Mock
+    private InviteService inviteService;
+
+    @Mock
+    private MasterRepository masterRepository;
+
+    @InjectMocks
+    private SalonService salonService;
+
+    @Test
+    @DisplayName("createSalon — returns SalonResponse with correct name and ownerId when owner is valid")
+    void should_createSalon_when_validOwnerAndRequest() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("Beauty Place", null, "Kyiv", null, null, null, null);
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "Beauty Place");
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.name()).isEqualTo("Beauty Place");
+        assertThat(response.ownerId()).isEqualTo(ownerId);
+    }
+
+    @Test
+    @DisplayName("createSalon — throws BusinessException(409) when owner already has a salon")
+    void should_throw409_when_ownerAlreadyHasSalon() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("Duplicate Salon", null, null, null, null, null, null);
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+
+        assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+
+        verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("createSalon — throws ForbiddenException when user is not SALON_OWNER")
+    void should_throwForbidden_when_userIsNotSalonOwner() {
+        UUID userId = UUID.randomUUID();
+        User client = buildUser(userId, "client@beautica.com", Role.CLIENT);
+        var request = new CreateSalonRequest("My Salon", null, null, null, null, null, null);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+
+        assertThatThrownBy(() -> salonService.createSalon(userId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("getSalon — throws NotFoundException when salonId does not exist")
+    void should_throwNotFound_when_getSalonWithUnknownId() {
+        UUID salonId = UUID.randomUUID();
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> salonService.getSalon(salonId))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("updateSalon — applies non-null patch fields and saves when owner matches")
+    void should_updateSalon_when_ownerPatchesSalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+
+        var request = new UpdateSalonRequest("New Name", null, "Lviv", null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(response.name()).isEqualTo("New Name");
+        assertThat(response.city()).isEqualTo("Lviv");
+        verify(salonRepository).save(salon);
+    }
+
+    @Test
+    @DisplayName("updateSalon — throws ForbiddenException when a different owner attempts the update")
+    void should_throwForbidden_when_differentOwnerUpdatesSalon() {
+        UUID realOwnerId = UUID.randomUUID();
+        UUID attackerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User realOwner = buildUser(realOwnerId, "real@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, realOwner, "Salon");
+
+        var request = new UpdateSalonRequest("Hijacked", null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        assertThatThrownBy(() -> salonService.updateSalon(attackerId, salonId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — sets isActive to false and saves when owner requests")
+    void should_deactivateSalon_when_ownerRequests() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        assertThat(salon.isActive()).isFalse();
+        verify(salonRepository).save(salon);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — throws ForbiddenException when non-owner attempts deactivation")
+    void should_throwForbidden_when_nonOwnerDeactivatesSalon() {
+        UUID realOwnerId = UUID.randomUUID();
+        UUID attackerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User realOwner = buildUser(realOwnerId, "real@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, realOwner, "Salon");
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(salonRepository, never()).save(any());
+    }
+
+    private User buildUser(UUID id, String email, Role role) {
+        var user = new User(email, "hashed", role, null, null, null);
+        ReflectionTestUtils.setField(user, "id", id);
+        return user;
+    }
+
+    private Salon buildSalon(UUID id, User owner, String name) {
+        var salon = Salon.builder()
+                .owner(owner)
+                .name(name)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(salon, "id", id);
+        ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
+        return salon;
+    }
+}
