@@ -26,6 +26,21 @@ public class AuthorizationService {
                 .orElse(false);
     }
 
+    public boolean canManageMaster(Authentication auth, UUID masterId) {
+        boolean hasSalonMasterRole = auth.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
+        if (hasSalonMasterRole) {
+            return false;
+        }
+        UUID actorId = principalId(auth);
+        return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
+            if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+                return m.getUser().getId().equals(actorId);
+            }
+            return m.getSalon() != null && m.getSalon().getOwner().getId().equals(actorId);
+        }).orElse(false);
+    }
+
     public boolean canManageMasterSchedule(Authentication auth, UUID masterId) {
         boolean hasSalonMasterRole = auth.getAuthorities().stream()
                 .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
@@ -33,7 +48,7 @@ public class AuthorizationService {
             return false;
         }
         UUID actorId = principalId(auth);
-        return masterRepository.findById(masterId).map(m -> {
+        return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
                 return m.getUser().getId().equals(actorId);
             }
@@ -48,6 +63,15 @@ public class AuthorizationService {
     }
 
     public void enforceCanManageMaster(UUID actorId, Master master) {
+        boolean allowed = master.getMasterType() == MasterType.INDEPENDENT_MASTER
+                ? master.getUser().getId().equals(actorId)
+                : master.getSalon() != null && master.getSalon().getOwner().getId().equals(actorId);
+        if (!allowed) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    public void enforceCanManageMasterSchedule(UUID actorId, Master master) {
         boolean allowed = master.getMasterType() == MasterType.INDEPENDENT_MASTER
                 ? master.getUser().getId().equals(actorId)
                 : master.getSalon() != null && master.getSalon().getOwner().getId().equals(actorId);
