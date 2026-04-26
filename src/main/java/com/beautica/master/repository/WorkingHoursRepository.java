@@ -9,6 +9,8 @@ import java.util.UUID;
 
 public interface WorkingHoursRepository extends JpaRepository<WorkingHours, UUID> {
 
+    List<WorkingHours> findByMasterId(UUID masterId);
+
     List<WorkingHours> findByMasterIdAndIsActiveTrue(UUID masterId);
 
     Optional<WorkingHours> findByMasterIdAndDayOfWeek(UUID masterId, int dayOfWeek);
