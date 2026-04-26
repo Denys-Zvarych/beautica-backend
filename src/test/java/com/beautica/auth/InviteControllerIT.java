@@ -95,6 +95,13 @@ class InviteControllerIT {
 
     @AfterEach
     void cleanUp() {
+        // masters.user_id → users.id blocks user deletion; delete masters first
+        for (String email : createdEmails) {
+            jdbcTemplate.update(
+                    "DELETE FROM masters WHERE user_id = (SELECT id FROM users WHERE email = ?)", email);
+        }
+        // users.salon_id → salons.id (ON DELETE SET NULL) — nullify first, then delete salons
+        jdbcTemplate.execute("UPDATE users SET salon_id = NULL WHERE salon_id IS NOT NULL");
         for (UUID sid : createdSalonIds) {
             jdbcTemplate.update("DELETE FROM salons WHERE id = ?", sid);
         }
@@ -244,7 +251,7 @@ class InviteControllerIT {
         createdSalonIds.add(salonId);
         saveValidInviteToken(masterEmail, salonId, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "password123", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
 
         log.debug("Act: POST /auth/invite/accept");
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -269,7 +276,7 @@ class InviteControllerIT {
     @Test
     @DisplayName("Token not found → 404")
     void should_return404_when_tokenNotFound() throws Exception {
-        var request = new InviteAcceptRequest("nonexistent-token-xyz", "password123", null, null, null);
+        var request = new InviteAcceptRequest("nonexistent-token-xyz", "password12345", "Jane", "Doe", null);
         log.debug("Arrange: no matching token in DB");
 
         log.debug("Act: POST /auth/invite/accept with unknown token");
@@ -290,7 +297,7 @@ class InviteControllerIT {
         String rawToken = UUID.randomUUID().toString();
         saveExpiredInviteToken(masterEmail, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
+        var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
 
         log.debug("Act: POST /auth/invite/accept with expired token");
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -315,7 +322,7 @@ class InviteControllerIT {
         String rawToken = UUID.randomUUID().toString();
         saveUsedInviteToken(masterEmail, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
+        var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
 
         log.debug("Act: POST /auth/invite/accept with already-used token");
         ResponseEntity<String> response = restTemplate.postForEntity(

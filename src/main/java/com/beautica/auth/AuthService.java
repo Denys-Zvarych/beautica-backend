@@ -6,7 +6,7 @@ import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.config.JwtConfig;
+import com.beautica.master.service.MasterService;
 import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
@@ -19,30 +19,31 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.util.UUID;
 
+
 @Service
 public class AuthService {
 
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
-    private final JwtTokenProvider jwtTokenProvider;
     private final PasswordEncoder passwordEncoder;
-    private final JwtConfig jwtConfig;
     private final TokenGenerator tokenGenerator;
+    private final MasterService masterService;
+    private final AuthResponseBuilder authResponseBuilder;
 
     public AuthService(
             UserRepository userRepository,
             RefreshTokenRepository refreshTokenRepository,
-            JwtTokenProvider jwtTokenProvider,
             PasswordEncoder passwordEncoder,
-            JwtConfig jwtConfig,
-            TokenGenerator tokenGenerator
+            TokenGenerator tokenGenerator,
+            MasterService masterService,
+            AuthResponseBuilder authResponseBuilder
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
-        this.jwtTokenProvider = jwtTokenProvider;
         this.passwordEncoder = passwordEncoder;
-        this.jwtConfig = jwtConfig;
         this.tokenGenerator = tokenGenerator;
+        this.masterService = masterService;
+        this.authResponseBuilder = authResponseBuilder;
     }
 
     @Transactional
@@ -79,6 +80,8 @@ public class AuthService {
                 request.phoneNumber()
         );
         var savedUser = userRepository.save(user);
+
+        masterService.createMasterForIndependentUser(savedUser.getId());
 
         return buildAuthResponse(savedUser);
     }
@@ -131,15 +134,6 @@ public class AuthService {
     }
 
     private AuthResponse buildAuthResponse(User user) {
-        String accessToken = jwtTokenProvider.generateAccessToken(
-                user.getId(), user.getEmail(), user.getRole());
-
-        String rawRefreshToken = jwtTokenProvider.generateRefreshToken(user.getId());
-
-        var expiresAt = Instant.now().plusMillis(jwtConfig.refreshTokenExpiration());
-        var refreshToken = new RefreshToken(tokenGenerator.hash(rawRefreshToken), user.getId(), expiresAt);
-        refreshTokenRepository.save(refreshToken);
-
-        return AuthResponse.of(accessToken, rawRefreshToken, user.getId(), user.getEmail(), user.getRole());
+        return authResponseBuilder.buildAuthResponse(user);
     }
 }

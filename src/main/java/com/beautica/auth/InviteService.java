@@ -8,12 +8,10 @@ import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.config.JwtConfig;
+import com.beautica.master.service.MasterService;
 import com.beautica.notification.EmailService;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
-import com.beautica.user.RefreshToken;
-import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.springframework.beans.factory.annotation.Value;
@@ -31,35 +29,32 @@ public class InviteService {
 
     private final InviteTokenRepository inviteTokenRepository;
     private final UserRepository userRepository;
-    private final RefreshTokenRepository refreshTokenRepository;
-    private final JwtTokenProvider jwtTokenProvider;
-    private final JwtConfig jwtConfig;
     private final PasswordEncoder passwordEncoder;
     private final EmailService emailService;
     private final TokenGenerator tokenGenerator;
+    private final MasterService masterService;
+    private final AuthResponseBuilder authResponseBuilder;
     private final String frontendBaseUrl;
     private final long tokenExpirationHours;
 
     public InviteService(
             InviteTokenRepository inviteTokenRepository,
             UserRepository userRepository,
-            RefreshTokenRepository refreshTokenRepository,
-            JwtTokenProvider jwtTokenProvider,
-            JwtConfig jwtConfig,
             PasswordEncoder passwordEncoder,
             EmailService emailService,
             TokenGenerator tokenGenerator,
+            MasterService masterService,
+            AuthResponseBuilder authResponseBuilder,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             @Value("${app.invite.token-expiration-hours:72}") long tokenExpirationHours
     ) {
         this.inviteTokenRepository = inviteTokenRepository;
         this.userRepository = userRepository;
-        this.refreshTokenRepository = refreshTokenRepository;
-        this.jwtTokenProvider = jwtTokenProvider;
-        this.jwtConfig = jwtConfig;
         this.passwordEncoder = passwordEncoder;
         this.emailService = emailService;
         this.tokenGenerator = tokenGenerator;
+        this.masterService = masterService;
+        this.authResponseBuilder = authResponseBuilder;
         this.frontendBaseUrl = frontendBaseUrl;
         this.tokenExpirationHours = tokenExpirationHours;
     }
@@ -124,6 +119,9 @@ public class InviteService {
             throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
         }
 
+        token.markUsed();
+        inviteTokenRepository.save(token);
+
         var user = new User(
                 token.getEmail(),
                 passwordEncoder.encode(request.password()),
@@ -135,8 +133,7 @@ public class InviteService {
         );
         var savedUser = userRepository.save(user);
 
-        token.markUsed();
-        inviteTokenRepository.save(token);
+        masterService.createMasterFromInvite(savedUser.getId(), token.getSalonId());
 
         return buildAuthResponse(savedUser);
     }
@@ -146,27 +143,7 @@ public class InviteService {
     }
 
     private AuthResponse buildAuthResponse(User user) {
-        if (!user.isActive()) {
-            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
-        }
-
-        String accessToken = jwtTokenProvider.generateAccessToken(
-                user.getId(), user.getEmail(), user.getRole());
-
-        String rawRefreshToken = jwtTokenProvider.generateRefreshToken(user.getId());
-
-        Instant expiresAt = Instant.now().plusMillis(jwtConfig.refreshTokenExpiration());
-        var refreshToken = new RefreshToken(tokenGenerator.hash(rawRefreshToken), user.getId(), expiresAt);
-        refreshTokenRepository.save(refreshToken);
-
-        return AuthResponse.of(
-                accessToken,
-                rawRefreshToken,
-                user.getId(),
-                user.getEmail(),
-                user.getRole(),
-                user.getSalonId()
-        );
+        return authResponseBuilder.buildAuthResponse(user);
     }
 
 }
