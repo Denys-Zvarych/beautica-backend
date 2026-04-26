@@ -6,6 +6,7 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -60,6 +61,9 @@ class IndependentMasterRegistrationIT {
     @Autowired
     private TransactionTemplate transactionTemplate;
 
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
     private String registeredEmail;
 
     @BeforeEach
@@ -71,6 +75,10 @@ class IndependentMasterRegistrationIT {
     @AfterEach
     void cleanUp() {
         if (registeredEmail == null) return;
+        // masters.user_id → users.id restricts user deletion; delete master first
+        jdbcTemplate.update(
+                "DELETE FROM masters WHERE user_id = (SELECT id FROM users WHERE email = ?)",
+                registeredEmail);
         transactionTemplate.executeWithoutResult(status -> {
             userRepository.findByEmail(registeredEmail).ifPresent(user -> {
                 log.debug("cleanUp: deleting refresh tokens for userId={}", user.getId());

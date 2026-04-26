@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
@@ -7,6 +8,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.JwtConfig;
+import com.beautica.master.service.MasterService;
 import com.beautica.notification.EmailService;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
@@ -65,25 +67,26 @@ class InviteServiceTest {
     @Mock
     private TokenGenerator tokenGenerator;
 
-    private JwtTokenProvider jwtTokenProvider;
-    private JwtConfig jwtConfig;
+    @Mock
+    private MasterService masterService;
+
+    @Mock
+    private AuthResponseBuilder authResponseBuilder;
+
     private PasswordEncoder passwordEncoder;
     private InviteService inviteService;
 
     @BeforeEach
     void setUp() {
         passwordEncoder = new BCryptPasswordEncoder(4);
-        jwtConfig = new JwtConfig(SECRET, ACCESS_MS, REFRESH_MS);
-        jwtTokenProvider = new JwtTokenProvider(jwtConfig);
         inviteService = new InviteService(
                 inviteTokenRepository,
                 userRepository,
-                refreshTokenRepository,
-                jwtTokenProvider,
-                jwtConfig,
                 passwordEncoder,
                 emailService,
                 tokenGenerator,
+                masterService,
+                authResponseBuilder,
                 "http://localhost:3000",
                 72L
         );
@@ -243,22 +246,24 @@ class InviteServiceTest {
         var rawToken = "raw-accept-token";
         var hashedToken = "hashed-accept-token";
         var salonId = UUID.randomUUID();
+        var userId = UUID.randomUUID();
         var invite = buildInviteToken("new@example.com", Instant.now().plusSeconds(3600));
         ReflectionTestUtils.setField(invite, "salonId", salonId);
         var request = new InviteAcceptRequest(rawToken, "password123", "Jane", "Doe", null);
         log.debug("Arrange: valid unused token for email=new@example.com salonId={}", salonId);
 
-        when(tokenGenerator.hash(anyString())).thenReturn("hashed-jwt-token");
+        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
+                userId, "new@example.com", Role.SALON_MASTER, salonId);
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("new@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
-            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            ReflectionTestUtils.setField(u, "id", userId);
             return u;
         });
-        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
         log.debug("Act: calling acceptInvite");
         var response = inviteService.acceptInvite(request);

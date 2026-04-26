@@ -1,11 +1,14 @@
 package com.beautica.auth;
 
+import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.JwtConfig;
+import com.beautica.master.entity.Master;
+import com.beautica.master.service.MasterService;
 import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
@@ -34,6 +37,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+
+
 @ExtendWith(MockitoExtension.class)
 @DisplayName("AuthService — unit")
 class AuthServiceTest {
@@ -54,6 +59,12 @@ class AuthServiceTest {
     @Mock
     private TokenGenerator tokenGenerator;
 
+    @Mock
+    private MasterService masterService;
+
+    @Mock
+    private AuthResponseBuilder authResponseBuilder;
+
     private PasswordEncoder passwordEncoder;
     private JwtTokenProvider jwtTokenProvider;
     private JwtConfig jwtConfig;
@@ -67,10 +78,10 @@ class AuthServiceTest {
         authService = new AuthService(
                 userRepository,
                 refreshTokenRepository,
-                jwtTokenProvider,
                 passwordEncoder,
-                jwtConfig,
-                tokenGenerator
+                tokenGenerator,
+                masterService,
+                authResponseBuilder
         );
     }
 
@@ -82,14 +93,15 @@ class AuthServiceTest {
                 "John", "Doe", null);
         log.debug("Arrange: seeding register request for email={}", request.email());
 
-        when(tokenGenerator.hash(anyString())).thenReturn("hashed-token");
+        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
+                UUID.randomUUID(), "new@example.com", Role.CLIENT);
         when(userRepository.existsByEmail("new@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
         log.debug("Act: calling authService.register");
         var response = authService.register(request);
@@ -130,14 +142,15 @@ class AuthServiceTest {
                 "Oksana", "Kovalenko", "+380671234567");
         log.debug("Arrange: seeding independent master request for email={}", request.email());
 
-        when(tokenGenerator.hash(anyString())).thenReturn("hashed-token");
+        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
+                UUID.randomUUID(), "master@example.com", Role.INDEPENDENT_MASTER);
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
         log.debug("Act: calling authService.registerIndependentMaster");
         var response = authService.registerIndependentMaster(request);
@@ -178,9 +191,10 @@ class AuthServiceTest {
         var user = buildUser(userId, "login@example.com", hashed, Role.SALON_OWNER);
         log.debug("Arrange: seeding user email=login@example.com role={}", Role.SALON_OWNER);
 
-        when(tokenGenerator.hash(anyString())).thenReturn("hashed-token");
+        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
+                userId, "login@example.com", Role.SALON_OWNER);
         when(userRepository.findByEmail("login@example.com")).thenReturn(Optional.of(user));
-        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
         log.debug("Act: calling authService.login");
         var response = authService.login(new LoginRequest("login@example.com", rawPassword));
@@ -248,11 +262,13 @@ class AuthServiceTest {
                 passwordEncoder.encode("pass"), Role.CLIENT);
         log.debug("Arrange: generated refresh token for userId={}", userId);
 
-        when(tokenGenerator.hash(anyString())).thenReturn("hashed-new-jwt-token");
+        var stubResponse = AuthResponse.of("new-access-tok", "new-refresh-tok",
+                userId, "ref@example.com", Role.CLIENT);
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
         when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
         log.debug("Act: calling authService.refresh");
         var response = authService.refresh(new RefreshRequest(rawToken));
