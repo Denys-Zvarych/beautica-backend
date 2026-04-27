@@ -16,8 +16,8 @@ import java.io.IOException;
 @Component
 public class AuthRateLimitFilter extends OncePerRequestFilter {
 
-    private static final String LOGIN_PATH = "/auth/login";
-    private static final String REFRESH_PATH = "/auth/refresh";
+    private static final String LOGIN_PATH = "/api/v1/auth/login";
+    private static final String REFRESH_PATH = "/api/v1/auth/refresh";
     private static final int RETRY_AFTER_SECONDS = 60;
 
     private final LoadingCache<String, Bucket> loginBuckets;

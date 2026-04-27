@@ -68,7 +68,7 @@ class AuthRateLimitFilterTest {
 
     // ==========================================================================
     @Nested
-    @DisplayName("POST /auth/login")
+    @DisplayName("POST /api/v1/auth/login")
     class LoginEndpoint {
 
         @Test
@@ -78,7 +78,7 @@ class AuthRateLimitFilterTest {
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
             when(bucket.tryConsume(1)).thenReturn(true);
 
-            var request  = postRequest("/auth/login");
+            var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
@@ -98,7 +98,7 @@ class AuthRateLimitFilterTest {
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
             when(bucket.tryConsume(1)).thenReturn(false);
 
-            var request  = postRequest("/auth/login");
+            var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
@@ -126,7 +126,7 @@ class AuthRateLimitFilterTest {
             when(refreshBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
             when(bucket.tryConsume(1)).thenReturn(true);
 
-            var request  = postRequest("/auth/refresh");
+            var request  = postRequest("/api/v1/auth/refresh");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
@@ -146,7 +146,7 @@ class AuthRateLimitFilterTest {
             when(refreshBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
             when(bucket.tryConsume(1)).thenReturn(false);
 
-            var request  = postRequest("/auth/refresh");
+            var request  = postRequest("/api/v1/auth/refresh");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
@@ -171,7 +171,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("GET on /auth/login passes through without touching any bucket")
         void should_passThrough_when_getRequestOnLoginPath() throws Exception {
             log.debug("Arrange: GET /auth/login request (method not POST)");
-            var request  = getRequest("/auth/login");
+            var request  = getRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
@@ -220,7 +220,7 @@ class AuthRateLimitFilterTest {
             when(loginBuckets.get(FORWARDED_IP)).thenReturn(bucket);
             when(bucket.tryConsume(1)).thenReturn(true);
 
-            var request = postRequest("/auth/login");
+            var request = postRequest("/api/v1/auth/login");
             request.addHeader("X-Forwarded-For", FORWARDED_IP + ", 192.168.1.1, 10.10.0.1");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
@@ -242,7 +242,7 @@ class AuthRateLimitFilterTest {
             when(bucket.tryConsume(1)).thenReturn(true);
 
             // postRequest() does not set X-Forwarded-For — deliberately absent.
-            var request  = postRequest("/auth/login");
+            var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
