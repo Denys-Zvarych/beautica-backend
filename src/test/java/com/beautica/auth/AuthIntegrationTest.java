@@ -66,7 +66,7 @@ class AuthIntegrationTest {
     private String registeredEmail;
 
     // ── constants ──────────────────────────────────────────────────────────────
-    private static final String REGISTER_URL = "/auth/register";
+    private static final String REGISTER_URL = "/api/v1/auth/register";
     private static final String TEST_PASSWORD = "SecurePass1!";
     private static final String TEST_FIRST    = "Taras";
     private static final String TEST_LAST     = "Shevchenko";

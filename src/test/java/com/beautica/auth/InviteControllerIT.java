@@ -139,7 +139,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite as SALON_OWNER");
         ResponseEntity<String> response = restTemplate.exchange(
-                "/auth/invite",
+                "/api/v1/auth/invite",
                 HttpMethod.POST,
                 new HttpEntity<>(request, headers),
                 String.class
@@ -169,7 +169,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite as CLIENT");
         ResponseEntity<String> response = restTemplate.exchange(
-                "/auth/invite",
+                "/api/v1/auth/invite",
                 HttpMethod.POST,
                 new HttpEntity<>(request, headers),
                 String.class
@@ -188,7 +188,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite without credentials");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite", request, String.class);
+                "/api/v1/auth/invite", request, String.class);
 
         log.trace("Assert: status=401");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
@@ -215,7 +215,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite targeting registered email");
         ResponseEntity<String> response = restTemplate.exchange(
-                "/auth/invite",
+                "/api/v1/auth/invite",
                 HttpMethod.POST,
                 new HttpEntity<>(request, headers),
                 String.class
@@ -255,7 +255,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite/accept");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite/accept", request, String.class);
+                "/api/v1/auth/invite/accept", request, String.class);
 
         log.trace("Assert: status=201, SALON_MASTER role");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
@@ -281,7 +281,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite/accept with unknown token");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite/accept", request, String.class);
+                "/api/v1/auth/invite/accept", request, String.class);
 
         log.trace("Assert: status=404");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
@@ -301,7 +301,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite/accept with expired token");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite/accept", request, String.class);
+                "/api/v1/auth/invite/accept", request, String.class);
 
         log.trace("Assert: status=400");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -326,7 +326,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite/accept with already-used token");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite/accept", request, String.class);
+                "/api/v1/auth/invite/accept", request, String.class);
 
         log.trace("Assert: status=400");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -345,7 +345,7 @@ class InviteControllerIT {
 
         log.debug("Act: POST /auth/invite/accept without credentials");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite/accept", request, String.class);
+                "/api/v1/auth/invite/accept", request, String.class);
 
         log.trace("Assert: status is not 401");
         assertThat(response.getStatusCode()).isNotEqualTo(HttpStatus.UNAUTHORIZED);
@@ -364,7 +364,7 @@ class InviteControllerIT {
 
         log.debug("Act: GET /auth/invite/validate?token={}", rawToken);
         ResponseEntity<String> response = restTemplate.getForEntity(
-                "/auth/invite/validate?token=" + rawToken, String.class);
+                "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
         log.trace("Assert: status=200, invitedEmail={}, role=SALON_MASTER", masterEmail);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -384,7 +384,7 @@ class InviteControllerIT {
 
         log.debug("Act: GET /auth/invite/validate with unknown token");
         ResponseEntity<String> response = restTemplate.getForEntity(
-                "/auth/invite/validate?token=" + UUID.randomUUID(), String.class);
+                "/api/v1/auth/invite/validate?token=" + UUID.randomUUID(), String.class);
 
         log.trace("Assert: status=400");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -402,7 +402,7 @@ class InviteControllerIT {
 
         log.debug("Act: GET /auth/invite/validate with expired token");
         ResponseEntity<String> response = restTemplate.getForEntity(
-                "/auth/invite/validate?token=" + rawToken, String.class);
+                "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
         log.trace("Assert: status=400, message contains 'expired'");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -425,7 +425,7 @@ class InviteControllerIT {
 
         log.debug("Act: GET /auth/invite/validate with already-used token");
         ResponseEntity<String> response = restTemplate.getForEntity(
-                "/auth/invite/validate?token=" + rawToken, String.class);
+                "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
         log.trace("Assert: status=400, message contains 'Invalid or expired'");
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -448,7 +448,7 @@ class InviteControllerIT {
 
         log.debug("Act: GET /auth/invite/validate without credentials");
         ResponseEntity<String> response = restTemplate.getForEntity(
-                "/auth/invite/validate?token=" + rawToken, String.class);
+                "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
         log.trace("Assert: status is not 401");
         assertThat(response.getStatusCode()).isNotEqualTo(HttpStatus.UNAUTHORIZED);
@@ -469,7 +469,7 @@ class InviteControllerIT {
 
     private String registerAndGetToken(String email, Role ignoredRole) throws Exception {
         var registerResp = restTemplate.postForEntity(
-                "/auth/register",
+                "/api/v1/auth/register",
                 new RegisterRequest(email, "password123", null, null, null),
                 String.class
         );
@@ -490,7 +490,7 @@ class InviteControllerIT {
                 })
         );
         var loginResp = restTemplate.postForEntity(
-                "/auth/login",
+                "/api/v1/auth/login",
                 new LoginRequest(email, "password123"),
                 String.class
         );
@@ -513,7 +513,7 @@ class InviteControllerIT {
                 })
         );
         var loginResp = restTemplate.postForEntity(
-                "/auth/login",
+                "/api/v1/auth/login",
                 new LoginRequest(email, "password123"),
                 String.class
         );

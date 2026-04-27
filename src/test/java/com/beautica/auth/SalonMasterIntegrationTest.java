@@ -142,7 +142,7 @@ class SalonMasterIntegrationTest {
         var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Oksana", "Kovalenko", null);
         log.debug("Act: POST /auth/invite/accept");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite/accept", request, String.class);
+                "/api/v1/auth/invite/accept", request, String.class);
 
         // Assert: HTTP 201 with SALON_MASTER role
         log.trace("Assert: status=201, role=SALON_MASTER");
@@ -193,7 +193,7 @@ class SalonMasterIntegrationTest {
         var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Fail", "Master", null);
         log.debug("Act: POST /auth/invite/accept with failing masterService");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/invite/accept", request, String.class);
+                "/api/v1/auth/invite/accept", request, String.class);
 
         // Assert: request failed (not 2xx)
         log.trace("Assert: status is not 2xx");
@@ -227,7 +227,7 @@ class SalonMasterIntegrationTest {
         // Act
         log.debug("Act: POST /auth/register/independent-master email={}", email);
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/register/independent-master", request, String.class);
+                "/api/v1/auth/register/independent-master", request, String.class);
 
         // Assert: registration succeeded
         log.trace("Assert: status=201, INDEPENDENT_MASTER role");
@@ -350,7 +350,7 @@ class SalonMasterIntegrationTest {
 
         // Act
         ResponseEntity<String> response = restTemplate.exchange(
-                "/auth/invite",
+                "/api/v1/auth/invite",
                 HttpMethod.POST,
                 new HttpEntity<>(requestBody, bearerHeaders(ownerBToken)),
                 String.class);
@@ -492,7 +492,7 @@ class SalonMasterIntegrationTest {
 
     private String loginAndGetToken(String email) throws Exception {
         ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(
                 resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});

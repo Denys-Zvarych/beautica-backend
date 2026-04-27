@@ -52,8 +52,8 @@ public class SecurityConfig {
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint(unauthorizedEntryPoint()))
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/auth/register", "/auth/register/independent-master", "/auth/login", "/auth/refresh", "/auth/invite/accept").permitAll()
-                        .requestMatchers(HttpMethod.GET, "/auth/invite/validate").permitAll()
+                        .requestMatchers("/api/v1/auth/register", "/api/v1/auth/register/independent-master", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/invite/accept").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll()
                         .requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers("/api-docs/**", "/api-docs").permitAll()
                         .requestMatchers(HttpMethod.GET, "/actuator/health").permitAll()

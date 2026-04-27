@@ -246,7 +246,7 @@ class SalonControllerTest {
                 UUID.randomUUID(), email, hash);
 
         ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
@@ -255,7 +255,7 @@ class SalonControllerTest {
     private String registerClientAndGetToken(String email) throws Exception {
         var request = new RegisterRequest(email, TEST_PASSWORD, null, null, null);
         ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/auth/register", request, String.class);
+                "/api/v1/auth/register", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();

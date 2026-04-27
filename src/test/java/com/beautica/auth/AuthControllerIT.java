@@ -59,7 +59,7 @@ class AuthControllerIT {
 
         log.debug("Act: POST /auth/register");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/register", request, String.class);
+                "/api/v1/auth/register", request, String.class);
 
         log.trace("Assert: status={}", response.getStatusCode());
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
@@ -81,11 +81,11 @@ class AuthControllerIT {
                 "duplicate@beautica.com", "password123",
                 null, null, null);
 
-        restTemplate.postForEntity("/auth/register", request, String.class);
+        restTemplate.postForEntity("/api/v1/auth/register", request, String.class);
 
         log.debug("Act: POST /auth/register (second attempt)");
         ResponseEntity<String> secondResponse = restTemplate.postForEntity(
-                "/auth/register", request, String.class);
+                "/api/v1/auth/register", request, String.class);
 
         log.trace("Assert: status={}", secondResponse.getStatusCode());
         assertThat(secondResponse.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
@@ -102,13 +102,13 @@ class AuthControllerIT {
         var password = "mypassword1";
         log.debug("Arrange: pre-registering email={} with known password", email);
 
-        restTemplate.postForEntity("/auth/register",
+        restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, null, null, null),
                 String.class);
 
         log.debug("Act: POST /auth/login");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/login",
+                "/api/v1/auth/login",
                 new LoginRequest(email, password),
                 String.class);
 
@@ -130,7 +130,7 @@ class AuthControllerIT {
 
         log.debug("Act: POST /auth/login with unknown email");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/login",
+                "/api/v1/auth/login",
                 new LoginRequest("nonexistent@beautica.com", "wrongpass"),
                 String.class);
 
@@ -149,12 +149,12 @@ class AuthControllerIT {
         var password = "refreshpass1";
         log.debug("Arrange: user {} registered and logged in", email);
 
-        restTemplate.postForEntity("/auth/register",
+        restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, null, null, null),
                 String.class);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
-                "/auth/login",
+                "/api/v1/auth/login",
                 new LoginRequest(email, password),
                 String.class);
 
@@ -164,7 +164,7 @@ class AuthControllerIT {
 
         log.debug("Act: POST /auth/refresh with original refresh token");
         ResponseEntity<String> refreshResp = restTemplate.postForEntity(
-                "/auth/refresh",
+                "/api/v1/auth/refresh",
                 new RefreshRequest(originalRefreshToken),
                 String.class);
 
@@ -185,12 +185,12 @@ class AuthControllerIT {
         var password = "logoutpass1";
         log.debug("Arrange: obtained access token for {}", email);
 
-        restTemplate.postForEntity("/auth/register",
+        restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, null, null, null),
                 String.class);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
-                "/auth/login",
+                "/api/v1/auth/login",
                 new LoginRequest(email, password),
                 String.class);
 
@@ -204,7 +204,7 @@ class AuthControllerIT {
 
         log.debug("Act: POST /auth/logout with Bearer token");
         ResponseEntity<Void> logoutResp = restTemplate.exchange(
-                "/auth/logout",
+                "/api/v1/auth/logout",
                 HttpMethod.POST,
                 new HttpEntity<>(headers),
                 Void.class);
@@ -219,7 +219,7 @@ class AuthControllerIT {
 
         log.debug("Act: POST /auth/logout without credentials");
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/logout", null, String.class);
+                "/api/v1/auth/logout", null, String.class);
 
         log.trace("Assert: status={}", response.getStatusCode());
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
@@ -232,12 +232,12 @@ class AuthControllerIT {
         var password = "replaypass1";
         log.debug("Arrange: register user email={}", email);
 
-        restTemplate.postForEntity("/auth/register",
+        restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, null, null, null),
                 String.class);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
-                "/auth/login",
+                "/api/v1/auth/login",
                 new LoginRequest(email, password),
                 String.class);
 
@@ -247,13 +247,13 @@ class AuthControllerIT {
 
         log.debug("Act: first refresh — rotates the token");
         restTemplate.postForEntity(
-                "/auth/refresh",
+                "/api/v1/auth/refresh",
                 new RefreshRequest(originalRefreshToken),
                 String.class);
 
         log.debug("Act: replay the original refresh token after rotation");
         ResponseEntity<String> replayResp = restTemplate.postForEntity(
-                "/auth/refresh",
+                "/api/v1/auth/refresh",
                 new RefreshRequest(originalRefreshToken),
                 String.class);
 

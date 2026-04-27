@@ -188,7 +188,7 @@ class MasterControllerTest {
                 UUID.randomUUID(), email, hash);
 
         ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
@@ -201,7 +201,7 @@ class MasterControllerTest {
                 UUID.randomUUID(), email, hash, role);
 
         ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();

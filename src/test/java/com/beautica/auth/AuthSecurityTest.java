@@ -59,7 +59,7 @@ class AuthSecurityTest {
         var email = "security-expired-" + System.nanoTime() + "@beautica.test";
         log.debug("Arrange: register email={}", email);
 
-        var resp = restTemplate.postForEntity("/auth/register",
+        var resp = restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, "password123", null, null, null),
                 String.class);
         var auth = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
@@ -91,7 +91,7 @@ class AuthSecurityTest {
         var email = "security-rbac-" + System.nanoTime() + "@beautica.test";
         log.debug("Arrange: register CLIENT email={}", email);
 
-        var resp = restTemplate.postForEntity("/auth/register",
+        var resp = restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, "password123", null, null, null),
                 String.class);
         var auth = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
@@ -106,7 +106,7 @@ class AuthSecurityTest {
 
         log.debug("Act: POST /auth/invite as CLIENT");
         ResponseEntity<String> response = restTemplate.exchange(
-                "/auth/invite", HttpMethod.POST,
+                "/api/v1/auth/invite", HttpMethod.POST,
                 new HttpEntity<>(body, headers), String.class);
 
         log.trace("Assert: status=403");
@@ -126,7 +126,7 @@ class AuthSecurityTest {
 
         log.debug("Act: POST /auth/register with extra role field");
         ResponseEntity<String> resp = restTemplate.exchange(
-                "/auth/register", HttpMethod.POST,
+                "/api/v1/auth/register", HttpMethod.POST,
                 new HttpEntity<>(requestBody, headers), String.class);
 
         log.trace("Assert: status=201, role=CLIENT (not SALON_OWNER)");
@@ -142,11 +142,11 @@ class AuthSecurityTest {
         var email = "security-revoked-" + System.nanoTime() + "@beautica.test";
         log.debug("Arrange: register email={}", email);
 
-        restTemplate.postForEntity("/auth/register",
+        restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, "password123", null, null, null), String.class);
 
         log.debug("Arrange: login to obtain tokens");
-        ResponseEntity<String> loginResp = restTemplate.postForEntity("/auth/login",
+        ResponseEntity<String> loginResp = restTemplate.postForEntity("/api/v1/auth/login",
                 new LoginRequest(email, "password123"), String.class);
         var loginBody = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         String accessToken = loginBody.data().accessToken();
@@ -155,12 +155,12 @@ class AuthSecurityTest {
         log.debug("Arrange: logout to revoke refresh tokens");
         HttpHeaders logoutHeaders = new HttpHeaders();
         logoutHeaders.setBearerAuth(accessToken);
-        restTemplate.exchange("/auth/logout", HttpMethod.POST,
+        restTemplate.exchange("/api/v1/auth/logout", HttpMethod.POST,
                 new HttpEntity<>(logoutHeaders), Void.class);
 
         log.debug("Act: attempt to use the now-revoked refresh token");
         ResponseEntity<String> replayResp = restTemplate.postForEntity(
-                "/auth/refresh",
+                "/api/v1/auth/refresh",
                 new RefreshRequest(refreshToken),
                 String.class);
 
