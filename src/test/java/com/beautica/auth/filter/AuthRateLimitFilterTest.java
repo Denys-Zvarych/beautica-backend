@@ -194,7 +194,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("POST /auth/register passes through without touching any bucket")
         void should_passThrough_when_postToNonRateLimitedPath() throws Exception {
             log.debug("Arrange: POST /auth/register (path not subject to rate limiting)");
-            var request  = postRequest("/auth/register");
+            var request  = postRequest("/api/v1/auth/register");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 

@@ -29,7 +29,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.UUID;
 
 @RestController
-@RequestMapping("/auth")
+@RequestMapping("/api/v1/auth")
 @Validated
 public class AuthController {
 

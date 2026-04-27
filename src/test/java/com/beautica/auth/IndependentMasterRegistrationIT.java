@@ -42,8 +42,8 @@ class IndependentMasterRegistrationIT {
     @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
-    private static final String REGISTER_URL = "/auth/register/independent-master";
-    private static final String CLIENT_REGISTER_URL = "/auth/register";
+    private static final String REGISTER_URL = "/api/v1/auth/register/independent-master";
+    private static final String CLIENT_REGISTER_URL = "/api/v1/auth/register";
     private static final String TEST_PASSWORD = "SecurePass1!";
     private static final String TEST_FIRST = "Oksana";
     private static final String TEST_LAST = "Kovalenko";

@@ -299,7 +299,7 @@ class UserControllerIT {
         var request = new RegisterRequest(email, password, firstName, lastName, phoneNumber);
 
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/auth/register", request, String.class);
+                "/api/v1/auth/register", request, String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
