@@ -51,7 +51,7 @@ public class SalonController {
     }
 
     @PatchMapping("/{salonId}")
-    @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId)")
     public ApiResponse<SalonResponse> updateSalon(
             @PathVariable UUID salonId,
             @Valid @RequestBody UpdateSalonRequest request,
@@ -62,14 +62,14 @@ public class SalonController {
     }
 
     @PostMapping("/{salonId}/invite")
-    @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<InviteResponse>> inviteMaster(
             @PathVariable UUID salonId,
             @Valid @RequestBody InviteRequest request,
             Authentication authentication
     ) {
         UUID ownerId = extractUserId(authentication);
-        InviteResponse response = salonService.inviteMaster(ownerId, salonId, request.email());
+        InviteResponse response = salonService.inviteMaster(ownerId, salonId, request.email(), request.effectiveRole());
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 

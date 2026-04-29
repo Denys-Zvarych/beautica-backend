@@ -344,7 +344,7 @@ class SalonMasterIntegrationTest {
         String targetEmail = uniqueEmail("target-master");
         // owner B sends an invite for salonA — caller's salonId (salonB) != requested salonId (salonA)
         var requestBody = objectMapper.writeValueAsString(
-                new com.beautica.auth.dto.InviteRequest(targetEmail, salonAId));
+                new com.beautica.auth.dto.InviteRequest(targetEmail, salonAId, null));
 
         log.debug("Act: POST /auth/invite with ownerB token targeting salonA={}", salonAId);
 
