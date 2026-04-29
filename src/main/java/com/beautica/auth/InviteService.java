@@ -6,10 +6,13 @@ import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.EmailService;
+import com.beautica.salon.entity.Salon;
+import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.User;
@@ -29,6 +32,7 @@ public class InviteService {
 
     private final InviteTokenRepository inviteTokenRepository;
     private final UserRepository userRepository;
+    private final SalonRepository salonRepository;
     private final PasswordEncoder passwordEncoder;
     private final EmailService emailService;
     private final TokenGenerator tokenGenerator;
@@ -40,6 +44,7 @@ public class InviteService {
     public InviteService(
             InviteTokenRepository inviteTokenRepository,
             UserRepository userRepository,
+            SalonRepository salonRepository,
             PasswordEncoder passwordEncoder,
             EmailService emailService,
             TokenGenerator tokenGenerator,
@@ -50,6 +55,7 @@ public class InviteService {
     ) {
         this.inviteTokenRepository = inviteTokenRepository;
         this.userRepository = userRepository;
+        this.salonRepository = salonRepository;
         this.passwordEncoder = passwordEncoder;
         this.emailService = emailService;
         this.tokenGenerator = tokenGenerator;
@@ -71,6 +77,22 @@ public class InviteService {
             throw new ForbiddenException("You do not own the specified salon");
         }
 
+        Role targetRole = request.effectiveRole();
+
+        if (targetRole != Role.SALON_MASTER && targetRole != Role.SALON_ADMIN) {
+            throw new ForbiddenException("Role " + targetRole + " cannot be assigned via invite");
+        }
+
+        if (targetRole == Role.SALON_ADMIN && caller.getRole() != Role.SALON_OWNER) {
+            throw new ForbiddenException("Only SALON_OWNER may invite a SALON_ADMIN");
+        }
+
+        if (targetRole == Role.SALON_ADMIN) {
+            if (userRepository.existsBySalonIdAndRole(request.salonId(), Role.SALON_ADMIN)) {
+                throw new ConflictException("This salon already has a SALON_ADMIN");
+            }
+        }
+
         inviteTokenRepository.findByEmailAndIsUsedFalse(request.email()).ifPresent(existing -> {
             if (existing.getExpiresAt().isAfter(Instant.now())) {
                 throw new BusinessException(HttpStatus.CONFLICT, "An active invite already exists for this email");
@@ -82,10 +104,13 @@ public class InviteService {
         String hashedToken = tokenGenerator.hash(rawToken);
         Instant expiresAt = Instant.now().plus(tokenExpirationHours, ChronoUnit.HOURS);
 
-        var inviteToken = new InviteToken(hashedToken, request.email(), request.salonId(), Role.SALON_MASTER, expiresAt);
+        var inviteToken = new InviteToken(hashedToken, request.email(), request.salonId(), targetRole, expiresAt);
         inviteTokenRepository.save(inviteToken);
 
-        emailService.sendInviteEmail(request.email(), buildInviteLink(rawToken));
+        String salonName = salonRepository.findById(request.salonId())
+                .map(Salon::getName)
+                .orElse("Beautica");
+        emailService.sendInviteEmail(request.email(), buildInviteLink(rawToken), salonName);
 
         return new InviteResponse(request.email(), expiresAt);
     }
@@ -125,7 +150,7 @@ public class InviteService {
         var user = new User(
                 token.getEmail(),
                 passwordEncoder.encode(request.password()),
-                Role.SALON_MASTER,
+                token.getRole(),
                 request.firstName(),
                 request.lastName(),
                 request.phoneNumber(),
@@ -133,7 +158,9 @@ public class InviteService {
         );
         var savedUser = userRepository.save(user);
 
-        masterService.createMasterFromInvite(savedUser.getId(), token.getSalonId());
+        if (token.getRole() == Role.SALON_MASTER) {
+            masterService.createMasterFromInvite(savedUser.getId(), token.getSalonId());
+        }
 
         return buildAuthResponse(savedUser);
     }

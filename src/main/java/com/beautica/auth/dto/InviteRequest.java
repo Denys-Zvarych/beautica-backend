@@ -1,5 +1,7 @@
 package com.beautica.auth.dto;
 
+import com.beautica.auth.Role;
+import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -14,5 +16,11 @@ public record InviteRequest(
         String email,
 
         @NotNull(message = "Salon ID is required")
-        UUID salonId
-) {}
+        UUID salonId,
+
+        @Nullable Role role
+) {
+    public Role effectiveRole() {
+        return role != null ? role : Role.SALON_MASTER;
+    }
+}

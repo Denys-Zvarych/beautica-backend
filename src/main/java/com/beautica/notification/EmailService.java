@@ -31,10 +31,11 @@ public class EmailService {
         this.fromEmail = fromEmail;
     }
 
-    public void sendInviteEmail(String toEmail, String inviteLink) {
+    public void sendInviteEmail(String toEmail, String inviteLink, String salonName) {
         var context = new Context();
         context.setVariable("inviteLink", inviteLink);
         context.setVariable("expiresHours", 72);
+        context.setVariable("salonName", salonName);
 
         String htmlContent = templateEngine.process("email/invite", context);
 

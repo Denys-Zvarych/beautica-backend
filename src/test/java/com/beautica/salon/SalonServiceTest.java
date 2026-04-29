@@ -7,6 +7,7 @@ import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
@@ -32,6 +33,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -51,6 +53,9 @@ class SalonServiceTest {
 
     @Mock
     private MasterRepository masterRepository;
+
+    @Mock
+    private AuthorizationService authorizationService;
 
     @InjectMocks
     private SalonService salonService;
@@ -118,7 +123,7 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("updateSalon — applies non-null patch fields and saves when owner matches")
+    @DisplayName("updateSalon — applies non-null patch fields and saves when actor has management access")
     void should_updateSalon_when_ownerPatchesSalon() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -129,6 +134,7 @@ class SalonServiceTest {
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
+        // authorizationService.enforceCanManageSalon is void — Mockito does nothing by default (access granted)
 
         SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
 
@@ -138,7 +144,7 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("updateSalon — throws ForbiddenException when a different owner attempts the update")
+    @DisplayName("updateSalon — throws ForbiddenException when actor lacks management access")
     void should_throwForbidden_when_differentOwnerUpdatesSalon() {
         UUID realOwnerId = UUID.randomUUID();
         UUID attackerId = UUID.randomUUID();
@@ -150,6 +156,8 @@ class SalonServiceTest {
         var request = new UpdateSalonRequest("Hijacked", null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authorizationService).enforceCanManageSalon(attackerId, salon);
 
         assertThatThrownBy(() -> salonService.updateSalon(attackerId, salonId, request))
                 .isInstanceOf(ForbiddenException.class);
@@ -165,6 +173,7 @@ class SalonServiceTest {
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
 
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -182,8 +191,10 @@ class SalonServiceTest {
         UUID salonId = UUID.randomUUID();
 
         User realOwner = buildUser(realOwnerId, "real@beautica.com", Role.SALON_OWNER);
+        User attacker = buildUser(attackerId, "attacker@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, realOwner, "Salon");
 
+        when(userRepository.findById(attackerId)).thenReturn(Optional.of(attacker));
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))

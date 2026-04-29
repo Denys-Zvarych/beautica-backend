@@ -206,7 +206,7 @@ class SalonControllerTest {
                 "owner-invite-" + System.nanoTime() + "@beautica.test");
         UUID salonId = createSalon(token, "Invite Salon");
 
-        doNothing().when(emailService).sendInviteEmail(anyString(), anyString());
+        doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
         String inviteEmail = "master-" + System.nanoTime() + "@beautica.test";
         String body = "{\"email\":\"" + inviteEmail + "\"}";
 
@@ -239,6 +239,82 @@ class SalonControllerTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
+    @Test
+    @DisplayName("PATCH /api/v1/salons/{id} — 200 when SALON_ADMIN patches the salon they belong to")
+    void should_return200_when_salonAdminPatchesSalon() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "owner-admin-patch-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "Admin Patch Salon");
+
+        String adminToken = createSalonAdminAndGetToken(
+                "admin-patch-" + System.nanoTime() + "@beautica.test", salonId);
+
+        var request = new UpdateSalonRequest("Updated By Admin", null, null, null, null, null, null);
+
+        log.debug("Act: PATCH {}/{} as SALON_ADMIN", SALONS_URL, salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "/" + salonId, HttpMethod.PATCH,
+                new HttpEntity<>(request, bearerHeaders(adminToken)),
+                String.class);
+
+        log.trace("Assert: status={}", response.getStatusCode());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<SalonResponse>>() {});
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().name()).isEqualTo("Updated By Admin");
+    }
+
+    @Test
+    @DisplayName("DELETE /api/v1/salons/{id} — 403 when SALON_ADMIN attempts to delete the salon")
+    void should_return403_when_salonAdminDeletesSalon() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "owner-admin-del-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "Admin Delete Salon");
+
+        String adminToken = createSalonAdminAndGetToken(
+                "admin-del-" + System.nanoTime() + "@beautica.test", salonId);
+
+        log.debug("Act: DELETE {}/{} as SALON_ADMIN", SALONS_URL, salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "/" + salonId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(adminToken)),
+                String.class);
+
+        log.trace("Assert: status={}", response.getStatusCode());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons/{id}/invite — 403 when SALON_ADMIN invites into a different salon")
+    void should_return403_when_salonAdminFromDifferentSalonInvites() throws Exception {
+        String ownerAToken = createSalonOwnerAndGetToken(
+                "owner-a-" + System.nanoTime() + "@beautica.test");
+        UUID salonAId = createSalon(ownerAToken, "Salon A");
+
+        String ownerBToken = createSalonOwnerAndGetToken(
+                "owner-b-" + System.nanoTime() + "@beautica.test");
+        UUID salonBId = createSalon(ownerBToken, "Salon B");
+
+        // SALON_ADMIN whose salonId is salon A
+        String adminToken = createSalonAdminAndGetToken(
+                "admin-cross-" + System.nanoTime() + "@beautica.test", salonAId);
+
+        doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
+        String inviteEmail = "victim-" + System.nanoTime() + "@beautica.test";
+        String body = "{\"email\":\"" + inviteEmail + "\"}";
+
+        log.debug("Act: POST {}/{}/invite as SALON_ADMIN from salon A targeting salon B", SALONS_URL, salonBId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "/" + salonBId + "/invite", HttpMethod.POST,
+                new HttpEntity<>(body, bearerHeaders(adminToken)),
+                String.class);
+
+        log.trace("Assert: status={}", response.getStatusCode());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
     private String createSalonOwnerAndGetToken(String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
@@ -257,6 +333,19 @@ class SalonControllerTest {
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    private String createSalonAdminAndGetToken(String email, UUID salonId) throws Exception {
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active) VALUES (?, ?, ?, 'SALON_ADMIN', ?, true)",
+                UUID.randomUUID(), email, hash, salonId);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
     }

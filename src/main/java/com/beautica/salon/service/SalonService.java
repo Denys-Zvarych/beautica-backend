@@ -7,6 +7,7 @@ import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -32,6 +33,7 @@ public class SalonService {
     private final UserRepository userRepository;
     private final InviteService inviteService;
     private final MasterRepository masterRepository;
+    private final AuthorizationService authorizationService;
 
     @Transactional
     public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
@@ -65,13 +67,11 @@ public class SalonService {
     }
 
     @Transactional
-    public SalonResponse updateSalon(UUID ownerId, UUID salonId, UpdateSalonRequest request) {
+    public SalonResponse updateSalon(UUID actorId, UUID salonId, UpdateSalonRequest request) {
         var salon = salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
 
-        if (!salon.getOwner().getId().equals(ownerId)) {
-            throw new ForbiddenException("Access denied");
-        }
+        authorizationService.enforceCanManageSalon(actorId, salon);
 
         if (request.name() != null) {
             salon.setName(request.name());
@@ -107,16 +107,14 @@ public class SalonService {
     }
 
     @Transactional
-    public InviteResponse inviteMaster(UUID ownerId, UUID salonId, String email) {
+    public InviteResponse inviteMaster(UUID actorId, UUID salonId, String email, Role role) {
         var salon = salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
 
-        if (!salon.getOwner().getId().equals(ownerId)) {
-            throw new ForbiddenException("Access denied");
-        }
+        authorizationService.enforceCanManageSalon(actorId, salon);
 
-        var inviteRequest = new InviteRequest(email, salonId);
-        return inviteService.sendInvite(inviteRequest, ownerId);
+        var inviteRequest = new InviteRequest(email, salonId, role);
+        return inviteService.sendInvite(inviteRequest, actorId);
     }
 
     @Transactional(readOnly = true)
@@ -127,6 +125,12 @@ public class SalonService {
 
     @Transactional
     public void deactivateSalon(UUID ownerId, UUID salonId) {
+        var caller = userRepository.findById(ownerId)
+                .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
+        if (caller.getRole() == Role.SALON_ADMIN) {
+            throw new ForbiddenException("SALON_ADMIN may not delete a salon");
+        }
+
         var salon = salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
 

@@ -132,10 +132,10 @@ class InviteControllerIT {
         String ownerToken = registerAndGetToken(ownerEmail, Role.CLIENT);
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, ownerToken, salonId);
 
-        doNothing().when(emailService).sendInviteEmail(anyString(), anyString());
+        doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
-        var request = new InviteRequest(masterEmail, salonId);
+        var request = new InviteRequest(masterEmail, salonId, null);
 
         log.debug("Act: POST /auth/invite as SALON_OWNER");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -165,7 +165,7 @@ class InviteControllerIT {
         String clientToken = registerAndGetToken(clientEmail, Role.CLIENT);
 
         HttpHeaders headers = bearerHeaders(clientToken);
-        var request = new InviteRequest(uniqueEmail("target"), UUID.randomUUID());
+        var request = new InviteRequest(uniqueEmail("target"), UUID.randomUUID(), null);
 
         log.debug("Act: POST /auth/invite as CLIENT");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -184,7 +184,7 @@ class InviteControllerIT {
     void should_return401_when_unauthenticatedSendsInvite() {
         log.debug("Arrange: no Authorization header");
 
-        var request = new InviteRequest(uniqueEmail("unauth"), UUID.randomUUID());
+        var request = new InviteRequest(uniqueEmail("unauth"), UUID.randomUUID(), null);
 
         log.debug("Act: POST /auth/invite without credentials");
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -208,10 +208,10 @@ class InviteControllerIT {
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, ownerToken, salonId);
         registerAndGetToken(alreadyRegistered, Role.CLIENT);
 
-        doNothing().when(emailService).sendInviteEmail(anyString(), anyString());
+        doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
-        var request = new InviteRequest(alreadyRegistered, salonId);
+        var request = new InviteRequest(alreadyRegistered, salonId, null);
 
         log.debug("Act: POST /auth/invite targeting registered email");
         ResponseEntity<String> response = restTemplate.exchange(
