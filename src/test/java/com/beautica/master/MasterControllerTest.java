@@ -102,12 +102,13 @@ class MasterControllerTest {
         UUID salonId = createSalon(ownerToken, "Test Salon");
         UUID masterId = createIndependentMaster("indep-" + System.nanoTime() + "@beautica.test");
 
-        log.debug("Act: GET {}/{} without credentials", MASTERS_URL, masterId);
+        log.debug("Act: GET {}/{} without credentials — public endpoint", MASTERS_URL, masterId);
         ResponseEntity<String> response = restTemplate.getForEntity(
                 MASTERS_URL + "/" + masterId, String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 for public GET master detail, masterId=%s", masterId)
+                .isEqualTo(HttpStatus.OK);
     }
 
     // ── PATCH /{masterId}/working-hours — protected ────────────────────────────
@@ -125,14 +126,15 @@ class MasterControllerTest {
                 new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true));
         String body = objectMapper.writeValueAsString(requests);
 
-        log.debug("Act: PATCH {}/{}/working-hours as SALON_MASTER", MASTERS_URL, masterId);
+        log.debug("Act: PATCH {}/{}/working-hours as SALON_MASTER — must be denied", MASTERS_URL, masterId);
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "/" + masterId + "/working-hours", HttpMethod.PATCH,
                 new HttpEntity<>(body, bearerHeaders(salonMasterToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when SALON_MASTER attempts to update working hours")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
@@ -150,8 +152,9 @@ class MasterControllerTest {
                 new HttpEntity<>(body, jsonHeaders()),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when no Authorization header is sent to PATCH working hours")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     // ── DELETE /{masterId} — deactivate ───────────────────────────────────────
@@ -171,8 +174,9 @@ class MasterControllerTest {
                 new HttpEntity<>(bearerHeaders(ownerToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(response.getStatusCode())
+                .as("status must be 204 when salon owner deactivates their master, masterId=%s", masterId)
+                .isEqualTo(HttpStatus.NO_CONTENT);
 
         Boolean isActive = jdbcTemplate.queryForObject(
                 "SELECT is_active FROM masters WHERE id = ?", Boolean.class, masterId);

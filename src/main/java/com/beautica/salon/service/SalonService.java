@@ -4,7 +4,6 @@ import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
-import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
@@ -19,10 +18,10 @@ import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
 import java.util.UUID;
 
 @Service
@@ -44,10 +43,6 @@ public class SalonService {
             throw new ForbiddenException("Only SALON_OWNER may create a salon");
         }
 
-        if (salonRepository.existsByOwnerId(ownerId)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Salon already exists for this owner");
-        }
-
         var salon = Salon.builder()
                 .owner(owner)
                 .name(request.name())
@@ -60,10 +55,7 @@ public class SalonService {
                 .isActive(true)
                 .build();
 
-        var saved = salonRepository.save(salon);
-        owner.setSalonId(saved.getId());
-        userRepository.save(owner);
-        return SalonResponse.from(saved);
+        return SalonResponse.from(salonRepository.save(salon));
     }
 
     @Transactional
@@ -123,12 +115,20 @@ public class SalonService {
                 .map(MasterSummaryResponse::from);
     }
 
+    @Transactional(readOnly = true)
+    public List<SalonResponse> getOwnerSalons(UUID ownerId) {
+        return salonRepository.findAllByOwnerIdFetchOwner(ownerId)
+                .stream()
+                .map(SalonResponse::from)
+                .toList();
+    }
+
     @Transactional
     public void deactivateSalon(UUID ownerId, UUID salonId) {
         var caller = userRepository.findById(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
-        if (caller.getRole() == Role.SALON_ADMIN) {
-            throw new ForbiddenException("SALON_ADMIN may not delete a salon");
+        if (caller.getRole() != Role.SALON_OWNER) {
+            throw new ForbiddenException("Only SALON_OWNER may deactivate a salon");
         }
 
         var salon = salonRepository.findById(salonId)

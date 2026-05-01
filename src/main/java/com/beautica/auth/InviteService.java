@@ -51,7 +51,7 @@ public class InviteService {
             MasterService masterService,
             AuthResponseBuilder authResponseBuilder,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
-            @Value("${app.invite.token-expiration-hours:72}") long tokenExpirationHours
+            @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours
     ) {
         this.inviteTokenRepository = inviteTokenRepository;
         this.userRepository = userRepository;
@@ -73,9 +73,6 @@ public class InviteService {
 
         User caller = userRepository.findById(callerId)
                 .orElseThrow(() -> new NotFoundException("Caller not found"));
-        if (!request.salonId().equals(caller.getSalonId())) {
-            throw new ForbiddenException("You do not own the specified salon");
-        }
 
         Role targetRole = request.effectiveRole();
 
@@ -86,6 +83,9 @@ public class InviteService {
         if (targetRole == Role.SALON_ADMIN && caller.getRole() != Role.SALON_OWNER) {
             throw new ForbiddenException("Only SALON_OWNER may invite a SALON_ADMIN");
         }
+
+        Salon salon = salonRepository.findByIdAndOwnerId(request.salonId(), callerId)
+                .orElseThrow(() -> new ForbiddenException("You do not own the specified salon"));
 
         if (targetRole == Role.SALON_ADMIN) {
             if (userRepository.existsBySalonIdAndRole(request.salonId(), Role.SALON_ADMIN)) {
@@ -107,10 +107,7 @@ public class InviteService {
         var inviteToken = new InviteToken(hashedToken, request.email(), request.salonId(), targetRole, expiresAt);
         inviteTokenRepository.save(inviteToken);
 
-        String salonName = salonRepository.findById(request.salonId())
-                .map(Salon::getName)
-                .orElse("Beautica");
-        emailService.sendInviteEmail(request.email(), buildInviteLink(rawToken), salonName);
+        emailService.sendInviteEmail(request.email(), buildInviteLink(rawToken), salon.getName());
 
         return new InviteResponse(request.email(), expiresAt);
     }

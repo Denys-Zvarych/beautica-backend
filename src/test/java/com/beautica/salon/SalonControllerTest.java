@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterRequest;
@@ -96,14 +97,15 @@ class SalonControllerTest {
 
         var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null);
 
-        log.debug("Act: POST {} as SALON_OWNER", SALONS_URL);
+        log.debug("Act: POST {} as SALON_OWNER with name='My Salon'", SALONS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(token)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(response.getStatusCode())
+                .as("status must be 201 when SALON_OWNER creates a valid salon")
+                .isEqualTo(HttpStatus.CREATED);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<SalonResponse>>() {});
@@ -119,14 +121,15 @@ class SalonControllerTest {
 
         var request = new CreateSalonRequest("Forbidden Salon", null, null, null, null, null, null);
 
-        log.debug("Act: POST {} as CLIENT", SALONS_URL);
+        log.debug("Act: POST {} as CLIENT — must be rejected with 403", SALONS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(token)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when CLIENT attempts to create a salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
@@ -134,14 +137,15 @@ class SalonControllerTest {
     void should_return401_when_noTokenOnCreateSalon() {
         var request = new CreateSalonRequest("Anon Salon", null, null, null, null, null, null);
 
-        log.debug("Act: POST {} without credentials", SALONS_URL);
+        log.debug("Act: POST {} without credentials — unauthenticated request must be rejected", SALONS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(request),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when no Authorization header is present")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
@@ -151,12 +155,13 @@ class SalonControllerTest {
                 "owner-get-" + System.nanoTime() + "@beautica.test");
         UUID salonId = createSalon(token, "Public Salon");
 
-        log.debug("Act: GET {}/{} without credentials", SALONS_URL, salonId);
+        log.debug("Act: GET {}/{} without credentials — public endpoint", SALONS_URL, salonId);
         ResponseEntity<String> response = restTemplate.getForEntity(
                 SALONS_URL + "/" + salonId, String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 for public GET salon detail, salonId=%s", salonId)
+                .isEqualTo(HttpStatus.OK);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<SalonResponse>>() {});
@@ -169,12 +174,13 @@ class SalonControllerTest {
     void should_return404_when_salonNotFound() {
         UUID unknownId = UUID.randomUUID();
 
-        log.debug("Act: GET {}/{} for non-existent salon", SALONS_URL, unknownId);
+        log.debug("Act: GET {}/{} for a salon that does not exist", SALONS_URL, unknownId);
         ResponseEntity<String> response = restTemplate.getForEntity(
                 SALONS_URL + "/" + unknownId, String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getStatusCode())
+                .as("status must be 404 when salon does not exist, id=%s", unknownId)
+                .isEqualTo(HttpStatus.NOT_FOUND);
     }
 
     @Test
@@ -189,14 +195,15 @@ class SalonControllerTest {
 
         var request = new UpdateSalonRequest("Hijacked", null, null, null, null, null, null);
 
-        log.debug("Act: PATCH {}/{} as a different SALON_OWNER", SALONS_URL, salonId);
+        log.debug("Act: PATCH {}/{} with attacker's token — different owner must be denied", SALONS_URL, salonId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonId, HttpMethod.PATCH,
                 new HttpEntity<>(request, bearerHeaders(attackerToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when a different SALON_OWNER tries to patch the salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
@@ -210,14 +217,15 @@ class SalonControllerTest {
         String inviteEmail = "master-" + System.nanoTime() + "@beautica.test";
         String body = "{\"email\":\"" + inviteEmail + "\"}";
 
-        log.debug("Act: POST {}/{}/invite as SALON_OWNER", SALONS_URL, salonId);
+        log.debug("Act: POST {}/{}/invite as SALON_OWNER with valid master email", SALONS_URL, salonId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonId + "/invite", HttpMethod.POST,
                 new HttpEntity<>(body, bearerHeaders(token)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(response.getStatusCode())
+                .as("status must be 201 when SALON_OWNER sends a valid invite")
+                .isEqualTo(HttpStatus.CREATED);
     }
 
     @Test
@@ -229,14 +237,15 @@ class SalonControllerTest {
 
         String body = "{\"email\":\"not-an-email\"}";
 
-        log.debug("Act: POST {}/{}/invite with invalid email", SALONS_URL, salonId);
+        log.debug("Act: POST {}/{}/invite with malformed email='not-an-email'", SALONS_URL, salonId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonId + "/invite", HttpMethod.POST,
                 new HttpEntity<>(body, bearerHeaders(token)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when invite email is not a valid email address")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
@@ -251,14 +260,15 @@ class SalonControllerTest {
 
         var request = new UpdateSalonRequest("Updated By Admin", null, null, null, null, null, null);
 
-        log.debug("Act: PATCH {}/{} as SALON_ADMIN", SALONS_URL, salonId);
+        log.debug("Act: PATCH {}/{} as SALON_ADMIN belonging to that salon", SALONS_URL, salonId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonId, HttpMethod.PATCH,
                 new HttpEntity<>(request, bearerHeaders(adminToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 when SALON_ADMIN patches their own salon, salonId=%s", salonId)
+                .isEqualTo(HttpStatus.OK);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<SalonResponse>>() {});
@@ -276,14 +286,15 @@ class SalonControllerTest {
         String adminToken = createSalonAdminAndGetToken(
                 "admin-del-" + System.nanoTime() + "@beautica.test", salonId);
 
-        log.debug("Act: DELETE {}/{} as SALON_ADMIN", SALONS_URL, salonId);
+        log.debug("Act: DELETE {}/{} as SALON_ADMIN — admin must not be allowed to delete", SALONS_URL, salonId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonId, HttpMethod.DELETE,
                 new HttpEntity<>(bearerHeaders(adminToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when SALON_ADMIN attempts to delete the salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
@@ -305,14 +316,15 @@ class SalonControllerTest {
         String inviteEmail = "victim-" + System.nanoTime() + "@beautica.test";
         String body = "{\"email\":\"" + inviteEmail + "\"}";
 
-        log.debug("Act: POST {}/{}/invite as SALON_ADMIN from salon A targeting salon B", SALONS_URL, salonBId);
+        log.debug("Act: POST {}/{}/invite as SALON_ADMIN of salon A targeting salon B — cross-salon invite must be denied", SALONS_URL, salonBId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonBId + "/invite", HttpMethod.POST,
                 new HttpEntity<>(body, bearerHeaders(adminToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when SALON_ADMIN attempts to invite into a different salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     private String createSalonOwnerAndGetToken(String email) throws Exception {
@@ -329,7 +341,7 @@ class SalonControllerTest {
     }
 
     private String registerClientAndGetToken(String email) throws Exception {
-        var request = new RegisterRequest(email, TEST_PASSWORD, null, null, null);
+        var request = new RegisterRequest(email, TEST_PASSWORD, SelfRegistrationRole.CLIENT, null, null, null, null);
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);

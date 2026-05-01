@@ -53,10 +53,9 @@ class EmailServiceTest {
         when(mailSender.createMimeMessage()).thenReturn(mimeMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
 
-        log.debug("Act: calling emailService.sendInviteEmail to={}", toEmail);
+        log.debug("Act: sendInviteEmail to={} with invite link and salon name", toEmail);
         emailService.sendInviteEmail(toEmail, inviteLink, "Test Salon");
 
-        log.trace("Assert: mailSender.send was invoked once");
         verify(mailSender).send(mimeMessage);
     }
 
@@ -72,7 +71,7 @@ class EmailServiceTest {
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
         doThrow(new MailSendException("SMTP connection failed")).when(mailSender).send(any(MimeMessage.class));
 
-        log.debug("Act: calling emailService.sendInviteEmail expecting BusinessException");
+        log.debug("Act: sendInviteEmail to={} when mailSender throws MailSendException — must be translated to BusinessException", toEmail);
         assertThatThrownBy(() -> emailService.sendInviteEmail(toEmail, inviteLink, "Test Salon"))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Failed to send invite email");

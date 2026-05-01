@@ -32,6 +32,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
+@DisplayName("AuthorizationService — unit")
 class AuthorizationServiceTest {
 
     @Mock
@@ -61,7 +62,7 @@ class AuthorizationServiceTest {
     // ── canManageSalon ─────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnTrue_when_actorIsTheSalonOwner")
+    @DisplayName("canManageSalon returns true when actor is the salon owner")
     void should_returnTrue_when_actorIsTheSalonOwner() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -80,7 +81,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnFalse_when_actorIsNotTheSalonOwner")
+    @DisplayName("canManageSalon returns false when actor is not the salon owner")
     void should_returnFalse_when_actorIsNotTheSalonOwner() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -99,7 +100,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnTrue_when_actorIsSalonAdminOfSalon")
+    @DisplayName("canManageSalon returns true when actor is a SALON_ADMIN belonging to the salon")
     void should_returnTrue_when_actorIsSalonAdminOfSalon() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -118,7 +119,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnFalse_when_actorIsSalonAdminOfDifferentSalon")
+    @DisplayName("canManageSalon returns false when actor is a SALON_ADMIN of a different salon")
     void should_returnFalse_when_actorIsSalonAdminOfDifferentSalon() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -140,7 +141,7 @@ class AuthorizationServiceTest {
     // ── canManageMasterSchedule ────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnTrue_when_independentMasterManagesOwnSchedule")
+    @DisplayName("canManageMasterSchedule returns true when independent master manages their own schedule")
     void should_returnTrue_when_independentMasterManagesOwnSchedule() {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
@@ -162,7 +163,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnTrue_when_salonOwnerManagesSalonMasterSchedule")
+    @DisplayName("canManageMasterSchedule returns true when salon owner manages a salon master's schedule")
     void should_returnTrue_when_salonOwnerManagesSalonMasterSchedule() {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
@@ -190,7 +191,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnFalse_when_salonMasterTriesToManageSchedule")
+    @DisplayName("canManageMasterSchedule returns false when actor has SALON_MASTER role")
     void should_returnFalse_when_salonMasterTriesToManageSchedule() {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
@@ -204,7 +205,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnFalse_when_salonMasterHasNullSalon")
+    @DisplayName("canManageMasterSchedule returns false when salon master record has a null salon reference")
     void should_returnFalse_when_salonMasterHasNullSalon() {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
@@ -225,7 +226,7 @@ class AuthorizationServiceTest {
     // ── enforceCanManageSalon ──────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_throwForbidden_when_enforceCanManageSalonCalledWithWrongActor")
+    @DisplayName("enforceCanManageSalon throws ForbiddenException when actor does not own the salon")
     void should_throwForbidden_when_enforceCanManageSalonCalledWithWrongActor() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -244,7 +245,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_notThrow_when_enforceCanManageSalonCalledWithCorrectOwner")
+    @DisplayName("enforceCanManageSalon does not throw when actor is the correct salon owner")
     void should_notThrow_when_enforceCanManageSalonCalledWithCorrectOwner() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -264,7 +265,7 @@ class AuthorizationServiceTest {
     // ── enforceCanManageMaster ─────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_throwForbidden_when_enforceCanManageMasterCalledWithWrongActorOnIndependentMaster")
+    @DisplayName("enforceCanManageMaster throws ForbiddenException when actor does not own the independent master record")
     void should_throwForbidden_when_enforceCanManageMasterCalledWithWrongActorOnIndependentMaster() {
         UUID actorId = UUID.randomUUID();
         UUID masterUserId = UUID.randomUUID();
@@ -281,7 +282,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_enforceCanManageMasterCalledWithWrongActorOnSalonMaster")
+    @DisplayName("enforceCanManageMaster throws ForbiddenException when actor does not own the salon that employs the master")
     void should_throwForbidden_when_enforceCanManageMasterCalledWithWrongActorOnSalonMaster() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -306,7 +307,7 @@ class AuthorizationServiceTest {
     // ── null-guard regression tests ────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnFalse_when_salonIdIsNull")
+    @DisplayName("hasManagementAccess returns false when salonId is null")
     void should_returnFalse_when_salonIdIsNull() {
         UUID actorId = UUID.randomUUID();
 
@@ -317,7 +318,7 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnFalse_when_salonAdminHasNullSalonId")
+    @DisplayName("hasManagementAccess returns false when SALON_ADMIN has a null salonId on their user record")
     void should_returnFalse_when_salonAdminHasNullSalonId() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();

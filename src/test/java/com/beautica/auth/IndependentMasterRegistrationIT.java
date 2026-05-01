@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
@@ -96,11 +97,12 @@ class IndependentMasterRegistrationIT {
         var request = new RegisterIndependentMasterRequest(
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
 
-        log.debug("Act: POST {} with email={}", REGISTER_URL, registeredEmail);
+        log.debug("Act: POST {} with valid INDEPENDENT_MASTER payload, email={}", REGISTER_URL, registeredEmail);
         var response = postIndependentMaster(request);
 
-        log.trace("Assert: status 201, role INDEPENDENT_MASTER, tokens present");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(response.getStatusCode())
+                .as("status for valid independent master registration, email=%s", registeredEmail)
+                .isEqualTo(HttpStatus.CREATED);
 
         var body = response.getBody();
         assertThat(body).isNotNull();
@@ -123,10 +125,9 @@ class IndependentMasterRegistrationIT {
         var request = new RegisterIndependentMasterRequest(
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
 
-        log.debug("Act: POST {} with email={}", REGISTER_URL, registeredEmail);
+        log.debug("Act: POST {} to persist user row, email={}", REGISTER_URL, registeredEmail);
         postIndependentMaster(request);
 
-        log.trace("Assert: DB row has role INDEPENDENT_MASTER");
         var saved = userRepository.findByEmail(registeredEmail);
         assertThat(saved).isPresent();
 
@@ -142,18 +143,19 @@ class IndependentMasterRegistrationIT {
     @DisplayName("returns 409 when email is already registered as a client")
     void should_return409_when_emailAlreadyRegisteredAsClient() {
         var clientRequest = new RegisterRequest(
-                registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
+                registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, TEST_PHONE, null);
 
         log.debug("Arrange: register email={} as CLIENT first", registeredEmail);
         postClient(clientRequest);
 
-        log.debug("Act: attempt to register same email as INDEPENDENT_MASTER");
+        log.debug("Act: register same email={} as INDEPENDENT_MASTER when already a CLIENT", registeredEmail);
         var masterRequest = new RegisterIndependentMasterRequest(
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
         var response = postIndependentMaster(masterRequest);
 
-        log.trace("Assert: second attempt rejected with 409");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getStatusCode())
+                .as("status must be 409 when email is already registered as CLIENT")
+                .isEqualTo(HttpStatus.CONFLICT);
 
         var body = response.getBody();
         assertThat(body).isNotNull();

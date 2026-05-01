@@ -2,6 +2,7 @@ package com.beautica.auth;
 
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
@@ -83,9 +84,11 @@ class AuthIntegrationTest {
         validRequest = new RegisterRequest(
                 registeredEmail,
                 TEST_PASSWORD,
+                SelfRegistrationRole.CLIENT,
                 TEST_FIRST,
                 TEST_LAST,
-                TEST_PHONE
+                TEST_PHONE,
+                null
         );
         log.debug("setUp: email={}", registeredEmail);
     }
@@ -123,12 +126,13 @@ class AuthIntegrationTest {
         @Test
         @DisplayName("returns 201 with tokens and correct user metadata")
         void should_return201WithTokensAndUserMetadata_when_requestIsValid() {
-            log.debug("Act: POST {} with email={}", REGISTER_URL, registeredEmail);
+            log.debug("Act: POST {} to register CLIENT with all required and optional fields, email={}", REGISTER_URL, registeredEmail);
 
             var response = post(validRequest);
 
-            log.trace("Assert: status, body structure, field values");
-            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+            assertThat(response.getStatusCode())
+                    .as("status for valid CLIENT registration with all fields")
+                    .isEqualTo(HttpStatus.CREATED);
 
             var body = response.getBody();
             assertThat(body).isNotNull();
@@ -148,11 +152,10 @@ class AuthIntegrationTest {
         @Test
         @DisplayName("persists the user row to the database")
         void should_persistUserInDatabase_when_registrationSucceeds() {
-            log.debug("Act: POST {} with email={}", REGISTER_URL, registeredEmail);
+            log.debug("Act: POST {} to persist CLIENT user row, email={}", REGISTER_URL, registeredEmail);
 
             post(validRequest);
 
-            log.trace("Assert: user row exists in DB with correct fields");
             var saved = userRepository.findByEmail(registeredEmail);
             assertThat(saved).isPresent();
 
@@ -169,13 +172,13 @@ class AuthIntegrationTest {
         @Test
         @DisplayName("stores password as a bcrypt hash, never plaintext")
         void should_hashPassword_when_userIsRegistered() {
-            log.debug("Act: POST {} — verifying password is hashed", REGISTER_URL);
+            log.debug("Act: POST {} — verifying password is stored as bcrypt hash, not plaintext", REGISTER_URL);
 
             post(validRequest);
 
             var user = userRepository.findByEmail(registeredEmail).orElseThrow();
-            log.trace("Assert: stored hash is not plaintext password");
             assertThat(user.getPasswordHash())
+                    .as("stored password hash must not equal plaintext and must be bcrypt")
                     .isNotEqualTo(TEST_PASSWORD)
                     .startsWith("$2a$");
         }
@@ -183,12 +186,11 @@ class AuthIntegrationTest {
         @Test
         @DisplayName("persists a refresh token row linked to the new user")
         void should_persistRefreshToken_when_registrationSucceeds() {
-            log.debug("Act: POST {} — verifying refresh token is stored", REGISTER_URL);
+            log.debug("Act: POST {} — verifying refresh token row is persisted for the new user", REGISTER_URL);
 
             var response = post(validRequest);
 
             var userId = response.getBody().data().userId();
-            log.trace("Assert: refresh_tokens row exists for userId={}", userId);
             // There is no findByUserId on RefreshTokenRepository, so we verify
             // through the count of tokens tied to this user by deleting them and
             // checking that at least one deletion took place. We use deleteByUserId
@@ -217,11 +219,12 @@ class AuthIntegrationTest {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
-            log.debug("Act: attempt to register the same email again");
+            log.debug("Act: register email={} a second time to trigger duplicate conflict", registeredEmail);
             var secondResponse = post(validRequest);
 
-            log.trace("Assert: second attempt is rejected with 409");
-            assertThat(secondResponse.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+            assertThat(secondResponse.getStatusCode())
+                    .as("status for second registration attempt with same email=%s", registeredEmail)
+                    .isEqualTo(HttpStatus.CONFLICT);
 
             var body = secondResponse.getBody();
             assertThat(body).isNotNull();
@@ -236,13 +239,14 @@ class AuthIntegrationTest {
             post(validRequest);
 
             long countAfterFirst = userRepository.count();
-            log.trace("Arrange: user count after first registration = {}", countAfterFirst);
+            log.debug("Arrange: user count after first registration = {}", countAfterFirst);
 
-            log.debug("Act: attempt to register the same email a second time");
+            log.debug("Act: attempt to register email={} a second time and verify no duplicate row is created", registeredEmail);
             post(validRequest);
 
-            log.trace("Assert: user count is unchanged");
-            assertThat(userRepository.count()).isEqualTo(countAfterFirst);
+            assertThat(userRepository.count())
+                    .as("user count must not increase after rejected duplicate registration")
+                    .isEqualTo(countAfterFirst);
         }
 
         @Test
@@ -251,13 +255,14 @@ class AuthIntegrationTest {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
-            log.debug("Act: POST with duplicate email");
+            log.debug("Act: POST with already-registered email={} to verify no tokens are returned", registeredEmail);
             var response = post(validRequest);
 
-            log.trace("Assert: data payload is null on rejected registration");
             var body = response.getBody();
             assertThat(body).isNotNull();
-            assertThat(body.data()).isNull();
+            assertThat(body.data())
+                    .as("data payload must be null when duplicate registration is rejected")
+                    .isNull();
         }
     }
 
@@ -272,7 +277,7 @@ class AuthIntegrationTest {
             // Email is blank — @NotBlank fires before the service is ever called,
             // so no user is created and @AfterEach will find nothing to clean up.
             registeredEmail = null;
-            var request = new RegisterRequest("", TEST_PASSWORD, TEST_FIRST, TEST_LAST, null);
+            var request = new RegisterRequest("", TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
 
             log.debug("Act: POST {} with blank email", REGISTER_URL);
             var response = post(request);
@@ -285,7 +290,7 @@ class AuthIntegrationTest {
         @DisplayName("returns 400 when email format is invalid")
         void should_return400_when_emailFormatIsInvalid() {
             registeredEmail = null;
-            var request = new RegisterRequest("not-an-email", TEST_PASSWORD, TEST_FIRST, TEST_LAST, null);
+            var request = new RegisterRequest("not-an-email", TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
 
             log.debug("Act: POST {} with malformed email", REGISTER_URL);
             var response = post(request);
@@ -299,7 +304,7 @@ class AuthIntegrationTest {
         void should_return400_when_passwordTooShort() {
             registeredEmail = null;
             var request = new RegisterRequest(
-                    "valid@beautica.test", "short", TEST_FIRST, TEST_LAST, null);
+                    "valid@beautica.test", "short", SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
 
             log.debug("Act: POST {} with password shorter than 8 chars", REGISTER_URL);
             var response = post(request);
@@ -313,7 +318,7 @@ class AuthIntegrationTest {
         void should_return400_when_passwordIsBlank() {
             registeredEmail = null;
             var request = new RegisterRequest(
-                    "valid2@beautica.test", "", TEST_FIRST, TEST_LAST, null);
+                    "valid2@beautica.test", "", SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
 
             log.debug("Act: POST {} with blank password", REGISTER_URL);
             var response = post(request);
@@ -326,7 +331,7 @@ class AuthIntegrationTest {
         @DisplayName("returns 201 when optional fields firstName, lastName, phoneNumber are absent")
         void should_return201_when_optionalFieldsAreNull() {
             // firstName, lastName, phoneNumber are optional in RegisterRequest — null is valid
-            var minimalRequest = new RegisterRequest(registeredEmail, TEST_PASSWORD, null, null, null);
+            var minimalRequest = new RegisterRequest(registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT, null, null, null, null);
 
             log.debug("Act: POST {} with only required fields", REGISTER_URL);
             var response = post(minimalRequest);
@@ -341,7 +346,7 @@ class AuthIntegrationTest {
             registeredEmail = null;
             var oversizedFirstName = "A".repeat(101);
             var request = new RegisterRequest(
-                    "oversize@beautica.test", TEST_PASSWORD, oversizedFirstName, TEST_LAST, null);
+                    "oversize@beautica.test", TEST_PASSWORD, SelfRegistrationRole.CLIENT, oversizedFirstName, TEST_LAST, null, null);
 
             log.debug("Act: POST {} with firstName of {} chars", REGISTER_URL, oversizedFirstName.length());
             var response = post(request);

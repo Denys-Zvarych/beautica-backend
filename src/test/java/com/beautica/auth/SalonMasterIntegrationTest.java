@@ -129,7 +129,6 @@ class SalonMasterIntegrationTest {
         createdEmails.add(ownerEmail);
         UUID salonId = UUID.randomUUID();
         createSalonOwnerWithSalon(ownerEmail, salonId);
-        String ownerToken = loginAndGetToken(ownerEmail);
 
         String masterEmail = uniqueEmail("newmaster");
         createdEmails.add(masterEmail);
@@ -145,8 +144,9 @@ class SalonMasterIntegrationTest {
                 "/api/v1/auth/invite/accept", request, String.class);
 
         // Assert: HTTP 201 with SALON_MASTER role
-        log.trace("Assert: status=201, role=SALON_MASTER");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(response.getStatusCode())
+                .as("status must be 201 after master accepts the invite")
+                .isEqualTo(HttpStatus.CREATED);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
@@ -196,8 +196,9 @@ class SalonMasterIntegrationTest {
                 "/api/v1/auth/invite/accept", request, String.class);
 
         // Assert: request failed (not 2xx)
-        log.trace("Assert: status is not 2xx");
-        assertThat(response.getStatusCode().is2xxSuccessful()).isFalse();
+        assertThat(response.getStatusCode().is2xxSuccessful())
+                .as("response must not be 2xx when masterService throws during invite acceptance")
+                .isFalse();
 
         // Assert: invite token was NOT permanently consumed (transaction rolled back)
         String hashedToken = sha256Hex(rawToken);
@@ -230,8 +231,9 @@ class SalonMasterIntegrationTest {
                 "/api/v1/auth/register/independent-master", request, String.class);
 
         // Assert: registration succeeded
-        log.trace("Assert: status=201, INDEPENDENT_MASTER role");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(response.getStatusCode())
+                .as("status must be 201 when independent master registration succeeds, email=%s", email)
+                .isEqualTo(HttpStatus.CREATED);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
@@ -314,8 +316,9 @@ class SalonMasterIntegrationTest {
         assertThat(detailBody.success()).isTrue();
 
         List<WorkingHoursResponse> returnedHours = detailBody.data().workingHours();
-        log.trace("Assert: workingHours has 2 entries");
-        assertThat(returnedHours).isNotNull().hasSize(2);
+        assertThat(returnedHours)
+                .as("workingHours array must contain exactly 2 entries for masterId=%s", masterId)
+                .isNotNull().hasSize(2);
         assertThat(returnedHours)
                 .extracting(WorkingHoursResponse::dayOfWeek)
                 .containsExactlyInAnyOrder(1, 2);
@@ -356,8 +359,9 @@ class SalonMasterIntegrationTest {
                 String.class);
 
         // Assert
-        log.trace("Assert: status=403");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when owner B targets salonA=%s that they do not own", salonAId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     // ── Test 6: different owner cannot patch working hours for another salon's master ──
@@ -411,8 +415,9 @@ class SalonMasterIntegrationTest {
                 String.class);
 
         // Assert
-        log.trace("Assert: status=403");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when owner B patches working hours for a master in salonA=%s", salonAId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     // ── Test 7: salon master cannot patch own working hours ───────────────────
@@ -462,8 +467,9 @@ class SalonMasterIntegrationTest {
                 String.class);
 
         // Assert: SALON_MASTER role is rejected immediately by canManageMasterSchedule
-        log.trace("Assert: status=403");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when SALON_MASTER attempts to update their own working hours")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

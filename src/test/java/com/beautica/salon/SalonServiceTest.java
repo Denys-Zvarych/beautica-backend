@@ -4,7 +4,6 @@ import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
-import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
@@ -23,10 +22,10 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -61,39 +60,40 @@ class SalonServiceTest {
     private SalonService salonService;
 
     @Test
-    @DisplayName("createSalon — returns SalonResponse with correct name and ownerId when owner is valid")
-    void should_createSalon_when_validOwnerAndRequest() {
+    @DisplayName("createSalon — saves and returns SalonResponse when owner already has one salon")
+    void should_createSalon_when_ownerAlreadyHasOneSalon() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
-        var request = new CreateSalonRequest("Beauty Place", null, "Kyiv", null, null, null, null);
-        var savedSalon = buildSalon(UUID.randomUUID(), owner, "Beauty Place");
+        var request = new CreateSalonRequest("Second Salon", null, "Kyiv", null, null, null, null);
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         SalonResponse response = salonService.createSalon(ownerId, request);
 
-        assertThat(response.name()).isEqualTo("Beauty Place");
+        assertThat(response.name()).isEqualTo("Second Salon");
         assertThat(response.ownerId()).isEqualTo(ownerId);
+        verify(salonRepository).save(any(Salon.class));
     }
 
     @Test
-    @DisplayName("createSalon — throws BusinessException(409) when owner already has a salon")
-    void should_throw409_when_ownerAlreadyHasSalon() {
+    @DisplayName("getOwnerSalons — returns all salons mapped to SalonResponse when owner has multiple salons")
+    void should_getOwnerSalons_when_ownerHasMultipleSalons() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
-        var request = new CreateSalonRequest("Duplicate Salon", null, null, null, null, null, null);
+        var salon1 = buildSalon(UUID.randomUUID(), owner, "Salon Alpha");
+        var salon2 = buildSalon(UUID.randomUUID(), owner, "Salon Beta");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.findAllByOwnerIdFetchOwner(ownerId)).thenReturn(List.of(salon1, salon2));
 
-        assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
-                        .isEqualTo(HttpStatus.CONFLICT));
+        List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
 
-        verify(salonRepository, never()).save(any());
+        assertThat(responses).hasSize(2);
+        assertThat(responses).extracting(SalonResponse::name)
+                .containsExactlyInAnyOrder("Salon Alpha", "Salon Beta");
+        assertThat(responses).allMatch(r -> ownerId.equals(r.ownerId()));
+        verify(salonRepository).findAllByOwnerIdFetchOwner(ownerId);
     }
 
     @Test
@@ -199,6 +199,22 @@ class SalonServiceTest {
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
                 .isInstanceOf(ForbiddenException.class);
+
+        verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — throws ForbiddenException when caller role is not SALON_OWNER (positive-guard coverage)")
+    void should_throwForbiddenException_when_nonOwnerCallsDeactivateSalon() {
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User master = buildUser(masterId, "master@beautica.com", Role.SALON_MASTER);
+
+        when(userRepository.findById(masterId)).thenReturn(Optional.of(master));
+
+        assertThatThrownBy(() -> salonService.deactivateSalon(masterId, salonId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Only SALON_OWNER may deactivate a salon");
 
         verify(salonRepository, never()).save(any());
     }

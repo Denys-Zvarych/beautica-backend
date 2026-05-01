@@ -82,11 +82,12 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal for POST /auth/login with tokens available");
+            log.debug("Act: doFilterInternal for POST /auth/login when bucket allows consumption");
             doFilter(request, response, chain);
 
-            log.trace("Assert: chain forwarded, no rate-limit response written");
-            assertThat(response.getStatus()).isEqualTo(200);
+            assertThat(response.getStatus())
+                    .as("status must be 200 when login bucket allows the request")
+                    .isEqualTo(200);
             assertThat(chain.getRequest()).isNotNull();
             verifyNoInteractions(refreshBuckets);
         }
@@ -102,11 +103,12 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal for POST /auth/login with exhausted bucket");
+            log.debug("Act: doFilterInternal for POST /auth/login when login bucket is exhausted");
             doFilter(request, response, chain);
 
-            log.trace("Assert: 429, Retry-After header, JSON body, chain not invoked");
-            assertThat(response.getStatus()).isEqualTo(429);
+            assertThat(response.getStatus())
+                    .as("status must be 429 when login bucket is exhausted")
+                    .isEqualTo(429);
             assertThat(response.getHeader("Retry-After")).isEqualTo("60");
             assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
             assertThat(chain.getRequest()).isNull();
@@ -130,11 +132,12 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal for POST /auth/refresh with tokens available");
+            log.debug("Act: doFilterInternal for POST /auth/refresh when refresh bucket allows consumption");
             doFilter(request, response, chain);
 
-            log.trace("Assert: chain forwarded, loginBuckets not consulted");
-            assertThat(response.getStatus()).isEqualTo(200);
+            assertThat(response.getStatus())
+                    .as("status must be 200 when refresh bucket allows the request")
+                    .isEqualTo(200);
             assertThat(chain.getRequest()).isNotNull();
             verifyNoInteractions(loginBuckets);
         }
@@ -150,11 +153,12 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal for POST /auth/refresh with exhausted bucket");
+            log.debug("Act: doFilterInternal for POST /auth/refresh when refresh bucket is exhausted");
             doFilter(request, response, chain);
 
-            log.trace("Assert: 429, Retry-After: 60, body matches spec, chain not invoked");
-            assertThat(response.getStatus()).isEqualTo(429);
+            assertThat(response.getStatus())
+                    .as("status must be 429 when refresh bucket is exhausted")
+                    .isEqualTo(429);
             assertThat(response.getHeader("Retry-After")).isEqualTo("60");
             assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
             assertThat(chain.getRequest()).isNull();
@@ -175,11 +179,12 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal for GET /auth/login");
+            log.debug("Act: doFilterInternal for GET /auth/login — non-POST method bypasses rate limiting");
             doFilter(request, response, chain);
 
-            log.trace("Assert: chain forwarded, neither bucket cache consulted");
-            assertThat(chain.getRequest()).isNotNull();
+            assertThat(chain.getRequest())
+                    .as("chain must be forwarded — GET method is not rate-limited")
+                    .isNotNull();
             verifyNoInteractions(loginBuckets);
             verifyNoInteractions(refreshBuckets);
         }
@@ -198,11 +203,12 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal for POST /auth/register");
+            log.debug("Act: doFilterInternal for POST /auth/register — path not subject to rate limiting");
             doFilter(request, response, chain);
 
-            log.trace("Assert: chain forwarded, no bucket cache consulted");
-            assertThat(chain.getRequest()).isNotNull();
+            assertThat(chain.getRequest())
+                    .as("chain must be forwarded — /auth/register is not rate-limited")
+                    .isNotNull();
             verifyNoInteractions(loginBuckets);
             verifyNoInteractions(refreshBuckets);
         }
@@ -225,13 +231,14 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal — filter must key bucket by first XFF IP, not remoteAddr");
+            log.debug("Act: doFilterInternal — X-Forwarded-For header present, bucket must key by first IP {}", FORWARDED_IP);
             doFilter(request, response, chain);
 
-            log.trace("Assert: bucket keyed by first XFF IP={}, remoteAddr={} never used as key", FORWARDED_IP, REMOTE_ADDR);
             verify(loginBuckets).get(FORWARDED_IP);
             verify(loginBuckets, never()).get(REMOTE_ADDR);
-            assertThat(chain.getRequest()).isNotNull();
+            assertThat(chain.getRequest())
+                    .as("chain must be forwarded when XFF bucket allows the request")
+                    .isNotNull();
         }
 
         @Test
@@ -246,12 +253,13 @@ class AuthRateLimitFilterTest {
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal — filter must fall back to remoteAddr");
+            log.debug("Act: doFilterInternal — no X-Forwarded-For, must fall back to remoteAddr={}", REMOTE_ADDR);
             doFilter(request, response, chain);
 
-            log.trace("Assert: bucket keyed by remoteAddr={}", REMOTE_ADDR);
             verify(loginBuckets).get(REMOTE_ADDR);
-            assertThat(chain.getRequest()).isNotNull();
+            assertThat(chain.getRequest())
+                    .as("chain must be forwarded when remoteAddr bucket allows the request")
+                    .isNotNull();
         }
     }
 }

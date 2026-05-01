@@ -32,6 +32,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -84,7 +85,7 @@ class InviteServiceAdminTest {
                 masterService,
                 authResponseBuilder,
                 "http://localhost:3000",
-                72L
+                48L
         );
     }
 
@@ -98,13 +99,16 @@ class InviteServiceAdminTest {
         var owner = buildOwner(callerId, salonId);
         var request = new InviteRequest("admin@example.com", salonId, Role.SALON_ADMIN);
 
+        var salonStub = mock(com.beautica.salon.entity.Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
         when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
         when(userRepository.existsBySalonIdAndRole(salonId, Role.SALON_ADMIN)).thenReturn(false);
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("admin@example.com"))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-admin-tok");
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
         ArgumentCaptor<InviteToken> tokenCaptor = ArgumentCaptor.forClass(InviteToken.class);
         when(inviteTokenRepository.save(tokenCaptor.capture())).thenAnswer(inv -> inv.getArgument(0));
 
@@ -142,6 +146,7 @@ class InviteServiceAdminTest {
 
         when(userRepository.existsByEmail("another-admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(com.beautica.salon.entity.Salon.class)));
         when(userRepository.existsBySalonIdAndRole(salonId, Role.SALON_ADMIN)).thenReturn(true);
 
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
@@ -182,11 +187,54 @@ class InviteServiceAdminTest {
 
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(requestSalonId, callerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("own the specified salon");
 
+        verify(salonRepository).findByIdAndOwnerId(requestSalonId, callerId);
+        verify(inviteTokenRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("sendInvite throws ForbiddenException when salon does not exist")
+    void should_throwForbiddenException_when_salonNotFound() {
+        var callerId = UUID.randomUUID();
+        var nonExistentSalonId = UUID.randomUUID();
+        var owner = buildOwner(callerId, UUID.randomUUID());
+        var request = new InviteRequest("master@example.com", nonExistentSalonId, Role.SALON_MASTER);
+
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(nonExistentSalonId, callerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("You do not own the specified salon");
+
+        verify(salonRepository).findByIdAndOwnerId(nonExistentSalonId, callerId);
+        verify(inviteTokenRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("sendInvite throws ForbiddenException when salon exists but is owned by another user")
+    void should_throwForbiddenException_when_salonExistsButOwnedByOther() {
+        var callerId = UUID.randomUUID();
+        var salonOwnedByOther = UUID.randomUUID();
+        var owner = buildOwner(callerId, UUID.randomUUID());
+        var request = new InviteRequest("master@example.com", salonOwnedByOther, Role.SALON_MASTER);
+
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
+        // Salon exists but the combined id+ownerId query returns empty — same result as non-existent.
+        when(salonRepository.findByIdAndOwnerId(salonOwnedByOther, callerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("You do not own the specified salon");
+
+        verify(salonRepository).findByIdAndOwnerId(salonOwnedByOther, callerId);
         verify(inviteTokenRepository, never()).save(any());
     }
 
@@ -223,11 +271,14 @@ class InviteServiceAdminTest {
 
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
+        // Salon B exists but the combined id+ownerId query returns empty because admin is not the owner.
+        when(salonRepository.findByIdAndOwnerId(targetSalonId, callerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("own the specified salon");
 
+        verify(salonRepository).findByIdAndOwnerId(targetSalonId, callerId);
         verify(inviteTokenRepository, never()).save(any());
     }
 
