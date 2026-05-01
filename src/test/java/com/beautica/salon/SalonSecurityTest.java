@@ -97,14 +97,15 @@ class SalonSecurityTest {
 
         var patchRequest = new UpdateSalonRequest("Stolen Salon", null, null, null, null, null, null);
 
-        log.debug("Act: PATCH {}/{} with Owner B's token targeting Owner A's salon", SALONS_URL, salonAId);
+        log.debug("Act: PATCH {}/{} with Owner B's token targeting Owner A's salon — cross-owner patch must be denied", SALONS_URL, salonAId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonAId, HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, bearerHeaders(ownerBToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when Owner B patches Owner A's salon, salonId=%s", salonAId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
@@ -119,14 +120,15 @@ class SalonSecurityTest {
 
         String inviteBody = "{\"email\":\"master-" + System.nanoTime() + "@beautica.test\"}";
 
-        log.debug("Act: POST {}/{}/invite with Owner B's token targeting Owner A's salon", SALONS_URL, salonAId);
+        log.debug("Act: POST {}/{}/invite with Owner B's token targeting Owner A's salon — cross-owner invite must be denied", SALONS_URL, salonAId);
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "/" + salonAId + "/invite", HttpMethod.POST,
                 new HttpEntity<>(inviteBody, bearerHeaders(ownerBToken)),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when Owner B sends invite for Owner A's salon, salonId=%s", salonAId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     private String createSalonOwnerAndGetToken(String email) throws Exception {

@@ -5,6 +5,7 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.master.service.MasterService;
 import com.beautica.user.RefreshToken;
@@ -52,14 +53,27 @@ public class AuthService {
             throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
         }
 
+        if (request.role() == SelfRegistrationRole.SALON_OWNER) {
+            if (request.businessName() == null || request.businessName().isBlank()) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "businessName is required for SALON_OWNER");
+            }
+        }
+
+        String businessName = request.role() == SelfRegistrationRole.SALON_OWNER
+                ? request.businessName()
+                : null;
+
         var user = new User(
                 request.email(),
                 passwordEncoder.encode(request.password()),
-                Role.CLIENT,
+                request.role().toRole(),
                 request.firstName(),
                 request.lastName(),
-                request.phoneNumber()
+                request.phoneNumber(),
+                businessName
         );
+
         var savedUser = userRepository.save(user);
 
         return buildAuthResponse(savedUser);

@@ -97,7 +97,7 @@ class InviteServiceTest {
                 masterService,
                 authResponseBuilder,
                 "http://localhost:3000",
-                72L
+                48L
         );
     }
 
@@ -112,23 +112,27 @@ class InviteServiceTest {
         var hashedToken = "hashed-invite-token";
         log.debug("Arrange: caller owns salon salonId={}", salonId);
 
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
         when(tokenGenerator.generateToken()).thenReturn(rawToken);
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com"))
                 .thenReturn(Optional.empty());
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
         ArgumentCaptor<InviteToken> captor = ArgumentCaptor.forClass(InviteToken.class);
         when(inviteTokenRepository.save(captor.capture())).thenAnswer(inv -> inv.getArgument(0));
 
-        log.debug("Act: calling inviteService.sendInvite");
+        log.debug("Act: sendInvite with tokenGenerator returning raw='{}' hashed='{}'", rawToken, hashedToken);
         inviteService.sendInvite(request, callerId);
 
         InviteToken saved = captor.getValue();
-        log.trace("Assert: saved token is the hash, not the raw value");
-        assertThat(saved.getToken()).isEqualTo(hashedToken);
+        assertThat(saved.getToken())
+                .as("persisted token must equal the hashed value, not raw='%s'", rawToken)
+                .isEqualTo(hashedToken);
         assertThat(saved.getToken()).isNotEqualTo(rawToken);
 
         ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
@@ -145,19 +149,23 @@ class InviteServiceTest {
         var caller = buildCallerWithSalon(callerId, salonId);
         log.debug("Arrange: email={} salonId={}", request.email(), salonId);
 
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com"))
                 .thenReturn(Optional.empty());
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
-        log.debug("Act: calling inviteService.sendInvite");
+        log.debug("Act: sendInvite for email={} salonId={} on happy path", request.email(), salonId);
         var response = inviteService.sendInvite(request, callerId);
 
-        log.trace("Assert: response email={}", response.invitedEmail());
-        assertThat(response.invitedEmail()).isEqualTo("master@example.com");
+        assertThat(response.invitedEmail())
+                .as("response must carry the invited email address")
+                .isEqualTo("master@example.com");
         assertThat(response.expiresAt()).isAfter(Instant.now());
 
         verify(inviteTokenRepository).save(any(InviteToken.class));
@@ -172,7 +180,7 @@ class InviteServiceTest {
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: calling sendInvite expecting BusinessException");
+        log.debug("Act: sendInvite for already-registered email={} — must throw BusinessException", request.email());
         assertThatThrownBy(() -> inviteService.sendInvite(request, UUID.randomUUID()))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("already registered");
@@ -192,12 +200,59 @@ class InviteServiceTest {
 
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(requestedSalonId, callerId)).thenReturn(Optional.empty());
 
-        log.debug("Act: calling sendInvite expecting ForbiddenException");
+        log.debug("Act: sendInvite where caller salonId={} differs from requested salonId={} — must throw ForbiddenException", callerOwnedSalonId, requestedSalonId);
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("do not own");
 
+        verify(salonRepository).findByIdAndOwnerId(requestedSalonId, callerId);
+        verify(inviteTokenRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("sendInvite throws ForbiddenException when salon does not exist")
+    void should_throwForbiddenException_when_salonNotFound() {
+        var callerId = UUID.randomUUID();
+        var nonExistentSalonId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", nonExistentSalonId, null);
+        var caller = buildCallerWithSalon(callerId, UUID.randomUUID());
+        log.debug("Arrange: salon salonId={} does not exist in DB", nonExistentSalonId);
+
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(nonExistentSalonId, callerId)).thenReturn(Optional.empty());
+
+        log.debug("Act: sendInvite for salonId={} that does not exist — must throw ForbiddenException", nonExistentSalonId);
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("You do not own the specified salon");
+
+        verify(salonRepository).findByIdAndOwnerId(nonExistentSalonId, callerId);
+        verify(inviteTokenRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("sendInvite throws ForbiddenException when salon exists but is owned by another user")
+    void should_throwForbiddenException_when_salonExistsButOwnedByOther() {
+        var callerId = UUID.randomUUID();
+        var salonOwnedByOther = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonOwnedByOther, null);
+        var caller = buildCallerWithSalon(callerId, UUID.randomUUID());
+        log.debug("Arrange: salon salonId={} exists but belongs to a different owner", salonOwnedByOther);
+
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        // Salon exists but the combined id+ownerId query returns empty — same result as non-existent.
+        when(salonRepository.findByIdAndOwnerId(salonOwnedByOther, callerId)).thenReturn(Optional.empty());
+
+        log.debug("Act: sendInvite for salonId={} owned by another user — must throw ForbiddenException", salonOwnedByOther);
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("You do not own the specified salon");
+
+        verify(salonRepository).findByIdAndOwnerId(salonOwnedByOther, callerId);
         verify(inviteTokenRepository, never()).save(any());
     }
 
@@ -213,10 +268,11 @@ class InviteServiceTest {
 
         when(userRepository.existsByEmail("pending@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("pending@example.com"))
                 .thenReturn(Optional.of(existing));
 
-        log.debug("Act: calling sendInvite expecting BusinessException");
+        log.debug("Act: sendInvite for email={} that already has an active invite — must throw BusinessException", request.email());
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("active invite");
@@ -234,18 +290,20 @@ class InviteServiceTest {
         var expired = buildInviteToken("expired@example.com", Instant.now().minusSeconds(1));
         log.debug("Arrange: expired invite exists for email={}", request.email());
 
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
         when(tokenGenerator.generateToken()).thenReturn("new-raw-token");
         when(userRepository.existsByEmail("expired@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("expired@example.com"))
                 .thenReturn(Optional.of(expired));
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
-        log.debug("Act: calling sendInvite with expired existing invite");
+        log.debug("Act: sendInvite for email={} — expired invite exists and must be replaced", request.email());
         var response = inviteService.sendInvite(request, callerId);
 
-        log.trace("Assert: old token deleted, new token saved");
         verify(inviteTokenRepository).delete(expired);
         verify(inviteTokenRepository).save(any(InviteToken.class));
         verify(emailService).sendInviteEmail(anyString(), anyString(), anyString());
@@ -277,11 +335,12 @@ class InviteServiceTest {
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        log.debug("Act: calling acceptInvite");
+        log.debug("Act: acceptInvite with valid SALON_MASTER token for email=new@example.com salonId={}", salonId);
         var response = inviteService.acceptInvite(request);
 
-        log.trace("Assert: SALON_MASTER user created, auth tokens issued");
-        assertThat(response.role()).isEqualTo(Role.SALON_MASTER);
+        assertThat(response.role())
+                .as("response role must be SALON_MASTER for a master invite token")
+                .isEqualTo(Role.SALON_MASTER);
         assertThat(response.email()).isEqualTo("new@example.com");
         assertThat(response.accessToken()).isNotBlank();
         assertThat(response.refreshToken()).isNotBlank();
@@ -305,7 +364,7 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.empty());
 
-        log.debug("Act: calling acceptInvite expecting NotFoundException");
+        log.debug("Act: acceptInvite with non-existent token='{}' — must throw NotFoundException", rawToken);
         assertThatThrownBy(() -> inviteService.acceptInvite(request))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("not found");
@@ -324,7 +383,7 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: calling acceptInvite expecting BusinessException");
+        log.debug("Act: acceptInvite with a token already marked used — must throw BusinessException");
         assertThatThrownBy(() -> inviteService.acceptInvite(request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("already been used");
@@ -342,7 +401,7 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: calling acceptInvite expecting BusinessException");
+        log.debug("Act: acceptInvite with an expired token — must throw BusinessException");
         assertThatThrownBy(() -> inviteService.acceptInvite(request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("expired");
@@ -361,7 +420,7 @@ class InviteServiceTest {
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("collision@example.com")).thenReturn(true);
 
-        log.debug("Act: calling acceptInvite expecting BusinessException");
+        log.debug("Act: acceptInvite where email=collision@example.com is already registered — must throw BusinessException");
         assertThatThrownBy(() -> inviteService.acceptInvite(request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("already registered");
@@ -379,11 +438,12 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: calling previewInvite");
+        log.debug("Act: previewInvite with valid token for email=preview@example.com");
         InvitePreviewResponse response = inviteService.previewInvite(rawToken);
 
-        log.trace("Assert: response fields match invite token");
-        assertThat(response.invitedEmail()).isEqualTo("preview@example.com");
+        assertThat(response.invitedEmail())
+                .as("preview response must return the email stored in the invite token")
+                .isEqualTo("preview@example.com");
         assertThat(response.role()).isEqualTo(Role.SALON_MASTER);
         assertThat(response.expiresAt()).isEqualTo(invite.getExpiresAt());
     }
@@ -398,7 +458,7 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.empty());
 
-        log.debug("Act: calling previewInvite expecting BusinessException");
+        log.debug("Act: previewInvite with unknown token='{}' — must throw BusinessException", rawToken);
         assertThatThrownBy(() -> inviteService.previewInvite(rawToken))
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("Invalid or expired invite token");
@@ -416,7 +476,7 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: calling previewInvite expecting BusinessException");
+        log.debug("Act: previewInvite with an already-used token for email=used@example.com — must throw BusinessException");
         assertThatThrownBy(() -> inviteService.previewInvite(rawToken))
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("Invalid or expired invite token");
@@ -433,7 +493,7 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: calling previewInvite expecting BusinessException");
+        log.debug("Act: previewInvite with an expired token for email=expired@example.com — must throw BusinessException");
         assertThatThrownBy(() -> inviteService.previewInvite(rawToken))
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("Invalid or expired invite token");
@@ -450,17 +510,20 @@ class InviteServiceTest {
         var caller = buildCallerWithSalon(callerId, salonId);
         log.debug("Arrange: SALON_OWNER invites SALON_ADMIN for salonId={}", salonId);
 
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
         when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
         when(userRepository.existsBySalonIdAndRole(salonId, Role.SALON_ADMIN)).thenReturn(false);
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("admin@example.com"))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-admin-token");
         ArgumentCaptor<InviteToken> tokenCaptor = ArgumentCaptor.forClass(InviteToken.class);
         when(inviteTokenRepository.save(tokenCaptor.capture())).thenAnswer(inv -> inv.getArgument(0));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
-        log.debug("Act: calling sendInvite with SALON_ADMIN role");
+        log.debug("Act: sendInvite with SALON_ADMIN role for email={} salonId={}", request.email(), salonId);
         var response = inviteService.sendInvite(request, callerId);
 
         assertThat(response.invitedEmail()).isEqualTo("admin@example.com");
@@ -481,7 +544,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(masterCaller));
 
-        log.debug("Act: calling sendInvite expecting ForbiddenException");
+        log.debug("Act: sendInvite with SALON_ADMIN role by non-owner callerId={} — must throw ForbiddenException", callerId);
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("SALON_OWNER");
@@ -500,9 +563,10 @@ class InviteServiceTest {
 
         when(userRepository.existsByEmail("admin2@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
         when(userRepository.existsBySalonIdAndRole(salonId, Role.SALON_ADMIN)).thenReturn(true);
 
-        log.debug("Act: calling sendInvite expecting ConflictException");
+        log.debug("Act: sendInvite with SALON_ADMIN role for salonId={} that already has an admin — must throw ConflictException", salonId);
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ConflictException.class)
                 .hasMessageContaining("already has a SALON_ADMIN");
@@ -535,7 +599,7 @@ class InviteServiceTest {
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        log.debug("Act: calling acceptInvite with SALON_ADMIN token");
+        log.debug("Act: acceptInvite with SALON_ADMIN token for email=admin@example.com salonId={}", salonId);
         inviteService.acceptInvite(request);
 
         ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
@@ -569,7 +633,7 @@ class InviteServiceTest {
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        log.debug("Act: calling acceptInvite with SALON_MASTER token");
+        log.debug("Act: acceptInvite with SALON_MASTER token for email=newmaster@example.com salonId={}", salonId);
         inviteService.acceptInvite(request);
 
         ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
@@ -590,7 +654,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("client@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
 
-        log.debug("Act: calling sendInvite expecting ForbiddenException");
+        log.debug("Act: sendInvite with CLIENT role for email={} — must throw ForbiddenException", request.email());
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("cannot be assigned via invite");
@@ -610,7 +674,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("indie@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
 
-        log.debug("Act: calling sendInvite expecting ForbiddenException");
+        log.debug("Act: sendInvite with INDEPENDENT_MASTER role for email={} — must throw ForbiddenException", request.email());
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("cannot be assigned via invite");
@@ -632,13 +696,13 @@ class InviteServiceTest {
 
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salon));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com"))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-tok");
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
 
-        log.debug("Act: calling sendInvite expecting salon name forwarded to emailService");
+        log.debug("Act: sendInvite for salon 'Glamour Studio' salonId={} — salon name must be forwarded to emailService", salonId);
         inviteService.sendInvite(request, callerId);
 
         ArgumentCaptor<String> salonNameCaptor = ArgumentCaptor.forClass(String.class);

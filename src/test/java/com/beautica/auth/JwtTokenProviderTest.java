@@ -39,11 +39,12 @@ class JwtTokenProviderTest {
         var role = Role.CLIENT;
         log.debug("Arrange: userId={}, email={}, role={}", userId, email, role);
 
-        log.debug("Act: calling jwtTokenProvider.generateAccessToken");
+        log.debug("Act: generateAccessToken for userId={} email={} role={}", userId, email, role);
         String token = jwtTokenProvider.generateAccessToken(userId, email, role);
 
-        log.trace("Assert: token length={}", token.length());
-        assertThat(token).isNotBlank();
+        assertThat(token)
+                .as("generated access token must not be blank")
+                .isNotBlank();
     }
 
     @Test
@@ -52,12 +53,13 @@ class JwtTokenProviderTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: expected userId={}", userId);
 
-        log.debug("Act: generating token and extracting userId");
+        log.debug("Act: generateAccessToken then getUserIdFromToken — expect userId={}", userId);
         String token = jwtTokenProvider.generateAccessToken(userId, "test@example.com", Role.CLIENT);
         UUID extracted = jwtTokenProvider.getUserIdFromToken(token);
 
-        log.trace("Assert: extracted userId={}", extracted);
-        assertThat(extracted).isEqualTo(userId);
+        assertThat(extracted)
+                .as("extracted userId must match the one embedded in the token, expected=%s", userId)
+                .isEqualTo(userId);
     }
 
     @Test
@@ -66,12 +68,13 @@ class JwtTokenProviderTest {
         var email = "user@beautica.com";
         log.debug("Arrange: expected email={}", email);
 
-        log.debug("Act: generating token and extracting email");
+        log.debug("Act: generateAccessToken then getEmailFromToken — expect email={}", email);
         String token = jwtTokenProvider.generateAccessToken(UUID.randomUUID(), email, Role.SALON_OWNER);
         String extracted = jwtTokenProvider.getEmailFromToken(token);
 
-        log.trace("Assert: extracted email={}", extracted);
-        assertThat(extracted).isEqualTo(email);
+        assertThat(extracted)
+                .as("extracted email must match the one embedded in the token, expected=%s", email)
+                .isEqualTo(email);
     }
 
     @Test
@@ -80,12 +83,13 @@ class JwtTokenProviderTest {
         var role = Role.INDEPENDENT_MASTER;
         log.debug("Arrange: expected role={}", role);
 
-        log.debug("Act: generating token and extracting role");
+        log.debug("Act: generateAccessToken then getRoleFromToken — expect role={}", role);
         String token = jwtTokenProvider.generateAccessToken(UUID.randomUUID(), "m@example.com", role);
         Role extracted = jwtTokenProvider.getRoleFromToken(token);
 
-        log.trace("Assert: extracted role={}", extracted);
-        assertThat(extracted).isEqualTo(role);
+        assertThat(extracted)
+                .as("extracted role must match the one embedded in the token, expected=%s", role)
+                .isEqualTo(role);
     }
 
     @Test
@@ -94,11 +98,12 @@ class JwtTokenProviderTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: userId={}", userId);
 
-        log.debug("Act: calling jwtTokenProvider.generateRefreshToken");
+        log.debug("Act: generateRefreshToken for userId={}", userId);
         String token = jwtTokenProvider.generateRefreshToken(userId);
 
-        log.trace("Assert: refresh token length={}", token.length());
-        assertThat(token).isNotBlank();
+        assertThat(token)
+                .as("generated refresh token must not be blank")
+                .isNotBlank();
     }
 
     @Test
@@ -107,12 +112,13 @@ class JwtTokenProviderTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: expected userId={}", userId);
 
-        log.debug("Act: generating refresh token and extracting userId");
+        log.debug("Act: generateRefreshToken then getUserIdFromToken — expect userId={}", userId);
         String token = jwtTokenProvider.generateRefreshToken(userId);
         UUID extracted = jwtTokenProvider.getUserIdFromToken(token);
 
-        log.trace("Assert: extracted userId={}", extracted);
-        assertThat(extracted).isEqualTo(userId);
+        assertThat(extracted)
+                .as("extracted userId from refresh token must match the one embedded, expected=%s", userId)
+                .isEqualTo(userId);
     }
 
     @Test
@@ -122,11 +128,12 @@ class JwtTokenProviderTest {
         String token = jwtTokenProvider.generateAccessToken(
                 UUID.randomUUID(), "ok@test.com", Role.CLIENT);
 
-        log.debug("Act: calling jwtTokenProvider.validateToken");
+        log.debug("Act: validateToken on a fresh valid access token");
         boolean valid = jwtTokenProvider.validateToken(token);
 
-        log.trace("Assert: validateToken returned {}", valid);
-        assertThat(valid).isTrue();
+        assertThat(valid)
+                .as("validateToken must return true for a freshly generated, unexpired token")
+                .isTrue();
     }
 
     @Test

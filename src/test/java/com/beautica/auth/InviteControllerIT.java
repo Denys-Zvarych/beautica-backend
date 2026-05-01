@@ -7,6 +7,7 @@ import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.EmailService;
@@ -137,7 +138,7 @@ class InviteControllerIT {
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(masterEmail, salonId, null);
 
-        log.debug("Act: POST /auth/invite as SALON_OWNER");
+        log.debug("Act: POST /auth/invite as SALON_OWNER for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/auth/invite",
                 HttpMethod.POST,
@@ -145,8 +146,9 @@ class InviteControllerIT {
                 String.class
         );
 
-        log.trace("Assert: status=201, invitedEmail={}", masterEmail);
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(response.getStatusCode())
+                .as("status must be 201 when SALON_OWNER sends a valid invite")
+                .isEqualTo(HttpStatus.CREATED);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
@@ -167,7 +169,7 @@ class InviteControllerIT {
         HttpHeaders headers = bearerHeaders(clientToken);
         var request = new InviteRequest(uniqueEmail("target"), UUID.randomUUID(), null);
 
-        log.debug("Act: POST /auth/invite as CLIENT");
+        log.debug("Act: POST /auth/invite as CLIENT role — must be rejected with 403");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/auth/invite",
                 HttpMethod.POST,
@@ -175,8 +177,9 @@ class InviteControllerIT {
                 String.class
         );
 
-        log.trace("Assert: status=403");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when CLIENT sends invite")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
@@ -186,12 +189,13 @@ class InviteControllerIT {
 
         var request = new InviteRequest(uniqueEmail("unauth"), UUID.randomUUID(), null);
 
-        log.debug("Act: POST /auth/invite without credentials");
+        log.debug("Act: POST /auth/invite without credentials — unauthenticated request must be rejected");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite", request, String.class);
 
-        log.trace("Assert: status=401");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when no Authorization header is present")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
@@ -213,7 +217,7 @@ class InviteControllerIT {
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(alreadyRegistered, salonId, null);
 
-        log.debug("Act: POST /auth/invite targeting registered email");
+        log.debug("Act: POST /auth/invite targeting already-registered email={}", alreadyRegistered);
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/auth/invite",
                 HttpMethod.POST,
@@ -221,8 +225,9 @@ class InviteControllerIT {
                 String.class
         );
 
-        log.trace("Assert: status=409");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getStatusCode())
+                .as("status must be 409 when invited email is already registered")
+                .isEqualTo(HttpStatus.CONFLICT);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
@@ -253,12 +258,13 @@ class InviteControllerIT {
 
         var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
 
-        log.debug("Act: POST /auth/invite/accept");
+        log.debug("Act: POST /auth/invite/accept with valid token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
 
-        log.trace("Assert: status=201, SALON_MASTER role");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(response.getStatusCode())
+                .as("status must be 201 when a valid invite token is accepted")
+                .isEqualTo(HttpStatus.CREATED);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
@@ -279,12 +285,13 @@ class InviteControllerIT {
         var request = new InviteAcceptRequest("nonexistent-token-xyz", "password12345", "Jane", "Doe", null);
         log.debug("Arrange: no matching token in DB");
 
-        log.debug("Act: POST /auth/invite/accept with unknown token");
+        log.debug("Act: POST /auth/invite/accept with a token that does not exist in the DB");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
 
-        log.trace("Assert: status=404");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getStatusCode())
+                .as("status must be 404 when token does not exist")
+                .isEqualTo(HttpStatus.NOT_FOUND);
     }
 
     @Test
@@ -299,12 +306,13 @@ class InviteControllerIT {
 
         var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
 
-        log.debug("Act: POST /auth/invite/accept with expired token");
+        log.debug("Act: POST /auth/invite/accept with an expired token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
 
-        log.trace("Assert: status=400");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when invite token is expired")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
@@ -324,12 +332,13 @@ class InviteControllerIT {
 
         var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
 
-        log.debug("Act: POST /auth/invite/accept with already-used token");
+        log.debug("Act: POST /auth/invite/accept with a token already marked used for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
 
-        log.trace("Assert: status=400");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when invite token was already used")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
@@ -343,12 +352,13 @@ class InviteControllerIT {
         var request = new InviteAcceptRequest("some-token", "password123", null, null, null);
         log.debug("Arrange: no Authorization header — endpoint must be public");
 
-        log.debug("Act: POST /auth/invite/accept without credentials");
+        log.debug("Act: POST /auth/invite/accept without credentials — endpoint must be public");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
 
-        log.trace("Assert: status is not 401");
-        assertThat(response.getStatusCode()).isNotEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode())
+                .as("invite/accept endpoint must not return 401 — it is public")
+                .isNotEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
@@ -362,12 +372,13 @@ class InviteControllerIT {
 
         saveValidInviteToken(masterEmail, null, rawToken);
 
-        log.debug("Act: GET /auth/invite/validate?token={}", rawToken);
+        log.debug("Act: GET /auth/invite/validate with valid token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.getForEntity(
                 "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
-        log.trace("Assert: status=200, invitedEmail={}, role=SALON_MASTER", masterEmail);
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 for a valid unexpired invite token")
+                .isEqualTo(HttpStatus.OK);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<InvitePreviewResponse>>() {});
@@ -382,12 +393,13 @@ class InviteControllerIT {
     void should_return404_when_validateWithUnknownToken() {
         log.debug("Arrange: no token stored — using random UUID");
 
-        log.debug("Act: GET /auth/invite/validate with unknown token");
+        log.debug("Act: GET /auth/invite/validate with a random UUID that has no matching token in the DB");
         ResponseEntity<String> response = restTemplate.getForEntity(
                 "/api/v1/auth/invite/validate?token=" + UUID.randomUUID(), String.class);
 
-        log.trace("Assert: status=400");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when token is unknown")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
@@ -400,12 +412,13 @@ class InviteControllerIT {
 
         saveExpiredInviteToken(masterEmail, rawToken);
 
-        log.debug("Act: GET /auth/invite/validate with expired token");
+        log.debug("Act: GET /auth/invite/validate with expired token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.getForEntity(
                 "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
-        log.trace("Assert: status=400, message contains 'expired'");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when invite token is expired")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
@@ -423,12 +436,13 @@ class InviteControllerIT {
 
         saveUsedInviteToken(masterEmail, rawToken);
 
-        log.debug("Act: GET /auth/invite/validate with already-used token");
+        log.debug("Act: GET /auth/invite/validate with a token already marked used for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.getForEntity(
                 "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
-        log.trace("Assert: status=400, message contains 'Invalid or expired'");
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when invite token was already used")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
@@ -446,12 +460,13 @@ class InviteControllerIT {
 
         saveValidInviteToken(masterEmail, null, rawToken);
 
-        log.debug("Act: GET /auth/invite/validate without credentials");
+        log.debug("Act: GET /auth/invite/validate without credentials — endpoint must be public");
         ResponseEntity<String> response = restTemplate.getForEntity(
                 "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
-        log.trace("Assert: status is not 401");
-        assertThat(response.getStatusCode()).isNotEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode())
+                .as("invite/validate endpoint must not return 401 — it is public")
+                .isNotEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -470,7 +485,7 @@ class InviteControllerIT {
     private String registerAndGetToken(String email, Role ignoredRole) throws Exception {
         var registerResp = restTemplate.postForEntity(
                 "/api/v1/auth/register",
-                new RegisterRequest(email, "password123", null, null, null),
+                new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class
         );
         var body = objectMapper.readValue(

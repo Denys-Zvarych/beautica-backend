@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.common.ApiResponse;
@@ -82,12 +83,13 @@ class UserControllerIT {
     void should_return401_when_noTokenProvided() {
         log.debug("Arrange: no Authorization header prepared");
 
-        log.debug("Act: GET /api/v1/users/me without credentials");
+        log.debug("Act: GET /api/v1/users/me without credentials — unauthenticated request must be rejected");
         ResponseEntity<String> response = restTemplate.getForEntity(
                 "/api/v1/users/me", String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when no Authorization header is present on GET /me")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
@@ -99,15 +101,16 @@ class UserControllerIT {
 
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: GET /api/v1/users/me");
+        log.debug("Act: GET /api/v1/users/me with valid token for getme@beautica.com");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.GET,
                 new HttpEntity<>(headers),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 when a valid token is used to access own profile")
+                .isEqualTo(HttpStatus.OK);
 
         var apiResponse = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
@@ -129,15 +132,16 @@ class UserControllerIT {
 
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: GET /api/v1/users/me");
+        log.debug("Act: GET /api/v1/users/me with CLIENT token — any authenticated role must be accepted");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.GET,
                 new HttpEntity<>(headers),
                 String.class);
 
-        log.trace("Assert: status={}, role returned", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 — GET /me has no role restriction")
+                .isEqualTo(HttpStatus.OK);
 
         var apiResponse = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
@@ -153,15 +157,16 @@ class UserControllerIT {
         log.debug("Arrange: no Authorization header prepared");
         var request = new UpdateProfileRequest("Ivan", "Petrenko", null);
 
-        log.debug("Act: PATCH /api/v1/users/me without credentials");
+        log.debug("Act: PATCH /api/v1/users/me without credentials — unauthenticated request must be rejected");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.PATCH,
                 new HttpEntity<>(request),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when no Authorization header is present on PATCH /me")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
@@ -174,15 +179,16 @@ class UserControllerIT {
         var patchRequest = new UpdateProfileRequest("Nova", "Familiya", "+380672222222");
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: PATCH /api/v1/users/me with new firstName/lastName/phoneNumber");
+        log.debug("Act: PATCH /api/v1/users/me changing firstName='Nova', lastName, and phoneNumber");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, headers),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 when valid patch fields are applied")
+                .isEqualTo(HttpStatus.OK);
 
         var apiResponse = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
@@ -203,15 +209,16 @@ class UserControllerIT {
         var patchRequest = new UpdateProfileRequest(null, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: PATCH /api/v1/users/me with all-null body");
+        log.debug("Act: PATCH /api/v1/users/me with all-null fields — existing values must be preserved");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, headers),
                 String.class);
 
-        log.trace("Assert: status={}, original fields preserved", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode())
+                .as("status must be 200 even when all patch fields are null")
+                .isEqualTo(HttpStatus.OK);
 
         var apiResponse = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
@@ -233,15 +240,16 @@ class UserControllerIT {
         var patchRequest = new UpdateProfileRequest("", null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: PATCH /api/v1/users/me with empty firstName");
+        log.debug("Act: PATCH /api/v1/users/me with empty string firstName — must be rejected");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, headers),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when firstName is an empty string")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
@@ -255,15 +263,16 @@ class UserControllerIT {
         var patchRequest = new UpdateProfileRequest(tooLong, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: PATCH /api/v1/users/me with 101-character firstName");
+        log.debug("Act: PATCH /api/v1/users/me with 101-character firstName — must exceed max length and be rejected");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, headers),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when firstName exceeds 100 characters")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
@@ -276,15 +285,16 @@ class UserControllerIT {
         var patchRequest = new UpdateProfileRequest(null, null, "not-a-phone!@#");
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: PATCH /api/v1/users/me with non-numeric phone");
+        log.debug("Act: PATCH /api/v1/users/me with phoneNumber='not-a-phone!@#' — must fail validation");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, headers),
                 String.class);
 
-        log.trace("Assert: status={}", response.getStatusCode());
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when phoneNumber contains invalid characters")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -296,7 +306,7 @@ class UserControllerIT {
     private String registerAndGetToken(
             String email, String password,
             String firstName, String lastName, String phoneNumber) throws Exception {
-        var request = new RegisterRequest(email, password, firstName, lastName, phoneNumber);
+        var request = new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, firstName, lastName, phoneNumber, null);
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);

@@ -45,6 +45,9 @@ public class User extends AuditableEntity {
     @Column(name = "is_active", nullable = false)
     private boolean isActive = true;
 
+    @Column(name = "business_name", length = 255)
+    private String businessName;
+
     @Column(name = "salon_id")
     private UUID salonId;
 
@@ -66,6 +69,19 @@ public class User extends AuditableEntity {
         this.lastName = lastName;
         this.phoneNumber = phoneNumber;
         this.isActive = true;
+    }
+
+    public User(
+            String email,
+            String passwordHash,
+            Role role,
+            String firstName,
+            String lastName,
+            String phoneNumber,
+            String businessName
+    ) {
+        this(email, passwordHash, role, firstName, lastName, phoneNumber);
+        this.businessName = businessName;
     }
 
     public User(
@@ -115,6 +131,14 @@ public class User extends AuditableEntity {
 
     public UUID getSalonId() {
         return salonId;
+    }
+
+    public String getBusinessName() {
+        return businessName;
+    }
+
+    public void setBusinessName(String businessName) {
+        this.businessName = businessName;
     }
 
     public void setSalonId(UUID salonId) {

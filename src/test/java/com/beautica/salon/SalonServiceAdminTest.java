@@ -98,7 +98,7 @@ class SalonServiceAdminTest {
 
         assertThatThrownBy(() -> salonService.deactivateSalon(adminId, salonId))
                 .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("SALON_ADMIN");
+                .hasMessage("Only SALON_OWNER may deactivate a salon");
 
         verify(salonRepository, never()).save(any());
     }

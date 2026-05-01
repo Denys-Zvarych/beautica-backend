@@ -73,5 +73,5 @@ app:
   frontend:
     base-url: ${FRONTEND_BASE_URL:http://localhost:3000}
   invite:
-    token-expiration-hours: 72
+    token-expiration-hours: 48
     from-email: noreply@beautica.app

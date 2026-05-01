@@ -5,6 +5,7 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.JwtConfig;
 import com.beautica.master.entity.Master;
@@ -17,6 +18,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
@@ -90,7 +93,7 @@ class AuthServiceTest {
     void should_returnAuthResponse_when_registerSucceeds() {
         var request = new RegisterRequest(
                 "new@example.com", "password123",
-                "John", "Doe", null);
+                SelfRegistrationRole.CLIENT, "John", "Doe", null, null);
         log.debug("Arrange: seeding register request for email={}", request.email());
 
         var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
@@ -103,12 +106,12 @@ class AuthServiceTest {
         });
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        log.debug("Act: calling authService.register");
+        log.debug("Act: register CLIENT with valid email new@example.com");
         var response = authService.register(request);
 
-        log.trace("Assert: response email={}, role={}, tokenType={}",
-                response.email(), response.role(), response.tokenType());
-        assertThat(response.email()).isEqualTo("new@example.com");
+        assertThat(response.email())
+                .as("email in response must match registration email")
+                .isEqualTo("new@example.com");
         assertThat(response.role()).isEqualTo(Role.CLIENT);
         assertThat(response.accessToken()).isNotBlank();
         assertThat(response.refreshToken()).isNotBlank();
@@ -120,17 +123,16 @@ class AuthServiceTest {
     void should_throwBusinessException_when_emailAlreadyRegistered() {
         var request = new RegisterRequest(
                 "taken@example.com", "password123",
-                null, null, null);
+                SelfRegistrationRole.CLIENT, null, null, null, null);
         log.debug("Arrange: existing email={} already registered", request.email());
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: calling authService.register expecting BusinessException");
+        log.debug("Act: register with already-taken email taken@example.com — expects BusinessException");
         assertThatThrownBy(() -> authService.register(request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("already registered");
 
-        log.trace("Assert: userRepository.save was never invoked");
         verify(userRepository, never()).save(any());
     }
 
@@ -152,10 +154,9 @@ class AuthServiceTest {
         });
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        log.debug("Act: calling authService.registerIndependentMaster");
+        log.debug("Act: register independent master with valid email master@example.com");
         var response = authService.registerIndependentMaster(request);
 
-        log.trace("Assert: role=INDEPENDENT_MASTER, tokens present");
         assertThat(response.role()).isEqualTo(Role.INDEPENDENT_MASTER);
         assertThat(response.email()).isEqualTo("master@example.com");
         assertThat(response.accessToken()).isNotBlank();
@@ -173,12 +174,11 @@ class AuthServiceTest {
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: calling authService.registerIndependentMaster expecting BusinessException");
+        log.debug("Act: register independent master with already-registered email taken@example.com");
         assertThatThrownBy(() -> authService.registerIndependentMaster(request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("already registered");
 
-        log.trace("Assert: userRepository.save was never invoked");
         verify(userRepository, never()).save(any());
     }
 
@@ -196,10 +196,9 @@ class AuthServiceTest {
         when(userRepository.findByEmail("login@example.com")).thenReturn(Optional.of(user));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        log.debug("Act: calling authService.login");
+        log.debug("Act: login with correct credentials for SALON_OWNER email=login@example.com");
         var response = authService.login(new LoginRequest("login@example.com", rawPassword));
 
-        log.trace("Assert: login response email={}, role={}", response.email(), response.role());
         assertThat(response.email()).isEqualTo("login@example.com");
         assertThat(response.role()).isEqualTo(Role.SALON_OWNER);
         assertThat(response.accessToken()).isNotBlank();
@@ -214,7 +213,7 @@ class AuthServiceTest {
 
         when(userRepository.findByEmail("u@example.com")).thenReturn(Optional.of(user));
 
-        log.debug("Act: calling authService.login with a wrong password");
+        log.debug("Act: login with wrong password for existing email u@example.com");
         assertThatThrownBy(() -> authService.login(new LoginRequest("u@example.com", "wrongPass")))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Invalid email or password");
@@ -226,7 +225,7 @@ class AuthServiceTest {
         log.debug("Arrange: userRepository returns empty for any email");
         when(userRepository.findByEmail(anyString())).thenReturn(Optional.empty());
 
-        log.debug("Act: calling authService.login with unknown email");
+        log.debug("Act: login with email no@example.com that has no matching user");
         assertThatThrownBy(() -> authService.login(new LoginRequest("no@example.com", "pass")))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Invalid email or password");
@@ -244,7 +243,7 @@ class AuthServiceTest {
 
         when(userRepository.findByEmail("inactive@example.com")).thenReturn(Optional.of(user));
 
-        log.debug("Act: calling authService.login with inactive user");
+        log.debug("Act: login with correct credentials for inactive account inactive@example.com");
         assertThatThrownBy(() -> authService.login(new LoginRequest("inactive@example.com", rawPassword)))
                 .isInstanceOf(BusinessException.class)
                 .extracting(ex -> ((BusinessException) ex).getStatus())
@@ -270,13 +269,14 @@ class AuthServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        log.debug("Act: calling authService.refresh");
+        log.debug("Act: refresh token rotation with valid non-expired token for userId={}", userId);
         var response = authService.refresh(new RefreshRequest(rawToken));
 
-        log.trace("Assert: new tokens issued, old token revoked={}", storedToken.isRevoked());
         assertThat(response.accessToken()).isNotBlank();
         assertThat(response.refreshToken()).isNotBlank();
-        assertThat(storedToken.isRevoked()).isTrue();
+        assertThat(storedToken.isRevoked())
+                .as("old refresh token must be revoked after rotation, userId=%s", userId)
+                .isTrue();
     }
 
     @Test
@@ -292,7 +292,7 @@ class AuthServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
 
-        log.debug("Act: calling authService.refresh with revoked token");
+        log.debug("Act: refresh with a token that has already been revoked for userId={}", userId);
         assertThatThrownBy(() -> authService.refresh(new RefreshRequest(rawToken)))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("revoked");
@@ -307,7 +307,7 @@ class AuthServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn("some-hash");
         when(refreshTokenRepository.findByToken(anyString())).thenReturn(Optional.empty());
 
-        log.debug("Act: calling authService.refresh with unknown token");
+        log.debug("Act: refresh with token 'nonexistent' which has no DB record");
         assertThatThrownBy(() -> authService.refresh(new RefreshRequest(rawToken)))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("not found");
@@ -319,11 +319,126 @@ class AuthServiceTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: userId={}", userId);
 
-        log.debug("Act: calling authService.logout");
+        log.debug("Act: logout for userId={} — expects all refresh tokens to be deleted", userId);
         authService.logout(userId);
 
-        log.trace("Assert: deleteByUserId called with userId={}", userId);
         verify(refreshTokenRepository).deleteByUserId(userId);
+    }
+
+    @Test
+    @DisplayName("register stores businessName when SALON_OWNER registers with valid businessName")
+    void should_storeBusinessName_when_salonOwnerRegisters() {
+        var request = new RegisterRequest(
+                "owner@example.com", "password123",
+                SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "Beauty Studio Lviv");
+        log.debug("Arrange: SALON_OWNER request with businessName={}", request.businessName());
+
+        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
+                UUID.randomUUID(), "owner@example.com", Role.SALON_OWNER);
+        when(userRepository.existsByEmail("owner@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+
+        log.debug("Act: register SALON_OWNER with businessName='Beauty Studio Lviv'");
+        authService.register(request);
+
+        verify(userRepository).save(org.mockito.ArgumentMatchers.argThat(u ->
+                "Beauty Studio Lviv".equals(u.getBusinessName())));
+    }
+
+    @Test
+    @DisplayName("register throws BusinessException when SALON_OWNER registers without businessName")
+    void should_throwBusinessException_when_salonOwnerRegistersWithoutBusinessName() {
+        var request = new RegisterRequest(
+                "owner@example.com", "password123",
+                SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, null);
+        log.debug("Arrange: SALON_OWNER request with null businessName");
+
+        when(userRepository.existsByEmail("owner@example.com")).thenReturn(false);
+
+        log.debug("Act: register SALON_OWNER with null businessName — expects validation failure");
+        assertThatThrownBy(() -> authService.register(request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("businessName is required for SALON_OWNER");
+
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("register throws BusinessException when SALON_OWNER registers with blank businessName")
+    void should_throwBusinessException_when_salonOwnerRegistersWithBlankBusinessName() {
+        var request = new RegisterRequest(
+                "owner@example.com", "password123",
+                SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "   ");
+        log.debug("Arrange: SALON_OWNER request with whitespace-only businessName");
+
+        when(userRepository.existsByEmail("owner@example.com")).thenReturn(false);
+
+        log.debug("Act: register SALON_OWNER with whitespace-only businessName — expects validation failure");
+        assertThatThrownBy(() -> authService.register(request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("businessName is required for SALON_OWNER");
+
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("register does not require businessName when CLIENT registers")
+    void should_notRequireBusinessName_when_clientRegisters() {
+        var request = new RegisterRequest(
+                "client@example.com", "password123",
+                SelfRegistrationRole.CLIENT, "Ivan", "Petrenko", null, null);
+        log.debug("Arrange: CLIENT request without businessName");
+
+        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
+                UUID.randomUUID(), "client@example.com", Role.CLIENT);
+        when(userRepository.existsByEmail("client@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+
+        log.debug("Act: register CLIENT without businessName — should succeed");
+        var response = authService.register(request);
+
+        assertThat(response.role()).isEqualTo(Role.CLIENT);
+        verify(userRepository).save(any(User.class));
+    }
+
+    @ParameterizedTest
+    @EnumSource(SelfRegistrationRole.class)
+    @DisplayName("register succeeds for every permitted self-registration role when prerequisites are met")
+    void should_register_when_permittedRole(SelfRegistrationRole role) {
+        boolean isSalonOwner = role == SelfRegistrationRole.SALON_OWNER;
+        String businessName = isSalonOwner ? "Test Salon" : null;
+        var request = new RegisterRequest(
+                "valid@example.com", "password123",
+                role, "Test", "User", null, businessName);
+        log.debug("Arrange: registering with permitted role={}", role);
+
+        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
+                UUID.randomUUID(), "valid@example.com", role.toRole());
+        when(userRepository.existsByEmail("valid@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+
+        log.debug("Act: register with permitted self-registration role={}", role);
+        var response = authService.register(request);
+
+        assertThat(response.role())
+                .as("registered role must equal requested role=%s", role)
+                .isEqualTo(role.toRole());
+        verify(userRepository).save(any(User.class));
     }
 
     private User buildUser(UUID id, String email, String passwordHash, Role role) {
