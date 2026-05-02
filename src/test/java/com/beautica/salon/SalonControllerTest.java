@@ -84,6 +84,7 @@ class SalonControllerTest {
     @AfterEach
     void cleanUp() {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
+        jdbcTemplate.execute("DELETE FROM masters");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
         jdbcTemplate.execute("DELETE FROM users");
@@ -298,6 +299,49 @@ class SalonControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/salons — 201 on second salon creation when SALON_OWNER already owns one salon")
+    void should_return201_when_salonOwnerCreatesSecondSalon() throws Exception {
+        String token = createSalonOwnerAndGetToken(
+                "owner-multi-" + System.nanoTime() + "@beautica.test");
+        createSalon(token, "First Salon");
+
+        var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null);
+
+        log.debug("Act: POST {} as SALON_OWNER who already owns one salon — multi-salon guard must be absent", SALONS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 201 when SALON_OWNER creates a second salon (one-per-owner guard removed)")
+                .isEqualTo(HttpStatus.CREATED);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<SalonResponse>>() {});
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().name()).isEqualTo("Second Salon");
+    }
+
+    @Test
+    @DisplayName("DELETE /api/v1/salons/{id} — 204 when SALON_OWNER deactivates their own salon")
+    void should_return204_when_salonOwnerDeletesOwnSalon() throws Exception {
+        String token = createSalonOwnerAndGetToken(
+                "owner-delete-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(token, "Salon To Delete");
+
+        log.debug("Act: DELETE {}/{} as SALON_OWNER — must deactivate and return 204", SALONS_URL, salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "/" + salonId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 204 when SALON_OWNER deletes their own salon, salonId=%s", salonId)
+                .isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    @Test
     @DisplayName("POST /api/v1/salons/{id}/invite — 403 when SALON_ADMIN invites into a different salon")
     void should_return403_when_salonAdminFromDifferentSalonInvites() throws Exception {
         String ownerAToken = createSalonOwnerAndGetToken(
@@ -351,9 +395,13 @@ class SalonControllerTest {
 
     private String createSalonAdminAndGetToken(String email, UUID salonId) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
+        UUID adminUserId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, salon_id, is_active) VALUES (?, ?, ?, 'SALON_ADMIN', ?, true)",
-                UUID.randomUUID(), email, hash, salonId);
+                adminUserId, email, hash, salonId);
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                UUID.randomUUID(), adminUserId, salonId);
 
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);

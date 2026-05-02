@@ -14,7 +14,6 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Component;
 
-import java.util.Objects;
 import java.util.UUID;
 
 @Component("authz")
@@ -39,7 +38,7 @@ public class AuthorizationService {
                 .orElseThrow(() -> new NotFoundException("User not found"));
         return switch (actor.getRole()) {
             case SALON_OWNER -> salonRepository.existsByIdAndOwnerId(salonId, actorId);
-            case SALON_ADMIN -> actor.getSalonId() != null && Objects.equals(actor.getSalonId(), salonId);
+            case SALON_ADMIN -> masterRepository.existsBySalonIdAndUserIdAndIsActiveTrue(salonId, actorId);
             default -> false;
         };
     }

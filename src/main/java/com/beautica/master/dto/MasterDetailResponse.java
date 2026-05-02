@@ -3,7 +3,7 @@ package com.beautica.master.dto;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.WorkingHours;
-import com.beautica.salon.dto.SalonResponse;
+import com.beautica.salon.dto.PublicSalonResponse;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -20,7 +20,7 @@ public record MasterDetailResponse(
         BigDecimal avgRating,
         int reviewCount,
         MasterType masterType,
-        SalonResponse salon,
+        PublicSalonResponse salon,
         List<WorkingHoursResponse> workingHours
 ) {
     public static MasterDetailResponse from(Master master, List<WorkingHours> hours) {
@@ -35,7 +35,7 @@ public record MasterDetailResponse(
                 master.getAvgRating(),
                 master.getReviewCount(),
                 master.getMasterType(),
-                master.getSalon() != null ? SalonResponse.from(master.getSalon()) : null,
+                master.getSalon() != null ? PublicSalonResponse.from(master.getSalon()) : null,
                 hours.stream().map(WorkingHoursResponse::from).toList()
         );
     }
