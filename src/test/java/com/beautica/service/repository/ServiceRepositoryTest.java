@@ -2,6 +2,7 @@ package com.beautica.service.repository;
 
 import com.beautica.auth.Role;
 import com.beautica.salon.entity.Salon;
+import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
@@ -68,7 +69,7 @@ class ServiceRepositoryTest {
     @DisplayName("should_returnActiveServices_when_ownerTypeAndOwnerIdMatch")
     void should_returnActiveServices_when_ownerTypeAndOwnerIdMatch() {
         ServiceDefinition activeService = ServiceDefinition.builder()
-                .ownerType("SALON")
+                .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Gel Manicure")
                 .category(ServiceCategory.MANICURE)
@@ -79,7 +80,7 @@ class ServiceRepositoryTest {
         em.persist(activeService);
 
         ServiceDefinition inactiveService = ServiceDefinition.builder()
-                .ownerType("SALON")
+                .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Classic Pedicure")
                 .category(ServiceCategory.PEDICURE)
@@ -92,7 +93,7 @@ class ServiceRepositoryTest {
         em.flush();
 
         List<ServiceDefinition> results =
-                serviceRepository.findByOwnerTypeAndOwnerIdAndIsActiveTrue("SALON", salonOwnerId);
+                serviceRepository.findByOwnerTypeAndOwnerIdAndIsActiveTrue(OwnerType.SALON, salonOwnerId);
 
         assertThat(results).hasSize(1);
         assertThat(results.get(0).getId()).isEqualTo(activeService.getId());
@@ -102,7 +103,7 @@ class ServiceRepositoryTest {
     @DisplayName("should_returnEmpty_when_ownerTypeDoesNotMatch")
     void should_returnEmpty_when_ownerTypeDoesNotMatch() {
         ServiceDefinition salonService = ServiceDefinition.builder()
-                .ownerType("SALON")
+                .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Eyebrow Shaping")
                 .category(ServiceCategory.BROWS)
@@ -115,7 +116,7 @@ class ServiceRepositoryTest {
         em.flush();
 
         List<ServiceDefinition> results =
-                serviceRepository.findByOwnerTypeAndOwnerIdAndIsActiveTrue("INDEPENDENT_MASTER", salonOwnerId);
+                serviceRepository.findByOwnerTypeAndOwnerIdAndIsActiveTrue(OwnerType.INDEPENDENT_MASTER, salonOwnerId);
 
         assertThat(results).isEmpty();
     }
@@ -124,7 +125,7 @@ class ServiceRepositoryTest {
     @DisplayName("should_returnAllActiveServices_when_onlyOwnerIdFiltered")
     void should_returnAllActiveServices_when_onlyOwnerIdFiltered() {
         ServiceDefinition salonService = ServiceDefinition.builder()
-                .ownerType("SALON")
+                .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Gel Manicure")
                 .category(ServiceCategory.MANICURE)
@@ -135,7 +136,7 @@ class ServiceRepositoryTest {
         em.persist(salonService);
 
         ServiceDefinition independentMasterService = ServiceDefinition.builder()
-                .ownerType("INDEPENDENT_MASTER")
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(salonOwnerId)
                 .name("Eyelash Extensions")
                 .category(ServiceCategory.EYELASH)

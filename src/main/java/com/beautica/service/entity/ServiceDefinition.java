@@ -8,6 +8,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -19,7 +20,11 @@ import java.math.BigDecimal;
 import java.util.UUID;
 
 @Entity
-@Table(name = "service_definitions")
+@Table(name = "service_definitions",
+        indexes = {
+                @Index(name = "idx_service_def_owner_active",      columnList = "owner_id, is_active"),
+                @Index(name = "idx_service_def_owner_type_active", columnList = "owner_type, owner_id, is_active")
+        })
 @Getter
 @Setter
 @NoArgsConstructor
@@ -32,11 +37,12 @@ public class ServiceDefinition extends AuditableEntity {
     private UUID id;
 
     /**
-     * Polymorphic owner type. Accepted values: "SALON" or "INDEPENDENT_MASTER".
+     * Polymorphic owner type. Type-safe enum — SALON or INDEPENDENT_MASTER.
      * No FK constraint — enforced at the application layer.
      */
+    @Enumerated(EnumType.STRING)
     @Column(name = "owner_type", nullable = false, length = 20)
-    private String ownerType;
+    private OwnerType ownerType;
 
     /**
      * Raw UUID of the owning entity (Salon.id or Master.id).

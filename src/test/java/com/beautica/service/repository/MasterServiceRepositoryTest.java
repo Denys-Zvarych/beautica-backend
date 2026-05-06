@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
@@ -68,7 +69,7 @@ class MasterServiceRepositoryTest {
         em.persist(master);
 
         serviceDefinition = ServiceDefinition.builder()
-                .ownerType("INDEPENDENT_MASTER")
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Gel Manicure")
                 .category(ServiceCategory.MANICURE)
@@ -85,7 +86,7 @@ class MasterServiceRepositoryTest {
     @DisplayName("should_findActiveServicesByMasterId_when_masterHasServices")
     void should_findActiveServicesByMasterId_when_masterHasServices() {
         ServiceDefinition secondService = ServiceDefinition.builder()
-                .ownerType("INDEPENDENT_MASTER")
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Classic Manicure")
                 .category(ServiceCategory.MANICURE)
@@ -108,7 +109,7 @@ class MasterServiceRepositoryTest {
                 .build();
 
         ServiceDefinition inactiveServiceDef = ServiceDefinition.builder()
-                .ownerType("INDEPENDENT_MASTER")
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Pedicure")
                 .category(ServiceCategory.PEDICURE)
