@@ -116,7 +116,7 @@ public class SalonService {
 
     @Transactional(readOnly = true)
     public List<SalonResponse> getOwnerSalons(UUID ownerId) {
-        return salonRepository.findAllByOwnerIdFetchOwner(ownerId)
+        return salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)
                 .stream()
                 .map(SalonResponse::from)
                 .toList();
