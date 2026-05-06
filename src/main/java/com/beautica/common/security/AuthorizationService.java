@@ -38,7 +38,7 @@ public class AuthorizationService {
                 .orElseThrow(() -> new NotFoundException("User not found"));
         return switch (actor.getRole()) {
             case SALON_OWNER -> salonRepository.existsByIdAndOwnerId(salonId, actorId);
-            case SALON_ADMIN -> masterRepository.existsBySalonIdAndUserIdAndIsActiveTrue(salonId, actorId);
+            case SALON_ADMIN -> salonId.equals(actor.getSalonId());
             default -> false;
         };
     }
