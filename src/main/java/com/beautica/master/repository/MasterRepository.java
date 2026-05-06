@@ -25,6 +25,8 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     )
     Page<Master> findBySalonIdAndIsActiveTrueWithUser(@Param("salonId") UUID salonId, Pageable pageable);
 
+    boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
+
     /**
      * Eagerly fetches the master together with its user, salon, and salon owner.
      * Used in authorization checks that run outside an active JPA session.

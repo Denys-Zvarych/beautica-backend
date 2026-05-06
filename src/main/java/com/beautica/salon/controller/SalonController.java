@@ -6,6 +6,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.InviteRequest;
+import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
@@ -46,8 +47,8 @@ public class SalonController {
     }
 
     @GetMapping("/{salonId}")
-    public ApiResponse<SalonResponse> getSalon(@PathVariable UUID salonId) {
-        return ApiResponse.ok(salonService.getSalon(salonId));
+    public ApiResponse<PublicSalonResponse> getSalon(@PathVariable UUID salonId) {
+        return ApiResponse.ok(PublicSalonResponse.from(salonService.getSalonEntity(salonId)));
     }
 
     @PatchMapping("/{salonId}")

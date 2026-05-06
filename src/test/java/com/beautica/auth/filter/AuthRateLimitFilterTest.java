@@ -20,6 +20,7 @@ import java.io.IOException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -30,8 +31,7 @@ class AuthRateLimitFilterTest {
 
     private static final Logger log = LoggerFactory.getLogger(AuthRateLimitFilterTest.class);
 
-    private static final String REMOTE_ADDR   = "10.0.0.1";
-    private static final String FORWARDED_IP  = "203.0.113.42";
+    private static final String REMOTE_ADDR = "10.0.0.1";
 
     // ── mocks ──────────────────────────────────────────────────────────────────
     @Mock private LoadingCache<String, Bucket> loginBuckets;
@@ -220,40 +220,51 @@ class AuthRateLimitFilterTest {
     class IpResolution {
 
         @Test
-        @DisplayName("uses first X-Forwarded-For IP as bucket key when header is present")
-        void should_useXForwardedForFirstValue_when_headerPresent() throws Exception {
-            log.debug("Arrange: X-Forwarded-For={} present; filter must use leftmost IP as rate-limit key", FORWARDED_IP);
-            when(loginBuckets.get(FORWARDED_IP)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+        @DisplayName("enforces limit on getRemoteAddr even when X-Forwarded-For rotates — bypass prevention")
+        void should_return429_when_xForwardedForRotatesButRemoteAddrIsTheSame() throws Exception {
+            when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1))
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(false);
 
-            var request = postRequest("/api/v1/auth/login");
-            request.addHeader("X-Forwarded-For", FORWARDED_IP + ", 192.168.1.1, 10.10.0.1");
-            var response = new MockHttpServletResponse();
-            var chain    = new MockFilterChain();
+            String[] rotatingIps = {
+                "1.2.3.4", "5.6.7.8", "9.10.11.12", "13.14.15.16", "17.18.19.20"
+            };
 
-            log.debug("Act: doFilterInternal — X-Forwarded-For header present, bucket must key by first IP {}", FORWARDED_IP);
-            doFilter(request, response, chain);
+            MockHttpServletResponse lastResponse = null;
+            MockFilterChain lastChain = null;
 
-            verify(loginBuckets).get(FORWARDED_IP);
-            verify(loginBuckets, never()).get(REMOTE_ADDR);
-            assertThat(chain.getRequest())
-                    .as("chain must be forwarded when XFF bucket allows the request")
-                    .isNotNull();
+            for (String fakeIp : rotatingIps) {
+                var request  = postRequest("/api/v1/auth/login");
+                request.addHeader("X-Forwarded-For", fakeIp);
+                lastResponse = new MockHttpServletResponse();
+                lastChain    = new MockFilterChain();
+
+                doFilter(request, lastResponse, lastChain);
+            }
+
+            assertThat(lastResponse.getStatus())
+                    .as("5th request must be 429 — limiter keys on getRemoteAddr, not the rotating XFF header")
+                    .isEqualTo(429);
+            assertThat(lastChain.getRequest())
+                    .as("filter chain must not be forwarded on the 5th (throttled) request")
+                    .isNull();
+            verify(loginBuckets, times(5)).get(REMOTE_ADDR);
         }
 
         @Test
-        @DisplayName("falls back to getRemoteAddr when X-Forwarded-For is absent")
-        void should_useRemoteAddr_when_xForwardedForHeaderAbsent() throws Exception {
-            log.debug("Arrange: no X-Forwarded-For header; remoteAddr={}", REMOTE_ADDR);
+        @DisplayName("keys on getRemoteAddr as the sole IP source of truth")
+        void should_useRemoteAddr_asIpKey() throws Exception {
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
             when(bucket.tryConsume(1)).thenReturn(true);
 
-            // postRequest() does not set X-Forwarded-For — deliberately absent.
             var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
-            log.debug("Act: doFilterInternal — no X-Forwarded-For, must fall back to remoteAddr={}", REMOTE_ADDR);
             doFilter(request, response, chain);
 
             verify(loginBuckets).get(REMOTE_ADDR);

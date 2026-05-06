@@ -92,10 +92,9 @@ public class SalonService {
     }
 
     @Transactional(readOnly = true)
-    public SalonResponse getSalon(UUID salonId) {
-        var salon = salonRepository.findById(salonId)
+    public Salon getSalonEntity(UUID salonId) {
+        return salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
-        return SalonResponse.from(salon);
     }
 
     @Transactional
@@ -131,12 +130,12 @@ public class SalonService {
             throw new ForbiddenException("Only SALON_OWNER may deactivate a salon");
         }
 
-        var salon = salonRepository.findById(salonId)
-                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
-
-        if (!salon.getOwner().getId().equals(ownerId)) {
+        if (!salonRepository.existsByIdAndOwnerId(salonId, ownerId)) {
             throw new ForbiddenException("Access denied");
         }
+
+        var salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
 
         salon.setActive(false);
         salonRepository.save(salon);

@@ -112,13 +112,13 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("getSalon — throws NotFoundException when salonId does not exist")
-    void should_throwNotFound_when_getSalonWithUnknownId() {
+    @DisplayName("getSalonEntity — throws NotFoundException when salonId does not exist")
+    void should_throwNotFound_when_getSalonEntityWithUnknownId() {
         UUID salonId = UUID.randomUUID();
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> salonService.getSalon(salonId))
+        assertThatThrownBy(() -> salonService.getSalonEntity(salonId))
                 .isInstanceOf(NotFoundException.class);
     }
 
@@ -174,6 +174,7 @@ class SalonServiceTest {
         Salon salon = buildSalon(salonId, owner, "Active Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -195,7 +196,7 @@ class SalonServiceTest {
         Salon salon = buildSalon(salonId, realOwner, "Salon");
 
         when(userRepository.findById(attackerId)).thenReturn(Optional.of(attacker));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.existsByIdAndOwnerId(salonId, attackerId)).thenReturn(false);
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
                 .isInstanceOf(ForbiddenException.class);
