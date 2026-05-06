@@ -8,6 +8,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
@@ -27,7 +28,10 @@ import java.util.UUID;
  * the Spring @Service stereotype annotation naming convention.
  */
 @Entity
-@Table(name = "master_services")
+@Table(name = "master_services",
+        indexes = {
+                @Index(name = "idx_master_services_master_active", columnList = "master_id, is_active")
+        })
 @Getter
 @Setter
 @NoArgsConstructor
