@@ -26,6 +26,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -44,6 +45,13 @@ public class SalonController {
         UUID ownerId = extractUserId(authentication);
         SalonResponse response = salonService.createSalon(ownerId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    @GetMapping("/mine")
+    @PreAuthorize("hasRole('SALON_OWNER')")
+    public ApiResponse<List<SalonResponse>> getOwnedSalons(Authentication authentication) {
+        UUID ownerId = extractUserId(authentication);
+        return ApiResponse.ok(salonService.getOwnerSalons(ownerId));
     }
 
     @GetMapping("/{salonId}")

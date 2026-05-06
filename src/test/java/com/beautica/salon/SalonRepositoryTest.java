@@ -37,10 +37,10 @@ class SalonRepositoryTest {
     private TestEntityManager em;
 
     @Test
-    @DisplayName("findAllByOwnerIdFetchOwner — returns only the target owner's salons with owner initialised")
-    void should_returnOwnerSalonsWithOwnerFetched_when_ownerHasMultipleSalons() {
+    @DisplayName("findAllByOwnerIdAndIsActiveTrue — returns only active salons for the target owner")
+    void should_returnOnlyActiveSalons_when_ownerHasActiveAndInactiveSalons() {
         User owner = new User(
-                "owner-fetch-" + UUID.randomUUID() + "@beautica.test",
+                "owner-active-" + UUID.randomUUID() + "@beautica.test",
                 "$2a$10$hashedpassword",
                 Role.SALON_OWNER,
                 "Olena",
@@ -59,15 +59,15 @@ class SalonRepositoryTest {
         );
         em.persist(otherOwner);
 
-        Salon salonOne = Salon.builder()
+        Salon activeSalon = Salon.builder()
                 .owner(owner)
-                .name("Salon One")
+                .name("Active Salon")
                 .isActive(true)
                 .build();
-        Salon salonTwo = Salon.builder()
+        Salon inactiveSalon = Salon.builder()
                 .owner(owner)
-                .name("Salon Two")
-                .isActive(true)
+                .name("Inactive Salon")
+                .isActive(false)
                 .build();
         Salon otherSalon = Salon.builder()
                 .owner(otherOwner)
@@ -75,24 +75,24 @@ class SalonRepositoryTest {
                 .isActive(true)
                 .build();
 
-        em.persist(salonOne);
-        em.persist(salonTwo);
+        em.persist(activeSalon);
+        em.persist(inactiveSalon);
         em.persist(otherSalon);
         em.flush();
         em.clear();
 
-        List<Salon> results = salonRepository.findAllByOwnerIdFetchOwner(owner.getId());
+        List<Salon> results = salonRepository.findAllByOwnerIdAndIsActiveTrue(owner.getId());
 
         assertThat(results)
-                .as("only salons belonging to the target owner must be returned")
-                .hasSize(2);
+                .as("only active salons belonging to the target owner must be returned")
+                .hasSize(1);
+        assertThat(results)
+                .extracting(Salon::getName)
+                .as("only the active salon must be present; the inactive one must be excluded")
+                .containsExactly("Active Salon");
         assertThat(results)
                 .extracting(s -> s.getOwner().getId())
-                .as("every returned salon must reference the correct owner (fetch join — no proxy)")
+                .as("every returned salon must belong to the target owner")
                 .containsOnly(owner.getId());
-        assertThat(results)
-                .extracting(s -> s.getOwner().getEmail())
-                .as("owner email must be accessible without LazyInitializationException (join fetch initialised proxy)")
-                .allMatch(email -> email.startsWith("owner-fetch-"));
     }
 }

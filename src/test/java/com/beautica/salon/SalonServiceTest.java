@@ -85,7 +85,7 @@ class SalonServiceTest {
         var salon1 = buildSalon(UUID.randomUUID(), owner, "Salon Alpha");
         var salon2 = buildSalon(UUID.randomUUID(), owner, "Salon Beta");
 
-        when(salonRepository.findAllByOwnerIdFetchOwner(ownerId)).thenReturn(List.of(salon1, salon2));
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salon1, salon2));
 
         List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
 
@@ -93,7 +93,7 @@ class SalonServiceTest {
         assertThat(responses).extracting(SalonResponse::name)
                 .containsExactlyInAnyOrder("Salon Alpha", "Salon Beta");
         assertThat(responses).allMatch(r -> ownerId.equals(r.ownerId()));
-        verify(salonRepository).findAllByOwnerIdFetchOwner(ownerId);
+        verify(salonRepository).findAllByOwnerIdAndIsActiveTrue(ownerId);
     }
 
     @Test
