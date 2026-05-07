@@ -73,6 +73,7 @@ springdoc:
     path: /api-docs
   swagger-ui:
     path: /swagger-ui.html
+    custom-js-url: /swagger-auth.js
 
 app:
   jwt:

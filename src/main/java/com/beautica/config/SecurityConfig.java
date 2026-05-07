@@ -6,8 +6,6 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.env.Environment;
-import org.springframework.core.env.Profiles;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
@@ -34,23 +32,18 @@ public class SecurityConfig {
 
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
-    private final Environment environment;
 
     @Value("${app.frontend.base-url}")
     private String frontendBaseUrl;
 
     public SecurityConfig(JwtAuthenticationFilter jwtAuthenticationFilter,
-                          AuthRateLimitFilter authRateLimitFilter,
-                          Environment environment) {
+                          AuthRateLimitFilter authRateLimitFilter) {
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
         this.authRateLimitFilter = authRateLimitFilter;
-        this.environment = environment;
     }
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
-        boolean isDevProfile = environment.acceptsProfiles(Profiles.of("local | test"));
-
         var authorizeConfig = http
                 .csrf(AbstractHttpConfigurer::disable)
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
@@ -61,10 +54,9 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> {
                     auth.requestMatchers("/api/v1/auth/register", "/api/v1/auth/register/independent-master", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/invite/accept").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll();
-                    if (isDevProfile) {
-                        auth.requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll();
-                        auth.requestMatchers("/api-docs/**", "/api-docs").permitAll();
-                    }
+                    auth.requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll();
+                    auth.requestMatchers("/api-docs/**", "/api-docs").permitAll();
+                    auth.requestMatchers("/swagger-auth.js").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/actuator/health").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll();
