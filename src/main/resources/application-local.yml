@@ -2,7 +2,7 @@ spring:
   datasource:
     url: jdbc:postgresql://localhost:5432/beautica
     username: beautica
-    password: REPLACE_WITH_LOCAL_DB_PASSWORD   # docker-compose default: beautica
+    password: beautica
     driver-class-name: org.postgresql.Driver
 
   jpa:
@@ -34,7 +34,7 @@ spring:
 
 app:
   jwt:
-    secret: REPLACE_WITH_LOCAL_JWT_SECRET      # generate: openssl rand -base64 48
+    secret: Ys9eSVVCRjTO8UIMW36Gj5mEuJVPtYRL1cja0XG5JnL+Fdv2osHaBqnP+NXX1hUm      # generate: openssl rand -base64 48
     access-token-expiration: 900000
     refresh-token-expiration: 604800000
   cloudflare-r2:
