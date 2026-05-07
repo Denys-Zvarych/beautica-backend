@@ -313,6 +313,45 @@ class ServiceControllerTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.NO_CONTENT);
     }
 
+    @Test
+    @DisplayName("DELETE /services/{id} — 401 when no Authorization header is present")
+    void should_return401_when_deleteServiceWithoutAuth() {
+        UUID anyId = UUID.randomUUID();
+
+        log.debug("Act: DELETE /api/v1/services/{} without Authorization header — must return 401", anyId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + anyId, HttpMethod.DELETE,
+                new HttpEntity<>(jsonHeaders()),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when DELETE /services/{id} is called without a Bearer token")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 403 when authenticated owner targets a non-existent service definition UUID")
+    void should_return403_when_ownerDeletesNonExistentServiceDefinition() throws Exception {
+        // canManageServiceDefinition calls serviceRepository.findOwnerUserId(serviceDefId).
+        // When the service definition does not exist that query returns empty, so the
+        // @PreAuthorize SpEL evaluates to false and Spring Security short-circuits with 403.
+        // This means a non-existent ID is indistinguishable from an unauthorised one at the
+        // HTTP boundary — intentional existence-oracle protection.
+        String ownerToken = createSalonOwnerAndGetToken(
+                "svc-del-missing-" + System.nanoTime() + "@beautica.test");
+        UUID nonExistentId = UUID.randomUUID();
+
+        log.debug("Act: DELETE /api/v1/services/{} with valid owner token but missing service def — must return 403", nonExistentId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + nonExistentId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 403 (not 404) when the service definition does not exist — @PreAuthorize denies before the service method runs")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String createSalonOwnerAndGetToken(String email) throws Exception {

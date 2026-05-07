@@ -174,30 +174,13 @@ public class ServiceCatalogService {
         @CacheEvict(value = "service-types", allEntries = true),
         @CacheEvict(value = "service-categories", allEntries = true)
     })
-    public void deactivateServiceDefinition(UUID ownerId, UUID serviceDefId) {
+    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller — any future caller must enforce the same guard.
+    public void deactivateServiceDefinition(UUID serviceDefId) {
         ServiceDefinition definition = serviceRepository.findById(serviceDefId)
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
 
-        verifyOwnership(ownerId, definition);
-
         definition.setActive(false);
         serviceRepository.save(definition);
-    }
-
-    private void verifyOwnership(UUID requestingUserId, ServiceDefinition definition) {
-        if (definition.getOwnerType() == OwnerType.SALON) {
-            var salon = salonRepository.findById(definition.getOwnerId())
-                    .orElseThrow(() -> new NotFoundException("Salon not found: " + definition.getOwnerId()));
-            if (!salon.getOwner().getId().equals(requestingUserId)) {
-                throw new ForbiddenException("Not authorised to modify this service definition");
-            }
-        } else {
-            var master = masterRepository.findById(definition.getOwnerId())
-                    .orElseThrow(() -> new NotFoundException("Master not found: " + definition.getOwnerId()));
-            if (!master.getUser().getId().equals(requestingUserId)) {
-                throw new ForbiddenException("Not authorised to modify this service definition");
-            }
-        }
     }
 
     @Cacheable("service-categories")

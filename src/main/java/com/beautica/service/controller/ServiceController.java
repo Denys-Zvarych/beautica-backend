@@ -84,11 +84,9 @@ public class ServiceController {
     @DeleteMapping("/services/{serviceDefId}")
     @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
     public ResponseEntity<Void> deactivateServiceDefinition(
-            @PathVariable UUID serviceDefId,
-            Authentication authentication
+            @PathVariable UUID serviceDefId
     ) {
-        UUID ownerId = extractUserId(authentication);
-        serviceCatalogService.deactivateServiceDefinition(ownerId, serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
         return ResponseEntity.noContent().build();
     }
 

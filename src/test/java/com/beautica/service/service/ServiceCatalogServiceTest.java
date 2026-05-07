@@ -319,17 +319,10 @@ class ServiceCatalogServiceTest {
     // ── deactivateServiceDefinition ────────────────────────────────────────────
 
     @Test
-    @DisplayName("deactivates ServiceDefinition when owner requests it")
+    @DisplayName("deactivates ServiceDefinition when requested")
     void should_deactivateServiceDefinition_when_ownerRequests() {
-        UUID ownerId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-
-        User owner = mock(User.class);
-        when(owner.getId()).thenReturn(ownerId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(owner);
 
         ServiceDefinition definition = ServiceDefinition.builder()
                 .id(serviceDefId)
@@ -342,47 +335,23 @@ class ServiceCatalogServiceTest {
                 .build();
 
         when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(definition));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(definition);
 
-        serviceCatalogService.deactivateServiceDefinition(ownerId, serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
 
         assertThat(definition.isActive()).isFalse();
         verify(serviceRepository).save(definition);
     }
 
     @Test
-    @DisplayName("throws ForbiddenException when non-owner attempts to deactivate a service definition")
-    void should_throwForbidden_when_nonOwnerDeactivatesServiceDefinition() {
-        UUID ownerId = UUID.randomUUID();
-        UUID differentOwnerId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
+    @DisplayName("throws NotFoundException when service definition does not exist")
+    void should_throwNotFoundException_when_serviceDefinitionDoesNotExist() {
+        UUID missing = UUID.randomUUID();
+        when(serviceRepository.findById(missing)).thenReturn(Optional.empty());
 
-        User actualOwner = mock(User.class);
-        when(actualOwner.getId()).thenReturn(differentOwnerId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(actualOwner);
-
-        ServiceDefinition definition = ServiceDefinition.builder()
-                .id(serviceDefId)
-                .ownerType(OwnerType.SALON)
-                .ownerId(salonId)
-                .name("Manicure")
-                .baseDurationMinutes(60)
-                .bufferMinutesAfter(0)
-                .isActive(true)
-                .build();
-
-        when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(definition));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-
-        assertThatThrownBy(() ->
-                serviceCatalogService.deactivateServiceDefinition(ownerId, serviceDefId))
-                .isInstanceOf(ForbiddenException.class);
-
-        verify(serviceRepository, never()).save(any());
+        assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(missing))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining(missing.toString());
     }
 
     // ── serviceType linkage ────────────────────────────────────────────────────
