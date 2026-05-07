@@ -504,5 +504,31 @@ class AuthRateLimitFilterTest {
                     .isNotNull();
             verify(loginBuckets).get(ipv6);
         }
+
+        @Test
+        @DisplayName("falls back to getRemoteAddr when leftmost XFF entry exceeds 45 characters (max IPv6 length)")
+        void should_fallBackToRemoteAddr_when_xffEntryExceedsMaxIpLength() throws Exception {
+            String oversizedIp = "a".repeat(46);
+            log.debug("Arrange: XFF leftmost entry is {} chars (> 45 max) — must fall back to REMOTE_ADDR ({})",
+                    oversizedIp.length(), REMOTE_ADDR);
+            when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request = postRequest("/api/v1/auth/login");
+            request.addHeader("X-Forwarded-For", oversizedIp);
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal with oversized XFF entry — guard must reject it and fall back to REMOTE_ADDR");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("must be 200 — bucket keyed on REMOTE_ADDR was not exhausted")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest())
+                    .as("filter chain must be forwarded when the REMOTE_ADDR bucket allows the request")
+                    .isNotNull();
+            verify(loginBuckets).get(REMOTE_ADDR);
+        }
     }
 }
