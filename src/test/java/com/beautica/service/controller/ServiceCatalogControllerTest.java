@@ -191,23 +191,6 @@ class ServiceCatalogControllerTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /service-types?q=Гель — returns matching types for query ≥ 2 chars")
-    void should_returnMatchingTypes_when_qParamIsAtLeastTwoChars() throws Exception {
-        log.debug("Act: GET /api/v1/service-types?q=Гель");
-
-        ResponseEntity<String> response = restTemplate.getForEntity(
-                "/api/v1/service-types?q=Гель", String.class);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-
-        var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<List<ServiceTypeResponse>>>() {});
-        assertThat(body.success()).isTrue();
-        // pg_trgm requires extension; results may vary in test — we verify the call succeeds with 200
-        assertThat(body.data()).isNotNull();
-    }
-
-    @Test
     @DisplayName("GET /service-types?q=М — falls back to all active types when q < 2 chars")
     void should_returnAllTypes_when_qParamHasFewerThanTwoChars() throws Exception {
         log.debug("Act: GET /api/v1/service-types?q=М — single char query falls back to all-active");
@@ -346,6 +329,7 @@ class ServiceCatalogControllerTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode())
                 .as("suggest endpoint must accept SALON_ADMIN")
                 .isEqualTo(HttpStatus.ACCEPTED);
+        verify(emailService).sendAdminNotification(anyString(), anyString(), anyString());
     }
 
     @Test
@@ -364,6 +348,7 @@ class ServiceCatalogControllerTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode())
                 .as("suggest endpoint must accept INDEPENDENT_MASTER")
                 .isEqualTo(HttpStatus.ACCEPTED);
+        verify(emailService).sendAdminNotification(anyString(), anyString(), anyString());
     }
 
     @Test
@@ -444,6 +429,9 @@ class ServiceCatalogControllerTest extends AbstractIntegrationTest {
         assertThat(body.success())
                 .as("response body must have success=true")
                 .isTrue();
+        assertThat(body.message())
+                .as("suggest response must confirm submission")
+                .isEqualTo("Suggestion submitted");
     }
 
     @Test

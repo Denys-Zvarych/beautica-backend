@@ -94,6 +94,13 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
                 .hasSize(3);
         assertThat(body.data()).extracting(SalonResponse::name)
                 .containsExactlyInAnyOrder("Alpha Salon", "Beta Salon", "Gamma Salon");
+        assertThat(body.data())
+                .as("each SalonResponse must have non-null id, non-null ownerId, and isActive=true")
+                .allSatisfy(salon -> {
+                    assertThat(salon.id()).isNotNull();
+                    assertThat(salon.ownerId()).isNotNull();
+                    assertThat(salon.isActive()).isTrue();
+                });
     }
 
     // -------------------------------------------------------------------------

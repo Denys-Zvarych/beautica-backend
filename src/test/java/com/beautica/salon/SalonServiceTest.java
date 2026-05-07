@@ -7,6 +7,9 @@ import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.master.dto.MasterSummaryResponse;
+import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
@@ -22,6 +25,9 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Instant;
@@ -32,6 +38,8 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -219,6 +227,51 @@ class SalonServiceTest {
         verify(salonRepository).findByIdAndOwnerId(salonId, ownerId);
         verify(salonRepository, never()).findById(any());
         verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("inviteMaster — delegates to inviteService when actor can manage salon")
+    void should_delegateToInviteService_when_inviteMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Salon salon = buildSalon(salonId, buildUser(actorId, "owner@test.com", Role.SALON_OWNER), "Test");
+        var expected = new InviteResponse("master@test.com", Instant.now().plusSeconds(3600));
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        doNothing().when(authorizationService).enforceCanManageSalon(eq(actorId), eq(salon));
+        when(inviteService.sendInvite(any(InviteRequest.class), eq(actorId))).thenReturn(expected);
+
+        InviteResponse result = salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER);
+
+        assertThat(result.invitedEmail()).isEqualTo("master@test.com");
+        verify(inviteService).sendInvite(any(InviteRequest.class), eq(actorId));
+    }
+
+    @Test
+    @DisplayName("getMastersBySalon — maps Page<Master> to Page<MasterSummaryResponse> via from() factory")
+    void should_returnMasterSummaries_when_getMastersBySalon() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.ofSize(10);
+
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master@beautica.test", Role.SALON_MASTER);
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .user(user)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+
+        Page<Master> pageOfMasters = new PageImpl<>(List.of(master), pageable, 1);
+        when(masterRepository.findBySalonIdAndIsActiveTrue(salonId, pageable)).thenReturn(pageOfMasters);
+
+        var result = salonService.getMastersBySalon(salonId, pageable);
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
+        assertThat(result.getContent().get(0).userId()).isEqualTo(userId);
+        verify(masterRepository).findBySalonIdAndIsActiveTrue(salonId, pageable);
     }
 
     private User buildUser(UUID id, String email, Role role) {

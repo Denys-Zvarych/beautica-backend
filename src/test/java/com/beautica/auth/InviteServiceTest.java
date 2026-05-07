@@ -15,8 +15,6 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
-import com.beautica.user.RefreshToken;
-import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,7 +36,6 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -69,9 +66,6 @@ class InviteServiceTest {
 
     @Mock
     private SalonRepository salonRepository;
-
-    @Mock
-    private RefreshTokenRepository refreshTokenRepository;
 
     @Mock
     private EmailService emailService;
@@ -744,19 +738,6 @@ class InviteServiceTest {
             synchronizations.forEach(TransactionSynchronization::afterCommit);
 
             verify(emailService).sendInviteEmail(eq("master@example.com"), anyString(), eq("Test Salon"));
-        } finally {
-            TransactionSynchronizationManager.clearSynchronization();
-        }
-    }
-
-    private <T> T runWithSyncFired(Supplier<T> action) {
-        TransactionSynchronizationManager.initSynchronization();
-        try {
-            T result = action.get();
-            List<TransactionSynchronization> synchronizations =
-                    TransactionSynchronizationManager.getSynchronizations();
-            synchronizations.forEach(TransactionSynchronization::afterCommit);
-            return result;
         } finally {
             TransactionSynchronizationManager.clearSynchronization();
         }

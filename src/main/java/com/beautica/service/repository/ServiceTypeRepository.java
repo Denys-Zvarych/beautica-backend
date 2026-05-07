@@ -9,6 +9,15 @@ import org.springframework.data.repository.query.Param;
 import java.util.List;
 import java.util.UUID;
 
+/**
+ * Read-only repository for service type catalog data.
+ *
+ * <p>Auth policy: {@code GET /api/v1/service-types} (list and search) is declared
+ * {@code permitAll()} in {@code SecurityConfig} — repository query methods here must not
+ * assume an authenticated principal. The {@code POST /api/v1/service-types/suggest}
+ * endpoint requires {@code SALON_OWNER}, {@code INDEPENDENT_MASTER}, or {@code SALON_ADMIN}
+ * roles, enforced at the controller layer via {@code @PreAuthorize}.
+ */
 public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> {
 
     /**

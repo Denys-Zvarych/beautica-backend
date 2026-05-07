@@ -140,6 +140,25 @@ class SalonControllerTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/salons — 400 when name is blank (fails @NotBlank validation)")
+    void should_return400_when_nameIsBlank_onCreateSalon() throws Exception {
+        String token = createSalonOwnerAndGetToken(
+                "owner-400-" + System.nanoTime() + "@beautica.test");
+
+        String blankNameBody = "{\"name\":\"\",\"city\":\"Kyiv\"}";
+
+        log.debug("Act: POST {} with blank name — must fail @NotBlank and return 400", SALONS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL, HttpMethod.POST,
+                new HttpEntity<>(blankNameBody, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("blank name must fail @NotBlank validation and return 400")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
     @DisplayName("GET /api/v1/salons/{id} — 200 without authentication (public endpoint)")
     void should_return200_when_publicGetSalon() throws Exception {
         String token = createSalonOwnerAndGetToken(
