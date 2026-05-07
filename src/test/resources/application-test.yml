@@ -16,6 +16,9 @@ spring:
     test-connection: false
 
 app:
+  rate-limit:
+    login-capacity: 100000
+    refresh-capacity: 100000
   jwt:
     secret: ${JWT_SECRET:test-jwt-secret-placeholder-min-32-bytes-testonly}
     access-token-expiration: 900000
