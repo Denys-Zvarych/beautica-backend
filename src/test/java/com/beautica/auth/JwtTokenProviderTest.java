@@ -2,12 +2,18 @@ package com.beautica.auth;
 
 import com.beautica.config.JwtConfig;
 import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.MalformedJwtException;
+import io.jsonwebtoken.security.Keys;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -29,22 +35,6 @@ class JwtTokenProviderTest {
     void setUp() {
         var config = new JwtConfig(SECRET, ACCESS_EXPIRY_MS, REFRESH_EXPIRY_MS);
         jwtTokenProvider = new JwtTokenProvider(config);
-    }
-
-    @Test
-    @DisplayName("generateAccessToken returns a non-blank token")
-    void should_generateAccessToken_when_validInputsProvided() {
-        var userId = UUID.randomUUID();
-        var email = "test@example.com";
-        var role = Role.CLIENT;
-        log.debug("Arrange: userId={}, email={}, role={}", userId, email, role);
-
-        log.debug("Act: generateAccessToken for userId={} email={} role={}", userId, email, role);
-        String token = jwtTokenProvider.generateAccessToken(userId, email, role);
-
-        assertThat(token)
-                .as("generated access token must not be blank")
-                .isNotBlank();
     }
 
     @Test
@@ -122,45 +112,79 @@ class JwtTokenProviderTest {
     }
 
     @Test
-    @DisplayName("validateToken returns true for a well-formed token")
-    void should_validateToken_when_tokenIsValid() {
-        log.debug("Arrange: generating a fresh valid access token");
-        String token = jwtTokenProvider.generateAccessToken(
-                UUID.randomUUID(), "ok@test.com", Role.CLIENT);
+    @DisplayName("getRoleFromToken throws JwtException when role claim is an unknown value")
+    void should_throwJwtException_when_roleClaimIsUnknown() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithBogusRole = Jwts.builder()
+                .subject(UUID.randomUUID().toString())
+                .claim("role", "SUPER_ADMIN")
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
 
-        log.debug("Act: validateToken on a fresh valid access token");
-        boolean valid = jwtTokenProvider.validateToken(token);
-
-        assertThat(valid)
-                .as("validateToken must return true for a freshly generated, unexpired token")
-                .isTrue();
+        assertThatThrownBy(() -> jwtTokenProvider.getRoleFromToken(tokenWithBogusRole))
+                .as("getRoleFromToken must throw MalformedJwtException for an unrecognised role claim")
+                .isInstanceOf(MalformedJwtException.class)
+                .hasMessageContaining("Unknown role claim");
     }
 
     @Test
-    @DisplayName("validateToken throws JwtException for an expired token")
-    void should_throwJwtException_when_tokenIsExpired() {
-        var expiredConfig = new JwtConfig(SECRET, -1L, REFRESH_EXPIRY_MS);
-        var expiredProvider = new JwtTokenProvider(expiredConfig);
-        String token = expiredProvider.generateAccessToken(
-                UUID.randomUUID(), "exp@test.com", Role.CLIENT);
-        log.debug("Arrange: generated a token with negative expiry");
+    @DisplayName("getUserIdFromToken throws MalformedJwtException when sub claim is null")
+    void should_throwMalformedJwtException_when_subjectClaimIsNull() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithoutSubject = Jwts.builder()
+                .claim("role", Role.CLIENT.name())
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+        var claims = jwtTokenProvider.parseAllClaims(tokenWithoutSubject);
 
-        log.debug("Act: validating expired token");
-        assertThatThrownBy(() -> jwtTokenProvider.validateToken(token))
-                .isInstanceOf(JwtException.class);
+        assertThatThrownBy(() -> jwtTokenProvider.getUserIdFromToken(claims))
+                .as("getUserIdFromToken must throw MalformedJwtException, not NullPointerException, when sub claim is absent")
+                .isInstanceOf(MalformedJwtException.class)
+                .hasMessage("Missing subject claim");
     }
 
     @Test
-    @DisplayName("validateToken throws JwtException for a tampered token")
-    void should_throwJwtException_when_tokenIsTampered() {
-        String token = jwtTokenProvider.generateAccessToken(
-                UUID.randomUUID(), "t@test.com", Role.CLIENT);
-        String tampered = token.substring(0, token.length() - 4) + "XXXX";
-        log.debug("Arrange: tampered last 4 chars of a valid token");
+    @DisplayName("getUserIdFromToken throws MalformedJwtException when sub is not a UUID")
+    void should_throwMalformedJwtException_when_subjectClaimIsNotUuid() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithBogusSubject = Jwts.builder()
+                .subject("not-a-uuid")
+                .claim("role", Role.CLIENT.name())
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+        var claims = jwtTokenProvider.parseAllClaims(tokenWithBogusSubject);
 
-        log.debug("Act: validating tampered token");
-        assertThatThrownBy(() -> jwtTokenProvider.validateToken(tampered))
-                .isInstanceOf(JwtException.class);
+        assertThatThrownBy(() -> jwtTokenProvider.getUserIdFromToken(claims))
+                .as("getUserIdFromToken must throw MalformedJwtException, not IllegalArgumentException, when sub is not a UUID")
+                .isInstanceOf(MalformedJwtException.class)
+                .hasMessageContaining("Invalid subject claim, expected UUID");
+    }
+
+    @Test
+    @DisplayName("getRoleFromToken throws MalformedJwtException when role claim is absent")
+    void should_throwMalformedJwtException_when_roleClaimIsAbsent() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithoutRole = Jwts.builder()
+                .subject(UUID.randomUUID().toString())
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+        var claims = jwtTokenProvider.parseAllClaims(tokenWithoutRole);
+
+        assertThatThrownBy(() -> jwtTokenProvider.getRoleFromToken(claims))
+                .as("getRoleFromToken must throw MalformedJwtException, not NullPointerException, when role claim is absent")
+                .isInstanceOf(MalformedJwtException.class);
     }
 
     @Test

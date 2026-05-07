@@ -52,6 +52,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         }
 
         String ip = resolveClientIp(request);
+        // Clamp to max IPv6 length (45 chars) to prevent oversized Caffeine cache keys
+        // crafted via a long X-Forwarded-For header value.
+        if (ip.length() > 45) {
+            ip = request.getRemoteAddr();
+        }
         Bucket bucket = cache.get(ip);
 
         if (bucket.tryConsume(1)) {
@@ -68,10 +73,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         String xfwd = request.getHeader("X-Forwarded-For");
         if (xfwd != null && !xfwd.isBlank()) {
             String[] parts = xfwd.split(",");
-            for (int i = parts.length - 1; i >= 0; i--) {
+            for (int i = 0; i < parts.length; i++) {
                 String part = parts[i].trim();
                 if (!part.isEmpty()) {
-                    return part;
+                    String ip = part;
+                    // clamp to max IPv6 length (45 chars) to prevent oversized cache keys
+                    return ip.length() > 45 ? request.getRemoteAddr() : ip;
                 }
             }
         }

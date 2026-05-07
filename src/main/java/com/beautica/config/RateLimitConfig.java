@@ -5,6 +5,7 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.BandwidthBuilder;
 import io.github.bucket4j.Bucket;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -13,13 +14,19 @@ import java.time.Duration;
 @Configuration
 public class RateLimitConfig {
 
+    @Value("${app.rate-limit.login-capacity:5}")
+    private long loginCapacity;
+
+    @Value("${app.rate-limit.refresh-capacity:20}")
+    private long refreshCapacity;
+
     @Bean
     public LoadingCache<String, Bucket> loginBuckets() {
         return Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(Duration.ofHours(1))
                 .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(5, Duration.ofMinutes(1)))
+                        .addLimit(bandwidthOf(loginCapacity, Duration.ofMinutes(1)))
                         .build());
     }
 
@@ -29,7 +36,7 @@ public class RateLimitConfig {
                 .maximumSize(100_000)
                 .expireAfterAccess(Duration.ofHours(1))
                 .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(20, Duration.ofMinutes(1)))
+                        .addLimit(bandwidthOf(refreshCapacity, Duration.ofMinutes(1)))
                         .build());
     }
 

@@ -1,6 +1,8 @@
 package com.beautica.auth;
 
+import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
+import com.beautica.common.TestConstants;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
@@ -23,10 +25,8 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -34,12 +34,8 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -54,18 +50,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doNothing;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@ActiveProfiles("test")
-@Testcontainers
 @Import(TestSecurityConfig.class)
 @DisplayName("Invite endpoints — integration")
-class InviteControllerIT {
+class InviteControllerIT extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(InviteControllerIT.class);
-
-    @Container
-    @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -247,8 +236,8 @@ class InviteControllerIT {
         createdEmails.add(salonOwnerEmail);
         jdbcTemplate.update(
                 "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, created_at, updated_at) " +
-                "VALUES (?, 'x', 'SALON_OWNER', 'Owner', 'Test', true, now(), now())",
-                salonOwnerEmail);
+                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, now(), now())",
+                salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
                 "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",

@@ -1,6 +1,7 @@
 package com.beautica.salon;
 
 import com.beautica.auth.Role;
+import com.beautica.common.TestConstants;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
@@ -41,7 +42,7 @@ class SalonRepositoryTest {
     void should_returnOnlyActiveSalons_when_ownerHasActiveAndInactiveSalons() {
         User owner = new User(
                 "owner-active-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$10$hashedpassword",
+                TestConstants.HASHED_TEST_PASSWORD,
                 Role.SALON_OWNER,
                 "Olena",
                 "Kovalenko",
@@ -51,7 +52,7 @@ class SalonRepositoryTest {
 
         User otherOwner = new User(
                 "other-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$10$hashedpassword",
+                TestConstants.HASHED_TEST_PASSWORD,
                 Role.SALON_OWNER,
                 "Ivan",
                 "Petrenko",
@@ -101,7 +102,7 @@ class SalonRepositoryTest {
     void should_returnTrue_when_salonExistsByIdAndOwnerId() {
         User owner = new User(
                 "owner-exists-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$10$hashedpassword",
+                TestConstants.HASHED_TEST_PASSWORD,
                 Role.SALON_OWNER,
                 "Olena",
                 "Kovalenko",
@@ -130,7 +131,7 @@ class SalonRepositoryTest {
     void should_returnFalse_when_ownerIdDoesNotMatchSalon() {
         User owner = new User(
                 "owner-real-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$10$hashedpassword",
+                TestConstants.HASHED_TEST_PASSWORD,
                 Role.SALON_OWNER,
                 "Olena",
                 "Kovalenko",
@@ -161,7 +162,7 @@ class SalonRepositoryTest {
     void should_returnOptionalEmpty_when_findByIdAndOwnerIdWithWrongOwner() {
         User ownerA = new User(
                 "owner-a-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$10$hashedpassword",
+                TestConstants.HASHED_TEST_PASSWORD,
                 Role.SALON_OWNER,
                 "Anna",
                 "Shevchenko",
@@ -169,7 +170,7 @@ class SalonRepositoryTest {
         );
         User ownerB = new User(
                 "owner-b-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$10$hashedpassword",
+                TestConstants.HASHED_TEST_PASSWORD,
                 Role.SALON_OWNER,
                 "Bohdan",
                 "Kravchenko",

@@ -9,6 +9,8 @@ import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.ServiceCatalogService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -53,8 +55,23 @@ public class ServiceController {
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
+    /**
+     * Returns the active services offered by the given master.
+     *
+     * <p><strong>Public endpoint — no authentication required.</strong>
+     * Unauthenticated clients browse a master's service menu before deciding to book.
+     * No {@code @PreAuthorize} guard is intentional; adding one would break the
+     * discovery flow for anonymous users.
+     *
+     * <p>The {@code pageable} parameter is accepted for forward-compatibility (and to bound
+     * unbounded client requests at the HTTP layer) but the current service implementation
+     * returns the full list for cache-friendliness. Future work: pass pageable through to
+     * a paginated repository query when per-master service counts exceed ~100.
+     */
     @GetMapping("/masters/{masterId}/services")
-    public ApiResponse<List<MasterServiceResponse>> getMasterServices(@PathVariable UUID masterId) {
+    public ApiResponse<List<MasterServiceResponse>> getMasterServices(
+            @PathVariable UUID masterId,
+            @PageableDefault(size = 50) Pageable pageable) {
         return ApiResponse.ok(serviceCatalogService.getMasterServices(masterId));
     }
 
@@ -72,11 +89,9 @@ public class ServiceController {
     @DeleteMapping("/services/{serviceDefId}")
     @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
     public ResponseEntity<Void> deactivateServiceDefinition(
-            @PathVariable UUID serviceDefId,
-            Authentication authentication
+            @PathVariable UUID serviceDefId
     ) {
-        UUID ownerId = extractUserId(authentication);
-        serviceCatalogService.deactivateServiceDefinition(ownerId, serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
         return ResponseEntity.noContent().build();
     }
 

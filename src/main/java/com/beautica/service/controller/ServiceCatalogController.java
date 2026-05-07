@@ -52,7 +52,7 @@ public class ServiceCatalogController {
             Authentication authentication) {
         UUID userId = extractUserId(authentication);
         serviceCatalogService.suggestServiceType(request, userId);
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(ApiResponse.ok(null));
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(ApiResponse.ok(null, "Suggestion submitted"));
     }
 
     private UUID extractUserId(Authentication authentication) {

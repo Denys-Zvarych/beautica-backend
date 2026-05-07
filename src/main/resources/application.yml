@@ -5,6 +5,16 @@ spring:
   datasource:
     url: ${DATABASE_URL}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      keepalive-time: 120000
+      idle-timeout: 300000
+      minimum-idle: 2
+      maximum-pool-size: 10
+      connection-timeout: 30000
+
+  threads:
+    virtual:
+      enabled: true
 
   jpa:
     open-in-view: false
@@ -21,11 +31,6 @@ spring:
 
   cache:
     type: caffeine
-    cache-names:
-      - service-categories
-      - service-types
-    caffeine:
-      spec: maximumSize=200,expireAfterWrite=60m
 
   mail:
     host: smtp-relay.brevo.com
@@ -41,7 +46,10 @@ spring:
 
 server:
   port: 8080
-  forward-headers-strategy: native
+  # forward-headers-strategy is intentionally omitted (defaults to 'none').
+  # Setting it to 'native' would cause Spring's ForwardedHeaderFilter to strip
+  # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
+  # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
 
 management:
   endpoints:
