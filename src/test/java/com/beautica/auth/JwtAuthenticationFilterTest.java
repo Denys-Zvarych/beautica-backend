@@ -2,6 +2,7 @@ package com.beautica.auth;
 
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.MalformedJwtException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -152,6 +153,31 @@ class JwtAuthenticationFilterTest {
                 .isNotNull();
         assertThat(SecurityContextHolder.getContext().getAuthentication())
                 .as("no authentication must be set when JWT validation throws")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_passRequestWithoutAuthentication_when_tokenContainsUnknownRole")
+    void should_passRequestWithoutAuthentication_when_tokenContainsUnknownRole() throws Exception {
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer tokenWithBogusRole");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("tokenWithBogusRole")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims)).thenReturn(UUID.randomUUID());
+        when(jwtTokenProvider.getEmailFromToken(mockClaims)).thenReturn("attacker@example.com");
+        when(jwtTokenProvider.getRoleFromToken(mockClaims))
+                .thenThrow(new MalformedJwtException("Unknown role claim: SUPER_ADMIN"));
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(chain.getRequest())
+                .as("chain must be called even when role claim is unrecognised")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("no authentication must be set when role claim is unrecognised")
                 .isNull();
     }
 }

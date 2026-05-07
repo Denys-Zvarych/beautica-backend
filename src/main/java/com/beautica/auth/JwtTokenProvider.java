@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.beautica.config.JwtConfig;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.MalformedJwtException;
 import io.jsonwebtoken.security.Keys;
 import org.springframework.stereotype.Component;
 
@@ -89,7 +90,12 @@ public class JwtTokenProvider {
     }
 
     public Role getRoleFromToken(Claims claims) {
-        return Role.valueOf(claims.get(CLAIM_ROLE, String.class));
+        String roleStr = claims.get(CLAIM_ROLE, String.class);
+        try {
+            return Role.valueOf(roleStr);
+        } catch (IllegalArgumentException ex) {
+            throw new MalformedJwtException("Unknown role claim: " + roleStr);
+        }
     }
 
     public Role getRoleFromToken(String token) {

@@ -2,12 +2,17 @@ package com.beautica.auth;
 
 import com.beautica.config.JwtConfig;
 import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -160,6 +165,24 @@ class JwtTokenProviderTest {
 
         log.debug("Act: validating tampered token");
         assertThatThrownBy(() -> jwtTokenProvider.validateToken(tampered))
+                .isInstanceOf(JwtException.class);
+    }
+
+    @Test
+    @DisplayName("getRoleFromToken throws JwtException when role claim is an unknown value")
+    void should_throwJwtException_when_roleClaimIsUnknown() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithBogusRole = Jwts.builder()
+                .subject(UUID.randomUUID().toString())
+                .claim("role", "SUPER_ADMIN")
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+
+        assertThatThrownBy(() -> jwtTokenProvider.getRoleFromToken(tokenWithBogusRole))
+                .as("getRoleFromToken must throw JwtException for an unrecognised role claim")
                 .isInstanceOf(JwtException.class);
     }
 
