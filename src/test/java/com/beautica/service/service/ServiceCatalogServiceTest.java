@@ -140,9 +140,11 @@ class ServiceCatalogServiceTest {
         when(salon.getId()).thenReturn(salonId);
 
         Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
         when(master.getSalon()).thenReturn(salon);
 
         ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getId()).thenReturn(serviceDefId);
         when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
         when(serviceDef.getOwnerId()).thenReturn(salonId);
         when(serviceDef.getBasePrice()).thenReturn(new BigDecimal("350.00"));
@@ -166,6 +168,15 @@ class ServiceCatalogServiceTest {
                 salonId, masterId, request);
 
         assertThat(result).isNotNull();
+        assertThat(result.masterId())
+                .as("masterId on response must match the master used in the request")
+                .isEqualTo(masterId);
+        assertThat(result.serviceDefinition().id())
+                .as("serviceDefinitionId on response must match the serviceDefId used in the request")
+                .isEqualTo(serviceDefId);
+        assertThat(result.isActive())
+                .as("isActive on response must be true as returned by the saved assignment")
+                .isTrue();
         verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
     }
 
@@ -266,13 +277,14 @@ class ServiceCatalogServiceTest {
     void should_createBothDefinitionAndAssignment_when_independentMasterAddsService() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
+        UUID savedDefId = UUID.randomUUID();
 
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(masterId);
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
 
         ServiceDefinition savedDef = ServiceDefinition.builder()
-                .id(UUID.randomUUID())
+                .id(savedDefId)
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(masterId)
                 .name("Manicure")
@@ -295,6 +307,15 @@ class ServiceCatalogServiceTest {
                 userId, buildCreateRequest());
 
         assertThat(result).isNotNull();
+        assertThat(result.masterId())
+                .as("masterId on response must match the independent master's id")
+                .isEqualTo(masterId);
+        assertThat(result.serviceDefinition().id())
+                .as("serviceDefinitionId on response must match the saved ServiceDefinition id")
+                .isEqualTo(savedDefId);
+        assertThat(result.isActive())
+                .as("isActive on response must be true as returned by the saved assignment")
+                .isTrue();
         verify(serviceRepository).save(any(ServiceDefinition.class));
         verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
     }

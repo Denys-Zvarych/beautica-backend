@@ -38,22 +38,6 @@ class JwtTokenProviderTest {
     }
 
     @Test
-    @DisplayName("generateAccessToken returns a non-blank token")
-    void should_generateAccessToken_when_validInputsProvided() {
-        var userId = UUID.randomUUID();
-        var email = "test@example.com";
-        var role = Role.CLIENT;
-        log.debug("Arrange: userId={}, email={}, role={}", userId, email, role);
-
-        log.debug("Act: generateAccessToken for userId={} email={} role={}", userId, email, role);
-        String token = jwtTokenProvider.generateAccessToken(userId, email, role);
-
-        assertThat(token)
-                .as("generated access token must not be blank")
-                .isNotBlank();
-    }
-
-    @Test
     @DisplayName("getUserIdFromToken returns correct user ID from access token")
     void should_extractUserId_when_accessTokenParsed() {
         var userId = UUID.randomUUID();

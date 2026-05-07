@@ -2,6 +2,7 @@ package com.beautica.auth;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
+import com.beautica.common.TestConstants;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
@@ -235,8 +236,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
         createdEmails.add(salonOwnerEmail);
         jdbcTemplate.update(
                 "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, created_at, updated_at) " +
-                "VALUES (?, 'x', 'SALON_OWNER', 'Owner', 'Test', true, now(), now())",
-                salonOwnerEmail);
+                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, now(), now())",
+                salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
                 "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",
