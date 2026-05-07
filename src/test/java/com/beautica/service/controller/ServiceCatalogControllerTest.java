@@ -59,6 +59,8 @@ class ServiceCatalogControllerTest extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    // @MockBean here must match sibling integration test classes (InviteControllerIT,
+    // SalonMasterIntegrationTest) to share the Spring application context and avoid a 15-s fork.
     @MockBean
     private EmailService emailService;
 
@@ -220,6 +222,20 @@ class ServiceCatalogControllerTest extends AbstractIntegrationTest {
         assertThat(body.data())
                 .as("single-char query must fall back to all active types — both categories present")
                 .hasSizeGreaterThanOrEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=<101-char string> — 400 when q exceeds @Size(max=100)")
+    void should_return400_when_qParamExceeds100Chars() throws Exception {
+        String longQ = "a".repeat(101);
+
+        log.debug("Act: GET /api/v1/service-types?q=<101 chars> — must return 400");
+        ResponseEntity<String> response = restTemplate.getForEntity(
+                "/api/v1/service-types?q=" + longQ, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when q param length=101 violates @Size(max=100)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     // ── POST /api/v1/service-types/suggest ────────────────────────────────────
@@ -518,11 +534,13 @@ class ServiceCatalogControllerTest extends AbstractIntegrationTest {
         return body.data().accessToken();
     }
 
-    private UUID createSalonForOwner(String ownerEmail) throws Exception {
-        createSalonOwnerAndGetToken(ownerEmail);
+    private UUID createSalonForOwner(String ownerEmail) {
+        UUID ownerId = UUID.randomUUID();
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                ownerId, ownerEmail, hash);
         UUID salonId = UUID.randomUUID();
-        UUID ownerId = jdbcTemplate.queryForObject(
-                "SELECT id FROM users WHERE email = ?", UUID.class, ownerEmail);
         jdbcTemplate.update(
                 "INSERT INTO salons (id, name, owner_id, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
                 salonId, "Test Salon " + System.nanoTime(), ownerId);

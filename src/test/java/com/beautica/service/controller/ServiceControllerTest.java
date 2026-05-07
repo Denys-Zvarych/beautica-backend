@@ -313,6 +313,143 @@ class ServiceControllerTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.NO_CONTENT);
     }
 
+    // ── Issue 1: boundary tests for validation constraints ─────────────────────
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when baseDurationMinutes exceeds 480")
+    void should_return400_when_baseDurationMinutesExceedsMax() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "svc-dur-max-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "Duration Max Salon");
+
+        String invalidBody = "{\"name\":\"Too Long\",\"baseDurationMinutes\":481,\"bufferMinutesAfter\":0}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with baseDurationMinutes=481 — must return 400", salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(invalidBody, bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when baseDurationMinutes=481 violates @Max(480)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when bufferMinutesAfter exceeds 120")
+    void should_return400_when_bufferMinutesAfterExceedsMax() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "svc-buf-max-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "Buffer Max Salon");
+
+        String invalidBody = "{\"name\":\"Buffer Service\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":121}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with bufferMinutesAfter=121 — must return 400", salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(invalidBody, bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when bufferMinutesAfter=121 violates @Max(120)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when basePrice exceeds DecimalMax(99999999.99)")
+    void should_return400_when_basePriceExceedsDecimalMax() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "svc-price-max-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "Price Max Salon");
+
+        String invalidBody = "{\"name\":\"Expensive Service\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"basePrice\":100000000.00}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with basePrice=100000000.00 — must return 400", salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(invalidBody, bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when basePrice=100000000.00 violates @DecimalMax(\"99999999.99\")")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when basePrice has 3 decimal places (violates @Digits(fraction=2))")
+    void should_return400_when_basePriceHasThreeDecimalPlaces() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "svc-price-frac-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "Price Fraction Salon");
+
+        String invalidBody = "{\"name\":\"Fraction Service\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"basePrice\":123.456}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with basePrice=123.456 — must return 400", salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(invalidBody, bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when basePrice=123.456 violates @Digits(fraction=2)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when name exceeds 255 characters")
+    void should_return400_when_nameExceeds255Chars() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "svc-name-long-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "Long Name Salon");
+
+        String longName = "a".repeat(256);
+        String invalidBody = "{\"name\":\"" + longName + "\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with name.length=256 — must return 400", salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(invalidBody, bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when name length=256 violates @Size(max=255)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    // ── Issue 4: 401 for unauthenticated POST requests ─────────────────────────
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 401 when no Authorization header is present")
+    void should_return401_when_postSalonServiceWithoutAuth() {
+        UUID anyId = UUID.randomUUID();
+
+        log.debug("Act: POST /api/v1/salons/{}/services without Authorization header — must return 401", anyId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + anyId + "/services", HttpMethod.POST,
+                new HttpEntity<>(jsonHeaders()),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when POST /salons/{id}/services is called without a Bearer token")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services — 401 when no Authorization header is present")
+    void should_return401_when_postIndependentMasterServiceWithoutAuth() {
+        log.debug("Act: POST /api/v1/independent-masters/me/services without Authorization header — must return 401");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/independent-masters/me/services", HttpMethod.POST,
+                new HttpEntity<>(jsonHeaders()),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 401 when POST /independent-masters/me/services is called without a Bearer token")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    // ── DELETE /api/v1/services/{serviceDefId} ─────────────────────────────────
+
     @Test
     @DisplayName("DELETE /services/{id} — 401 when no Authorization header is present")
     void should_return401_when_deleteServiceWithoutAuth() {

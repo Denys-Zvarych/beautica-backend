@@ -30,6 +30,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -314,6 +315,62 @@ class ServiceCatalogServiceTest {
 
         verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
+    }
+
+    // ── getMasterServices ──────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("throws NotFoundException when master does not exist")
+    void should_throwNotFound_when_masterDoesNotExistOnGetMasterServices() {
+        UUID masterId = UUID.randomUUID();
+
+        when(masterRepository.existsById(masterId)).thenReturn(false);
+
+        assertThatThrownBy(() -> serviceCatalogService.getMasterServices(masterId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(masterServiceRepository, never()).findByMasterIdAndIsActiveTrueWithGraph(any());
+    }
+
+    @Test
+    @DisplayName("returns mapped list with correct fields when master exists and has active assignments")
+    void should_returnMappedList_when_masterExistsWithActiveAssignments() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID assignmentId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(masterId)
+                .name("Manicure")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(assignmentId);
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(null);
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+
+        when(masterRepository.existsById(masterId)).thenReturn(true);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId))
+                .thenReturn(List.of(assignment));
+
+        List<MasterServiceResponse> result = serviceCatalogService.getMasterServices(masterId);
+
+        assertThat(result).hasSize(1);
+        MasterServiceResponse item = result.get(0);
+        assertThat(item.masterId()).isEqualTo(masterId);
+        assertThat(item.serviceDefinition().id()).isEqualTo(serviceDefId);
+        assertThat(item.isActive()).isTrue();
     }
 
     // ── deactivateServiceDefinition ────────────────────────────────────────────

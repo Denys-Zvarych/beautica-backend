@@ -166,6 +166,19 @@ class AuthorizationServiceTest {
         verify(userRepository, never()).findById(any());
     }
 
+    @Test
+    @DisplayName("canManageSalon returns false without DB hit when actor has ROLE_SALON_MASTER")
+    void should_returnFalse_without_DB_when_actorIsSalonMaster() {
+        UUID salonId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canManageSalon(auth, salonId);
+
+        assertThat(result).isFalse();
+        verify(userRepository, never()).findById(any());
+        verify(salonRepository, never()).findById(any());
+    }
+
     // ── canManageMasterSchedule ────────────────────────────────────────────────
 
     @Test

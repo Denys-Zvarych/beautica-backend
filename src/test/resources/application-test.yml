@@ -17,7 +17,7 @@ spring:
 
 app:
   jwt:
-    secret: test-secret-that-is-long-enough-for-hs256-ok-padding-here
+    secret: ${JWT_SECRET:test-jwt-secret-placeholder-min-32-bytes-testonly}
     access-token-expiration: 900000
     refresh-token-expiration: 604800000
   cloudflare-r2:

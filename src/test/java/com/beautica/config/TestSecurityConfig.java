@@ -12,6 +12,9 @@ public class TestSecurityConfig {
     @Bean
     @Primary
     public PasswordEncoder passwordEncoder() {
+        // BCrypt cost lowered to 4 for test speed; production uses 10.
+        // Acceptable: Testcontainers DB round-trip dominates test time, not BCrypt.
+        // The authentication path (encode + verify) is still exercised — only the work factor differs.
         return new BCryptPasswordEncoder(4);
     }
 }
