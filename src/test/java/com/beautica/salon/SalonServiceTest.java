@@ -173,6 +173,7 @@ class SalonServiceTest {
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
 
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -180,7 +181,7 @@ class SalonServiceTest {
 
         assertThat(salon.isActive()).isFalse();
         verify(salonRepository).save(salon);
-        verify(userRepository, never()).findById(any());
+        verify(userRepository).findById(ownerId);
     }
 
     @Test
@@ -188,14 +189,16 @@ class SalonServiceTest {
     void should_throwNotFound_when_salonNotOwnedByRequester() {
         UUID attackerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
+        User attacker = buildUser(attackerId, "attacker@beautica.com", Role.SALON_OWNER);
 
+        when(userRepository.findById(attackerId)).thenReturn(Optional.of(attacker));
         when(salonRepository.findByIdAndOwnerId(salonId, attackerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
                 .isInstanceOf(NotFoundException.class);
 
         verify(salonRepository, never()).save(any());
-        verify(userRepository, never()).findById(any());
+        verify(userRepository).findById(attackerId);
     }
 
     @Test
@@ -206,15 +209,16 @@ class SalonServiceTest {
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
 
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
         salonService.deactivateSalon(ownerId, salonId);
 
+        verify(userRepository).findById(ownerId);
         verify(salonRepository).findByIdAndOwnerId(salonId, ownerId);
         verify(salonRepository, never()).findById(any());
         verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
-        verify(userRepository, never()).findById(any());
     }
 
     private User buildUser(UUID id, String email, Role role) {
