@@ -3,10 +3,12 @@ package com.beautica.service.repository;
 import com.beautica.auth.Role;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.entity.ServiceType;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -234,5 +236,77 @@ class MasterServiceRepositoryTest {
         var result = masterServiceRepository.findByMasterIdAndId(otherMaster.getId(), assignment.getId());
 
         assertThat(result).isEmpty();
+    }
+
+    // ── findByMasterIdAndIsActiveTrueWithGraph (phase 3.8: LEFT JOIN FETCH sd.serviceType) ──────
+
+    @Test
+    @DisplayName("should_initializeServiceTypeInGraph_when_serviceDefinitionHasServiceType")
+    void should_initializeServiceTypeInGraph_when_serviceDefinitionHasServiceType() {
+        // Arrange — persist a CatalogCategory and ServiceType, then link them to the service definition
+        CatalogCategory category = CatalogCategory.builder()
+                .nameUk("Нігті")
+                .nameEn("Nails")
+                .sortOrder(1)
+                .build();
+        em.persist(category);
+
+        ServiceType serviceType = ServiceType.builder()
+                .category(category)
+                .nameUk("Манікюр")
+                .nameEn("Manicure")
+                .slug("manicure-" + UUID.randomUUID())
+                .build();
+        em.persist(serviceType);
+
+        serviceDefinition.setServiceType(serviceType);
+        em.persist(serviceDefinition);
+
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .isActive(true)
+                .build();
+        em.persist(assignment);
+        em.flush();
+        em.clear(); // evict all entities to force JPA to use the query, not the first-level cache
+
+        // Act
+        List<MasterServiceAssignment> results =
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId());
+
+        // Assert — serviceType must be initialized by the LEFT JOIN FETCH (no LazyInitializationException)
+        assertThat(results).hasSize(1);
+        ServiceDefinition loadedDef = results.get(0).getServiceDefinition();
+        assertThat(loadedDef.getServiceType())
+                .as("serviceType must be eagerly loaded by the LEFT JOIN FETCH — not null")
+                .isNotNull();
+        assertThat(loadedDef.getServiceType().getNameUk())
+                .as("serviceType.nameUk must match the persisted value")
+                .isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("should_returnNullServiceType_when_serviceDefinitionHasNoServiceType")
+    void should_returnNullServiceType_when_serviceDefinitionHasNoServiceType() {
+        // Arrange — service definition has no service_type_id (nullable FK, legacy data scenario)
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(serviceDefinition) // no serviceType set — null FK
+                .isActive(true)
+                .build();
+        em.persist(assignment);
+        em.flush();
+        em.clear();
+
+        // Act
+        List<MasterServiceAssignment> results =
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId());
+
+        // Assert — LEFT JOIN means null serviceType is valid; query must still return the row
+        assertThat(results).hasSize(1);
+        assertThat(results.get(0).getServiceDefinition().getServiceType())
+                .as("serviceType must be null when no service_type_id is set on the definition")
+                .isNull();
     }
 }

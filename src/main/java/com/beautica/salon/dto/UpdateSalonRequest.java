@@ -1,5 +1,6 @@
 package com.beautica.salon.dto;
 
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 public record UpdateSalonRequest(
@@ -9,5 +10,7 @@ public record UpdateSalonRequest(
         @Size(max = 100) String region,
         @Size(max = 500) String address,
         @Size(max = 20) String phone,
+        @Pattern(regexp = "^$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
+                message = "Must be a valid Instagram URL or empty")
         @Size(max = 500) String instagramUrl
 ) {}

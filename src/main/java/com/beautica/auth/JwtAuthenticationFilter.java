@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -41,16 +42,16 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
         if (token != null) {
             try {
-                jwtTokenProvider.validateToken(token);
+                Claims claims = jwtTokenProvider.parseAllClaims(token);
 
-                if (!jwtTokenProvider.isAccessToken(token)) {
+                if (!jwtTokenProvider.isAccessToken(claims)) {
                     filterChain.doFilter(request, response);
                     return;
                 }
 
-                UUID userId = jwtTokenProvider.getUserIdFromToken(token);
-                String email = jwtTokenProvider.getEmailFromToken(token);
-                Role role = jwtTokenProvider.getRoleFromToken(token);
+                UUID userId = jwtTokenProvider.getUserIdFromToken(claims);
+                String email = jwtTokenProvider.getEmailFromToken(claims);
+                Role role = jwtTokenProvider.getRoleFromToken(claims);
 
                 var authority = new SimpleGrantedAuthority("ROLE_" + role.name());
                 var authentication = new UsernamePasswordAuthenticationToken(

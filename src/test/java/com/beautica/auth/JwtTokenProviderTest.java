@@ -162,4 +162,31 @@ class JwtTokenProviderTest {
         assertThatThrownBy(() -> jwtTokenProvider.validateToken(tampered))
                 .isInstanceOf(JwtException.class);
     }
+
+    @Test
+    @DisplayName("parseAllClaims returns Claims from which all getters extract correct values")
+    void should_extractAllClaimsCorrectly_when_parseAllClaimsCalledOnce() {
+        var userId = UUID.randomUUID();
+        var email = "claims@beautica.com";
+        var role = Role.SALON_OWNER;
+        log.debug("Arrange: userId={}, email={}, role={}", userId, email, role);
+
+        String token = jwtTokenProvider.generateAccessToken(userId, email, role);
+
+        log.debug("Act: parseAllClaims once, then use Claims overloads for all getters");
+        var claims = jwtTokenProvider.parseAllClaims(token);
+
+        assertThat(jwtTokenProvider.getUserIdFromToken(claims))
+                .as("userId extracted from pre-parsed Claims must match original")
+                .isEqualTo(userId);
+        assertThat(jwtTokenProvider.getEmailFromToken(claims))
+                .as("email extracted from pre-parsed Claims must match original")
+                .isEqualTo(email);
+        assertThat(jwtTokenProvider.getRoleFromToken(claims))
+                .as("role extracted from pre-parsed Claims must match original")
+                .isEqualTo(role);
+        assertThat(jwtTokenProvider.isAccessToken(claims))
+                .as("isAccessToken from pre-parsed Claims must return true for access token")
+                .isTrue();
+    }
 }

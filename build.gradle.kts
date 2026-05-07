@@ -53,7 +53,7 @@ dependencies {
 
     // Rate limiting
     implementation("com.bucket4j:bucket4j-core:8.10.1")
-    implementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
+    implementation("com.github.ben-manes.caffeine:caffeine")
 
     // JWT (JJWT 0.12)
     implementation("io.jsonwebtoken:jjwt-api:0.12.6")

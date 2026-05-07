@@ -174,50 +174,51 @@ class SalonServiceTest {
         Salon salon = buildSalon(salonId, owner, "Active Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
         salonService.deactivateSalon(ownerId, salonId);
 
         assertThat(salon.isActive()).isFalse();
         verify(salonRepository).save(salon);
+        verify(userRepository).findById(ownerId);
     }
 
     @Test
-    @DisplayName("deactivateSalon — throws ForbiddenException when non-owner attempts deactivation")
-    void should_throwForbidden_when_nonOwnerDeactivatesSalon() {
-        UUID realOwnerId = UUID.randomUUID();
+    @DisplayName("deactivateSalon — throws NotFoundException when salonId and ownerId do not match")
+    void should_throwNotFound_when_salonNotOwnedByRequester() {
         UUID attackerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-
-        User realOwner = buildUser(realOwnerId, "real@beautica.com", Role.SALON_OWNER);
         User attacker = buildUser(attackerId, "attacker@beautica.com", Role.SALON_OWNER);
-        Salon salon = buildSalon(salonId, realOwner, "Salon");
 
         when(userRepository.findById(attackerId)).thenReturn(Optional.of(attacker));
-        when(salonRepository.existsByIdAndOwnerId(salonId, attackerId)).thenReturn(false);
+        when(salonRepository.findByIdAndOwnerId(salonId, attackerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(NotFoundException.class);
 
         verify(salonRepository, never()).save(any());
+        verify(userRepository).findById(attackerId);
     }
 
     @Test
-    @DisplayName("deactivateSalon — throws ForbiddenException when caller role is not SALON_OWNER (positive-guard coverage)")
-    void should_throwForbiddenException_when_nonOwnerCallsDeactivateSalon() {
-        UUID masterId = UUID.randomUUID();
+    @DisplayName("deactivateSalon — makes exactly one repository call (findByIdAndOwnerId only)")
+    void should_makeExactlyOneRepositoryCall_when_deactivateSalon() {
+        UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        User master = buildUser(masterId, "master@beautica.com", Role.SALON_MASTER);
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
 
-        when(userRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        assertThatThrownBy(() -> salonService.deactivateSalon(masterId, salonId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("Only SALON_OWNER may deactivate a salon");
+        salonService.deactivateSalon(ownerId, salonId);
 
-        verify(salonRepository, never()).save(any());
+        verify(userRepository).findById(ownerId);
+        verify(salonRepository).findByIdAndOwnerId(salonId, ownerId);
+        verify(salonRepository, never()).findById(any());
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
     }
 
     private User buildUser(UUID id, String email, Role role) {

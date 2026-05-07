@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -25,6 +26,9 @@ class JwtAuthenticationFilterTest {
 
     @Mock
     private JwtTokenProvider jwtTokenProvider;
+
+    @Mock
+    private Claims mockClaims;
 
     @InjectMocks
     private JwtAuthenticationFilter filter;
@@ -64,7 +68,8 @@ class JwtAuthenticationFilterTest {
         var response = new MockHttpServletResponse();
         var chain    = new MockFilterChain();
 
-        when(jwtTokenProvider.isAccessToken("someToken")).thenReturn(false);
+        when(jwtTokenProvider.parseAllClaims("someToken")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(false);
 
         filter.doFilterInternal(request, response, chain);
 
@@ -106,11 +111,11 @@ class JwtAuthenticationFilterTest {
         var response = new MockHttpServletResponse();
         var chain    = new MockFilterChain();
 
-        when(jwtTokenProvider.validateToken("validToken")).thenReturn(true);
-        when(jwtTokenProvider.isAccessToken("validToken")).thenReturn(true);
-        when(jwtTokenProvider.getUserIdFromToken("validToken")).thenReturn(userId);
-        when(jwtTokenProvider.getEmailFromToken("validToken")).thenReturn(email);
-        when(jwtTokenProvider.getRoleFromToken("validToken")).thenReturn(role);
+        when(jwtTokenProvider.parseAllClaims("validToken")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims)).thenReturn(userId);
+        when(jwtTokenProvider.getEmailFromToken(mockClaims)).thenReturn(email);
+        when(jwtTokenProvider.getRoleFromToken(mockClaims)).thenReturn(role);
 
         filter.doFilterInternal(request, response, chain);
 
@@ -138,7 +143,7 @@ class JwtAuthenticationFilterTest {
         var response = new MockHttpServletResponse();
         var chain    = new MockFilterChain();
 
-        when(jwtTokenProvider.validateToken("badToken")).thenThrow(new JwtException("invalid signature"));
+        when(jwtTokenProvider.parseAllClaims("badToken")).thenThrow(new JwtException("invalid signature"));
 
         filter.doFilterInternal(request, response, chain);
 

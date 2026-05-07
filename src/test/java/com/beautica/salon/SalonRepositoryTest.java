@@ -95,4 +95,102 @@ class SalonRepositoryTest {
                 .as("every returned salon must belong to the target owner")
                 .containsOnly(owner.getId());
     }
+
+    @Test
+    @DisplayName("existsByIdAndOwnerId — returns true when salon belongs to the given owner")
+    void should_returnTrue_when_salonExistsByIdAndOwnerId() {
+        User owner = new User(
+                "owner-exists-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$10$hashedpassword",
+                Role.SALON_OWNER,
+                "Olena",
+                "Kovalenko",
+                "+380501234567"
+        );
+        em.persist(owner);
+
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("My Salon")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+        em.flush();
+        em.clear();
+
+        boolean result = salonRepository.existsByIdAndOwnerId(salon.getId(), owner.getId());
+
+        assertThat(result)
+                .as("existsByIdAndOwnerId must return true when owner matches the persisted salon")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("existsByIdAndOwnerId — returns false when ownerId does not match the salon")
+    void should_returnFalse_when_ownerIdDoesNotMatchSalon() {
+        User owner = new User(
+                "owner-real-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$10$hashedpassword",
+                Role.SALON_OWNER,
+                "Olena",
+                "Kovalenko",
+                "+380501111111"
+        );
+        em.persist(owner);
+
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("Real Owner Salon")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+        em.flush();
+        em.clear();
+
+        UUID wrongOwnerId = UUID.randomUUID();
+
+        boolean result = salonRepository.existsByIdAndOwnerId(salon.getId(), wrongOwnerId);
+
+        assertThat(result)
+                .as("existsByIdAndOwnerId must return false when ownerId does not match the salon")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("findByIdAndOwnerId — returns empty when owner B tries to fetch owner A's salon")
+    void should_returnOptionalEmpty_when_findByIdAndOwnerIdWithWrongOwner() {
+        User ownerA = new User(
+                "owner-a-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$10$hashedpassword",
+                Role.SALON_OWNER,
+                "Anna",
+                "Shevchenko",
+                "+380502222222"
+        );
+        User ownerB = new User(
+                "owner-b-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$10$hashedpassword",
+                Role.SALON_OWNER,
+                "Bohdan",
+                "Kravchenko",
+                "+380503333333"
+        );
+        em.persist(ownerA);
+        em.persist(ownerB);
+
+        Salon salonA = Salon.builder()
+                .owner(ownerA)
+                .name("Salon A")
+                .isActive(true)
+                .build();
+        em.persist(salonA);
+        em.flush();
+        em.clear();
+
+        var result = salonRepository.findByIdAndOwnerId(salonA.getId(), ownerB.getId());
+
+        assertThat(result)
+                .as("findByIdAndOwnerId must return empty when owner B requests owner A's salon")
+                .isEmpty();
+    }
 }

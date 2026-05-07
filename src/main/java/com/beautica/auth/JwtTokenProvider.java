@@ -60,29 +60,43 @@ public class JwtTokenProvider {
     }
 
     public boolean validateToken(String token) {
-        parseClaims(token);
+        parseAllClaims(token);
         return true;
     }
 
-    public boolean isAccessToken(String token) {
-        Claims claims = parseClaims(token);
+    public boolean isAccessToken(Claims claims) {
         return TYPE_ACCESS.equals(claims.get(CLAIM_TYPE, String.class));
     }
 
+    public boolean isAccessToken(String token) {
+        return isAccessToken(parseAllClaims(token));
+    }
+
+    public UUID getUserIdFromToken(Claims claims) {
+        return UUID.fromString(claims.getSubject());
+    }
+
     public UUID getUserIdFromToken(String token) {
-        return UUID.fromString(parseClaims(token).getSubject());
+        return getUserIdFromToken(parseAllClaims(token));
+    }
+
+    public String getEmailFromToken(Claims claims) {
+        return claims.get(CLAIM_EMAIL, String.class);
     }
 
     public String getEmailFromToken(String token) {
-        return parseClaims(token).get(CLAIM_EMAIL, String.class);
+        return getEmailFromToken(parseAllClaims(token));
+    }
+
+    public Role getRoleFromToken(Claims claims) {
+        return Role.valueOf(claims.get(CLAIM_ROLE, String.class));
     }
 
     public Role getRoleFromToken(String token) {
-        String roleStr = parseClaims(token).get(CLAIM_ROLE, String.class);
-        return Role.valueOf(roleStr);
+        return getRoleFromToken(parseAllClaims(token));
     }
 
-    private Claims parseClaims(String token) {
+    public Claims parseAllClaims(String token) {
         return Jwts.parser()
                 .verifyWith(signingKey)
                 .build()

@@ -22,6 +22,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -107,7 +109,18 @@ public class InviteService {
         var inviteToken = new InviteToken(hashedToken, request.email(), request.salonId(), targetRole, expiresAt);
         inviteTokenRepository.save(inviteToken);
 
-        emailService.sendInviteEmail(request.email(), buildInviteLink(rawToken), salon.getName());
+        String inviteLink = buildInviteLink(rawToken);
+        String salonName = salon.getName();
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    emailService.sendInviteEmail(request.email(), inviteLink, salonName);
+                }
+            });
+        } else {
+            emailService.sendInviteEmail(request.email(), inviteLink, salonName);
+        }
 
         return new InviteResponse(request.email(), expiresAt);
     }

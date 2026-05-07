@@ -31,10 +31,14 @@ import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -708,6 +712,54 @@ class InviteServiceTest {
         ArgumentCaptor<String> salonNameCaptor = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendInviteEmail(anyString(), anyString(), salonNameCaptor.capture());
         assertThat(salonNameCaptor.getValue()).isEqualTo("Glamour Studio");
+    }
+
+    @Test
+    @DisplayName("sendInvite registers afterCommit callback — emailService not called before commit fires")
+    void should_notCallEmailDirectly_when_sendInviteRegistersAfterCommitCallback() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonId, null);
+        var caller = buildCallerWithSalon(callerId, salonId);
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            inviteService.sendInvite(request, callerId);
+
+            verify(emailService, never()).sendInviteEmail(anyString(), anyString(), anyString());
+
+            List<TransactionSynchronization> synchronizations =
+                    TransactionSynchronizationManager.getSynchronizations();
+            assertThat(synchronizations).hasSize(1);
+
+            synchronizations.forEach(TransactionSynchronization::afterCommit);
+
+            verify(emailService).sendInviteEmail(eq("master@example.com"), anyString(), eq("Test Salon"));
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    private <T> T runWithSyncFired(Supplier<T> action) {
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            T result = action.get();
+            List<TransactionSynchronization> synchronizations =
+                    TransactionSynchronizationManager.getSynchronizations();
+            synchronizations.forEach(TransactionSynchronization::afterCommit);
+            return result;
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
     }
 
     private InviteToken buildInviteToken(String email, Instant expiresAt) {

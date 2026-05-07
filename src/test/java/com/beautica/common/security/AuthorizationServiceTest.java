@@ -7,6 +7,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.DisplayName;
@@ -43,6 +44,9 @@ class AuthorizationServiceTest {
 
     @Mock
     private UserRepository userRepository;
+
+    @Mock
+    private ServiceRepository serviceRepository;
 
     @InjectMocks
     private AuthorizationService authorizationService;
@@ -331,5 +335,95 @@ class AuthorizationServiceTest {
         boolean result = authorizationService.hasManagementAccess(salonId, actorId);
 
         assertThat(result).isFalse();
+    }
+
+    // ── masterBelongsToSalon ───────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("masterBelongsToSalon returns true when master belongs to the salon")
+    void should_return_true_when_master_belongs_to_salon() {
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+
+        boolean result = authorizationService.masterBelongsToSalon(masterId, salonId);
+
+        assertThat(result).isTrue();
+        verify(masterRepository).existsByIdAndSalonId(masterId, salonId);
+    }
+
+    @Test
+    @DisplayName("masterBelongsToSalon returns false when master does not belong to the salon")
+    void should_return_false_when_master_does_not_belong_to_salon() {
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(false);
+
+        boolean result = authorizationService.masterBelongsToSalon(masterId, salonId);
+
+        assertThat(result).isFalse();
+        verify(masterRepository).existsByIdAndSalonId(masterId, salonId);
+    }
+
+    @Test
+    @DisplayName("masterBelongsToSalon returns false immediately when masterId is null")
+    void should_return_false_when_masterId_is_null() {
+        UUID salonId = UUID.randomUUID();
+
+        boolean result = authorizationService.masterBelongsToSalon(null, salonId);
+
+        assertThat(result).isFalse();
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+    }
+
+    // ── canManageServiceDefinition ─────────────────────────────────────────────
+
+    @Test
+    @DisplayName("canManageServiceDefinition returns true via SALON path when actor owns the salon")
+    void should_returnTrue_when_actorOwnsSalonServiceDefinition() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.findOwnerUserId(serviceDefId)).thenReturn(Optional.of(actorId));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageServiceDefinition returns true via INDEPENDENT_MASTER path when actor is the master's user")
+    void should_returnTrue_when_actorIsIndependentMasterOwner() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.findOwnerUserId(serviceDefId)).thenReturn(Optional.of(actorId));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageServiceDefinition returns false when service definition does not exist")
+    void should_returnFalse_when_serviceDefinitionDoesNotExist() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.findOwnerUserId(serviceDefId)).thenReturn(Optional.empty());
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
+
+        assertThat(result).isFalse();
+        verify(salonRepository, never()).findById(any());
+        verify(masterRepository, never()).findById(any());
     }
 }

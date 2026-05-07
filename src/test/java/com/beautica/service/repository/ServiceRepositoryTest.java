@@ -122,8 +122,8 @@ class ServiceRepositoryTest {
     }
 
     @Test
-    @DisplayName("should_returnAllActiveServices_when_onlyOwnerIdFiltered")
-    void should_returnAllActiveServices_when_onlyOwnerIdFiltered() {
+    @DisplayName("should_notLeakAcrossOwnerTypes_when_ownerIdCoincides")
+    void should_notLeakAcrossOwnerTypes_when_ownerIdCoincides() {
         ServiceDefinition salonService = ServiceDefinition.builder()
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
@@ -148,12 +148,16 @@ class ServiceRepositoryTest {
 
         em.flush();
 
-        List<ServiceDefinition> results =
-                serviceRepository.findByOwnerIdAndIsActiveTrue(salonOwnerId);
+        List<ServiceDefinition> salonResults =
+                serviceRepository.findByOwnerTypeAndOwnerIdAndIsActiveTrue(OwnerType.SALON, salonOwnerId);
 
-        assertThat(results).hasSize(2);
-        assertThat(results)
-                .extracting(ServiceDefinition::getId)
-                .containsExactlyInAnyOrder(salonService.getId(), independentMasterService.getId());
+        List<ServiceDefinition> masterResults =
+                serviceRepository.findByOwnerTypeAndOwnerIdAndIsActiveTrue(OwnerType.INDEPENDENT_MASTER, salonOwnerId);
+
+        assertThat(salonResults).hasSize(1);
+        assertThat(salonResults).extracting(ServiceDefinition::getId).containsExactly(salonService.getId());
+
+        assertThat(masterResults).hasSize(1);
+        assertThat(masterResults).extracting(ServiceDefinition::getId).containsExactly(independentMasterService.getId());
     }
 }

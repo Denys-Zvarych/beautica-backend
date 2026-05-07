@@ -5,10 +5,13 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -23,7 +26,8 @@ import java.util.UUID;
 @Table(name = "service_definitions",
         indexes = {
                 @Index(name = "idx_service_def_owner_active",      columnList = "owner_id, is_active"),
-                @Index(name = "idx_service_def_owner_type_active", columnList = "owner_type, owner_id, is_active")
+                @Index(name = "idx_service_def_owner_type_active", columnList = "owner_type, owner_id, is_active"),
+                @Index(name = "idx_service_def_service_type",      columnList = "service_type_id")
         })
 @Getter
 @Setter
@@ -78,4 +82,8 @@ public class ServiceDefinition extends AuditableEntity {
 
     @Column(name = "is_active", nullable = false)
     private boolean isActive;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "service_type_id")
+    private ServiceType serviceType;
 }

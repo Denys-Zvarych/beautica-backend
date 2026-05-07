@@ -299,6 +299,25 @@ class AuthServiceTest {
     }
 
     @Test
+    @DisplayName("refresh throws BusinessException when refresh token is expired")
+    void should_throwBusinessException_when_refreshTokenIsExpired() {
+        var userId = UUID.randomUUID();
+        var rawToken = "raw-expired";
+        var hashedToken = "hashed-expired";
+        // expiresAt is 1 second in the past — token is expired
+        var storedToken = new RefreshToken(hashedToken, userId, Instant.now().minusSeconds(1));
+        log.debug("Arrange: stored token for userId={} has expired expiresAt", userId);
+
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
+
+        log.debug("Act: refresh with an expired token for userId={}", userId);
+        assertThatThrownBy(() -> authService.refresh(new RefreshRequest(rawToken)))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("expired");
+    }
+
+    @Test
     @DisplayName("refresh throws BusinessException when token is not found")
     void should_throwBusinessException_when_refreshTokenNotFound() {
         var rawToken = "nonexistent";

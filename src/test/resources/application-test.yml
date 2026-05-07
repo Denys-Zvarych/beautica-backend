@@ -32,6 +32,7 @@ app:
   invite:
     token-expiration-hours: 72
     from-email: noreply@beautica.app
+  admin-email: admin@beautica.test
 
 management:
   health:
