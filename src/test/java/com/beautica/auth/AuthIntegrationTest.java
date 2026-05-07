@@ -6,6 +6,7 @@ import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
+import com.beautica.AbstractIntegrationTest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -14,37 +15,20 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.support.TransactionTemplate;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@ActiveProfiles("test")
-@Testcontainers
 @DisplayName("Auth — registration integration")
-class AuthIntegrationTest {
+class AuthIntegrationTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(AuthIntegrationTest.class);
-
-    // ── Testcontainers ─────────────────────────────────────────────────────────
-    // Static container — shared across all tests in this class for performance.
-    // @ServiceConnection auto-wires the datasource URL/user/password so no
-    // @DynamicPropertySource boilerplate is needed.
-    @Container
-    @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
     // ── Spring beans ───────────────────────────────────────────────────────────
     @Autowired

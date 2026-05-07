@@ -273,7 +273,7 @@ class CatalogRepositoryTest {
             em.flush();
 
             // "Манікюр" is a close match for "Манікюр класичний"
-            List<ServiceType> results = serviceTypeRepository.searchByName("Манікюр");
+            List<ServiceType> results = serviceTypeRepository.searchByName("Манікюр", PageRequest.of(0, 20));
 
             assertThat(results)
                     .as("pg_trgm search must return the active type matching the query")
@@ -289,7 +289,7 @@ class CatalogRepositoryTest {
             persistServiceType(nails, "Гель-лак", "Gel Polish", "gel-polish-5", true);
             em.flush();
 
-            List<ServiceType> results = serviceTypeRepository.searchByName("Gel Polish");
+            List<ServiceType> results = serviceTypeRepository.searchByName("Gel Polish", PageRequest.of(0, 20));
 
             assertThat(results)
                     .as("pg_trgm search must match on name_en as well as name_uk")
@@ -305,7 +305,7 @@ class CatalogRepositoryTest {
             persistServiceType(nails, "Манікюр застарілий", "Deprecated Manicure", "man-dep", false);
             em.flush();
 
-            List<ServiceType> results = serviceTypeRepository.searchByName("Манікюр застарілий");
+            List<ServiceType> results = serviceTypeRepository.searchByName("Манікюр застарілий", PageRequest.of(0, 20));
 
             assertThat(results)
                     .as("inactive service types must never appear in search results")
@@ -320,7 +320,7 @@ class CatalogRepositoryTest {
             em.flush();
 
             // Completely unrelated term — similarity will be below 0.2 threshold
-            List<ServiceType> results = serviceTypeRepository.searchByName("xyzxyzxyz");
+            List<ServiceType> results = serviceTypeRepository.searchByName("xyzxyzxyz", PageRequest.of(0, 20));
 
             assertThat(results)
                     .as("query with no similar match must return empty list")

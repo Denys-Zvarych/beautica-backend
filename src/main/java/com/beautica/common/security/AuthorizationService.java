@@ -51,7 +51,17 @@ public class AuthorizationService {
         return salonRepository.existsByIdAndOwnerId(salonId, actorId);
     }
 
+    /**
+     * Role-aware fast path: if the JWT-derived role cannot possibly grant salon management
+     * access (i.e. it is not SALON_OWNER or SALON_ADMIN), return false immediately without
+     * any DB round-trip. Only SALON_OWNER and SALON_ADMIN proceed to the ownership query.
+     */
     public boolean canManageSalon(Authentication auth, UUID salonId) {
+        if (salonId == null) return false;
+        boolean mayManage = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_OWNER")
+                        || a.getAuthority().equals("ROLE_SALON_ADMIN"));
+        if (!mayManage) return false;
         UUID actorId = principalId(auth);
         return hasManagementAccess(salonId, actorId);
     }
@@ -71,12 +81,16 @@ public class AuthorizationService {
         }).orElse(false);
     }
 
+    /**
+     * Role-aware fast path: CLIENT and SALON_MASTER roles can never manage a schedule,
+     * so return false immediately without any DB round-trip. Only SALON_OWNER, SALON_ADMIN,
+     * and INDEPENDENT_MASTER proceed to the master ownership query.
+     */
     public boolean canManageMasterSchedule(Authentication auth, UUID masterId) {
-        boolean hasSalonMasterRole = auth.getAuthorities().stream()
-                .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
-        if (hasSalonMasterRole) {
-            return false;
-        }
+        boolean cannotManage = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotManage) return false;
         UUID actorId = principalId(auth);
         return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {

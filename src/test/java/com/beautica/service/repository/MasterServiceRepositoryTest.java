@@ -247,7 +247,7 @@ class MasterServiceRepositoryTest {
         CatalogCategory category = CatalogCategory.builder()
                 .nameUk("Нігті")
                 .nameEn("Nails")
-                .sortOrder(1)
+                .sortOrder(999)
                 .build();
         em.persist(category);
 

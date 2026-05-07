@@ -11,24 +11,30 @@ import java.util.UUID;
 
 public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> {
 
-    // Kept for backward compatibility — does not JOIN FETCH; use findByCategoryWithCategory for list endpoints.
+    /**
+     * @deprecated No JOIN FETCH — accessing {@code category} fields on returned entities
+     *             will trigger N+1 lazy loads or a LazyInitializationException outside a
+     *             transaction. Use {@link #findByCategoryWithCategory(UUID)} for any endpoint
+     *             that projects category fields. Retained for the repository-layer test only.
+     */
+    @Deprecated(since = "phase-3", forRemoval = false)
     List<ServiceType> findAllByCategoryIdAndActiveTrueOrderByNameUkAsc(UUID categoryId);
 
     /**
      * Callers MUST validate: q is not blank, length <= 100, stripped of control characters.
      * Minimum 3 characters recommended for meaningful trigram similarity results.
      */
-    @Query(
-        value = """
-            SELECT * FROM service_types t
-            WHERE t.is_active = true
-              AND (similarity(t.name_uk, :q) > 0.2 OR similarity(t.name_en, :q) > 0.2)
-            ORDER BY GREATEST(similarity(t.name_uk, :q), similarity(t.name_en, :q)) DESC
-            LIMIT 20
-            """,
-        nativeQuery = true
-    )
-    List<ServiceType> searchByName(@Param("q") String q);
+    @Query("""
+        SELECT t FROM ServiceType t
+        JOIN FETCH t.category
+        WHERE t.active = true
+          AND (FUNCTION('similarity', t.nameUk, :q) > 0.2
+            OR FUNCTION('similarity', t.nameEn, :q) > 0.2)
+        ORDER BY GREATEST(
+          FUNCTION('similarity', t.nameUk, :q),
+          FUNCTION('similarity', t.nameEn, :q)) DESC
+        """)
+    List<ServiceType> searchByName(@Param("q") String q, Pageable pageable);
 
     /**
      * Bounded replacement for the former unbounded findAllByActiveTrueOrderByNameUkAsc.
@@ -45,6 +51,14 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
     List<ServiceType> findAllActiveWithCategory();
 
     /**
+     * Pageable overload of {@link #findAllActiveWithCategory()} for large datasets.
+     * Use {@code PageRequest.of(0, 200)} for dropdown-style requests.
+     */
+    @Query(value = "SELECT t FROM ServiceType t JOIN FETCH t.category WHERE t.active = true ORDER BY t.nameUk ASC",
+           countQuery = "SELECT count(t) FROM ServiceType t WHERE t.active = true")
+    List<ServiceType> findAllActiveWithCategory(Pageable pageable);
+
+    /**
      * Filtered by category with JOIN FETCH to avoid N+1 queries on list endpoints.
      */
     @Query("""
@@ -55,4 +69,17 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
             ORDER BY t.nameUk ASC
             """)
     List<ServiceType> findByCategoryWithCategory(@Param("categoryId") UUID categoryId);
+
+    /**
+     * Pageable overload of {@link #findByCategoryWithCategory(UUID)} for large datasets.
+     */
+    @Query(value = """
+            SELECT t FROM ServiceType t
+            JOIN FETCH t.category
+            WHERE t.category.id = :categoryId
+              AND t.active = true
+            ORDER BY t.nameUk ASC
+            """,
+           countQuery = "SELECT count(t) FROM ServiceType t WHERE t.category.id = :categoryId AND t.active = true")
+    List<ServiceType> findByCategoryWithCategory(@Param("categoryId") UUID categoryId, Pageable pageable);
 }

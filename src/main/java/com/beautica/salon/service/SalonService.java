@@ -16,6 +16,8 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -35,6 +37,7 @@ public class SalonService {
     private final AuthorizationService authorizationService;
 
     @Transactional
+    @CacheEvict(value = "ownerSalons", key = "#ownerId")
     public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
         var owner = userRepository.findById(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
@@ -58,6 +61,7 @@ public class SalonService {
         return SalonResponse.from(salonRepository.save(salon));
     }
 
+    @CacheEvict(value = "ownerSalons", key = "#actorId")
     @Transactional
     public SalonResponse updateSalon(UUID actorId, UUID salonId, UpdateSalonRequest request) {
         var salon = salonRepository.findById(salonId)
@@ -115,6 +119,7 @@ public class SalonService {
     }
 
     @Transactional(readOnly = true)
+    @Cacheable(value = "ownerSalons", key = "#ownerId")
     public List<SalonResponse> getOwnerSalons(UUID ownerId) {
         return salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)
                 .stream()
@@ -123,6 +128,7 @@ public class SalonService {
     }
 
     @Transactional
+    @CacheEvict(value = "ownerSalons", key = "#ownerId")
     public void deactivateSalon(UUID ownerId, UUID salonId) {
         var caller = userRepository.findById(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));

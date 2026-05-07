@@ -7,7 +7,6 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
-import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
@@ -26,10 +25,13 @@ import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
@@ -78,6 +80,7 @@ public class ServiceCatalogService {
     }
 
     @Transactional
+    @CacheEvict(value = "masterServices", key = "#masterId")
     public MasterServiceResponse assignServiceToMaster(
             UUID salonId,
             UUID masterId,
@@ -114,6 +117,7 @@ public class ServiceCatalogService {
     }
 
     @Transactional
+    @CacheEvict(value = "masterServices", allEntries = true)
     public MasterServiceResponse addIndependentMasterService(
             UUID userId,
             CreateServiceDefinitionRequest request) {
@@ -152,6 +156,7 @@ public class ServiceCatalogService {
     }
 
     @Transactional(readOnly = true)
+    @Cacheable(value = "masterServices", key = "#masterId")
     public List<MasterServiceResponse> getMasterServices(UUID masterId) {
         if (!masterRepository.existsById(masterId)) {
             throw new NotFoundException("Master not found: " + masterId);
@@ -164,27 +169,35 @@ public class ServiceCatalogService {
     }
 
     @Transactional
+    @Caching(evict = {
+        @CacheEvict(value = "masterServices", allEntries = true),
+        @CacheEvict(value = "service-types", allEntries = true),
+        @CacheEvict(value = "service-categories", allEntries = true)
+    })
     public void deactivateServiceDefinition(UUID ownerId, UUID serviceDefId) {
         ServiceDefinition definition = serviceRepository.findById(serviceDefId)
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
 
-        if (definition.getOwnerType() == OwnerType.SALON) {
-            Salon salon = salonRepository.findById(definition.getOwnerId())
-                    .orElseThrow(() -> new NotFoundException("Salon not found: " + definition.getOwnerId()));
-            if (!salon.getOwner().getId().equals(ownerId)) {
-                throw new ForbiddenException("You do not own this service definition");
-            }
-        } else {
-            // INDEPENDENT_MASTER: ownerId on definition is master.id; resolve back to user
-            Master master = masterRepository.findById(definition.getOwnerId())
-                    .orElseThrow(() -> new NotFoundException("Master not found: " + definition.getOwnerId()));
-            if (!master.getUser().getId().equals(ownerId)) {
-                throw new ForbiddenException("You do not own this service definition");
-            }
-        }
+        verifyOwnership(ownerId, definition);
 
         definition.setActive(false);
         serviceRepository.save(definition);
+    }
+
+    private void verifyOwnership(UUID requestingUserId, ServiceDefinition definition) {
+        if (definition.getOwnerType() == OwnerType.SALON) {
+            var salon = salonRepository.findById(definition.getOwnerId())
+                    .orElseThrow(() -> new NotFoundException("Salon not found: " + definition.getOwnerId()));
+            if (!salon.getOwner().getId().equals(requestingUserId)) {
+                throw new ForbiddenException("Not authorised to modify this service definition");
+            }
+        } else {
+            var master = masterRepository.findById(definition.getOwnerId())
+                    .orElseThrow(() -> new NotFoundException("Master not found: " + definition.getOwnerId()));
+            if (!master.getUser().getId().equals(requestingUserId)) {
+                throw new ForbiddenException("Not authorised to modify this service definition");
+            }
+        }
     }
 
     @Cacheable("service-categories")
@@ -219,7 +232,7 @@ public class ServiceCatalogService {
 
     @Transactional(readOnly = true)
     public List<ServiceTypeResponse> searchServiceTypesByName(String q, @Nullable UUID categoryId) {
-        List<ServiceType> types = serviceTypeRepository.searchByName(q);
+        List<ServiceType> types = serviceTypeRepository.searchByName(q, PageRequest.of(0, 20));
         if (categoryId != null) {
             types = types.stream()
                     .filter(t -> t.getCategory().getId().equals(categoryId))

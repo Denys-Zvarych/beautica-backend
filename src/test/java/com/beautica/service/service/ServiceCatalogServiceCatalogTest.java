@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
@@ -152,13 +153,13 @@ class ServiceCatalogServiceCatalogTest {
         when(type.getNameEn()).thenReturn("Classic Manicure");
         when(type.getSlug()).thenReturn("manicure-classic");
 
-        when(serviceTypeRepository.searchByName("Ма")).thenReturn(List.of(type));
+        when(serviceTypeRepository.searchByName("Ма", PageRequest.of(0, 20))).thenReturn(List.of(type));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(null, "Ма");
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).nameUk()).isEqualTo("Манікюр класичний");
-        verify(serviceTypeRepository).searchByName("Ма");
+        verify(serviceTypeRepository).searchByName("Ма", PageRequest.of(0, 20));
     }
 
     @Test
@@ -174,12 +175,12 @@ class ServiceCatalogServiceCatalogTest {
         when(type.getNameEn()).thenReturn("Gel Polish");
         when(type.getSlug()).thenReturn("gel-polish");
 
-        when(serviceTypeRepository.searchByName("Гель")).thenReturn(List.of(type));
+        when(serviceTypeRepository.searchByName("Гель", PageRequest.of(0, 20))).thenReturn(List.of(type));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(null, "  Гель  ");
 
         assertThat(result).hasSize(1);
-        verify(serviceTypeRepository).searchByName("Гель");
+        verify(serviceTypeRepository).searchByName("Гель", PageRequest.of(0, 20));
     }
 
     @Test
@@ -215,7 +216,7 @@ class ServiceCatalogServiceCatalogTest {
         var nonMatchingType = mock(ServiceType.class);
         when(nonMatchingType.getCategory()).thenReturn(otherCategory);
 
-        when(serviceTypeRepository.searchByName("Ман")).thenReturn(List.of(matchingType, nonMatchingType));
+        when(serviceTypeRepository.searchByName("Ман", PageRequest.of(0, 20))).thenReturn(List.of(matchingType, nonMatchingType));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(targetCategoryId, "Ман");
 

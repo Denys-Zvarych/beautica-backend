@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.LoginRequest;
@@ -24,11 +25,9 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -39,10 +38,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.test.context.ActiveProfiles;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -59,20 +54,13 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.reset;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@ActiveProfiles("test")
-@Testcontainers
 @Import(TestSecurityConfig.class)
 @DisplayName("SalonMaster — invite flow + independent master registration integration")
-class SalonMasterIntegrationTest {
+class SalonMasterIntegrationTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(SalonMasterIntegrationTest.class);
 
     private static final String TEST_PASSWORD = "SecurePass1!";
-
-    @Container
-    @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
     @Autowired
     private TestRestTemplate restTemplate;
