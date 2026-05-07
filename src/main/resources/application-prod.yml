@@ -18,8 +18,3 @@ logging:
     root: INFO
     com.beautica: INFO
 
-springdoc:
-  api-docs:
-    enabled: false
-  swagger-ui:
-    enabled: false
