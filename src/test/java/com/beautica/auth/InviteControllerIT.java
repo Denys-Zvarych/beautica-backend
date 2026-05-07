@@ -130,8 +130,8 @@ class InviteControllerIT {
         UUID salonId = UUID.randomUUID();
         log.debug("Arrange: register SALON_OWNER email={}", ownerEmail);
 
-        String ownerToken = registerAndGetToken(ownerEmail, Role.CLIENT);
-        String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, ownerToken, salonId);
+        String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
 
         doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
 
@@ -208,8 +208,8 @@ class InviteControllerIT {
         UUID salonId = UUID.randomUUID();
         log.debug("Arrange: register both owner={} and target={}", ownerEmail, alreadyRegistered);
 
-        String ownerToken = registerAndGetToken(ownerEmail, Role.CLIENT);
-        String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, ownerToken, salonId);
+        String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
         registerAndGetToken(alreadyRegistered, Role.CLIENT);
 
         doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());

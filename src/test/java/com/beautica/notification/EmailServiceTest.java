@@ -39,7 +39,7 @@ class EmailServiceTest {
 
     @BeforeEach
     void setUp() {
-        emailService = new EmailService(mailSender, templateEngine, "noreply@beautica.app");
+        emailService = new EmailService(mailSender, templateEngine, "noreply@beautica.app", 48L);
     }
 
     @Test

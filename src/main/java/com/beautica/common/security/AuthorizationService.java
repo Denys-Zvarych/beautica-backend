@@ -8,6 +8,8 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -23,6 +25,7 @@ public class AuthorizationService {
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
     private final UserRepository userRepository;
+    private final ServiceRepository serviceRepository;
 
     /**
      * Returns true when actorId has management access to the given salon.
@@ -105,6 +108,37 @@ public class AuthorizationService {
         if (!allowed) {
             throw new ForbiddenException("Access denied");
         }
+    }
+
+    /**
+     * Returns true iff the given master is a member of the given salon.
+     * Used in @PreAuthorize on assignServiceToMaster to prevent a timing-oracle
+     * IDOR where a caller with a valid token for Salon B could probe whether a
+     * master UUID belongs to Salon A by observing 403 vs 404 responses.
+     *
+     * Returns false immediately when either argument is null.
+     */
+    public boolean masterBelongsToSalon(UUID masterId, UUID salonId) {
+        if (masterId == null || salonId == null) return false;
+        return masterRepository.existsByIdAndSalonId(masterId, salonId);
+    }
+
+    /**
+     * Returns true iff the authenticated actor owns the parent entity of the given
+     * ServiceDefinition:
+     *   ownerType == SALON              → actor must own the salon (ownerId is salonId)
+     *   ownerType == INDEPENDENT_MASTER → actor must be the master's own user (ownerId is masterId)
+     *
+     * Returns false — causing 403 — when the service definition does not exist.
+     *
+     * A single JPQL projection query resolves the owner's user UUID directly,
+     * eliminating the two-query chain used previously.
+     */
+    public boolean canManageServiceDefinition(Authentication auth, UUID serviceDefId) {
+        UUID actorId = principalId(auth);
+        return serviceRepository.findOwnerUserId(serviceDefId)
+                .map(ownerUserId -> ownerUserId.equals(actorId))
+                .orElse(false);
     }
 
     private UUID principalId(Authentication auth) {

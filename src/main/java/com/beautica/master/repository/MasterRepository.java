@@ -27,6 +27,8 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
 
     boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
 
+    boolean existsByIdAndSalonId(UUID id, UUID salonId);
+
     /**
      * Eagerly fetches the master together with its user, salon, and salon owner.
      * Used in authorization checks that run outside an active JPA session.

@@ -2,7 +2,7 @@ spring:
   datasource:
     url: jdbc:postgresql://localhost:5432/beautica
     username: beautica
-    password: beautica
+    password: REPLACE_WITH_LOCAL_DB_PASSWORD   # docker-compose default: beautica
     driver-class-name: org.postgresql.Driver
 
   jpa:
@@ -14,6 +14,11 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+
+  cache:
+    type: caffeine
+    caffeine:
+      spec: maximumSize=200,expireAfterWrite=60m
 
   mail:
     host: localhost
@@ -29,7 +34,7 @@ spring:
 
 app:
   jwt:
-    secret: dGVzdC1sb2NhbC1kZXYtc2VjcmV0LW5lZWRzLXRvLWJlLXJhbmRvbS0yNTZiaXQh
+    secret: REPLACE_WITH_LOCAL_JWT_SECRET      # generate: openssl rand -base64 48
     access-token-expiration: 900000
     refresh-token-expiration: 604800000
   cloudflare-r2:
@@ -44,3 +49,4 @@ app:
   invite:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
+  admin-email: ${ADMIN_EMAIL:dev-admin@localhost}

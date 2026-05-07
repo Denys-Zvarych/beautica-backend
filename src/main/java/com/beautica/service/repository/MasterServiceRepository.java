@@ -19,7 +19,8 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
 
     @Query("""
             SELECT msa FROM MasterServiceAssignment msa
-            JOIN FETCH msa.serviceDefinition
+            JOIN FETCH msa.serviceDefinition sd
+            LEFT JOIN FETCH sd.serviceType
             JOIN FETCH msa.master
             WHERE msa.master.id = :masterId AND msa.isActive = true
             """)

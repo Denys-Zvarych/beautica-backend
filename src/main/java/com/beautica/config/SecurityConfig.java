@@ -6,6 +6,8 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.Profiles;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
@@ -32,38 +34,50 @@ public class SecurityConfig {
 
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
+    private final Environment environment;
 
     @Value("${app.frontend.base-url}")
     private String frontendBaseUrl;
 
     public SecurityConfig(JwtAuthenticationFilter jwtAuthenticationFilter,
-                          AuthRateLimitFilter authRateLimitFilter) {
+                          AuthRateLimitFilter authRateLimitFilter,
+                          Environment environment) {
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
         this.authRateLimitFilter = authRateLimitFilter;
+        this.environment = environment;
     }
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
-        return http
+        boolean isDevProfile = environment.acceptsProfiles(Profiles.of("local | test"));
+
+        var authorizeConfig = http
                 .csrf(AbstractHttpConfigurer::disable)
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .sessionManagement(session ->
                         session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint(unauthorizedEntryPoint()))
-                .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/api/v1/auth/register", "/api/v1/auth/register/independent-master", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/invite/accept").permitAll()
-                        .requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll()
-                        .requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll()
-                        .requestMatchers("/api-docs/**", "/api-docs").permitAll()
-                        .requestMatchers(HttpMethod.GET, "/actuator/health").permitAll()
-                        .requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}").permitAll()
-                        .requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll()
-                        .requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll()
-                        .anyRequest().authenticated())
+                .authorizeHttpRequests(auth -> {
+                    auth.requestMatchers("/api/v1/auth/register", "/api/v1/auth/register/independent-master", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/invite/accept").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll();
+                    if (isDevProfile) {
+                        auth.requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll();
+                        auth.requestMatchers("/api-docs/**", "/api-docs").permitAll();
+                    }
+                    auth.requestMatchers(HttpMethod.GET, "/actuator/health").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
+                    auth.anyRequest().authenticated();
+                })
                 .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
-                .addFilterBefore(authRateLimitFilter, JwtAuthenticationFilter.class)
-                .build();
+                .addFilterBefore(authRateLimitFilter, JwtAuthenticationFilter.class);
+
+        return authorizeConfig.build();
     }
 
     @Bean

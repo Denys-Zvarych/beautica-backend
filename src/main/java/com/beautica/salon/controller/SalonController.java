@@ -71,7 +71,7 @@ public class SalonController {
     }
 
     @PostMapping("/{salonId}/invite")
-    @PreAuthorize("@authz.canManageSalon(authentication, #salonId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<InviteResponse>> inviteMaster(
             @PathVariable UUID salonId,
             @Valid @RequestBody InviteRequest request,
