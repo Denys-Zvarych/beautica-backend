@@ -180,4 +180,75 @@ class JwtAuthenticationFilterTest {
                 .as("no authentication must be set when role claim is unrecognised")
                 .isNull();
     }
+
+    @Test
+    @DisplayName("should_passRequestWithoutAuthentication_when_getUserIdFromTokenThrowsMalformedJwtException")
+    void should_passRequestWithoutAuthentication_when_getUserIdFromTokenThrowsMalformedJwtException() throws Exception {
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer tokenWithBogusSubject");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("tokenWithBogusSubject")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims))
+                .thenThrow(new MalformedJwtException("Invalid subject claim, expected UUID: not-a-uuid"));
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(chain.getRequest())
+                .as("chain must be called when getUserIdFromToken throws MalformedJwtException")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("no authentication must be set when subject claim is not a valid UUID")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_passRequestWithoutAuthentication_when_getRoleFromTokenThrowsMalformedJwtExceptionForMissingClaim")
+    void should_passRequestWithoutAuthentication_when_getRoleFromTokenThrowsMalformedJwtExceptionForMissingClaim() throws Exception {
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer tokenWithoutRole");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("tokenWithoutRole")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims)).thenReturn(UUID.randomUUID());
+        when(jwtTokenProvider.getEmailFromToken(mockClaims)).thenReturn("user@example.com");
+        when(jwtTokenProvider.getRoleFromToken(mockClaims))
+                .thenThrow(new MalformedJwtException("Missing role claim"));
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(chain.getRequest())
+                .as("chain must be called when getRoleFromToken throws MalformedJwtException for missing role claim")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("no authentication must be set when role claim is absent from the token")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_passRequestWithoutAuthentication_when_getUserIdFromTokenThrowsMalformedJwtExceptionForNullSub")
+    void should_passRequestWithoutAuthentication_when_getUserIdFromTokenThrowsMalformedJwtExceptionForNullSub() throws Exception {
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer tokenWithNullSub");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("tokenWithNullSub")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims))
+                .thenThrow(new MalformedJwtException("Missing subject claim"));
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(chain.getRequest())
+                .as("chain must be called when getUserIdFromToken throws MalformedJwtException for null sub")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("no authentication must be set when subject claim is absent from the token")
+                .isNull();
+    }
 }

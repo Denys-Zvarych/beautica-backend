@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.beautica.config.JwtConfig;
 import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.MalformedJwtException;
 import io.jsonwebtoken.security.Keys;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -127,48 +128,6 @@ class JwtTokenProviderTest {
     }
 
     @Test
-    @DisplayName("validateToken returns true for a well-formed token")
-    void should_validateToken_when_tokenIsValid() {
-        log.debug("Arrange: generating a fresh valid access token");
-        String token = jwtTokenProvider.generateAccessToken(
-                UUID.randomUUID(), "ok@test.com", Role.CLIENT);
-
-        log.debug("Act: validateToken on a fresh valid access token");
-        boolean valid = jwtTokenProvider.validateToken(token);
-
-        assertThat(valid)
-                .as("validateToken must return true for a freshly generated, unexpired token")
-                .isTrue();
-    }
-
-    @Test
-    @DisplayName("validateToken throws JwtException for an expired token")
-    void should_throwJwtException_when_tokenIsExpired() {
-        var expiredConfig = new JwtConfig(SECRET, -1L, REFRESH_EXPIRY_MS);
-        var expiredProvider = new JwtTokenProvider(expiredConfig);
-        String token = expiredProvider.generateAccessToken(
-                UUID.randomUUID(), "exp@test.com", Role.CLIENT);
-        log.debug("Arrange: generated a token with negative expiry");
-
-        log.debug("Act: validating expired token");
-        assertThatThrownBy(() -> jwtTokenProvider.validateToken(token))
-                .isInstanceOf(JwtException.class);
-    }
-
-    @Test
-    @DisplayName("validateToken throws JwtException for a tampered token")
-    void should_throwJwtException_when_tokenIsTampered() {
-        String token = jwtTokenProvider.generateAccessToken(
-                UUID.randomUUID(), "t@test.com", Role.CLIENT);
-        String tampered = token.substring(0, token.length() - 4) + "XXXX";
-        log.debug("Arrange: tampered last 4 chars of a valid token");
-
-        log.debug("Act: validating tampered token");
-        assertThatThrownBy(() -> jwtTokenProvider.validateToken(tampered))
-                .isInstanceOf(JwtException.class);
-    }
-
-    @Test
     @DisplayName("getRoleFromToken throws JwtException when role claim is an unknown value")
     void should_throwJwtException_when_roleClaimIsUnknown() {
         SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
@@ -182,8 +141,66 @@ class JwtTokenProviderTest {
                 .compact();
 
         assertThatThrownBy(() -> jwtTokenProvider.getRoleFromToken(tokenWithBogusRole))
-                .as("getRoleFromToken must throw JwtException for an unrecognised role claim")
-                .isInstanceOf(JwtException.class);
+                .as("getRoleFromToken must throw MalformedJwtException for an unrecognised role claim")
+                .isInstanceOf(MalformedJwtException.class)
+                .hasMessageContaining("Unknown role claim");
+    }
+
+    @Test
+    @DisplayName("getUserIdFromToken throws MalformedJwtException when sub claim is null")
+    void should_throwMalformedJwtException_when_subjectClaimIsNull() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithoutSubject = Jwts.builder()
+                .claim("role", Role.CLIENT.name())
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+        var claims = jwtTokenProvider.parseAllClaims(tokenWithoutSubject);
+
+        assertThatThrownBy(() -> jwtTokenProvider.getUserIdFromToken(claims))
+                .as("getUserIdFromToken must throw MalformedJwtException, not NullPointerException, when sub claim is absent")
+                .isInstanceOf(MalformedJwtException.class)
+                .hasMessage("Missing subject claim");
+    }
+
+    @Test
+    @DisplayName("getUserIdFromToken throws MalformedJwtException when sub is not a UUID")
+    void should_throwMalformedJwtException_when_subjectClaimIsNotUuid() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithBogusSubject = Jwts.builder()
+                .subject("not-a-uuid")
+                .claim("role", Role.CLIENT.name())
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+        var claims = jwtTokenProvider.parseAllClaims(tokenWithBogusSubject);
+
+        assertThatThrownBy(() -> jwtTokenProvider.getUserIdFromToken(claims))
+                .as("getUserIdFromToken must throw MalformedJwtException, not IllegalArgumentException, when sub is not a UUID")
+                .isInstanceOf(MalformedJwtException.class)
+                .hasMessageContaining("Invalid subject claim, expected UUID");
+    }
+
+    @Test
+    @DisplayName("getRoleFromToken throws MalformedJwtException when role claim is absent")
+    void should_throwMalformedJwtException_when_roleClaimIsAbsent() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithoutRole = Jwts.builder()
+                .subject(UUID.randomUUID().toString())
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+        var claims = jwtTokenProvider.parseAllClaims(tokenWithoutRole);
+
+        assertThatThrownBy(() -> jwtTokenProvider.getRoleFromToken(claims))
+                .as("getRoleFromToken must throw MalformedJwtException, not NullPointerException, when role claim is absent")
+                .isInstanceOf(MalformedJwtException.class);
     }
 
     @Test

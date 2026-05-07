@@ -2,6 +2,7 @@ package com.beautica.auth;
 
 import com.beautica.config.JwtConfig;
 import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtParser;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.MalformedJwtException;
 import io.jsonwebtoken.security.Keys;
@@ -22,11 +23,13 @@ public class JwtTokenProvider {
     private static final String TYPE_REFRESH = "refresh";
 
     private final SecretKey signingKey;
+    private final JwtParser jwtParser;
     private final long accessTokenExpirationMs;
     private final long refreshTokenExpirationMs;
 
     public JwtTokenProvider(JwtConfig jwtConfig) {
         this.signingKey = Keys.hmacShaKeyFor(jwtConfig.secret().getBytes(StandardCharsets.UTF_8));
+        this.jwtParser = Jwts.parser().verifyWith(signingKey).build();
         this.accessTokenExpirationMs = jwtConfig.accessTokenExpiration();
         this.refreshTokenExpirationMs = jwtConfig.refreshTokenExpiration();
     }
@@ -60,11 +63,6 @@ public class JwtTokenProvider {
                 .compact();
     }
 
-    public boolean validateToken(String token) {
-        parseAllClaims(token);
-        return true;
-    }
-
     public boolean isAccessToken(Claims claims) {
         return TYPE_ACCESS.equals(claims.get(CLAIM_TYPE, String.class));
     }
@@ -74,7 +72,15 @@ public class JwtTokenProvider {
     }
 
     public UUID getUserIdFromToken(Claims claims) {
-        return UUID.fromString(claims.getSubject());
+        String subject = claims.getSubject();
+        if (subject == null) {
+            throw new MalformedJwtException("Missing subject claim");
+        }
+        try {
+            return UUID.fromString(subject);
+        } catch (IllegalArgumentException ex) {
+            throw new MalformedJwtException(String.format("Invalid subject claim, expected UUID: %s", subject));
+        }
     }
 
     public UUID getUserIdFromToken(String token) {
@@ -91,10 +97,13 @@ public class JwtTokenProvider {
 
     public Role getRoleFromToken(Claims claims) {
         String roleStr = claims.get(CLAIM_ROLE, String.class);
+        if (roleStr == null) {
+            throw new MalformedJwtException("Missing role claim");
+        }
         try {
             return Role.valueOf(roleStr);
         } catch (IllegalArgumentException ex) {
-            throw new MalformedJwtException("Unknown role claim: " + roleStr);
+            throw new MalformedJwtException(String.format("Unknown role claim: %s", roleStr));
         }
     }
 
@@ -103,10 +112,6 @@ public class JwtTokenProvider {
     }
 
     public Claims parseAllClaims(String token) {
-        return Jwts.parser()
-                .verifyWith(signingKey)
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
+        return jwtParser.parseSignedClaims(token).getPayload();
     }
 }
