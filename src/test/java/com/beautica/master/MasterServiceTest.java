@@ -243,6 +243,21 @@ class MasterServiceTest {
         verify(workingHoursRepository, never()).saveAll(any());
     }
 
+    @Test
+    @DisplayName("should_throwNotFound_when_upsertWorkingHoursWithUnknownMasterId")
+    void should_throwNotFound_when_upsertWorkingHoursWithUnknownMasterId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        var request = new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.upsertWorkingHours(ownerId, masterId, List.of(request)))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(workingHoursRepository, never()).saveAll(any());
+    }
+
     // ── deactivateMaster ──────────────────────────────────────────────────────
 
     @Test
@@ -315,5 +330,109 @@ class MasterServiceTest {
         assertThat(result.getReason()).isEqualTo(ScheduleExceptionReason.HOLIDAY);
         verify(authorizationService).enforceCanManageMasterSchedule(actorId, master);
         verify(scheduleExceptionRepository).save(any(ScheduleException.class));
+    }
+
+    @Test
+    @DisplayName("should_updateExistingScheduleException_when_dateAlreadyExistsForMaster")
+    void should_updateExistingScheduleException_when_dateAlreadyExistsForMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 6, 15);
+
+        Master master = mock(Master.class);
+
+        ScheduleException existingException = ScheduleException.builder()
+                .master(master)
+                .date(date)
+                .reason(ScheduleExceptionReason.HOLIDAY)
+                .note(null)
+                .build();
+        ReflectionTestUtils.setField(existingException, "id", UUID.randomUUID());
+
+        var request = new ScheduleExceptionRequest(date, ScheduleExceptionReason.VACATION, "Going on vacation");
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
+                .thenReturn(Optional.of(existingException));
+        when(scheduleExceptionRepository.save(existingException)).thenReturn(existingException);
+
+        ScheduleException result = masterService.addScheduleException(actorId, masterId, request);
+
+        assertThat(result.getReason()).isEqualTo(ScheduleExceptionReason.VACATION);
+        assertThat(result.getNote()).isEqualTo("Going on vacation");
+        verify(scheduleExceptionRepository).save(existingException);
+    }
+
+    // ── removeScheduleException ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_removeScheduleException_when_authorizedActorRequests")
+    void should_removeScheduleException_when_authorizedActorRequests() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 6, 1);
+
+        Master master = mock(Master.class);
+        ScheduleException exception = mock(ScheduleException.class);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
+                .thenReturn(Optional.of(exception));
+
+        masterService.removeScheduleException(actorId, masterId, date);
+
+        verify(authorizationService).enforceCanManageMasterSchedule(actorId, master);
+        verify(scheduleExceptionRepository).delete(exception);
+    }
+
+    @Test
+    @DisplayName("should_doNothing_when_removeScheduleException_dateHasNoException")
+    void should_doNothing_when_removeScheduleException_dateHasNoException() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 6, 1);
+        Master master = mock(Master.class);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
+                .thenReturn(Optional.empty());
+
+        masterService.removeScheduleException(actorId, masterId, date);
+
+        verify(scheduleExceptionRepository, never()).delete(any());
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_removeScheduleException_masterMissing")
+    void should_throwNotFound_when_removeScheduleException_masterMissing() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 6, 1);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.removeScheduleException(actorId, masterId, date))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(scheduleExceptionRepository, never()).delete(any());
+    }
+
+    @Test
+    @DisplayName("should_throwForbidden_when_unauthorizedActorRemovesScheduleException")
+    void should_throwForbidden_when_unauthorizedActorRemovesScheduleException() {
+        UUID attackerId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 6, 1);
+
+        Master master = mock(Master.class);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authorizationService).enforceCanManageMasterSchedule(attackerId, master);
+
+        assertThatThrownBy(() -> masterService.removeScheduleException(attackerId, masterId, date))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(scheduleExceptionRepository, never()).delete(any());
     }
 }

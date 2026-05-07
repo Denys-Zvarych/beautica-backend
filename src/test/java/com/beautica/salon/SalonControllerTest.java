@@ -64,13 +64,16 @@ class SalonControllerTest extends AbstractIntegrationTest {
 
     @BeforeEach
     void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        if (!(restTemplate.getRestTemplate().getRequestFactory() instanceof HttpComponentsClientHttpRequestFactory)) {
+            restTemplate.getRestTemplate().setRequestFactory(
+                    new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        }
     }
 
     @AfterEach
     void cleanUp() {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
+        jdbcTemplate.execute("DELETE FROM master_services");
         jdbcTemplate.execute("DELETE FROM masters");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
@@ -329,6 +332,69 @@ class SalonControllerTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses javascript: scheme")
+    void should_return400_when_instagramUrlUsesJavascriptScheme() throws Exception {
+        String token = createSalonOwnerAndGetToken(
+                "owner-insta-js-" + System.nanoTime() + "@beautica.test");
+
+        var request = new CreateSalonRequest(
+                "Insta Salon JS", null, "Kyiv", null, null, null, "javascript:alert(1)");
+
+        log.debug("Act: POST {} with instagramUrl='javascript:alert(1)' — must be rejected with 400", SALONS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when instagramUrl uses a javascript: URI scheme")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses http: instead of https:")
+    void should_return400_when_instagramUrlUsesHttpScheme() throws Exception {
+        String token = createSalonOwnerAndGetToken(
+                "owner-insta-http-" + System.nanoTime() + "@beautica.test");
+
+        var request = new CreateSalonRequest(
+                "Insta Salon HTTP", null, "Kyiv", null, null, null, "http://instagram.com/testuser");
+
+        log.debug("Act: POST {} with instagramUrl='http://instagram.com/testuser' — must be rejected with 400", SALONS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when instagramUrl uses http instead of https")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons/{id}/invite — 403 when SALON_MASTER calls invite endpoint")
+    void should_return403_when_salonMasterCallsInviteEndpoint() throws Exception {
+        String ownerToken = createSalonOwnerAndGetToken(
+                "owner-sm-invite-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerToken, "SM Invite Salon");
+
+        String salonMasterToken = createSalonMasterAndGetToken(
+                "salon-master-inv-" + System.nanoTime() + "@beautica.test", salonId);
+
+        String body = "{\"email\":\"victim@test.com\"}";
+
+        log.debug("Act: POST {}/{}/invite as SALON_MASTER — must be denied with 403", SALONS_URL, salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "/" + salonId + "/invite", HttpMethod.POST,
+                new HttpEntity<>(body, bearerHeaders(salonMasterToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when SALON_MASTER attempts to invite into a salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
     @DisplayName("POST /api/v1/salons/{id}/invite — 403 when SALON_ADMIN invites into a different salon")
     void should_return403_when_salonAdminFromDifferentSalonInvites() throws Exception {
         String ownerAToken = createSalonOwnerAndGetToken(
@@ -376,6 +442,23 @@ class SalonControllerTest extends AbstractIntegrationTest {
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    private String createSalonMasterAndGetToken(String email, UUID salonId) throws Exception {
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_MASTER', true)",
+                masterUserId, email, hash);
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                UUID.randomUUID(), masterUserId, salonId);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
     }
