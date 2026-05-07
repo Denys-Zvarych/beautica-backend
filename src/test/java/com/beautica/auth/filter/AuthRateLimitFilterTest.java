@@ -506,6 +506,36 @@ class AuthRateLimitFilterTest {
         }
 
         @Test
+        @DisplayName("uses XFF value when leftmost XFF entry is exactly 45 characters (boundary: accepted, not replaced by REMOTE_ADDR)")
+        void should_useXffValue_when_xffEntryIsExactly45Chars() throws Exception {
+            // 45 chars is the guard boundary: ip.length() > 45 triggers fallback, so exactly-45
+            // must be accepted as the bucket key and NOT replaced by REMOTE_ADDR.
+            String exactly45Chars = "a".repeat(45);
+            log.debug("Arrange: XFF leftmost entry is exactly {} chars — must be used as bucket key, not REMOTE_ADDR",
+                    exactly45Chars.length());
+            when(loginBuckets.get(exactly45Chars)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request = postRequest("/api/v1/auth/login");
+            request.addHeader("X-Forwarded-For", exactly45Chars);
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal with exactly-45-char XFF entry — guard must accept it");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("must be 200 — bucket keyed on the 45-char XFF value was not exhausted")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest())
+                    .as("filter chain must be forwarded — 45-char XFF entry is within the accepted length")
+                    .isNotNull();
+            // Bucket must be keyed on the XFF value, NOT on REMOTE_ADDR (10.0.0.1)
+            verify(loginBuckets).get(exactly45Chars);
+            verify(loginBuckets, never()).get(REMOTE_ADDR);
+        }
+
+        @Test
         @DisplayName("falls back to getRemoteAddr when leftmost XFF entry exceeds 45 characters (max IPv6 length)")
         void should_fallBackToRemoteAddr_when_xffEntryExceedsMaxIpLength() throws Exception {
             String oversizedIp = "a".repeat(46);

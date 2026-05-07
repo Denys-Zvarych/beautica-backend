@@ -14,6 +14,7 @@ import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import com.beautica.TestConstants;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -48,8 +49,7 @@ class AuthServiceTest {
 
     private static final Logger log = LoggerFactory.getLogger(AuthServiceTest.class);
 
-    private static final String SECRET =
-            "test-secret-that-is-long-enough-for-hs256-ok-padding-here";
+    private static final String SECRET = TestConstants.TEST_JWT_SECRET;
     private static final long ACCESS_MS = 900_000L;
     private static final long REFRESH_MS = 604_800_000L;
 

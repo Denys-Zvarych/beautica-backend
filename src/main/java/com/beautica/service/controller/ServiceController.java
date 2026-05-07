@@ -58,7 +58,12 @@ public class ServiceController {
     /**
      * Returns the active services offered by the given master.
      *
-     * The {@code pageable} parameter is accepted for forward-compatibility (and to bound
+     * <p><strong>Public endpoint — no authentication required.</strong>
+     * Unauthenticated clients browse a master's service menu before deciding to book.
+     * No {@code @PreAuthorize} guard is intentional; adding one would break the
+     * discovery flow for anonymous users.
+     *
+     * <p>The {@code pageable} parameter is accepted for forward-compatibility (and to bound
      * unbounded client requests at the HTTP layer) but the current service implementation
      * returns the full list for cache-friendliness. Future work: pass pageable through to
      * a paginated repository query when per-master service counts exceed ~100.
