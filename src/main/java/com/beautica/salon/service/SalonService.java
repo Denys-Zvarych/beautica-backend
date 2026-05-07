@@ -124,6 +124,13 @@ public class SalonService {
 
     @Transactional
     public void deactivateSalon(UUID ownerId, UUID salonId) {
+        var caller = userRepository.findById(ownerId)
+                .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
+
+        if (caller.getRole() != Role.SALON_OWNER) {
+            throw new ForbiddenException("Only SALON_OWNER may deactivate a salon");
+        }
+
         var salon = salonRepository.findByIdAndOwnerId(salonId, ownerId)
                 .orElseThrow(() -> new NotFoundException("Salon not found or access denied"));
 
