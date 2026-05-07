@@ -36,6 +36,7 @@ class AuthRateLimitFilterTest {
     // ── mocks ──────────────────────────────────────────────────────────────────
     @Mock private LoadingCache<String, Bucket> loginBuckets;
     @Mock private LoadingCache<String, Bucket> refreshBuckets;
+    @Mock private LoadingCache<String, Bucket> slotsBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ class AuthRateLimitFilterTest {
 
     @BeforeEach
     void setUp() {
-        filter = new AuthRateLimitFilter(loginBuckets, refreshBuckets);
+        filter = new AuthRateLimitFilter(loginBuckets, refreshBuckets, slotsBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

@@ -102,7 +102,7 @@ class UserControllerTest {
         @Primary
         AuthRateLimitFilter authRateLimitFilter() {
             // Pass-through: rate limiting is not under test in a controller slice.
-            return new AuthRateLimitFilter(null, null) {
+            return new AuthRateLimitFilter(null, null, null) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
                                                 HttpServletResponse res,

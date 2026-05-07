@@ -102,7 +102,7 @@ class MasterControllerTest {
         @Bean
         @Primary
         AuthRateLimitFilter authRateLimitFilter() {
-            return new AuthRateLimitFilter(null, null) {
+            return new AuthRateLimitFilter(null, null, null) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
                                                 HttpServletResponse res,
