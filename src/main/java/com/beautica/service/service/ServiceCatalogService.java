@@ -26,6 +26,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
@@ -161,7 +162,8 @@ public class ServiceCatalogService {
         // An unknown masterId produces an empty list — the existsById check was a
         // redundant DB round-trip because the JOIN FETCH graph query already returns
         // nothing for a non-existent master.
-        return masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId)
+        return masterServiceRepository
+                .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
                 .toList();
@@ -188,6 +190,9 @@ public class ServiceCatalogService {
 
     @Transactional(readOnly = true)
     public List<ServiceTypeResponse> searchServiceTypes(@Nullable UUID categoryId, @Nullable String q) {
+        if (categoryId != null && !catalogCategoryRepository.existsById(categoryId)) {
+            throw new NotFoundException("Category not found");
+        }
         // Intentional duplication of the controller's @Size(min=3) constraint: this guard
         // defends non-HTTP callers (internal services, tests, future programmatic callers)
         // where the Bean Validation boundary is not active. Removing it would silently allow

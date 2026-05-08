@@ -8,13 +8,10 @@ spring:
     hikari:
       keepalive-time: 120000
       idle-timeout: 300000
-      minimum-idle: 2
-      maximum-pool-size: 10
-      connection-timeout: 30000
-
-  threads:
-    virtual:
-      enabled: true
+      minimum-idle: 5              # Keep connections warm under virtual-thread burst (was 2)
+      maximum-pool-size: 10        # Neon free tier hard ceiling — do not raise without a plan upgrade
+      connection-timeout: 20000    # Fail faster under pool saturation; 30s was masking exhaustion (was 30000)
+      leak-detection-threshold: 10000  # Alert on connections held > 10 s — indicates a blocking or long-running query
 
   jpa:
     open-in-view: false

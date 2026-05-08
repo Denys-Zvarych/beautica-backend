@@ -20,6 +20,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
 
+import org.springframework.data.domain.Pageable;
+
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
@@ -61,12 +63,14 @@ class ServiceCatalogServiceCacheTest {
     @DisplayName("second call to getMasterServices returns cached result without hitting repository")
     void should_notHitRepository_when_getMasterServicesCalledTwice() {
         UUID masterId = UUID.randomUUID();
-        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId)).thenReturn(List.of());
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of());
 
         serviceCatalogService.getMasterServices(masterId);
         serviceCatalogService.getMasterServices(masterId);
 
-        verify(masterServiceRepository, times(1)).findByMasterIdAndIsActiveTrueWithGraph(masterId);
+        verify(masterServiceRepository, times(1))
+                .findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class));
     }
 
     @Test
@@ -75,7 +79,8 @@ class ServiceCatalogServiceCacheTest {
         UUID masterId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
 
-        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId)).thenReturn(List.of());
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of());
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         // Populate cache
@@ -85,7 +90,8 @@ class ServiceCatalogServiceCacheTest {
         // Cache was evicted — repository must be queried again
         serviceCatalogService.getMasterServices(masterId);
 
-        verify(masterServiceRepository, times(2)).findByMasterIdAndIsActiveTrueWithGraph(masterId);
+        verify(masterServiceRepository, times(2))
+                .findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class));
     }
 
     @Test
@@ -153,6 +159,7 @@ class ServiceCatalogServiceCacheTest {
     @DisplayName("second searchServiceTypes(categoryId, null) hits cache — category-scoped repo method called once")
     void should_hitCache_when_searchServiceTypesCalledTwiceWithSameCategoryId() {
         UUID categoryId = UUID.randomUUID();
+        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
         when(serviceTypeRepository.findByCategoryWithCategory(categoryId)).thenReturn(List.of());
 
         serviceCatalogService.searchServiceTypes(categoryId, null);
@@ -176,6 +183,7 @@ class ServiceCatalogServiceCacheTest {
     @DisplayName("(q, categoryId) and (q, null) are cached independently — repo called once per distinct key")
     void should_cacheIndependently_when_queryWithAndWithoutCategoryId() {
         UUID categoryId = UUID.randomUUID();
+        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
         when(serviceTypeRepository.searchByName(eq("ман"), any())).thenReturn(List.of());
         when(serviceTypeRepository.searchByNameAndCategory(eq("ман"), eq(categoryId), any())).thenReturn(List.of());
 

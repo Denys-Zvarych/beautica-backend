@@ -23,7 +23,9 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.List;
 import java.util.UUID;
 
+import com.beautica.common.exception.NotFoundException;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -132,6 +134,7 @@ class ServiceCatalogServiceCatalogTest {
         when(type.getNameEn()).thenReturn("Manicure");
         when(type.getSlug()).thenReturn("manicure");
 
+        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
         when(serviceTypeLookup.getByCategory(categoryId)).thenReturn(List.of(type));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(categoryId, null);
@@ -185,6 +188,7 @@ class ServiceCatalogServiceCatalogTest {
         UUID categoryId = UUID.randomUUID();
         var expected = new ServiceTypeResponse(UUID.randomUUID(), categoryId, "Манікюр", "Manicure", "manicure");
 
+        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
         when(serviceTypeSearchService.searchByName("ман", categoryId)).thenReturn(List.of(expected));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(categoryId, "Ман");
@@ -290,5 +294,26 @@ class ServiceCatalogServiceCatalogTest {
         service.searchServiceTypes(null, "");
 
         verify(serviceTypeLookup).getByCategory(null);
+    }
+
+    @Test
+    @DisplayName("should not check category existence when categoryId is null")
+    void should_notCheckCategoryExistence_when_categoryIdIsNull() {
+        when(serviceTypeLookup.getByCategory(null)).thenReturn(List.of());
+
+        service.searchServiceTypes(null, null);
+
+        verify(catalogCategoryRepository, never()).existsById(any());
+    }
+
+    @Test
+    @DisplayName("should throw NotFoundException when categoryId does not exist")
+    void should_throwNotFoundException_when_categoryIdDoesNotExist() {
+        UUID unknownCategoryId = UUID.randomUUID();
+        when(catalogCategoryRepository.existsById(unknownCategoryId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.searchServiceTypes(unknownCategoryId, null))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Category not found");
     }
 }

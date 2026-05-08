@@ -22,6 +22,8 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import org.springframework.data.domain.PageRequest;
+
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
@@ -133,7 +135,7 @@ class MasterServiceRepositoryTest {
         em.flush();
 
         List<MasterServiceAssignment> results =
-                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId());
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
 
         assertThat(results).hasSize(2);
         assertThat(results).extracting(a -> a.getServiceDefinition().getId())
@@ -273,7 +275,7 @@ class MasterServiceRepositoryTest {
 
         // Act
         List<MasterServiceAssignment> results =
-                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId());
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
 
         // Assert — serviceType must be initialized by the LEFT JOIN FETCH (no LazyInitializationException)
         assertThat(results).hasSize(1);
@@ -301,7 +303,7 @@ class MasterServiceRepositoryTest {
 
         // Act
         List<MasterServiceAssignment> results =
-                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId());
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
 
         // Assert — LEFT JOIN means null serviceType is valid; query must still return the row
         assertThat(results).hasSize(1);

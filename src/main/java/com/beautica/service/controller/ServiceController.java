@@ -9,8 +9,6 @@ import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.ServiceCatalogService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.web.PageableDefault;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -62,16 +60,10 @@ public class ServiceController {
      * Unauthenticated clients browse a master's service menu before deciding to book.
      * No {@code @PreAuthorize} guard is intentional; adding one would break the
      * discovery flow for anonymous users.
-     *
-     * <p>The {@code pageable} parameter is accepted for forward-compatibility (and to bound
-     * unbounded client requests at the HTTP layer) but the current service implementation
-     * returns the full list for cache-friendliness. Future work: pass pageable through to
-     * a paginated repository query when per-master service counts exceed ~100.
      */
     @GetMapping("/masters/{masterId}/services")
     public ApiResponse<List<MasterServiceResponse>> getMasterServices(
-            @PathVariable UUID masterId,
-            @PageableDefault(size = 50) Pageable pageable) {
+            @PathVariable UUID masterId) {
         return ApiResponse.ok(serviceCatalogService.getMasterServices(masterId));
     }
 

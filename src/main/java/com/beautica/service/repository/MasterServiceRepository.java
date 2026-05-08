@@ -1,6 +1,7 @@
 package com.beautica.service.repository;
 
 import com.beautica.service.entity.MasterServiceAssignment;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -36,6 +37,9 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             LEFT JOIN FETCH sd.serviceType
             JOIN FETCH msa.master
             WHERE msa.master.id = :masterId AND msa.isActive = true
+            ORDER BY msa.id
             """)
-    List<MasterServiceAssignment> findByMasterIdAndIsActiveTrueWithGraph(@Param("masterId") UUID masterId);
+    List<MasterServiceAssignment> findByMasterIdAndIsActiveTrueWithGraph(
+            @Param("masterId") UUID masterId,
+            Pageable pageable);
 }

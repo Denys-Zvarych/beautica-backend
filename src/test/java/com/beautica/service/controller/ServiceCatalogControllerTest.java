@@ -3,6 +3,7 @@ package com.beautica.service.controller;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
@@ -229,6 +230,21 @@ class ServiceCatalogControllerTest {
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.length()").value(1))
                 .andExpect(jsonPath("$.data[0].nameUk").value("Гель-лак"));
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryId=<unknown> — 404 when category does not exist")
+    void should_return404_when_categoryIdDoesNotExist() throws Exception {
+        UUID unknownId = UUID.randomUUID();
+        when(serviceCatalogService.searchServiceTypes(eq(unknownId), isNull()))
+                .thenThrow(new NotFoundException("Category not found"));
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryId", unknownId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Category not found"));
     }
 
     // ── POST /api/v1/service-types/suggest ────────────────────────────────────

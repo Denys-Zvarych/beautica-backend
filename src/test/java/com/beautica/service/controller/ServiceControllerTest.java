@@ -280,6 +280,19 @@ class ServiceControllerTest {
     }
 
     @Test
+    @DisplayName("GET /masters/{masterId}/services — 200 when page/size params sent (Pageable removed)")
+    void should_return200_when_paginationParamsSentToNonPageableEndpoint() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .param("page", "0")
+                        .param("size", "10")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+    }
+
+    @Test
     @DisplayName("GET /masters/{masterId}/services — 404 when master does not exist")
     void should_return404_when_masterDoesNotExist() throws Exception {
         var unknownMasterId = UUID.randomUUID();

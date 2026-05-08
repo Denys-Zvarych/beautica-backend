@@ -677,6 +677,14 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("evictAvailableSlots — method compiles and does not throw (signature guard)")
+    void should_notThrow_when_evictAvailableSlotsCalledDirectly() {
+        assertThatCode(() -> slotCalculationService.evictAvailableSlots(
+                UUID.randomUUID(), LocalDate.now(clock), UUID.randomUUID()))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     @DisplayName("should pass Kyiv day-boundary window to findOverlappingByMaster")
     void should_passDayBoundaryWindow_when_queryingOverlappingBookings() {
         UUID masterId = UUID.randomUUID();

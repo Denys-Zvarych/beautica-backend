@@ -26,6 +26,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
@@ -350,7 +351,7 @@ class ServiceCatalogServiceTest {
     void should_returnEmptyList_when_masterDoesNotExistOnGetMasterServices() {
         UUID masterId = UUID.randomUUID();
 
-        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId))
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class)))
                 .thenReturn(List.of());
 
         List<MasterServiceResponse> result = serviceCatalogService.getMasterServices(masterId);
@@ -386,7 +387,7 @@ class ServiceCatalogServiceTest {
         when(assignment.getPriceOverride()).thenReturn(null);
         when(assignment.getDurationOverrideMinutes()).thenReturn(null);
 
-        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId))
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class)))
                 .thenReturn(List.of(assignment));
 
         List<MasterServiceResponse> result = serviceCatalogService.getMasterServices(masterId);

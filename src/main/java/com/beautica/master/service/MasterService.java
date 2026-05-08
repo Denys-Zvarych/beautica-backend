@@ -24,6 +24,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -35,6 +36,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Service
@@ -191,8 +193,23 @@ public class MasterService {
                 .orElseThrow(() -> new NotFoundException("Master not found"));
         OffsetDateTime fromOdt = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime toOdt = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
-        Page<Booking> page = bookingRepository.findActiveByMasterIdAndStartsAtBetweenWithGraph(
+
+        // Two-query pattern (Fix H1 — HHH90003004): paginate on IDs only so the DB
+        // applies LIMIT/OFFSET correctly, then hydrate the full graph for those IDs.
+        Page<UUID> idPage = bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
                 master.getId(), fromOdt, toOdt, pageable);
-        return page.map(BookingResponse::from);
+
+        if (idPage.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
+        }
+
+        List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        Map<UUID, Booking> byId = hydrated.stream()
+                .collect(Collectors.toMap(Booking::getId, Function.identity()));
+        List<BookingResponse> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .map(BookingResponse::from)
+                .toList();
+        return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 }
