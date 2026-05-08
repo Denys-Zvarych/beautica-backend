@@ -16,7 +16,7 @@ import java.math.BigDecimal;
 import java.util.UUID;
 
 public record CreateServiceDefinitionRequest(
-        @NotBlank @Size(max = 255) String name,
+        @NotBlank @Size(max = 100) String name,
         @Size(max = 2000) String description,
         ServiceCategory category,
         @NotNull @Positive @Max(480) int baseDurationMinutes,
