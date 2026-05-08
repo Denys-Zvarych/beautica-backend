@@ -4,6 +4,7 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.controller.MasterController;
@@ -128,7 +129,6 @@ class MasterControllerTest {
                     .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                     .authorizeHttpRequests(auth -> auth
                             .requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll()
-                            .requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/slots").permitAll()
                             .anyRequest().authenticated())
                     .exceptionHandling(ex -> ex
                             .authenticationEntryPoint((req, res, exc) ->
@@ -447,11 +447,56 @@ class MasterControllerTest {
     void should_return400_when_slotsMissingDateParam() throws Exception {
         var masterId = UUID.randomUUID();
         var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
 
         log.debug("Act: GET {}/{}/slots without 'date' param — must be rejected with 400", MASTERS_URL, masterId);
         mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
                         .param("serviceId", serviceId.toString())
-                        .accept(MediaType.APPLICATION_JSON))
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 200 with non-empty slots list when service returns one slot")
+    void should_return200WithNonEmptySlots_when_slotsRequestedWithValidParams() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+
+        var futureDate = java.time.ZonedDateTime.now().plusDays(1);
+        var stubSlot = new com.beautica.booking.dto.AvailableSlotResponse(futureDate, futureDate.plusHours(1));
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(serviceId)))
+                .thenReturn(List.of(stubSlot));
+
+        log.debug("Act: GET {}/{}/slots with valid params — must return 200 with one slot", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2027-06-15")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").value("2027-06-15"))
+                .andExpect(jsonPath("$.data.slots").isArray())
+                .andExpect(jsonPath("$.data.slots[0].startsAt").exists());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 400 when service rejects a past date")
+    void should_return400_when_dateIsInThePast() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(serviceId)))
+                .thenThrow(new BusinessException("date is in the past"));
+
+        log.debug("Act: GET {}/{}/slots with a past date — must be rejected with 400", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2020-01-01")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
                 .andExpect(status().isBadRequest());
     }
 

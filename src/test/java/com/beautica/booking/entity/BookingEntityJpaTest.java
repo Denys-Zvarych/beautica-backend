@@ -132,14 +132,18 @@ class BookingEntityJpaTest {
         OffsetDateTime firstStart = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime firstEnd = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
-        Booking first = buildBooking(client, master, masterService, firstStart, firstEnd);
+        // Use distinct idempotency keys so this test exercises the GiST exclusion
+        // constraint, not the unique idempotency-key constraint.
+        Booking first = buildBooking(client, master, masterService, firstStart, firstEnd,
+                UUID.randomUUID().toString());
         em.persist(first);
         em.flush();
 
         OffsetDateTime secondStart = OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC);
         OffsetDateTime secondEnd = OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC);
 
-        Booking second = buildBooking(client, master, masterService, secondStart, secondEnd);
+        Booking second = buildBooking(client, master, masterService, secondStart, secondEnd,
+                UUID.randomUUID().toString());
 
         assertThatThrownBy(() -> em.persistAndFlush(second))
                 .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
@@ -152,6 +156,17 @@ class BookingEntityJpaTest {
             OffsetDateTime startsAt,
             OffsetDateTime endsAt
     ) {
+        return buildBooking(client, master, masterService, startsAt, endsAt, "test-key-123");
+    }
+
+    private Booking buildBooking(
+            User client,
+            Master master,
+            MasterServiceAssignment masterService,
+            OffsetDateTime startsAt,
+            OffsetDateTime endsAt,
+            String idempotencyKey
+    ) {
         return Booking.builder()
                 .client(client)
                 .master(master)
@@ -163,7 +178,7 @@ class BookingEntityJpaTest {
                 .priceAtBooking(new BigDecimal("450.00"))
                 .durationMinutesAtBooking(60)
                 .bufferMinutesAtBooking(0)
-                .idempotencyKey("test-key-123")
+                .idempotencyKey(idempotencyKey)
                 .cancellationReason(null)
                 .clientComment("Please be on time")
                 .providerComment(null)

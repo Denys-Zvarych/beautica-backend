@@ -104,6 +104,40 @@ class BookingSecurityTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("should_return403_when_salonMasterAttemptsToConfirmBooking")
+    void should_return403_when_salonMasterAttemptsToConfirmBooking() throws Exception {
+        // Arrange: create a salon with a master; CLIENT books a slot
+        String ownerEmail = "sm-confirm-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("sm-confirm-client-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
+
+        // Resolve the SALON_MASTER user that was inserted by createSalonOwnerSalonAndMaster
+        String masterEmail = jdbcTemplate.queryForObject(
+                """
+                SELECT u.email FROM users u
+                JOIN masters m ON m.user_id = u.id
+                WHERE m.id = ?
+                """,
+                String.class, masterId);
+        String salonMasterToken = loginAndGetToken(masterEmail);
+
+        // Act: SALON_MASTER attempts to confirm — must be rejected with 403
+        log.debug("Act: PATCH {}/{}/confirm as SALON_MASTER — must return 403", BOOKINGS_URL, bookingId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(salonMasterToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("SALON_MASTER confirming booking must return 403, bookingId=%s", bookingId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
     @DisplayName("PATCH confirm — 403 when owner B attempts to confirm a booking from salon A")
     void should_return403_when_ownerOfSalonBManagesBookingInSalonA() throws Exception {
         String ownerAEmail = "owner-a-idor-" + System.nanoTime() + "@beautica.test";

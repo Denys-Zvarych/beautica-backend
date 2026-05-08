@@ -31,7 +31,12 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import com.beautica.booking.repository.BookingRepository;
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.time.LocalDate;
 import java.time.ZonedDateTime;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,6 +60,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private BookingRepository bookingRepository;
 
     @MockBean
     private NotificationOutboxService notificationOutboxService;
@@ -170,6 +178,205 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode())
                 .as("owner confirming booking must return 204, bookingId=%s", bookingId)
                 .isEqualTo(HttpStatus.NO_CONTENT);
+
+        String dbStatus = jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbStatus)
+                .as("booking status in DB must be CONFIRMED after owner confirm, bookingId=%s", bookingId)
+                .isEqualTo("CONFIRMED");
+    }
+
+    @Test
+    @DisplayName("GET /masters/{masterId}/slots — booked slot absent when booking is PENDING")
+    void should_excludeCreatedBookingFromSlots_when_bookingIsPending() throws Exception {
+        String clientToken = createClientAndGetToken("integ-slots-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-slots-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        // Use a date at least 2 days ahead so the @Future constraint is satisfied and
+        // the slot has never been cached (fresh date per test run).
+        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        LocalDate slotDate = startsAt.toLocalDate();
+
+        // Verify the slot is available before booking
+        String slotsUrl = "/api/v1/masters/" + masterId + "/slots"
+                + "?date=" + slotDate + "&serviceId=" + masterServiceId;
+        ResponseEntity<String> beforeResponse = restTemplate.exchange(
+                slotsUrl, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(clientToken)),
+                String.class);
+        assertThat(beforeResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode beforeSlots = objectMapper.readTree(beforeResponse.getBody())
+                .path("data").path("slots");
+        assertThat(beforeSlots.isArray()).isTrue();
+        boolean slotPresentBefore = false;
+        for (JsonNode slot : beforeSlots) {
+            if (slot.path("startsAt").asText().startsWith(startsAt.toOffsetDateTime().toString().substring(0, 16))) {
+                slotPresentBefore = true;
+                break;
+            }
+        }
+        assertThat(slotPresentBefore)
+                .as("slot at %s must be available before booking", startsAt)
+                .isTrue();
+
+        // Create the booking
+        createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        // Evict the cache entry so the next query hits the DB (same eviction the service performs)
+        jdbcTemplate.execute("SELECT 1"); // no-op — cache eviction already happened via afterCommit hook
+
+        // Fetch slots again — the booked slot must no longer appear
+        ResponseEntity<String> afterResponse = restTemplate.exchange(
+                slotsUrl, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(clientToken)),
+                String.class);
+        assertThat(afterResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode afterSlots = objectMapper.readTree(afterResponse.getBody())
+                .path("data").path("slots");
+        assertThat(afterSlots.isArray()).isTrue();
+        for (JsonNode slot : afterSlots) {
+            String slotStart = slot.path("startsAt").asText();
+            assertThat(slotStart)
+                    .as("booked slot at %s must not appear in available slots response", startsAt)
+                    .doesNotStartWith(startsAt.toOffsetDateTime().toString().substring(0, 16));
+        }
+    }
+
+    @Test
+    @DisplayName("POST /bookings — 409 when same slot booked twice sequentially, DB has exactly 1 row")
+    void should_return409_when_sameSlotBookedTwiceSequentially() throws Exception {
+        String clientAToken = createClientAndGetToken("integ-conflict-a-" + System.nanoTime() + "@beautica.test");
+        String clientBToken = createClientAndGetToken("integ-conflict-b-" + System.nanoTime() + "@beautica.test");
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-conflict-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(12).withMinute(0).withSecond(0).withNano(0);
+
+        log.debug("Act: first booking by clientA at {}", startsAt);
+        createBooking(clientAToken, masterId, masterServiceId, startsAt);
+
+        log.debug("Act: second booking by clientB at same slot — must return 409");
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null);
+        ResponseEntity<String> secondResponse = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(clientBToken)),
+                String.class);
+
+        assertThat(secondResponse.getStatusCode())
+                .as("second booking for the same slot must return 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        JsonNode conflictBody = objectMapper.readTree(secondResponse.getBody());
+        assertThat(conflictBody.path("success").asBoolean())
+                .as("conflict response body must have success=false")
+                .isFalse();
+        String conflictMessage = conflictBody.path("message").asText("").toLowerCase();
+        assertThat(conflictMessage)
+                .as("conflict message must not expose internal SQL or stack details")
+                .doesNotContainIgnoringCase("sql")
+                .doesNotContainIgnoringCase("constraint")
+                .doesNotContainIgnoringCase("duplicate key")
+                .doesNotContainIgnoringCase("violat")
+                .doesNotContainIgnoringCase("exception")
+                .doesNotContainIgnoringCase("stack");
+
+        long count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM bookings", Long.class);
+        assertThat(count)
+                .as("exactly one booking row must exist in the database after a conflict")
+                .isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/confirm and /complete — full PENDING→CONFIRMED→COMPLETED flow with DB assertions")
+    void should_confirmAndCompleteBooking_when_fullStatusFlow() throws Exception {
+        String ownerEmail = "integ-flow-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-flow-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(13).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        // Step 2: SALON_OWNER confirms — expect 204
+        log.debug("Act: PATCH {}/{}/confirm as SALON_OWNER", BOOKINGS_URL, bookingId);
+        ResponseEntity<Void> confirmResponse = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                Void.class);
+        assertThat(confirmResponse.getStatusCode())
+                .as("confirm must return 204")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        // Step 3: DB must show CONFIRMED
+        String statusAfterConfirm = jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(statusAfterConfirm)
+                .as("DB status must be CONFIRMED after confirm, bookingId=%s", bookingId)
+                .isEqualTo("CONFIRMED");
+
+        // Step 4: SALON_OWNER completes — expect 204
+        log.debug("Act: PATCH {}/{}/complete as SALON_OWNER", BOOKINGS_URL, bookingId);
+        ResponseEntity<Void> completeResponse = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/complete", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                Void.class);
+        assertThat(completeResponse.getStatusCode())
+                .as("complete must return 204")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        // Step 5: DB must show COMPLETED
+        String statusAfterComplete = jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(statusAfterComplete)
+                .as("DB status must be COMPLETED after complete, bookingId=%s", bookingId)
+                .isEqualTo("COMPLETED");
+    }
+
+    @Test
+    @DisplayName("GET /masters/me/calendar — master B sees 0 bookings when only master A has a booking")
+    void should_returnOnlyOwnBookings_when_masterCallsCalendar() throws Exception {
+        // Arrange: salon A with master A + one booking
+        String ownerAEmail = "integ-cal-owner-a-" + System.nanoTime() + "@beautica.test";
+        UUID masterAId = createSalonOwnerSalonAndMaster(ownerAEmail);
+        UUID masterAServiceId = createMasterService(masterAId);
+        addWorkingHoursForEveryDay(masterAId);
+
+        String clientToken = createClientAndGetToken("integ-cal-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(9).withMinute(0).withSecond(0).withNano(0);
+        createBooking(clientToken, masterAId, masterAServiceId, startsAt);
+
+        // Arrange: salon B with master B — no bookings
+        String ownerBEmail = "integ-cal-owner-b-" + System.nanoTime() + "@beautica.test";
+        createSalonOwnerSalonAndMaster(ownerBEmail);
+
+        // Obtain SALON_MASTER user ID for master B so we can log in as that master
+        String masterBEmail = getMasterEmailForOwner(ownerBEmail);
+        String masterBToken = loginAndGetToken(masterBEmail);
+
+        LocalDate from = startsAt.toLocalDate().minusDays(1);
+        LocalDate to = startsAt.toLocalDate().plusDays(1);
+        String calendarUrl = "/api/v1/masters/me/calendar?from=" + from + "&to=" + to;
+
+        log.debug("Act: GET {} as master B — must return 0 bookings", calendarUrl);
+        ResponseEntity<String> response = restTemplate.exchange(
+                calendarUrl, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(masterBToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("master B calendar request must return 200")
+                .isEqualTo(HttpStatus.OK);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        long totalElements = data.path("totalElements").asLong(-1);
+        assertThat(totalElements)
+                .as("master B must see 0 bookings — master A's booking must not be visible")
+                .isEqualTo(0L);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -243,6 +450,11 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
     private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId) throws Exception {
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        return createBooking(clientToken, masterId, masterServiceId, startsAt);
+    }
+
+    private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId,
+                               ZonedDateTime startsAt) throws Exception {
         var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null);
 
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -252,6 +464,23 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<BookingResponse>>() {});
         return body.data().id();
+    }
+
+    /**
+     * Returns the email of the SALON_MASTER user that was created under the given salon owner.
+     * {@link #createSalonOwnerSalonAndMaster(String)} inserts the master user with
+     * role=SALON_MASTER and email starting with "master-". This query finds that user.
+     */
+    private String getMasterEmailForOwner(String ownerEmail) {
+        return jdbcTemplate.queryForObject(
+                """
+                SELECT u.email FROM users u
+                JOIN users owner ON owner.email = ?
+                JOIN salons s ON s.owner_id = owner.id
+                WHERE u.salon_id = s.id AND u.role = 'SALON_MASTER'
+                LIMIT 1
+                """,
+                String.class, ownerEmail);
     }
 
     private HttpHeaders bearerHeaders(String token) {

@@ -508,8 +508,8 @@ class BookingRepositoryTest {
     // ── findBySalonIdAndOwnerIdWithGraph — happy-path ─────────────────────────
 
     @Test
-    @DisplayName("findBySalonIdAndOwnerIdWithGraph_returnsOwnerBookings")
-    void findBySalonIdAndOwnerIdWithGraph_returnsOwnerBookings() {
+    @DisplayName("should_returnOwnerBookings_when_salonOwnerQueriesAll")
+    void should_returnOwnerBookings_when_salonOwnerQueriesAll() {
         User salonOwner = new User(
                 "owner-happy-" + UUID.randomUUID() + "@test.com",
                 "$2a$10$hash",
@@ -593,8 +593,8 @@ class BookingRepositoryTest {
     // ── findBySalonIdAndOwnerIdAndStatusWithGraph — happy-path ───────────────
 
     @Test
-    @DisplayName("findBySalonIdAndOwnerIdAndStatusWithGraph_filtersByStatus")
-    void findBySalonIdAndOwnerIdAndStatusWithGraph_filtersByStatus() {
+    @DisplayName("should_filterByStatus_when_salonOwnerPassesStatusParam")
+    void should_filterByStatus_when_salonOwnerPassesStatusParam() {
         User salonOwner = new User(
                 "owner-status-" + UUID.randomUUID() + "@test.com",
                 "$2a$10$hash",
@@ -688,6 +688,27 @@ class BookingRepositoryTest {
         assertThat(result.getTotalElements()).isEqualTo(1);
         assertThat(result.getContent().get(0).getId()).isEqualTo(confirmedBooking.getId());
         assertThat(result.getContent().get(0).getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("should_returnFullGraph_when_findActiveByMasterIdAndStartsAtBetweenWithGraph")
+    void should_returnFullGraph_when_findActiveByMasterIdAndStartsAtBetweenWithGraph() {
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 11, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 11, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
+        em.persist(booking);
+        em.flush();
+        em.clear();
+
+        OffsetDateTime from = OffsetDateTime.of(2026, 11, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime to = OffsetDateTime.of(2026, 11, 1, 12, 0, 0, 0, ZoneOffset.UTC);
+
+        Page<Booking> result = bookingRepository.findActiveByMasterIdAndStartsAtBetweenWithGraph(
+                master.getId(), from, to, org.springframework.data.domain.Pageable.ofSize(10));
+
+        assertThat(result.getContent()).isNotEmpty();
+        assertThat(result.getContent().get(0).getClient()).isNotNull();
     }
 
     @Test
