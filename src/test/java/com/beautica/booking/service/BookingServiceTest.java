@@ -40,6 +40,7 @@ import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
+import org.springframework.data.domain.PageImpl;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -716,6 +717,28 @@ class BookingServiceTest {
         assertThat(result).isNotNull();
         verify(bookingRepository).findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable);
         verify(bookingRepository, never()).findBySalonIdAndOwnerIdAndStatusWithGraph(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("mapped BookingResponse page is returned when salon owner lists with a non-empty page")
+    void should_returnMappedBookings_when_salonOwnerListsWithNonEmptyPage() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User salonOwner = new User(
+                "owner3@example.com", "hash", Role.SALON_OWNER, "Owner", "Three", "+380501111115", salonId);
+        setField(salonOwner, "id", actorId);
+        Pageable pageable = Pageable.unpaged();
+        Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
+
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+        when(bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable))
+                .thenReturn(new PageImpl<>(List.of(existingBooking)));
+
+        Page<BookingResponse> result =
+                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent()).hasSize(1);
     }
 
     @Test

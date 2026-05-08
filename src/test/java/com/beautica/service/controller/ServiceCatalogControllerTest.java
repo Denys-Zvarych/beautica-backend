@@ -216,6 +216,24 @@ class ServiceCatalogControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
+    @Test
+    @DisplayName("GET /service-types?q=Гель&categoryId=... — 200 and non-empty content when both params provided")
+    void should_return200_when_bothQAndCategoryIdProvided() throws Exception {
+        var result = List.of(
+                new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish"));
+        when(serviceCatalogService.searchServiceTypes(eq(nailsCategoryId), eq("Гель"))).thenReturn(result);
+        log.debug("Act: GET /api/v1/service-types?q=Гель&categoryId={}", nailsCategoryId);
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "Гель")
+                        .param("categoryId", nailsCategoryId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(1))
+                .andExpect(jsonPath("$.data[0].nameUk").value("Гель-лак"));
+    }
+
     // ── POST /api/v1/service-types/suggest ────────────────────────────────────
 
     @Test
