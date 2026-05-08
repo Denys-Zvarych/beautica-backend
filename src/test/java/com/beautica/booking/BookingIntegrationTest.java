@@ -33,6 +33,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.UUID;
@@ -260,9 +261,8 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         UUID masterServiceId = createMasterService(masterId);
         addWorkingHoursForEveryDay(masterId);
 
-        // Use a date at least 2 days ahead so the @Future constraint is satisfied and
-        // the slot has never been cached (fresh date per test run).
-        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        // Use Kyiv zone explicitly so the slot prefix comparison is stable regardless of CI server TZ.
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2).withHour(11).withMinute(0).withSecond(0).withNano(0);
         LocalDate slotDate = startsAt.toLocalDate();
 
         // Verify the slot is available before booking

@@ -72,6 +72,7 @@ class SalonServiceAdminTest {
         var request = new UpdateSalonRequest("Updated Name", null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.save(salon)).thenReturn(salon);
         // Authorization is exclusively enforced by @PreAuthorize on SalonController — not re-checked in service.
 
         SalonResponse response = salonService.updateSalon(adminId, salonId, request);
