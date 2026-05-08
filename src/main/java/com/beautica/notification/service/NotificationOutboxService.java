@@ -1,6 +1,7 @@
 package com.beautica.notification.service;
 
 import org.springframework.stereotype.Service;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -22,7 +23,7 @@ public class NotificationOutboxService {
      *       {@link NotificationService} outside of any booking transaction.
      * </ul>
      */
-    public void enqueueNewBooking(UUID bookingId) {}
+    public void enqueueNewBooking(UUID bookingId) { Objects.requireNonNull(bookingId, "bookingId"); }
 
     /**
      * Enqueues a "booking status changed" notification for Phase 5 implementation.
@@ -38,7 +39,7 @@ public class NotificationOutboxService {
      *       {@link NotificationService} outside of any booking transaction.
      * </ul>
      */
-    public void enqueueStatusChanged(UUID bookingId) {}
+    public void enqueueStatusChanged(UUID bookingId) { Objects.requireNonNull(bookingId, "bookingId"); }
 
     /**
      * Enqueues a "client cancelled booking" notification for Phase 5 implementation.
@@ -54,5 +55,5 @@ public class NotificationOutboxService {
      *       {@link NotificationService} outside of any booking transaction.
      * </ul>
      */
-    public void enqueueClientCancelled(UUID bookingId) {}
+    public void enqueueClientCancelled(UUID bookingId) { Objects.requireNonNull(bookingId, "bookingId"); }
 }
