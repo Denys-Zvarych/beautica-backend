@@ -61,11 +61,14 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
     @org.springframework.boot.test.mock.mockito.MockBean
     private EmailService emailService;
 
+    private ServiceTestFixtures fixtures;
+
     @BeforeEach
     void configureHttpClient() {
         restTemplate.getRestTemplate().setRequestFactory(
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
         doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
+        fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
     @AfterEach
@@ -83,11 +86,11 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
     @DisplayName("POST /salons/{salonAId}/services — 403 when Owner B adds a service to Owner A's salon")
     void should_return403_when_ownerBAddsServiceToSalonOwnedByOwnerA() throws Exception {
         // Arrange
-        String ownerAToken = createSalonOwnerAndGetToken(
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-a-add-" + System.nanoTime() + "@beautica.test");
-        UUID salonAId = createSalon(ownerAToken, "Owner A Salon");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon");
 
-        String ownerBToken = createSalonOwnerAndGetToken(
+        String ownerBToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-b-add-" + System.nanoTime() + "@beautica.test");
 
         var request = new CreateServiceDefinitionRequest(
@@ -97,7 +100,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — IDOR must be blocked", salonAId);
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/salons/" + salonAId + "/services", HttpMethod.POST,
-                new HttpEntity<>(request, bearerHeaders(ownerBToken)),
+                new HttpEntity<>(request, fixtures.bearerHeaders(ownerBToken)),
                 String.class);
 
         // Assert
@@ -110,13 +113,13 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
     @DisplayName("POST /salons/{salonAId}/masters/{masterAId}/services — 403 when Owner B assigns service to Master in Owner A's salon")
     void should_return403_when_ownerBAssignsServiceToMasterInSalonOwnedByOwnerA() throws Exception {
         // Arrange
-        String ownerAToken = createSalonOwnerAndGetToken(
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-a-assign-" + System.nanoTime() + "@beautica.test");
-        UUID salonAId = createSalon(ownerAToken, "Owner A Salon");
-        UUID masterAId = createSalonMaster(salonAId);
-        UUID serviceDefId = createServiceDefinition(ownerAToken, salonAId, "Salon A Service");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon");
+        UUID masterAId = fixtures.createSalonMaster(salonAId);
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonAId, "Salon A Service");
 
-        String ownerBToken = createSalonOwnerAndGetToken(
+        String ownerBToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-b-assign-" + System.nanoTime() + "@beautica.test");
 
         var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
@@ -126,7 +129,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 salonAId, masterAId);
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/salons/" + salonAId + "/masters/" + masterAId + "/services", HttpMethod.POST,
-                new HttpEntity<>(request, bearerHeaders(ownerBToken)),
+                new HttpEntity<>(request, fixtures.bearerHeaders(ownerBToken)),
                 String.class);
 
         // Assert
@@ -140,19 +143,19 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
     @DisplayName("DELETE /services/{salonAServiceId} — 403 when Owner B deactivates Owner A's service definition")
     void should_return403_when_ownerBDeactivatesServiceOwnedBySalonA() throws Exception {
         // Arrange
-        String ownerAToken = createSalonOwnerAndGetToken(
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-a-del-" + System.nanoTime() + "@beautica.test");
-        UUID salonAId = createSalon(ownerAToken, "Owner A Salon");
-        UUID salonAServiceId = createServiceDefinition(ownerAToken, salonAId, "Owner A's Service");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon");
+        UUID salonAServiceId = fixtures.createServiceDefinition(ownerAToken, salonAId, "Owner A's Service");
 
-        String ownerBToken = createSalonOwnerAndGetToken(
+        String ownerBToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-b-del-" + System.nanoTime() + "@beautica.test");
 
         // Act
         log.debug("Act: DELETE /api/v1/services/{} with Owner B token — IDOR must be blocked", salonAServiceId);
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/services/" + salonAServiceId, HttpMethod.DELETE,
-                new HttpEntity<>(bearerHeaders(ownerBToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerBToken)),
                 String.class);
 
         // Assert
@@ -165,12 +168,12 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
     @DisplayName("DELETE /services/{serviceDefId} — 403 when SALON_OWNER deletes an INDEPENDENT_MASTER's service")
     void should_return403_when_salonOwnerDeletesIndependentMasterService() throws Exception {
         // Arrange — independent master creates a service
-        String indepToken = createIndependentMasterAndGetToken(
+        String indepToken = fixtures.createIndependentMasterAndGetToken(
                 "sec-indep-del-" + System.nanoTime() + "@beautica.test");
-        UUID indepServiceId = createIndependentMasterService(indepToken, "Lash Extensions");
+        UUID indepServiceId = fixtures.createIndependentMasterService(indepToken, "Lash Extensions");
 
         // Arrange — separate salon owner
-        String ownerToken = createSalonOwnerAndGetToken(
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-del-indep-" + System.nanoTime() + "@beautica.test");
 
         // Act
@@ -178,7 +181,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 indepServiceId);
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/services/" + indepServiceId, HttpMethod.DELETE,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
                 String.class);
 
         // Assert
@@ -192,12 +195,12 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
     @DisplayName("DELETE /services/{serviceDefId} — 403 when INDEPENDENT_MASTER A deletes INDEPENDENT_MASTER B's service")
     void should_return403_when_independentMasterADeletesIndependentMasterBService() throws Exception {
         // Arrange — master B creates a service
-        String masterBToken = createIndependentMasterAndGetToken(
+        String masterBToken = fixtures.createIndependentMasterAndGetToken(
                 "sec-indep-b-" + System.nanoTime() + "@beautica.test");
-        UUID masterBServiceId = createIndependentMasterService(masterBToken, "Gel Nails");
+        UUID masterBServiceId = fixtures.createIndependentMasterService(masterBToken, "Gel Nails");
 
         // Arrange — master A (different independent master)
-        String masterAToken = createIndependentMasterAndGetToken(
+        String masterAToken = fixtures.createIndependentMasterAndGetToken(
                 "sec-indep-a-" + System.nanoTime() + "@beautica.test");
 
         // Act
@@ -205,7 +208,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 masterBServiceId);
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/services/" + masterBServiceId, HttpMethod.DELETE,
-                new HttpEntity<>(bearerHeaders(masterAToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(masterAToken)),
                 String.class);
 
         // Assert
@@ -215,84 +218,4 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
-    // ── helpers ────────────────────────────────────────────────────────────────
-
-    private String createSalonOwnerAndGetToken(String email) throws Exception {
-        String hash = passwordEncoder.encode(TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
-                UUID.randomUUID(), email, hash);
-
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
-        return body.data().accessToken();
-    }
-
-    private UUID createSalon(String ownerToken, String name) throws Exception {
-        String body = "{\"name\":\"" + name + "\"}";
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons", HttpMethod.POST,
-                new HttpEntity<>(body, bearerHeaders(ownerToken)),
-                String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        var parsed = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<com.beautica.salon.dto.SalonResponse>>() {});
-        return parsed.data().id();
-    }
-
-    private UUID createSalonMaster(UUID salonId) {
-        UUID masterUserId = UUID.randomUUID();
-        String masterEmail = "sec-master-" + System.nanoTime() + "@beautica.test";
-        String hash = passwordEncoder.encode(TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active) VALUES (?, ?, ?, 'SALON_MASTER', ?, true)",
-                masterUserId, masterEmail, hash, salonId);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
-        return masterId;
-    }
-
-    private UUID createServiceDefinition(String ownerToken, UUID salonId, String name) throws Exception {
-        var request = new CreateServiceDefinitionRequest(name, null, null, 60, new BigDecimal("500.00"), 0, null);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
-                new HttpEntity<>(request, bearerHeaders(ownerToken)),
-                String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        var parsed = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
-        return parsed.data().id();
-    }
-
-    private String createIndependentMasterAndGetToken(String email) throws Exception {
-        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", null);
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/register/independent-master", request, String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
-        return body.data().accessToken();
-    }
-
-    private UUID createIndependentMasterService(String indepToken, String name) throws Exception {
-        var request = new CreateServiceDefinitionRequest(name, null, null, 60, new BigDecimal("500.00"), 0, null);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/independent-masters/me/services", HttpMethod.POST,
-                new HttpEntity<>(request, bearerHeaders(indepToken)),
-                String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        var parsed = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<com.beautica.service.dto.MasterServiceResponse>>() {});
-        return parsed.data().serviceDefinition().id();
-    }
-
-    private HttpHeaders bearerHeaders(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return headers;
-    }
 }
