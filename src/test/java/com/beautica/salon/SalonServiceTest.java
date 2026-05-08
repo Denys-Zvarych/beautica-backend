@@ -118,7 +118,7 @@ class SalonServiceTest {
     void should_throwNotFound_when_getSalonEntityWithUnknownId() {
         UUID salonId = UUID.randomUUID();
 
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
+        when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.getSalonEntity(salonId))
                 .isInstanceOf(NotFoundException.class);
@@ -135,6 +135,7 @@ class SalonServiceTest {
         var request = new UpdateSalonRequest("New Name", null, "Lviv", null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.save(salon)).thenReturn(salon);
         // authorizationService.enforceCanManageSalon is void — Mockito does nothing by default (access granted)
 
         SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
@@ -156,6 +157,7 @@ class SalonServiceTest {
         var request = new UpdateSalonRequest("Updated Name", null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.save(salon)).thenReturn(salon);
 
         SalonResponse response = salonService.updateSalon(actorId, salonId, request);
 

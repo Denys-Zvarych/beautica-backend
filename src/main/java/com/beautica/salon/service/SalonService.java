@@ -17,6 +17,7 @@ import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -59,7 +60,10 @@ public class SalonService {
         return SalonResponse.from(salonRepository.save(salon));
     }
 
-    @CacheEvict(value = "ownerSalons", key = "#actorId")
+    @Caching(evict = {
+            @CacheEvict(value = "ownerSalons", key = "#actorId"),
+            @CacheEvict(value = "salon-detail", key = "#salonId")
+    })
     @Transactional
     public SalonResponse updateSalon(UUID actorId, UUID salonId, UpdateSalonRequest request) {
         var salon = salonRepository.findById(salonId)
@@ -90,12 +94,13 @@ public class SalonService {
             salon.setInstagramUrl(request.instagramUrl());
         }
 
-        return SalonResponse.from(salon);
+        return SalonResponse.from(salonRepository.save(salon));
     }
 
     @Transactional(readOnly = true)
+    @Cacheable(value = "salon-detail", key = "#salonId")
     public Salon getSalonEntity(UUID salonId) {
-        return salonRepository.findById(salonId)
+        return salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
     }
 
@@ -125,8 +130,11 @@ public class SalonService {
                 .toList();
     }
 
+    @Caching(evict = {
+            @CacheEvict(value = "ownerSalons", key = "#ownerId"),
+            @CacheEvict(value = "salon-detail", key = "#salonId")
+    })
     @Transactional
-    @CacheEvict(value = "ownerSalons", key = "#ownerId")
     public void deactivateSalon(UUID ownerId, UUID salonId) {
         var caller = userRepository.findById(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));

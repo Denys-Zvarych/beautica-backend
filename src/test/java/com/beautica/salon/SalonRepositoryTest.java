@@ -229,4 +229,85 @@ class SalonRepositoryTest {
                 .as("findByIdAndOwnerId must return empty when owner B requests owner A's salon")
                 .isEmpty();
     }
+
+    // ── findByIdAndIsActiveTrueWithOwner ───────────────────────────────────────
+
+    @Test
+    @DisplayName("findByIdAndIsActiveTrueWithOwner — returns entity with owner graph populated for an active salon")
+    void should_returnSalonWithOwner_when_salonIsActive() {
+        User owner = new User(
+                "owner-active-detail-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Olena",
+                "Bondar",
+                "+380501111122"
+        );
+        em.persist(owner);
+
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("Active Detail Salon")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+        em.flush();
+        em.clear();
+
+        var result = salonRepository.findByIdAndIsActiveTrueWithOwner(salon.getId());
+
+        assertThat(result)
+                .as("findByIdAndIsActiveTrueWithOwner must return a populated Optional for an active salon")
+                .isPresent();
+        assertThat(result.get().getName())
+                .as("salon name must match the persisted value")
+                .isEqualTo("Active Detail Salon");
+        assertThat(result.get().getOwner())
+                .as("owner graph must be populated (JOIN FETCH)")
+                .isNotNull();
+        assertThat(result.get().getOwner().getId())
+                .as("owner ID must match the persisted owner")
+                .isEqualTo(owner.getId());
+    }
+
+    @Test
+    @DisplayName("findByIdAndIsActiveTrueWithOwner — returns Optional.empty() for an inactive salon")
+    void should_returnEmpty_when_salonIsInactive() {
+        User owner = new User(
+                "owner-inactive-detail-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Ivan",
+                "Koval",
+                "+380502222233"
+        );
+        em.persist(owner);
+
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("Inactive Detail Salon")
+                .isActive(false)
+                .build();
+        em.persist(salon);
+        em.flush();
+        em.clear();
+
+        var result = salonRepository.findByIdAndIsActiveTrueWithOwner(salon.getId());
+
+        assertThat(result)
+                .as("findByIdAndIsActiveTrueWithOwner must return empty for an inactive salon")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("findByIdAndIsActiveTrueWithOwner — returns Optional.empty() for a non-existent UUID")
+    void should_returnEmpty_when_salonIdDoesNotExist() {
+        UUID nonExistentId = UUID.randomUUID();
+
+        var result = salonRepository.findByIdAndIsActiveTrueWithOwner(nonExistentId);
+
+        assertThat(result)
+                .as("findByIdAndIsActiveTrueWithOwner must return empty when no salon matches the given UUID")
+                .isEmpty();
+    }
 }

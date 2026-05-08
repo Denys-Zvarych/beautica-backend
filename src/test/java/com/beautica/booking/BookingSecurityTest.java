@@ -11,7 +11,6 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -28,7 +27,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -52,9 +50,6 @@ class BookingSecurityTest extends AbstractIntegrationTest {
     private ObjectMapper objectMapper;
 
     @Autowired
-    private JdbcTemplate jdbcTemplate;
-
-    @Autowired
     private PasswordEncoder passwordEncoder;
 
     @MockBean
@@ -64,20 +59,6 @@ class BookingSecurityTest extends AbstractIntegrationTest {
     void configureHttpClient() {
         restTemplate.getRestTemplate().setRequestFactory(
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
-
-    @AfterEach
-    void cleanUp() {
-        jdbcTemplate.execute("DELETE FROM bookings");
-        jdbcTemplate.execute("DELETE FROM master_services");
-        jdbcTemplate.execute("DELETE FROM service_definitions");
-        jdbcTemplate.execute("DELETE FROM working_hours");
-        jdbcTemplate.execute("DELETE FROM schedule_exceptions");
-        jdbcTemplate.execute("DELETE FROM masters");
-        jdbcTemplate.execute("DELETE FROM invite_tokens");
-        jdbcTemplate.execute("DELETE FROM salons");
-        jdbcTemplate.execute("DELETE FROM refresh_tokens");
-        jdbcTemplate.execute("DELETE FROM users");
     }
 
     @Test

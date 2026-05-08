@@ -21,6 +21,7 @@ import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -134,6 +135,7 @@ public class BookingService {
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 
+    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse confirmBooking(UUID actorUserId, UUID bookingId) {
         Booking booking = loadBookingOrThrow(bookingId);
@@ -145,6 +147,7 @@ public class BookingService {
         return BookingResponse.from(saved);
     }
 
+    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         // Fix M4: require a reason, consistent with notCompleteBooking
@@ -163,6 +166,7 @@ public class BookingService {
         return BookingResponse.from(saved);
     }
 
+    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse completeBooking(UUID actorUserId, UUID bookingId) {
         Booking booking = loadBookingOrThrow(bookingId);
@@ -174,6 +178,7 @@ public class BookingService {
         return BookingResponse.from(saved);
     }
 
+    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse notCompleteBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking booking = loadBookingOrThrow(bookingId);
@@ -190,6 +195,7 @@ public class BookingService {
         return BookingResponse.from(saved);
     }
 
+    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, CancelBookingRequest req) {
         Booking booking = loadBookingOrThrow(bookingId);

@@ -25,6 +25,7 @@ public class CacheConfig {
      *   available-slots     — slot availability per master/date/service — 60 sec TTL, max 5000 entries
      *   master-calendar     — paginated booking calendar per master/date range — 30 sec TTL, max 500 entries
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
+     *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
      */
     @Bean
     public CacheManager cacheManager() {
@@ -65,6 +66,11 @@ public class CacheConfig {
                         .expireAfterWrite(30, TimeUnit.SECONDS)
                         .build());
         manager.registerCustomCache("service-type-search",
+                Caffeine.newBuilder()
+                        .maximumSize(1000)
+                        .expireAfterWrite(5, TimeUnit.MINUTES)
+                        .build());
+        manager.registerCustomCache("salon-detail",
                 Caffeine.newBuilder()
                         .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
