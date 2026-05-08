@@ -33,6 +33,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.transaction.annotation.Transactional;
 
+
 import java.util.List;
 import java.util.UUID;
 
@@ -47,6 +48,7 @@ public class ServiceCatalogService {
     private final ServiceTypeRepository serviceTypeRepository;
     private final CatalogCategoryRepository catalogCategoryRepository;
     private final EmailService emailService;
+    private final ServiceTypeLookup serviceTypeLookup;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -192,16 +194,7 @@ public class ServiceCatalogService {
         if (useSearch) {
             return searchServiceTypesByName(q.strip(), categoryId);
         }
-        return getCachedServiceTypes(categoryId);
-    }
-
-    @Cacheable(value = "service-types", key = "#categoryId")
-    @Transactional(readOnly = true)
-    public List<ServiceTypeResponse> getCachedServiceTypes(@Nullable UUID categoryId) {
-        List<ServiceType> types = (categoryId != null)
-                ? serviceTypeRepository.findByCategoryWithCategory(categoryId)
-                : serviceTypeRepository.findAllActiveWithCategory();
-        return types.stream()
+        return serviceTypeLookup.getByCategory(categoryId).stream()
                 .map(ServiceTypeResponse::from)
                 .toList();
     }
@@ -242,8 +235,7 @@ public class ServiceCatalogService {
         if (request.serviceTypeId() == null) {
             return;
         }
-        ServiceType type = serviceTypeRepository.findById(request.serviceTypeId())
-                .orElseThrow(() -> new NotFoundException("Service type not found: " + request.serviceTypeId()));
+        ServiceType type = serviceTypeLookup.getById(request.serviceTypeId());
         if (!type.isActive()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
         }

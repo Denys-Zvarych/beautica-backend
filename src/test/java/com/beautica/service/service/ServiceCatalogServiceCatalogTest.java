@@ -44,6 +44,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private ServiceTypeRepository serviceTypeRepository;
     @Mock private CatalogCategoryRepository catalogCategoryRepository;
     @Mock private EmailService emailService;
+    @Mock private ServiceTypeLookup serviceTypeLookup;
 
     private ServiceCatalogService service;
 
@@ -56,7 +57,8 @@ class ServiceCatalogServiceCatalogTest {
                 masterRepository,
                 serviceTypeRepository,
                 catalogCategoryRepository,
-                emailService
+                emailService,
+                serviceTypeLookup
         );
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
@@ -103,13 +105,13 @@ class ServiceCatalogServiceCatalogTest {
         when(type.getNameEn()).thenReturn("Gel Polish");
         when(type.getSlug()).thenReturn("gel-polish");
 
-        when(serviceTypeRepository.findAllActiveWithCategory()).thenReturn(List.of(type));
+        when(serviceTypeLookup.getByCategory(null)).thenReturn(List.of(type));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(null, null);
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).nameUk()).isEqualTo("Гель-лак");
-        verify(serviceTypeRepository).findAllActiveWithCategory();
+        verify(serviceTypeLookup).getByCategory(null);
     }
 
     // ── searchServiceTypes — by categoryId ────────────────────────────────────
@@ -129,19 +131,19 @@ class ServiceCatalogServiceCatalogTest {
         when(type.getNameEn()).thenReturn("Manicure");
         when(type.getSlug()).thenReturn("manicure");
 
-        when(serviceTypeRepository.findByCategoryWithCategory(categoryId)).thenReturn(List.of(type));
+        when(serviceTypeLookup.getByCategory(categoryId)).thenReturn(List.of(type));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(categoryId, null);
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).categoryId()).isEqualTo(categoryId);
-        verify(serviceTypeRepository).findByCategoryWithCategory(categoryId);
+        verify(serviceTypeLookup).getByCategory(categoryId);
     }
 
     // ── searchServiceTypes — with q ≥ 2 chars ────────────────────────────────
 
     @Test
-    @DisplayName("delegates to searchByName when q has 2 or more characters")
+    @DisplayName("delegates to searchByName when q has 3 or more characters")
     void should_delegateToSearchByName_when_qHasTwoOrMoreChars() {
         var category = mock(CatalogCategory.class);
         when(category.getId()).thenReturn(UUID.randomUUID());
@@ -153,13 +155,13 @@ class ServiceCatalogServiceCatalogTest {
         when(type.getNameEn()).thenReturn("Classic Manicure");
         when(type.getSlug()).thenReturn("manicure-classic");
 
-        when(serviceTypeRepository.searchByName("Ма", PageRequest.of(0, 20))).thenReturn(List.of(type));
+        when(serviceTypeRepository.searchByName("Ман", PageRequest.of(0, 20))).thenReturn(List.of(type));
 
-        List<ServiceTypeResponse> result = service.searchServiceTypes(null, "Ма");
+        List<ServiceTypeResponse> result = service.searchServiceTypes(null, "Ман");
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).nameUk()).isEqualTo("Манікюр класичний");
-        verify(serviceTypeRepository).searchByName("Ма", PageRequest.of(0, 20));
+        verify(serviceTypeRepository).searchByName("Ман", PageRequest.of(0, 20));
     }
 
     @Test
@@ -186,12 +188,12 @@ class ServiceCatalogServiceCatalogTest {
     @Test
     @DisplayName("falls back to all-active when q has fewer than 2 chars after stripping")
     void should_fallbackToAllActive_when_qHasFewerThanTwoCharsAfterStrip() {
-        when(serviceTypeRepository.findAllActiveWithCategory()).thenReturn(List.of());
+        when(serviceTypeLookup.getByCategory(null)).thenReturn(List.of());
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(null, "М");
 
         assertThat(result).isEmpty();
-        verify(serviceTypeRepository).findAllActiveWithCategory();
+        verify(serviceTypeLookup).getByCategory(null);
     }
 
     @Test
@@ -301,10 +303,10 @@ class ServiceCatalogServiceCatalogTest {
     @Test
     @DisplayName("falls back to findAllActiveWithCategory when q is an empty string")
     void should_fallbackToAllActive_when_qIsEmptyString() {
-        when(serviceTypeRepository.findAllActiveWithCategory()).thenReturn(List.of());
+        when(serviceTypeLookup.getByCategory(null)).thenReturn(List.of());
 
         service.searchServiceTypes(null, "");
 
-        verify(serviceTypeRepository).findAllActiveWithCategory();
+        verify(serviceTypeLookup).getByCategory(null);
     }
 }

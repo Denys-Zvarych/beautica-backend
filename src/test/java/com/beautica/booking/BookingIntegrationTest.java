@@ -382,6 +382,28 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(0L);
     }
 
+    @Test
+    @DisplayName("PATCH /bookings/{id}/cancel — 403 when a different client attempts the cancellation")
+    void should_return403_when_differentClientCancels() throws Exception {
+        String clientAToken = createClientAndGetToken("integ-cancel-a-" + System.nanoTime() + "@beautica.test");
+        String clientBToken = createClientAndGetToken("integ-cancel-b-" + System.nanoTime() + "@beautica.test");
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-cancel-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        UUID bookingId = createBooking(clientAToken, masterId, masterServiceId);
+
+        log.debug("Act: PATCH {}/{}/cancel with clientB token — must return 403", BOOKINGS_URL, bookingId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/cancel", HttpMethod.PATCH,
+                new HttpEntity<>("{}", bearerHeaders(clientBToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("different client cancelling another client's booking must return 403")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String createClientAndGetToken(String email) throws Exception {

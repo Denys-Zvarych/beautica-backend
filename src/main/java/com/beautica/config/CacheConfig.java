@@ -19,6 +19,7 @@ public class CacheConfig {
      * Cache inventory:
      *   service-categories  — catalog categories, rarely change — 60 min TTL, max 200 entries
      *   service-types       — service types per category — 60 min TTL, max 500 entries
+     *   service-type-by-id  — single service type by ID — 60 min TTL, max 500 entries
      *   ownerSalons         — salon list per owner, high-frequency read — 5 min TTL, max 1000 entries
      *   masterServices      — service list per master, public endpoint — 10 min TTL, max 2000 entries
      *   available-slots     — slot availability per master/date/service — 60 sec TTL, max 5000 entries
@@ -33,6 +34,11 @@ public class CacheConfig {
                         .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
         manager.registerCustomCache("service-types",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.MINUTES)
+                        .build());
+        manager.registerCustomCache("service-type-by-id",
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.MINUTES)
