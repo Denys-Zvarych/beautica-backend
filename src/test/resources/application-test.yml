@@ -23,6 +23,8 @@ app:
     login-capacity: 100000
     refresh-capacity: 100000
   jwt:
+    # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
+    # integration tests loaded via this profile use the placeholder below. Keep both in sync.
     secret: ${JWT_SECRET:test-jwt-secret-placeholder-min-32-bytes-testonly}
     access-token-expiration: 900000
     refresh-token-expiration: 604800000

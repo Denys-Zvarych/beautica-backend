@@ -158,6 +158,41 @@ class SalonRepositoryTest {
     }
 
     @Test
+    @DisplayName("findByIdAndOwnerId — returns populated Optional when correct owner fetches their salon")
+    void should_returnSalon_when_correctOwnerFetchesSalon() {
+        User owner = new User(
+                "owner-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Olena",
+                "Marchenko",
+                "+380501111111"
+        );
+        em.persist(owner);
+
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("Olena Beauty")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+        em.flush();
+        em.clear();
+
+        var result = salonRepository.findByIdAndOwnerId(salon.getId(), owner.getId());
+
+        assertThat(result)
+                .as("findByIdAndOwnerId must return a populated Optional when the correct owner fetches their salon")
+                .isPresent();
+        assertThat(result.get().getName())
+                .as("salon name must match")
+                .isEqualTo("Olena Beauty");
+        assertThat(result.get().getOwner().getId())
+                .as("owner ID must match")
+                .isEqualTo(owner.getId());
+    }
+
+    @Test
     @DisplayName("findByIdAndOwnerId — returns empty when owner B tries to fetch owner A's salon")
     void should_returnOptionalEmpty_when_findByIdAndOwnerIdWithWrongOwner() {
         User ownerA = new User(
