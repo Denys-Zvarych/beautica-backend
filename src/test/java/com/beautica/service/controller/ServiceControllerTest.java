@@ -155,6 +155,23 @@ class ServiceControllerTest {
     }
 
     @Test
+    @DisplayName("POST /salons/{id}/services — 403 when SALON_MASTER attempts to create a service (read-only role)")
+    void should_return403_when_salonMasterAttemptsToCreateService() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        // SALON_MASTER is a read-only role: @PreAuthorize on the controller method denies the request
+        // before AuthorizationService is consulted, so no stub is needed.
+
+        log.debug("Act: POST /api/v1/salons/{}/services as SALON_MASTER — read-only role must be denied with 403", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Hair Cut\",\"baseDurationMinutes\":30,\"basePrice\":\"50.00\",\"bufferMinutesAfter\":0}"))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
     @DisplayName("POST /salons/{id}/services — 403 when a different owner adds a service")
     void should_return403_when_nonOwnerAddsServiceToSalon() throws Exception {
         var ownerBUserId = UUID.randomUUID();

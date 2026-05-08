@@ -106,6 +106,9 @@ class ServiceCatalogServiceTest {
                 salonId, buildCreateRequest());
 
         assertThat(result).isNotNull();
+        assertThat(result.id()).as("id must be populated from the saved entity").isNotNull();
+        assertThat(result.name()).as("name must match the request input").isEqualTo("Manicure");
+        assertThat(result.isActive()).as("newly created service definition must be active").isTrue();
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(captor.capture());
@@ -396,8 +399,8 @@ class ServiceCatalogServiceTest {
     // ── deactivateServiceDefinition ────────────────────────────────────────────
 
     @Test
-    @DisplayName("deactivates ServiceDefinition when requested")
-    void should_deactivateServiceDefinition_when_ownerRequests() {
+    @DisplayName("deactivates ServiceDefinition when service definition exists")
+    void should_deactivateServiceDefinition_when_serviceDefinitionExists() {
         UUID serviceDefId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
 
@@ -617,6 +620,10 @@ class ServiceCatalogServiceTest {
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(userId, request);
 
         assertThat(result).isNotNull();
+        assertThat(result.masterId()).as("masterId must match the independent master").isEqualTo(masterId);
+        assertThat(result.serviceDefinition().id())
+                .as("serviceDefinitionId must be populated from the saved entity").isNotNull();
+        assertThat(result.isActive()).as("newly assigned service must be active").isTrue();
         verify(serviceTypeRepository).findById(serviceTypeId);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
