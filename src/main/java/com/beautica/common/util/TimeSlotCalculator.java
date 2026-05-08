@@ -23,6 +23,11 @@ public class TimeSlotCalculator {
 
     public record TimeRange(Instant start, Instant end) {}
 
+    /**
+     * @param occupied pre-filtered to the target {@code date}; ranges outside the date window
+     *                 are silently ignored but waste comparison cycles — callers must narrow the
+     *                 query window to [dayStart, dayEnd) before invoking this method.
+     */
     public List<TimeRange> calculateAvailableSlots(
             LocalDate date,
             LocalTime workStart,
