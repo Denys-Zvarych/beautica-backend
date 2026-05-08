@@ -24,6 +24,8 @@ public class ServiceType extends AuditableEntity {
     @Column(name = "name_uk", nullable = false, length = 255)
     private String nameUk;
 
+    // Intentionally nullable: English names are optional. Callers must null-check
+    // or fall back to nameUk before displaying (no coalescing guard exists in the DB).
     @Column(name = "name_en", length = 255)
     private String nameEn;
 

@@ -159,6 +159,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
               AND starts_at < :windowEnd
               AND ends_at   > :windowStart
             """, nativeQuery = true)
+    // Callers must pass a narrow [windowStart, windowEnd) spanning only the target day.
+    // A wide window causes full table scans and inflates the returned list unnecessarily.
     List<Booking> findOverlappingByMaster(
             @Param("masterId") UUID masterId,
             @Param("windowStart") OffsetDateTime windowStart,

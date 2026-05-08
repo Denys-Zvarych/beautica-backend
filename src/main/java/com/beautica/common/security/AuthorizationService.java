@@ -44,6 +44,7 @@ public class AuthorizationService {
                 .orElseThrow(() -> new NotFoundException("User not found"));
         return switch (actor.getRole()) {
             case SALON_OWNER -> salonRepository.existsByIdAndOwnerId(salonId, actorId);
+            // salonId is set at invite time and is not user-modifiable (UpdateProfileRequest has no salonId field).
             case SALON_ADMIN -> salonId.equals(actor.getSalonId());
             default -> false;
         };

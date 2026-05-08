@@ -63,6 +63,10 @@ public class JwtTokenProvider {
                 .compact();
     }
 
+    // Each String-overload calls parseAllClaims internally. When multiple claims are
+    // needed from the same token, prefer the Claims-overload variants (parseAllClaims
+    // once, then pass the Claims object) to avoid parsing the token multiple times.
+
     public boolean isAccessToken(Claims claims) {
         return TYPE_ACCESS.equals(claims.get(CLAIM_TYPE, String.class));
     }

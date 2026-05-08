@@ -18,6 +18,8 @@ public record MasterServiceResponse(
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
         var sdResponse = ServiceDefinitionResponse.from(msa.getServiceDefinition());
 
+        // effectivePrice is null when both priceOverride and basePrice are null (no @NotNull on basePrice entity field).
+        // All API-created ServiceDefinitions have a non-null basePrice, but callers mapping this DTO must null-check.
         var effectivePrice = msa.getPriceOverride() != null
                 ? msa.getPriceOverride()
                 : msa.getServiceDefinition().getBasePrice();
