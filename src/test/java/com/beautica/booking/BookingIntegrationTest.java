@@ -75,6 +75,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
     @AfterEach
     void cleanUp() {
+        // Order matters: child tables with FKs must be deleted before parents.
+        // bookings → masters, master_services, service_definitions
+        // masters → salons, users; invite_tokens → users; refresh_tokens → users
         jdbcTemplate.execute("DELETE FROM bookings");
         jdbcTemplate.execute("DELETE FROM master_services");
         jdbcTemplate.execute("DELETE FROM service_definitions");
