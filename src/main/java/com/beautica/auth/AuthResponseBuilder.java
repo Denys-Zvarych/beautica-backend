@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
+import java.time.Clock;
 import java.time.Instant;
 
 /**
@@ -29,6 +30,7 @@ public class AuthResponseBuilder {
     private final JwtConfig jwtConfig;
     private final TokenGenerator tokenGenerator;
     private final RefreshTokenRepository refreshTokenRepository;
+    private final Clock clock;
 
     /**
      * Builds a complete {@link AuthResponse} for {@code user}.
@@ -50,7 +52,7 @@ public class AuthResponseBuilder {
 
         String rawRefreshToken = jwtTokenProvider.generateRefreshToken(user.getId());
 
-        Instant expiresAt = Instant.now().plusMillis(jwtConfig.refreshTokenExpiration());
+        Instant expiresAt = clock.instant().plusMillis(jwtConfig.refreshTokenExpiration());
         var refreshToken = new RefreshToken(
                 tokenGenerator.hash(rawRefreshToken), user.getId(), expiresAt);
         refreshTokenRepository.save(refreshToken);

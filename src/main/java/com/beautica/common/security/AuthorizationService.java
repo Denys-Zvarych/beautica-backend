@@ -1,6 +1,9 @@
 package com.beautica.common.security;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingViewAccess;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -8,12 +11,12 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
-import com.beautica.service.entity.OwnerType;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 
 import java.util.UUID;
@@ -26,6 +29,7 @@ public class AuthorizationService {
     private final MasterRepository masterRepository;
     private final UserRepository userRepository;
     private final ServiceRepository serviceRepository;
+    private final BookingRepository bookingRepository;
 
     /**
      * Returns true when actorId has management access to the given salon.
@@ -41,6 +45,7 @@ public class AuthorizationService {
                 .orElseThrow(() -> new NotFoundException("User not found"));
         return switch (actor.getRole()) {
             case SALON_OWNER -> salonRepository.existsByIdAndOwnerId(salonId, actorId);
+            // salonId is set at invite time and is not user-modifiable (UpdateProfileRequest has no salonId field).
             case SALON_ADMIN -> salonId.equals(actor.getSalonId());
             default -> false;
         };
@@ -155,9 +160,141 @@ public class AuthorizationService {
                 .orElse(false);
     }
 
+    /**
+     * Returns true iff the actor has management authority over the given booking.
+     *
+     * <p>Uses the lightweight {@code findViewAccessById} projection (3 UUID columns,
+     * no entity graph) instead of {@code findByIdWithFullGraph} (6-join entity load),
+     * eliminating the redundant full-graph fetch that would otherwise occur on every
+     * {@code @PreAuthorize} SpEL evaluation before the service method loads the same
+     * booking again.
+     *
+     * <p>Authorization rule (mirrors {@link #isAuthorizedToManageBooking}):
+     * <ul>
+     *   <li>{@code salonOwnerUserId != null} — salon booking: actor must be the salon owner.</li>
+     *   <li>{@code salonOwnerUserId == null} — independent master booking: actor must be the master's user.</li>
+     * </ul>
+     * {@code ROLE_SALON_MASTER} is rejected immediately (no DB round-trip).
+     */
+    public boolean canManageBooking(Authentication auth, UUID bookingId) {
+        boolean isSalonMaster = auth.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
+        if (isSalonMaster) return false;
+        UUID actorId = principalId(auth);
+        return bookingRepository.findViewAccessById(bookingId).map(v -> {
+            if (v.salonOwnerUserId() != null) {
+                return v.salonOwnerUserId().equals(actorId);
+            }
+            return v.masterUserId().equals(actorId);
+        }).orElse(false);
+    }
+
+    public boolean canViewBooking(Authentication auth, UUID bookingId) {
+        UUID actorId = principalId(auth);
+        // Finding 2: role is derived from the SecurityContext (set by JwtAuthenticationFilter)
+        // instead of from a cross-entity DB join, eliminating the Cartesian product.
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findViewAccessById(bookingId).map(v -> {
+            // Management access: SALON_OWNER whose id matches the salon owner, or INDEPENDENT_MASTER
+            // whose user id matches the master's user id. Both checks use the projection fields
+            // resolved in a single JOIN — no second DB round-trip on any branch.
+            if (v.salonOwnerUserId() != null && v.salonOwnerUserId().equals(actorId)) {
+                return true;
+            }
+            if (v.masterUserId().equals(actorId) && actorRole != Role.SALON_MASTER) {
+                return true;
+            }
+            if (actorRole == Role.CLIENT) {
+                return v.clientUserId().equals(actorId);
+            }
+            if (actorRole == Role.SALON_MASTER) {
+                // SALON_MASTER may only view their own bookings — not all bookings at the salon.
+                return v.masterUserId().equals(actorId);
+            }
+            return false;
+        }).orElse(false);
+    }
+
+    public void enforceCanManageBooking(UUID actorUserId, Booking booking) {
+        if (!isAuthorizedToManageBooking(actorUserId, booking)) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
+        if (isAuthorizedToManageBooking(actorUserId, booking)) {
+            return;
+        }
+        // Finding 3: role is derived from the SecurityContext instead of a userRepository
+        // round-trip. The booking entity is already loaded by the caller, so all
+        // ownership fields are available in memory — no additional DB call is needed.
+        Role actorRole = roleFromCurrentAuthentication();
+        boolean allowed = false;
+        if (actorRole == Role.CLIENT) {
+            allowed = booking.getClient().getId().equals(actorUserId);
+        } else if (actorRole == Role.SALON_MASTER) {
+            // Fix M1: SALON_MASTER may only view their own bookings, not all bookings
+            // at the salon — the previous salon-scoped check leaked other masters'
+            // client names and prices to every master at the same salon.
+            allowed = booking.getMaster().getUser().getId().equals(actorUserId);
+        }
+        if (!allowed) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    private boolean isAuthorizedToManageBooking(UUID actorId, Booking booking) {
+        // SALON_MASTER exclusion: callers are responsible for short-circuiting before reaching here.
+        // canManageBooking() does so explicitly; other callers (enforceCanManageBooking, canViewBooking)
+        // rely on the ID-ownership checks below, which a SALON_MASTER cannot satisfy because their
+        // userId is never equal to the salon owner's userId.
+        //
+        // SALON_ADMIN exclusion: implicit via ownership semantics — SALON_ADMIN has a distinct userId
+        // from the salon owner, so the owner-ID equality check below always returns false for them.
+        // This means SALON_ADMIN cannot confirm/decline/complete individual bookings — only the salon
+        // OWNER and the assigned INDEPENDENT_MASTER can. This boundary keeps booking lifecycle
+        // authority at the owner level and must be preserved if ownership logic ever relaxes.
+        Master master = booking.getMaster();
+        if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+            return master.getUser().getId().equals(actorId);
+        }
+        if (master.getSalon() != null) {
+            return master.getSalon().getOwner() != null
+                    && master.getSalon().getOwner().getId().equals(actorId);
+        }
+        return false;
+    }
+
+    /**
+     * Extracts the {@link Role} from the supplied {@code Authentication} object.
+     * The JWT filter encodes the role as a {@code GrantedAuthority} with the
+     * standard {@code ROLE_} prefix.
+     */
+    private Role roleFromAuthentication(Authentication auth) {
+        if (auth == null) {
+            throw new IllegalStateException("No authentication in security context");
+        }
+        return auth.getAuthorities().stream()
+                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("No role in security context"));
+    }
+
+    /**
+     * Convenience variant of {@link #roleFromAuthentication} that reads from
+     * {@code SecurityContextHolder} directly. Used in non-{@code Authentication}-
+     * accepting methods such as {@code enforceCanViewBooking}.
+     */
+    private Role roleFromCurrentAuthentication() {
+        return roleFromAuthentication(SecurityContextHolder.getContext().getAuthentication());
+    }
+
     private UUID principalId(Authentication auth) {
         // JwtAuthenticationFilter sets the UUID as authentication.getDetails()
         // and the email string as the principal.
-        return (UUID) auth.getDetails();
+        if (auth == null || !(auth.getDetails() instanceof UUID id)) {
+            throw new IllegalStateException("No authenticated principal UUID in security context");
+        }
+        return id;
     }
 }

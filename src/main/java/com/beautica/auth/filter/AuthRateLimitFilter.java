@@ -12,34 +12,52 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 @Component
 public class AuthRateLimitFilter extends OncePerRequestFilter {
 
+    private static final byte[] TOO_MANY_REQUESTS_BODY =
+            "{\"error\":\"Too many requests\"}".getBytes(StandardCharsets.UTF_8);
+
     private static final String LOGIN_PATH = "/api/v1/auth/login";
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
+    private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
+    private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final int RETRY_AFTER_SECONDS = 60;
 
     private final LoadingCache<String, Bucket> loginBuckets;
     private final LoadingCache<String, Bucket> refreshBuckets;
+    private final LoadingCache<String, Bucket> slotsBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
-            @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets) {
+            @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets) {
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
+        this.slotsBuckets = slotsBuckets;
     }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
+        String path = request.getRequestURI();
+
+        // Slots rate-limit: GET /api/v1/masters/{masterId}/slots — checked before POST guard
+        if (HttpMethod.GET.matches(request.getMethod())
+                && path.startsWith(SLOTS_PATH_PREFIX)
+                && path.endsWith(SLOTS_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, slotsBuckets);
+            return;
+        }
+
         if (!HttpMethod.POST.matches(request.getMethod())) {
             filterChain.doFilter(request, response);
             return;
         }
 
-        String path = request.getRequestURI();
         LoadingCache<String, Bucket> cache;
 
         if (LOGIN_PATH.equals(path)) {
@@ -51,6 +69,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        applyRateLimit(request, response, filterChain, cache);
+    }
+
+    private void applyRateLimit(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain,
+                                LoadingCache<String, Bucket> cache) throws ServletException, IOException {
         String ip = resolveClientIp(request);
         // Clamp to max IPv6 length (45 chars) to prevent oversized Caffeine cache keys
         // crafted via a long X-Forwarded-For header value.
@@ -65,7 +90,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             response.setStatus(429);
             response.setContentType("application/json");
             response.setHeader("Retry-After", String.valueOf(RETRY_AFTER_SECONDS));
-            response.getWriter().write("{\"error\":\"Too many requests\"}");
+            response.setContentLength(TOO_MANY_REQUESTS_BODY.length);
+            response.getOutputStream().write(TOO_MANY_REQUESTS_BODY);
         }
     }
 
@@ -73,12 +99,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         String xfwd = request.getHeader("X-Forwarded-For");
         if (xfwd != null && !xfwd.isBlank()) {
             String[] parts = xfwd.split(",");
-            for (int i = 0; i < parts.length; i++) {
+            // Rightmost entry is appended by Railway's trusted proxy — cannot be spoofed.
+            for (int i = parts.length - 1; i >= 0; i--) {
                 String part = parts[i].trim();
                 if (!part.isEmpty()) {
-                    String ip = part;
-                    // clamp to max IPv6 length (45 chars) to prevent oversized cache keys
-                    return ip.length() > 45 ? request.getRemoteAddr() : ip;
+                    return part.length() > 45 ? request.getRemoteAddr() : part;
                 }
             }
         }

@@ -5,6 +5,7 @@ import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
@@ -20,6 +21,7 @@ class MasterServiceResponseTest {
     private static final BigDecimal OVERRIDE_PRICE = new BigDecimal("450.00");
 
     @Test
+    @DisplayName("effective duration is the override value when a duration override is set")
     void should_computeEffectiveDurationAsOverride_when_durationOverrideSet() {
         var msa = buildAssignment(OVERRIDE_PRICE, OVERRIDE_DURATION);
 
@@ -29,6 +31,7 @@ class MasterServiceResponseTest {
     }
 
     @Test
+    @DisplayName("effective duration falls back to base duration when no duration override is set")
     void should_computeEffectiveDurationAsBase_when_noOverride() {
         var msa = buildAssignment(null, null);
 
@@ -38,6 +41,7 @@ class MasterServiceResponseTest {
     }
 
     @Test
+    @DisplayName("effective price is the override value when a price override is set")
     void should_computeEffectivePriceAsOverride_when_priceOverrideSet() {
         var msa = buildAssignment(OVERRIDE_PRICE, null);
 
@@ -47,6 +51,7 @@ class MasterServiceResponseTest {
     }
 
     @Test
+    @DisplayName("effective price falls back to base price when no price override is set")
     void should_computeEffectivePriceAsBasePrice_when_noOverride() {
         var msa = buildAssignment(null, null);
 
@@ -56,6 +61,7 @@ class MasterServiceResponseTest {
     }
 
     @Test
+    @DisplayName("all passthrough fields are mapped correctly when a fully-populated MSA is converted")
     void should_mapAllPassthroughFields_when_msaMapped() {
         UUID expectedMsaId = UUID.randomUUID();
         UUID expectedMasterId = UUID.randomUUID();
@@ -98,6 +104,7 @@ class MasterServiceResponseTest {
     }
 
     @Test
+    @DisplayName("effective price is null when neither base price nor price override is set")
     void should_returnNullEffectivePrice_when_noPriceSetAnywhere() {
         var serviceDefinition = ServiceDefinition.builder()
                 .id(UUID.randomUUID())

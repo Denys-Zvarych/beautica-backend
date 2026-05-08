@@ -22,6 +22,7 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 import java.util.Properties;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -90,11 +91,21 @@ class EmailServiceTest {
         assertThat(realMessage.getRecipients(Message.RecipientType.TO)[0].toString())
                 .as("To: address must contain the recipient email")
                 .contains(toEmail);
+        assertThat(realMessage.getFrom())
+                .as("From: must be set to the configured sender address")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getFrom()[0].toString())
+                .as("From: address must equal the configured noreply sender")
+                .contains("noreply@beautica.app");
+        assertThat(realMessage.getSubject())
+                .as("Subject must equal the invite email subject")
+                .isEqualTo("You've been invited to Beautica");
     }
 
     @Test
-    @DisplayName("sendInviteEmail throws BusinessException when MailException occurs")
-    void should_throwBusinessException_when_mailSenderThrowsMailException() {
+    @DisplayName("sendInviteEmail completes normally when MailException occurs (async method logs and swallows)")
+    void should_notThrow_when_mailSenderThrowsMailException() {
         var toEmail = "fail@example.com";
         var inviteLink = "http://localhost:3000/invite/accept?token=failtoken";
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
@@ -104,9 +115,38 @@ class EmailServiceTest {
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
         doThrow(new MailSendException("SMTP connection failed")).when(mailSender).send(any(MimeMessage.class));
 
-        log.debug("Act: sendInviteEmail to={} when mailSender throws MailSendException — must be translated to BusinessException", toEmail);
-        assertThatThrownBy(() -> emailService.sendInviteEmail(toEmail, inviteLink, "Test Salon"))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("Failed to send invite email");
+        log.debug("Act: sendInviteEmail to={} when mailSender throws — @Async method must not propagate", toEmail);
+        assertThatCode(() -> emailService.sendInviteEmail(toEmail, inviteLink, "Test Salon"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("sendAdminNotification calls mailSender.send when invoked")
+    void should_sendEmail_when_sendAdminNotificationCalled() throws Exception {
+        var toEmail = "admin@beautica.app";
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        log.debug("Arrange: real MimeMessage so fields are inspectable after helper populates them");
+
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+
+        log.debug("Act: sendAdminNotification to={}", toEmail);
+        emailService.sendAdminNotification(toEmail, "Test Subject", "Test body");
+
+        verify(mailSender).send(realMessage);
+    }
+
+    @Test
+    @DisplayName("sendAdminNotification completes normally when MailException occurs (async method logs and swallows)")
+    void should_notThrow_when_mailExceptionOnAdminNotification() {
+        var toEmail = "admin@beautica.app";
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        log.debug("Arrange: mailSender.send will throw MailSendException");
+
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        doThrow(new MailSendException("SMTP connection failed")).when(mailSender).send(any(MimeMessage.class));
+
+        log.debug("Act: sendAdminNotification when mailSender throws — @Async method must not propagate");
+        assertThatCode(() -> emailService.sendAdminNotification(toEmail, "Test Subject", "Test body"))
+                .doesNotThrowAnyException();
     }
 }

@@ -118,6 +118,40 @@ class SalonSecurityTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
+    @Test
+    @DisplayName("GET /mine — 403 when a non-owner (CLIENT role) calls the owner-only get-my-salons endpoint")
+    void should_return403_when_nonOwnerCallsGetMineSalons() throws Exception {
+        // Arrange — register a CLIENT user and obtain their JWT
+        String clientToken = createClientAndGetToken(
+                "client-mine-" + System.nanoTime() + "@beautica.test");
+
+        log.debug("Act: GET {}/mine with CLIENT token — role guard must deny access", SALONS_URL);
+
+        // Act
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "/mine", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(clientToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 403 when a CLIENT calls the SALON_OWNER-only /mine endpoint")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    private String createClientAndGetToken(String email) throws Exception {
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'CLIENT', true)",
+                UUID.randomUUID(), email, hash);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
     private String createSalonOwnerAndGetToken(String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(

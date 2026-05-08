@@ -19,6 +19,8 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -134,6 +136,8 @@ class JwtAuthenticationFilterTest {
         assertThat(authentication.getDetails())
                 .as("details must carry the userId UUID from the token")
                 .isEqualTo(userId);
+
+        verify(jwtTokenProvider, times(1)).parseAllClaims("validToken");
     }
 
     @Test

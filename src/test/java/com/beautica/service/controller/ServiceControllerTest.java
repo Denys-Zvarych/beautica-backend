@@ -3,20 +3,16 @@ package com.beautica.service.controller;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import java.io.IOException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -26,7 +22,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -66,49 +62,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(ServiceController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
+@Import(WebMvcTestSupport.class)
 @DisplayName("ServiceController — @WebMvcTest slice")
 class ServiceControllerTest {
 
     private static final Logger log = LoggerFactory.getLogger(ServiceControllerTest.class);
 
-    // ── Pass-through filter overrides ─────────────────────────────────────────
+    // ── Security configuration ────────────────────────────────────────────────
 
     @TestConfiguration
     @EnableMethodSecurity
-    static class PassThroughFilters {
-
-        @Bean
-        @Primary
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-            };
-        }
-
-        @Bean
-        @Primary
-        AuthRateLimitFilter authRateLimitFilter() {
-            return new AuthRateLimitFilter(null, null) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-
-                @Override
-                public boolean shouldNotFilter(HttpServletRequest request) {
-                    return true;
-                }
-            };
-        }
+    static class SecurityConfig {
 
         @Bean
         SecurityFilterChain testSecurityFilterChain(HttpSecurity http,
@@ -188,6 +152,23 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.id").value(serviceId.toString()))
                 .andExpect(jsonPath("$.data.name").value("Classic Manicure"));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 403 when SALON_MASTER attempts to create a service (read-only role)")
+    void should_return403_when_salonMasterAttemptsToCreateService() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        // SALON_MASTER is a read-only role: @PreAuthorize on the controller method denies the request
+        // before AuthorizationService is consulted, so no stub is needed.
+
+        log.debug("Act: POST /api/v1/salons/{}/services as SALON_MASTER — read-only role must be denied with 403", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Hair Cut\",\"baseDurationMinutes\":30,\"basePrice\":\"50.00\",\"bufferMinutesAfter\":0}"))
+                .andExpect(status().isForbidden());
     }
 
     @Test
@@ -296,6 +277,32 @@ class ServiceControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.length()").value(1));
+    }
+
+    @Test
+    @DisplayName("GET /masters/{masterId}/services — 200 when page/size params sent (Pageable removed)")
+    void should_return200_when_paginationParamsSentToNonPageableEndpoint() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .param("page", "0")
+                        .param("size", "10")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("GET /masters/{masterId}/services — 404 when master does not exist")
+    void should_return404_when_masterDoesNotExist() throws Exception {
+        var unknownMasterId = UUID.randomUUID();
+        when(serviceCatalogService.getMasterServices(unknownMasterId))
+                .thenThrow(new BusinessException(HttpStatus.NOT_FOUND, "Master not found"));
+
+        log.debug("Act: GET /api/v1/masters/{}/services with unknown masterId — must return 404", unknownMasterId);
+        mockMvc.perform(get("/api/v1/masters/" + unknownMasterId + "/services")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
     }
 
     // ── POST /api/v1/independent-masters/me/services ───────────────────────────
@@ -483,6 +490,55 @@ class ServiceControllerTest {
         mockMvc.perform(delete("/api/v1/services/" + anyId)
                         .with(csrf()))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 403 when CLIENT role calls the delete endpoint")
+    void should_return403_when_clientCallsDeleteService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        // canManageServiceDefinition returns false for a CLIENT: a CLIENT user never owns
+        // a service definition, so AuthorizationService denies the request.
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
+
+        log.debug("Act: DELETE /api/v1/services/{} as CLIENT — must be denied with 403", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 204 when INDEPENDENT_MASTER deletes their own service definition")
+    void should_return204_when_independentMasterDeletesOwnService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        // canManageServiceDefinition returns true: this master owns the definition.
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+        // deactivateServiceDefinition is void — default Mockito behaviour is a no-op,
+        // which is exactly what we want.
+
+        log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER — must deactivate and return 204", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 403 when INDEPENDENT_MASTER tries to delete SALON-owned service")
+    void should_return403_when_independentMasterDeletesSalonOwnedService() throws Exception {
+        var imUserId = UUID.randomUUID();
+        var salonOwnedServiceId = UUID.randomUUID();
+        // canManageServiceDefinition returns false because the independent master does not own
+        // this service definition (it belongs to a salon).
+        when(authorizationService.canManageServiceDefinition(any(), eq(salonOwnedServiceId))).thenReturn(false);
+
+        log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER targeting salon-owned service — must return 403", salonOwnedServiceId);
+        mockMvc.perform(delete("/api/v1/services/" + salonOwnedServiceId)
+                        .with(authenticatedAs(imUserId, "im@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
     }
 
     @Test

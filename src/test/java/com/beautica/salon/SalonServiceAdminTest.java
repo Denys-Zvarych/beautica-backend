@@ -4,7 +4,6 @@ import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.ForbiddenException;
-import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -57,9 +56,6 @@ class SalonServiceAdminTest {
     @Mock
     private MasterRepository masterRepository;
 
-    @Mock
-    private AuthorizationService authorizationService;
-
     @InjectMocks
     private SalonService salonService;
 
@@ -76,13 +72,12 @@ class SalonServiceAdminTest {
         var request = new UpdateSalonRequest("Updated Name", null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
-        // authorizationService.enforceCanManageSalon does nothing — access granted for SALON_ADMIN
+        when(salonRepository.save(salon)).thenReturn(salon);
+        // Authorization is exclusively enforced by @PreAuthorize on SalonController — not re-checked in service.
 
         SalonResponse response = salonService.updateSalon(adminId, salonId, request);
 
         assertThat(response.name()).isEqualTo("Updated Name");
-        verify(salonRepository).save(salon);
     }
 
     // ── deactivateSalon ───────────────────────────────────────────────────────

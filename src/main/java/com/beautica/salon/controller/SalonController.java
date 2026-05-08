@@ -13,6 +13,7 @@ import com.beautica.salon.service.SalonService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -60,7 +61,7 @@ public class SalonController {
     }
 
     @PatchMapping("/{salonId}")
-    @PreAuthorize("@authz.canManageSalon(authentication, #salonId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ApiResponse<SalonResponse> updateSalon(
             @PathVariable UUID salonId,
             @Valid @RequestBody UpdateSalonRequest request,
@@ -70,6 +71,8 @@ public class SalonController {
         return ApiResponse.ok(salonService.updateSalon(ownerId, salonId, request));
     }
 
+    // SALON_ADMIN may invite masters to their own salon — intentional per product decision.
+    // canManageSalon enforces salonId == admin's assigned salon_id set at invite time.
     @PostMapping("/{salonId}/invite")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<InviteResponse>> inviteMaster(
@@ -85,7 +88,7 @@ public class SalonController {
     @GetMapping("/{salonId}/masters")
     public ApiResponse<PageResponse<MasterSummaryResponse>> getMastersBySalon(
             @PathVariable UUID salonId,
-            Pageable pageable
+            @PageableDefault(size = 20) Pageable pageable
     ) {
         var page = salonService.getMastersBySalon(salonId, pageable);
         return ApiResponse.ok(PageResponse.of(

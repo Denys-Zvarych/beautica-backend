@@ -1,6 +1,9 @@
 package com.beautica.common.security;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingViewAccess;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -10,6 +13,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -19,12 +23,14 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -48,11 +54,23 @@ class AuthorizationServiceTest {
     @Mock
     private ServiceRepository serviceRepository;
 
+    @Mock
+    private BookingRepository bookingRepository;
+
     @InjectMocks
     private AuthorizationService authorizationService;
 
+    @AfterEach
+    void clearSecurityContext() {
+        SecurityContextHolder.clearContext();
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
+    // Principal is set to an email string (not UUID) to match JwtAuthenticationFilter behaviour.
+    // AuthorizationService reads the actor ID from token.getDetails(), not getPrincipal().
+    // If that ever changes to use getPrincipal(), these tests would silently pass with a wrong
+    // UUID — update this helper to set principal=actorId and remove this comment.
     private Authentication mockAuth(UUID actorId, String roleName) {
         var token = new UsernamePasswordAuthenticationToken(
                 "user@example.com",
@@ -152,6 +170,7 @@ class AuthorizationServiceTest {
 
         assertThat(result).isFalse();
         verify(userRepository, never()).findById(any());
+        verify(salonRepository, never()).findById(any());
     }
 
     @Test
@@ -164,6 +183,7 @@ class AuthorizationServiceTest {
 
         assertThat(result).isFalse();
         verify(userRepository, never()).findById(any());
+        verify(salonRepository, never()).findById(any());
     }
 
     @Test
@@ -378,7 +398,7 @@ class AuthorizationServiceTest {
 
     @Test
     @DisplayName("masterBelongsToSalon returns true when master belongs to the salon")
-    void should_return_true_when_master_belongs_to_salon() {
+    void should_returnTrue_when_masterBelongsToSalon() {
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
 
@@ -392,7 +412,7 @@ class AuthorizationServiceTest {
 
     @Test
     @DisplayName("masterBelongsToSalon returns false when master does not belong to the salon")
-    void should_return_false_when_master_does_not_belong_to_salon() {
+    void should_returnFalse_when_masterDoesNotBelongToSalon() {
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
 
@@ -406,7 +426,7 @@ class AuthorizationServiceTest {
 
     @Test
     @DisplayName("masterBelongsToSalon returns false immediately when masterId is null")
-    void should_return_false_when_masterId_is_null() {
+    void should_returnFalse_when_masterIdIsNull() {
         UUID salonId = UUID.randomUUID();
 
         boolean result = authorizationService.masterBelongsToSalon(null, salonId);
@@ -462,5 +482,280 @@ class AuthorizationServiceTest {
         assertThat(result).isFalse();
         verify(salonRepository, never()).findById(any());
         verify(masterRepository, never()).findById(any());
+    }
+
+    // ── canManageBooking ───────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("canManageBooking returns false immediately when actor has ROLE_SALON_MASTER without touching repository")
+    void should_returnFalse_when_salonMasterTriesToManageBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canManageBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findViewAccessById(any());
+    }
+
+    @Test
+    @DisplayName("canManageBooking returns true when salon owner's ID matches the booking's salonOwnerUserId")
+    void should_returnTrue_when_salonOwnerManagesOwnSalonsBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        // Salon booking: salonOwnerUserId is non-null and equals actorId
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, actorId)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageBooking returns false when owner B tries to manage a booking from owner A's salon")
+    void should_returnFalse_when_ownerBTriesToManageOwnerASalonsBooking() {
+        UUID ownerAId = UUID.randomUUID();
+        UUID ownerBId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        // Salon booking: salonOwnerUserId is ownerA — ownerB must be rejected
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, ownerAId)));
+
+        Authentication auth = mockAuth(ownerBId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    @DisplayName("canManageBooking returns true when independent master manages their own booking")
+    void should_returnTrue_when_independentMasterManagesOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // salonOwnerUserId is null — this is an independent master booking
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), actorId, null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        assertThat(authorizationService.canManageBooking(auth, bookingId)).isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageBooking returns false when independent master tries to manage another master's booking")
+    void should_returnFalse_when_independentMasterManagesAnotherMastersBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // salonOwnerUserId is null — independent master booking, but masterUserId is a different master
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), UUID.randomUUID(), null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        assertThat(authorizationService.canManageBooking(auth, bookingId)).isFalse();
+    }
+
+    // ── canViewBooking ─────────────────────────────────────────────────────────
+    // After Finding 2 fix: canViewBooking calls findViewAccessById(bookingId) (no actorId arg)
+    // and derives the actor's role from the Authentication object (SecurityContext).
+
+    @Test
+    @DisplayName("canViewBooking returns true when client views their own booking")
+    void should_returnTrue_when_clientViewsOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID salonOwnerUserId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        // Client is the booking owner — clientUserId matches actorId
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(actorId, masterUserId, salonOwnerUserId)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canViewBooking returns false when client B tries to view client A's booking")
+    void should_returnFalse_when_clientBViewsClientABooking() {
+        UUID clientAId = UUID.randomUUID();
+        UUID clientBId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+        UUID salonOwnerUserId = UUID.randomUUID();
+
+        // Booking belongs to clientA, actor is clientB
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(clientAId, masterUserId, salonOwnerUserId)));
+
+        Authentication auth = mockAuth(clientBId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    @DisplayName("canViewBooking returns true when salon master views a booking assigned to them")
+    void should_returnTrue_when_salonMasterViewsOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID clientUserId = UUID.randomUUID();
+        UUID salonOwnerUserId = UUID.randomUUID();
+
+        // masterUserId matches actorId — the master is viewing their own booking
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, salonOwnerUserId)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canViewBooking returns false when salon master views another master's booking")
+    void should_returnFalse_when_salonMasterViewsAnotherMastersBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID clientUserId = UUID.randomUUID();
+        UUID salonOwnerUserId = UUID.randomUUID();
+
+        // masterUserId is otherMasterUserId — actor is a different salon master
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, otherMasterUserId, salonOwnerUserId)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    // ── enforceCanViewBooking ──────────────────────────────────────────────────
+    // After Finding 3 fix: enforceCanViewBooking reads role from SecurityContextHolder
+    // instead of calling userRepository.findById — the SecurityContext must be populated.
+
+    @Test
+    @DisplayName("enforceCanViewBooking throws ForbiddenException when wrong client tries to view another client's booking")
+    void should_throwForbidden_when_enforceCanViewBookingCalledWithWrongClient() {
+        UUID clientAId = UUID.randomUUID();
+        UUID clientBId = UUID.randomUUID();
+
+        User clientA = mock(User.class);
+        when(clientA.getId()).thenReturn(clientAId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getClient()).thenReturn(clientA);
+
+        // Populate SecurityContext with CLIENT role for clientB
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(clientBId, "ROLE_CLIENT"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(clientBId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking does not throw when correct client views their own booking")
+    void should_notThrow_when_enforceCanViewBookingCalledWithCorrectClient() {
+        UUID actorId = UUID.randomUUID();
+
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(actorId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getClient()).thenReturn(client);
+
+        // Populate SecurityContext with CLIENT role for the correct client
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_CLIENT"));
+
+        assertThatCode(() -> authorizationService.enforceCanViewBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    // ── enforceCanManageBooking ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("enforceCanManageBooking throws ForbiddenException when owner B tries to manage owner A's salon booking")
+    void should_throwForbidden_when_enforceCanManageBookingCalledWithWrongOwner() {
+        UUID ownerAId = UUID.randomUUID();
+        UUID ownerBId = UUID.randomUUID();
+
+        User ownerA = mock(User.class);
+        when(ownerA.getId()).thenReturn(ownerAId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(ownerA);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(ownerBId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageBooking does not throw when correct salon owner manages their own salon's booking")
+    void should_notThrow_when_enforceCanManageBookingCalledWithCorrectSalonOwner() {
+        UUID actorId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        assertThatCode(() -> authorizationService.enforceCanManageBooking(actorId, booking))
+                .doesNotThrowAnyException();
     }
 }

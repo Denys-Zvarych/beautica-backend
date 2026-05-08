@@ -6,7 +6,6 @@ import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -18,6 +17,7 @@ import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -34,7 +34,6 @@ public class SalonService {
     private final UserRepository userRepository;
     private final InviteService inviteService;
     private final MasterRepository masterRepository;
-    private final AuthorizationService authorizationService;
 
     @Transactional
     @CacheEvict(value = "ownerSalons", key = "#ownerId")
@@ -61,13 +60,17 @@ public class SalonService {
         return SalonResponse.from(salonRepository.save(salon));
     }
 
-    @CacheEvict(value = "ownerSalons", key = "#actorId")
+    @Caching(evict = {
+            @CacheEvict(value = "ownerSalons", key = "#actorId"),
+            @CacheEvict(value = "salon-detail", key = "#salonId")
+    })
     @Transactional
     public SalonResponse updateSalon(UUID actorId, UUID salonId, UpdateSalonRequest request) {
         var salon = salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
 
-        authorizationService.enforceCanManageSalon(actorId, salon);
+        // Ownership already enforced by @PreAuthorize("... @authz.canManageSalon(...)") on
+        // the controller — no redundant DB round-trip needed here.
 
         if (request.name() != null) {
             salon.setName(request.name());
@@ -91,22 +94,22 @@ public class SalonService {
             salon.setInstagramUrl(request.instagramUrl());
         }
 
-        var saved = salonRepository.save(salon);
-        return SalonResponse.from(saved);
+        return SalonResponse.from(salonRepository.save(salon));
     }
 
     @Transactional(readOnly = true)
+    @Cacheable(value = "salon-detail", key = "#salonId")
     public Salon getSalonEntity(UUID salonId) {
-        return salonRepository.findById(salonId)
+        return salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
     }
 
     @Transactional
     public InviteResponse inviteMaster(UUID actorId, UUID salonId, String email, Role role) {
-        var salon = salonRepository.findById(salonId)
+        // Ownership already enforced by @PreAuthorize("... @authz.canManageSalon(...)") on
+        // the controller — no redundant DB round-trip needed here.
+        salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
-
-        authorizationService.enforceCanManageSalon(actorId, salon);
 
         var inviteRequest = new InviteRequest(email, salonId, role);
         return inviteService.sendInvite(inviteRequest, actorId);
@@ -114,7 +117,7 @@ public class SalonService {
 
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersBySalon(UUID salonId, Pageable pageable) {
-        return masterRepository.findBySalonIdAndIsActiveTrue(salonId, pageable)
+        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable)
                 .map(MasterSummaryResponse::from);
     }
 
@@ -127,8 +130,11 @@ public class SalonService {
                 .toList();
     }
 
+    @Caching(evict = {
+            @CacheEvict(value = "ownerSalons", key = "#ownerId"),
+            @CacheEvict(value = "salon-detail", key = "#salonId")
+    })
     @Transactional
-    @CacheEvict(value = "ownerSalons", key = "#ownerId")
     public void deactivateSalon(UUID ownerId, UUID salonId) {
         var caller = userRepository.findById(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));

@@ -1,9 +1,9 @@
 package com.beautica.master;
 
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterDetailResponse;
+import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
@@ -26,8 +26,12 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.List;
@@ -38,7 +42,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -53,7 +56,7 @@ class MasterServiceTest {
     @Mock private SalonRepository salonRepository;
     @Mock private WorkingHoursRepository workingHoursRepository;
     @Mock private ScheduleExceptionRepository scheduleExceptionRepository;
-    @Mock private AuthorizationService authorizationService;
+    @Mock private BookingRepository bookingRepository;
 
     @InjectMocks
     private MasterService masterService;
@@ -122,6 +125,20 @@ class MasterServiceTest {
         assertThat(result.getSalon()).isEqualTo(salon);
         assertThat(result.isActive()).isTrue();
         verify(masterRepository).save(any(Master.class));
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_createMasterFromInviteWithUnknownUserId")
+    void should_throwNotFound_when_createMasterFromInviteWithUnknownUserId() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(userRepository.findById(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.createMasterFromInvite(userId, salonId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(masterRepository, never()).save(any());
     }
 
     @Test
@@ -210,7 +227,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
 
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of(saved));
 
         List<WorkingHoursResponse> result =
@@ -222,23 +239,19 @@ class MasterServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_salonMasterTriesToEditOwnSchedule")
-    void should_throwForbidden_when_salonMasterTriesToEditOwnSchedule() {
-        UUID salonMasterUserId = UUID.randomUUID();
+    @DisplayName("should_throwNotFound_when_upsertWorkingHours_masterMissing")
+    void should_throwNotFound_when_upsertWorkingHours_masterMissing_explicit() {
+        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
+        // This test verifies the service throws NotFoundException when master is absent.
+        UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
-
-        Master master = mock(Master.class);
-
         var request = new WorkingHoursRequest(2, LocalTime.of(10, 0), LocalTime.of(18, 0), true);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        doThrow(new ForbiddenException("Access denied"))
-                .when(authorizationService).enforceCanManageMasterSchedule(salonMasterUserId, master);
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
 
-        // actorId is the salon master's user id, not the owner — should be rejected
         assertThatThrownBy(() ->
-                masterService.upsertWorkingHours(salonMasterUserId, masterId, List.of(request)))
-                .isInstanceOf(ForbiddenException.class);
+                masterService.upsertWorkingHours(actorId, masterId, List.of(request)))
+                .isInstanceOf(NotFoundException.class);
 
         verify(workingHoursRepository, never()).saveAll(any());
     }
@@ -261,8 +274,9 @@ class MasterServiceTest {
     // ── deactivateMaster ──────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_deactivateMaster_when_authorizedActorRequests")
+    @DisplayName("should_deactivateMaster_when_masterExists")
     void should_deactivateMaster_when_authorizedActorRequests() {
+        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
         UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
 
@@ -273,29 +287,24 @@ class MasterServiceTest {
 
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterRepository.save(any(Master.class))).thenAnswer(inv -> inv.getArgument(0));
-        // authorizationService is a mock — enforceCanManageMaster is a no-op by default
 
         masterService.deactivateMaster(ownerId, masterId);
 
         assertThat(master.isActive()).isFalse();
         verify(masterRepository).save(master);
-        verify(authorizationService).enforceCanManageMaster(ownerId, master);
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_unauthorizedActorDeactivatesMaster")
-    void should_throwForbidden_when_unauthorizedActorDeactivatesMaster() {
-        UUID attackerId = UUID.randomUUID();
+    @DisplayName("should_throwNotFound_when_deactivateMaster_masterMissing")
+    void should_throwNotFound_when_unauthorizedActorDeactivatesMaster() {
+        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
+        UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
 
-        Master master = mock(Master.class);
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        doThrow(new ForbiddenException("Access denied"))
-                .when(authorizationService).enforceCanManageMaster(attackerId, master);
-
-        assertThatThrownBy(() -> masterService.deactivateMaster(attackerId, masterId))
-                .isInstanceOf(ForbiddenException.class);
+        assertThatThrownBy(() -> masterService.deactivateMaster(actorId, masterId))
+                .isInstanceOf(NotFoundException.class);
 
         verify(masterRepository, never()).save(any());
     }
@@ -328,8 +337,24 @@ class MasterServiceTest {
 
         assertThat(result.getDate()).isEqualTo(date);
         assertThat(result.getReason()).isEqualTo(ScheduleExceptionReason.HOLIDAY);
-        verify(authorizationService).enforceCanManageMasterSchedule(actorId, master);
         verify(scheduleExceptionRepository).save(any(ScheduleException.class));
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_addScheduleException_masterMissing")
+    void should_throwNotFound_when_unauthorizedActorAddsScheduleException() {
+        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 1);
+        var request = new ScheduleExceptionRequest(date, ScheduleExceptionReason.HOLIDAY, null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.addScheduleException(actorId, masterId, request))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(scheduleExceptionRepository, never()).save(any());
     }
 
     @Test
@@ -381,7 +406,6 @@ class MasterServiceTest {
 
         masterService.removeScheduleException(actorId, masterId, date);
 
-        verify(authorizationService).enforceCanManageMasterSchedule(actorId, master);
         verify(scheduleExceptionRepository).delete(exception);
     }
 
@@ -418,21 +442,56 @@ class MasterServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_unauthorizedActorRemovesScheduleException")
+    @DisplayName("should_throwNotFound_when_removeScheduleException_masterMissingOnRemove")
     void should_throwForbidden_when_unauthorizedActorRemovesScheduleException() {
-        UUID attackerId = UUID.randomUUID();
+        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
+        UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 6, 1);
 
-        Master master = mock(Master.class);
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        doThrow(new ForbiddenException("Access denied"))
-                .when(authorizationService).enforceCanManageMasterSchedule(attackerId, master);
-
-        assertThatThrownBy(() -> masterService.removeScheduleException(attackerId, masterId, date))
-                .isInstanceOf(ForbiddenException.class);
+        assertThatThrownBy(() -> masterService.removeScheduleException(actorId, masterId, date))
+                .isInstanceOf(NotFoundException.class);
 
         verify(scheduleExceptionRepository, never()).delete(any());
+    }
+
+    // ── getMastersByPage ───────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_returnPagedMasters_when_getMastersByPageCalled")
+    void should_returnPagedMasters_when_getMastersByPageCalled() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        Pageable pageable = Pageable.ofSize(10);
+
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(userId);
+        when(user.getFirstName()).thenReturn("Olena");
+        when(user.getLastName()).thenReturn("Bondar");
+
+        Master master = Master.builder()
+                .user(user)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+
+        Page<Master> masterPage = new PageImpl<>(List.of(master), pageable, 1);
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable))
+                .thenReturn(masterPage);
+
+        Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, pageable);
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent()).hasSize(1);
+        assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
+        assertThat(result.getContent().get(0).userId()).isEqualTo(userId);
+        assertThat(result.getContent().get(0).masterType()).isEqualTo(MasterType.SALON_MASTER);
+        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, pageable);
     }
 }

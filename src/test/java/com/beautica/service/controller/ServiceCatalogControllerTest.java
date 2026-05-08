@@ -3,17 +3,14 @@ package com.beautica.service.controller;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.beautica.common.exception.NotFoundException;
+import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import java.io.IOException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -23,7 +20,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -63,49 +60,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(ServiceCatalogController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
+@Import(WebMvcTestSupport.class)
 @DisplayName("ServiceCatalogController — @WebMvcTest slice")
 class ServiceCatalogControllerTest {
 
     private static final Logger log = LoggerFactory.getLogger(ServiceCatalogControllerTest.class);
 
-    // ── Pass-through filter overrides ─────────────────────────────────────────
+    // ── Security configuration ────────────────────────────────────────────────
 
     @TestConfiguration
     @EnableMethodSecurity
-    static class PassThroughFilters {
-
-        @Bean
-        @Primary
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-            };
-        }
-
-        @Bean
-        @Primary
-        AuthRateLimitFilter authRateLimitFilter() {
-            return new AuthRateLimitFilter(null, null) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-
-                @Override
-                public boolean shouldNotFilter(HttpServletRequest request) {
-                    return true;
-                }
-            };
-        }
+    static class SecurityConfig {
 
         @Bean
         SecurityFilterChain testSecurityFilterChain(HttpSecurity http,
@@ -227,17 +192,14 @@ class ServiceCatalogControllerTest {
     }
 
     @Test
-    @DisplayName("GET /service-types?q=М — falls back to all active types when q < 2 chars")
-    void should_returnAllTypes_when_qParamHasFewerThanTwoChars() throws Exception {
-        // Single-char q is forwarded to the service; the service itself decides to return all types
-        when(serviceCatalogService.searchServiceTypes(isNull(), eq("М"))).thenReturn(stubServiceTypes());
-        log.debug("Act: GET /api/v1/service-types?q=М — single char query falls back to all-active");
+    @DisplayName("q param shorter than 3 chars returns 400 validation error")
+    void should_return400_when_qParamHasFewerThanThreeChars() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?q=М — single char query must return 400");
 
         mockMvc.perform(get("/api/v1/service-types")
                         .param("q", "М")
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.length()").value(2));
+                .andExpect(status().isBadRequest());
     }
 
     @Test
@@ -250,6 +212,39 @@ class ServiceCatalogControllerTest {
                         .param("q", longQ)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=Гель&categoryId=... — 200 and non-empty content when both params provided")
+    void should_return200_when_bothQAndCategoryIdProvided() throws Exception {
+        var result = List.of(
+                new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish"));
+        when(serviceCatalogService.searchServiceTypes(eq(nailsCategoryId), eq("Гель"))).thenReturn(result);
+        log.debug("Act: GET /api/v1/service-types?q=Гель&categoryId={}", nailsCategoryId);
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "Гель")
+                        .param("categoryId", nailsCategoryId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(1))
+                .andExpect(jsonPath("$.data[0].nameUk").value("Гель-лак"));
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryId=<unknown> — 404 when category does not exist")
+    void should_return404_when_categoryIdDoesNotExist() throws Exception {
+        UUID unknownId = UUID.randomUUID();
+        when(serviceCatalogService.searchServiceTypes(eq(unknownId), isNull()))
+                .thenThrow(new NotFoundException("Category not found"));
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryId", unknownId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Category not found"));
     }
 
     // ── POST /api/v1/service-types/suggest ────────────────────────────────────
@@ -430,6 +425,31 @@ class ServiceCatalogControllerTest {
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.message").value("Suggestion submitted"));
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=<3-char string> — 200 when q has exactly three characters")
+    void should_return200_when_qParamHasExactlyThreeChars() throws Exception {
+        var result = List.of(
+                new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish"));
+        when(serviceCatalogService.searchServiceTypes(isNull(), eq("abc"))).thenReturn(result);
+        log.debug("Act: GET /api/v1/service-types?q=abc — exactly 3 chars must return 200");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "abc")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=<2-char string> — 400 when q has fewer than three characters")
+    void should_return400_when_qParamHasTwoChars() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?q=ab — 2 chars must return 400");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "ab")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
     }
 
     @Test

@@ -25,6 +25,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 @Import(TestSecurityConfig.class)
@@ -54,13 +58,12 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         var auth = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         var userId = auth.data().userId();
 
-        // Build a JwtTokenProvider with 1 ms access token expiry using the same secret
+        // Build a JwtTokenProvider pinned to 60 seconds in the past so the token is
+        // expired before it is even generated — no Thread.sleep required.
+        var pastClock = Clock.fixed(Instant.now().minusSeconds(60), ZoneOffset.UTC);
         var shortLivedConfig = new JwtConfig(jwtConfig.secret(), 1L, jwtConfig.refreshTokenExpiration());
-        var shortJwtProvider = new JwtTokenProvider(shortLivedConfig);
+        var shortJwtProvider = new JwtTokenProvider(shortLivedConfig, pastClock);
         String expiredToken = shortJwtProvider.generateAccessToken(userId, email, Role.CLIENT);
-
-        // Guarantee expiry before the request reaches the filter
-        Thread.sleep(10);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(expiredToken);

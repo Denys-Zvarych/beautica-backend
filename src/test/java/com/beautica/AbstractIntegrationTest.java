@@ -1,6 +1,10 @@
 package com.beautica;
 
+import org.junit.jupiter.api.AfterEach;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cache.CacheManager;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -21,6 +25,31 @@ import org.testcontainers.containers.PostgreSQLContainer;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 public abstract class AbstractIntegrationTest {
+
+    @Autowired
+    protected JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private CacheManager cacheManager;
+
+    @AfterEach
+    void cleanDb() {
+        jdbcTemplate.execute("DELETE FROM bookings");
+        jdbcTemplate.execute("DELETE FROM master_services");
+        jdbcTemplate.execute("DELETE FROM service_definitions");
+        jdbcTemplate.execute("DELETE FROM working_hours");
+        jdbcTemplate.execute("DELETE FROM schedule_exceptions");
+        jdbcTemplate.execute("DELETE FROM masters");
+        jdbcTemplate.execute("DELETE FROM invite_tokens");
+        jdbcTemplate.execute("DELETE FROM salons");
+        jdbcTemplate.execute("DELETE FROM refresh_tokens");
+        jdbcTemplate.execute("DELETE FROM users");
+
+        cacheManager.getCacheNames().forEach(name -> {
+            var cache = cacheManager.getCache(name);
+            if (cache != null) cache.clear();
+        });
+    }
 
     private static final PostgreSQLContainer<?> POSTGRES =
             new PostgreSQLContainer<>("postgres:16-alpine");

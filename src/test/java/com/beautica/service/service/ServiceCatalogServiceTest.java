@@ -18,7 +18,6 @@ import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
-import com.beautica.service.repository.ServiceTypeRepository;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -27,6 +26,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
@@ -59,7 +59,10 @@ class ServiceCatalogServiceTest {
     private MasterRepository masterRepository;
 
     @Mock
-    private ServiceTypeRepository serviceTypeRepository;
+    private ServiceTypeLookup serviceTypeLookup;
+
+    @Mock
+    private ServiceTypeSearchService serviceTypeSearchService;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
@@ -106,6 +109,9 @@ class ServiceCatalogServiceTest {
                 salonId, buildCreateRequest());
 
         assertThat(result).isNotNull();
+        assertThat(result.id()).as("id must be populated from the saved entity").isNotNull();
+        assertThat(result.name()).as("name must match the request input").isEqualTo("Manicure");
+        assertThat(result.isActive()).as("newly created service definition must be active").isTrue();
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(captor.capture());
@@ -341,16 +347,16 @@ class ServiceCatalogServiceTest {
     // ── getMasterServices ──────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("throws NotFoundException when master does not exist")
-    void should_throwNotFound_when_masterDoesNotExistOnGetMasterServices() {
+    @DisplayName("returns empty list when master does not exist")
+    void should_returnEmptyList_when_masterDoesNotExistOnGetMasterServices() {
         UUID masterId = UUID.randomUUID();
 
-        when(masterRepository.existsById(masterId)).thenReturn(false);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class)))
+                .thenReturn(List.of());
 
-        assertThatThrownBy(() -> serviceCatalogService.getMasterServices(masterId))
-                .isInstanceOf(NotFoundException.class);
+        List<MasterServiceResponse> result = serviceCatalogService.getMasterServices(masterId);
 
-        verify(masterServiceRepository, never()).findByMasterIdAndIsActiveTrueWithGraph(any());
+        assertThat(result).isEmpty();
     }
 
     @Test
@@ -381,8 +387,7 @@ class ServiceCatalogServiceTest {
         when(assignment.getPriceOverride()).thenReturn(null);
         when(assignment.getDurationOverrideMinutes()).thenReturn(null);
 
-        when(masterRepository.existsById(masterId)).thenReturn(true);
-        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId))
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class)))
                 .thenReturn(List.of(assignment));
 
         List<MasterServiceResponse> result = serviceCatalogService.getMasterServices(masterId);
@@ -397,39 +402,39 @@ class ServiceCatalogServiceTest {
     // ── deactivateServiceDefinition ────────────────────────────────────────────
 
     @Test
-    @DisplayName("deactivates ServiceDefinition when requested")
-    void should_deactivateServiceDefinition_when_ownerRequests() {
+    @DisplayName("deactivates ServiceDefinition when service definition exists")
+    void should_deactivateServiceDefinition_when_serviceDefinitionExists() {
         UUID serviceDefId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
 
-        ServiceDefinition definition = ServiceDefinition.builder()
-                .id(serviceDefId)
-                .ownerType(OwnerType.SALON)
-                .ownerId(salonId)
-                .name("Manicure")
-                .baseDurationMinutes(60)
-                .bufferMinutesAfter(0)
-                .isActive(true)
-                .build();
-
-        when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(definition));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(definition);
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(serviceDefId);
 
-        assertThat(definition.isActive()).isFalse();
-        verify(serviceRepository).save(definition);
+        verify(serviceRepository).deactivateById(serviceDefId);
     }
 
     @Test
     @DisplayName("throws NotFoundException when service definition does not exist")
     void should_throwNotFoundException_when_serviceDefinitionDoesNotExist() {
         UUID missing = UUID.randomUUID();
-        when(serviceRepository.findById(missing)).thenReturn(Optional.empty());
+        when(serviceRepository.deactivateById(missing)).thenReturn(0);
 
         assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(missing))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining(missing.toString());
+    }
+
+    @Test
+    @DisplayName("uses deactivateById (bulk UPDATE) rather than save — deactivation must not trigger a full entity replace")
+    void should_useDeactivateById_not_save_when_deactivating() {
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+
+        verify(serviceRepository).deactivateById(serviceDefId);
+        verify(serviceRepository, never()).save(any());
     }
 
     // ── serviceType linkage ────────────────────────────────────────────────────
@@ -443,6 +448,7 @@ class ServiceCatalogServiceTest {
         ServiceType serviceType = mock(ServiceType.class);
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Манікюр");
+        when(serviceType.isActive()).thenReturn(true);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
                 "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, serviceTypeId);
@@ -459,14 +465,14 @@ class ServiceCatalogServiceTest {
         savedDef.setServiceType(serviceType);
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
-        when(serviceTypeRepository.findById(serviceTypeId)).thenReturn(Optional.of(serviceType));
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
 
         ServiceDefinitionResponse result = serviceCatalogService.addServiceToSalon(salonId, request);
 
         assertThat(result.serviceTypeId()).isEqualTo(serviceTypeId);
         assertThat(result.serviceTypeNameUk()).isEqualTo("Манікюр");
-        verify(serviceTypeRepository).findById(serviceTypeId);
+        verify(serviceTypeLookup).getById(serviceTypeId);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(captor.capture());
@@ -485,7 +491,7 @@ class ServiceCatalogServiceTest {
 
         serviceCatalogService.addServiceToSalon(salonId, buildCreateRequest());
 
-        verify(serviceTypeRepository, never()).findById(any());
+        verify(serviceTypeLookup, never()).getById(any());
     }
 
     @Test
@@ -498,7 +504,7 @@ class ServiceCatalogServiceTest {
                 "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, unknownTypeId);
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
-        when(serviceTypeRepository.findById(unknownTypeId)).thenReturn(Optional.empty());
+        when(serviceTypeLookup.getById(unknownTypeId)).thenThrow(new NotFoundException("Service type not found: " + unknownTypeId));
 
         assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
                 .isInstanceOf(NotFoundException.class)
@@ -525,6 +531,7 @@ class ServiceCatalogServiceTest {
         ServiceType serviceType = mock(ServiceType.class);
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Педикюр");
+        when(serviceType.isActive()).thenReturn(true);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
                 "Pedicure", "Basic pedicure", null, 60, new BigDecimal("400.00"), 10, serviceTypeId);
@@ -547,14 +554,18 @@ class ServiceCatalogServiceTest {
         when(savedAssignment.isActive()).thenReturn(true);
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(serviceTypeRepository.findById(serviceTypeId)).thenReturn(Optional.of(serviceType));
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(userId, request);
 
         assertThat(result).isNotNull();
-        verify(serviceTypeRepository).findById(serviceTypeId);
+        assertThat(result.masterId()).as("masterId must match the independent master").isEqualTo(masterId);
+        assertThat(result.serviceDefinition().id())
+                .as("serviceDefinitionId must be populated from the saved entity").isNotNull();
+        assertThat(result.isActive()).as("newly assigned service must be active").isTrue();
+        verify(serviceTypeLookup).getById(serviceTypeId);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(captor.capture());
@@ -576,11 +587,61 @@ class ServiceCatalogServiceTest {
                 "Pedicure", null, null, 60, new BigDecimal("400.00"), 0, unknownTypeId);
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(serviceTypeRepository.findById(unknownTypeId)).thenReturn(Optional.empty());
+        when(serviceTypeLookup.getById(unknownTypeId)).thenThrow(new NotFoundException("Service type not found: " + unknownTypeId));
 
         assertThatThrownBy(() -> serviceCatalogService.addIndependentMasterService(userId, request))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Service type not found");
+
+        verify(serviceRepository, never()).save(any());
+        verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("throws 400 when linked ServiceType is inactive — addServiceToSalon")
+    void should_throw400_when_linkedServiceTypeIsInactive_addServiceToSalon() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        ServiceType inactiveType = mock(ServiceType.class);
+        when(inactiveType.isActive()).thenReturn(false);
+
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, serviceTypeId);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(inactiveType);
+
+        assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("throws 400 when linked ServiceType is inactive — addIndependentMasterService")
+    void should_throw400_when_linkedServiceTypeIsInactive_addIndependentMasterService() {
+        UUID userId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+
+        ServiceType inactiveType = mock(ServiceType.class);
+        when(inactiveType.isActive()).thenReturn(false);
+
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "Lash Lift", "Full lash lift", null, 90, new BigDecimal("600.00"), 15, serviceTypeId);
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(inactiveType);
+
+        assertThatThrownBy(() -> serviceCatalogService.addIndependentMasterService(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());

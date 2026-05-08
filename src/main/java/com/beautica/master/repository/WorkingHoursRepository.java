@@ -9,6 +9,10 @@ import java.util.UUID;
 
 public interface WorkingHoursRepository extends JpaRepository<WorkingHours, UUID> {
 
+    /**
+     * @deprecated Fetches all rows including inactive. Use findByMasterIdAndIsActiveTrue instead.
+     */
+    @Deprecated
     List<WorkingHours> findByMasterId(UUID masterId);
 
     List<WorkingHours> findByMasterIdAndIsActiveTrue(UUID masterId);

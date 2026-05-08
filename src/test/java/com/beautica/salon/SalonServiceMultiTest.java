@@ -11,7 +11,6 @@ import com.beautica.salon.service.SalonService;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import com.beautica.auth.InviteService;
-import com.beautica.common.security.AuthorizationService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -47,9 +46,6 @@ class SalonServiceMultiTest {
 
     @Mock
     private MasterRepository masterRepository;
-
-    @Mock
-    private AuthorizationService authorizationService;
 
     @InjectMocks
     private SalonService salonService;

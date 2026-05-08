@@ -23,6 +23,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
+import java.time.Clock;
 
 import java.time.Instant;
 import java.util.Optional;
@@ -85,7 +86,8 @@ class InviteServiceAdminTest {
                 masterService,
                 authResponseBuilder,
                 "http://localhost:3000",
-                48L
+                48L,
+                Clock.systemUTC()
         );
     }
 

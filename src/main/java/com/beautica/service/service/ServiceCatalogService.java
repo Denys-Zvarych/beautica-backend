@@ -19,22 +19,21 @@ import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
-import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
-import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.annotation.Caching;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.transaction.annotation.Transactional;
 
+
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 
 @Service
@@ -45,9 +44,10 @@ public class ServiceCatalogService {
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
-    private final ServiceTypeRepository serviceTypeRepository;
-    private final CatalogCategoryRepository catalogCategoryRepository;
+    private final CatalogCategoryLookup catalogCategoryLookup;
     private final EmailService emailService;
+    private final ServiceTypeLookup serviceTypeLookup;
+    private final ServiceTypeSearchService serviceTypeSearchService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -158,70 +158,51 @@ public class ServiceCatalogService {
     @Transactional(readOnly = true)
     @Cacheable(value = "masterServices", key = "#masterId")
     public List<MasterServiceResponse> getMasterServices(UUID masterId) {
-        if (!masterRepository.existsById(masterId)) {
-            throw new NotFoundException("Master not found: " + masterId);
-        }
-
-        return masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId)
+        // An unknown masterId produces an empty list — the existsById check was a
+        // redundant DB round-trip because the JOIN FETCH graph query already returns
+        // nothing for a non-existent master.
+        return masterServiceRepository
+                .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
                 .toList();
     }
 
     @Transactional
-    @Caching(evict = {
-        @CacheEvict(value = "masterServices", allEntries = true),
-        @CacheEvict(value = "service-types", allEntries = true),
-        @CacheEvict(value = "service-categories", allEntries = true)
-    })
+    @CacheEvict(value = "masterServices", allEntries = true)
     // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller — any future caller must enforce the same guard.
     public void deactivateServiceDefinition(UUID serviceDefId) {
-        ServiceDefinition definition = serviceRepository.findById(serviceDefId)
-                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
-
-        definition.setActive(false);
-        serviceRepository.save(definition);
+        int updated = serviceRepository.deactivateById(serviceDefId);
+        if (updated == 0) {
+            throw new NotFoundException("Service definition not found: " + serviceDefId);
+        }
     }
 
-    @Cacheable("service-categories")
     @Transactional(readOnly = true)
     public List<CatalogCategoryResponse> getCategories() {
-        return catalogCategoryRepository.findAllByOrderBySortOrderAsc()
-                .stream()
-                .map(CatalogCategoryResponse::from)
-                .toList();
+        return catalogCategoryLookup.getAll();
     }
 
     @Transactional(readOnly = true)
     public List<ServiceTypeResponse> searchServiceTypes(@Nullable UUID categoryId, @Nullable String q) {
-        boolean useSearch = q != null && q.strip().length() >= 2;
+        if (categoryId != null) {
+            boolean exists = catalogCategoryLookup.getAll().stream()
+                    .anyMatch(c -> c.id().equals(categoryId));
+            if (!exists) throw new NotFoundException("Category not found");
+        }
+        // Intentional duplication of the controller's @Size(min=3) constraint: this guard
+        // defends non-HTTP callers (internal services, tests, future programmatic callers)
+        // where the Bean Validation boundary is not active. Removing it would silently allow
+        // short queries to exhaust cache slots via direct service invocation.
+        boolean useSearch = q != null && q.strip().length() >= 3;
 
         if (useSearch) {
-            return searchServiceTypesByName(q.strip(), categoryId);
+            // Delegate through serviceTypeSearchService (a separate Spring bean) so that
+            // the @Cacheable proxy intercept is active. A direct this.method() call would
+            // bypass the AOP proxy and make caching inert.
+            return serviceTypeSearchService.searchByName(q.strip().toLowerCase(Locale.ROOT), categoryId);
         }
-        return getCachedServiceTypes(categoryId);
-    }
-
-    @Cacheable(value = "service-types", key = "#categoryId")
-    @Transactional(readOnly = true)
-    public List<ServiceTypeResponse> getCachedServiceTypes(@Nullable UUID categoryId) {
-        List<ServiceType> types = (categoryId != null)
-                ? serviceTypeRepository.findByCategoryWithCategory(categoryId)
-                : serviceTypeRepository.findAllActiveWithCategory();
-        return types.stream()
-                .map(ServiceTypeResponse::from)
-                .toList();
-    }
-
-    @Transactional(readOnly = true)
-    public List<ServiceTypeResponse> searchServiceTypesByName(String q, @Nullable UUID categoryId) {
-        List<ServiceType> types = serviceTypeRepository.searchByName(q, PageRequest.of(0, 20));
-        if (categoryId != null) {
-            types = types.stream()
-                    .filter(t -> t.getCategory().getId().equals(categoryId))
-                    .toList();
-        }
-        return types.stream()
+        return serviceTypeLookup.getByCategory(categoryId).stream()
                 .map(ServiceTypeResponse::from)
                 .toList();
     }
@@ -249,8 +230,10 @@ public class ServiceCatalogService {
         if (request.serviceTypeId() == null) {
             return;
         }
-        ServiceType type = serviceTypeRepository.findById(request.serviceTypeId())
-                .orElseThrow(() -> new NotFoundException("Service type not found: " + request.serviceTypeId()));
+        ServiceType type = serviceTypeLookup.getById(request.serviceTypeId());
+        if (!type.isActive()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
+        }
         definition.setServiceType(type);
     }
 }

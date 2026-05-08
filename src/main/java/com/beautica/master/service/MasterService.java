@@ -1,7 +1,10 @@
 package com.beautica.master.service;
 
+import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.TimeZones;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
@@ -17,7 +20,10 @@ import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,6 +35,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Service
@@ -40,7 +47,7 @@ public class MasterService {
     private final SalonRepository salonRepository;
     private final WorkingHoursRepository workingHoursRepository;
     private final ScheduleExceptionRepository scheduleExceptionRepository;
-    private final AuthorizationService authorizationService;
+    private final BookingRepository bookingRepository;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -94,12 +101,12 @@ public class MasterService {
     public List<WorkingHoursResponse> upsertWorkingHours(
             UUID actorId, UUID masterId, List<WorkingHoursRequest> requests) {
 
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
+        // the controller — no redundant DB round-trip needed here.
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
-        authorizationService.enforceCanManageMasterSchedule(actorId, master);
-
-        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterId(masterId)
+        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)
                 .stream()
                 .collect(Collectors.toMap(WorkingHours::getDayOfWeek, wh -> wh));
 
@@ -124,10 +131,10 @@ public class MasterService {
     public ScheduleException addScheduleException(
             UUID actorId, UUID masterId, ScheduleExceptionRequest request) {
 
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
+        // the controller — no redundant DB round-trip needed here.
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
         var existing = scheduleExceptionRepository.findByMasterIdAndDate(masterId, request.date());
         if (existing.isPresent()) {
@@ -142,7 +149,6 @@ public class MasterService {
                 .date(request.date())
                 .reason(request.reason())
                 .note(request.note())
-                .createdAt(OffsetDateTime.now())
                 .build();
 
         return scheduleExceptionRepository.save(exception);
@@ -150,21 +156,22 @@ public class MasterService {
 
     @Transactional
     public void removeScheduleException(UUID actorId, UUID masterId, LocalDate date) {
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
+        // the controller — no redundant DB round-trip needed here.
+        masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
         scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
                 .ifPresent(scheduleExceptionRepository::delete);
     }
 
+    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public void deactivateMaster(UUID actorId, UUID masterId) {
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMaster(...)") on
+        // the controller — no redundant DB round-trip needed here.
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        authorizationService.enforceCanManageMaster(actorId, master);
 
         master.setActive(false);
         masterRepository.save(master);
@@ -175,5 +182,32 @@ public class MasterService {
     public Page<MasterSummaryResponse> getMastersByPage(UUID salonId, Pageable pageable) {
         return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable)
                 .map(MasterSummaryResponse::from);
+    }
+
+    @Cacheable(value = "master-calendar", key = "#actorUserId + '-' + #from + '-' + #to + '-' + #pageable.pageNumber + '-' + #pageable.pageSize")
+    @Transactional(readOnly = true)
+    public Page<BookingResponse> getMasterCalendar(UUID actorUserId, LocalDate from, LocalDate to, Pageable pageable) {
+        Master master = masterRepository.findByUserId(actorUserId)
+                .orElseThrow(() -> new NotFoundException("Master not found"));
+        OffsetDateTime fromOdt = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toOdt = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+
+        // Two-query pattern (Fix H1 — HHH90003004): paginate on IDs only so the DB
+        // applies LIMIT/OFFSET correctly, then hydrate the full graph for those IDs.
+        Page<UUID> idPage = bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
+                master.getId(), fromOdt, toOdt, pageable);
+
+        if (idPage.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
+        }
+
+        List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        Map<UUID, Booking> byId = hydrated.stream()
+                .collect(Collectors.toMap(Booking::getId, Function.identity()));
+        List<BookingResponse> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .map(BookingResponse::from)
+                .toList();
+        return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 }

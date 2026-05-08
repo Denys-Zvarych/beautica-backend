@@ -3,22 +3,19 @@ package com.beautica.master;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.config.WebMvcTestSupport;
 import com.beautica.master.controller.MasterController;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.MasterType;
+import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.master.service.MasterService;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import java.io.IOException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -28,7 +25,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -49,6 +46,10 @@ import java.time.LocalTime;
 import java.util.List;
 import java.util.UUID;
 
+import com.beautica.master.dto.MasterSummaryResponse;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
@@ -73,50 +74,18 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(MasterController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
+@Import(WebMvcTestSupport.class)
 @DisplayName("MasterController — @WebMvcTest slice")
 class MasterControllerTest {
 
     private static final Logger log = LoggerFactory.getLogger(MasterControllerTest.class);
     private static final String MASTERS_URL = "/api/v1/masters";
 
-    // ── Pass-through filter overrides ─────────────────────────────────────────
+    // ── Security configuration ────────────────────────────────────────────────
 
     @TestConfiguration
     @EnableMethodSecurity
-    static class PassThroughFilters {
-
-        @Bean
-        @Primary
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-            };
-        }
-
-        @Bean
-        @Primary
-        AuthRateLimitFilter authRateLimitFilter() {
-            return new AuthRateLimitFilter(null, null) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-
-                @Override
-                public boolean shouldNotFilter(HttpServletRequest request) {
-                    return true;
-                }
-            };
-        }
+    static class SecurityConfig {
 
         @Bean
         SecurityFilterChain testSecurityFilterChain(HttpSecurity http,
@@ -145,6 +114,9 @@ class MasterControllerTest {
 
     @MockBean
     private MasterService masterService;
+
+    @MockBean
+    private SlotCalculationService slotCalculationService;
 
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
@@ -210,6 +182,34 @@ class MasterControllerTest {
                 .andExpect(status().isUnauthorized());
     }
 
+    @Test
+    @DisplayName("GET /by-salon/{salonId} — 200 with paged masters when authenticated")
+    void should_return200_withPagedMasters_when_authenticated() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var userId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+
+        var summary = new MasterSummaryResponse(
+                masterId, userId, "Oksana", "Kovalenko", null,
+                BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER);
+        Page<MasterSummaryResponse> page =
+                new PageImpl<>(List.of(summary), PageRequest.of(0, 20), 1);
+
+        when(masterService.getMastersByPage(eq(salonId), any())).thenReturn(page);
+
+        log.debug("Act: GET {}/by-salon/{} as CLIENT — must return 200 with one master", MASTERS_URL, salonId);
+        mockMvc.perform(get(MASTERS_URL + "/by-salon/" + salonId)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.data").isArray())
+                .andExpect(jsonPath("$.data.data[0].masterId").value(masterId.toString()))
+                .andExpect(jsonPath("$.data.data[0].firstName").value("Oksana"))
+                .andExpect(jsonPath("$.data.totalElements").value(1));
+    }
+
     // ── PATCH /{masterId}/working-hours — protected ────────────────────────────
 
     @Test
@@ -226,6 +226,24 @@ class MasterControllerTest {
         log.debug("Act: PATCH {}/{}/working-hours as SALON_MASTER — must be denied", MASTERS_URL, masterId);
         mockMvc.perform(patch(MASTERS_URL + "/" + masterId + "/working-hours")
                         .with(authenticatedAs(salonMasterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("PATCH /{masterId}/working-hours — 403 when SALON_OWNER does not own the master")
+    void should_return403_when_salonOwnerDoesNotOwnMaster() throws Exception {
+        var foreignMasterId = UUID.randomUUID();
+        var actorId = UUID.randomUUID();
+        when(authorizationService.canManageMasterSchedule(any(), eq(foreignMasterId))).thenReturn(false);
+
+        var requests = List.of(new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true));
+        String body = objectMapper.writeValueAsString(requests);
+
+        mockMvc.perform(patch(MASTERS_URL + "/" + foreignMasterId + "/working-hours")
+                        .with(authenticatedAs(actorId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
@@ -358,6 +376,20 @@ class MasterControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    @Test
+    @DisplayName("DELETE /{masterId} — 403 when SALON_OWNER targets a master they do not own (IDOR)")
+    void should_return403_when_salonOwnerDeletesForeignMaster() throws Exception {
+        var foreignOwnerId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canManageMaster(any(), eq(masterId))).thenReturn(false);
+
+        log.debug("Act: DELETE {}/{} as SALON_OWNER without ownership — must be 403", MASTERS_URL, masterId);
+        mockMvc.perform(delete(MASTERS_URL + "/" + masterId)
+                        .with(authenticatedAs(foreignOwnerId, "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
     // ── DELETE /{masterId}/schedule-exceptions/{date} ─────────────────────────
 
     @Test
@@ -397,6 +429,170 @@ class MasterControllerTest {
         mockMvc.perform(delete(MASTERS_URL + "/" + masterId + "/schedule-exceptions/2026-06-01")
                         .with(authenticatedAs(salonMasterUserId, "smaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    // ── GET /{masterId}/slots — requires authentication ───────────────────────
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 200 when authenticated client requests available slots")
+    void should_return200_when_authenticatedGetAvailableSlots() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(serviceId)))
+                .thenReturn(List.of());
+
+        log.debug("Act: GET {}/{}/slots with CLIENT credentials — must return 200", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2027-01-15")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").exists())
+                .andExpect(jsonPath("$.data.slots").exists());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 401 when unauthenticated request")
+    void should_return401_when_unauthenticatedGetAvailableSlots() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/{}/slots without credentials — must return 401", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2027-01-15")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 400 when required 'date' param is absent")
+    void should_return400_when_slotsMissingDateParam() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/{}/slots without 'date' param — must be rejected with 400", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 200 with non-empty slots list when service returns one slot")
+    void should_return200WithNonEmptySlots_when_slotsRequestedWithValidParams() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+
+        var futureDate = java.time.ZonedDateTime.now().plusDays(1);
+        var stubSlot = new com.beautica.booking.dto.AvailableSlotResponse(futureDate, futureDate.plusHours(1));
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(serviceId)))
+                .thenReturn(List.of(stubSlot));
+
+        log.debug("Act: GET {}/{}/slots with valid params — must return 200 with one slot", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2027-06-15")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").value("2027-06-15"))
+                .andExpect(jsonPath("$.data.slots").isArray())
+                .andExpect(jsonPath("$.data.slots[0].startsAt").exists());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 400 when service rejects a past date")
+    void should_return400_when_dateIsInThePast() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(serviceId)))
+                .thenThrow(new BusinessException("date is in the past"));
+
+        log.debug("Act: GET {}/{}/slots with a past date — must be rejected with 400", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2020-01-01")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
+                .andExpect(status().isBadRequest());
+    }
+
+    // ── GET /me/calendar — protected ─────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /me/calendar — 200 when SALON_MASTER requests valid date range")
+    void should_return200_when_validCalendarRequest() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        when(masterService.getMasterCalendar(any(), any(), any(), any())).thenReturn(Page.empty());
+
+        log.debug("Act: GET {}/me/calendar as SALON_MASTER with valid range", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-01-15")
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 400 when date range exceeds 31 days")
+    void should_return400_when_calendarRangeExceeds31Days() throws Exception {
+        var masterUserId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me/calendar with range > 31 days — must be rejected with 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-03-01")
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 400 when 'from' is after 'to'")
+    void should_return400_when_calendarFromIsAfterTo() throws Exception {
+        var masterUserId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me/calendar with from > to — must be rejected with 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-06-01")
+                        .param("to", "2027-01-01")
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 401 when no Authorization header")
+    void should_return401_when_noTokenOnGetCalendar() throws Exception {
+        log.debug("Act: GET {}/me/calendar without credentials — must be rejected with 401", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-01-15")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 403 when CLIENT requests master calendar")
+    void should_return403_when_clientRequestsCalendar() throws Exception {
+        var clientUserId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me/calendar as CLIENT — must be denied with 403", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-01-15")
+                        .with(authenticatedAs(clientUserId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
     }
 }

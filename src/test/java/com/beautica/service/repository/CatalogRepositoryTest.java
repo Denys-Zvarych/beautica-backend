@@ -328,6 +328,69 @@ class CatalogRepositoryTest {
         }
     }
 
+    // ── ServiceTypeRepository — searchByNameAndCategory (pg_trgm + category) ──
+
+    @Nested
+    @DisplayName("ServiceTypeRepository.searchByNameAndCategory (pg_trgm native query scoped to category)")
+    class SearchByNameAndCategory {
+
+        @Test
+        @DisplayName("should_returnOnlyCategoryMatch_when_searchByNameAndCategory")
+        void should_returnOnlyCategoryMatch_when_searchByNameAndCategory() {
+            var nails = persistCategory("Нігті", "Nails", 1);
+            var brows = persistCategory("Брови", "Brows", 2);
+
+            // Both names are close to "Манікюр" — trigram similarity will match — but
+            // only the one in the nails category should appear in the result.
+            persistServiceType(nails, "Манікюр класичний", "Classic Manicure", "man-cl-cat1", true);
+            persistServiceType(brows, "Манікюр брів",      "Brow Manicure",    "man-brow-cat1", true);
+            em.flush();
+
+            List<ServiceType> results = serviceTypeRepository.searchByNameAndCategory(
+                    "Манікюр", nails.getId(), PageRequest.of(0, 20));
+
+            assertThat(results)
+                    .as("only the service type belonging to the queried category must be returned")
+                    .hasSize(1);
+            assertThat(results.get(0).getNameUk())
+                    .as("returned type must be the nails-category one")
+                    .isEqualTo("Манікюр класичний");
+            assertThat(results.get(0).getCategory().getId())
+                    .as("JOIN FETCH must initialise the category — id must match the queried category")
+                    .isEqualTo(nails.getId());
+        }
+
+        @Test
+        @DisplayName("should_excludeInactiveTypes_when_queryMatchesInactiveNameInCategory")
+        void should_excludeInactiveTypes_when_queryMatchesInactiveNameInCategory() {
+            var nails = persistCategory("Нігті", "Nails", 1);
+            persistServiceType(nails, "Манікюр застарілий", "Deprecated Manicure", "man-dep-cat1", false);
+            em.flush();
+
+            List<ServiceType> results = serviceTypeRepository.searchByNameAndCategory(
+                    "Манікюр", nails.getId(), PageRequest.of(0, 20));
+
+            assertThat(results)
+                    .as("inactive service types must never appear in category-scoped search results")
+                    .isEmpty();
+        }
+
+        @Test
+        @DisplayName("should_returnEmptyList_when_queryHasNoSimilarMatchInCategory")
+        void should_returnEmptyList_when_queryHasNoSimilarMatchInCategory() {
+            var nails = persistCategory("Нігті", "Nails", 1);
+            persistServiceType(nails, "Манікюр класичний", "Classic Manicure", "man-cl-cat2", true);
+            em.flush();
+
+            List<ServiceType> results = serviceTypeRepository.searchByNameAndCategory(
+                    "xyzxyzxyz", nails.getId(), PageRequest.of(0, 20));
+
+            assertThat(results)
+                    .as("query with no trigram match must return empty list even when categoryId matches")
+                    .isEmpty();
+        }
+    }
+
     // ── ServiceTypeRepository — findAllActiveWithCategory (JOIN FETCH) ────────
 
     @Nested

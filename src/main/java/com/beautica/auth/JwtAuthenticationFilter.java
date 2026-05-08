@@ -51,9 +51,14 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
                 UUID userId = jwtTokenProvider.getUserIdFromToken(claims);
                 String email = jwtTokenProvider.getEmailFromToken(claims);
+                if (email == null) {
+                    log.debug("JWT is missing required email claim — skipping authentication");
+                    filterChain.doFilter(request, response);
+                    return;
+                }
                 Role role = jwtTokenProvider.getRoleFromToken(claims);
 
-                var authority = new SimpleGrantedAuthority("ROLE_" + role.name());
+                var authority = new SimpleGrantedAuthority(role.springRole);
                 var authentication = new UsernamePasswordAuthenticationToken(
                         email,
                         null,
@@ -63,7 +68,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
                 SecurityContextHolder.getContext().setAuthentication(authentication);
             } catch (JwtException ex) {
-                log.debug("JWT validation failed: {}", ex.getMessage());
+                log.debug("JWT validation failed: {}", ex.getClass().getSimpleName());
             }
         }
 

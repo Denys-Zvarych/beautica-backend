@@ -2,7 +2,7 @@ package com.beautica.auth;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
-import com.beautica.common.TestConstants;
+import com.beautica.TestConstants;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;

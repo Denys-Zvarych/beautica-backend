@@ -34,4 +34,17 @@ public final class TestConstants {
      */
     public static final String TEST_JWT_SECRET =
             "test-secret-that-is-long-enough-for-hs256-ok-padding-here";
+
+    /**
+     * BCrypt hash of "test-password" at cost factor 4.
+     *
+     * <p>Cost 4 is the minimum supported by BCrypt and is significantly faster than the
+     * production cost of 10, keeping test suites quick while still exercising the correct
+     * hash format. Use this instead of structurally invalid strings like
+     * {@code "$2a$10$hashedpassword"} or {@code "x"}.
+     *
+     * <p>To regenerate: {@code new BCryptPasswordEncoder(4).encode("test-password")}
+     */
+    public static final String HASHED_TEST_PASSWORD =
+            "$2b$04$hdRHhf50.zg190tE2wHX1OAdI5qUSG/zroaKUKvRr3IVLpexsXAR6";
 }

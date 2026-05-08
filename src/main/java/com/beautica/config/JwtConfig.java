@@ -8,4 +8,10 @@ public record JwtConfig(
         long accessTokenExpiration,
         long refreshTokenExpiration
 ) {
+    public JwtConfig {
+        if (secret == null || secret.length() < 32) {
+            throw new IllegalStateException(
+                    "app.jwt.secret must be at least 32 characters — refusing to start with a weak JWT secret");
+        }
+    }
 }

@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.util.Date;
 import java.util.UUID;
 
@@ -26,16 +27,18 @@ public class JwtTokenProvider {
     private final JwtParser jwtParser;
     private final long accessTokenExpirationMs;
     private final long refreshTokenExpirationMs;
+    private final Clock clock;
 
-    public JwtTokenProvider(JwtConfig jwtConfig) {
+    public JwtTokenProvider(JwtConfig jwtConfig, Clock clock) {
         this.signingKey = Keys.hmacShaKeyFor(jwtConfig.secret().getBytes(StandardCharsets.UTF_8));
         this.jwtParser = Jwts.parser().verifyWith(signingKey).build();
         this.accessTokenExpirationMs = jwtConfig.accessTokenExpiration();
         this.refreshTokenExpirationMs = jwtConfig.refreshTokenExpiration();
+        this.clock = clock;
     }
 
     public String generateAccessToken(UUID userId, String email, Role role) {
-        var now = new Date();
+        var now = Date.from(clock.instant());
         var expiry = new Date(now.getTime() + accessTokenExpirationMs);
 
         return Jwts.builder()
@@ -45,12 +48,12 @@ public class JwtTokenProvider {
                 .claim(CLAIM_TYPE, TYPE_ACCESS)
                 .issuedAt(now)
                 .expiration(expiry)
-                .signWith(signingKey)
+                .signWith(signingKey, Jwts.SIG.HS256)
                 .compact();
     }
 
     public String generateRefreshToken(UUID userId) {
-        var now = new Date();
+        var now = Date.from(clock.instant());
         var expiry = new Date(now.getTime() + refreshTokenExpirationMs);
 
         return Jwts.builder()
@@ -59,9 +62,13 @@ public class JwtTokenProvider {
                 .claim(CLAIM_TYPE, TYPE_REFRESH)
                 .issuedAt(now)
                 .expiration(expiry)
-                .signWith(signingKey)
+                .signWith(signingKey, Jwts.SIG.HS256)
                 .compact();
     }
+
+    // Each String-overload calls parseAllClaims internally. When multiple claims are
+    // needed from the same token, prefer the Claims-overload variants (parseAllClaims
+    // once, then pass the Claims object) to avoid parsing the token multiple times.
 
     public boolean isAccessToken(Claims claims) {
         return TYPE_ACCESS.equals(claims.get(CLAIM_TYPE, String.class));

@@ -10,12 +10,12 @@ import java.util.UUID;
 public record SuggestServiceTypeRequest(
         @NotBlank
         @Size(max = 255)
-        @Pattern(regexp = "^[^\\r\\n]*$", message = "Name must not contain newline characters")
+        @Pattern(regexp = "^[^\\r\\n\\t]*$", message = "Name must not contain newline or tab characters")
         String name,
 
         @NotNull UUID categoryId,
 
         @Size(max = 1000)
-        @Pattern(regexp = "^[^\\r\\n]*$", message = "Description must not contain newline characters")
+        @Pattern(regexp = "^[^\\r\\n\\t]*$", message = "Description must not contain newline or tab characters")
         String description
 ) {}

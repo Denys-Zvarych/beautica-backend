@@ -7,14 +7,11 @@ import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.config.JwtConfig;
-import com.beautica.master.entity.Master;
 import com.beautica.master.service.MasterService;
 import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
-import com.beautica.TestConstants;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -26,6 +23,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import java.time.Clock;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -49,10 +47,6 @@ class AuthServiceTest {
 
     private static final Logger log = LoggerFactory.getLogger(AuthServiceTest.class);
 
-    private static final String SECRET = TestConstants.TEST_JWT_SECRET;
-    private static final long ACCESS_MS = 900_000L;
-    private static final long REFRESH_MS = 604_800_000L;
-
     @Mock
     private UserRepository userRepository;
 
@@ -69,22 +63,19 @@ class AuthServiceTest {
     private AuthResponseBuilder authResponseBuilder;
 
     private PasswordEncoder passwordEncoder;
-    private JwtTokenProvider jwtTokenProvider;
-    private JwtConfig jwtConfig;
     private AuthService authService;
 
     @BeforeEach
     void setUp() {
         passwordEncoder = new BCryptPasswordEncoder(4);
-        jwtConfig = new JwtConfig(SECRET, ACCESS_MS, REFRESH_MS);
-        jwtTokenProvider = new JwtTokenProvider(jwtConfig);
         authService = new AuthService(
                 userRepository,
                 refreshTokenRepository,
                 passwordEncoder,
                 tokenGenerator,
                 masterService,
-                authResponseBuilder
+                authResponseBuilder,
+                Clock.systemUTC()
         );
     }
 
