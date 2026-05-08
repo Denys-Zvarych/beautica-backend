@@ -26,11 +26,14 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
@@ -47,6 +50,7 @@ public class BookingService {
     private final UserRepository userRepository;
     private final AuthorizationService authz;
     private final NotificationOutboxService outboxService;
+    private final SlotCalculationService slotCalculationService;
     private final Clock clock;
 
     @Transactional
@@ -127,6 +131,7 @@ public class BookingService {
         booking.setProviderComment(req.comment());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved);
     }
 
@@ -159,12 +164,6 @@ public class BookingService {
 
     @Transactional
     public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, StatusUpdateRequest req) {
-        // Fix H1 (SEC): role guard before booking load prevents UUID-collision bypass
-        User actor = userRepository.findById(clientUserId)
-                .orElseThrow(() -> new NotFoundException("User not found"));
-        if (actor.getRole() != Role.CLIENT) {
-            throw new ForbiddenException("Only clients can cancel bookings");
-        }
         Booking booking = loadBookingOrThrow(bookingId);
         if (!booking.getClient().getId().equals(clientUserId)) {
             throw new ForbiddenException("Access denied");
@@ -177,6 +176,7 @@ public class BookingService {
         booking.setCancellationReason(req.cancellationReason());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved);
     }
 
@@ -185,12 +185,9 @@ public class BookingService {
                 .filter(Master::isActive)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
 
-        MasterServiceAssignment msa = masterServiceRepository.findById(request.masterServiceId())
+        MasterServiceAssignment msa = masterServiceRepository
+                .findByMasterIdAndIdWithGraph(request.masterId(), request.masterServiceId())
                 .orElseThrow(() -> new NotFoundException("Master service not found"));
-
-        if (!msa.getMaster().getId().equals(request.masterId())) {
-            throw new BusinessException("Service does not belong to the requested master");
-        }
 
         OffsetDateTime startsAt = request.startsAt().toOffsetDateTime();
         validateStartsAt(startsAt);
@@ -238,6 +235,7 @@ public class BookingService {
         }
 
         outboxService.enqueueNewBooking(saved.getId());
+        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved);
     }
 
@@ -249,6 +247,20 @@ public class BookingService {
         }
         if (gap.toDays() > MAX_DAYS_AHEAD) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Booking cannot be more than 180 days in the future");
+        }
+    }
+
+    private void registerSlotEviction(UUID masterId, LocalDate date, UUID masterServiceId) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+                }
+            });
+        } else {
+            // No active transaction (e.g. unit test context) — evict directly
+            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
         }
     }
 

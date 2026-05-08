@@ -100,6 +100,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
 
     // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
+    /**
+     * @deprecated No JOIN FETCH — triggers N+1 lazy loads on client/master/masterService.
+     *             Use {@link #findActiveByMasterIdAndStartsAtBetweenWithGraph} instead.
+     */
+    @Deprecated(since = "phase-4", forRemoval = false)
     Page<Booking> findByMasterIdAndStartsAtBetween(UUID masterId, OffsetDateTime from, OffsetDateTime to, Pageable pageable);
 
     @Query(value = """

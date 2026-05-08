@@ -16,6 +16,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
@@ -38,6 +39,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.Optional;
@@ -46,6 +48,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -66,6 +69,8 @@ class BookingServiceTest {
     private AuthorizationService authz;
     @Mock
     private NotificationOutboxService outboxService;
+    @Mock
+    private SlotCalculationService slotCalculationService;
 
     private Clock clock;
 
@@ -94,6 +99,7 @@ class BookingServiceTest {
                 userRepository,
                 authz,
                 outboxService,
+                slotCalculationService,
                 clock
         );
 
@@ -203,7 +209,7 @@ class BookingServiceTest {
     @DisplayName("should_createBooking_when_slotAvailableAndNoConflict")
     void should_createBooking_when_slotAvailableAndNoConflict() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.of(msa));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -215,6 +221,11 @@ class BookingServiceTest {
         verify(bookingRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getStatus()).isEqualTo(BookingStatus.PENDING);
         assertThat(result).isNotNull();
+        verify(slotCalculationService).evictAvailableSlots(
+                eq(masterId),
+                any(LocalDate.class),
+                eq(masterServiceId)
+        );
     }
 
     @Test
@@ -235,7 +246,7 @@ class BookingServiceTest {
     @DisplayName("should_throw409_when_slotOverlapsExistingBooking")
     void should_throw409_when_slotOverlapsExistingBooking() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.of(msa));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(true);
 
@@ -258,7 +269,7 @@ class BookingServiceTest {
     @DisplayName("should_throw404_when_masterServiceNotFound")
     void should_throw404_when_masterServiceNotFound() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.empty());
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
                 .isInstanceOf(NotFoundException.class);
@@ -268,7 +279,7 @@ class BookingServiceTest {
     @DisplayName("should_throw400_when_startsAtInThePast")
     void should_throw400_when_startsAtInThePast() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.of(msa));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest pastRequest = new CreateBookingRequest(
                 masterId,
@@ -287,7 +298,7 @@ class BookingServiceTest {
     @DisplayName("should_throw400_when_startsAtMoreThan180DaysAhead")
     void should_throw400_when_startsAtMoreThan180DaysAhead() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.of(msa));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest farFutureRequest = new CreateBookingRequest(
                 masterId,
@@ -308,7 +319,7 @@ class BookingServiceTest {
         MasterServiceAssignment msaWithOverrides = buildMsa(
                 masterServiceId, master, serviceDef, new BigDecimal("250.00"), 45);
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.of(msaWithOverrides));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msaWithOverrides));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msaWithOverrides, BookingStatus.PENDING);
@@ -328,7 +339,7 @@ class BookingServiceTest {
     @DisplayName("should_fallBackToBaseValues_when_noOverrides")
     void should_fallBackToBaseValues_when_noOverrides() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.of(msa));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -346,7 +357,7 @@ class BookingServiceTest {
     @DisplayName("should_enqueueNewBookingNotification_when_bookingCreated")
     void should_enqueueNewBookingNotification_when_bookingCreated() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findById(masterServiceId)).thenReturn(Optional.of(msa));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -415,6 +426,11 @@ class BookingServiceTest {
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.DECLINED);
         assertThat(booking.getCancellationReason()).isEqualTo(CancellationReason.PROVIDER_UNAVAILABLE);
         verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(slotCalculationService).evictAvailableSlots(
+                eq(masterId),
+                any(LocalDate.class),
+                eq(masterServiceId)
+        );
     }
 
     @Test
@@ -497,7 +513,6 @@ class BookingServiceTest {
     void should_cancelBooking_when_clientCancelsPendingBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
-        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
 
@@ -505,6 +520,11 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
         verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(slotCalculationService).evictAvailableSlots(
+                eq(masterId),
+                any(LocalDate.class),
+                eq(masterServiceId)
+        );
     }
 
     @Test
@@ -512,7 +532,6 @@ class BookingServiceTest {
     void should_cancelBooking_when_clientCancelsConfirmedBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
-        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
 
@@ -520,34 +539,40 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
         verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(slotCalculationService).evictAvailableSlots(
+                eq(masterId),
+                any(LocalDate.class),
+                eq(masterServiceId)
+        );
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_nonClientRoleCallsCancelBooking")
-    void should_throwForbidden_when_nonClientRoleCallsCancelBooking() {
-        // Fix SEC H1: a user whose UUID coincidentally matches the booking's client UUID
-        // but who holds SALON_OWNER role must be rejected by the role guard, not the
-        // ownership check — the role check fires first before any booking is loaded.
-        UUID salonOwnerUserId = UUID.randomUUID();
-        User salonOwner = buildUser(salonOwnerUserId, Role.SALON_OWNER);
+    @DisplayName("should_throwForbidden_when_differentClientAttemptsToCancel")
+    void should_throwForbidden_when_differentClientAttemptsToCancel() {
+        // Role guard is at the controller layer (hasRole CLIENT).
+        // At the service layer the ownership check fires: booking.client.id must equal actorId.
+        UUID differentClientId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
-        when(userRepository.findById(salonOwnerUserId)).thenReturn(Optional.of(salonOwner));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        // differentClientId != client.id → ownership check throws ForbiddenException
+        assertThatThrownBy(() -> bookingService.cancelBooking(differentClientId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwForbidden_when_salonOwnerAttemptsToCancel")
+    void should_throwForbidden_when_salonOwnerAttemptsToCancel() {
+        // A SALON_OWNER UUID that does NOT match the booking's client UUID must be rejected
+        // by the ownership check inside cancelBooking (controller already blocks non-CLIENT
+        // via @PreAuthorize; this test covers the service-level ownership guard in isolation).
+        UUID salonOwnerUserId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.cancelBooking(salonOwnerUserId, bookingId, req))
-                .isInstanceOf(ForbiddenException.class);
-
-        verify(bookingRepository, never()).findByIdWithFullGraph(any());
-    }
-
-    @Test
-    @DisplayName("should_throwForbidden_when_nonClientCancelsBooking")
-    void should_throwForbidden_when_nonClientCancelsBooking() {
-        UUID otherUserId = UUID.randomUUID();
-        User otherUser = buildUser(otherUserId, Role.SALON_MASTER);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
-        when(userRepository.findById(otherUserId)).thenReturn(Optional.of(otherUser));
-
-        assertThatThrownBy(() -> bookingService.cancelBooking(otherUserId, bookingId, req))
                 .isInstanceOf(ForbiddenException.class);
     }
 
@@ -556,7 +581,6 @@ class BookingServiceTest {
     void should_throw400_when_clientCancelsCompletedBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
-        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))

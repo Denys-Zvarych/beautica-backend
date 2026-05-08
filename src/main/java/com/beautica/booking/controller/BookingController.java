@@ -57,7 +57,7 @@ public class BookingController {
     }
 
     @GetMapping("/{bookingId}")
-    @PreAuthorize("@authz.canViewBooking(authentication, #bookingId)")
+    @PreAuthorize("isAuthenticated()")
     public ApiResponse<BookingDetailResponse> getBooking(
             @PathVariable UUID bookingId,
             Authentication auth
@@ -83,7 +83,7 @@ public class BookingController {
     }
 
     @PatchMapping("/{bookingId}/confirm")
-    @PreAuthorize("@authz.canManageBooking(authentication, #bookingId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER', 'SALON_MASTER', 'INDEPENDENT_MASTER')")
     public ResponseEntity<Void> confirmBooking(
             @PathVariable UUID bookingId,
             Authentication auth
@@ -93,7 +93,7 @@ public class BookingController {
     }
 
     @PatchMapping("/{bookingId}/decline")
-    @PreAuthorize("@authz.canManageBooking(authentication, #bookingId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER', 'SALON_MASTER', 'INDEPENDENT_MASTER')")
     public ResponseEntity<Void> declineBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody StatusUpdateRequest req,
@@ -104,7 +104,7 @@ public class BookingController {
     }
 
     @PatchMapping("/{bookingId}/complete")
-    @PreAuthorize("@authz.canManageBooking(authentication, #bookingId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER', 'SALON_MASTER', 'INDEPENDENT_MASTER')")
     public ResponseEntity<Void> completeBooking(
             @PathVariable UUID bookingId,
             Authentication auth
@@ -114,7 +114,7 @@ public class BookingController {
     }
 
     @PatchMapping("/{bookingId}/not-complete")
-    @PreAuthorize("@authz.canManageBooking(authentication, #bookingId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER', 'SALON_MASTER', 'INDEPENDENT_MASTER')")
     public ResponseEntity<Void> notCompleteBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody StatusUpdateRequest req,
@@ -125,7 +125,7 @@ public class BookingController {
     }
 
     @PatchMapping("/{bookingId}/cancel")
-    @PreAuthorize("hasRole('CLIENT') and @authz.canCancelBooking(authentication, #bookingId)")
+    @PreAuthorize("hasRole('CLIENT')")
     public ResponseEntity<Void> cancelBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody StatusUpdateRequest req,

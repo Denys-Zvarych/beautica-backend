@@ -7,6 +7,7 @@ import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -52,6 +53,7 @@ import org.springframework.data.domain.Page;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -264,7 +266,7 @@ class BookingControllerTest {
     void should_return403_when_unauthorizedGetBooking() throws Exception {
         var userId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canViewBooking(any(), eq(bookingId))).thenReturn(false);
+        when(bookingService.getBooking(any(), any())).thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(get(BOOKINGS_URL + "/" + bookingId)
                         .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
@@ -457,7 +459,8 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(false);
+        doThrow(new ForbiddenException("Access denied"))
+                .when(bookingService).cancelBooking(any(), any(), any());
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/cancel")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
