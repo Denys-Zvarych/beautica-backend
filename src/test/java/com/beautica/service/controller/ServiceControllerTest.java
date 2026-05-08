@@ -450,6 +450,39 @@ class ServiceControllerTest {
     }
 
     @Test
+    @DisplayName("DELETE /services/{id} — 403 when CLIENT role calls the delete endpoint")
+    void should_return403_when_clientCallsDeleteService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        // canManageServiceDefinition returns false for a CLIENT: a CLIENT user never owns
+        // a service definition, so AuthorizationService denies the request.
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
+
+        log.debug("Act: DELETE /api/v1/services/{} as CLIENT — must be denied with 403", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 204 when INDEPENDENT_MASTER deletes their own service definition")
+    void should_return204_when_independentMasterDeletesOwnService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        // canManageServiceDefinition returns true: this master owns the definition.
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+        // deactivateServiceDefinition is void — default Mockito behaviour is a no-op,
+        // which is exactly what we want.
+
+        log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER — must deactivate and return 204", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
     @DisplayName("DELETE /services/{id} — 403 when authenticated owner targets a non-existent service definition UUID")
     void should_return403_when_ownerDeletesNonExistentServiceDefinition() throws Exception {
         // canManageServiceDefinition returns false when service definition does not exist

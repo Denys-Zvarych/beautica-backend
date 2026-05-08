@@ -20,7 +20,7 @@ public record CreateServiceDefinitionRequest(
         @Size(max = 2000) String description,
         ServiceCategory category,
         @NotNull @Positive @Max(480) int baseDurationMinutes,
-        @DecimalMin("0.00") @DecimalMax("99999999.99") @Digits(integer = 8, fraction = 2) BigDecimal basePrice,
+        @NotNull(message = "Base price is required") @DecimalMin("0.00") @DecimalMax("99999999.99") @Digits(integer = 8, fraction = 2) BigDecimal basePrice,
         @Min(0) @Max(120) int bufferMinutesAfter,
         @Nullable UUID serviceTypeId
 ) {

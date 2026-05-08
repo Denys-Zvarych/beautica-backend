@@ -63,7 +63,7 @@ management:
         include: health
   endpoint:
     health:
-      show-details: when-authorized
+      show-details: never
 
 logging:
   level:

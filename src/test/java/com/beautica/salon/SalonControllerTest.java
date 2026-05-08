@@ -351,6 +351,48 @@ class SalonControllerTest {
                 .andExpect(status().isNoContent());
     }
 
+    // ── GET /api/v1/salons/mine — deactivated salon excluded ─────────────────
+
+    @Test
+    @DisplayName("GET /api/v1/salons/mine — deactivated salon does not appear in listing")
+    void should_notReturnDeactivatedSalon_when_listingSalons() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var activeSalon = stubSalonResponse(salonId, "Active Salon");
+
+        // First call: salon exists and is active.
+        // Second call (after deactivation): service filters by isActive=true and returns nothing.
+        when(salonService.getOwnerSalons(userId))
+                .thenReturn(List.of(activeSalon))
+                .thenReturn(List.of());
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        // Verify the salon appears in the list before deactivation.
+        log.debug("Arrange: GET {}/mine — salon {} must be present before deactivation", SALONS_URL, salonId);
+        mockMvc.perform(get(SALONS_URL + "/mine")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(1))
+                .andExpect(jsonPath("$.data[0].id").value(salonId.toString()));
+
+        // Act: deactivate the salon via DELETE.
+        log.debug("Act: DELETE {}/{} — deactivates the salon", SALONS_URL, salonId);
+        mockMvc.perform(delete(SALONS_URL + "/" + salonId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+
+        // Assert: the listing no longer contains the deactivated salon.
+        log.debug("Assert: GET {}/mine — deactivated salon {} must be absent", SALONS_URL, salonId);
+        mockMvc.perform(get(SALONS_URL + "/mine")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(0));
+    }
+
     // ── POST salons — second salon ────────────────────────────────────────────
 
     @Test

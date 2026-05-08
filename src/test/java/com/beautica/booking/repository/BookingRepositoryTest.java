@@ -740,6 +740,27 @@ class BookingRepositoryTest {
     }
 
     @Test
+    @DisplayName("should_includeBooking_when_bookingStartsExactlyAtFromBoundary")
+    void should_includeBooking_when_bookingStartsExactlyAtFromBoundary() {
+        // Arrange: booking whose startsAt equals the 'from' boundary exactly.
+        OffsetDateTime from = OffsetDateTime.of(2026, 6, 15, 9, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime to = OffsetDateTime.of(2026, 6, 15, 18, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 15, 10, 0, 0, 0, ZoneOffset.UTC);
+
+        Booking booking = buildBooking(BookingStatus.CONFIRMED, from, endsAt);
+        em.persist(booking);
+        em.flush();
+
+        // Act: query with from == booking.startsAt — the lower boundary must be inclusive.
+        Page<Booking> result = bookingRepository.findActiveByMasterIdAndStartsAtBetween(
+                master.getId(), from, to, PageRequest.of(0, 10));
+
+        // Assert: the booking IS returned — BETWEEN is inclusive on both ends.
+        assertThat(result.getContent()).hasSize(1);
+        assertThat(result.getContent().get(0).getId()).isEqualTo(booking.getId());
+    }
+
+    @Test
     @DisplayName("should_findActiveByMasterIdAndStartsAtBetween_excludesCancelledBookings")
     void should_findActiveByMasterIdAndStartsAtBetween_excludesCancelledBookings() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);

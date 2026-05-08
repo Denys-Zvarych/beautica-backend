@@ -2,6 +2,7 @@ package com.beautica.user;
 
 import com.beautica.auth.Role;
 import com.beautica.common.AuditableEntity;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -105,6 +106,7 @@ public class User extends AuditableEntity {
         return email;
     }
 
+    @JsonIgnore
     public String getPasswordHash() {
         return passwordHash;
     }
