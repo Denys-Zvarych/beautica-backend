@@ -157,10 +157,9 @@ public class ServiceCatalogService {
     @Transactional(readOnly = true)
     @Cacheable(value = "masterServices", key = "#masterId")
     public List<MasterServiceResponse> getMasterServices(UUID masterId) {
-        if (!masterRepository.existsById(masterId)) {
-            throw new NotFoundException("Master not found: " + masterId);
-        }
-
+        // An unknown masterId produces an empty list — the existsById check was a
+        // redundant DB round-trip because the JOIN FETCH graph query already returns
+        // nothing for a non-existent master.
         return masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(masterId)
                 .stream()
                 .map(MasterServiceResponse::from)

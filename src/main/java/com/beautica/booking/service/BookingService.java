@@ -24,6 +24,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -74,12 +75,16 @@ public class BookingService {
     }
 
     @Transactional(readOnly = true)
-    public Page<BookingResponse> listBookings(UUID actorUserId, BookingStatus status, Pageable pageable) {
-        User actor = userRepository.findById(actorUserId)
-                .orElseThrow(() -> new NotFoundException("User not found"));
+    public Page<BookingResponse> listBookings(UUID actorUserId, Authentication auth, BookingStatus status, Pageable pageable) {
+        // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
+        // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
+        Role role = auth.getAuthorities().stream()
+                .findFirst()
+                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
 
         // Fix H1: use full-graph queries to prevent N+1 lazy loads on BookingResponse mapping
-        Page<Booking> page = switch (actor.getRole()) {
+        Page<Booking> page = switch (role) {
             case CLIENT -> status == null
                     ? bookingRepository.findByClientIdWithGraph(actorUserId, pageable)
                     : bookingRepository.findByClientIdAndStatusWithGraph(actorUserId, status, pageable);
@@ -91,10 +96,8 @@ public class BookingService {
                         : bookingRepository.findByMasterIdAndStatusWithGraph(master.getId(), status, pageable);
             }
             case SALON_OWNER -> {
-                UUID salonId = actor.getSalonId();
-                if (salonId == null) {
-                    throw new BusinessException("Salon owner has no associated salon");
-                }
+                UUID salonId = userRepository.findSalonIdById(actorUserId)
+                        .orElseThrow(() -> new BusinessException("Salon owner has no associated salon"));
                 yield status == null
                         ? bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorUserId, pageable)
                         : bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorUserId, status, pageable);

@@ -289,6 +289,19 @@ class BookingControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /{bookingId}/confirm — 204 when SALON_MASTER confirms booking")
+    void should_return204_when_salonMasterConfirmsBooking() throws Exception {
+        var masterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        when(bookingService.confirmBooking(any(), eq(bookingId))).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
     @DisplayName("PATCH /{bookingId}/confirm — 403 when CLIENT tries to confirm")
     void should_return403_when_clientConfirmsBooking() throws Exception {
         var clientId = UUID.randomUUID();
@@ -353,6 +366,22 @@ class BookingControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /{bookingId}/decline — 204 when SALON_MASTER declines booking")
+    void should_return204_when_salonMasterDeclinesBooking() throws Exception {
+        var masterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
     @DisplayName("PATCH /{bookingId}/decline — 403 when CLIENT attempts to decline booking")
     void should_return403_when_clientDeclinesBooking() throws Exception {
         var clientId = UUID.randomUUID();
@@ -385,6 +414,19 @@ class BookingControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /{bookingId}/complete — 204 when SALON_MASTER completes booking")
+    void should_return204_when_salonMasterCompletesBooking() throws Exception {
+        var masterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        when(bookingService.completeBooking(any(), eq(bookingId))).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/complete")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
     @DisplayName("PATCH /{bookingId}/complete — 403 when CLIENT attempts to complete booking")
     void should_return403_when_clientCompletesBooking() throws Exception {
         var clientId = UUID.randomUUID();
@@ -410,6 +452,22 @@ class BookingControllerTest {
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/not-complete — 204 when SALON_MASTER marks booking not-completed")
+    void should_return204_when_salonMasterMarksNotCompleted() throws Exception {
+        var masterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
@@ -473,7 +531,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when authenticated CLIENT lists their bookings")
     void should_return200_when_authenticatedListMyBookings() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.listBookings(any(), any(), any())).thenReturn(Page.empty());
+        when(bookingService.listBookings(any(), any(), any(), any())).thenReturn(Page.empty());
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -486,7 +544,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 and status param is forwarded to the service when ?status=PENDING is supplied")
     void should_return200_and_passStatusParam_when_statusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.listBookings(any(), eq(BookingStatus.PENDING), any())).thenReturn(Page.empty());
+        when(bookingService.listBookings(any(), any(), eq(BookingStatus.PENDING), any())).thenReturn(Page.empty());
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
                         .param("status", "PENDING")
@@ -495,7 +553,7 @@ class BookingControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
 
-        org.mockito.Mockito.verify(bookingService).listBookings(any(), eq(BookingStatus.PENDING), any());
+        org.mockito.Mockito.verify(bookingService).listBookings(any(), any(), eq(BookingStatus.PENDING), any());
     }
 
     @Test

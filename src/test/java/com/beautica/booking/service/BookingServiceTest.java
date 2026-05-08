@@ -34,6 +34,9 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
@@ -42,6 +45,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -120,6 +124,14 @@ class BookingServiceTest {
         User u = new User("test@example.com", "hash", role, "First", "Last", "+380501234567");
         setField(u, "id", id);
         return u;
+    }
+
+    private Authentication buildAuth(Role role) {
+        return new UsernamePasswordAuthenticationToken(
+                "test@example.com",
+                null,
+                List.of(new SimpleGrantedAuthority("ROLE_" + role.name()))
+        );
     }
 
     private Master buildMaster(UUID id, MasterType type) {
@@ -271,6 +283,36 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.empty());
 
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("404 NotFoundException is thrown when the master exists but is inactive")
+    void should_throw404_when_masterIsInactive() {
+        // Arrange — build a master with isActive = false
+        Master inactiveMaster = Master.builder()
+                .user(client)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(false)
+                .build();
+        setField(inactiveMaster, "id", masterId);
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(inactiveMaster));
+
+        // Act + Assert — the filter(Master::isActive) turns the Optional empty
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("404 NotFoundException is thrown when the requested service does not belong to the master")
+    void should_throwNotFoundException_when_serviceDoesNotBelongToMaster() {
+        // Arrange — master is found and active; but the service lookup returns empty
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.empty());
+
+        // Act + Assert
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
                 .isInstanceOf(NotFoundException.class);
     }
@@ -642,12 +684,12 @@ class BookingServiceTest {
         setField(salonOwner, "id", actorId);
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findById(actorId)).thenReturn(Optional.of(salonOwner));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
         when(bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorId, BookingStatus.PENDING, pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result =
-                bookingService.listBookings(actorId, BookingStatus.PENDING, pageable);
+                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.PENDING, pageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorId, BookingStatus.PENDING, pageable);
@@ -664,12 +706,12 @@ class BookingServiceTest {
         setField(salonOwner, "id", actorId);
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findById(actorId)).thenReturn(Optional.of(salonOwner));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
         when(bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result =
-                bookingService.listBookings(actorId, null, pageable);
+                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable);
@@ -684,9 +726,9 @@ class BookingServiceTest {
         // salonId is null — buildUser does not set it
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findById(actorId)).thenReturn(Optional.of(salonOwner));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> bookingService.listBookings(actorId, null, pageable))
+        assertThatThrownBy(() -> bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable))
                 .isInstanceOf(BusinessException.class);
     }
 
@@ -695,10 +737,9 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithoutStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.findByClientIdWithGraph(clientId, pageable)).thenReturn(Page.empty());
 
-        Page<BookingResponse> result = bookingService.listBookings(clientId, null, pageable);
+        Page<BookingResponse> result = bookingService.listBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findByClientIdWithGraph(clientId, pageable);
@@ -710,11 +751,10 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.findByClientIdAndStatusWithGraph(clientId, BookingStatus.PENDING, pageable))
                 .thenReturn(Page.empty());
 
-        Page<BookingResponse> result = bookingService.listBookings(clientId, BookingStatus.PENDING, pageable);
+        Page<BookingResponse> result = bookingService.listBookings(clientId, buildAuth(Role.CLIENT), BookingStatus.PENDING, pageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findByClientIdAndStatusWithGraph(clientId, BookingStatus.PENDING, pageable);
@@ -728,11 +768,10 @@ class BookingServiceTest {
         User masterUser = buildUser(UUID.randomUUID(), Role.INDEPENDENT_MASTER);
         UUID masterUserId = masterUser.getId();
 
-        when(userRepository.findById(masterUserId)).thenReturn(Optional.of(masterUser));
         when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
         when(bookingRepository.findByMasterIdWithGraph(masterId, pageable)).thenReturn(Page.empty());
 
-        Page<BookingResponse> result = bookingService.listBookings(masterUserId, null, pageable);
+        Page<BookingResponse> result = bookingService.listBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER), null, pageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findByMasterIdWithGraph(masterId, pageable);
@@ -745,9 +784,7 @@ class BookingServiceTest {
         User salonAdmin = buildUser(salonAdminId, Role.SALON_ADMIN);
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findById(salonAdminId)).thenReturn(Optional.of(salonAdmin));
-
-        assertThatThrownBy(() -> bookingService.listBookings(salonAdminId, null, pageable))
+        assertThatThrownBy(() -> bookingService.listBookings(salonAdminId, buildAuth(Role.SALON_ADMIN), null, pageable))
                 .isInstanceOf(ForbiddenException.class);
     }
 

@@ -72,7 +72,7 @@ public class BookingController {
             @PageableDefault(size = 20) Pageable pageable,
             Authentication auth
     ) {
-        Page<BookingResponse> page = bookingService.listBookings(principalId(auth), status, pageable);
+        Page<BookingResponse> page = bookingService.listBookings(principalId(auth), auth, status, pageable);
         return ApiResponse.ok(PageResponse.of(
                 page.getContent(),
                 page.getNumber(),
