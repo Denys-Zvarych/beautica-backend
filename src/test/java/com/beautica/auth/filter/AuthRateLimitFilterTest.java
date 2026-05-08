@@ -111,6 +111,9 @@ class AuthRateLimitFilterTest {
                     .as("status must be 429 when login bucket is exhausted")
                     .isEqualTo(429);
             assertThat(response.getHeader("Retry-After")).isEqualTo("60");
+            assertThat(response.getContentType())
+                    .as("Content-Type must be application/json on 429 login response")
+                    .startsWith("application/json");
             assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
             assertThat(chain.getRequest()).isNull();
             verifyNoInteractions(refreshBuckets);
@@ -157,10 +160,14 @@ class AuthRateLimitFilterTest {
             log.debug("Act: doFilterInternal for POST /auth/refresh when refresh bucket is exhausted");
             doFilter(request, response, chain);
 
+
             assertThat(response.getStatus())
                     .as("status must be 429 when refresh bucket is exhausted")
                     .isEqualTo(429);
             assertThat(response.getHeader("Retry-After")).isEqualTo("60");
+            assertThat(response.getContentType())
+                    .as("Content-Type must be application/json on 429 refresh response")
+                    .startsWith("application/json");
             assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
             assertThat(chain.getRequest()).isNull();
             verifyNoInteractions(loginBuckets);
