@@ -64,6 +64,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             SELECT COUNT(b) FROM Booking b
             WHERE b.master.id = :masterId
             """)
+    // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
+    // Scope enforcement: BookingService resolves masterId via masterRepository.findByUserId(actorUserId).
     Page<Booking> findByMasterIdWithGraph(@Param("masterId") UUID masterId, Pageable pageable);
 
     @Query(value = """
@@ -79,6 +81,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             SELECT COUNT(b) FROM Booking b
             WHERE b.master.id = :masterId AND b.status = :status
             """)
+    // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
     Page<Booking> findByMasterIdAndStatusWithGraph(
             @Param("masterId") UUID masterId,
             @Param("status") BookingStatus status,

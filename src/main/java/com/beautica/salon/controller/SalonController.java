@@ -70,6 +70,8 @@ public class SalonController {
         return ApiResponse.ok(salonService.updateSalon(ownerId, salonId, request));
     }
 
+    // SALON_ADMIN may invite masters to their own salon — intentional per product decision.
+    // canManageSalon enforces salonId == admin's assigned salon_id set at invite time.
     @PostMapping("/{salonId}/invite")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<InviteResponse>> inviteMaster(

@@ -43,7 +43,6 @@ class JwtTokenProviderTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: expected userId={}", userId);
 
-        log.debug("Act: generateAccessToken then getUserIdFromToken — expect userId={}", userId);
         String token = jwtTokenProvider.generateAccessToken(userId, "test@example.com", Role.CLIENT);
         UUID extracted = jwtTokenProvider.getUserIdFromToken(token);
 
@@ -58,7 +57,6 @@ class JwtTokenProviderTest {
         var email = "user@beautica.com";
         log.debug("Arrange: expected email={}", email);
 
-        log.debug("Act: generateAccessToken then getEmailFromToken — expect email={}", email);
         String token = jwtTokenProvider.generateAccessToken(UUID.randomUUID(), email, Role.SALON_OWNER);
         String extracted = jwtTokenProvider.getEmailFromToken(token);
 
@@ -73,7 +71,6 @@ class JwtTokenProviderTest {
         var role = Role.INDEPENDENT_MASTER;
         log.debug("Arrange: expected role={}", role);
 
-        log.debug("Act: generateAccessToken then getRoleFromToken — expect role={}", role);
         String token = jwtTokenProvider.generateAccessToken(UUID.randomUUID(), "m@example.com", role);
         Role extracted = jwtTokenProvider.getRoleFromToken(token);
 
@@ -88,7 +85,6 @@ class JwtTokenProviderTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: userId={}", userId);
 
-        log.debug("Act: generateRefreshToken for userId={}", userId);
         String token = jwtTokenProvider.generateRefreshToken(userId);
 
         // Intentionally isNotBlank() only: refresh tokens are opaque to callers.
@@ -104,7 +100,6 @@ class JwtTokenProviderTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: userId={}", userId);
 
-        log.debug("Act: generateRefreshToken then parseAllClaims then isAccessToken — expect false");
         String token = jwtTokenProvider.generateRefreshToken(userId);
         var claims = jwtTokenProvider.parseAllClaims(token);
 
@@ -119,7 +114,6 @@ class JwtTokenProviderTest {
         var userId = UUID.randomUUID();
         log.debug("Arrange: expected userId={}", userId);
 
-        log.debug("Act: generateRefreshToken then getUserIdFromToken — expect userId={}", userId);
         String token = jwtTokenProvider.generateRefreshToken(userId);
         UUID extracted = jwtTokenProvider.getUserIdFromToken(token);
 
@@ -213,8 +207,6 @@ class JwtTokenProviderTest {
         log.debug("Arrange: userId={}, email={}, role={}", userId, email, role);
 
         String token = jwtTokenProvider.generateAccessToken(userId, email, role);
-
-        log.debug("Act: parseAllClaims once, then use Claims overloads for all getters");
         var claims = jwtTokenProvider.parseAllClaims(token);
 
         assertThat(jwtTokenProvider.getUserIdFromToken(claims))
