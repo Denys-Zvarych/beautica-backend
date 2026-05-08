@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
+import java.time.Clock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -95,7 +96,8 @@ class InviteServiceTest {
                 masterService,
                 authResponseBuilder,
                 "http://localhost:3000",
-                48L
+                48L,
+                Clock.systemUTC()
         );
     }
 

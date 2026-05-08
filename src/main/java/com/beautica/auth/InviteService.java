@@ -27,6 +27,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
@@ -44,6 +45,7 @@ public class InviteService {
     private final AuthResponseBuilder authResponseBuilder;
     private final String frontendBaseUrl;
     private final long tokenExpirationHours;
+    private final Clock clock;
 
     public InviteService(
             InviteTokenRepository inviteTokenRepository,
@@ -55,7 +57,8 @@ public class InviteService {
             MasterService masterService,
             AuthResponseBuilder authResponseBuilder,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
-            @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours
+            @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours,
+            Clock clock
     ) {
         this.inviteTokenRepository = inviteTokenRepository;
         this.userRepository = userRepository;
@@ -67,6 +70,7 @@ public class InviteService {
         this.authResponseBuilder = authResponseBuilder;
         this.frontendBaseUrl = frontendBaseUrl;
         this.tokenExpirationHours = tokenExpirationHours;
+        this.clock = clock;
     }
 
     @Transactional
@@ -98,7 +102,7 @@ public class InviteService {
         }
 
         inviteTokenRepository.findByEmailAndIsUsedFalse(request.email()).ifPresent(existing -> {
-            if (existing.getExpiresAt().isAfter(Instant.now())) {
+            if (existing.getExpiresAt().isAfter(clock.instant())) {
                 throw new BusinessException(HttpStatus.CONFLICT, "An active invite already exists for this email");
             }
             inviteTokenRepository.delete(existing);
@@ -106,7 +110,7 @@ public class InviteService {
 
         String rawToken = tokenGenerator.generateToken();
         String hashedToken = tokenGenerator.hash(rawToken);
-        Instant expiresAt = Instant.now().plus(tokenExpirationHours, ChronoUnit.HOURS);
+        Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
 
         var inviteToken = new InviteToken(hashedToken, request.email(), request.salonId(), targetRole, expiresAt);
         inviteTokenRepository.save(inviteToken);
@@ -132,7 +136,7 @@ public class InviteService {
         InviteToken token = inviteTokenRepository.findByToken(tokenGenerator.hash(rawToken))
                 .orElseThrow(() -> new BusinessException("Invalid or expired invite token"));
 
-        if (token.isUsed() || token.getExpiresAt().isBefore(Instant.now())) {
+        if (token.isUsed() || token.getExpiresAt().isBefore(clock.instant())) {
             throw new BusinessException("Invalid or expired invite token");
         }
 
@@ -148,7 +152,7 @@ public class InviteService {
             throw new BusinessException("Invite token has already been used");
         }
 
-        if (token.getExpiresAt().isBefore(Instant.now())) {
+        if (token.getExpiresAt().isBefore(clock.instant())) {
             throw new BusinessException("Invite token has expired");
         }
 

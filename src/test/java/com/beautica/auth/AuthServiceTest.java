@@ -23,6 +23,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import java.time.Clock;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -73,7 +74,8 @@ class AuthServiceTest {
                 passwordEncoder,
                 tokenGenerator,
                 masterService,
-                authResponseBuilder
+                authResponseBuilder,
+                Clock.systemUTC()
         );
     }
 

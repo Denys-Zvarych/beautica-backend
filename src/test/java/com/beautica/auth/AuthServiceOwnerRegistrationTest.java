@@ -18,6 +18,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
+import java.time.Clock;
 
 import java.util.UUID;
 
@@ -58,7 +59,8 @@ class AuthServiceOwnerRegistrationTest {
                 passwordEncoder,
                 tokenGenerator,
                 masterService,
-                authResponseBuilder
+                authResponseBuilder,
+                Clock.systemUTC()
         );
     }
 

@@ -211,6 +211,11 @@ public class BookingService {
         // minimise the lock hold window — no DB round-trip inside the critical section.
         User client = userRepository.findById(clientId)
                 .orElseThrow(() -> new NotFoundException("Client not found"));
+        // Defence in depth: the controller @PreAuthorize already restricts to CLIENT,
+        // but an explicit check here prevents privilege escalation if the annotation is relaxed.
+        if (client.getRole() != Role.CLIENT) {
+            throw new ForbiddenException("Only clients can create bookings");
+        }
 
         Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
         if (lockResult == null) {

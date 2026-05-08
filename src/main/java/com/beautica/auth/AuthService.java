@@ -17,6 +17,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -30,6 +31,7 @@ public class AuthService {
     private final TokenGenerator tokenGenerator;
     private final MasterService masterService;
     private final AuthResponseBuilder authResponseBuilder;
+    private final Clock clock;
 
     public AuthService(
             UserRepository userRepository,
@@ -37,7 +39,8 @@ public class AuthService {
             PasswordEncoder passwordEncoder,
             TokenGenerator tokenGenerator,
             MasterService masterService,
-            AuthResponseBuilder authResponseBuilder
+            AuthResponseBuilder authResponseBuilder,
+            Clock clock
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -45,6 +48,7 @@ public class AuthService {
         this.tokenGenerator = tokenGenerator;
         this.masterService = masterService;
         this.authResponseBuilder = authResponseBuilder;
+        this.clock = clock;
     }
 
     @Transactional
@@ -125,7 +129,7 @@ public class AuthService {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token has been revoked");
         }
 
-        if (storedToken.getExpiresAt().isBefore(Instant.now())) {
+        if (storedToken.getExpiresAt().isBefore(clock.instant())) {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token has expired");
         }
 
