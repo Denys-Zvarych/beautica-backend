@@ -100,33 +100,6 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
 
     // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
-    /**
-     * @deprecated No JOIN FETCH — triggers N+1 lazy loads on client/master/masterService.
-     *             Use {@link #findActiveByMasterIdAndStartsAtBetweenWithGraph} instead.
-     */
-    @Deprecated(since = "phase-4", forRemoval = false)
-    Page<Booking> findByMasterIdAndStartsAtBetween(UUID masterId, OffsetDateTime from, OffsetDateTime to, Pageable pageable);
-
-    @Query(value = """
-            SELECT * FROM bookings
-            WHERE master_id = :masterId
-              AND status IN ('PENDING','CONFIRMED')
-              AND starts_at BETWEEN :from AND :to
-            """,
-            countQuery = """
-            SELECT COUNT(*) FROM bookings
-            WHERE master_id = :masterId
-              AND status IN ('PENDING','CONFIRMED')
-              AND starts_at BETWEEN :from AND :to
-            """,
-            nativeQuery = true)
-    Page<Booking> findActiveByMasterIdAndStartsAtBetween(
-            @Param("masterId") UUID masterId,
-            @Param("from") OffsetDateTime from,
-            @Param("to") OffsetDateTime to,
-            Pageable pageable
-    );
-
     @Query(value = """
             SELECT b FROM Booking b
             JOIN FETCH b.client c

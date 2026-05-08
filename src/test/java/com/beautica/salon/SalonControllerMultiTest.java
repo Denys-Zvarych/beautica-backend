@@ -58,6 +58,8 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
     @AfterEach
     void cleanUp() {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
+        jdbcTemplate.execute("DELETE FROM schedule_exceptions");
+        jdbcTemplate.execute("DELETE FROM working_hours");
         jdbcTemplate.execute("DELETE FROM masters");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");

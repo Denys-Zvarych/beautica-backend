@@ -147,7 +147,6 @@ public class MasterService {
                 .date(request.date())
                 .reason(request.reason())
                 .note(request.note())
-                .createdAt(OffsetDateTime.now())
                 .build();
 
         return scheduleExceptionRepository.save(exception);

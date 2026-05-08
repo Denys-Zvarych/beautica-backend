@@ -22,7 +22,6 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
-import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -174,7 +173,6 @@ class MasterScheduleRepositoryTest {
                 .master(master)
                 .date(today)
                 .reason(ScheduleExceptionReason.VACATION)
-                .createdAt(OffsetDateTime.now())
                 .build();
         em.persist(exception);
         em.flush();
@@ -196,7 +194,6 @@ class MasterScheduleRepositoryTest {
                 .master(master)
                 .date(today)
                 .reason(ScheduleExceptionReason.SICK_DAY)
-                .createdAt(OffsetDateTime.now())
                 .build();
         em.persist(exception);
         em.flush();
@@ -217,7 +214,6 @@ class MasterScheduleRepositoryTest {
                 .master(master)
                 .date(today)
                 .reason(ScheduleExceptionReason.HOLIDAY)
-                .createdAt(OffsetDateTime.now())
                 .build();
         em.persist(first);
         em.flush();
@@ -226,7 +222,6 @@ class MasterScheduleRepositoryTest {
                 .master(master)
                 .date(today)
                 .reason(ScheduleExceptionReason.OTHER)
-                .createdAt(OffsetDateTime.now())
                 .build();
         em.persist(duplicate);
 
