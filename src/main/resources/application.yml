@@ -103,4 +103,4 @@ app:
   invite:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
-  admin-email: ${ADMIN_EMAIL}
+  admin-email: ${ADMIN_EMAIL:admin@beautica.app}
