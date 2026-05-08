@@ -2,6 +2,7 @@ package com.beautica.master.controller;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingResponse;
+import com.beautica.master.dto.AvailableSlotsResponse;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
@@ -37,7 +38,6 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 @RestController
@@ -143,13 +143,13 @@ public class MasterController {
 
     @GetMapping("/{masterId}/slots")
     @PreAuthorize("isAuthenticated()")
-    public ApiResponse<Map<String, Object>> getAvailableSlots(
+    public ApiResponse<AvailableSlotsResponse> getAvailableSlots(
             @PathVariable UUID masterId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam UUID serviceId
     ) {
         List<AvailableSlotResponse> slots = slotCalculationService.getAvailableSlots(masterId, date, serviceId);
-        return ApiResponse.ok(Map.of("date", date, "slots", slots));
+        return ApiResponse.ok(new AvailableSlotsResponse(date, slots));
     }
 
     private UUID extractUserId(Authentication authentication) {

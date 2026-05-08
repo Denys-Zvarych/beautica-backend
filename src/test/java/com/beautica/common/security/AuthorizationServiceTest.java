@@ -59,6 +59,10 @@ class AuthorizationServiceTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
+    // Principal is set to an email string (not UUID) to match JwtAuthenticationFilter behaviour.
+    // AuthorizationService reads the actor ID from token.getDetails(), not getPrincipal().
+    // If that ever changes to use getPrincipal(), these tests would silently pass with a wrong
+    // UUID — update this helper to set principal=actorId and remove this comment.
     private Authentication mockAuth(UUID actorId, String roleName) {
         var token = new UsernamePasswordAuthenticationToken(
                 "user@example.com",
