@@ -21,8 +21,8 @@ public class CacheConfig {
      *   service-types       — service types per category — 60 min TTL, max 500 entries
      *   service-type-by-id  — single service type by ID — 60 min TTL, max 500 entries
      *   ownerSalons         — salon list per owner, high-frequency read — 5 min TTL, max 1000 entries
-     *   masterServices      — service list per master, public endpoint — 10 min TTL, max 2000 entries
-     *   available-slots     — slot availability per master/date/service — 60 sec TTL, max 5000 entries
+     *   masterServices      — service list per master, public endpoint — 10 min TTL, max 500 entries
+     *   available-slots     — slot availability per master/date/service — 60 sec TTL, max 500 entries
      *   master-calendar     — paginated booking calendar per master/date range — 30 sec TTL, max 500 entries
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
      *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
@@ -52,12 +52,12 @@ public class CacheConfig {
                         .build());
         manager.registerCustomCache("masterServices",
                 Caffeine.newBuilder()
-                        .maximumSize(2000)
+                        .maximumSize(500)
                         .expireAfterWrite(10, TimeUnit.MINUTES)
                         .build());
         manager.registerCustomCache("available-slots",
                 Caffeine.newBuilder()
-                        .maximumSize(5000)
+                        .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
         manager.registerCustomCache("master-calendar",
