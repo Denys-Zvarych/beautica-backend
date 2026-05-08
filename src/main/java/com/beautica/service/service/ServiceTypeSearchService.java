@@ -38,7 +38,12 @@ class ServiceTypeSearchService {
      * <p>Cache key: {@code q + ':' + categoryId} — both parameters form a composite
      * key so that searches with and without a category are cached independently.
      *
-     * @param q          search term (caller must ensure length >= 3, stripped)
+     * <p><strong>Cache eviction contract:</strong> any future write path that modifies
+     * {@code ServiceType} rows (admin create/update/deactivate) MUST call
+     * {@code @CacheEvict(value = "service-type-search", allEntries = true)} to prevent
+     * stale search results for up to the 5-minute TTL.
+     *
+     * @param q          search term (caller must ensure length >= 3, stripped, lowercased)
      * @param categoryId optional category filter; {@code null} searches across all categories
      */
     @Cacheable(value = "service-type-search", key = "#q + ':' + #categoryId")

@@ -7,6 +7,7 @@ import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
@@ -41,7 +42,7 @@ public class ServiceCatalogController {
     @GetMapping("/service-types")
     public ApiResponse<List<ServiceTypeResponse>> getServiceTypes(
             @RequestParam(required = false) UUID categoryId,
-            @RequestParam(required = false) @Size(max = 100) String q) {
+            @RequestParam(required = false) @Size(min = 3, max = 100) @Pattern(regexp = "^[^\\p{Cntrl}]+$") String q) {
         return ApiResponse.ok(serviceCatalogService.searchServiceTypes(categoryId, q));
     }
 

@@ -145,27 +145,27 @@ class ServiceCatalogServiceCatalogTest {
 
     @Test
     @DisplayName("delegates to searchByName when q has 3 or more characters")
-    void should_delegateToSearchByName_when_qHasTwoOrMoreChars() {
+    void should_delegateToSearchByName_when_qHasThreeOrMoreChars() {
         UUID categoryId = UUID.randomUUID();
         var expected = new ServiceTypeResponse(UUID.randomUUID(), categoryId, "Манікюр класичний", "Classic Manicure", "manicure-classic");
 
-        when(serviceTypeSearchService.searchByName("Ман", null)).thenReturn(List.of(expected));
+        when(serviceTypeSearchService.searchByName("ман", null)).thenReturn(List.of(expected));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(null, "Ман");
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).nameUk()).isEqualTo("Манікюр класичний");
-        verify(serviceTypeSearchService).searchByName("Ман", null);
+        verify(serviceTypeSearchService).searchByName("ман", null);
     }
 
     @Test
-    @DisplayName("strips whitespace from q before delegating to search service")
+    @DisplayName("strips whitespace and lowercases q before delegating to search service")
     void should_stripWhitespace_when_qHasLeadingOrTrailingSpaces() {
-        when(serviceTypeSearchService.searchByName("Гель", null)).thenReturn(List.of());
+        when(serviceTypeSearchService.searchByName("гель", null)).thenReturn(List.of());
 
         service.searchServiceTypes(null, "  Гель  ");
 
-        verify(serviceTypeSearchService).searchByName("Гель", null);
+        verify(serviceTypeSearchService).searchByName("гель", null);
     }
 
     @Test
@@ -185,25 +185,25 @@ class ServiceCatalogServiceCatalogTest {
         UUID categoryId = UUID.randomUUID();
         var expected = new ServiceTypeResponse(UUID.randomUUID(), categoryId, "Манікюр", "Manicure", "manicure");
 
-        when(serviceTypeSearchService.searchByName("Ман", categoryId)).thenReturn(List.of(expected));
+        when(serviceTypeSearchService.searchByName("ман", categoryId)).thenReturn(List.of(expected));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(categoryId, "Ман");
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).categoryId()).isEqualTo(categoryId);
         // serviceTypeSearchService.searchByName receives the categoryId so the DB query is category-scoped
-        verify(serviceTypeSearchService).searchByName("Ман", categoryId);
-        verify(serviceTypeSearchService, never()).searchByName(eq("Ман"), eq(null));
+        verify(serviceTypeSearchService).searchByName("ман", categoryId);
+        verify(serviceTypeSearchService, never()).searchByName(eq("ман"), eq(null));
     }
 
     @Test
     @DisplayName("uses plain searchByName (categoryId=null) when categoryId is null and q >= 3 chars")
     void should_useSearchByName_when_categoryIdIsNull() {
-        when(serviceTypeSearchService.searchByName("Ман", null)).thenReturn(List.of());
+        when(serviceTypeSearchService.searchByName("ман", null)).thenReturn(List.of());
 
         service.searchServiceTypes(null, "Ман");
 
-        verify(serviceTypeSearchService).searchByName("Ман", null);
+        verify(serviceTypeSearchService).searchByName("ман", null);
         // searchByName with a non-null categoryId must never be called
         verify(serviceTypeSearchService, never()).searchByName(anyString(), any(UUID.class));
     }

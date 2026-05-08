@@ -164,11 +164,27 @@ class ServiceCatalogServiceCacheTest {
     @Test
     @DisplayName("second call to searchServiceTypes with same q does not re-query repository — cache is effective")
     void should_hitCache_when_searchServiceTypesCalledTwice() {
-        when(serviceTypeRepository.searchByName(eq("Ман"), any())).thenReturn(List.of());
+        when(serviceTypeRepository.searchByName(eq("ман"), any())).thenReturn(List.of());
 
         serviceCatalogService.searchServiceTypes(null, "Ман");
         serviceCatalogService.searchServiceTypes(null, "Ман");
 
-        verify(serviceTypeRepository, times(1)).searchByName(eq("Ман"), any());
+        verify(serviceTypeRepository, times(1)).searchByName(eq("ман"), any());
+    }
+
+    @Test
+    @DisplayName("(q, categoryId) and (q, null) are cached independently — repo called once per distinct key")
+    void should_cacheIndependently_when_queryWithAndWithoutCategoryId() {
+        UUID categoryId = UUID.randomUUID();
+        when(serviceTypeRepository.searchByName(eq("ман"), any())).thenReturn(List.of());
+        when(serviceTypeRepository.searchByNameAndCategory(eq("ман"), eq(categoryId), any())).thenReturn(List.of());
+
+        serviceCatalogService.searchServiceTypes(null, "Ман");     // cache key "ман:null"
+        serviceCatalogService.searchServiceTypes(categoryId, "Ман"); // cache key "ман:<categoryId>"
+        serviceCatalogService.searchServiceTypes(null, "Ман");     // cache hit for "ман:null"
+        serviceCatalogService.searchServiceTypes(categoryId, "Ман"); // cache hit for "ман:<categoryId>"
+
+        verify(serviceTypeRepository, times(1)).searchByName(eq("ман"), any());
+        verify(serviceTypeRepository, times(1)).searchByNameAndCategory(eq("ман"), eq(categoryId), any());
     }
 }

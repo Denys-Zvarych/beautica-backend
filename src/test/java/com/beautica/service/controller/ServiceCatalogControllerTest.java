@@ -191,17 +191,14 @@ class ServiceCatalogControllerTest {
     }
 
     @Test
-    @DisplayName("GET /service-types?q=М — falls back to all active types when q < 2 chars")
-    void should_returnAllTypes_when_qParamHasFewerThanTwoChars() throws Exception {
-        // Single-char q is forwarded to the service; the service itself decides to return all types
-        when(serviceCatalogService.searchServiceTypes(isNull(), eq("М"))).thenReturn(stubServiceTypes());
-        log.debug("Act: GET /api/v1/service-types?q=М — single char query falls back to all-active");
+    @DisplayName("q param shorter than 3 chars returns 400 validation error")
+    void should_return400_when_qParamHasFewerThanThreeChars() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?q=М — single char query must return 400");
 
         mockMvc.perform(get("/api/v1/service-types")
                         .param("q", "М")
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.length()").value(2));
+                .andExpect(status().isBadRequest());
     }
 
     @Test
