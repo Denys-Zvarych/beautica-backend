@@ -188,7 +188,7 @@ public class ServiceCatalogService {
 
     @Transactional(readOnly = true)
     public List<ServiceTypeResponse> searchServiceTypes(@Nullable UUID categoryId, @Nullable String q) {
-        boolean useSearch = q != null && q.strip().length() >= 2;
+        boolean useSearch = q != null && q.strip().length() >= 3;
 
         if (useSearch) {
             return searchServiceTypesByName(q.strip(), categoryId);

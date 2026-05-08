@@ -31,7 +31,7 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
 
     /**
      * Callers MUST validate: q is not blank, length <= 100, stripped of control characters.
-     * Minimum 3 characters recommended for meaningful trigram similarity results.
+     * Minimum 3 characters required for meaningful trigram similarity results.
      */
     @Query("""
         SELECT t FROM ServiceType t

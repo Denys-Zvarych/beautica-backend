@@ -692,7 +692,7 @@ class BookingServiceTest {
         Page<BookingResponse> result =
                 bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.PENDING, pageable);
 
-        assertThat(result).isNotNull();
+        assertThat(result.getTotalElements()).isZero();
         verify(bookingRepository).findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorId, BookingStatus.PENDING, pageable);
         verify(bookingRepository, never()).findBySalonIdAndOwnerIdWithGraph(any(), any(), any());
     }
