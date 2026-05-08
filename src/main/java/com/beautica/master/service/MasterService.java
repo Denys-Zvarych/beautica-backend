@@ -21,6 +21,8 @@ import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -163,6 +165,7 @@ public class MasterService {
                 .ifPresent(scheduleExceptionRepository::delete);
     }
 
+    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public void deactivateMaster(UUID actorId, UUID masterId) {
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
@@ -181,6 +184,7 @@ public class MasterService {
                 .map(MasterSummaryResponse::from);
     }
 
+    @Cacheable(value = "master-calendar", key = "#actorUserId + '-' + #from + '-' + #to + '-' + #pageable.pageNumber")
     @Transactional(readOnly = true)
     public Page<BookingResponse> getMasterCalendar(UUID actorUserId, LocalDate from, LocalDate to, Pageable pageable) {
         Master master = masterRepository.findByUserId(actorUserId)
