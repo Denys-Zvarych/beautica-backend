@@ -159,6 +159,9 @@ public class AuthorizationService {
     }
 
     public boolean canManageBooking(Authentication auth, UUID bookingId) {
+        boolean isSalonMaster = auth.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
+        if (isSalonMaster) return false;
         UUID actorId = principalId(auth);
         return bookingRepository.findById(bookingId)
                 .map(b -> isAuthorizedToManageBooking(actorId, b))

@@ -11,6 +11,7 @@ import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.MasterType;
+import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.master.service.MasterService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -49,6 +50,7 @@ import java.time.LocalTime;
 import java.util.List;
 import java.util.UUID;
 
+import org.springframework.data.domain.Page;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
@@ -126,6 +128,7 @@ class MasterControllerTest {
                     .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                     .authorizeHttpRequests(auth -> auth
                             .requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll()
+                            .requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/slots").permitAll()
                             .anyRequest().authenticated())
                     .exceptionHandling(ex -> ex
                             .authenticationEntryPoint((req, res, exc) ->
@@ -145,6 +148,9 @@ class MasterControllerTest {
 
     @MockBean
     private MasterService masterService;
+
+    @MockBean
+    private SlotCalculationService slotCalculationService;
 
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
@@ -397,6 +403,109 @@ class MasterControllerTest {
         mockMvc.perform(delete(MASTERS_URL + "/" + masterId + "/schedule-exceptions/2026-06-01")
                         .with(authenticatedAs(salonMasterUserId, "smaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    // ── GET /{masterId}/slots — public ────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 200 without authentication (public endpoint)")
+    void should_return200_when_publicGetAvailableSlots() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(serviceId)))
+                .thenReturn(List.of());
+
+        log.debug("Act: GET {}/{}/slots without credentials — public endpoint", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2027-01-15")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").exists())
+                .andExpect(jsonPath("$.data.slots").exists());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 400 when required 'date' param is absent")
+    void should_return400_when_slotsMissingDateParam() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/{}/slots without 'date' param — must be rejected with 400", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    // ── GET /me/calendar — protected ─────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /me/calendar — 200 when SALON_MASTER requests valid date range")
+    void should_return200_when_validCalendarRequest() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        when(masterService.getMasterCalendar(any(), any(), any(), any())).thenReturn(Page.empty());
+
+        log.debug("Act: GET {}/me/calendar as SALON_MASTER with valid range", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-01-15")
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 400 when date range exceeds 31 days")
+    void should_return400_when_calendarRangeExceeds31Days() throws Exception {
+        var masterUserId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me/calendar with range > 31 days — must be rejected with 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-03-01")
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 400 when 'from' is after 'to'")
+    void should_return400_when_calendarFromIsAfterTo() throws Exception {
+        var masterUserId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me/calendar with from > to — must be rejected with 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-06-01")
+                        .param("to", "2027-01-01")
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 401 when no Authorization header")
+    void should_return401_when_noTokenOnGetCalendar() throws Exception {
+        log.debug("Act: GET {}/me/calendar without credentials — must be rejected with 401", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-01-15")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 403 when CLIENT requests master calendar")
+    void should_return403_when_clientRequestsCalendar() throws Exception {
+        var clientUserId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me/calendar as CLIENT — must be denied with 403", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-01-15")
+                        .with(authenticatedAs(clientUserId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
     }
 }

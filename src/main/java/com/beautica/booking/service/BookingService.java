@@ -91,7 +91,7 @@ public class BookingService {
                 if (salonId == null) {
                     throw new BusinessException("Salon owner has no associated salon");
                 }
-                yield bookingRepository.findBySalonIdAndOwnerId(salonId, actorUserId, pageable);
+                yield bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorUserId, pageable);
             }
             default -> throw new ForbiddenException("Access denied");
         };

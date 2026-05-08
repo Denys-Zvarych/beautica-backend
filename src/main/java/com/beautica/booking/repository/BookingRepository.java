@@ -122,6 +122,37 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             Pageable pageable
     );
 
+    @Query(value = """
+            SELECT b FROM Booking b
+            JOIN FETCH b.client c
+            JOIN FETCH b.master m
+            JOIN FETCH m.user mu
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition sd
+            WHERE b.master.id = :masterId
+            AND b.startsAt >= :from
+            AND b.startsAt < :to
+            AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
+                             com.beautica.booking.enums.BookingStatus.CONFIRMED,
+                             com.beautica.booking.enums.BookingStatus.COMPLETED)
+            ORDER BY b.startsAt ASC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.master.id = :masterId
+            AND b.startsAt >= :from
+            AND b.startsAt < :to
+            AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
+                             com.beautica.booking.enums.BookingStatus.CONFIRMED,
+                             com.beautica.booking.enums.BookingStatus.COMPLETED)
+            """)
+    Page<Booking> findActiveByMasterIdAndStartsAtBetweenWithGraph(
+            @Param("masterId") UUID masterId,
+            @Param("from") OffsetDateTime from,
+            @Param("to") OffsetDateTime to,
+            Pageable pageable
+    );
+
     // ── Idempotency lookup — partial-index aligned (Fix M5) ───────────────────
 
     /**
@@ -174,6 +205,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """, nativeQuery = true)
     void acquireAdvisoryLock(@Param("masterId") UUID masterId);
 
+    // ── Legacy native query — retained for backward-compatibility with existing tests ───────────
     @Query(value = """
             SELECT * FROM bookings
             WHERE salon_id = :salonId
@@ -186,4 +218,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """,
             nativeQuery = true)
     Page<Booking> findBySalonIdAndOwnerId(@Param("salonId") UUID salonId, @Param("ownerId") UUID ownerId, Pageable pageable);
+
+    // ── Fix H1 — N+1: full-graph variant used by BookingService (production path) ─────────────
+    @Query(value = """
+            SELECT b FROM Booking b
+            JOIN FETCH b.client c
+            JOIN FETCH b.master m
+            JOIN FETCH m.user mu
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition sd
+            WHERE m.salon.id = :salonId
+            AND m.salon.owner.id = :ownerId
+            AND m.isActive = true
+            ORDER BY b.startsAt DESC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            JOIN b.master m
+            WHERE m.salon.id = :salonId
+            AND m.salon.owner.id = :ownerId
+            AND m.isActive = true
+            """)
+    Page<Booking> findBySalonIdAndOwnerIdWithGraph(
+            @Param("salonId") UUID salonId,
+            @Param("ownerId") UUID ownerId,
+            Pageable pageable);
 }
