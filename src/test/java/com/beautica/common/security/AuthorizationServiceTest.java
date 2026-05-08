@@ -386,7 +386,7 @@ class AuthorizationServiceTest {
 
     @Test
     @DisplayName("masterBelongsToSalon returns true when master belongs to the salon")
-    void should_return_true_when_master_belongs_to_salon() {
+    void should_returnTrue_when_masterBelongsToSalon() {
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
 
@@ -400,7 +400,7 @@ class AuthorizationServiceTest {
 
     @Test
     @DisplayName("masterBelongsToSalon returns false when master does not belong to the salon")
-    void should_return_false_when_master_does_not_belong_to_salon() {
+    void should_returnFalse_when_masterDoesNotBelongToSalon() {
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
 
@@ -414,7 +414,7 @@ class AuthorizationServiceTest {
 
     @Test
     @DisplayName("masterBelongsToSalon returns false immediately when masterId is null")
-    void should_return_false_when_masterId_is_null() {
+    void should_returnFalse_when_masterIdIsNull() {
         UUID salonId = UUID.randomUUID();
 
         boolean result = authorizationService.masterBelongsToSalon(null, salonId);

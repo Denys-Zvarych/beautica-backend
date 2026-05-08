@@ -91,6 +91,8 @@ class JwtTokenProviderTest {
         log.debug("Act: generateRefreshToken for userId={}", userId);
         String token = jwtTokenProvider.generateRefreshToken(userId);
 
+        // Intentionally isNotBlank() only: refresh tokens are opaque to callers.
+        // Claim-level extraction (userId, isAccessToken=false) is verified at line 100+.
         assertThat(token)
                 .as("generated refresh token must not be blank")
                 .isNotBlank();

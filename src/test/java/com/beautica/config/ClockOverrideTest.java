@@ -7,8 +7,6 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
-import org.springframework.test.context.ActiveProfiles;
-
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -19,7 +17,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         classes = {ClockConfig.class, ClockOverrideTest.FixedClockConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
-@ActiveProfiles("test")
 @DisplayName("ClockConfig — Clock bean can be overridden via @TestConfiguration")
 class ClockOverrideTest {
 
