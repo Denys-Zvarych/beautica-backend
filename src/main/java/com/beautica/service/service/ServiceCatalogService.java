@@ -170,11 +170,10 @@ public class ServiceCatalogService {
     @CacheEvict(value = "masterServices", allEntries = true)
     // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller — any future caller must enforce the same guard.
     public void deactivateServiceDefinition(UUID serviceDefId) {
-        ServiceDefinition definition = serviceRepository.findById(serviceDefId)
-                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
-
-        definition.setActive(false);
-        serviceRepository.save(definition);
+        int updated = serviceRepository.deactivateById(serviceDefId);
+        if (updated == 0) {
+            throw new NotFoundException("Service definition not found: " + serviceDefId);
+        }
     }
 
     @Cacheable("service-categories")

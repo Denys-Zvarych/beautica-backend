@@ -3,6 +3,7 @@ package com.beautica.service.repository;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -32,4 +33,8 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             WHERE sd.id = :serviceDefId
             """)
     Optional<UUID> findOwnerUserId(@Param("serviceDefId") UUID serviceDefId);
+
+    @Modifying
+    @Query("UPDATE ServiceDefinition sd SET sd.isActive = false WHERE sd.id = :id")
+    int deactivateById(@Param("id") UUID id);
 }

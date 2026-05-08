@@ -402,32 +402,19 @@ class ServiceCatalogServiceTest {
     @DisplayName("deactivates ServiceDefinition when service definition exists")
     void should_deactivateServiceDefinition_when_serviceDefinitionExists() {
         UUID serviceDefId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
 
-        ServiceDefinition definition = ServiceDefinition.builder()
-                .id(serviceDefId)
-                .ownerType(OwnerType.SALON)
-                .ownerId(salonId)
-                .name("Manicure")
-                .baseDurationMinutes(60)
-                .bufferMinutesAfter(0)
-                .isActive(true)
-                .build();
-
-        when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(definition));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(definition);
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(serviceDefId);
 
-        assertThat(definition.isActive()).isFalse();
-        verify(serviceRepository).save(definition);
+        verify(serviceRepository).deactivateById(serviceDefId);
     }
 
     @Test
     @DisplayName("throws NotFoundException when service definition does not exist")
     void should_throwNotFoundException_when_serviceDefinitionDoesNotExist() {
         UUID missing = UUID.randomUUID();
-        when(serviceRepository.findById(missing)).thenReturn(Optional.empty());
+        when(serviceRepository.deactivateById(missing)).thenReturn(0);
 
         assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(missing))
                 .isInstanceOf(NotFoundException.class)
@@ -437,26 +424,13 @@ class ServiceCatalogServiceTest {
     @Test
     @DisplayName("deactivates ServiceDefinition when independent master owns it")
     void should_deactivateServiceDefinition_when_independentMasterOwnsIt() {
-        UUID masterId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
 
-        ServiceDefinition definition = ServiceDefinition.builder()
-                .id(serviceDefId)
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(masterId)
-                .name("Gel Nails")
-                .baseDurationMinutes(90)
-                .bufferMinutesAfter(15)
-                .isActive(true)
-                .build();
-
-        when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(definition));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(definition);
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(serviceDefId);
 
-        assertThat(definition.isActive()).isFalse();
-        verify(serviceRepository).save(definition);
+        verify(serviceRepository).deactivateById(serviceDefId);
     }
 
     @Test
