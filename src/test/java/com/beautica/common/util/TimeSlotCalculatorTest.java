@@ -244,6 +244,28 @@ class TimeSlotCalculatorTest {
     }
 
     @Test
+    @DisplayName("throws IllegalArgumentException when serviceDuration exceeds 24 hours")
+    void should_throwIllegalArgument_when_serviceDurationExceedsOneDay() {
+        TimeSlotCalculator calc = new TimeSlotCalculator(Clock.fixed(Instant.parse("2026-05-07T05:59:00Z"), ZoneOffset.UTC));
+
+        assertThatThrownBy(() -> calc.calculateAvailableSlots(LocalDate.of(2026, 5, 7), LocalTime.of(9, 0), LocalTime.of(13, 0),
+                Duration.ofDays(1).plusMinutes(1), Duration.ofMinutes(30), List.of()))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("serviceDuration must not exceed 24 hours");
+    }
+
+    @Test
+    @DisplayName("throws IllegalArgumentException when step exceeds 24 hours")
+    void should_throwIllegalArgument_when_stepExceedsOneDay() {
+        TimeSlotCalculator calc = new TimeSlotCalculator(Clock.fixed(Instant.parse("2026-05-07T05:59:00Z"), ZoneOffset.UTC));
+
+        assertThatThrownBy(() -> calc.calculateAvailableSlots(LocalDate.of(2026, 5, 7), LocalTime.of(9, 0), LocalTime.of(13, 0),
+                Duration.ofMinutes(60), Duration.ofDays(1).plusMinutes(1), List.of()))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("step must not exceed 24 hours");
+    }
+
+    @Test
     @DisplayName("should return available slots when occupied list is null (null treated as empty)")
     void should_returnAvailableSlots_when_occupiedIsNull() {
         TimeSlotCalculator calc = new TimeSlotCalculator(Clock.fixed(Instant.parse("2026-05-07T05:59:00Z"), ZoneOffset.UTC));

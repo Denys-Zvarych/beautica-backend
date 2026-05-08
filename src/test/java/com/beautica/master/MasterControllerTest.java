@@ -376,6 +376,20 @@ class MasterControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    @Test
+    @DisplayName("DELETE /{masterId} — 403 when SALON_OWNER targets a master they do not own (IDOR)")
+    void should_return403_when_salonOwnerDeletesForeignMaster() throws Exception {
+        var foreignOwnerId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canManageMaster(any(), eq(masterId))).thenReturn(false);
+
+        log.debug("Act: DELETE {}/{} as SALON_OWNER without ownership — must be 403", MASTERS_URL, masterId);
+        mockMvc.perform(delete(MASTERS_URL + "/" + masterId)
+                        .with(authenticatedAs(foreignOwnerId, "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
     // ── DELETE /{masterId}/schedule-exceptions/{date} ─────────────────────────
 
     @Test
