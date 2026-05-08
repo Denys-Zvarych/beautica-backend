@@ -483,6 +483,22 @@ class BookingControllerTest {
     }
 
     @Test
+    @DisplayName("GET /me — 200 and status param is forwarded to the service when ?status=PENDING is supplied")
+    void should_return200_and_passStatusParam_when_statusQueryParamProvided() throws Exception {
+        var clientId = UUID.randomUUID();
+        when(bookingService.listBookings(any(), eq(BookingStatus.PENDING), any())).thenReturn(Page.empty());
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me")
+                        .param("status", "PENDING")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        org.mockito.Mockito.verify(bookingService).listBookings(any(), eq(BookingStatus.PENDING), any());
+    }
+
+    @Test
     @DisplayName("GET /me — 401 when no Authorization header")
     void should_return401_when_unauthenticatedListMyBookings() throws Exception {
         mockMvc.perform(get(BOOKINGS_URL + "/me")

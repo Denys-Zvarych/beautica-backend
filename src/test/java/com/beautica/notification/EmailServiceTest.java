@@ -90,6 +90,16 @@ class EmailServiceTest {
         assertThat(realMessage.getRecipients(Message.RecipientType.TO)[0].toString())
                 .as("To: address must contain the recipient email")
                 .contains(toEmail);
+        assertThat(realMessage.getFrom())
+                .as("From: must be set to the configured sender address")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getFrom()[0].toString())
+                .as("From: address must equal the configured noreply sender")
+                .contains("noreply@beautica.app");
+        assertThat(realMessage.getSubject())
+                .as("Subject must equal the invite email subject")
+                .isEqualTo("You've been invited to Beautica");
     }
 
     @Test
@@ -108,5 +118,36 @@ class EmailServiceTest {
         assertThatThrownBy(() -> emailService.sendInviteEmail(toEmail, inviteLink, "Test Salon"))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Failed to send invite email");
+    }
+
+    @Test
+    @DisplayName("sendAdminNotification calls mailSender.send when invoked")
+    void should_sendEmail_when_sendAdminNotificationCalled() throws Exception {
+        var toEmail = "admin@beautica.app";
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        log.debug("Arrange: real MimeMessage so fields are inspectable after helper populates them");
+
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+
+        log.debug("Act: sendAdminNotification to={}", toEmail);
+        emailService.sendAdminNotification(toEmail, "Test Subject", "Test body");
+
+        verify(mailSender).send(realMessage);
+    }
+
+    @Test
+    @DisplayName("sendAdminNotification throws BusinessException when MailException occurs")
+    void should_throwBusinessException_when_mailExceptionOnAdminNotification() {
+        var toEmail = "admin@beautica.app";
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        log.debug("Arrange: mailSender.send will throw MailSendException");
+
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        doThrow(new MailSendException("SMTP connection failed")).when(mailSender).send(any(MimeMessage.class));
+
+        log.debug("Act: sendAdminNotification when mailSender throws MailSendException — must be translated to BusinessException");
+        assertThatThrownBy(() -> emailService.sendAdminNotification(toEmail, "Test Subject", "Test body"))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Failed to send admin notification email");
     }
 }

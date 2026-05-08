@@ -138,7 +138,35 @@ class BookingRepositoryTest {
                 windowEnd
         );
 
-        assertThat(result).hasSize(1);
+        assertThat(result)
+                .hasSize(1)
+                .extracting(Booking::getId)
+                .containsExactly(booking.getId());
+    }
+
+    @Test
+    @DisplayName("should_findOverlap_when_confirmedBookingOverlaps")
+    void should_findOverlap_when_confirmedBookingOverlaps() {
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
+        em.persist(booking);
+        em.flush();
+
+        OffsetDateTime windowStart = OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime windowEnd = OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC);
+
+        List<Booking> result = bookingRepository.findOverlappingByMaster(
+                master.getId(),
+                windowStart,
+                windowEnd
+        );
+
+        assertThat(result)
+                .hasSize(1)
+                .extracting(Booking::getId)
+                .containsExactly(booking.getId());
     }
 
     @Test

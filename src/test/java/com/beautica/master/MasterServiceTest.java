@@ -4,6 +4,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterDetailResponse;
+import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
@@ -26,8 +27,12 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.List;
@@ -122,6 +127,20 @@ class MasterServiceTest {
         assertThat(result.getSalon()).isEqualTo(salon);
         assertThat(result.isActive()).isTrue();
         verify(masterRepository).save(any(Master.class));
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_createMasterFromInviteWithUnknownUserId")
+    void should_throwNotFound_when_createMasterFromInviteWithUnknownUserId() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(userRepository.findById(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.createMasterFromInvite(userId, salonId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(masterRepository, never()).save(any());
     }
 
     @Test
@@ -333,6 +352,26 @@ class MasterServiceTest {
     }
 
     @Test
+    @DisplayName("should_throwForbidden_when_unauthorizedActorAddsScheduleException")
+    void should_throwForbidden_when_unauthorizedActorAddsScheduleException() {
+        UUID attackerId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 1);
+
+        Master master = mock(Master.class);
+        var request = new ScheduleExceptionRequest(date, ScheduleExceptionReason.HOLIDAY, null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authorizationService).enforceCanManageMasterSchedule(attackerId, master);
+
+        assertThatThrownBy(() -> masterService.addScheduleException(attackerId, masterId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(scheduleExceptionRepository, never()).save(any());
+    }
+
+    @Test
     @DisplayName("should_updateExistingScheduleException_when_dateAlreadyExistsForMaster")
     void should_updateExistingScheduleException_when_dateAlreadyExistsForMaster() {
         UUID actorId = UUID.randomUUID();
@@ -434,5 +473,43 @@ class MasterServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verify(scheduleExceptionRepository, never()).delete(any());
+    }
+
+    // ── getMastersByPage ───────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_returnPagedMasters_when_getMastersByPageCalled")
+    void should_returnPagedMasters_when_getMastersByPageCalled() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        Pageable pageable = Pageable.ofSize(10);
+
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(userId);
+        when(user.getFirstName()).thenReturn("Olena");
+        when(user.getLastName()).thenReturn("Bondar");
+
+        Master master = Master.builder()
+                .user(user)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+
+        Page<Master> masterPage = new PageImpl<>(List.of(master), pageable, 1);
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable))
+                .thenReturn(masterPage);
+
+        Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, pageable);
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent()).hasSize(1);
+        assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
+        assertThat(result.getContent().get(0).userId()).isEqualTo(userId);
+        assertThat(result.getContent().get(0).masterType()).isEqualTo(MasterType.SALON_MASTER);
+        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, pageable);
     }
 }

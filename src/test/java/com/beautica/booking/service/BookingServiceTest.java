@@ -434,6 +434,20 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("ForbiddenException is thrown when an unauthorized actor attempts to decline a booking")
+    void should_throwForbidden_when_unauthorizedActorDeclinesBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageBooking(actorId, booking);
+
+        assertThatThrownBy(() -> bookingService.declineBooking(actorId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
     @DisplayName("400 is thrown when decline is called without a cancellation reason")
     void should_throw400_when_declineCalledWithoutCancellationReason() {
         UUID actorId = UUID.randomUUID();
@@ -459,6 +473,19 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.COMPLETED);
         verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("ForbiddenException is thrown when an unauthorized actor attempts to complete a booking")
+    void should_throwForbidden_when_unauthorizedActorCompletesBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageBooking(actorId, booking);
+
+        assertThatThrownBy(() -> bookingService.completeBooking(actorId, bookingId))
+                .isInstanceOf(ForbiddenException.class);
     }
 
     @Test
@@ -490,6 +517,20 @@ class BookingServiceTest {
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.NOT_COMPLETED);
         assertThat(booking.getCancellationReason()).isEqualTo(CancellationReason.CLIENT_NO_SHOW);
         verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("ForbiddenException is thrown when an unauthorized actor attempts to mark a booking not-completed")
+    void should_throwForbidden_when_unauthorizedActorMarksNotCompleted() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageBooking(actorId, booking);
+
+        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
     }
 
     @Test
@@ -649,7 +690,82 @@ class BookingServiceTest {
                 .isInstanceOf(BusinessException.class);
     }
 
+    @Test
+    @DisplayName("CLIENT with no status filter receives bookings from the client-scoped repository method")
+    void should_returnClientBookings_when_clientListsWithoutStatus() {
+        Pageable pageable = Pageable.unpaged();
+
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        when(bookingRepository.findByClientIdWithGraph(clientId, pageable)).thenReturn(Page.empty());
+
+        Page<BookingResponse> result = bookingService.listBookings(clientId, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findByClientIdWithGraph(clientId, pageable);
+        verify(bookingRepository, never()).findByClientIdAndStatusWithGraph(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("CLIENT with PENDING status filter receives bookings from the status-scoped repository method")
+    void should_returnClientBookings_when_clientListsWithStatus() {
+        Pageable pageable = Pageable.unpaged();
+
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        when(bookingRepository.findByClientIdAndStatusWithGraph(clientId, BookingStatus.PENDING, pageable))
+                .thenReturn(Page.empty());
+
+        Page<BookingResponse> result = bookingService.listBookings(clientId, BookingStatus.PENDING, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findByClientIdAndStatusWithGraph(clientId, BookingStatus.PENDING, pageable);
+        verify(bookingRepository, never()).findByClientIdWithGraph(any(), any());
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER receives bookings from the master-scoped repository method")
+    void should_returnMasterBookings_when_independentMasterLists() {
+        Pageable pageable = Pageable.unpaged();
+        User masterUser = buildUser(UUID.randomUUID(), Role.INDEPENDENT_MASTER);
+        UUID masterUserId = masterUser.getId();
+
+        when(userRepository.findById(masterUserId)).thenReturn(Optional.of(masterUser));
+        when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findByMasterIdWithGraph(masterId, pageable)).thenReturn(Page.empty());
+
+        Page<BookingResponse> result = bookingService.listBookings(masterUserId, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findByMasterIdWithGraph(masterId, pageable);
+    }
+
+    @Test
+    @DisplayName("ForbiddenException is thrown when SALON_ADMIN calls listBookings")
+    void should_throwForbidden_when_salonAdminListsBookings() {
+        UUID salonAdminId = UUID.randomUUID();
+        User salonAdmin = buildUser(salonAdminId, Role.SALON_ADMIN);
+        Pageable pageable = Pageable.unpaged();
+
+        when(userRepository.findById(salonAdminId)).thenReturn(Optional.of(salonAdmin));
+
+        assertThatThrownBy(() -> bookingService.listBookings(salonAdminId, null, pageable))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
     // ── getBooking ─────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("BookingDetailResponse is returned when an authorized actor requests their own booking")
+    void should_returnBooking_when_getBookingCalledByOwner() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result).isNotNull();
+        assertThat(result.id()).isEqualTo(bookingId);
+        assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
+        verify(authz).enforceCanViewBooking(clientId, booking);
+    }
 
     @Test
     @DisplayName("ForbiddenException is thrown when client B attempts to read client A's booking")

@@ -220,7 +220,7 @@ class AuthRateLimitFilterTest {
     @DisplayName("IP resolution — rightmost X-Forwarded-For")
     class IpResolution {
 
-        private static final String RIGHTMOST_IP    = "5.6.7.8";
+        private static final String CLIENT_IP    = "5.6.7.8";
         private static final String DIFFERENT_IP    = "99.99.99.99";
 
         @Test
@@ -249,8 +249,8 @@ class AuthRateLimitFilterTest {
             // The leftmost XFF entry is the original client IP.
             // An attacker trying to bypass rate limiting by spoofing proxy hops (rightmost entries)
             // cannot get a fresh bucket because the filter always keys on the leftmost (client) IP.
-            log.debug("Arrange: bucket keyed on leftmost XFF entry {}", RIGHTMOST_IP);
-            when(loginBuckets.get(RIGHTMOST_IP)).thenReturn(bucket);
+            log.debug("Arrange: bucket keyed on leftmost XFF entry {}", CLIENT_IP);
+            when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
             when(bucket.tryConsume(1))
                     .thenReturn(true)
                     .thenReturn(true)
@@ -265,10 +265,10 @@ class AuthRateLimitFilterTest {
             MockHttpServletResponse lastResponse = null;
             MockFilterChain lastChain = null;
 
-            log.debug("Act: send 5 requests each with a different rightmost XFF entry but the same leftmost ({})", RIGHTMOST_IP);
+            log.debug("Act: send 5 requests each with a different rightmost XFF entry but the same leftmost ({})", CLIENT_IP);
             for (String rightIp : rotatingRightEntries) {
                 var request  = postRequest("/api/v1/auth/login");
-                request.addHeader("X-Forwarded-For", RIGHTMOST_IP + ", " + rightIp);
+                request.addHeader("X-Forwarded-For", CLIENT_IP + ", " + rightIp);
                 lastResponse = new MockHttpServletResponse();
                 lastChain    = new MockFilterChain();
 
@@ -281,23 +281,23 @@ class AuthRateLimitFilterTest {
             assertThat(lastChain.getRequest())
                     .as("filter chain must not be forwarded on the throttled request")
                     .isNull();
-            verify(loginBuckets, times(5)).get(RIGHTMOST_IP);
+            verify(loginBuckets, times(5)).get(CLIENT_IP);
         }
 
         @Test
         @DisplayName("same leftmost XFF from requests with different proxy hops is still rate-limited on the same bucket")
         void should_return429_when_sameRightmostXffUsedAcrossDifferentOuterIps() throws Exception {
-            log.debug("Arrange: second request uses a different rightmost (proxy) XFF entry but identical leftmost ({})", RIGHTMOST_IP);
-            when(loginBuckets.get(RIGHTMOST_IP)).thenReturn(bucket);
+            log.debug("Arrange: second request uses a different rightmost (proxy) XFF entry but identical leftmost ({})", CLIENT_IP);
+            when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
             // First request exhausts the bucket; second request is denied.
             when(bucket.tryConsume(1)).thenReturn(true).thenReturn(false);
 
             var firstRequest = postRequest("/api/v1/auth/login");
-            firstRequest.addHeader("X-Forwarded-For", RIGHTMOST_IP + ", 1.2.3.4");
+            firstRequest.addHeader("X-Forwarded-For", CLIENT_IP + ", 1.2.3.4");
             doFilter(firstRequest, new MockHttpServletResponse(), new MockFilterChain());
 
             var secondRequest  = postRequest("/api/v1/auth/login");
-            secondRequest.addHeader("X-Forwarded-For", RIGHTMOST_IP + ", 9.9.9.9");
+            secondRequest.addHeader("X-Forwarded-For", CLIENT_IP + ", 9.9.9.9");
             var secondResponse = new MockHttpServletResponse();
             var secondChain    = new MockFilterChain();
 
@@ -310,7 +310,7 @@ class AuthRateLimitFilterTest {
             assertThat(secondChain.getRequest())
                     .as("filter chain must not be forwarded on the throttled request")
                     .isNull();
-            verify(loginBuckets, times(2)).get(RIGHTMOST_IP);
+            verify(loginBuckets, times(2)).get(CLIENT_IP);
         }
 
         @Test
@@ -347,8 +347,8 @@ class AuthRateLimitFilterTest {
             // keyed on REMOTE_ADDR only when ALL segments are blank, which is not this case.
             // Here the first non-blank segment from the right is "5.6.7.8", so the bucket
             // must be keyed on that value — NOT on REMOTE_ADDR.
-            log.debug("Arrange: XFF has trailing whitespace-only segment; first non-blank from right is {}", RIGHTMOST_IP);
-            when(loginBuckets.get(RIGHTMOST_IP)).thenReturn(bucket);
+            log.debug("Arrange: XFF has trailing whitespace-only segment; first non-blank from right is {}", CLIENT_IP);
+            when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
             when(bucket.tryConsume(1))
                     .thenReturn(true)
                     .thenReturn(true)
@@ -360,25 +360,25 @@ class AuthRateLimitFilterTest {
             // Exhaust the bucket using requests with the whitespace-trailing header.
             for (int i = 0; i < 5; i++) {
                 var req = postRequest("/api/v1/auth/login");
-                req.addHeader("X-Forwarded-For", RIGHTMOST_IP + ",   ");
+                req.addHeader("X-Forwarded-For", CLIENT_IP + ",   ");
                 doFilter(req, new MockHttpServletResponse(), new MockFilterChain());
             }
 
             // A clean request from the same REMOTE_ADDR but without XFF must also be
             // rate-limited because it falls back to REMOTE_ADDR, which is a different key
-            // from RIGHTMOST_IP — so it gets its own fresh bucket (not yet exhausted).
+            // from CLIENT_IP — so it gets its own fresh bucket (not yet exhausted).
             // The important invariant we assert here is: with the trailing-whitespace header
-            // the bucket key is RIGHTMOST_IP, not an empty string and not REMOTE_ADDR.
+            // the bucket key is CLIENT_IP, not an empty string and not REMOTE_ADDR.
             var throttledRequest  = postRequest("/api/v1/auth/login");
-            throttledRequest.addHeader("X-Forwarded-For", RIGHTMOST_IP + ",   ");
+            throttledRequest.addHeader("X-Forwarded-For", CLIENT_IP + ",   ");
             var throttledResponse = new MockHttpServletResponse();
             var throttledChain    = new MockFilterChain();
 
-            log.debug("Act: 6th request with whitespace-trailing XFF — bucket keyed on {} must be exhausted", RIGHTMOST_IP);
+            log.debug("Act: 6th request with whitespace-trailing XFF — bucket keyed on {} must be exhausted", CLIENT_IP);
             doFilter(throttledRequest, throttledResponse, throttledChain);
 
             assertThat(throttledResponse.getStatus())
-                    .as("6th request must be 429 — bucket keyed on rightmost non-blank XFF entry is exhausted")
+                    .as("6th request must be 429 — bucket keyed on leftmost non-blank XFF entry (CLIENT_IP) is exhausted")
                     .isEqualTo(429);
             assertThat(throttledChain.getRequest())
                     .as("filter chain must not be forwarded when the bucket is exhausted")
@@ -400,7 +400,7 @@ class AuthRateLimitFilterTest {
             assertThat(differentResponse.getStatus())
                     .as("request from a different IP must not be rate-limited — it has its own fresh bucket")
                     .isEqualTo(200);
-            verify(loginBuckets, times(6)).get(RIGHTMOST_IP);
+            verify(loginBuckets, times(6)).get(CLIENT_IP);
             verify(loginBuckets).get(DIFFERENT_IP);
         }
 
@@ -431,8 +431,8 @@ class AuthRateLimitFilterTest {
         @Test
         @DisplayName("keys on the single XFF entry when the header has no comma")
         void should_useXffEntry_when_xffContainsSingleEntry() throws Exception {
-            log.debug("Arrange: XFF header with single entry {} — no comma", RIGHTMOST_IP);
-            when(loginBuckets.get(RIGHTMOST_IP)).thenReturn(bucket);
+            log.debug("Arrange: XFF header with single entry {} — no comma", CLIENT_IP);
+            when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
             when(bucket.tryConsume(1))
                     .thenReturn(true)
                     .thenReturn(true)
@@ -440,17 +440,17 @@ class AuthRateLimitFilterTest {
 
             // Two requests from the same single-entry XFF share the same bucket.
             var first = postRequest("/api/v1/auth/login");
-            first.addHeader("X-Forwarded-For", RIGHTMOST_IP);
+            first.addHeader("X-Forwarded-For", CLIENT_IP);
             doFilter(first, new MockHttpServletResponse(), new MockFilterChain());
 
             var second  = postRequest("/api/v1/auth/login");
-            second.addHeader("X-Forwarded-For", RIGHTMOST_IP);
+            second.addHeader("X-Forwarded-For", CLIENT_IP);
             var secondResponse = new MockHttpServletResponse();
             var secondChain    = new MockFilterChain();
 
             log.debug("Act: third request with single-entry XFF — bucket must be exhausted");
             var third  = postRequest("/api/v1/auth/login");
-            third.addHeader("X-Forwarded-For", RIGHTMOST_IP);
+            third.addHeader("X-Forwarded-For", CLIENT_IP);
             var thirdResponse = new MockHttpServletResponse();
             var thirdChain    = new MockFilterChain();
             doFilter(second, secondResponse, secondChain);
@@ -477,7 +477,7 @@ class AuthRateLimitFilterTest {
             assertThat(differentResponse.getStatus())
                     .as("request from a different single-entry XFF must not be rate-limited")
                     .isEqualTo(200);
-            verify(loginBuckets, times(3)).get(RIGHTMOST_IP);
+            verify(loginBuckets, times(3)).get(CLIENT_IP);
             verify(loginBuckets).get(DIFFERENT_IP);
         }
 
@@ -560,6 +560,99 @@ class AuthRateLimitFilterTest {
                     .as("filter chain must be forwarded when the REMOTE_ADDR bucket allows the request")
                     .isNotNull();
             verify(loginBuckets).get(REMOTE_ADDR);
+        }
+
+        @Test
+        @DisplayName("two distinct remote addresses use independent buckets and both succeed")
+        void should_useIndependentBuckets_when_twoDistinctRemoteAddresses() throws Exception {
+            String firstIp  = "11.11.11.11";
+            String secondIp = "22.22.22.22";
+            log.debug("Arrange: two independent buckets for {} and {}", firstIp, secondIp);
+
+            Bucket firstBucket  = org.mockito.Mockito.mock(Bucket.class);
+            Bucket secondBucket = org.mockito.Mockito.mock(Bucket.class);
+            when(loginBuckets.get(firstIp)).thenReturn(firstBucket);
+            when(loginBuckets.get(secondIp)).thenReturn(secondBucket);
+            when(firstBucket.tryConsume(1)).thenReturn(true);
+            when(secondBucket.tryConsume(1)).thenReturn(true);
+
+            var firstRequest = new MockHttpServletRequest("POST", "/api/v1/auth/login");
+            firstRequest.setRemoteAddr(firstIp);
+            var firstResponse = new MockHttpServletResponse();
+            var firstChain    = new MockFilterChain();
+
+            var secondRequest = new MockHttpServletRequest("POST", "/api/v1/auth/login");
+            secondRequest.setRemoteAddr(secondIp);
+            var secondResponse = new MockHttpServletResponse();
+            var secondChain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for two requests from distinct IPs");
+            doFilter(firstRequest, firstResponse, firstChain);
+            doFilter(secondRequest, secondResponse, secondChain);
+
+            assertThat(firstResponse.getStatus())
+                    .as("first IP must receive 200 — its bucket was not exhausted")
+                    .isEqualTo(200);
+            assertThat(secondResponse.getStatus())
+                    .as("second IP must receive 200 — it has its own independent bucket")
+                    .isEqualTo(200);
+            verify(loginBuckets).get(firstIp);
+            verify(loginBuckets).get(secondIp);
+        }
+
+        @Test
+        @DisplayName("returns 429 when XFF refresh endpoint is throttled")
+        void should_return429_when_xffRefreshEndpointThrottled() throws Exception {
+            log.debug("Arrange: refresh bucket keyed on leftmost XFF entry {} is exhausted", CLIENT_IP);
+            when(refreshBuckets.get(CLIENT_IP)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request = postRequest("/api/v1/auth/refresh");
+            request.addHeader("X-Forwarded-For", CLIENT_IP + ", proxy.railway.app");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/refresh with exhausted XFF-keyed refresh bucket");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("must be 429 — refresh bucket keyed on leftmost XFF entry is exhausted")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("Retry-After")).isEqualTo("60");
+            assertThat(chain.getRequest())
+                    .as("filter chain must not be forwarded when the refresh bucket is exhausted")
+                    .isNull();
+            verify(refreshBuckets).get(CLIENT_IP);
+            verifyNoInteractions(loginBuckets);
+        }
+
+        @Test
+        @DisplayName("falls back to getRemoteAddr when all XFF segments are whitespace")
+        void should_keyOnAllWhitespaceXff_when_allXffSegmentsAreWhitespace() throws Exception {
+            // XFF = "  ,   ,  " — outer isBlank() does NOT fire because the full header value
+            // is not blank (it contains commas). The segment loop iterates all three segments;
+            // each is blank after trim, so no segment is accepted. The filter falls through to
+            // getRemoteAddr() as the bucket key.
+            log.debug("Arrange: XFF = '  ,   ,  ' — all segments whitespace; filter must fall back to REMOTE_ADDR ({})", REMOTE_ADDR);
+            when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request = postRequest("/api/v1/auth/login");
+            request.addHeader("X-Forwarded-For", "  ,   ,  ");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal with all-whitespace XFF segments — must key on REMOTE_ADDR");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("must be 200 — bucket keyed on REMOTE_ADDR was not exhausted")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest())
+                    .as("filter chain must be forwarded when the REMOTE_ADDR bucket allows the request")
+                    .isNotNull();
+            verify(loginBuckets).get(REMOTE_ADDR);
+            verify(loginBuckets, never()).get("");
         }
     }
 }

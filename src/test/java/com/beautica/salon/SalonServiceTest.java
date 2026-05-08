@@ -230,6 +230,52 @@ class SalonServiceTest {
     }
 
     @Test
+    @DisplayName("deactivateSalon — throws ForbiddenException when caller is not SALON_OWNER")
+    void should_throwForbidden_when_nonOwnerCallsDeactivateSalon() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User client = buildUser(userId, "client@beautica.com", Role.CLIENT);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+
+        assertThatThrownBy(() -> salonService.deactivateSalon(userId, salonId))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("inviteMaster — throws ForbiddenException when actor cannot manage salon")
+    void should_throwForbidden_when_actorCannotManageSalonForInvite() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Salon salon = buildSalon(salonId, buildUser(UUID.randomUUID(), "owner@test.com", Role.SALON_OWNER), "Test");
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authorizationService).enforceCanManageSalon(actorId, salon);
+
+        assertThatThrownBy(() -> salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(inviteService, never()).sendInvite(any(), any());
+    }
+
+    @Test
+    @DisplayName("getOwnerSalons — returns empty list when owner has no active salons")
+    void should_returnEmptyList_when_noSalonsExist() {
+        UUID ownerId = UUID.randomUUID();
+
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
+
+        List<SalonResponse> result = salonService.getOwnerSalons(ownerId);
+
+        assertThat(result).isNotNull();
+        assertThat(result).isEmpty();
+        verify(salonRepository).findAllByOwnerIdAndIsActiveTrue(ownerId);
+    }
+
+    @Test
     @DisplayName("inviteMaster — delegates to inviteService when actor can manage salon")
     void should_delegateToInviteService_when_inviteMaster() {
         UUID actorId = UUID.randomUUID();
