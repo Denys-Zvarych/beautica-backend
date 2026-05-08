@@ -1,6 +1,7 @@
 package com.beautica.common.security;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -47,6 +48,9 @@ class AuthorizationServiceTest {
 
     @Mock
     private ServiceRepository serviceRepository;
+
+    @Mock
+    private BookingRepository bookingRepository;
 
     @InjectMocks
     private AuthorizationService authorizationService;

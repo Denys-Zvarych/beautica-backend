@@ -1,6 +1,8 @@
 package com.beautica.common.security;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -26,6 +28,7 @@ public class AuthorizationService {
     private final MasterRepository masterRepository;
     private final UserRepository userRepository;
     private final ServiceRepository serviceRepository;
+    private final BookingRepository bookingRepository;
 
     /**
      * Returns true when actorId has management access to the given salon.
@@ -153,6 +156,82 @@ public class AuthorizationService {
         return serviceRepository.findOwnerUserId(serviceDefId)
                 .map(ownerUserId -> ownerUserId.equals(actorId))
                 .orElse(false);
+    }
+
+    public boolean canManageBooking(Authentication auth, UUID bookingId) {
+        UUID actorId = principalId(auth);
+        return bookingRepository.findById(bookingId)
+                .map(b -> isAuthorizedToManageBooking(actorId, b))
+                .orElse(false);
+    }
+
+    public boolean canViewBooking(Authentication auth, UUID bookingId) {
+        UUID actorId = principalId(auth);
+        return bookingRepository.findById(bookingId).map(b -> {
+            if (isAuthorizedToManageBooking(actorId, b)) {
+                return true;
+            }
+            User actor = userRepository.findById(actorId)
+                    .orElseThrow(() -> new NotFoundException("User not found"));
+            if (actor.getRole() == Role.CLIENT) {
+                return b.getClient().getId().equals(actorId);
+            }
+            if (actor.getRole() == Role.SALON_MASTER) {
+                // Fix M1: SALON_MASTER may only view their own bookings, not all bookings
+                // at the salon — the previous salon-scoped check leaked other masters'
+                // client names and prices to every master at the same salon.
+                return b.getMaster().getUser().getId().equals(actorId);
+            }
+            return false;
+        }).orElse(false);
+    }
+
+    public boolean canCancelBooking(Authentication auth, UUID bookingId) {
+        UUID actorId = principalId(auth);
+        return bookingRepository.findById(bookingId)
+                .map(b -> b.getClient().getId().equals(actorId))
+                .orElse(false);
+    }
+
+    public void enforceCanManageBooking(UUID actorUserId, Booking booking) {
+        if (!isAuthorizedToManageBooking(actorUserId, booking)) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
+        if (isAuthorizedToManageBooking(actorUserId, booking)) {
+            return;
+        }
+        User actor = userRepository.findById(actorUserId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+        boolean allowed = false;
+        if (actor.getRole() == Role.CLIENT) {
+            allowed = booking.getClient().getId().equals(actorUserId);
+        } else if (actor.getRole() == Role.SALON_MASTER) {
+            // Fix M1: SALON_MASTER may only view their own bookings, not all bookings
+            // at the salon — the previous salon-scoped check leaked other masters'
+            // client names and prices to every master at the same salon.
+            allowed = booking.getMaster().getUser().getId().equals(actorUserId);
+        }
+        if (!allowed) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    private boolean isAuthorizedToManageBooking(UUID actorId, Booking booking) {
+        // SALON_ADMIN can manage salon configuration and masters but cannot confirm/decline/complete
+        // individual bookings — only the salon OWNER and the assigned master can. This boundary
+        // keeps booking lifecycle authority at the owner level.
+        Master master = booking.getMaster();
+        if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+            return master.getUser().getId().equals(actorId);
+        }
+        if (master.getSalon() != null) {
+            return master.getSalon().getOwner() != null
+                    && master.getSalon().getOwner().getId().equals(actorId);
+        }
+        return false;
     }
 
     private UUID principalId(Authentication auth) {

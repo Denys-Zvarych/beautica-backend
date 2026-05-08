@@ -220,7 +220,7 @@ class BookingRepositoryTest {
         em.persist(booking);
         em.flush();
 
-        Optional<Booking> result = bookingRepository.findByClientIdAndIdempotencyKey(
+        Optional<Booking> result = bookingRepository.findActiveByClientIdAndIdempotencyKey(
                 clientUser.getId(), "idem-key-001");
 
         assertThat(result).isPresent();
@@ -270,7 +270,7 @@ class BookingRepositoryTest {
     @Test
     @DisplayName("should_returnEmpty_when_idempotencyKeyNotFound")
     void should_returnEmpty_when_idempotencyKeyNotFound() {
-        Optional<Booking> result = bookingRepository.findByClientIdAndIdempotencyKey(
+        Optional<Booking> result = bookingRepository.findActiveByClientIdAndIdempotencyKey(
                 clientUser.getId(), "idem-key-not-found");
 
         assertThat(result).isEmpty();

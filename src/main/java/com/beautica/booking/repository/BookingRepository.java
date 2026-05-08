@@ -16,13 +16,89 @@ import java.util.UUID;
 
 public interface BookingRepository extends JpaRepository<Booking, UUID> {
 
-    Page<Booking> findByClientId(UUID clientId, Pageable pageable);
+    // ── Full-graph list queries (Fix H1 — N+1 prevention) ─────────────────────
 
-    Page<Booking> findByMasterId(UUID masterId, Pageable pageable);
+    @Query(value = """
+            SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.client.id = :clientId
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.client.id = :clientId
+            """)
+    Page<Booking> findByClientIdWithGraph(@Param("clientId") UUID clientId, Pageable pageable);
 
-    Page<Booking> findByClientIdAndStatus(UUID clientId, BookingStatus status, Pageable pageable);
+    @Query(value = """
+            SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.client.id = :clientId AND b.status = :status
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.client.id = :clientId AND b.status = :status
+            """)
+    Page<Booking> findByClientIdAndStatusWithGraph(
+            @Param("clientId") UUID clientId,
+            @Param("status") BookingStatus status,
+            Pageable pageable);
 
-    Page<Booking> findByMasterIdAndStatus(UUID masterId, BookingStatus status, Pageable pageable);
+    @Query(value = """
+            SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.master.id = :masterId
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.master.id = :masterId
+            """)
+    Page<Booking> findByMasterIdWithGraph(@Param("masterId") UUID masterId, Pageable pageable);
+
+    @Query(value = """
+            SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.master.id = :masterId AND b.status = :status
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.master.id = :masterId AND b.status = :status
+            """)
+    Page<Booking> findByMasterIdAndStatusWithGraph(
+            @Param("masterId") UUID masterId,
+            @Param("status") BookingStatus status,
+            Pageable pageable);
+
+    // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────
+
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            LEFT JOIN FETCH b.salon
+            WHERE b.id = :id
+            """)
+    Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
+
+    // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
     Page<Booking> findByMasterIdAndStartsAtBetween(UUID masterId, OffsetDateTime from, OffsetDateTime to, Pageable pageable);
 
@@ -46,7 +122,23 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             Pageable pageable
     );
 
-    Optional<Booking> findByClientIdAndIdempotencyKey(UUID clientId, String idempotencyKey);
+    // ── Idempotency lookup — partial-index aligned (Fix M5) ───────────────────
+
+    /**
+     * Matches the partial unique index {@code uq_client_idempotency_key_active}
+     * which covers only PENDING and CONFIRMED rows. Filtering by status here
+     * allows the planner to use the partial index rather than scanning all rows.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            WHERE b.client.id = :clientId
+              AND b.idempotencyKey = :idempotencyKey
+              AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
+                               com.beautica.booking.enums.BookingStatus.CONFIRMED)
+            """)
+    Optional<Booking> findActiveByClientIdAndIdempotencyKey(
+            @Param("clientId") UUID clientId,
+            @Param("idempotencyKey") String idempotencyKey);
 
     @Query(value = """
             SELECT * FROM bookings
