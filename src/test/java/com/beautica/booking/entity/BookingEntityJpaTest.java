@@ -2,6 +2,7 @@ package com.beautica.booking.entity;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -22,6 +23,9 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
@@ -144,6 +148,120 @@ class BookingEntityJpaTest {
 
         Booking second = buildBooking(client, master, masterService, secondStart, secondEnd,
                 UUID.randomUUID().toString());
+
+        assertThatThrownBy(() -> em.persistAndFlush(second))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @ParameterizedTest(name = "BookingStatus.{0} persists and reads back correctly")
+    @EnumSource(BookingStatus.class)
+    @DisplayName("all BookingStatus values survive a DB round-trip")
+    void should_persistAndRetrieveAllStatuses(BookingStatus status) {
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        Booking booking = Booking.builder()
+                .client(client).master(master).masterService(masterService).salon(null)
+                .status(status)
+                .startsAt(startsAt).endsAt(endsAt)
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(60).bufferMinutesAtBooking(0)
+                .idempotencyKey("status-key-" + status.name() + "-" + UUID.randomUUID())
+                .build();
+        em.persist(booking);
+        em.flush();
+        em.clear();
+
+        Booking loaded = em.find(Booking.class, booking.getId());
+        assertThat(loaded.getStatus()).isEqualTo(status);
+    }
+
+    @Test
+    @DisplayName("chk_booking_interval — ends_at must be strictly after starts_at")
+    void should_rejectBooking_when_endsAtEqualsStartsAt() {
+        OffsetDateTime ts = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        Booking booking = Booking.builder()
+                .client(client).master(master).masterService(masterService).salon(null)
+                .status(BookingStatus.PENDING)
+                .startsAt(ts).endsAt(ts)
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(60).bufferMinutesAtBooking(0)
+                .idempotencyKey(UUID.randomUUID().toString())
+                .build();
+
+        assertThatThrownBy(() -> em.persistAndFlush(booking))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("chk_booking_duration_positive — duration_minutes_at_booking must be > 0")
+    void should_rejectBooking_when_durationIsZero() {
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+        Booking booking = Booking.builder()
+                .client(client).master(master).masterService(masterService).salon(null)
+                .status(BookingStatus.PENDING)
+                .startsAt(startsAt).endsAt(endsAt)
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(0).bufferMinutesAtBooking(0)
+                .idempotencyKey(UUID.randomUUID().toString())
+                .build();
+
+        assertThatThrownBy(() -> em.persistAndFlush(booking))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("chk_booking_price_non_negative — price_at_booking must be >= 0")
+    void should_rejectBooking_when_priceIsNegative() {
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+        Booking booking = Booking.builder()
+                .client(client).master(master).masterService(masterService).salon(null)
+                .status(BookingStatus.PENDING)
+                .startsAt(startsAt).endsAt(endsAt)
+                .priceAtBooking(new BigDecimal("-1.00"))
+                .durationMinutesAtBooking(60).bufferMinutesAtBooking(0)
+                .idempotencyKey(UUID.randomUUID().toString())
+                .build();
+
+        assertThatThrownBy(() -> em.persistAndFlush(booking))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("chk_cancellation_reason_status — non-null reason rejected for non-terminal PENDING status")
+    void should_rejectBooking_when_cancellationReasonSetOnPendingStatus() {
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+        Booking booking = Booking.builder()
+                .client(client).master(master).masterService(masterService).salon(null)
+                .status(BookingStatus.PENDING)
+                .startsAt(startsAt).endsAt(endsAt)
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(60).bufferMinutesAtBooking(0)
+                .idempotencyKey(UUID.randomUUID().toString())
+                .cancellationReason(CancellationReason.OTHER)
+                .build();
+
+        assertThatThrownBy(() -> em.persistAndFlush(booking))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("uq_client_idempotency_key_active — duplicate key for same client in PENDING status is rejected")
+    void should_rejectBooking_when_duplicateIdempotencyKeyForActiveBooking() {
+        OffsetDateTime startsAt1 = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt1 = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+        String sharedKey = "shared-idem-key-" + UUID.randomUUID();
+
+        Booking first = buildBooking(client, master, masterService, startsAt1, endsAt1, sharedKey);
+        em.persist(first);
+        em.flush();
+
+        OffsetDateTime startsAt2 = OffsetDateTime.of(2026, 6, 2, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt2 = OffsetDateTime.of(2026, 6, 2, 11, 0, 0, 0, ZoneOffset.UTC);
+        Booking second = buildBooking(client, master, masterService, startsAt2, endsAt2, sharedKey);
 
         assertThatThrownBy(() -> em.persistAndFlush(second))
                 .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
