@@ -675,4 +675,56 @@ class SlotCalculationServiceTest {
         assertThat(result.get(0).startsAt()).isEqualTo(slotStart.atZone(kyiv));
         assertThat(result.get(0).endsAt()).isEqualTo(slotEnd.atZone(kyiv));
     }
+
+    @Test
+    @DisplayName("should pass Kyiv day-boundary window to findOverlappingByMaster")
+    void should_passDayBoundaryWindow_when_queryingOverlappingBookings() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 7);
+        ZoneId kyiv = ZoneId.of("Europe/Kyiv");
+        int dayOfWeek = date.getDayOfWeek().getValue();
+
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .isActive(true)
+                .build();
+        WorkingHours wh = WorkingHours.builder()
+                .id(UUID.randomUUID())
+                .dayOfWeek(dayOfWeek)
+                .startTime(LocalTime.of(9, 0))
+                .endTime(LocalTime.of(17, 0))
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
+                .thenReturn(Optional.of(wh));
+        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+
+        ArgumentCaptor<OffsetDateTime> startCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
+        ArgumentCaptor<OffsetDateTime> endCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(bookingRepository).findOverlappingByMaster(eq(masterId), startCaptor.capture(), endCaptor.capture());
+
+        // Service must query the full day in Kyiv time: midnight-to-midnight on the target date.
+        OffsetDateTime expectedStart = date.atStartOfDay(kyiv).toOffsetDateTime();
+        OffsetDateTime expectedEnd = date.plusDays(1).atStartOfDay(kyiv).toOffsetDateTime();
+        assertThat(startCaptor.getValue()).isEqualTo(expectedStart);
+        assertThat(endCaptor.getValue()).isEqualTo(expectedEnd);
+    }
 }

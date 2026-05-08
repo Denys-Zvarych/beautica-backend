@@ -12,9 +12,13 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 @Component
 public class AuthRateLimitFilter extends OncePerRequestFilter {
+
+    private static final byte[] TOO_MANY_REQUESTS_BODY =
+            "{\"error\":\"Too many requests\"}".getBytes(StandardCharsets.UTF_8);
 
     private static final String LOGIN_PATH = "/api/v1/auth/login";
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
@@ -86,7 +90,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             response.setStatus(429);
             response.setContentType("application/json");
             response.setHeader("Retry-After", String.valueOf(RETRY_AFTER_SECONDS));
-            response.getWriter().write("{\"error\":\"Too many requests\"}");
+            response.setContentLength(TOO_MANY_REQUESTS_BODY.length);
+            response.getOutputStream().write(TOO_MANY_REQUESTS_BODY);
         }
     }
 
