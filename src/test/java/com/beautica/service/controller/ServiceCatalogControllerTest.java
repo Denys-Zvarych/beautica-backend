@@ -412,6 +412,31 @@ class ServiceCatalogControllerTest {
     }
 
     @Test
+    @DisplayName("GET /service-types?q=<3-char string> — 200 when q has exactly three characters")
+    void should_return200_when_qParamHasExactlyThreeChars() throws Exception {
+        var result = List.of(
+                new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish"));
+        when(serviceCatalogService.searchServiceTypes(isNull(), eq("abc"))).thenReturn(result);
+        log.debug("Act: GET /api/v1/service-types?q=abc — exactly 3 chars must return 200");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "abc")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=<2-char string> — 400 when q has fewer than three characters")
+    void should_return400_when_qParamHasTwoChars() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?q=ab — 2 chars must return 400");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "ab")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
     @DisplayName("GET /service-types?q=Гель — returns non-empty list with nameUk containing 'Гель'")
     void should_returnMatchingTypesWithGel_when_qParamIsGel() throws Exception {
         var gelType = new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish");

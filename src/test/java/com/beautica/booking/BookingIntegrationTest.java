@@ -99,7 +99,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         addWorkingHoursForEveryDay(masterId);
 
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
 
         log.debug("Act: POST {} with valid CLIENT token — must return 201", BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -122,7 +122,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("POST /bookings — 401 when no Authorization header is present")
     void should_return401_when_noTokenOnCreateBooking() {
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null);
+        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null, null);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -146,7 +146,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         String ownerToken = loginAndGetToken(ownerEmail);
 
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null);
+        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null, null);
 
         log.debug("Act: POST {} with SALON_OWNER token — must return 403", BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -187,6 +187,91 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         assertThat(dbStatus)
                 .as("booking status in DB must be CONFIRMED after owner confirm, bookingId=%s", bookingId)
                 .isEqualTo("CONFIRMED");
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/decline — PENDING booking transitions to DECLINED with reason stored in DB")
+    void should_declineBooking_and_return204_when_pendingBookingDeclined() throws Exception {
+        String ownerEmail = "integ-decline-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-decline-client-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
+
+        String body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}";
+        log.debug("Act: PATCH {}/{}/decline as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
+        ResponseEntity<Void> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(ownerToken)),
+                Void.class);
+
+        assertThat(response.getStatusCode())
+                .as("owner declining PENDING booking must return 204")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        String dbStatus = jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbStatus)
+                .as("booking status in DB must be DECLINED after decline")
+                .isEqualTo("DECLINED");
+
+        String dbReason = jdbcTemplate.queryForObject(
+                "SELECT cancellation_reason FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbReason)
+                .as("cancellation_reason must be stored as PROVIDER_UNAVAILABLE")
+                .isEqualTo("PROVIDER_UNAVAILABLE");
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/not-complete — CONFIRMED booking transitions to NOT_COMPLETED with reason stored in DB")
+    void should_markNotCompleted_and_return204_when_confirmedBookingMarkedNotCompleted() throws Exception {
+        String ownerEmail = "integ-notcomplete-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-notcomplete-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        // First confirm the booking
+        restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                Void.class);
+
+        String dbStatusAfterConfirm = jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbStatusAfterConfirm)
+                .as("booking must be CONFIRMED before not-complete transition")
+                .isEqualTo("CONFIRMED");
+
+        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
+        log.debug("Act: PATCH {}/{}/not-complete as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
+        ResponseEntity<Void> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(ownerToken)),
+                Void.class);
+
+        assertThat(response.getStatusCode())
+                .as("owner marking CONFIRMED booking not-completed must return 204")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        String dbStatus = jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbStatus)
+                .as("booking status in DB must be NOT_COMPLETED after not-complete transition")
+                .isEqualTo("NOT_COMPLETED");
+
+        String dbReason = jdbcTemplate.queryForObject(
+                "SELECT cancellation_reason FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbReason)
+                .as("cancellation_reason must be stored as CLIENT_NO_SHOW")
+                .isEqualTo("CLIENT_NO_SHOW");
     }
 
     @Test
@@ -262,7 +347,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         createBooking(clientAToken, masterId, masterServiceId, startsAt);
 
         log.debug("Act: second booking by clientB at same slot — must return 409");
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
         ResponseEntity<String> secondResponse = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(clientBToken)),
@@ -480,7 +565,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
     private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId,
                                ZonedDateTime startsAt) throws Exception {
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,

@@ -146,7 +146,7 @@ class BookingConcurrencyTest {
                 try {
                     go.await();
                     // Each thread uses a unique idempotency key to prevent dedup short-circuit
-                    var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, idempotencyKey);
+                    var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, idempotencyKey, null);
                     ResponseEntity<String> response = restTemplate.exchange(
                             BOOKINGS_URL, HttpMethod.POST,
                             new HttpEntity<>(request, bearerHeaders(clientToken)),

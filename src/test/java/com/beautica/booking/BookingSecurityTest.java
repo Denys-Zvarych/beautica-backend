@@ -236,7 +236,7 @@ class BookingSecurityTest extends AbstractIntegrationTest {
 
     private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId) throws Exception {
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,

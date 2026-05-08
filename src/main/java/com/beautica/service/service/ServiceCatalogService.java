@@ -188,7 +188,10 @@ public class ServiceCatalogService {
 
     @Transactional(readOnly = true)
     public List<ServiceTypeResponse> searchServiceTypes(@Nullable UUID categoryId, @Nullable String q) {
-        // Guard mirrors controller @Size(min=3): prevents cache-slot exhaustion via short queries
+        // Intentional duplication of the controller's @Size(min=3) constraint: this guard
+        // defends non-HTTP callers (internal services, tests, future programmatic callers)
+        // where the Bean Validation boundary is not active. Removing it would silently allow
+        // short queries to exhaust cache slots via direct service invocation.
         boolean useSearch = q != null && q.strip().length() >= 3;
 
         if (useSearch) {

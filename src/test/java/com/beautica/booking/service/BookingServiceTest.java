@@ -191,6 +191,7 @@ class BookingServiceTest {
                 masterId,
                 masterServiceId,
                 ZonedDateTime.now(clock).plusHours(2),
+                null,
                 null
         );
     }
@@ -329,6 +330,7 @@ class BookingServiceTest {
                 masterId,
                 masterServiceId,
                 ZonedDateTime.now(clock).minusMinutes(10),
+                null,
                 null
         );
 
@@ -348,6 +350,7 @@ class BookingServiceTest {
                 masterId,
                 masterServiceId,
                 ZonedDateTime.now(clock).plusDays(181),
+                null,
                 null
         );
 
@@ -674,6 +677,32 @@ class BookingServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
     }
 
+    @Test
+    @DisplayName("400 is thrown when a client attempts to cancel a booking already in DECLINED status")
+    void should_throwException_when_cancelBooking_alreadyDeclined() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.DECLINED);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    @Test
+    @DisplayName("400 is thrown when a client attempts to cancel a booking already in NOT_COMPLETED status")
+    void should_throwException_when_cancelBooking_alreadyNotCompleted() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.NOT_COMPLETED);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
     // ── listBookings ───────────────────────────────────────────────────────────
 
     @Test
@@ -687,15 +716,15 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
 
         when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-        when(bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorId, BookingStatus.PENDING, pageable))
+        when(bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(salonId, actorId, BookingStatus.PENDING, pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result =
                 bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.PENDING, pageable);
 
         assertThat(result.getTotalElements()).isZero();
-        verify(bookingRepository).findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorId, BookingStatus.PENDING, pageable);
-        verify(bookingRepository, never()).findBySalonIdAndOwnerIdWithGraph(any(), any(), any());
+        verify(bookingRepository).findIdsBySalonIdAndOwnerIdAndStatus(salonId, actorId, BookingStatus.PENDING, pageable);
+        verify(bookingRepository, never()).findIdsBySalonIdAndOwnerId(any(), any(), any());
     }
 
     @Test
@@ -709,15 +738,15 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
 
         when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-        when(bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable))
+        when(bookingRepository.findIdsBySalonIdAndOwnerId(salonId, actorId, pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result =
                 bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable);
-        verify(bookingRepository, never()).findBySalonIdAndOwnerIdAndStatusWithGraph(any(), any(), any(), any());
+        verify(bookingRepository).findIdsBySalonIdAndOwnerId(salonId, actorId, pageable);
+        verify(bookingRepository, never()).findIdsBySalonIdAndOwnerIdAndStatus(any(), any(), any(), any());
     }
 
     @Test
@@ -732,8 +761,10 @@ class BookingServiceTest {
         Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
 
         when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-        when(bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable))
-                .thenReturn(new PageImpl<>(List.of(existingBooking)));
+        when(bookingRepository.findIdsBySalonIdAndOwnerId(salonId, actorId, pageable))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
+                .thenReturn(List.of(existingBooking));
 
         Page<BookingResponse> result =
                 bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
@@ -761,13 +792,13 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithoutStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findByClientIdWithGraph(clientId, pageable)).thenReturn(Page.empty());
+        when(bookingRepository.findIdsByClientId(clientId, pageable)).thenReturn(Page.empty());
 
         Page<BookingResponse> result = bookingService.listBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findByClientIdWithGraph(clientId, pageable);
-        verify(bookingRepository, never()).findByClientIdAndStatusWithGraph(any(), any(), any());
+        verify(bookingRepository).findIdsByClientId(clientId, pageable);
+        verify(bookingRepository, never()).findIdsByClientIdAndStatus(any(), any(), any());
     }
 
     @Test
@@ -775,14 +806,14 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findByClientIdAndStatusWithGraph(clientId, BookingStatus.PENDING, pageable))
+        when(bookingRepository.findIdsByClientIdAndStatus(clientId, BookingStatus.PENDING, pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result = bookingService.listBookings(clientId, buildAuth(Role.CLIENT), BookingStatus.PENDING, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findByClientIdAndStatusWithGraph(clientId, BookingStatus.PENDING, pageable);
-        verify(bookingRepository, never()).findByClientIdWithGraph(any(), any());
+        verify(bookingRepository).findIdsByClientIdAndStatus(clientId, BookingStatus.PENDING, pageable);
+        verify(bookingRepository, never()).findIdsByClientId(any(), any());
     }
 
     @Test
@@ -793,12 +824,12 @@ class BookingServiceTest {
         UUID masterUserId = masterUser.getId();
 
         when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
-        when(bookingRepository.findByMasterIdWithGraph(masterId, pageable)).thenReturn(Page.empty());
+        when(bookingRepository.findIdsByMasterId(masterId, pageable)).thenReturn(Page.empty());
 
         Page<BookingResponse> result = bookingService.listBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER), null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findByMasterIdWithGraph(masterId, pageable);
+        verify(bookingRepository).findIdsByMasterId(masterId, pageable);
     }
 
     @Test
@@ -809,15 +840,15 @@ class BookingServiceTest {
         UUID salonMasterUserId = salonMasterUser.getId();
 
         when(masterRepository.findByUserId(salonMasterUserId)).thenReturn(Optional.of(master));
-        when(bookingRepository.findByMasterIdAndStatusWithGraph(masterId, BookingStatus.CONFIRMED, pageable))
+        when(bookingRepository.findIdsByMasterIdAndStatus(masterId, BookingStatus.CONFIRMED, pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result = bookingService.listBookings(
                 salonMasterUserId, buildAuth(Role.SALON_MASTER), BookingStatus.CONFIRMED, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findByMasterIdAndStatusWithGraph(masterId, BookingStatus.CONFIRMED, pageable);
-        verify(bookingRepository, never()).findByMasterIdWithGraph(any(), any());
+        verify(bookingRepository).findIdsByMasterIdAndStatus(masterId, BookingStatus.CONFIRMED, pageable);
+        verify(bookingRepository, never()).findIdsByMasterId(any(), any());
     }
 
     @Test

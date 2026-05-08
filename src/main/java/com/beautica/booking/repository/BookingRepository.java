@@ -2,6 +2,7 @@ package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.repository.BookingViewAccess;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -16,49 +17,42 @@ import java.util.UUID;
 
 public interface BookingRepository extends JpaRepository<Booking, UUID> {
 
-    // ── Full-graph list queries (Fix H1 — N+1 prevention) ─────────────────────
+    // ── ID-only paginated queries — two-query pattern (Fix H1 — HHH90003004) ──
+    //
+    // JOIN FETCH + Pageable on a collection path forces Hibernate to load all rows
+    // into memory and paginate in the application layer (HHH90003004). The fix is a
+    // two-query pattern: (1) paginate on IDs only (no JOIN FETCH → correct SQL LIMIT/
+    // OFFSET), then (2) batch-hydrate the full graph for only those IDs.
 
     @Query(value = """
-            SELECT b FROM Booking b
-            JOIN FETCH b.client
-            JOIN FETCH b.master m
-            JOIN FETCH m.user
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            SELECT b.id FROM Booking b
             WHERE b.client.id = :clientId
+            ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             WHERE b.client.id = :clientId
             """)
-    Page<Booking> findByClientIdWithGraph(@Param("clientId") UUID clientId, Pageable pageable);
+    Page<UUID> findIdsByClientId(@Param("clientId") UUID clientId, Pageable pageable);
 
     @Query(value = """
-            SELECT b FROM Booking b
-            JOIN FETCH b.client
-            JOIN FETCH b.master m
-            JOIN FETCH m.user
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            SELECT b.id FROM Booking b
             WHERE b.client.id = :clientId AND b.status = :status
+            ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             WHERE b.client.id = :clientId AND b.status = :status
             """)
-    Page<Booking> findByClientIdAndStatusWithGraph(
+    Page<UUID> findIdsByClientIdAndStatus(
             @Param("clientId") UUID clientId,
             @Param("status") BookingStatus status,
             Pageable pageable);
 
     @Query(value = """
-            SELECT b FROM Booking b
-            JOIN FETCH b.client
-            JOIN FETCH b.master m
-            JOIN FETCH m.user
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            SELECT b.id FROM Booking b
             WHERE b.master.id = :masterId
+            ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
@@ -66,50 +60,76 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """)
     // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
     // Scope enforcement: BookingService resolves masterId via masterRepository.findByUserId(actorUserId).
-    Page<Booking> findByMasterIdWithGraph(@Param("masterId") UUID masterId, Pageable pageable);
+    Page<UUID> findIdsByMasterId(@Param("masterId") UUID masterId, Pageable pageable);
 
     @Query(value = """
-            SELECT b FROM Booking b
-            JOIN FETCH b.client
-            JOIN FETCH b.master m
-            JOIN FETCH m.user
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            SELECT b.id FROM Booking b
             WHERE b.master.id = :masterId AND b.status = :status
+            ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             WHERE b.master.id = :masterId AND b.status = :status
             """)
     // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
-    Page<Booking> findByMasterIdAndStatusWithGraph(
+    Page<UUID> findIdsByMasterIdAndStatus(
             @Param("masterId") UUID masterId,
             @Param("status") BookingStatus status,
             Pageable pageable);
 
-    // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────
-
-    @Query("""
-            SELECT b FROM Booking b
-            JOIN FETCH b.client
-            JOIN FETCH b.master m
-            JOIN FETCH m.user
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
-            LEFT JOIN FETCH b.salon
-            WHERE b.id = :id
+    @Query(value = """
+            SELECT b.id FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            JOIN s.owner o
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
+            AND m.isActive = true
+            ORDER BY b.startsAt DESC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            JOIN s.owner o
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
+            AND m.isActive = true
             """)
-    Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
-
-    // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
+    Page<UUID> findIdsBySalonIdAndOwnerId(
+            @Param("salonId") UUID salonId,
+            @Param("ownerId") UUID ownerId,
+            Pageable pageable);
 
     @Query(value = """
-            SELECT b FROM Booking b
-            JOIN FETCH b.client c
-            JOIN FETCH b.master m
-            JOIN FETCH m.user mu
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition sd
+            SELECT b.id FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            JOIN s.owner o
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
+            AND m.isActive = true
+            AND b.status = :status
+            ORDER BY b.startsAt DESC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            JOIN s.owner o
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
+            AND m.isActive = true
+            AND b.status = :status
+            """)
+    Page<UUID> findIdsBySalonIdAndOwnerIdAndStatus(
+            @Param("salonId") UUID salonId,
+            @Param("ownerId") UUID ownerId,
+            @Param("status") BookingStatus status,
+            Pageable pageable);
+
+    @Query(value = """
+            SELECT b.id FROM Booking b
             WHERE b.master.id = :masterId
             AND b.startsAt >= :from
             AND b.startsAt < :to
@@ -127,12 +147,46 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
                              com.beautica.booking.enums.BookingStatus.CONFIRMED,
                              com.beautica.booking.enums.BookingStatus.COMPLETED)
             """)
-    Page<Booking> findActiveByMasterIdAndStartsAtBetweenWithGraph(
+    Page<UUID> findActiveIdsByMasterIdAndStartsAtBetween(
             @Param("masterId") UUID masterId,
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to,
-            Pageable pageable
-    );
+            Pageable pageable);
+
+    /**
+     * Batch-hydrates a bounded set of booking IDs with the full association graph.
+     * Always called with the result of an ID-only page query, so the IN list size
+     * equals the configured page size (default 20) — never unbounded.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH s.owner
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.id IN :ids
+            """)
+    List<Booking> findAllByIdsWithGraph(@Param("ids") List<UUID> ids);
+
+    // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────
+
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH s.owner
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.id = :id
+            """)
+    Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
+
+    // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
     // ── Idempotency lookup — partial-index aligned (Fix M5) ───────────────────
 
@@ -147,6 +201,13 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      */
     @Query("""
             SELECT b FROM Booking b
+            JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH s.owner
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
             WHERE b.client.id = :clientId
               AND b.idempotencyKey = :idempotencyKey
               AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
@@ -186,6 +247,34 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt
     );
 
+    // ── View-access projection — ownership-only, role from SecurityContext ───────
+    /**
+     * Returns booking ownership data for {@code canViewBooking} in one round-trip.
+     *
+     * <p>The actor join was removed (Finding 2): the cross-entity join
+     * {@code JOIN com.beautica.user.User actor ON actor.id = :actorId} was producing
+     * a Cartesian product in SQL and pulling {@code actorRole} from the database on
+     * every access check. The actor's role is already present in the
+     * {@code SecurityContextHolder} (set by {@code JwtAuthenticationFilter}) —
+     * resolving it from there eliminates the cross-join and the extra DB column read.
+     *
+     * <p>Returns empty when the booking does not exist.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingViewAccess(
+                b.client.id,
+                bm.user.id,
+                sOwner.id
+            )
+            FROM Booking b
+            JOIN b.master bm
+            JOIN bm.user
+            LEFT JOIN bm.salon bs
+            LEFT JOIN bs.owner sOwner
+            WHERE b.id = :bookingId
+            """)
+    Optional<BookingViewAccess> findViewAccessById(@Param("bookingId") UUID bookingId);
+
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
     // but should be revisited if the platform scales significantly.
@@ -194,64 +283,4 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """, nativeQuery = true)
     Integer acquireAdvisoryLock(@Param("masterId") UUID masterId);
 
-    // ── Fix H1 — N+1: full-graph variant used by BookingService (production path) ─────────────
-    @Query(value = """
-            SELECT b FROM Booking b
-            JOIN FETCH b.client c
-            JOIN FETCH b.master m
-            JOIN FETCH m.user mu
-            JOIN m.salon s
-            JOIN s.owner o
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition sd
-            WHERE s.id = :salonId
-            AND o.id = :ownerId
-            AND m.isActive = true
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            JOIN s.owner o
-            WHERE s.id = :salonId
-            AND o.id = :ownerId
-            AND m.isActive = true
-            """)
-    Page<Booking> findBySalonIdAndOwnerIdWithGraph(
-            @Param("salonId") UUID salonId,
-            @Param("ownerId") UUID ownerId,
-            Pageable pageable);
-
-    // ── Fix MEDIUM: SALON_OWNER status-filtered variant ──────────────────────────
-    @Query(value = """
-            SELECT b FROM Booking b
-            JOIN FETCH b.client c
-            JOIN FETCH b.master m
-            JOIN FETCH m.user mu
-            JOIN m.salon s
-            JOIN s.owner o
-            JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition sd
-            WHERE s.id = :salonId
-            AND o.id = :ownerId
-            AND m.isActive = true
-            AND b.status = :status
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            JOIN s.owner o
-            WHERE s.id = :salonId
-            AND o.id = :ownerId
-            AND m.isActive = true
-            AND b.status = :status
-            """)
-    Page<Booking> findBySalonIdAndOwnerIdAndStatusWithGraph(
-            @Param("salonId") UUID salonId,
-            @Param("ownerId") UUID ownerId,
-            @Param("status") BookingStatus status,
-            Pageable pageable);
 }

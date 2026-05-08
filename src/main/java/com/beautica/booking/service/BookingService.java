@@ -23,6 +23,7 @@ import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
@@ -37,7 +38,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -84,24 +90,26 @@ public class BookingService {
                 .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
 
-        // Fix H1: use full-graph queries to prevent N+1 lazy loads on BookingResponse mapping
-        Page<Booking> page = switch (role) {
+        // Two-query pattern (Fix H1 — HHH90003004): first fetch a page of IDs using
+        // plain JPQL with no JOIN FETCH (so the DB applies LIMIT/OFFSET correctly), then
+        // batch-hydrate only those IDs with the full association graph in a second query.
+        Page<UUID> idPage = switch (role) {
             case CLIENT -> status == null
-                    ? bookingRepository.findByClientIdWithGraph(actorUserId, pageable)
-                    : bookingRepository.findByClientIdAndStatusWithGraph(actorUserId, status, pageable);
+                    ? bookingRepository.findIdsByClientId(actorUserId, pageable)
+                    : bookingRepository.findIdsByClientIdAndStatus(actorUserId, status, pageable);
             case SALON_MASTER, INDEPENDENT_MASTER -> {
                 Master master = masterRepository.findByUserId(actorUserId)
                         .orElseThrow(() -> new NotFoundException("Master profile not found"));
                 yield status == null
-                        ? bookingRepository.findByMasterIdWithGraph(master.getId(), pageable)
-                        : bookingRepository.findByMasterIdAndStatusWithGraph(master.getId(), status, pageable);
+                        ? bookingRepository.findIdsByMasterId(master.getId(), pageable)
+                        : bookingRepository.findIdsByMasterIdAndStatus(master.getId(), status, pageable);
             }
             case SALON_OWNER -> {
                 UUID salonId = userRepository.findSalonIdById(actorUserId)
                         .orElseThrow(() -> new BusinessException("Salon owner has no associated salon"));
                 yield status == null
-                        ? bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorUserId, pageable)
-                        : bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorUserId, status, pageable);
+                        ? bookingRepository.findIdsBySalonIdAndOwnerId(salonId, actorUserId, pageable)
+                        : bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(salonId, actorUserId, status, pageable);
             }
             // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings.
             // If this restriction is ever relaxed, add a SALON_ADMIN branch scoped to their salon.
@@ -109,7 +117,21 @@ public class BookingService {
             default -> throw new ForbiddenException("Access denied");
         };
 
-        return page.map(BookingResponse::from);
+        if (idPage.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
+        }
+
+        List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        // Restore the original ordering dictated by the pageable sort — the IN clause
+        // does not guarantee ordering from the database.
+        Map<UUID, Booking> byId = hydrated.stream()
+                .collect(Collectors.toMap(Booking::getId, Function.identity()));
+        List<BookingResponse> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
+                .map(BookingResponse::from)
+                .toList();
+        return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 
     @Transactional
@@ -242,6 +264,7 @@ public class BookingService {
                 .durationMinutesAtBooking(effectiveDuration)
                 .bufferMinutesAtBooking(bufferMinutes)
                 .idempotencyKey(idempotencyKey)
+                .clientComment(request.clientComment())
                 .build();
 
         Booking saved;

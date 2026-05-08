@@ -350,14 +350,14 @@ class BookingRepositoryTest {
         em.flush();
         em.clear();
 
-        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdWithGraph(
+        Page<UUID> result = bookingRepository.findIdsBySalonIdAndOwnerId(
                 salon.getId(), otherOwner.getId(), PageRequest.of(0, 10));
 
         assertThat(result).isEmpty();
     }
 
     @Test
-    @DisplayName("should_returnOnlyMatchingStatus_when_salonOwnerFiltersBookings")
+    @DisplayName("should_returnOnlyMatchingStatusId_when_salonOwnerFiltersBookings")
     void should_returnOnlyMatchingStatus_when_salonOwnerFiltersBookings() {
         User salonOwner = new User(
                 "owner-filter-" + UUID.randomUUID() + "@test.com",
@@ -445,11 +445,11 @@ class BookingRepositoryTest {
         em.flush();
         em.clear();
 
-        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(
+        Page<UUID> idPage = bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(
                 salon.getId(), salonOwner.getId(), BookingStatus.PENDING, PageRequest.of(0, 10));
 
-        assertThat(result.getTotalElements()).isEqualTo(1);
-        assertThat(result.getContent().get(0).getStatus()).isEqualTo(BookingStatus.PENDING);
+        assertThat(idPage.getTotalElements()).isEqualTo(1);
+        assertThat(idPage.getContent().get(0)).isEqualTo(pendingBooking.getId());
     }
 
     @Test
@@ -527,16 +527,16 @@ class BookingRepositoryTest {
         em.flush();
         em.clear();
 
-        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(
+        Page<UUID> result = bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(
                 salon.getId(), salonOwner.getId(), BookingStatus.CONFIRMED, PageRequest.of(0, 10));
 
         assertThat(result).isEmpty();
     }
 
-    // ── findBySalonIdAndOwnerIdWithGraph — happy-path ─────────────────────────
+    // ── findIdsBySalonIdAndOwnerId — happy-path ───────────────────────────────
 
     @Test
-    @DisplayName("should_returnOwnerBookings_when_salonOwnerQueriesAll")
+    @DisplayName("should_returnOwnerBookingId_when_salonOwnerQueriesAll")
     void should_returnOwnerBookings_when_salonOwnerQueriesAll() {
         User salonOwner = new User(
                 "owner-happy-" + UUID.randomUUID() + "@test.com",
@@ -610,18 +610,25 @@ class BookingRepositoryTest {
         em.flush();
         em.clear();
 
-        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdWithGraph(
+        Page<UUID> idPage = bookingRepository.findIdsBySalonIdAndOwnerId(
                 salon.getId(), salonOwner.getId(), PageRequest.of(0, 10));
 
-        assertThat(result.getTotalElements()).isEqualTo(1);
-        assertThat(result.getContent().get(0).getId()).isEqualTo(booking.getId());
-        assertThat(result.getContent().get(0).getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(idPage.getTotalElements()).isEqualTo(1);
+        assertThat(idPage.getContent().get(0)).isEqualTo(booking.getId());
+
+        // Verify the batch-hydrate query fetches the full graph for the returned IDs
+        List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        assertThat(hydrated).hasSize(1);
+        assertThat(hydrated.get(0).getId()).isEqualTo(booking.getId());
+        assertThat(hydrated.get(0).getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(hydrated.get(0).getClient()).isNotNull();
+        assertThat(hydrated.get(0).getMaster()).isNotNull();
     }
 
-    // ── findBySalonIdAndOwnerIdAndStatusWithGraph — happy-path ───────────────
+    // ── findIdsBySalonIdAndOwnerIdAndStatus — happy-path ─────────────────────
 
     @Test
-    @DisplayName("should_filterByStatus_when_salonOwnerPassesStatusParam")
+    @DisplayName("should_returnOnlyMatchingStatusIds_when_salonOwnerPassesStatusParam")
     void should_filterByStatus_when_salonOwnerPassesStatusParam() {
         User salonOwner = new User(
                 "owner-status-" + UUID.randomUUID() + "@test.com",
@@ -710,17 +717,16 @@ class BookingRepositoryTest {
         em.flush();
         em.clear();
 
-        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(
+        Page<UUID> idPage = bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(
                 salon.getId(), salonOwner.getId(), BookingStatus.CONFIRMED, PageRequest.of(0, 10));
 
-        assertThat(result.getTotalElements()).isEqualTo(1);
-        assertThat(result.getContent().get(0).getId()).isEqualTo(confirmedBooking.getId());
-        assertThat(result.getContent().get(0).getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(idPage.getTotalElements()).isEqualTo(1);
+        assertThat(idPage.getContent().get(0)).isEqualTo(confirmedBooking.getId());
     }
 
     @Test
-    @DisplayName("should_returnFullGraph_when_findActiveByMasterIdAndStartsAtBetweenWithGraph")
-    void should_returnFullGraph_when_findActiveByMasterIdAndStartsAtBetweenWithGraph() {
+    @DisplayName("should_returnBookingId_when_findActiveIdsByMasterIdAndStartsAtBetween")
+    void should_returnBookingId_when_findActiveIdsByMasterIdAndStartsAtBetween() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 11, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 11, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
@@ -732,11 +738,17 @@ class BookingRepositoryTest {
         OffsetDateTime from = OffsetDateTime.of(2026, 11, 1, 9, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime to = OffsetDateTime.of(2026, 11, 1, 12, 0, 0, 0, ZoneOffset.UTC);
 
-        Page<Booking> result = bookingRepository.findActiveByMasterIdAndStartsAtBetweenWithGraph(
+        Page<UUID> idPage = bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
                 master.getId(), from, to, org.springframework.data.domain.Pageable.ofSize(10));
 
-        assertThat(result.getContent()).isNotEmpty();
-        assertThat(result.getContent().get(0).getClient()).isNotNull();
+        assertThat(idPage.getContent()).isNotEmpty();
+        assertThat(idPage.getContent().get(0)).isEqualTo(booking.getId());
+
+        // Verify batch-hydrate loads the full graph for the returned IDs
+        List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        assertThat(hydrated).hasSize(1);
+        assertThat(hydrated.get(0).getClient()).isNotNull();
+        assertThat(hydrated.get(0).getMaster()).isNotNull();
     }
 
 }

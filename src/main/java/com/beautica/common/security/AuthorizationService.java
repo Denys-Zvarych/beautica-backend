@@ -3,6 +3,7 @@ package com.beautica.common.security;
 import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingViewAccess;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -10,12 +11,12 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
-import com.beautica.service.entity.OwnerType;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 
 import java.util.UUID;
@@ -159,36 +160,56 @@ public class AuthorizationService {
                 .orElse(false);
     }
 
+    /**
+     * Returns true iff the actor has management authority over the given booking.
+     *
+     * <p>Uses the lightweight {@code findViewAccessById} projection (3 UUID columns,
+     * no entity graph) instead of {@code findByIdWithFullGraph} (6-join entity load),
+     * eliminating the redundant full-graph fetch that would otherwise occur on every
+     * {@code @PreAuthorize} SpEL evaluation before the service method loads the same
+     * booking again.
+     *
+     * <p>Authorization rule (mirrors {@link #isAuthorizedToManageBooking}):
+     * <ul>
+     *   <li>{@code salonOwnerUserId != null} — salon booking: actor must be the salon owner.</li>
+     *   <li>{@code salonOwnerUserId == null} — independent master booking: actor must be the master's user.</li>
+     * </ul>
+     * {@code ROLE_SALON_MASTER} is rejected immediately (no DB round-trip).
+     */
     public boolean canManageBooking(Authentication auth, UUID bookingId) {
         boolean isSalonMaster = auth.getAuthorities().stream()
                 .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
         if (isSalonMaster) return false;
         UUID actorId = principalId(auth);
-        return bookingRepository.findByIdWithFullGraph(bookingId)
-                .map(b -> isAuthorizedToManageBooking(actorId, b))
-                .orElse(false);
+        return bookingRepository.findViewAccessById(bookingId).map(v -> {
+            if (v.salonOwnerUserId() != null) {
+                return v.salonOwnerUserId().equals(actorId);
+            }
+            return v.masterUserId().equals(actorId);
+        }).orElse(false);
     }
 
-    // Known timing delta: "not found" path returns after one DB call; "unauthorized" path issues a
-    // second userRepository.findById call — the difference leaks a weak existence oracle for booking
-    // IDs. Acceptable for a view (read-only) guard; mutation endpoints use enforceCanManageBooking
-    // which avoids this pattern.
     public boolean canViewBooking(Authentication auth, UUID bookingId) {
         UUID actorId = principalId(auth);
-        return bookingRepository.findByIdWithFullGraph(bookingId).map(b -> {
-            if (isAuthorizedToManageBooking(actorId, b)) {
+        // Finding 2: role is derived from the SecurityContext (set by JwtAuthenticationFilter)
+        // instead of from a cross-entity DB join, eliminating the Cartesian product.
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findViewAccessById(bookingId).map(v -> {
+            // Management access: SALON_OWNER whose id matches the salon owner, or INDEPENDENT_MASTER
+            // whose user id matches the master's user id. Both checks use the projection fields
+            // resolved in a single JOIN — no second DB round-trip on any branch.
+            if (v.salonOwnerUserId() != null && v.salonOwnerUserId().equals(actorId)) {
                 return true;
             }
-            User actor = userRepository.findById(actorId)
-                    .orElseThrow(() -> new NotFoundException("User not found"));
-            if (actor.getRole() == Role.CLIENT) {
-                return b.getClient().getId().equals(actorId);
+            if (v.masterUserId().equals(actorId) && actorRole != Role.SALON_MASTER) {
+                return true;
             }
-            if (actor.getRole() == Role.SALON_MASTER) {
-                // Fix M1: SALON_MASTER may only view their own bookings, not all bookings
-                // at the salon — the previous salon-scoped check leaked other masters'
-                // client names and prices to every master at the same salon.
-                return b.getMaster().getUser().getId().equals(actorId);
+            if (actorRole == Role.CLIENT) {
+                return v.clientUserId().equals(actorId);
+            }
+            if (actorRole == Role.SALON_MASTER) {
+                // SALON_MASTER may only view their own bookings — not all bookings at the salon.
+                return v.masterUserId().equals(actorId);
             }
             return false;
         }).orElse(false);
@@ -204,12 +225,14 @@ public class AuthorizationService {
         if (isAuthorizedToManageBooking(actorUserId, booking)) {
             return;
         }
-        User actor = userRepository.findById(actorUserId)
-                .orElseThrow(() -> new NotFoundException("User not found"));
+        // Finding 3: role is derived from the SecurityContext instead of a userRepository
+        // round-trip. The booking entity is already loaded by the caller, so all
+        // ownership fields are available in memory — no additional DB call is needed.
+        Role actorRole = roleFromCurrentAuthentication();
         boolean allowed = false;
-        if (actor.getRole() == Role.CLIENT) {
+        if (actorRole == Role.CLIENT) {
             allowed = booking.getClient().getId().equals(actorUserId);
-        } else if (actor.getRole() == Role.SALON_MASTER) {
+        } else if (actorRole == Role.SALON_MASTER) {
             // Fix M1: SALON_MASTER may only view their own bookings, not all bookings
             // at the salon — the previous salon-scoped check leaked other masters'
             // client names and prices to every master at the same salon.
@@ -240,6 +263,30 @@ public class AuthorizationService {
                     && master.getSalon().getOwner().getId().equals(actorId);
         }
         return false;
+    }
+
+    /**
+     * Extracts the {@link Role} from the supplied {@code Authentication} object.
+     * The JWT filter encodes the role as a {@code GrantedAuthority} with the
+     * standard {@code ROLE_} prefix.
+     */
+    private Role roleFromAuthentication(Authentication auth) {
+        if (auth == null) {
+            throw new IllegalStateException("No authentication in security context");
+        }
+        return auth.getAuthorities().stream()
+                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("No role in security context"));
+    }
+
+    /**
+     * Convenience variant of {@link #roleFromAuthentication} that reads from
+     * {@code SecurityContextHolder} directly. Used in non-{@code Authentication}-
+     * accepting methods such as {@code enforceCanViewBooking}.
+     */
+    private Role roleFromCurrentAuthentication() {
+        return roleFromAuthentication(SecurityContextHolder.getContext().getAuthentication());
     }
 
     private UUID principalId(Authentication auth) {
