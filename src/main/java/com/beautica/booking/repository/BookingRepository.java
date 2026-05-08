@@ -243,4 +243,32 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("salonId") UUID salonId,
             @Param("ownerId") UUID ownerId,
             Pageable pageable);
+
+    // ── Fix MEDIUM: SALON_OWNER status-filtered variant ──────────────────────────
+    @Query(value = """
+            SELECT b FROM Booking b
+            JOIN FETCH b.client c
+            JOIN FETCH b.master m
+            JOIN FETCH m.user mu
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition sd
+            WHERE m.salon.id = :salonId
+            AND m.salon.owner.id = :ownerId
+            AND m.isActive = true
+            AND b.status = :status
+            ORDER BY b.startsAt DESC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            JOIN b.master m
+            WHERE m.salon.id = :salonId
+            AND m.salon.owner.id = :ownerId
+            AND m.isActive = true
+            AND b.status = :status
+            """)
+    Page<Booking> findBySalonIdAndOwnerIdAndStatusWithGraph(
+            @Param("salonId") UUID salonId,
+            @Param("ownerId") UUID ownerId,
+            @Param("status") BookingStatus status,
+            Pageable pageable);
 }

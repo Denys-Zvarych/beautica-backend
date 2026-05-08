@@ -329,6 +329,183 @@ class BookingRepositoryTest {
     }
 
     @Test
+    @DisplayName("should_returnOnlyMatchingStatus_when_salonOwnerFiltersBookings")
+    void should_returnOnlyMatchingStatus_when_salonOwnerFiltersBookings() {
+        User salonOwner = new User(
+                "owner-filter-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_OWNER,
+                "Owner",
+                "Filter",
+                "+380501111115"
+        );
+        em.persist(salonOwner);
+
+        Salon salon = Salon.builder()
+                .owner(salonOwner)
+                .name("Filter Salon")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+
+        User salonMasterUser = new User(
+                "smaster-filter-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_MASTER,
+                "Salon",
+                "MasterFilter",
+                "+380501111116"
+        );
+        em.persist(salonMasterUser);
+
+        Master salonMaster = Master.builder()
+                .user(salonMasterUser)
+                .salon(salon)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(salonMaster);
+
+        ServiceDefinition salonServiceDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.SALON)
+                .ownerId(salon.getId())
+                .name("Pedicure")
+                .category(ServiceCategory.MANICURE)
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("350.00"))
+                .isActive(true)
+                .build();
+        em.persist(salonServiceDef);
+
+        MasterServiceAssignment salonMsa = MasterServiceAssignment.builder()
+                .master(salonMaster)
+                .serviceDefinition(salonServiceDef)
+                .isActive(true)
+                .build();
+        em.persist(salonMsa);
+
+        Booking pendingBooking = Booking.builder()
+                .client(clientUser)
+                .master(salonMaster)
+                .masterService(salonMsa)
+                .salon(salon)
+                .status(BookingStatus.PENDING)
+                .startsAt(OffsetDateTime.of(2026, 7, 1, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 7, 1, 11, 0, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("350.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(pendingBooking);
+
+        Booking confirmedBooking = Booking.builder()
+                .client(clientUser)
+                .master(salonMaster)
+                .masterService(salonMsa)
+                .salon(salon)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(OffsetDateTime.of(2026, 7, 2, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 7, 2, 11, 0, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("350.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(confirmedBooking);
+
+        em.flush();
+        em.clear();
+
+        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(
+                salon.getId(), salonOwner.getId(), BookingStatus.PENDING, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent().get(0).getStatus()).isEqualTo(BookingStatus.PENDING);
+    }
+
+    @Test
+    @DisplayName("should_returnEmpty_when_noBookingsMatchStatus")
+    void should_returnEmpty_when_noBookingsMatchStatus() {
+        User salonOwner = new User(
+                "owner-empty-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_OWNER,
+                "Owner",
+                "Empty",
+                "+380501111117"
+        );
+        em.persist(salonOwner);
+
+        Salon salon = Salon.builder()
+                .owner(salonOwner)
+                .name("Empty Salon")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+
+        User salonMasterUser = new User(
+                "smaster-empty-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_MASTER,
+                "Salon",
+                "MasterEmpty",
+                "+380501111118"
+        );
+        em.persist(salonMasterUser);
+
+        Master salonMaster = Master.builder()
+                .user(salonMasterUser)
+                .salon(salon)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(salonMaster);
+
+        ServiceDefinition salonServiceDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.SALON)
+                .ownerId(salon.getId())
+                .name("Eyebrows")
+                .category(ServiceCategory.MANICURE)
+                .baseDurationMinutes(45)
+                .basePrice(new BigDecimal("300.00"))
+                .isActive(true)
+                .build();
+        em.persist(salonServiceDef);
+
+        MasterServiceAssignment salonMsa = MasterServiceAssignment.builder()
+                .master(salonMaster)
+                .serviceDefinition(salonServiceDef)
+                .isActive(true)
+                .build();
+        em.persist(salonMsa);
+
+        Booking pendingBooking = Booking.builder()
+                .client(clientUser)
+                .master(salonMaster)
+                .masterService(salonMsa)
+                .salon(salon)
+                .status(BookingStatus.PENDING)
+                .startsAt(OffsetDateTime.of(2026, 8, 1, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 8, 1, 10, 45, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("300.00"))
+                .durationMinutesAtBooking(45)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(pendingBooking);
+
+        em.flush();
+        em.clear();
+
+        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(
+                salon.getId(), salonOwner.getId(), BookingStatus.CONFIRMED, PageRequest.of(0, 10));
+
+        assertThat(result).isEmpty();
+    }
+
+    @Test
     @DisplayName("should_findActiveByMasterIdAndStartsAtBetween_excludesCancelledBookings")
     void should_findActiveByMasterIdAndStartsAtBetween_excludesCancelledBookings() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);

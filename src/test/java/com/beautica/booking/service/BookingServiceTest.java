@@ -23,6 +23,8 @@ import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -561,6 +563,66 @@ class BookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    // ── listBookings ───────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_returnFilteredBookings_when_salonOwnerListsWithStatus")
+    void should_returnFilteredBookings_when_salonOwnerListsWithStatus() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User salonOwner = new User(
+                "owner@example.com", "hash", Role.SALON_OWNER, "Owner", "User", "+380501111113", salonId);
+        setField(salonOwner, "id", actorId);
+        Pageable pageable = Pageable.unpaged();
+
+        when(userRepository.findById(actorId)).thenReturn(Optional.of(salonOwner));
+        when(bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorId, BookingStatus.PENDING, pageable))
+                .thenReturn(Page.empty());
+
+        Page<BookingResponse> result =
+                bookingService.listBookings(actorId, BookingStatus.PENDING, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorId, BookingStatus.PENDING, pageable);
+        verify(bookingRepository, never()).findBySalonIdAndOwnerIdWithGraph(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("should_returnAllBookings_when_salonOwnerListsWithoutStatus")
+    void should_returnAllBookings_when_salonOwnerListsWithoutStatus() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User salonOwner = new User(
+                "owner2@example.com", "hash", Role.SALON_OWNER, "Owner", "Two", "+380501111114", salonId);
+        setField(salonOwner, "id", actorId);
+        Pageable pageable = Pageable.unpaged();
+
+        when(userRepository.findById(actorId)).thenReturn(Optional.of(salonOwner));
+        when(bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable))
+                .thenReturn(Page.empty());
+
+        Page<BookingResponse> result =
+                bookingService.listBookings(actorId, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findBySalonIdAndOwnerIdWithGraph(salonId, actorId, pageable);
+        verify(bookingRepository, never()).findBySalonIdAndOwnerIdAndStatusWithGraph(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("should_throwBusinessException_when_salonOwnerHasNoSalonId")
+    void should_throwBusinessException_when_salonOwnerHasNoSalonId() {
+        UUID actorId = UUID.randomUUID();
+        User salonOwner = buildUser(actorId, Role.SALON_OWNER);
+        // salonId is null — buildUser does not set it
+        Pageable pageable = Pageable.unpaged();
+
+        when(userRepository.findById(actorId)).thenReturn(Optional.of(salonOwner));
+
+        assertThatThrownBy(() -> bookingService.listBookings(actorId, null, pageable))
+                .isInstanceOf(BusinessException.class);
     }
 
     // ── getBooking ─────────────────────────────────────────────────────────────
