@@ -141,14 +141,12 @@ class SalonServiceTest {
         var request = new UpdateSalonRequest("New Name", null, "Lviv", null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
         // authorizationService.enforceCanManageSalon is void — Mockito does nothing by default (access granted)
 
         SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
 
         assertThat(response.name()).isEqualTo("New Name");
         assertThat(response.city()).isEqualTo("Lviv");
-        verify(salonRepository).save(salon);
     }
 
     @Test

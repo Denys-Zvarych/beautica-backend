@@ -709,6 +709,31 @@ class InviteServiceTest {
     }
 
     @Test
+    @DisplayName("sendInvite sends email immediately when no active transaction synchronization is present")
+    void should_sendEmailImmediately_when_noActiveTransactionSync() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonId, null);
+        var caller = buildCallerWithSalon(callerId, salonId);
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        // No TransactionSynchronizationManager.initSynchronization() — synchronization is NOT active
+
+        inviteService.sendInvite(request, callerId);
+
+        // Email must be sent directly, not deferred via afterCommit
+        verify(emailService).sendInviteEmail(eq("master@example.com"), anyString(), eq("Test Salon"));
+    }
+
+    @Test
     @DisplayName("sendInvite registers afterCommit callback — emailService not called before commit fires")
     void should_notCallEmailDirectly_when_sendInviteRegistersAfterCommitCallback() {
         var salonId = UUID.randomUUID();

@@ -51,6 +51,11 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
                 UUID userId = jwtTokenProvider.getUserIdFromToken(claims);
                 String email = jwtTokenProvider.getEmailFromToken(claims);
+                if (email == null) {
+                    log.debug("JWT is missing required email claim — skipping authentication");
+                    filterChain.doFilter(request, response);
+                    return;
+                }
                 Role role = jwtTokenProvider.getRoleFromToken(claims);
 
                 var authority = new SimpleGrantedAuthority("ROLE_" + role.name());

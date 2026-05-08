@@ -91,8 +91,7 @@ public class SalonService {
             salon.setInstagramUrl(request.instagramUrl());
         }
 
-        var saved = salonRepository.save(salon);
-        return SalonResponse.from(saved);
+        return SalonResponse.from(salon);
     }
 
     @Transactional(readOnly = true)

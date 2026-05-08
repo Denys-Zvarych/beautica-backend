@@ -113,4 +113,37 @@ class BookingResponseTest {
 
         assertThat(response.createdAt().getOffset()).isEqualTo(ZoneOffset.UTC);
     }
+
+    @Test
+    @DisplayName("startsAt has +02:00 offset when mapping a January (winter) UTC timestamp")
+    void should_returnUtcPlusTwoOffset_when_mappingWinterStartsAt() {
+        // 2025-01-15T10:00:00Z — Kyiv is on UTC+2 in January (no DST)
+        var winterStartsAt = OffsetDateTime.of(2025, 1, 15, 10, 0, 0, 0, ZoneOffset.UTC);
+
+        var client = booking.getClient();
+        var master = booking.getMaster();
+        var masterService = booking.getMasterService();
+
+        var winterBooking = mock(Booking.class);
+        when(winterBooking.getId()).thenReturn(bookingId);
+        when(winterBooking.getClient()).thenReturn(client);
+        when(winterBooking.getMaster()).thenReturn(master);
+        when(winterBooking.getMasterService()).thenReturn(masterService);
+        when(winterBooking.getStatus()).thenReturn(BookingStatus.PENDING);
+        when(winterBooking.getStartsAt()).thenReturn(winterStartsAt);
+        when(winterBooking.getEndsAt()).thenReturn(winterStartsAt.plusHours(1));
+        when(winterBooking.getPriceAtBooking()).thenReturn(new BigDecimal("350.00"));
+        when(winterBooking.getDurationMinutesAtBooking()).thenReturn(60);
+        when(winterBooking.getCreatedAt()).thenReturn(CREATED_AT);
+
+        var response = BookingResponse.from(winterBooking);
+
+        assertThat(response.startsAt().getZone()).isEqualTo(ZoneId.of("Europe/Kyiv"));
+        assertThat(response.startsAt().getOffset())
+                .as("Kyiv offset in January must be UTC+2 (winter time, no DST)")
+                .isEqualTo(ZoneOffset.ofHours(2));
+        assertThat(response.startsAt().getHour())
+                .as("10:00 UTC in January Kyiv (UTC+2) must map to hour 12")
+                .isEqualTo(12);
+    }
 }

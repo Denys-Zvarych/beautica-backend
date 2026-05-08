@@ -50,7 +50,10 @@ import java.time.LocalTime;
 import java.util.List;
 import java.util.UUID;
 
+import com.beautica.master.dto.MasterSummaryResponse;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
@@ -213,6 +216,34 @@ class MasterControllerTest {
         mockMvc.perform(get(MASTERS_URL + "/by-salon/" + salonId)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET /by-salon/{salonId} — 200 with paged masters when authenticated")
+    void should_return200_withPagedMasters_when_authenticated() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var userId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+
+        var summary = new MasterSummaryResponse(
+                masterId, userId, "Oksana", "Kovalenko", null,
+                BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER);
+        Page<MasterSummaryResponse> page =
+                new PageImpl<>(List.of(summary), PageRequest.of(0, 20), 1);
+
+        when(masterService.getMastersByPage(eq(salonId), any())).thenReturn(page);
+
+        log.debug("Act: GET {}/by-salon/{} as CLIENT — must return 200 with one master", MASTERS_URL, salonId);
+        mockMvc.perform(get(MASTERS_URL + "/by-salon/" + salonId)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.data").isArray())
+                .andExpect(jsonPath("$.data.data[0].masterId").value(masterId.toString()))
+                .andExpect(jsonPath("$.data.data[0].firstName").value("Oksana"))
+                .andExpect(jsonPath("$.data.totalElements").value(1));
     }
 
     // ── PATCH /{masterId}/working-hours — protected ────────────────────────────

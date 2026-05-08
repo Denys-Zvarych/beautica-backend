@@ -246,6 +246,9 @@ public class ServiceCatalogService {
         }
         ServiceType type = serviceTypeRepository.findById(request.serviceTypeId())
                 .orElseThrow(() -> new NotFoundException("Service type not found: " + request.serviceTypeId()));
+        if (!type.isActive()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
+        }
         definition.setServiceType(type);
     }
 }

@@ -443,6 +443,7 @@ class ServiceCatalogServiceTest {
         ServiceType serviceType = mock(ServiceType.class);
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Манікюр");
+        when(serviceType.isActive()).thenReturn(true);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
                 "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, serviceTypeId);
@@ -525,6 +526,7 @@ class ServiceCatalogServiceTest {
         ServiceType serviceType = mock(ServiceType.class);
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Педикюр");
+        when(serviceType.isActive()).thenReturn(true);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
                 "Pedicure", "Basic pedicure", null, 60, new BigDecimal("400.00"), 10, serviceTypeId);

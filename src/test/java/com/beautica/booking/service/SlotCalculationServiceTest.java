@@ -35,6 +35,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -497,6 +498,130 @@ class SlotCalculationServiceTest {
                 any(), any(), any(), totalDurationCaptor.capture(), any(), any());
 
         assertThat(totalDurationCaptor.getValue()).isEqualTo(Duration.ofMinutes(90));
+    }
+
+    @Test
+    @DisplayName("should exclude slot when buffer after previous booking fills it")
+    void should_excludeSlot_when_bufferAfterPreviousBookingFillsIt() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 9);
+        int dayOfWeek = date.getDayOfWeek().getValue();
+
+        // Service: 60 min duration + 30 min buffer = 90 min totalDuration
+        ServiceDefinition serviceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(30)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(serviceDefinition)
+                .isActive(true)
+                .build();
+
+        WorkingHours workingHours = WorkingHours.builder()
+                .id(UUID.randomUUID())
+                .dayOfWeek(dayOfWeek)
+                .startTime(LocalTime.of(9, 0))
+                .endTime(LocalTime.of(18, 0))
+                .isActive(true)
+                .build();
+
+        // Existing booking occupies 09:00–10:00 Kyiv (06:00–07:00 UTC)
+        Booking existingBooking = mock(Booking.class);
+        when(existingBooking.getStartsAt())
+                .thenReturn(OffsetDateTime.parse("2026-05-09T09:00:00+03:00"));
+        when(existingBooking.getEndsAt())
+                .thenReturn(OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
+                .thenReturn(Optional.of(workingHours));
+        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
+                .thenReturn(List.of(existingBooking));
+        // Calculator returns empty — simulates the 10:00 slot being blocked because the
+        // 90-min candidate window [10:00, 11:30] overlaps the occupied range [09:00, 10:00]
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        List<AvailableSlotResponse> result =
+                slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+
+        assertThat(result).isEmpty();
+
+        // Confirm the calculator received totalDuration = 90 min (service 60 + buffer 30)
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).calculateAvailableSlots(
+                any(), any(), any(), durationCaptor.capture(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(90));
+    }
+
+    @Test
+    @DisplayName("should accept today when date is today (lower boundary)")
+    void should_acceptToday_when_dateIsToday() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        // Clock fixed to 2026-05-07T00:00Z → Kyiv today is 2026-05-07
+        LocalDate today = LocalDate.now(clock.withZone(ZoneId.of("Europe/Kyiv")));
+
+        ServiceDefinition serviceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(serviceDefinition)
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(workingHoursRepository.findByMasterIdAndDayOfWeek(any(), anyInt()))
+                .thenReturn(Optional.empty());
+
+        assertThatCode(() -> slotCalculationService.getAvailableSlots(masterId, today, masterServiceId))
+                .as("today must be accepted as the lower boundary without throwing")
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("should accept max date when date is 180 days ahead (upper boundary)")
+    void should_acceptMaxDate_when_dateIs180DaysAhead() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        // Clock fixed to 2026-05-07T00:00Z → Kyiv today is 2026-05-07; today+180 is the max valid date
+        LocalDate maxDate = LocalDate.now(clock.withZone(ZoneId.of("Europe/Kyiv"))).plusDays(180);
+
+        ServiceDefinition serviceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(serviceDefinition)
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(workingHoursRepository.findByMasterIdAndDayOfWeek(any(), anyInt()))
+                .thenReturn(Optional.empty());
+
+        assertThatCode(() -> slotCalculationService.getAvailableSlots(masterId, maxDate, masterServiceId))
+                .as("today + 180 days must be accepted as the upper boundary without throwing")
+                .doesNotThrowAnyException();
     }
 
     @Test

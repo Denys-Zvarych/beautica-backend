@@ -25,6 +25,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
@@ -176,7 +178,7 @@ public class InviteService {
     }
 
     private String buildInviteLink(String rawToken) {
-        return frontendBaseUrl + "/invite/accept?token=" + rawToken;
+        return frontendBaseUrl + "/invite/accept?token=" + URLEncoder.encode(rawToken, StandardCharsets.UTF_8);
     }
 
     private AuthResponse buildAuthResponse(User user) {

@@ -240,6 +240,9 @@ public class AuthorizationService {
     private UUID principalId(Authentication auth) {
         // JwtAuthenticationFilter sets the UUID as authentication.getDetails()
         // and the email string as the principal.
-        return (UUID) auth.getDetails();
+        if (auth == null || !(auth.getDetails() instanceof UUID id)) {
+            throw new IllegalStateException("No authenticated principal UUID in security context");
+        }
+        return id;
     }
 }

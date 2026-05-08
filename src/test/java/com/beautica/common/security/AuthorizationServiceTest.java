@@ -158,6 +158,7 @@ class AuthorizationServiceTest {
 
         assertThat(result).isFalse();
         verify(userRepository, never()).findById(any());
+        verify(salonRepository, never()).findById(any());
     }
 
     @Test
@@ -170,6 +171,7 @@ class AuthorizationServiceTest {
 
         assertThat(result).isFalse();
         verify(userRepository, never()).findById(any());
+        verify(salonRepository, never()).findById(any());
     }
 
     @Test

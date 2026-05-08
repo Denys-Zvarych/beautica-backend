@@ -97,6 +97,21 @@ class JwtTokenProviderTest {
     }
 
     @Test
+    @DisplayName("isAccessToken returns false when token is a refresh token")
+    void should_returnFalse_when_tokenIsRefreshToken() {
+        var userId = UUID.randomUUID();
+        log.debug("Arrange: userId={}", userId);
+
+        log.debug("Act: generateRefreshToken then parseAllClaims then isAccessToken — expect false");
+        String token = jwtTokenProvider.generateRefreshToken(userId);
+        var claims = jwtTokenProvider.parseAllClaims(token);
+
+        assertThat(jwtTokenProvider.isAccessToken(claims))
+                .as("isAccessToken must return false for a refresh token")
+                .isFalse();
+    }
+
+    @Test
     @DisplayName("getUserIdFromToken returns correct user ID from refresh token")
     void should_extractUserId_when_refreshTokenParsed() {
         var userId = UUID.randomUUID();
