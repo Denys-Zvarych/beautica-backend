@@ -188,18 +188,22 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             JOIN FETCH b.client c
             JOIN FETCH b.master m
             JOIN FETCH m.user mu
+            JOIN m.salon s
+            JOIN s.owner o
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition sd
-            WHERE m.salon.id = :salonId
-            AND m.salon.owner.id = :ownerId
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
             AND m.isActive = true
             ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             JOIN b.master m
-            WHERE m.salon.id = :salonId
-            AND m.salon.owner.id = :ownerId
+            JOIN m.salon s
+            JOIN s.owner o
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
             AND m.isActive = true
             """)
     Page<Booking> findBySalonIdAndOwnerIdWithGraph(
@@ -213,10 +217,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             JOIN FETCH b.client c
             JOIN FETCH b.master m
             JOIN FETCH m.user mu
+            JOIN m.salon s
+            JOIN s.owner o
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition sd
-            WHERE m.salon.id = :salonId
-            AND m.salon.owner.id = :ownerId
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
             AND m.isActive = true
             AND b.status = :status
             ORDER BY b.startsAt DESC
@@ -224,8 +230,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             JOIN b.master m
-            WHERE m.salon.id = :salonId
-            AND m.salon.owner.id = :ownerId
+            JOIN m.salon s
+            JOIN s.owner o
+            WHERE s.id = :salonId
+            AND o.id = :ownerId
             AND m.isActive = true
             AND b.status = :status
             """)
