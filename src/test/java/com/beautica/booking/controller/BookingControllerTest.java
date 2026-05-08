@@ -207,6 +207,39 @@ class BookingControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
+    @Test
+    @DisplayName("POST / — 400 when startsAt is in the past (@Future constraint)")
+    void should_return400_when_startsAtIsInThePast() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = "{\"masterId\":\"" + UUID.randomUUID()
+                + "\",\"masterServiceId\":\"" + UUID.randomUUID()
+                + "\",\"startsAt\":\"2000-01-01T10:00:00+02:00\"}";
+
+        mockMvc.perform(post(BOOKINGS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("POST / — 400 when idempotencyKey contains invalid characters (@Pattern constraint)")
+    void should_return400_when_idempotencyKeyHasInvalidFormat() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = "{\"masterId\":\"" + UUID.randomUUID()
+                + "\",\"masterServiceId\":\"" + UUID.randomUUID()
+                + "\",\"startsAt\":\"2027-01-01T10:00:00+02:00\""
+                + ",\"idempotencyKey\":\"invalid key with spaces\"}";
+
+        mockMvc.perform(post(BOOKINGS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+    }
+
     // ── GET /{bookingId} ─────────────────────────────────────────────────────
 
     @Test

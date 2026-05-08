@@ -169,6 +169,10 @@ public class AuthorizationService {
                 .orElse(false);
     }
 
+    // Known timing delta: "not found" path returns after one DB call; "unauthorized" path issues a
+    // second userRepository.findById call — the difference leaks a weak existence oracle for booking
+    // IDs. Acceptable for a view (read-only) guard; mutation endpoints use enforceCanManageBooking
+    // which avoids this pattern.
     public boolean canViewBooking(Authentication auth, UUID bookingId) {
         UUID actorId = principalId(auth);
         return bookingRepository.findByIdWithFullGraph(bookingId).map(b -> {
