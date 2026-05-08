@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.util.Date;
 import java.util.UUID;
 
@@ -34,7 +35,7 @@ class JwtTokenProviderTest {
     @BeforeEach
     void setUp() {
         var config = new JwtConfig(SECRET, ACCESS_EXPIRY_MS, REFRESH_EXPIRY_MS);
-        jwtTokenProvider = new JwtTokenProvider(config);
+        jwtTokenProvider = new JwtTokenProvider(config, Clock.systemUTC());
     }
 
     @Test
