@@ -1,6 +1,5 @@
 package com.beautica.notification;
 
-import com.beautica.common.exception.BusinessException;
 import jakarta.mail.internet.MimeMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,11 +45,9 @@ public class EmailService {
             helper.setText(body, false);
             mailSender.send(message);
         } catch (MailException ex) {
-            log.error("Failed to send admin notification email", ex);
-            throw new BusinessException("Failed to send admin notification email");
+            log.error("Failed to send admin notification email: {}", ex.getMessage());
         } catch (Exception ex) {
-            log.error("Failed to send admin notification email", ex);
-            throw new BusinessException("Failed to send admin notification email");
+            log.error("Failed to send admin notification email: {}", ex.getMessage());
         }
     }
 
@@ -72,11 +69,9 @@ public class EmailService {
             helper.setText(htmlContent, true);
             mailSender.send(message);
         } catch (MailException ex) {
-            log.error("Failed to send invite email", ex);
-            throw new BusinessException("Failed to send invite email");
+            log.error("Failed to send invite email: {}", ex.getMessage());
         } catch (Exception ex) {
-            log.error("Failed to send invite email", ex);
-            throw new BusinessException("Failed to send invite email");
+            log.error("Failed to send invite email: {}", ex.getMessage());
         }
     }
 }

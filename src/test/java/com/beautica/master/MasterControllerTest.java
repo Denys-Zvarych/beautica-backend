@@ -233,6 +233,24 @@ class MasterControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /{masterId}/working-hours — 403 when SALON_OWNER does not own the master")
+    void should_return403_when_salonOwnerDoesNotOwnMaster() throws Exception {
+        var foreignMasterId = UUID.randomUUID();
+        var actorId = UUID.randomUUID();
+        when(authorizationService.canManageMasterSchedule(any(), eq(foreignMasterId))).thenReturn(false);
+
+        var requests = List.of(new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true));
+        String body = objectMapper.writeValueAsString(requests);
+
+        mockMvc.perform(patch(MASTERS_URL + "/" + foreignMasterId + "/working-hours")
+                        .with(authenticatedAs(actorId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
     @DisplayName("PATCH /{masterId}/working-hours — 401 when no Authorization header")
     void should_return401_when_noTokenOnPatchWorkingHours() throws Exception {
         var masterId = UUID.randomUUID();
