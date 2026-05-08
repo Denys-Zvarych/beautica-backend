@@ -3,11 +3,14 @@ package com.beautica.config;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import io.github.bucket4j.Bucket;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import org.mockito.Mockito;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
@@ -67,8 +70,10 @@ public class WebMvcTestSupport {
      */
     @Bean
     @Primary
+    @SuppressWarnings("unchecked")
     public AuthRateLimitFilter authRateLimitFilter() {
-        return new AuthRateLimitFilter(null, null, null) {
+        LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
+        return new AuthRateLimitFilter(dummy, dummy, dummy) {
             @Override
             protected void doFilterInternal(HttpServletRequest req,
                                             HttpServletResponse res,

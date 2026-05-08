@@ -801,6 +801,25 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("SALON_MASTER receives only status-matched bookings from the master-scoped repository method")
+    void should_returnMasterBookings_when_salonMasterListsWithStatus() {
+        Pageable pageable = Pageable.unpaged();
+        User salonMasterUser = buildUser(UUID.randomUUID(), Role.SALON_MASTER);
+        UUID salonMasterUserId = salonMasterUser.getId();
+
+        when(masterRepository.findByUserId(salonMasterUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findByMasterIdAndStatusWithGraph(masterId, BookingStatus.CONFIRMED, pageable))
+                .thenReturn(Page.empty());
+
+        Page<BookingResponse> result = bookingService.listBookings(
+                salonMasterUserId, buildAuth(Role.SALON_MASTER), BookingStatus.CONFIRMED, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findByMasterIdAndStatusWithGraph(masterId, BookingStatus.CONFIRMED, pageable);
+        verify(bookingRepository, never()).findByMasterIdWithGraph(any(), any());
+    }
+
+    @Test
     @DisplayName("ForbiddenException is thrown when SALON_ADMIN calls listBookings")
     void should_throwForbidden_when_salonAdminListsBookings() {
         UUID salonAdminId = UUID.randomUUID();

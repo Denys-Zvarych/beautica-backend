@@ -9,6 +9,19 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.UUID;
 
+/**
+ * Booking summary DTO used in list endpoints.
+ *
+ * <p><strong>Access contract:</strong> {@code clientId} and {@code masterId} are exposed.
+ * Controller must scope the query to the authenticated actor (own bookings only) before
+ * returning this DTO — it must never appear in a publicly accessible or cross-user list.
+ *
+ * <p><strong>Lazy chain:</strong> {@code from()} calls
+ * {@code booking.getMasterService().getServiceDefinition().getName()} — the repository query
+ * that loads {@link com.beautica.booking.entity.Booking Booking} instances for this DTO
+ * must include {@code LEFT JOIN FETCH b.masterService ms LEFT JOIN FETCH ms.serviceDefinition}
+ * to avoid N+1 lazy loads.
+ */
 public record BookingResponse(
         UUID id,
         UUID clientId,

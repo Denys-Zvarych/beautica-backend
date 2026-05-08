@@ -189,6 +189,8 @@ public class AuthorizationService {
         }).orElse(false);
     }
 
+    // Returns false for both "booking not found" and "not your booking" — intentional timing oracle:
+    // callers cannot distinguish the two cases, which prevents booking-ID enumeration.
     public boolean canCancelBooking(Authentication auth, UUID bookingId) {
         UUID actorId = principalId(auth);
         return bookingRepository.findByIdWithFullGraph(bookingId)
