@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
+import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -168,7 +169,7 @@ public class BookingService {
     }
 
     @Transactional
-    public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, StatusUpdateRequest req) {
+    public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, CancelBookingRequest req) {
         Booking booking = loadBookingOrThrow(bookingId);
         if (!booking.getClient().getId().equals(clientUserId)) {
             throw new ForbiddenException("Access denied");
@@ -178,6 +179,7 @@ public class BookingService {
             throw new BusinessException("Cannot cancel a booking in status %s".formatted(current));
         }
         booking.setStatus(BookingStatus.CANCELLED);
+        // cancellationReason is guaranteed non-null by @NotNull on CancelBookingRequest
         booking.setCancellationReason(req.cancellationReason());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());

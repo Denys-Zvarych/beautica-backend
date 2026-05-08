@@ -194,17 +194,6 @@ public class AuthorizationService {
         }).orElse(false);
     }
 
-    // Returns false for both "booking not found" and "not your booking" — intentional timing oracle:
-    // callers cannot distinguish the two cases, which prevents booking-ID enumeration.
-    // Trade-off: used as @PreAuthorize SpEL, so BookingService.cancelBooking also loads the booking
-    // → two findById round-trips. Acceptable for cancellation; mutation endpoints use enforce* instead.
-    public boolean canCancelBooking(Authentication auth, UUID bookingId) {
-        UUID actorId = principalId(auth);
-        return bookingRepository.findByIdWithFullGraph(bookingId)
-                .map(b -> b.getClient().getId().equals(actorId))
-                .orElse(false);
-    }
-
     public void enforceCanManageBooking(UUID actorUserId, Booking booking) {
         if (!isAuthorizedToManageBooking(actorUserId, booking)) {
             throw new ForbiddenException("Access denied");

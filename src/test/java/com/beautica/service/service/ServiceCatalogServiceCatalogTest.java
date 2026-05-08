@@ -11,7 +11,6 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
-import com.beautica.service.repository.ServiceTypeRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -25,9 +24,11 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -41,10 +42,10 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private SalonRepository salonRepository;
     @Mock private MasterRepository masterRepository;
-    @Mock private ServiceTypeRepository serviceTypeRepository;
     @Mock private CatalogCategoryRepository catalogCategoryRepository;
     @Mock private EmailService emailService;
     @Mock private ServiceTypeLookup serviceTypeLookup;
+    @Mock private ServiceTypeSearchService serviceTypeSearchService;
 
     private ServiceCatalogService service;
 
@@ -55,10 +56,10 @@ class ServiceCatalogServiceCatalogTest {
                 masterServiceRepository,
                 salonRepository,
                 masterRepository,
-                serviceTypeRepository,
                 catalogCategoryRepository,
                 emailService,
-                serviceTypeLookup
+                serviceTypeLookup,
+                serviceTypeSearchService
         );
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
@@ -140,53 +141,35 @@ class ServiceCatalogServiceCatalogTest {
         verify(serviceTypeLookup).getByCategory(categoryId);
     }
 
-    // ── searchServiceTypes — with q ≥ 2 chars ────────────────────────────────
+    // ── searchServiceTypes — with q ≥ 3 chars ────────────────────────────────
 
     @Test
     @DisplayName("delegates to searchByName when q has 3 or more characters")
     void should_delegateToSearchByName_when_qHasTwoOrMoreChars() {
-        var category = mock(CatalogCategory.class);
-        when(category.getId()).thenReturn(UUID.randomUUID());
+        UUID categoryId = UUID.randomUUID();
+        var expected = new ServiceTypeResponse(UUID.randomUUID(), categoryId, "Манікюр класичний", "Classic Manicure", "manicure-classic");
 
-        var type = mock(ServiceType.class);
-        when(type.getId()).thenReturn(UUID.randomUUID());
-        when(type.getCategory()).thenReturn(category);
-        when(type.getNameUk()).thenReturn("Манікюр класичний");
-        when(type.getNameEn()).thenReturn("Classic Manicure");
-        when(type.getSlug()).thenReturn("manicure-classic");
-
-        when(serviceTypeRepository.searchByName("Ман", PageRequest.of(0, 20))).thenReturn(List.of(type));
+        when(serviceTypeSearchService.searchByName("Ман", null)).thenReturn(List.of(expected));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(null, "Ман");
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).nameUk()).isEqualTo("Манікюр класичний");
-        verify(serviceTypeRepository).searchByName("Ман", PageRequest.of(0, 20));
+        verify(serviceTypeSearchService).searchByName("Ман", null);
     }
 
     @Test
-    @DisplayName("strips whitespace from q before search")
+    @DisplayName("strips whitespace from q before delegating to search service")
     void should_stripWhitespace_when_qHasLeadingOrTrailingSpaces() {
-        var category = mock(CatalogCategory.class);
-        when(category.getId()).thenReturn(UUID.randomUUID());
+        when(serviceTypeSearchService.searchByName("Гель", null)).thenReturn(List.of());
 
-        var type = mock(ServiceType.class);
-        when(type.getId()).thenReturn(UUID.randomUUID());
-        when(type.getCategory()).thenReturn(category);
-        when(type.getNameUk()).thenReturn("Гель-лак");
-        when(type.getNameEn()).thenReturn("Gel Polish");
-        when(type.getSlug()).thenReturn("gel-polish");
+        service.searchServiceTypes(null, "  Гель  ");
 
-        when(serviceTypeRepository.searchByName("Гель", PageRequest.of(0, 20))).thenReturn(List.of(type));
-
-        List<ServiceTypeResponse> result = service.searchServiceTypes(null, "  Гель  ");
-
-        assertThat(result).hasSize(1);
-        verify(serviceTypeRepository).searchByName("Гель", PageRequest.of(0, 20));
+        verify(serviceTypeSearchService).searchByName("Гель", null);
     }
 
     @Test
-    @DisplayName("falls back to all-active when q has fewer than 2 chars after stripping")
+    @DisplayName("falls back to all-active when q has fewer than 3 chars after stripping")
     void should_fallbackToAllActive_when_qHasFewerThanTwoCharsAfterStrip() {
         when(serviceTypeLookup.getByCategory(null)).thenReturn(List.of());
 
@@ -197,33 +180,32 @@ class ServiceCatalogServiceCatalogTest {
     }
 
     @Test
-    @DisplayName("filters search results by categoryId when both q and categoryId provided")
-    void should_filterByCategory_when_qAndCategoryIdBothProvided() {
-        UUID targetCategoryId = UUID.randomUUID();
-        UUID otherCategoryId = UUID.randomUUID();
+    @DisplayName("delegates to searchByNameAndCategory when both q and categoryId are provided")
+    void should_delegateToSearchByNameAndCategory_when_qAndCategoryIdBothProvided() {
+        UUID categoryId = UUID.randomUUID();
+        var expected = new ServiceTypeResponse(UUID.randomUUID(), categoryId, "Манікюр", "Manicure", "manicure");
 
-        var targetCategory = mock(CatalogCategory.class);
-        when(targetCategory.getId()).thenReturn(targetCategoryId);
+        when(serviceTypeSearchService.searchByName("Ман", categoryId)).thenReturn(List.of(expected));
 
-        var otherCategory = mock(CatalogCategory.class);
-        when(otherCategory.getId()).thenReturn(otherCategoryId);
-
-        var matchingType = mock(ServiceType.class);
-        when(matchingType.getId()).thenReturn(UUID.randomUUID());
-        when(matchingType.getCategory()).thenReturn(targetCategory);
-        when(matchingType.getNameUk()).thenReturn("Манікюр");
-        when(matchingType.getNameEn()).thenReturn("Manicure");
-        when(matchingType.getSlug()).thenReturn("manicure");
-
-        var nonMatchingType = mock(ServiceType.class);
-        when(nonMatchingType.getCategory()).thenReturn(otherCategory);
-
-        when(serviceTypeRepository.searchByName("Ман", PageRequest.of(0, 20))).thenReturn(List.of(matchingType, nonMatchingType));
-
-        List<ServiceTypeResponse> result = service.searchServiceTypes(targetCategoryId, "Ман");
+        List<ServiceTypeResponse> result = service.searchServiceTypes(categoryId, "Ман");
 
         assertThat(result).hasSize(1);
-        assertThat(result.get(0).categoryId()).isEqualTo(targetCategoryId);
+        assertThat(result.get(0).categoryId()).isEqualTo(categoryId);
+        // serviceTypeSearchService.searchByName receives the categoryId so the DB query is category-scoped
+        verify(serviceTypeSearchService).searchByName("Ман", categoryId);
+        verify(serviceTypeSearchService, never()).searchByName(eq("Ман"), eq(null));
+    }
+
+    @Test
+    @DisplayName("uses plain searchByName (categoryId=null) when categoryId is null and q >= 3 chars")
+    void should_useSearchByName_when_categoryIdIsNull() {
+        when(serviceTypeSearchService.searchByName("Ман", null)).thenReturn(List.of());
+
+        service.searchServiceTypes(null, "Ман");
+
+        verify(serviceTypeSearchService).searchByName("Ман", null);
+        // searchByName with a non-null categoryId must never be called
+        verify(serviceTypeSearchService, never()).searchByName(anyString(), any(UUID.class));
     }
 
     // ── suggestServiceType ────────────────────────────────────────────────────

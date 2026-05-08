@@ -3,6 +3,7 @@ package com.beautica.booking.controller;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
+import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingService;
@@ -128,7 +129,7 @@ public class BookingController {
     @PreAuthorize("hasRole('CLIENT')")
     public ResponseEntity<Void> cancelBooking(
             @PathVariable UUID bookingId,
-            @Valid @RequestBody StatusUpdateRequest req,
+            @Valid @RequestBody CancelBookingRequest req,
             Authentication auth
     ) {
         bookingService.cancelBooking(principalId(auth), bookingId, req);
@@ -136,8 +137,9 @@ public class BookingController {
     }
 
     private UUID principalId(Authentication auth) {
-        if (auth instanceof UsernamePasswordAuthenticationToken token) {
-            return (UUID) token.getDetails();
+        if (auth instanceof UsernamePasswordAuthenticationToken token
+                && token.getDetails() instanceof UUID id) {
+            return id;
         }
         throw new ForbiddenException("Not authenticated");
     }

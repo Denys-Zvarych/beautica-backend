@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
+import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -596,7 +597,7 @@ class BookingServiceTest {
     @DisplayName("PENDING booking moves to CANCELLED and slot cache is evicted when client cancels")
     void should_cancelBooking_when_clientCancelsPendingBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
 
@@ -615,7 +616,7 @@ class BookingServiceTest {
     @DisplayName("CONFIRMED booking moves to CANCELLED and slot cache is evicted when client cancels")
     void should_cancelBooking_when_clientCancelsConfirmedBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
 
@@ -637,7 +638,7 @@ class BookingServiceTest {
         // At the service layer the ownership check fires: booking.client.id must equal actorId.
         UUID differentClientId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         // differentClientId != client.id → ownership check throws ForbiddenException
@@ -653,7 +654,7 @@ class BookingServiceTest {
         // via @PreAuthorize; this test covers the service-level ownership guard in isolation).
         UUID salonOwnerUserId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.cancelBooking(salonOwnerUserId, bookingId, req))
@@ -664,7 +665,7 @@ class BookingServiceTest {
     @DisplayName("400 is thrown when a client attempts to cancel an already COMPLETED booking")
     void should_throw400_when_clientCancelsCompletedBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))

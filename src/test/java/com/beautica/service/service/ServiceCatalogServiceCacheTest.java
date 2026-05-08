@@ -26,12 +26,13 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {ServiceCatalogService.class, ServiceTypeLookup.class, CacheConfig.class},
+        classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class, CacheConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
@@ -53,6 +54,7 @@ class ServiceCatalogServiceCacheTest {
         cacheManager.getCache("masterServices").clear();
         cacheManager.getCache("service-type-by-id").clear();
         cacheManager.getCache("service-types").clear();
+        cacheManager.getCache("service-type-search").clear();
     }
 
     @Test
@@ -157,5 +159,16 @@ class ServiceCatalogServiceCacheTest {
         serviceCatalogService.searchServiceTypes(categoryId, null);
 
         verify(serviceTypeRepository, times(1)).findByCategoryWithCategory(categoryId);
+    }
+
+    @Test
+    @DisplayName("second call to searchServiceTypes with same q does not re-query repository — cache is effective")
+    void should_hitCache_when_searchServiceTypesCalledTwice() {
+        when(serviceTypeRepository.searchByName(eq("Ман"), any())).thenReturn(List.of());
+
+        serviceCatalogService.searchServiceTypes(null, "Ман");
+        serviceCatalogService.searchServiceTypes(null, "Ман");
+
+        verify(serviceTypeRepository, times(1)).searchByName(eq("Ман"), any());
     }
 }

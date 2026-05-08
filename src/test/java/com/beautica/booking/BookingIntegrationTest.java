@@ -396,7 +396,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         log.debug("Act: PATCH {}/{}/cancel with clientB token — must return 403", BOOKINGS_URL, bookingId);
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/cancel", HttpMethod.PATCH,
-                new HttpEntity<>("{}", bearerHeaders(clientBToken)),
+                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_CANCELLED\"}", bearerHeaders(clientBToken)),
                 String.class);
 
         assertThat(response.getStatusCode())

@@ -697,51 +697,6 @@ class AuthorizationServiceTest {
         assertThat(result).isFalse();
     }
 
-    // ── canCancelBooking ───────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("canCancelBooking returns false when client B tries to cancel client A's booking")
-    void should_returnFalse_when_clientBCancelsClientABooking() {
-        UUID clientAId = UUID.randomUUID();
-        UUID clientBId = UUID.randomUUID();
-        UUID bookingId = UUID.randomUUID();
-
-        User clientA = mock(User.class);
-        when(clientA.getId()).thenReturn(clientAId);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getClient()).thenReturn(clientA);
-
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-
-        Authentication auth = mockAuth(clientBId, "ROLE_CLIENT");
-
-        boolean result = authorizationService.canCancelBooking(auth, bookingId);
-
-        assertThat(result).isFalse();
-    }
-
-    @Test
-    @DisplayName("canCancelBooking returns true when client cancels their own booking")
-    void should_returnTrue_when_clientCancelsOwnBooking() {
-        UUID actorId = UUID.randomUUID();
-        UUID bookingId = UUID.randomUUID();
-
-        User client = mock(User.class);
-        when(client.getId()).thenReturn(actorId);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getClient()).thenReturn(client);
-
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-
-        Authentication auth = mockAuth(actorId, "ROLE_CLIENT");
-
-        boolean result = authorizationService.canCancelBooking(auth, bookingId);
-
-        assertThat(result).isTrue();
-    }
-
     // ── enforceCanViewBooking ──────────────────────────────────────────────────
 
     @Test

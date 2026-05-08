@@ -22,7 +22,6 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
-import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
@@ -30,7 +29,6 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.transaction.annotation.Transactional;
 
 
@@ -45,10 +43,10 @@ public class ServiceCatalogService {
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
-    private final ServiceTypeRepository serviceTypeRepository;
     private final CatalogCategoryRepository catalogCategoryRepository;
     private final EmailService emailService;
     private final ServiceTypeLookup serviceTypeLookup;
+    private final ServiceTypeSearchService serviceTypeSearchService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -192,24 +190,26 @@ public class ServiceCatalogService {
         boolean useSearch = q != null && q.strip().length() >= 3;
 
         if (useSearch) {
-            return searchServiceTypesByName(q.strip(), categoryId);
+            // Delegate through serviceTypeSearchService (a separate Spring bean) so that
+            // the @Cacheable proxy intercept is active. A direct this.method() call would
+            // bypass the AOP proxy and make caching inert.
+            return serviceTypeSearchService.searchByName(q.strip(), categoryId);
         }
         return serviceTypeLookup.getByCategory(categoryId).stream()
                 .map(ServiceTypeResponse::from)
                 .toList();
     }
 
+    /**
+     * @deprecated Use {@link ServiceTypeSearchService#searchByName(String, UUID)} directly
+     *             via the injected {@code serviceTypeSearchService} field. Retained only for
+     *             external callers that may reference this method by name; will be removed in
+     *             a follow-up cleanup.
+     */
+    @Deprecated(since = "phase-3-fix1", forRemoval = true)
     @Transactional(readOnly = true)
     public List<ServiceTypeResponse> searchServiceTypesByName(String q, @Nullable UUID categoryId) {
-        List<ServiceType> types = serviceTypeRepository.searchByName(q, PageRequest.of(0, 20));
-        if (categoryId != null) {
-            types = types.stream()
-                    .filter(t -> t.getCategory().getId().equals(categoryId))
-                    .toList();
-        }
-        return types.stream()
-                .map(ServiceTypeResponse::from)
-                .toList();
+        return serviceTypeSearchService.searchByName(q, categoryId);
     }
 
     public void suggestServiceType(SuggestServiceTypeRequest request, UUID requestedByUserId) {

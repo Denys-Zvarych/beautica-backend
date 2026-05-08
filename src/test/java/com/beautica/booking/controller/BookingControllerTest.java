@@ -4,7 +4,9 @@ import com.beautica.booking.service.BookingService;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.BookingDetailResponse;
+import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
@@ -322,7 +324,7 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         when(bookingService.cancelBooking(any(), eq(bookingId), any())).thenReturn(null);
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/cancel")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -497,7 +499,7 @@ class BookingControllerTest {
     void should_return403_when_ownerTriesToCancelBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/cancel")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
@@ -512,7 +514,7 @@ class BookingControllerTest {
     void should_return403_when_clientCancelsAnotherClientsBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null));
         doThrow(new ForbiddenException("Access denied"))
                 .when(bookingService).cancelBooking(any(), any(), any());
 

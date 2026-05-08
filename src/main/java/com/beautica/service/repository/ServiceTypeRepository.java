@@ -91,4 +91,25 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
             """,
            countQuery = "SELECT count(t) FROM ServiceType t WHERE t.category.id = :categoryId AND t.active = true")
     List<ServiceType> findByCategoryWithCategory(@Param("categoryId") UUID categoryId, Pageable pageable);
+
+    /**
+     * Trigram-similarity search scoped to a specific category.
+     * Pushes the {@code categoryId} filter into the DB query to avoid post-pagination
+     * in-memory filtering on a capped page window.
+     *
+     * Callers MUST validate: q is not blank, length <= 100, stripped of control characters.
+     * Minimum 3 characters required for meaningful trigram similarity results.
+     */
+    @Query("""
+        SELECT t FROM ServiceType t
+        JOIN FETCH t.category
+        WHERE t.active = true
+          AND t.category.id = :categoryId
+          AND (FUNCTION('similarity', t.nameUk, :q) > 0.2
+            OR FUNCTION('similarity', t.nameEn, :q) > 0.2)
+        ORDER BY GREATEST(
+          FUNCTION('similarity', t.nameUk, :q),
+          FUNCTION('similarity', t.nameEn, :q)) DESC
+        """)
+    List<ServiceType> searchByNameAndCategory(@Param("q") String q, @Param("categoryId") UUID categoryId, Pageable pageable);
 }

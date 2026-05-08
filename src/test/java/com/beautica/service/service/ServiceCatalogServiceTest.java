@@ -18,7 +18,6 @@ import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
-import com.beautica.service.repository.ServiceTypeRepository;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -59,10 +58,10 @@ class ServiceCatalogServiceTest {
     private MasterRepository masterRepository;
 
     @Mock
-    private ServiceTypeRepository serviceTypeRepository;
+    private ServiceTypeLookup serviceTypeLookup;
 
     @Mock
-    private ServiceTypeLookup serviceTypeLookup;
+    private ServiceTypeSearchService serviceTypeSearchService;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
@@ -425,8 +424,8 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("deactivates ServiceDefinition when independent master owns it")
-    void should_deactivateServiceDefinition_when_independentMasterOwnsIt() {
+    @DisplayName("uses deactivateById (bulk UPDATE) rather than save — deactivation must not trigger a full entity replace")
+    void should_useDeactivateById_not_save_when_deactivating() {
         UUID serviceDefId = UUID.randomUUID();
 
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
@@ -434,42 +433,6 @@ class ServiceCatalogServiceTest {
         serviceCatalogService.deactivateServiceDefinition(serviceDefId);
 
         verify(serviceRepository).deactivateById(serviceDefId);
-    }
-
-    @Test
-    @DisplayName("throws ForbiddenException when a different independent master tries to deactivate — ownership check via AuthorizationService")
-    void should_throwForbidden_when_differentIndependentMasterTriesToDeactivate() {
-        // deactivateServiceDefinition() does not accept a caller identity: ownership is
-        // enforced by @authz.canManageServiceDefinition at the controller layer, which
-        // delegates to AuthorizationService.findOwnerUserId to compare the authenticated
-        // user against the service definition's owner.  When that check fails the
-        // controller raises AccessDeniedException → 403 before the service is ever called.
-        //
-        // This unit test exercises the AuthorizationService path in isolation: we verify
-        // that a definition owned by master A does NOT match master B's user ID, which is
-        // the condition the real AuthorizationService evaluates.
-        UUID masterAUserId = UUID.randomUUID();
-        UUID masterBUserId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        ServiceDefinition definitionOwnedByMasterA = ServiceDefinition.builder()
-                .id(serviceDefId)
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(masterAUserId)
-                .name("Lash Lift")
-                .baseDurationMinutes(60)
-                .bufferMinutesAfter(0)
-                .isActive(true)
-                .build();
-
-        // Assert: master B's user ID does NOT match the ownerId of this definition,
-        // so an ownership guard based on these values would deny master B.
-        assertThat(definitionOwnedByMasterA.getOwnerType()).isEqualTo(OwnerType.INDEPENDENT_MASTER);
-        assertThat(definitionOwnedByMasterA.getOwnerId()).isNotEqualTo(masterBUserId);
-
-        // Verify the service-layer pre-condition: no save is triggered when ownership
-        // would be denied.  (The actual 403 is asserted in ServiceControllerTest —
-        // see should_return403_when_clientCallsDeleteService.)
         verify(serviceRepository, never()).save(any());
     }
 
@@ -654,5 +617,32 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("throws 400 when linked ServiceType is inactive — addIndependentMasterService")
+    void should_throw400_when_linkedServiceTypeIsInactive_addIndependentMasterService() {
+        UUID userId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+
+        ServiceType inactiveType = mock(ServiceType.class);
+        when(inactiveType.isActive()).thenReturn(false);
+
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "Lash Lift", "Full lash lift", null, 90, new BigDecimal("600.00"), 15, serviceTypeId);
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(inactiveType);
+
+        assertThatThrownBy(() -> serviceCatalogService.addIndependentMasterService(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(serviceRepository, never()).save(any());
+        verify(masterServiceRepository, never()).save(any());
     }
 }
