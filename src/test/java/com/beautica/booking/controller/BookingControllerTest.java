@@ -248,7 +248,6 @@ class BookingControllerTest {
     void should_return200_when_authorizedGetBooking() throws Exception {
         var userId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canViewBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.getBooking(eq(userId), eq(bookingId)))
                 .thenReturn(stubDetailResponse(bookingId, userId, UUID.randomUUID(), UUID.randomUUID()));
 
@@ -281,7 +280,6 @@ class BookingControllerTest {
     void should_return204_when_ownerConfirmsBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.confirmBooking(any(), eq(bookingId))).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
@@ -295,7 +293,8 @@ class BookingControllerTest {
     void should_return403_when_clientConfirmsBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(false);
+        when(bookingService.confirmBooking(any(), eq(bookingId)))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -310,7 +309,6 @@ class BookingControllerTest {
     void should_return204_when_clientCancelsBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.cancelBooking(any(), eq(bookingId), any())).thenReturn(null);
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
 
@@ -327,7 +325,6 @@ class BookingControllerTest {
     void should_return400_when_invalidStatusTransition() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.confirmBooking(any(), eq(bookingId)))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Invalid status transition"));
 
@@ -345,7 +342,6 @@ class BookingControllerTest {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
@@ -362,7 +358,8 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(false);
+        when(bookingService.declineBooking(any(), eq(bookingId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -379,7 +376,6 @@ class BookingControllerTest {
     void should_return204_when_authorizedCompleteBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.completeBooking(any(), eq(bookingId))).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/complete")
@@ -393,7 +389,8 @@ class BookingControllerTest {
     void should_return403_when_clientCompletesBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(false);
+        when(bookingService.completeBooking(any(), eq(bookingId)))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/complete")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -409,7 +406,6 @@ class BookingControllerTest {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
@@ -426,7 +422,8 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
-        when(authorizationService.canManageBooking(any(), eq(bookingId))).thenReturn(false);
+        when(bookingService.notCompleteBooking(any(), eq(bookingId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))

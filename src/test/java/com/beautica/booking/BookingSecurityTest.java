@@ -104,7 +104,7 @@ class BookingSecurityTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should_return403_when_salonMasterAttemptsToConfirmBooking")
+    @DisplayName("PATCH confirm — 403 when SALON_MASTER attempts to confirm (not a manager role)")
     void should_return403_when_salonMasterAttemptsToConfirmBooking() throws Exception {
         // Arrange: create a salon with a master; CLIENT books a slot
         String ownerEmail = "sm-confirm-owner-" + System.nanoTime() + "@beautica.test";

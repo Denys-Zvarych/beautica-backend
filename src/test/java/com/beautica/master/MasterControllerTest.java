@@ -15,7 +15,6 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.master.service.MasterService;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;

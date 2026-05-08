@@ -37,7 +37,7 @@ public class SlotCalculationService {
     private final MasterServiceRepository masterServiceRepository;
     private final ScheduleExceptionRepository scheduleExceptionRepository;
     private final TimeSlotCalculator timeSlotCalculator;
-    private final Clock clock;
+    private final Clock kyivClock;
 
     public SlotCalculationService(
             WorkingHoursRepository workingHoursRepository,
@@ -51,14 +51,14 @@ public class SlotCalculationService {
         this.masterServiceRepository = masterServiceRepository;
         this.scheduleExceptionRepository = scheduleExceptionRepository;
         this.timeSlotCalculator = timeSlotCalculator;
-        this.clock = clock;
+        this.kyivClock = clock.withZone(KYIV);
     }
 
     @Transactional(readOnly = true)
     @Cacheable(value = "available-slots", key = "#masterId + ':' + #date + ':' + #masterServiceId")
     public List<AvailableSlotResponse> getAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {
         // Step 1: date range validation — cheapest guard, no DB
-        LocalDate today = LocalDate.now(clock.withZone(KYIV));
+        LocalDate today = LocalDate.now(kyivClock);
         if (date.isBefore(today)) {
             throw new BusinessException("date is in the past");
         }

@@ -27,7 +27,6 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.annotation.Caching;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
@@ -169,11 +168,7 @@ public class ServiceCatalogService {
     }
 
     @Transactional
-    @Caching(evict = {
-        @CacheEvict(value = "masterServices", allEntries = true),
-        @CacheEvict(value = "service-types", allEntries = true),
-        @CacheEvict(value = "service-categories", allEntries = true)
-    })
+    @CacheEvict(value = "masterServices", allEntries = true)
     // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller — any future caller must enforce the same guard.
     public void deactivateServiceDefinition(UUID serviceDefId) {
         ServiceDefinition definition = serviceRepository.findById(serviceDefId)

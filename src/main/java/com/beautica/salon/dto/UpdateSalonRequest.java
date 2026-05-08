@@ -9,6 +9,7 @@ public record UpdateSalonRequest(
         @Size(max = 100) String city,
         @Size(max = 100) String region,
         @Size(max = 500) String address,
+        @Pattern(regexp = "^[+\\d\\s\\-()/]*$", message = "Invalid phone format")
         @Size(max = 20) String phone,
         @Pattern(regexp = "^$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
                 message = "Must be a valid Instagram URL or empty")

@@ -4,6 +4,7 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
@@ -16,6 +17,7 @@ import static org.mockito.Mockito.when;
 class ServiceDefinitionResponseTest {
 
     @Test
+    @DisplayName("all fields are mapped correctly when a fully-populated ServiceDefinition is converted")
     void should_mapAllFields_when_serviceDefinitionMapped() {
         UUID id = UUID.randomUUID();
 
@@ -51,6 +53,7 @@ class ServiceDefinitionResponseTest {
     }
 
     @Test
+    @DisplayName("description is null in response when service definition has no description")
     void should_preserveNullDescription_when_descriptionIsNull() {
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -68,6 +71,7 @@ class ServiceDefinitionResponseTest {
     }
 
     @Test
+    @DisplayName("category is null in response when service definition has no category")
     void should_preserveNullCategory_when_categoryIsNull() {
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -85,6 +89,7 @@ class ServiceDefinitionResponseTest {
     }
 
     @Test
+    @DisplayName("base price is null in response when service definition has no base price")
     void should_preserveNullBasePrice_when_basePriceIsNull() {
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -102,6 +107,7 @@ class ServiceDefinitionResponseTest {
     }
 
     @Test
+    @DisplayName("service type id and name are mapped when a ServiceType is linked to the definition")
     void should_mapServiceTypeFields_when_serviceTypeIsSet() {
         UUID serviceTypeId = UUID.randomUUID();
 
@@ -126,6 +132,7 @@ class ServiceDefinitionResponseTest {
     }
 
     @Test
+    @DisplayName("service type id and name are null when no ServiceType is linked to the definition")
     void should_returnNullServiceTypeFields_when_serviceTypeIsNull() {
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())

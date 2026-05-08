@@ -133,7 +133,7 @@ class MasterServiceRepositoryTest {
         em.flush();
 
         List<MasterServiceAssignment> results =
-                masterServiceRepository.findByMasterIdAndIsActiveTrue(master.getId());
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId());
 
         assertThat(results).hasSize(2);
         assertThat(results).extracting(a -> a.getServiceDefinition().getId())

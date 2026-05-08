@@ -206,7 +206,7 @@ class BookingServiceTest {
     // ── createBooking ──────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_createBooking_when_slotAvailableAndNoConflict")
+    @DisplayName("booking is created and saved when the slot is free and no overlap exists")
     void should_createBooking_when_slotAvailableAndNoConflict() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
@@ -229,7 +229,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnExistingBooking_when_idempotencyKeyMatches")
+    @DisplayName("existing booking is returned without saving when idempotency key already exists")
     void should_returnExistingBooking_when_idempotencyKeyMatches() {
         String key = "unique-key-123";
         Booking existing = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -243,7 +243,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw409_when_slotOverlapsExistingBooking")
+    @DisplayName("409 Conflict is thrown when the requested slot overlaps an existing booking")
     void should_throw409_when_slotOverlapsExistingBooking() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
@@ -257,7 +257,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw404_when_masterNotFound")
+    @DisplayName("404 NotFoundException is thrown when the master does not exist")
     void should_throw404_when_masterNotFound() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
 
@@ -266,7 +266,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw404_when_masterServiceNotFound")
+    @DisplayName("404 NotFoundException is thrown when the master service assignment does not exist")
     void should_throw404_when_masterServiceNotFound() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.empty());
@@ -276,7 +276,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_startsAtInThePast")
+    @DisplayName("400 is thrown when the requested start time is in the past")
     void should_throw400_when_startsAtInThePast() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
@@ -295,7 +295,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_startsAtMoreThan180DaysAhead")
+    @DisplayName("400 is thrown when the requested start time is more than 180 days in the future")
     void should_throw400_when_startsAtMoreThan180DaysAhead() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
@@ -314,7 +314,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_snapshotPriceAndDuration_when_masterServiceHasOverrides")
+    @DisplayName("price and duration are snapshotted from the override values when the master service has overrides")
     void should_snapshotPriceAndDuration_when_masterServiceHasOverrides() {
         MasterServiceAssignment msaWithOverrides = buildMsa(
                 masterServiceId, master, serviceDef, new BigDecimal("250.00"), 45);
@@ -336,7 +336,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_fallBackToBaseValues_when_noOverrides")
+    @DisplayName("price and duration are snapshotted from base values when no overrides are set")
     void should_fallBackToBaseValues_when_noOverrides() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
@@ -354,7 +354,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_enqueueNewBookingNotification_when_bookingCreated")
+    @DisplayName("new-booking notification is enqueued when the booking is successfully created")
     void should_enqueueNewBookingNotification_when_bookingCreated() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
@@ -371,7 +371,7 @@ class BookingServiceTest {
     // ── confirmBooking ─────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_confirmBooking_when_authorizedActorConfirms")
+    @DisplayName("booking moves to CONFIRMED and notification is enqueued when authorized actor confirms")
     void should_confirmBooking_when_authorizedActorConfirms() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -385,7 +385,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_unauthorizedActorConfirms")
+    @DisplayName("ForbiddenException is thrown when an unauthorized actor attempts to confirm a booking")
     void should_throwForbidden_when_unauthorizedActorConfirms() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -398,7 +398,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_confirmingNonPendingBooking")
+    @DisplayName("400 is thrown when confirm is called on a booking that is not in PENDING status")
     void should_throw400_when_confirmingNonPendingBooking() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
@@ -413,7 +413,7 @@ class BookingServiceTest {
     // ── declineBooking ─────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_declineBooking_when_authorizedActorDeclines")
+    @DisplayName("booking moves to DECLINED and slot cache is evicted when authorized actor declines")
     void should_declineBooking_when_authorizedActorDeclines() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -434,7 +434,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_declineCalledWithoutCancellationReason")
+    @DisplayName("400 is thrown when decline is called without a cancellation reason")
     void should_throw400_when_declineCalledWithoutCancellationReason() {
         UUID actorId = UUID.randomUUID();
         StatusUpdateRequest req = new StatusUpdateRequest(null, "some comment");
@@ -448,7 +448,7 @@ class BookingServiceTest {
     // ── completeBooking ────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_completeBooking_when_confirmedBookingCompleted")
+    @DisplayName("booking moves to COMPLETED and notification is enqueued when a CONFIRMED booking is completed")
     void should_completeBooking_when_confirmedBookingCompleted() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
@@ -462,7 +462,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_completingPendingBooking")
+    @DisplayName("400 is thrown when complete is called on a booking that is still PENDING")
     void should_throw400_when_completingPendingBooking() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
@@ -477,7 +477,7 @@ class BookingServiceTest {
     // ── notCompleteBooking ─────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_markNotCompleted_when_masterRecordsNoShow")
+    @DisplayName("booking moves to NOT_COMPLETED with CLIENT_NO_SHOW reason when master records a no-show")
     void should_markNotCompleted_when_masterRecordsNoShow() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
@@ -493,7 +493,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_notCompleteCalledWithoutCancellationReason")
+    @DisplayName("400 is thrown when not-complete is called without a cancellation reason")
     void should_throw400_when_notCompleteCalledWithoutCancellationReason() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
@@ -509,7 +509,7 @@ class BookingServiceTest {
     // ── cancelBooking ──────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_cancelBooking_when_clientCancelsPendingBooking")
+    @DisplayName("PENDING booking moves to CANCELLED and slot cache is evicted when client cancels")
     void should_cancelBooking_when_clientCancelsPendingBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
@@ -528,7 +528,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_cancelBooking_when_clientCancelsConfirmedBooking")
+    @DisplayName("CONFIRMED booking moves to CANCELLED and slot cache is evicted when client cancels")
     void should_cancelBooking_when_clientCancelsConfirmedBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
@@ -547,7 +547,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_differentClientAttemptsToCancel")
+    @DisplayName("ForbiddenException is thrown when a different client attempts to cancel another client's booking")
     void should_throwForbidden_when_differentClientAttemptsToCancel() {
         // Role guard is at the controller layer (hasRole CLIENT).
         // At the service layer the ownership check fires: booking.client.id must equal actorId.
@@ -562,7 +562,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_salonOwnerAttemptsToCancel")
+    @DisplayName("ForbiddenException is thrown at the service ownership check when a salon owner attempts to cancel")
     void should_throwForbidden_when_salonOwnerAttemptsToCancel() {
         // A SALON_OWNER UUID that does NOT match the booking's client UUID must be rejected
         // by the ownership check inside cancelBooking (controller already blocks non-CLIENT
@@ -577,7 +577,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_clientCancelsCompletedBooking")
+    @DisplayName("400 is thrown when a client attempts to cancel an already COMPLETED booking")
     void should_throw400_when_clientCancelsCompletedBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_CANCELLED, null);
@@ -592,7 +592,7 @@ class BookingServiceTest {
     // ── listBookings ───────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnFilteredBookings_when_salonOwnerListsWithStatus")
+    @DisplayName("filtered bookings page is returned when salon owner queries with a specific status")
     void should_returnFilteredBookings_when_salonOwnerListsWithStatus() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -614,7 +614,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnAllBookings_when_salonOwnerListsWithoutStatus")
+    @DisplayName("all bookings page is returned when salon owner queries without a status filter")
     void should_returnAllBookings_when_salonOwnerListsWithoutStatus() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -636,7 +636,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwBusinessException_when_salonOwnerHasNoSalonId")
+    @DisplayName("BusinessException is thrown when a salon owner's account has no salon ID linked")
     void should_throwBusinessException_when_salonOwnerHasNoSalonId() {
         UUID actorId = UUID.randomUUID();
         User salonOwner = buildUser(actorId, Role.SALON_OWNER);
@@ -652,7 +652,7 @@ class BookingServiceTest {
     // ── getBooking ─────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_throw403_when_clientBReadsClientABooking")
+    @DisplayName("ForbiddenException is thrown when client B attempts to read client A's booking")
     void should_throw403_when_clientBReadsClientABooking() {
         UUID clientBId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);

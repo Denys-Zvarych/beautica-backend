@@ -210,7 +210,7 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("deactivateSalon — makes exactly one repository call (findByIdAndOwnerId only)")
+    @DisplayName("deactivateSalon — calls findByIdAndOwnerId, save, and findById(user) but no other repository methods")
     void should_makeExactlyOneRepositoryCall_when_deactivateSalon() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
