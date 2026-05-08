@@ -5,6 +5,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceType;
@@ -34,7 +35,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class, CacheConfig.class},
+        classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class, CatalogCategoryLookup.class, CacheConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
@@ -57,6 +58,7 @@ class ServiceCatalogServiceCacheTest {
         cacheManager.getCache("service-type-by-id").clear();
         cacheManager.getCache("service-types").clear();
         cacheManager.getCache("service-type-search").clear();
+        cacheManager.getCache("service-categories").clear();
     }
 
     @Test
@@ -159,13 +161,20 @@ class ServiceCatalogServiceCacheTest {
     @DisplayName("second searchServiceTypes(categoryId, null) hits cache — category-scoped repo method called once")
     void should_hitCache_when_searchServiceTypesCalledTwiceWithSameCategoryId() {
         UUID categoryId = UUID.randomUUID();
-        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
+        CatalogCategory category = CatalogCategory.builder()
+                .id(categoryId)
+                .nameUk("Test")
+                .nameEn("Test")
+                .sortOrder(1)
+                .build();
+        when(catalogCategoryRepository.findAllByOrderBySortOrderAsc()).thenReturn(List.of(category));
         when(serviceTypeRepository.findByCategoryWithCategory(categoryId)).thenReturn(List.of());
 
         serviceCatalogService.searchServiceTypes(categoryId, null);
         serviceCatalogService.searchServiceTypes(categoryId, null);
 
         verify(serviceTypeRepository, times(1)).findByCategoryWithCategory(categoryId);
+        verify(catalogCategoryRepository, times(1)).findAllByOrderBySortOrderAsc();
     }
 
     @Test
@@ -183,7 +192,13 @@ class ServiceCatalogServiceCacheTest {
     @DisplayName("(q, categoryId) and (q, null) are cached independently — repo called once per distinct key")
     void should_cacheIndependently_when_queryWithAndWithoutCategoryId() {
         UUID categoryId = UUID.randomUUID();
-        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
+        CatalogCategory category = CatalogCategory.builder()
+                .id(categoryId)
+                .nameUk("Test")
+                .nameEn("Test")
+                .sortOrder(1)
+                .build();
+        when(catalogCategoryRepository.findAllByOrderBySortOrderAsc()).thenReturn(List.of(category));
         when(serviceTypeRepository.searchByName(eq("ман"), any())).thenReturn(List.of());
         when(serviceTypeRepository.searchByNameAndCategory(eq("ман"), eq(categoryId), any())).thenReturn(List.of());
 
@@ -194,5 +209,16 @@ class ServiceCatalogServiceCacheTest {
 
         verify(serviceTypeRepository, times(1)).searchByName(eq("ман"), any());
         verify(serviceTypeRepository, times(1)).searchByNameAndCategory(eq("ман"), eq(categoryId), any());
+    }
+
+    @Test
+    @DisplayName("second call to getCategories does not hit repository — service-categories cache is effective")
+    void should_hitCache_when_getCategoriesCalledTwice() {
+        when(catalogCategoryRepository.findAllByOrderBySortOrderAsc()).thenReturn(List.of());
+
+        serviceCatalogService.getCategories();
+        serviceCatalogService.getCategories();
+
+        verify(catalogCategoryRepository, times(1)).findAllByOrderBySortOrderAsc();
     }
 }

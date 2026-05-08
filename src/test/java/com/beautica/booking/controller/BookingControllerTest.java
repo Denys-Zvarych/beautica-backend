@@ -277,6 +277,59 @@ class BookingControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
+    @Test
+    @DisplayName("POST / — 201 when Idempotency-Key header is absent")
+    void should_return201_when_idempotencyKeyHeaderIsNull() throws Exception {
+        var clientId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateBookingRequest(masterId, serviceId, ZonedDateTime.now().plusDays(1), null, null));
+        when(bookingService.createBooking(eq(clientId), any(), any()))
+                .thenReturn(stubResponse(bookingId, clientId, masterId, serviceId));
+
+        mockMvc.perform(post(BOOKINGS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated());
+    }
+
+    @Test
+    @DisplayName("POST / — 400 when Idempotency-Key header exceeds 64 characters")
+    void should_return400_when_idempotencyKeyHeaderExceeds64Chars() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), ZonedDateTime.now().plusDays(1), null, null));
+        var oversizedKey = "A".repeat(65);
+
+        mockMvc.perform(post(BOOKINGS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .header("Idempotency-Key", oversizedKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("POST / — 400 when Idempotency-Key header contains control characters")
+    void should_return400_when_idempotencyKeyHeaderContainsControlChars() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), ZonedDateTime.now().plusDays(1), null, null));
+
+        mockMvc.perform(post(BOOKINGS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .header("Idempotency-Key", "valid-prefix\tinvalid")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+    }
+
     // ── GET /{bookingId} ─────────────────────────────────────────────────────
 
     @Test
@@ -347,6 +400,18 @@ class BookingControllerTest {
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/confirm — 403 when SALON_ADMIN attempts to confirm booking")
+    void should_return403_when_salonAdminAttemptsToConfirm() throws Exception {
+        var adminId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
+                        .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
                         .with(csrf()))
                 .andExpect(status().isForbidden());
     }
@@ -431,6 +496,21 @@ class BookingControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /{bookingId}/decline — 403 when SALON_ADMIN attempts to decline booking")
+    void should_return403_when_salonAdminAttemptsToDecline() throws Exception {
+        var adminId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
+                        .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
     @DisplayName("PATCH /{bookingId}/decline — 403 when CLIENT attempts to decline booking")
     void should_return403_when_clientDeclinesBooking() throws Exception {
         var clientId = UUID.randomUUID();
@@ -493,6 +573,18 @@ class BookingControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /{bookingId}/complete — 403 when SALON_ADMIN attempts to complete booking")
+    void should_return403_when_salonAdminAttemptsToComplete() throws Exception {
+        var adminId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/complete")
+                        .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
     @DisplayName("PATCH /{bookingId}/complete — 403 when CLIENT attempts to complete booking")
     void should_return403_when_clientCompletesBooking() throws Exception {
         var clientId = UUID.randomUUID();
@@ -533,6 +625,21 @@ class BookingControllerTest {
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/not-complete — 403 when SALON_ADMIN attempts to mark booking not-completed")
+    void should_return403_when_salonAdminAttemptsToNotComplete() throws Exception {
+        var adminId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
+                        .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))

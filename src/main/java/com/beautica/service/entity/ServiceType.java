@@ -2,6 +2,8 @@ package com.beautica.service.entity;
 
 import com.beautica.common.AuditableEntity;
 import jakarta.persistence.*;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 import lombok.*;
 import java.util.UUID;
 
@@ -38,6 +40,8 @@ public class ServiceType extends AuditableEntity {
     @Column(name = "name_en", length = 255)
     private String nameEn;
 
+    @Pattern(regexp = "^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    @Size(max = 255)
     @Column(nullable = false, unique = true, length = 255)
     private String slug;
 

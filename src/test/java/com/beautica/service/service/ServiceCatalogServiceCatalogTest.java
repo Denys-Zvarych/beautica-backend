@@ -8,7 +8,6 @@ import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.ServiceType;
-import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,7 +16,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
@@ -44,7 +42,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private SalonRepository salonRepository;
     @Mock private MasterRepository masterRepository;
-    @Mock private CatalogCategoryRepository catalogCategoryRepository;
+    @Mock private CatalogCategoryLookup catalogCategoryLookup;
     @Mock private EmailService emailService;
     @Mock private ServiceTypeLookup serviceTypeLookup;
     @Mock private ServiceTypeSearchService serviceTypeSearchService;
@@ -58,7 +56,7 @@ class ServiceCatalogServiceCatalogTest {
                 masterServiceRepository,
                 salonRepository,
                 masterRepository,
-                catalogCategoryRepository,
+                catalogCategoryLookup,
                 emailService,
                 serviceTypeLookup,
                 serviceTypeSearchService
@@ -71,10 +69,10 @@ class ServiceCatalogServiceCatalogTest {
     @Test
     @DisplayName("returns categories ordered by sortOrder from repository")
     void should_returnCategories_when_repositoryReturnsSortedList() {
-        var cat1 = CatalogCategory.builder().nameUk("Нігті").nameEn("Nails").sortOrder(1).build();
-        var cat2 = CatalogCategory.builder().nameUk("Брови").nameEn("Brows").sortOrder(2).build();
+        var cat1 = new CatalogCategoryResponse(UUID.randomUUID(), "Нігті", "Nails", 1);
+        var cat2 = new CatalogCategoryResponse(UUID.randomUUID(), "Брови", "Brows", 2);
 
-        when(catalogCategoryRepository.findAllByOrderBySortOrderAsc()).thenReturn(List.of(cat1, cat2));
+        when(catalogCategoryLookup.getAll()).thenReturn(List.of(cat1, cat2));
 
         List<CatalogCategoryResponse> result = service.getCategories();
 
@@ -86,7 +84,7 @@ class ServiceCatalogServiceCatalogTest {
     @Test
     @DisplayName("returns empty list when no categories exist")
     void should_returnEmptyList_when_noCategoriesExist() {
-        when(catalogCategoryRepository.findAllByOrderBySortOrderAsc()).thenReturn(List.of());
+        when(catalogCategoryLookup.getAll()).thenReturn(List.of());
 
         List<CatalogCategoryResponse> result = service.getCategories();
 
@@ -134,7 +132,8 @@ class ServiceCatalogServiceCatalogTest {
         when(type.getNameEn()).thenReturn("Manicure");
         when(type.getSlug()).thenReturn("manicure");
 
-        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
+        when(catalogCategoryLookup.getAll()).thenReturn(
+                List.of(new CatalogCategoryResponse(categoryId, "Нігті", "Nails", 1)));
         when(serviceTypeLookup.getByCategory(categoryId)).thenReturn(List.of(type));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(categoryId, null);
@@ -188,7 +187,8 @@ class ServiceCatalogServiceCatalogTest {
         UUID categoryId = UUID.randomUUID();
         var expected = new ServiceTypeResponse(UUID.randomUUID(), categoryId, "Манікюр", "Manicure", "manicure");
 
-        when(catalogCategoryRepository.existsById(categoryId)).thenReturn(true);
+        when(catalogCategoryLookup.getAll()).thenReturn(
+                List.of(new CatalogCategoryResponse(categoryId, "Нігті", "Nails", 1)));
         when(serviceTypeSearchService.searchByName("ман", categoryId)).thenReturn(List.of(expected));
 
         List<ServiceTypeResponse> result = service.searchServiceTypes(categoryId, "Ман");
@@ -303,14 +303,14 @@ class ServiceCatalogServiceCatalogTest {
 
         service.searchServiceTypes(null, null);
 
-        verify(catalogCategoryRepository, never()).existsById(any());
+        verify(catalogCategoryLookup, never()).getAll();
     }
 
     @Test
     @DisplayName("should throw NotFoundException when categoryId does not exist")
     void should_throwNotFoundException_when_categoryIdDoesNotExist() {
         UUID unknownCategoryId = UUID.randomUUID();
-        when(catalogCategoryRepository.existsById(unknownCategoryId)).thenReturn(false);
+        when(catalogCategoryLookup.getAll()).thenReturn(List.of());
 
         assertThatThrownBy(() -> service.searchServiceTypes(unknownCategoryId, null))
                 .isInstanceOf(NotFoundException.class)

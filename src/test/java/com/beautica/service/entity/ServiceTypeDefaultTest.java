@@ -39,4 +39,43 @@ class ServiceTypeDefaultTest {
                 .as("ServiceType.active must honour an explicit false value from the builder")
                 .isFalse();
     }
+
+    @Test
+    @DisplayName("should_violateSize_when_slugExceeds255Chars")
+    void should_violateSize_when_slugExceeds255Chars() {
+        var type = ServiceType.builder()
+                .nameUk("Test")
+                .slug("s".repeat(256))
+                .build();
+
+        var violations = jakarta.validation.Validation
+                .buildDefaultValidatorFactory().getValidator().validate(type);
+
+        assertThat(violations)
+                .as("@Size(max=255) must fire when slug has 256 characters")
+                .anyMatch(v -> v.getPropertyPath().toString().equals("slug"));
+    }
+
+    @Test
+    @DisplayName("should_notViolateSize_when_slugHasExactly255Chars")
+    void should_notViolateSize_when_slugHasExactly255Chars() {
+        // 254 'a' chars + one '-b' suffix = 253 + 2 = 255 chars — max allowed
+        var slug = "a".repeat(253) + "-b";
+        var type = ServiceType.builder()
+                .nameUk("Test")
+                .slug(slug)
+                .build();
+
+        var sizeViolations = jakarta.validation.Validation
+                .buildDefaultValidatorFactory().getValidator().validate(type)
+                .stream()
+                .filter(v -> v.getPropertyPath().toString().equals("slug")
+                        && v.getConstraintDescriptor().getAnnotation().annotationType()
+                                .equals(jakarta.validation.constraints.Size.class))
+                .toList();
+
+        assertThat(sizeViolations)
+                .as("@Size(max=255) must NOT fire for exactly 255 characters")
+                .isEmpty();
+    }
 }

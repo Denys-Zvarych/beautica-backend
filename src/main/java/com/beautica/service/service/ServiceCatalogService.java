@@ -19,7 +19,6 @@ import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
-import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import lombok.RequiredArgsConstructor;
@@ -45,7 +44,7 @@ public class ServiceCatalogService {
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
-    private final CatalogCategoryRepository catalogCategoryRepository;
+    private final CatalogCategoryLookup catalogCategoryLookup;
     private final EmailService emailService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
@@ -179,19 +178,17 @@ public class ServiceCatalogService {
         }
     }
 
-    @Cacheable("service-categories")
     @Transactional(readOnly = true)
     public List<CatalogCategoryResponse> getCategories() {
-        return catalogCategoryRepository.findAllByOrderBySortOrderAsc()
-                .stream()
-                .map(CatalogCategoryResponse::from)
-                .toList();
+        return catalogCategoryLookup.getAll();
     }
 
     @Transactional(readOnly = true)
     public List<ServiceTypeResponse> searchServiceTypes(@Nullable UUID categoryId, @Nullable String q) {
-        if (categoryId != null && !catalogCategoryRepository.existsById(categoryId)) {
-            throw new NotFoundException("Category not found");
+        if (categoryId != null) {
+            boolean exists = catalogCategoryLookup.getAll().stream()
+                    .anyMatch(c -> c.id().equals(categoryId));
+            if (!exists) throw new NotFoundException("Category not found");
         }
         // Intentional duplication of the controller's @Size(min=3) constraint: this guard
         // defends non-HTTP callers (internal services, tests, future programmatic callers)
