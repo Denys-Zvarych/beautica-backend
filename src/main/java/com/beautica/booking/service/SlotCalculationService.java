@@ -3,6 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.TimeSlotCalculator;
@@ -21,7 +22,6 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
-import java.time.ZoneId;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -29,7 +29,6 @@ import java.util.UUID;
 @Service
 public class SlotCalculationService {
 
-    private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final Duration SLOT_STEP = Duration.ofMinutes(30);
 
     private final WorkingHoursRepository workingHoursRepository;
@@ -51,7 +50,7 @@ public class SlotCalculationService {
         this.masterServiceRepository = masterServiceRepository;
         this.scheduleExceptionRepository = scheduleExceptionRepository;
         this.timeSlotCalculator = timeSlotCalculator;
-        this.kyivClock = clock.withZone(KYIV);
+        this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
 
     @Transactional(readOnly = true)
@@ -105,8 +104,8 @@ public class SlotCalculationService {
         }
 
         // Step 7: compute day window in OffsetDateTime for the booking query
-        OffsetDateTime dayStart = date.atStartOfDay(KYIV).toOffsetDateTime();
-        OffsetDateTime dayEnd   = date.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime dayStart = date.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime dayEnd   = date.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
         // Step 8: load existing bookings that overlap the day window (PENDING + CONFIRMED only)
         List<TimeRange> occupied = bookingRepository
@@ -127,8 +126,8 @@ public class SlotCalculationService {
         // Step 10: map to response DTOs with Kyiv zone
         return free.stream()
                 .map(r -> new AvailableSlotResponse(
-                        r.start().atZone(KYIV),
-                        r.end().atZone(KYIV)))
+                        r.start().atZone(TimeZones.KYIV),
+                        r.end().atZone(TimeZones.KYIV)))
                 .toList();
     }
 

@@ -3,29 +3,21 @@ package com.beautica.user;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.beautica.config.WebMvcTestSupport;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
-import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
-import org.springframework.web.filter.OncePerRequestFilter;
 
-import java.io.IOException;
 import java.util.List;
 import java.util.UUID;
 
@@ -69,55 +61,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(UserController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
+@Import(WebMvcTestSupport.class)
 @DisplayName("UserController — @WebMvcTest slice")
 class UserControllerTest {
-
-    // ── Pass-through filter overrides ─────────────────────────────────────────
-
-    /**
-     * Replaces both {@code @Component} filters with stateless pass-through beans so
-     * the filter chain reaches the DispatcherServlet. Without this, Mockito mocks
-     * these filters as no-ops and requests never reach any handler.
-     */
-    @TestConfiguration
-    static class PassThroughFilters {
-
-        @Bean
-        @Primary
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            // Pass-through: never parses a real JWT; the test injects auth directly
-            // via SecurityMockMvcRequestPostProcessors.authentication().
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-            };
-        }
-
-        @Bean
-        @Primary
-        AuthRateLimitFilter authRateLimitFilter() {
-            // Pass-through: rate limiting is not under test in a controller slice.
-            return new AuthRateLimitFilter(null, null, null) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-
-                @Override
-                public boolean shouldNotFilter(HttpServletRequest request) {
-                    return true;
-                }
-            };
-        }
-    }
 
     // ── Slice infrastructure ──────────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 package com.beautica.salon;
 
 import com.beautica.auth.Role;
-import com.beautica.common.TestConstants;
+import com.beautica.TestConstants;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;

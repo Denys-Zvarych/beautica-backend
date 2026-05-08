@@ -4,17 +4,14 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteResponse;
-import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.config.WebMvcTestSupport;
 import com.beautica.salon.controller.SalonController;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -25,7 +22,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
@@ -40,7 +37,6 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
-import java.io.IOException;
 import java.util.List;
 import java.util.UUID;
 
@@ -69,64 +65,32 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(SalonController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
+@Import(WebMvcTestSupport.class)
 @DisplayName("SalonController — @WebMvcTest slice")
 class SalonControllerTest {
 
     private static final Logger log = LoggerFactory.getLogger(SalonControllerTest.class);
     private static final String SALONS_URL = "/api/v1/salons";
 
-    // ── Pass-through filter overrides ─────────────────────────────────────────
+    // ── Security configuration ────────────────────────────────────────────────
 
+    /**
+     * Minimal {@link SecurityFilterChain} for the {@code @WebMvcTest} slice.
+     *
+     * <p>Mirrors the permit-all rules from production {@code SecurityConfig} for the
+     * endpoints under test, while keeping CSRF disabled and session stateless so that
+     * {@code SecurityMockMvcRequestPostProcessors.authentication()} injects auth tokens
+     * correctly.
+     *
+     * <p>The pass-through {@link JwtAuthenticationFilter} is registered via
+     * {@code addFilterBefore} so the filter chain position matches production, but the
+     * filter itself is a no-op — authentication is injected directly by the test via
+     * {@code authentication()}.
+     */
     @TestConfiguration
     @EnableMethodSecurity
-    static class PassThroughFilters {
+    static class SecurityConfig {
 
-        @Bean
-        @Primary
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-            };
-        }
-
-        @Bean
-        @Primary
-        AuthRateLimitFilter authRateLimitFilter() {
-            return new AuthRateLimitFilter(null, null, null) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-
-                @Override
-                public boolean shouldNotFilter(HttpServletRequest request) {
-                    return true;
-                }
-            };
-        }
-
-        /**
-         * Minimal {@link SecurityFilterChain} for the {@code @WebMvcTest} slice.
-         *
-         * <p>Mirrors the permit-all rules from production {@code SecurityConfig} for the
-         * endpoints under test, while keeping CSRF disabled and session stateless so that
-         * {@code SecurityMockMvcRequestPostProcessors.authentication()} injects auth tokens
-         * correctly.
-         *
-         * <p>The pass-through {@link JwtAuthenticationFilter} is registered via
-         * {@code addFilterBefore} so the filter chain position matches production, but the
-         * filter itself is a no-op — authentication is injected directly by the test via
-         * {@code authentication()}.
-         */
         @Bean
         SecurityFilterChain testSecurityFilterChain(HttpSecurity http,
                 JwtAuthenticationFilter jwtFilter) throws Exception {

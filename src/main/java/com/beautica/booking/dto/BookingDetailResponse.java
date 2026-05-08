@@ -2,9 +2,9 @@ package com.beautica.booking.dto;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.common.TimeZones;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
-import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.UUID;
@@ -32,8 +32,6 @@ public record BookingDetailResponse(
         String clientComment,
         String providerComment
 ) {
-    private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
-
     public static BookingDetailResponse from(Booking booking) {
         return new BookingDetailResponse(
                 booking.getId(),
@@ -42,8 +40,8 @@ public record BookingDetailResponse(
                 booking.getMasterService().getId(),
                 booking.getMasterService().getServiceDefinition().getName(),
                 booking.getStatus(),
-                booking.getStartsAt().atZoneSameInstant(KYIV),
-                booking.getEndsAt().atZoneSameInstant(KYIV),
+                booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV),
+                booking.getEndsAt().atZoneSameInstant(TimeZones.KYIV),
                 booking.getPriceAtBooking(),
                 booking.getDurationMinutesAtBooking(),
                 booking.getCreatedAt().atOffset(ZoneOffset.UTC),

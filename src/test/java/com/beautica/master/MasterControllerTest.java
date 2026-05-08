@@ -3,10 +3,10 @@ package com.beautica.master;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.config.WebMvcTestSupport;
 import com.beautica.master.controller.MasterController;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
@@ -15,11 +15,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.master.service.MasterService;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import java.io.IOException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -29,7 +25,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -78,50 +74,18 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(MasterController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
+@Import(WebMvcTestSupport.class)
 @DisplayName("MasterController — @WebMvcTest slice")
 class MasterControllerTest {
 
     private static final Logger log = LoggerFactory.getLogger(MasterControllerTest.class);
     private static final String MASTERS_URL = "/api/v1/masters";
 
-    // ── Pass-through filter overrides ─────────────────────────────────────────
+    // ── Security configuration ────────────────────────────────────────────────
 
     @TestConfiguration
     @EnableMethodSecurity
-    static class PassThroughFilters {
-
-        @Bean
-        @Primary
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-            };
-        }
-
-        @Bean
-        @Primary
-        AuthRateLimitFilter authRateLimitFilter() {
-            return new AuthRateLimitFilter(null, null, null) {
-                @Override
-                protected void doFilterInternal(HttpServletRequest req,
-                                                HttpServletResponse res,
-                                                FilterChain chain)
-                        throws ServletException, IOException {
-                    chain.doFilter(req, res);
-                }
-
-                @Override
-                public boolean shouldNotFilter(HttpServletRequest request) {
-                    return true;
-                }
-            };
-        }
+    static class SecurityConfig {
 
         @Bean
         SecurityFilterChain testSecurityFilterChain(HttpSecurity http,

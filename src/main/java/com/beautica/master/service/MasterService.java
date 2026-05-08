@@ -3,6 +3,7 @@ package com.beautica.master.service;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.TimeZones;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterDetailResponse;
@@ -28,7 +29,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
-import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -38,8 +38,6 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class MasterService {
-
-    private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
 
     private final MasterRepository masterRepository;
     private final UserRepository userRepository;
@@ -106,7 +104,7 @@ public class MasterService {
 
         authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
-        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterId(masterId)
+        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)
                 .stream()
                 .collect(Collectors.toMap(WorkingHours::getDayOfWeek, wh -> wh));
 
@@ -188,8 +186,8 @@ public class MasterService {
     public Page<BookingResponse> getMasterCalendar(UUID actorUserId, LocalDate from, LocalDate to, Pageable pageable) {
         Master master = masterRepository.findByUserId(actorUserId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-        OffsetDateTime fromOdt = from.atStartOfDay(KYIV).toOffsetDateTime();
-        OffsetDateTime toOdt = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime fromOdt = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toOdt = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         Page<Booking> page = bookingRepository.findActiveByMasterIdAndStartsAtBetweenWithGraph(
                 master.getId(), fromOdt, toOdt, pageable);
         return page.map(BookingResponse::from);

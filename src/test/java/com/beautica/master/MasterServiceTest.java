@@ -229,7 +229,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
 
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of(saved));
 
         List<WorkingHoursResponse> result =

@@ -1,5 +1,6 @@
 package com.beautica.common.util;
 
+import com.beautica.common.TimeZones;
 import org.springframework.stereotype.Component;
 
 import java.time.Clock;
@@ -7,14 +8,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
-import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 @Component
 public class TimeSlotCalculator {
-
-    private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
 
     private final Clock clock;
 
@@ -32,6 +31,10 @@ public class TimeSlotCalculator {
             Duration step,
             List<TimeRange> occupied
     ) {
+        Objects.requireNonNull(date, "date must not be null");
+        Objects.requireNonNull(workStart, "workStart must not be null");
+        Objects.requireNonNull(workEnd, "workEnd must not be null");
+
         if (serviceDuration.isNegative() || serviceDuration.isZero())
             throw new IllegalArgumentException("serviceDuration must be positive");
         if (step.isNegative() || step.isZero())
@@ -43,8 +46,8 @@ public class TimeSlotCalculator {
 
         List<TimeRange> safeOccupied = occupied != null ? occupied : List.of();
 
-        Instant workStartInst = date.atTime(workStart).atZone(KYIV).toInstant();
-        Instant workEndInst   = date.atTime(workEnd).atZone(KYIV).toInstant();
+        Instant workStartInst = date.atTime(workStart).atZone(TimeZones.KYIV).toInstant();
+        Instant workEndInst   = date.atTime(workEnd).atZone(TimeZones.KYIV).toInstant();
 
         if (workEndInst.equals(workStartInst)) {
             return List.of();
