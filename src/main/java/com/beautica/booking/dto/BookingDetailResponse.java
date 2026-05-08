@@ -12,6 +12,10 @@ import java.util.UUID;
 /**
  * PII access contract: the controller MUST verify the caller is the booking's client
  * or the assigned master/owner before invoking {@code from(booking)}.
+ *
+ * <p>{@code clientFirstName}/{@code clientLastName} are intentionally visible to SALON_MASTER
+ * actors — the master needs the client's name on their calendar. No field-level role
+ * differentiation is applied. If {@code canViewBooking} scope ever widens, audit this DTO.
  */
 public record BookingDetailResponse(
         UUID id,

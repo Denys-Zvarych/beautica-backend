@@ -18,3 +18,11 @@ logging:
     root: INFO
     com.beautica: INFO
 
+# Explicitly disable OpenAPI / Swagger in production — base config sets these false,
+# but repeating here prevents a sibling profile from accidentally re-enabling them.
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+

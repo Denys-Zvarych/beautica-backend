@@ -6,7 +6,16 @@ import lombok.*;
 import java.util.UUID;
 
 @Entity
-@Table(name = "service_types")
+@Table(
+        name = "service_types",
+        indexes = {
+                // GIN trigram indexes from V12 for Ukrainian/English name autocomplete.
+                @jakarta.persistence.Index(name = "idx_service_types_name_uk_trgm", columnList = "name_uk"),
+                @jakarta.persistence.Index(name = "idx_service_types_name_en_trgm", columnList = "name_en"),
+                // Composite partial index from V14 covering category+active filter.
+                @jakarta.persistence.Index(name = "idx_service_types_category_active", columnList = "category_id, name_uk")
+        }
+)
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor

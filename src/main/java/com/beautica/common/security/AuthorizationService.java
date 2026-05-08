@@ -228,9 +228,16 @@ public class AuthorizationService {
     }
 
     private boolean isAuthorizedToManageBooking(UUID actorId, Booking booking) {
-        // SALON_ADMIN can manage salon configuration and masters but cannot confirm/decline/complete
-        // individual bookings — only the salon OWNER and the assigned master can. This boundary
-        // keeps booking lifecycle authority at the owner level.
+        // SALON_MASTER exclusion: callers are responsible for short-circuiting before reaching here.
+        // canManageBooking() does so explicitly; other callers (enforceCanManageBooking, canViewBooking)
+        // rely on the ID-ownership checks below, which a SALON_MASTER cannot satisfy because their
+        // userId is never equal to the salon owner's userId.
+        //
+        // SALON_ADMIN exclusion: implicit via ownership semantics — SALON_ADMIN has a distinct userId
+        // from the salon owner, so the owner-ID equality check below always returns false for them.
+        // This means SALON_ADMIN cannot confirm/decline/complete individual bookings — only the salon
+        // OWNER and the assigned INDEPENDENT_MASTER can. This boundary keeps booking lifecycle
+        // authority at the owner level and must be preserved if ownership logic ever relaxes.
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             return master.getUser().getId().equals(actorId);
