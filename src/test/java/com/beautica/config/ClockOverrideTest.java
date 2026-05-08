@@ -14,16 +14,16 @@ import java.time.ZoneOffset;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(
-        classes = {ClockConfig.class, ClockOverrideTest.FixedClockConfig.class},
+        classes = {ClockOverrideTest.FixedClockConfig.class, ClockConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
-@DisplayName("ClockConfig — Clock bean can be overridden via @TestConfiguration")
+@DisplayName("ClockConfig — @ConditionalOnMissingBean is suppressed when test Clock bean is registered as 'systemClock'")
 class ClockOverrideTest {
 
     private static final Instant FIXED_INSTANT = Instant.parse("2026-05-10T09:00:00Z");
 
     @Autowired
-    @Qualifier("overriddenClock")
+    @Qualifier("systemClock")
     private Clock clock;
 
     @Test
@@ -45,8 +45,10 @@ class ClockOverrideTest {
     @TestConfiguration
     static class FixedClockConfig {
 
+        // Named "systemClock" to trigger @ConditionalOnMissingBean in ClockConfig.systemClock(),
+        // ensuring the production bean is suppressed when a test Clock bean is present.
         @Bean
-        Clock overriddenClock() {
+        Clock systemClock() {
             return Clock.fixed(Instant.parse("2026-05-10T09:00:00Z"), ZoneOffset.UTC);
         }
     }

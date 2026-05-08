@@ -102,6 +102,8 @@ public class BookingService {
                         ? bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorUserId, pageable)
                         : bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorUserId, status, pageable);
             }
+            // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings.
+            // If this restriction is ever relaxed, add a SALON_ADMIN branch scoped to their salon.
             case SALON_ADMIN -> throw new ForbiddenException("SALON_ADMIN cannot list bookings via this endpoint");
             default -> throw new ForbiddenException("Access denied");
         };
@@ -223,6 +225,8 @@ public class BookingService {
                 .client(client)
                 .master(master)
                 .masterService(msa)
+                // salon is set from master.getSalon() which is null for INDEPENDENT_MASTER.
+                // This preserves the V18 nullable salon_id column intent without an explicit check.
                 .salon(master.getSalon())
                 .status(BookingStatus.PENDING)
                 .startsAt(startsAt)

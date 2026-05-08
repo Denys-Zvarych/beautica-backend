@@ -140,6 +140,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * Matches the partial unique index {@code uq_client_idempotency_key_active}
      * which covers only PENDING and CONFIRMED rows. Filtering by status here
      * allows the planner to use the partial index rather than scanning all rows.
+     *
+     * <p>Intentional design: idempotency keys can be reused once a booking reaches a
+     * terminal state (COMPLETED, CANCELLED, etc.) — a repeat request creates a new booking.
+     * This avoids permanent client-side key exhaustion for long-lived users.
      */
     @Query("""
             SELECT b FROM Booking b
@@ -182,6 +186,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt
     );
 
+    // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
+    // Birthday-paradox probability is negligible for current master counts (<10,000)
+    // but should be revisited if the platform scales significantly.
     @Query(value = """
             SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))) sub
             """, nativeQuery = true)
