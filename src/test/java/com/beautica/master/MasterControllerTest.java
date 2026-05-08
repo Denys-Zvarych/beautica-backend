@@ -406,24 +406,40 @@ class MasterControllerTest {
                 .andExpect(status().isForbidden());
     }
 
-    // ── GET /{masterId}/slots — public ────────────────────────────────────────
+    // ── GET /{masterId}/slots — requires authentication ───────────────────────
 
     @Test
-    @DisplayName("GET /{masterId}/slots — 200 without authentication (public endpoint)")
-    void should_return200_when_publicGetAvailableSlots() throws Exception {
+    @DisplayName("GET /{masterId}/slots — 200 when authenticated client requests available slots")
+    void should_return200_when_authenticatedGetAvailableSlots() throws Exception {
         var masterId = UUID.randomUUID();
         var serviceId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
         when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(serviceId)))
                 .thenReturn(List.of());
 
-        log.debug("Act: GET {}/{}/slots without credentials — public endpoint", MASTERS_URL, masterId);
+        log.debug("Act: GET {}/{}/slots with CLIENT credentials — must return 200", MASTERS_URL, masterId);
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
+                        .param("date", "2027-01-15")
+                        .param("serviceId", serviceId.toString())
+                        .accept(MediaType.APPLICATION_JSON)
+                        .with(authenticatedAs(clientId, "client@test.com", Role.CLIENT)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").exists())
+                .andExpect(jsonPath("$.data.slots").exists());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId}/slots — 401 when unauthenticated request")
+    void should_return401_when_unauthenticatedGetAvailableSlots() throws Exception {
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/{}/slots without credentials — must return 401", MASTERS_URL, masterId);
         mockMvc.perform(get(MASTERS_URL + "/" + masterId + "/slots")
                         .param("date", "2027-01-15")
                         .param("serviceId", serviceId.toString())
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.date").exists())
-                .andExpect(jsonPath("$.data.slots").exists());
+                .andExpect(status().isUnauthorized());
     }
 
     @Test

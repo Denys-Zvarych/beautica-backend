@@ -46,6 +46,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
+@DisplayName("SlotCalculationService — unit")
 class SlotCalculationServiceTest {
 
     // Fixed clock: 2026-05-07T00:00:00Z — Kyiv is UTC+3 so this is 2026-05-07T03:00 Kyiv
@@ -80,6 +81,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("should return empty list when no working hours exist for the requested day")
     void should_returnEmpty_when_noWorkingHoursForRequestedDay() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -114,6 +116,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("should return empty list when master has a schedule exception on the requested date")
     void should_returnEmpty_when_masterHasScheduleException() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -157,6 +160,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("should throw 400 BusinessException when the requested date is in the past")
     void should_throw400_when_dateIsInThePast() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -171,6 +175,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("should throw 400 BusinessException when the requested date is more than 180 days ahead")
     void should_throw400_when_dateMoreThan180DaysAhead() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -185,6 +190,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("should delegate to calculator when working hours exist and no schedule exception is present")
     void should_delegateToCalculator_when_workingHoursExistAndNoException() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -249,6 +255,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("should use the master service duration override when one is set, ignoring the base duration")
     void should_useOverrideDuration_when_masterServiceHasDurationOverride() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -315,6 +322,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
+    @DisplayName("should throw 400 BusinessException when total service duration including buffer exceeds 600 minutes")
     void should_throw400_when_totalDurationExceedsMaximum() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();

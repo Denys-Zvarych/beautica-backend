@@ -199,11 +199,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt
     );
 
-    @Modifying
     @Query(value = """
-            SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))
+            SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))) sub
             """, nativeQuery = true)
-    void acquireAdvisoryLock(@Param("masterId") UUID masterId);
+    Integer acquireAdvisoryLock(@Param("masterId") UUID masterId);
 
     // ── Fix H1 — N+1: full-graph variant used by BookingService (production path) ─────────────
     @Query(value = """

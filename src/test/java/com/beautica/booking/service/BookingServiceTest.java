@@ -207,12 +207,12 @@ class BookingServiceTest {
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
-        when(bookingRepository.save(any())).thenReturn(saved);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
 
         BookingResponse result = bookingService.createBooking(clientId, null, validRequest());
 
         ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
-        verify(bookingRepository).save(captor.capture());
+        verify(bookingRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getStatus()).isEqualTo(BookingStatus.PENDING);
         assertThat(result).isNotNull();
     }
@@ -227,7 +227,7 @@ class BookingServiceTest {
 
         BookingResponse result = bookingService.createBooking(clientId, key, validRequest());
 
-        verify(bookingRepository, never()).save(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
         assertThat(result.id()).isEqualTo(bookingId);
     }
 
@@ -314,12 +314,12 @@ class BookingServiceTest {
         Booking saved = buildBooking(bookingId, client, master, msaWithOverrides, BookingStatus.PENDING);
         setField(saved, "priceAtBooking", new BigDecimal("250.00"));
         setField(saved, "durationMinutesAtBooking", 45);
-        when(bookingRepository.save(any())).thenReturn(saved);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
 
         bookingService.createBooking(clientId, null, validRequest());
 
         ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
-        verify(bookingRepository).save(captor.capture());
+        verify(bookingRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getPriceAtBooking()).isEqualByComparingTo(new BigDecimal("250.00"));
         assertThat(captor.getValue().getDurationMinutesAtBooking()).isEqualTo(45);
     }
@@ -332,12 +332,12 @@ class BookingServiceTest {
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
-        when(bookingRepository.save(any())).thenReturn(saved);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
 
         bookingService.createBooking(clientId, null, validRequest());
 
         ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
-        verify(bookingRepository).save(captor.capture());
+        verify(bookingRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getPriceAtBooking()).isEqualByComparingTo(new BigDecimal("200.00"));
         assertThat(captor.getValue().getDurationMinutesAtBooking()).isEqualTo(60);
     }
@@ -350,7 +350,7 @@ class BookingServiceTest {
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
-        when(bookingRepository.save(any())).thenReturn(saved);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
 
         bookingService.createBooking(clientId, null, validRequest());
 

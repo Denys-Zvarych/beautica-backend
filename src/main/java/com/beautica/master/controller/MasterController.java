@@ -142,6 +142,7 @@ public class MasterController {
     }
 
     @GetMapping("/{masterId}/slots")
+    @PreAuthorize("isAuthenticated()")
     public ApiResponse<Map<String, Object>> getAvailableSlots(
             @PathVariable UUID masterId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,

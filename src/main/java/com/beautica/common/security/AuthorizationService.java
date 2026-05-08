@@ -163,14 +163,14 @@ public class AuthorizationService {
                 .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
         if (isSalonMaster) return false;
         UUID actorId = principalId(auth);
-        return bookingRepository.findById(bookingId)
+        return bookingRepository.findByIdWithFullGraph(bookingId)
                 .map(b -> isAuthorizedToManageBooking(actorId, b))
                 .orElse(false);
     }
 
     public boolean canViewBooking(Authentication auth, UUID bookingId) {
         UUID actorId = principalId(auth);
-        return bookingRepository.findById(bookingId).map(b -> {
+        return bookingRepository.findByIdWithFullGraph(bookingId).map(b -> {
             if (isAuthorizedToManageBooking(actorId, b)) {
                 return true;
             }
@@ -191,7 +191,7 @@ public class AuthorizationService {
 
     public boolean canCancelBooking(Authentication auth, UUID bookingId) {
         UUID actorId = principalId(auth);
-        return bookingRepository.findById(bookingId)
+        return bookingRepository.findByIdWithFullGraph(bookingId)
                 .map(b -> b.getClient().getId().equals(actorId))
                 .orElse(false);
     }

@@ -1,6 +1,7 @@
 package com.beautica.common.security;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
@@ -26,6 +27,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -466,5 +468,381 @@ class AuthorizationServiceTest {
         assertThat(result).isFalse();
         verify(salonRepository, never()).findById(any());
         verify(masterRepository, never()).findById(any());
+    }
+
+    // ── canManageBooking ───────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("canManageBooking returns false immediately when actor has ROLE_SALON_MASTER without touching repository")
+    void should_returnFalse_when_salonMasterTriesToManageBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canManageBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findByIdWithFullGraph(any());
+    }
+
+    @Test
+    @DisplayName("canManageBooking returns true when salon owner's ID matches the booking master's salon owner")
+    void should_returnTrue_when_salonOwnerManagesOwnSalonsBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageBooking returns false when owner B tries to manage a booking from owner A's salon")
+    void should_returnFalse_when_ownerBTriesToManageOwnerASalonsBooking() {
+        UUID ownerAId = UUID.randomUUID();
+        UUID ownerBId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User ownerA = mock(User.class);
+        when(ownerA.getId()).thenReturn(ownerAId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(ownerA);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        Authentication auth = mockAuth(ownerBId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    // ── canViewBooking ─────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("canViewBooking returns true when client views their own booking")
+    void should_returnTrue_when_clientViewsOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(actorId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getClient()).thenReturn(client);
+
+        User actor = mock(User.class);
+        when(actor.getRole()).thenReturn(Role.CLIENT);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(userRepository.findById(actorId)).thenReturn(Optional.of(actor));
+
+        Authentication auth = mockAuth(actorId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canViewBooking returns false when client B tries to view client A's booking")
+    void should_returnFalse_when_clientBViewsClientABooking() {
+        UUID clientAId = UUID.randomUUID();
+        UUID clientBId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User clientA = mock(User.class);
+        when(clientA.getId()).thenReturn(clientAId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getClient()).thenReturn(clientA);
+
+        User actor = mock(User.class);
+        when(actor.getRole()).thenReturn(Role.CLIENT);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(userRepository.findById(clientBId)).thenReturn(Optional.of(actor));
+
+        Authentication auth = mockAuth(clientBId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    @DisplayName("canViewBooking returns true when salon master views a booking assigned to them")
+    void should_returnTrue_when_salonMasterViewsOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+        when(master.getUser()).thenReturn(masterUser);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        User actor = mock(User.class);
+        when(actor.getRole()).thenReturn(Role.SALON_MASTER);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(userRepository.findById(actorId)).thenReturn(Optional.of(actor));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canViewBooking returns false when salon master views another master's booking")
+    void should_returnFalse_when_salonMasterViewsAnotherMastersBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User otherMasterUser = mock(User.class);
+        when(otherMasterUser.getId()).thenReturn(otherMasterUserId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+        when(master.getUser()).thenReturn(otherMasterUser);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        User actor = mock(User.class);
+        when(actor.getRole()).thenReturn(Role.SALON_MASTER);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(userRepository.findById(actorId)).thenReturn(Optional.of(actor));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    // ── canCancelBooking ───────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("canCancelBooking returns false when client B tries to cancel client A's booking")
+    void should_returnFalse_when_clientBCancelsClientABooking() {
+        UUID clientAId = UUID.randomUUID();
+        UUID clientBId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User clientA = mock(User.class);
+        when(clientA.getId()).thenReturn(clientAId);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(clientA);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        Authentication auth = mockAuth(clientBId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canCancelBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    @DisplayName("canCancelBooking returns true when client cancels their own booking")
+    void should_returnTrue_when_clientCancelsOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(actorId);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(client);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        Authentication auth = mockAuth(actorId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canCancelBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    // ── enforceCanViewBooking ──────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("enforceCanViewBooking throws ForbiddenException when wrong client tries to view another client's booking")
+    void should_throwForbidden_when_enforceCanViewBookingCalledWithWrongClient() {
+        UUID clientAId = UUID.randomUUID();
+        UUID clientBId = UUID.randomUUID();
+
+        User clientA = mock(User.class);
+        when(clientA.getId()).thenReturn(clientAId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getClient()).thenReturn(clientA);
+
+        User actor = mock(User.class);
+        when(actor.getRole()).thenReturn(Role.CLIENT);
+        when(userRepository.findById(clientBId)).thenReturn(Optional.of(actor));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(clientBId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking does not throw when correct client views their own booking")
+    void should_notThrow_when_enforceCanViewBookingCalledWithCorrectClient() {
+        UUID actorId = UUID.randomUUID();
+
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(actorId);
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getClient()).thenReturn(client);
+
+        User actor = mock(User.class);
+        when(actor.getRole()).thenReturn(Role.CLIENT);
+        when(userRepository.findById(actorId)).thenReturn(Optional.of(actor));
+
+        assertThatCode(() -> authorizationService.enforceCanViewBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    // ── enforceCanManageBooking ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("enforceCanManageBooking throws ForbiddenException when owner B tries to manage owner A's salon booking")
+    void should_throwForbidden_when_enforceCanManageBookingCalledWithWrongOwner() {
+        UUID ownerAId = UUID.randomUUID();
+        UUID ownerBId = UUID.randomUUID();
+
+        User ownerA = mock(User.class);
+        when(ownerA.getId()).thenReturn(ownerAId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(ownerA);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(ownerBId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageBooking does not throw when correct salon owner manages their own salon's booking")
+    void should_notThrow_when_enforceCanManageBookingCalledWithCorrectSalonOwner() {
+        UUID actorId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        assertThatCode(() -> authorizationService.enforceCanManageBooking(actorId, booking))
+                .doesNotThrowAnyException();
     }
 }

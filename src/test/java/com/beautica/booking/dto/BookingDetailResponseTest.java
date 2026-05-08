@@ -24,16 +24,16 @@ import static org.mockito.Mockito.when;
 @DisplayName("BookingDetailResponse.from — unit")
 class BookingDetailResponseTest {
 
-    private static final UUID BOOKING_ID        = UUID.fromString("00000000-0000-0000-0000-000000000011");
-    private static final UUID CLIENT_ID         = UUID.fromString("00000000-0000-0000-0000-000000000012");
-    private static final UUID MASTER_ID         = UUID.fromString("00000000-0000-0000-0000-000000000013");
-    private static final UUID MASTER_SERVICE_ID = UUID.fromString("00000000-0000-0000-0000-000000000014");
-
     private static final OffsetDateTime STARTS_AT =
             OffsetDateTime.of(2025, 6, 15, 10, 0, 0, 0, ZoneOffset.UTC);
     private static final OffsetDateTime ENDS_AT =
             OffsetDateTime.of(2025, 6, 15, 11, 0, 0, 0, ZoneOffset.UTC);
     private static final Instant CREATED_AT = Instant.parse("2025-06-01T08:00:00Z");
+
+    private UUID bookingId;
+    private UUID clientId;
+    private UUID masterId;
+    private UUID masterServiceId;
 
     // Separate User mocks so the test can verify traversal for client vs. master
     private User clientUser;
@@ -42,8 +42,13 @@ class BookingDetailResponseTest {
 
     @BeforeEach
     void setUp() {
+        bookingId = UUID.randomUUID();
+        clientId = UUID.randomUUID();
+        masterId = UUID.randomUUID();
+        masterServiceId = UUID.randomUUID();
+
         clientUser = mock(User.class);
-        when(clientUser.getId()).thenReturn(CLIENT_ID);
+        when(clientUser.getId()).thenReturn(clientId);
         when(clientUser.getFirstName()).thenReturn("Олена");
         when(clientUser.getLastName()).thenReturn("Коваль");
 
@@ -52,18 +57,18 @@ class BookingDetailResponseTest {
         when(masterUser.getLastName()).thenReturn("Бойко");
 
         var master = mock(Master.class);
-        when(master.getId()).thenReturn(MASTER_ID);
+        when(master.getId()).thenReturn(masterId);
         when(master.getUser()).thenReturn(masterUser);
 
         var serviceDef = mock(ServiceDefinition.class);
         when(serviceDef.getName()).thenReturn("Манікюр");
 
         var masterService = mock(MasterServiceAssignment.class);
-        when(masterService.getId()).thenReturn(MASTER_SERVICE_ID);
+        when(masterService.getId()).thenReturn(masterServiceId);
         when(masterService.getServiceDefinition()).thenReturn(serviceDef);
 
         booking = mock(Booking.class);
-        when(booking.getId()).thenReturn(BOOKING_ID);
+        when(booking.getId()).thenReturn(bookingId);
         when(booking.getClient()).thenReturn(clientUser);
         when(booking.getMaster()).thenReturn(master);
         when(booking.getMasterService()).thenReturn(masterService);
@@ -83,10 +88,10 @@ class BookingDetailResponseTest {
         var response = BookingDetailResponse.from(booking);
 
         // shared fields
-        assertThat(response.id()).isEqualTo(BOOKING_ID);
-        assertThat(response.clientId()).isEqualTo(CLIENT_ID);
-        assertThat(response.masterId()).isEqualTo(MASTER_ID);
-        assertThat(response.masterServiceId()).isEqualTo(MASTER_SERVICE_ID);
+        assertThat(response.id()).isEqualTo(bookingId);
+        assertThat(response.clientId()).isEqualTo(clientId);
+        assertThat(response.masterId()).isEqualTo(masterId);
+        assertThat(response.masterServiceId()).isEqualTo(masterServiceId);
         assertThat(response.serviceName()).isEqualTo("Манікюр");
         assertThat(response.status()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(response.priceAtBooking()).isEqualByComparingTo(new BigDecimal("350.00"));

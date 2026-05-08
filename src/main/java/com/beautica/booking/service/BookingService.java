@@ -95,6 +95,7 @@ public class BookingService {
                         ? bookingRepository.findBySalonIdAndOwnerIdWithGraph(salonId, actorUserId, pageable)
                         : bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(salonId, actorUserId, status, pageable);
             }
+            case SALON_ADMIN -> throw new ForbiddenException("SALON_ADMIN cannot list bookings via this endpoint");
             default -> throw new ForbiddenException("Access denied");
         };
 
@@ -231,7 +232,7 @@ public class BookingService {
 
         Booking saved;
         try {
-            saved = bookingRepository.save(booking);
+            saved = bookingRepository.saveAndFlush(booking);
         } catch (DataIntegrityViolationException e) {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }
