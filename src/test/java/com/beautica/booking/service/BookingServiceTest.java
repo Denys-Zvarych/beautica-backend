@@ -341,6 +341,50 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("400 is thrown when the requested start time is exactly 14 minutes from now (below minimum lead time)")
+    void should_throw400_when_startsAtIsExactly14MinutesFromNow() {
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
+
+        CreateBookingRequest request = new CreateBookingRequest(
+                masterId,
+                masterServiceId,
+                ZonedDateTime.now(clock).plusMinutes(14),
+                null,
+                null
+        );
+
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    @Test
+    @DisplayName("booking proceeds past time check when start time is exactly 15 minutes from now (minimum lead time boundary)")
+    void should_proceedPastTimeCheck_when_startsAtIsExactly15MinutesFromNow() {
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
+        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+
+        CreateBookingRequest request = new CreateBookingRequest(
+                masterId,
+                masterServiceId,
+                ZonedDateTime.now(clock).plusMinutes(15),
+                null,
+                null
+        );
+
+        BookingResponse result = bookingService.createBooking(clientId, null, request);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).saveAndFlush(any());
+    }
+
+    @Test
     @DisplayName("400 is thrown when the requested start time is more than 180 days in the future")
     void should_throw400_when_startsAtMoreThan180DaysAhead() {
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
@@ -889,5 +933,7 @@ class BookingServiceTest {
 
         assertThatThrownBy(() -> bookingService.getBooking(clientBId, bookingId))
                 .isInstanceOf(ForbiddenException.class);
+
+        verify(authz).enforceCanViewBooking(clientBId, booking);
     }
 }

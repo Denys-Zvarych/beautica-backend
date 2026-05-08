@@ -2,7 +2,6 @@ package com.beautica.salon;
 
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
-import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.CacheConfig;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.repository.SalonRepository;
@@ -37,7 +36,6 @@ class SalonServiceCacheTest {
     @MockBean UserRepository userRepository;
     @MockBean InviteService inviteService;
     @MockBean MasterRepository masterRepository;
-    @MockBean AuthorizationService authorizationService;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;

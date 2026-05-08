@@ -54,6 +54,12 @@ public class NotificationOutboxService {
      *   <li>The drain worker (a separate scheduled task) reads the outbox and calls
      *       {@link NotificationService} outside of any booking transaction.
      * </ul>
+     *
+     * <p><strong>Phase 5 hook — not yet wired; cancelBooking currently calls
+     * enqueueStatusChanged for all transitions.</strong>
+     * Wire this method in {@code BookingService.cancelBooking} when Phase 5 implements
+     * role-specific notification templates that distinguish client cancellations from
+     * other status changes.
      */
     public void enqueueClientCancelled(UUID bookingId) { Objects.requireNonNull(bookingId, "bookingId"); }
 }

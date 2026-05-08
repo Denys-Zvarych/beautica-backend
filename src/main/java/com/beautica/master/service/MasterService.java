@@ -5,7 +5,6 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
@@ -48,7 +47,6 @@ public class MasterService {
     private final SalonRepository salonRepository;
     private final WorkingHoursRepository workingHoursRepository;
     private final ScheduleExceptionRepository scheduleExceptionRepository;
-    private final AuthorizationService authorizationService;
     private final BookingRepository bookingRepository;
 
     @Transactional
@@ -103,10 +101,10 @@ public class MasterService {
     public List<WorkingHoursResponse> upsertWorkingHours(
             UUID actorId, UUID masterId, List<WorkingHoursRequest> requests) {
 
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
+        // the controller — no redundant DB round-trip needed here.
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
         Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)
                 .stream()
@@ -133,10 +131,10 @@ public class MasterService {
     public ScheduleException addScheduleException(
             UUID actorId, UUID masterId, ScheduleExceptionRequest request) {
 
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
+        // the controller — no redundant DB round-trip needed here.
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
         var existing = scheduleExceptionRepository.findByMasterIdAndDate(masterId, request.date());
         if (existing.isPresent()) {
@@ -158,10 +156,10 @@ public class MasterService {
 
     @Transactional
     public void removeScheduleException(UUID actorId, UUID masterId, LocalDate date) {
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
+        // the controller — no redundant DB round-trip needed here.
+        masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
         scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
                 .ifPresent(scheduleExceptionRepository::delete);
@@ -170,10 +168,10 @@ public class MasterService {
     @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public void deactivateMaster(UUID actorId, UUID masterId) {
+        // Ownership already enforced by @PreAuthorize("@authz.canManageMaster(...)") on
+        // the controller — no redundant DB round-trip needed here.
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        authorizationService.enforceCanManageMaster(actorId, master);
 
         master.setActive(false);
         masterRepository.save(master);
@@ -186,7 +184,7 @@ public class MasterService {
                 .map(MasterSummaryResponse::from);
     }
 
-    @Cacheable(value = "master-calendar", key = "#actorUserId + '-' + #from + '-' + #to + '-' + #pageable.pageNumber")
+    @Cacheable(value = "master-calendar", key = "#actorUserId + '-' + #from + '-' + #to + '-' + #pageable.pageNumber + '-' + #pageable.pageSize")
     @Transactional(readOnly = true)
     public Page<BookingResponse> getMasterCalendar(UUID actorUserId, LocalDate from, LocalDate to, Pageable pageable) {
         Master master = masterRepository.findByUserId(actorUserId)

@@ -6,7 +6,6 @@ import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -39,8 +38,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doNothing;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -60,9 +57,6 @@ class SalonServiceTest {
 
     @Mock
     private MasterRepository masterRepository;
-
-    @Mock
-    private AuthorizationService authorizationService;
 
     @InjectMocks
     private SalonService salonService;
@@ -150,25 +144,22 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("updateSalon — throws ForbiddenException when actor lacks management access")
-    void should_throwForbidden_when_differentOwnerUpdatesSalon() {
-        UUID realOwnerId = UUID.randomUUID();
-        UUID attackerId = UUID.randomUUID();
+    @DisplayName("updateSalon — applies patch when salon exists (authorization delegated to @PreAuthorize on controller)")
+    void should_updateSalon_when_salonExists_regardlessOfOwner() {
+        // Authorization is exclusively enforced by @PreAuthorize on SalonController.updateSalon.
+        // The service applies the patch to whichever salon is found — ownership is not re-checked here.
+        UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
+        User owner = buildUser(UUID.randomUUID(), "real@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
 
-        User realOwner = buildUser(realOwnerId, "real@beautica.com", Role.SALON_OWNER);
-        Salon salon = buildSalon(salonId, realOwner, "Salon");
-
-        var request = new UpdateSalonRequest("Hijacked", null, null, null, null, null, null);
+        var request = new UpdateSalonRequest("Updated Name", null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        doThrow(new ForbiddenException("Access denied"))
-                .when(authorizationService).enforceCanManageSalon(attackerId, salon);
 
-        assertThatThrownBy(() -> salonService.updateSalon(attackerId, salonId, request))
-                .isInstanceOf(ForbiddenException.class);
+        SalonResponse response = salonService.updateSalon(actorId, salonId, request);
 
-        verify(salonRepository, never()).save(any());
+        assertThat(response.name()).isEqualTo("Updated Name");
     }
 
     @Test
@@ -243,18 +234,17 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("inviteMaster — throws ForbiddenException when actor cannot manage salon")
-    void should_throwForbidden_when_actorCannotManageSalonForInvite() {
+    @DisplayName("inviteMaster — throws NotFoundException when salon does not exist")
+    void should_throwNotFound_when_salonNotFoundForInvite() {
+        // Authorization is exclusively enforced by @PreAuthorize on SalonController.inviteMaster.
+        // The service only validates that the salon exists before delegating to inviteService.
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = buildSalon(salonId, buildUser(UUID.randomUUID(), "owner@test.com", Role.SALON_OWNER), "Test");
 
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        doThrow(new ForbiddenException("Access denied"))
-                .when(authorizationService).enforceCanManageSalon(actorId, salon);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(NotFoundException.class);
 
         verify(inviteService, never()).sendInvite(any(), any());
     }
@@ -274,7 +264,7 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("inviteMaster — delegates to inviteService when actor can manage salon")
+    @DisplayName("inviteMaster — delegates to inviteService when salon exists")
     void should_delegateToInviteService_when_inviteMaster() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -282,7 +272,6 @@ class SalonServiceTest {
         var expected = new InviteResponse("master@test.com", Instant.now().plusSeconds(3600));
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        doNothing().when(authorizationService).enforceCanManageSalon(eq(actorId), eq(salon));
         when(inviteService.sendInvite(any(InviteRequest.class), eq(actorId))).thenReturn(expected);
 
         InviteResponse result = salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER);
@@ -308,14 +297,14 @@ class SalonServiceTest {
         ReflectionTestUtils.setField(master, "id", masterId);
 
         Page<Master> pageOfMasters = new PageImpl<>(List.of(master), pageable, 1);
-        when(masterRepository.findBySalonIdAndIsActiveTrue(salonId, pageable)).thenReturn(pageOfMasters);
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable)).thenReturn(pageOfMasters);
 
         var result = salonService.getMastersBySalon(salonId, pageable);
 
         assertThat(result.getTotalElements()).isEqualTo(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
         assertThat(result.getContent().get(0).userId()).isEqualTo(userId);
-        verify(masterRepository).findBySalonIdAndIsActiveTrue(salonId, pageable);
+        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, pageable);
     }
 
     private User buildUser(UUID id, String email, Role role) {

@@ -13,6 +13,10 @@ import java.util.UUID;
 
 public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID> {
 
+    /**
+     * @deprecated Unbounded result — add a Pageable overload before using.
+     */
+    @Deprecated
     List<ServiceDefinition> findByOwnerTypeAndOwnerIdAndIsActiveTrue(OwnerType ownerType, UUID ownerId);
 
     /**

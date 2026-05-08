@@ -19,6 +19,7 @@ import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -57,7 +58,7 @@ public class MasterController {
     @GetMapping("/by-salon/{salonId}")
     public ApiResponse<PageResponse<MasterSummaryResponse>> getMastersBySalon(
             @PathVariable UUID salonId,
-            Pageable pageable
+            @PageableDefault(size = 20) Pageable pageable
     ) {
         var page = masterService.getMastersByPage(salonId, pageable);
         return ApiResponse.ok(PageResponse.of(
@@ -120,7 +121,7 @@ public class MasterController {
     public ApiResponse<PageResponse<BookingResponse>> getMasterCalendar(
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
-            Pageable pageable,
+            @PageableDefault(size = 20) Pageable pageable,
             Authentication authentication
     ) {
         long daysBetween = ChronoUnit.DAYS.between(from, to);

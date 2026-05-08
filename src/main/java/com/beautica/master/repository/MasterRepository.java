@@ -17,6 +17,8 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
 
     List<Master> findBySalonId(UUID salonId);
 
+    /** @deprecated No JOIN FETCH on user — triggers N+1. Use {@link #findBySalonIdAndIsActiveTrueWithUser} instead. */
+    @Deprecated
     Page<Master> findBySalonIdAndIsActiveTrue(UUID salonId, Pageable pageable);
 
     @Query(

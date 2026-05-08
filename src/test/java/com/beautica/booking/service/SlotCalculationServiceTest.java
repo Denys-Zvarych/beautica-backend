@@ -679,6 +679,8 @@ class SlotCalculationServiceTest {
     @Test
     @DisplayName("evictAvailableSlots — method compiles and does not throw (signature guard)")
     void should_notThrow_when_evictAvailableSlotsCalledDirectly() {
+        // Compile/signature guard only — no AOP proxy active in this unit test context.
+        // Cache eviction behaviour (@CacheEvict) is verified in SlotCalculationServiceCacheTest.
         assertThatCode(() -> slotCalculationService.evictAvailableSlots(
                 UUID.randomUUID(), LocalDate.now(clock), UUID.randomUUID()))
                 .doesNotThrowAnyException();

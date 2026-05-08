@@ -1,5 +1,8 @@
 package com.beautica.service.entity;
 
+import jakarta.validation.Validation;
+import jakarta.validation.ValidatorFactory;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -11,8 +14,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ServiceTypeDefaultTest {
 
+    private static final ValidatorFactory FACTORY = Validation.buildDefaultValidatorFactory();
+
+    @AfterAll
+    static void closeFactory() {
+        FACTORY.close();
+    }
+
     @Test
-    @DisplayName("should_defaultActiveToTrue_when_builtWithoutExplicitActiveValue")
+    @DisplayName("ServiceType.active defaults to true when built without an explicit value")
     void should_defaultActiveToTrue_when_builtWithoutExplicitActiveValue() {
         var type = ServiceType.builder()
                 .nameUk("Манікюр класичний")
@@ -26,7 +36,7 @@ class ServiceTypeDefaultTest {
     }
 
     @Test
-    @DisplayName("should_setActiveToFalse_when_explicitlyPassedFalse")
+    @DisplayName("ServiceType.active is honoured as false when explicitly passed to the builder")
     void should_setActiveToFalse_when_explicitlyPassedFalse() {
         var type = ServiceType.builder()
                 .nameUk("Застарілий тип")
@@ -48,8 +58,7 @@ class ServiceTypeDefaultTest {
                 .slug("s".repeat(256))
                 .build();
 
-        var violations = jakarta.validation.Validation
-                .buildDefaultValidatorFactory().getValidator().validate(type);
+        var violations = FACTORY.getValidator().validate(type);
 
         assertThat(violations)
                 .as("@Size(max=255) must fire when slug has 256 characters")
@@ -66,8 +75,7 @@ class ServiceTypeDefaultTest {
                 .slug(slug)
                 .build();
 
-        var sizeViolations = jakarta.validation.Validation
-                .buildDefaultValidatorFactory().getValidator().validate(type)
+        var sizeViolations = FACTORY.getValidator().validate(type)
                 .stream()
                 .filter(v -> v.getPropertyPath().toString().equals("slug")
                         && v.getConstraintDescriptor().getAnnotation().annotationType()

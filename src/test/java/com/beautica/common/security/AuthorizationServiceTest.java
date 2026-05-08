@@ -537,6 +537,36 @@ class AuthorizationServiceTest {
         assertThat(result).isFalse();
     }
 
+    @Test
+    @DisplayName("canManageBooking returns true when independent master manages their own booking")
+    void should_returnTrue_when_independentMasterManagesOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // salonOwnerUserId is null — this is an independent master booking
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), actorId, null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        assertThat(authorizationService.canManageBooking(auth, bookingId)).isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageBooking returns false when independent master tries to manage another master's booking")
+    void should_returnFalse_when_independentMasterManagesAnotherMastersBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // salonOwnerUserId is null — independent master booking, but masterUserId is a different master
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), UUID.randomUUID(), null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        assertThat(authorizationService.canManageBooking(auth, bookingId)).isFalse();
+    }
+
     // ── canViewBooking ─────────────────────────────────────────────────────────
     // After Finding 2 fix: canViewBooking calls findViewAccessById(bookingId) (no actorId arg)
     // and derives the actor's role from the Authentication object (SecurityContext).

@@ -106,6 +106,9 @@ class SlotCalculationServiceCacheTest {
         // Second call — cache hit, repository NOT called again
         slotCalculationService.getAvailableSlots(masterId, futureDate, masterServiceId);
 
+        // Assumption: evictAvailableSlots must be called OUTSIDE an active transaction.
+        // @Transactional(NOT_SUPPORTED) suspends the caller's transaction — calling from within
+        // a transaction body would suspend eviction, causing this test to give a false green.
         // Evict the cache entry
         slotCalculationService.evictAvailableSlots(masterId, futureDate, masterServiceId);
 
