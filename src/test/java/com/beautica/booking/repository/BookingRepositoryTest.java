@@ -322,7 +322,7 @@ class BookingRepositoryTest {
         em.flush();
         em.clear();
 
-        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerId(
+        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdWithGraph(
                 salon.getId(), otherOwner.getId(), PageRequest.of(0, 10));
 
         assertThat(result).isEmpty();
@@ -503,6 +503,191 @@ class BookingRepositoryTest {
                 salon.getId(), salonOwner.getId(), BookingStatus.CONFIRMED, PageRequest.of(0, 10));
 
         assertThat(result).isEmpty();
+    }
+
+    // ── findBySalonIdAndOwnerIdWithGraph — happy-path ─────────────────────────
+
+    @Test
+    @DisplayName("findBySalonIdAndOwnerIdWithGraph_returnsOwnerBookings")
+    void findBySalonIdAndOwnerIdWithGraph_returnsOwnerBookings() {
+        User salonOwner = new User(
+                "owner-happy-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_OWNER,
+                "Happy",
+                "Owner",
+                "+380509000001"
+        );
+        em.persist(salonOwner);
+
+        Salon salon = Salon.builder()
+                .owner(salonOwner)
+                .name("Happy Salon")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+
+        User salonMasterUser = new User(
+                "smaster-happy-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_MASTER,
+                "Happy",
+                "SalonMaster",
+                "+380509000002"
+        );
+        em.persist(salonMasterUser);
+
+        Master salonMaster = Master.builder()
+                .user(salonMasterUser)
+                .salon(salon)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(salonMaster);
+
+        ServiceDefinition salonServiceDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.SALON)
+                .ownerId(salon.getId())
+                .name("Happy Manicure")
+                .category(ServiceCategory.MANICURE)
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .isActive(true)
+                .build();
+        em.persist(salonServiceDef);
+
+        MasterServiceAssignment salonMsa = MasterServiceAssignment.builder()
+                .master(salonMaster)
+                .serviceDefinition(salonServiceDef)
+                .isActive(true)
+                .build();
+        em.persist(salonMsa);
+
+        Booking booking = Booking.builder()
+                .client(clientUser)
+                .master(salonMaster)
+                .masterService(salonMsa)
+                .salon(salon)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(OffsetDateTime.of(2026, 9, 1, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 9, 1, 11, 0, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("500.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(booking);
+
+        em.flush();
+        em.clear();
+
+        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdWithGraph(
+                salon.getId(), salonOwner.getId(), PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent().get(0).getId()).isEqualTo(booking.getId());
+        assertThat(result.getContent().get(0).getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+    }
+
+    // ── findBySalonIdAndOwnerIdAndStatusWithGraph — happy-path ───────────────
+
+    @Test
+    @DisplayName("findBySalonIdAndOwnerIdAndStatusWithGraph_filtersByStatus")
+    void findBySalonIdAndOwnerIdAndStatusWithGraph_filtersByStatus() {
+        User salonOwner = new User(
+                "owner-status-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_OWNER,
+                "Status",
+                "Owner",
+                "+380509000003"
+        );
+        em.persist(salonOwner);
+
+        Salon salon = Salon.builder()
+                .owner(salonOwner)
+                .name("Status Salon")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+
+        User salonMasterUser = new User(
+                "smaster-status-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_MASTER,
+                "Status",
+                "SalonMaster",
+                "+380509000004"
+        );
+        em.persist(salonMasterUser);
+
+        Master salonMaster = Master.builder()
+                .user(salonMasterUser)
+                .salon(salon)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(salonMaster);
+
+        ServiceDefinition salonServiceDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.SALON)
+                .ownerId(salon.getId())
+                .name("Status Pedicure")
+                .category(ServiceCategory.MANICURE)
+                .baseDurationMinutes(45)
+                .basePrice(new BigDecimal("400.00"))
+                .isActive(true)
+                .build();
+        em.persist(salonServiceDef);
+
+        MasterServiceAssignment salonMsa = MasterServiceAssignment.builder()
+                .master(salonMaster)
+                .serviceDefinition(salonServiceDef)
+                .isActive(true)
+                .build();
+        em.persist(salonMsa);
+
+        // Save one CONFIRMED booking and one COMPLETED booking for the same salon/owner.
+        Booking confirmedBooking = Booking.builder()
+                .client(clientUser)
+                .master(salonMaster)
+                .masterService(salonMsa)
+                .salon(salon)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(OffsetDateTime.of(2026, 10, 1, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 10, 1, 10, 45, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("400.00"))
+                .durationMinutesAtBooking(45)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(confirmedBooking);
+
+        Booking completedBooking = Booking.builder()
+                .client(clientUser)
+                .master(salonMaster)
+                .masterService(salonMsa)
+                .salon(salon)
+                .status(BookingStatus.COMPLETED)
+                .startsAt(OffsetDateTime.of(2026, 10, 2, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 10, 2, 10, 45, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("400.00"))
+                .durationMinutesAtBooking(45)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(completedBooking);
+
+        em.flush();
+        em.clear();
+
+        Page<Booking> result = bookingRepository.findBySalonIdAndOwnerIdAndStatusWithGraph(
+                salon.getId(), salonOwner.getId(), BookingStatus.CONFIRMED, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent().get(0).getId()).isEqualTo(confirmedBooking.getId());
+        assertThat(result.getContent().get(0).getStatus()).isEqualTo(BookingStatus.CONFIRMED);
     }
 
     @Test

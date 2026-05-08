@@ -14,7 +14,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.notification.NotificationOutboxService;
+import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
@@ -108,7 +108,7 @@ public class BookingService {
         assertTransition(booking, BookingStatus.PENDING, BookingStatus.CONFIRMED);
         booking.setStatus(BookingStatus.CONFIRMED);
         Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueBookingStatusChange(saved.getId());
+        outboxService.enqueueStatusChanged(saved.getId());
         return BookingResponse.from(saved);
     }
 
@@ -125,7 +125,7 @@ public class BookingService {
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(req.comment());
         Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueBookingStatusChange(saved.getId());
+        outboxService.enqueueStatusChanged(saved.getId());
         return BookingResponse.from(saved);
     }
 
@@ -136,7 +136,7 @@ public class BookingService {
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.COMPLETED);
         booking.setStatus(BookingStatus.COMPLETED);
         Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueBookingStatusChange(saved.getId());
+        outboxService.enqueueStatusChanged(saved.getId());
         return BookingResponse.from(saved);
     }
 
@@ -152,7 +152,7 @@ public class BookingService {
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(req.comment());
         Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueBookingStatusChange(saved.getId());
+        outboxService.enqueueStatusChanged(saved.getId());
         return BookingResponse.from(saved);
     }
 
@@ -175,7 +175,7 @@ public class BookingService {
         booking.setStatus(BookingStatus.CANCELLED);
         booking.setCancellationReason(req.cancellationReason());
         Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueBookingStatusChange(saved.getId());
+        outboxService.enqueueStatusChanged(saved.getId());
         return BookingResponse.from(saved);
     }
 

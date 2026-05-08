@@ -16,7 +16,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.notification.NotificationOutboxService;
+import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -370,7 +370,7 @@ class BookingServiceTest {
         bookingService.confirmBooking(actorId, bookingId);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
-        verify(outboxService).enqueueBookingStatusChange(bookingId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
     }
 
     @Test
@@ -414,7 +414,7 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.DECLINED);
         assertThat(booking.getCancellationReason()).isEqualTo(CancellationReason.PROVIDER_UNAVAILABLE);
-        verify(outboxService).enqueueBookingStatusChange(bookingId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
     }
 
     @Test
@@ -442,7 +442,7 @@ class BookingServiceTest {
         bookingService.completeBooking(actorId, bookingId);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.COMPLETED);
-        verify(outboxService).enqueueBookingStatusChange(bookingId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
     }
 
     @Test
@@ -473,7 +473,7 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.NOT_COMPLETED);
         assertThat(booking.getCancellationReason()).isEqualTo(CancellationReason.CLIENT_NO_SHOW);
-        verify(outboxService).enqueueBookingStatusChange(bookingId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
     }
 
     @Test
@@ -504,7 +504,7 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
-        verify(outboxService).enqueueBookingStatusChange(bookingId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
     }
 
     @Test
@@ -519,7 +519,7 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
-        verify(outboxService).enqueueBookingStatusChange(bookingId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
     }
 
     @Test

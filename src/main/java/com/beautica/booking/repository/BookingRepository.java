@@ -205,20 +205,6 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """, nativeQuery = true)
     void acquireAdvisoryLock(@Param("masterId") UUID masterId);
 
-    // ── Legacy native query — retained for backward-compatibility with existing tests ───────────
-    @Query(value = """
-            SELECT * FROM bookings
-            WHERE salon_id = :salonId
-              AND salon_id IN (SELECT id FROM salons WHERE owner_id = :ownerId)
-            """,
-            countQuery = """
-            SELECT COUNT(*) FROM bookings
-            WHERE salon_id = :salonId
-              AND salon_id IN (SELECT id FROM salons WHERE owner_id = :ownerId)
-            """,
-            nativeQuery = true)
-    Page<Booking> findBySalonIdAndOwnerId(@Param("salonId") UUID salonId, @Param("ownerId") UUID ownerId, Pageable pageable);
-
     // ── Fix H1 — N+1: full-graph variant used by BookingService (production path) ─────────────
     @Query(value = """
             SELECT b FROM Booking b
