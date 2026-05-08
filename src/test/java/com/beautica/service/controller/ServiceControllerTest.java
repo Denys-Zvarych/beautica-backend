@@ -279,6 +279,19 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.data.length()").value(1));
     }
 
+    @Test
+    @DisplayName("GET /masters/{masterId}/services — 404 when master does not exist")
+    void should_return404_when_masterDoesNotExist() throws Exception {
+        var unknownMasterId = UUID.randomUUID();
+        when(serviceCatalogService.getMasterServices(unknownMasterId))
+                .thenThrow(new BusinessException(HttpStatus.NOT_FOUND, "Master not found"));
+
+        log.debug("Act: GET /api/v1/masters/{}/services with unknown masterId — must return 404", unknownMasterId);
+        mockMvc.perform(get("/api/v1/masters/" + unknownMasterId + "/services")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
     // ── POST /api/v1/independent-masters/me/services ───────────────────────────
 
     @Test
@@ -497,6 +510,22 @@ class ServiceControllerTest {
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf()))
                 .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 403 when INDEPENDENT_MASTER tries to delete SALON-owned service")
+    void should_return403_when_independentMasterDeletesSalonOwnedService() throws Exception {
+        var imUserId = UUID.randomUUID();
+        var salonOwnedServiceId = UUID.randomUUID();
+        // canManageServiceDefinition returns false because the independent master does not own
+        // this service definition (it belongs to a salon).
+        when(authorizationService.canManageServiceDefinition(any(), eq(salonOwnedServiceId))).thenReturn(false);
+
+        log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER targeting salon-owned service — must return 403", salonOwnedServiceId);
+        mockMvc.perform(delete("/api/v1/services/" + salonOwnedServiceId)
+                        .with(authenticatedAs(imUserId, "im@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
     }
 
     @Test
