@@ -210,7 +210,10 @@ public class BookingService {
         User client = userRepository.findById(clientId)
                 .orElseThrow(() -> new NotFoundException("Client not found"));
 
-        bookingRepository.acquireAdvisoryLock(master.getId());
+        Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
 
         if (bookingRepository.existsOverlap(master.getId(), startsAt, endsAt)) {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
