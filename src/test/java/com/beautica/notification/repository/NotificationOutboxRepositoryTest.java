@@ -12,12 +12,10 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
-import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.validation.beanvalidation.MethodValidationPostProcessor;
 
 import java.time.Instant;
 import java.util.List;
@@ -46,14 +44,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <p>Uses a real PostgreSQL container so that {@code FOR UPDATE SKIP LOCKED} and
  * {@code CHECK} constraints execute exactly as in production.
  *
- * <p>{@link MethodValidationPostProcessor} is imported explicitly because the
- * {@code @DataJpaTest} slice does not auto-configure it: in production the bean is
- * registered by Spring Boot's full {@code ValidationAutoConfiguration} (via
- * {@code @SpringBootApplication}). Without this import the {@code @Validated} guard on
- * {@link NotificationOutboxRepository#claimPendingBatch(int)} is a no-op inside the slice
- * context, which would silently mask Bean Validation regressions in this test.
+ * <p>{@code MethodValidationPostProcessor} is imported by {@link AbstractDataJpaTest} so
+ * the {@code @Validated} guard on
+ * {@link NotificationOutboxRepository#claimPendingBatch(int)} fires inside the slice
+ * context. Without that bean the {@code @DataJpaTest} slice would silently mask Bean
+ * Validation regressions in this test, because Spring Boot's full
+ * {@code ValidationAutoConfiguration} is not loaded by the slice.
  */
-@Import(MethodValidationPostProcessor.class)
 class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
 
     @Autowired

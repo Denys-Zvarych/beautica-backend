@@ -2,9 +2,11 @@ package com.beautica;
 
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.validation.beanvalidation.MethodValidationPostProcessor;
 import org.testcontainers.containers.PostgreSQLContainer;
 
 /**
@@ -33,10 +35,15 @@ import org.testcontainers.containers.PostgreSQLContainer;
  *
  * <p>Subclasses retain {@code @DataJpaTest} slice semantics: transactional rollback per
  * test, repository beans only, fast bootstrap.
+ *
+ * <p>Also imports {@link MethodValidationPostProcessor} so subclasses testing
+ * {@code @Validated} repositories see real {@link jakarta.validation.ConstraintViolationException}
+ * propagation (otherwise {@code @Validated} is silently a no-op in the slice context).
  */
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @ActiveProfiles("test")
+@Import(MethodValidationPostProcessor.class)
 public abstract class AbstractDataJpaTest {
 
     @SuppressWarnings("resource") // Singleton — never closed; JVM exit handles cleanup via Testcontainers Ryuk.
