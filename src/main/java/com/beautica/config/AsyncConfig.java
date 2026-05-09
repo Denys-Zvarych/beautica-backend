@@ -46,6 +46,6 @@ public class AsyncConfig implements AsyncConfigurer {
     public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
         return (ex, method, params) ->
                 log.error("Uncaught async exception in {}.{}(): {}",
-                        method.getDeclaringClass().getSimpleName(), method.getName(), ex.getMessage(), ex);
+                        method.getDeclaringClass().getSimpleName(), method.getName(), ex.getClass().getName(), ex);
     }
 }
