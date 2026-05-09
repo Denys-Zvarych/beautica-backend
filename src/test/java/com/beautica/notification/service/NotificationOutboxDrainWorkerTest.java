@@ -2,6 +2,7 @@ package com.beautica.notification.service;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.notification.crypto.OutboxPayloadCipher;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
@@ -19,9 +20,13 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -41,6 +46,9 @@ class NotificationOutboxDrainWorkerTest {
 
     @Mock
     private ObjectMapper objectMapper;
+
+    @Mock
+    private OutboxPayloadCipher cipher;
 
     @InjectMocks
     private NotificationOutboxDrainWorker worker;
@@ -98,28 +106,103 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
-    // ── Test 3: INVITE dispatches to sendInviteEmail (real ObjectMapper) ──────
+    // ── Test 3a: INVITE happy path — sealed URL is decrypted via cipher ───────
 
     @Test
-    @DisplayName("sendInviteEmail is called with correct args and status set to SENT when INVITE entry processed")
-    void should_callSendInviteEmail_when_inviteEntryProcessed() throws Exception {
+    @DisplayName("inviteUrlSealed is decrypted and forwarded to sendInviteEmail when INVITE entry processed")
+    void should_decryptInviteUrlSealedAndDispatch_when_inviteEntryProcessed() throws Exception {
         // Arrange — use a real ObjectMapper so JSON deserialisation is actually exercised.
-        NotificationOutboxDrainWorker workerWithRealMapper =
-                new NotificationOutboxDrainWorker(outboxRepository, notificationService, bookingRepository, REAL_MAPPER);
+        NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
+                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
 
         UUID aggregateId = UUID.randomUUID();
-        String payload = REAL_MAPPER.writeValueAsString(Map.of("email", "a@b.com", "salonName", "Beauty"));
+        String sealed = "v1:STUB-SEALED";
+        String decryptedUrl = "https://app.beautica.ua/invite/accept?token=ABC123";
+        String payload = REAL_MAPPER.writeValueAsString(Map.of(
+                "email", "a@b.com",
+                "salonName", "Beauty",
+                "inviteUrlSealed", sealed));
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, payload, aggregateId);
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         // INVITE entries are excluded from the bookingIds set — stub returns empty to be safe.
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(cipher.open(sealed)).thenReturn(decryptedUrl);
+
+        // Act
+        workerWithRealMapper.drain();
+
+        // Assert — decrypted URL is forwarded; aggregateId is NOT used as URL.
+        verify(cipher, times(1)).open(eq(sealed));
+        verify(notificationService, times(1))
+                .sendInviteEmail("a@b.com", decryptedUrl, "Beauty");
+        // Forward-dependency regex check from Phase 5.11 QA contract.
+        assertThat(decryptedUrl).matches("^https?://.+/invite/accept\\?token=.+");
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
+    // ── Test 3b: INVITE corrupt ciphertext → dead-letter after MAX_ATTEMPTS ──
+
+    @Test
+    @DisplayName("entry transitions to DEAD without dispatch when cipher.open throws on corrupt ciphertext")
+    void should_dead_letter_when_cipherOpenThrows() throws Exception {
+        NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
+                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+
+        UUID aggregateId = UUID.randomUUID();
+        String payload = REAL_MAPPER.writeValueAsString(Map.of(
+                "email", "a@b.com",
+                "salonName", "Beauty",
+                "inviteUrlSealed", "v1:CORRUPT"));
+        // attempts=2 so this third attempt promotes the entry to DEAD.
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, aggregateId);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(cipher.open(anyString())).thenThrow(new IllegalStateException(
+                "OutboxPayloadCipher open failed — corrupt or tampered ciphertext"));
 
         workerWithRealMapper.drain();
 
-        verify(notificationService, times(1))
-                .sendInviteEmail("a@b.com", aggregateId.toString(), "Beauty");
-        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.DEAD);
+        assertThat(outboxEntry.getAttempts()).isEqualTo(3);
+        assertThat(outboxEntry.getLastError())
+                .isNotNull()
+                .contains("OutboxPayloadCipher")
+                // Sanitiser must not leak plaintext URL fragments or sealed Base64.
+                .doesNotContain("v1:CORRUPT")
+                .doesNotContain("https://")
+                .doesNotContain("token=");
+        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
+    }
+
+    // ── Test 3c: INVITE missing inviteUrlSealed → dead-letter, cipher untouched ─
+
+    @Test
+    @DisplayName("entry transitions to DEAD without invoking cipher when inviteUrlSealed is missing from payload")
+    void should_dead_letter_when_inviteUrlSealedMissing() throws Exception {
+        NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
+                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+
+        UUID aggregateId = UUID.randomUUID();
+        // Older-schema row: email + salonName only, no inviteUrlSealed key.
+        String payload = REAL_MAPPER.writeValueAsString(Map.of(
+                "email", "a@b.com",
+                "salonName", "Beauty"));
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, aggregateId);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+
+        workerWithRealMapper.drain();
+
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.DEAD);
+        assertThat(outboxEntry.getAttempts()).isEqualTo(3);
+        assertThat(outboxEntry.getLastError())
+                .isNotNull()
+                .contains("missing inviteUrlSealed");
+        verify(cipher, never()).open(anyString());
+        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
     }
 
     // ── Test 4: failure below MAX_ATTEMPTS → PENDING ──────────────────────────

@@ -2,6 +2,7 @@ package com.beautica.notification.service;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.notification.crypto.OutboxPayloadCipher;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
@@ -49,6 +50,7 @@ public class NotificationOutboxDrainWorker {
     private final NotificationService notificationService;
     private final BookingRepository bookingRepository;
     private final ObjectMapper objectMapper;
+    private final OutboxPayloadCipher cipher;
 
     @Scheduled(fixedDelay = 5_000)
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -90,10 +92,18 @@ public class NotificationOutboxDrainWorker {
             case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
             case INVITE -> {
                 Map<String, String> p = readJson(entry.getPayload());
-                // aggregateId = inviteTokenId UUID; Phase 5.11 NotificationService resolves real URL.
+                // Decrypt inviteUrlSealed from payload (Phase 5.4a cipher); aggregateId is the
+                // invite_tokens row UUID for traceability only — the URL itself is derived from
+                // the sealed payload field, not from aggregateId.
+                String sealedUrl = p.get("inviteUrlSealed");
+                if (sealedUrl == null || sealedUrl.isBlank()) {
+                    throw new IllegalStateException(
+                            "INVITE outbox payload missing inviteUrlSealed (entry " + entry.getId() + ")");
+                }
+                String inviteUrl = cipher.open(sealedUrl);
                 notificationService.sendInviteEmail(
                         p.get("email"),
-                        entry.getAggregateId().toString(),
+                        inviteUrl,
                         p.get("salonName")
                 );
             }
