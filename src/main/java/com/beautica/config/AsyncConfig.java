@@ -10,6 +10,7 @@ import org.springframework.core.task.TaskExecutor;
 import org.springframework.scheduling.annotation.AsyncConfigurer;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
 
 @Configuration
 @EnableAsync
@@ -17,7 +18,10 @@ public class AsyncConfig implements AsyncConfigurer {
 
     private static final Logger log = LoggerFactory.getLogger(AsyncConfig.class);
 
-    // SMTP pool for invite and admin notification emails — FCM/APNs push gets a dedicated pool in Phase 5.8+
+    // SMTP pool for invite and admin notification emails — FCM/APNs push gets a dedicated pool in Phase 5.8+.
+    // Wrapped in DelegatingSecurityContextTaskExecutor so the calling thread's SecurityContext
+    // (Authentication / actor identity) propagates into async tasks. Without this wrapper any
+    // @Async method reading SecurityContextHolder.getContext().getAuthentication() observes null.
     @Bean(name = "emailExecutor")
     public TaskExecutor emailExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
@@ -29,10 +33,11 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(20);
         executor.initialize();
-        return executor;
+        return new DelegatingSecurityContextTaskExecutor(executor);
     }
 
-    // FCM/APNs push — dedicated pool to prevent SMTP starvation under push burst
+    // FCM/APNs push — dedicated pool to prevent SMTP starvation under push burst.
+    // Same SecurityContext propagation rationale as emailExecutor.
     @Bean(name = "pushExecutor")
     public TaskExecutor pushExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
@@ -44,7 +49,7 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);
         executor.initialize();
-        return executor;
+        return new DelegatingSecurityContextTaskExecutor(executor);
     }
 
     @Override

@@ -2,15 +2,19 @@ package com.beautica.notification.repository;
 
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxStatus;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.validation.annotation.Validated;
 
 import java.util.List;
 import java.util.UUID;
 
+@Validated
 public interface NotificationOutboxRepository extends JpaRepository<NotificationOutboxEntry, UUID> {
 
     /**
@@ -31,7 +35,14 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * active transaction exists, {@link org.springframework.transaction.IllegalTransactionStateException}
      * is thrown immediately, preventing silent duplicate delivery across concurrent drain workers.
      *
-     * @param limit maximum number of rows to claim in one batch (recommend 50–200)
+     * <p>The {@code limit} is bound to {@code [1, 500]} via Bean Validation
+     * ({@code @Min}/{@code @Max}) — {@code 0} would silently return an empty list while
+     * {@link Integer#MAX_VALUE} would issue an effectively uncapped {@code LIMIT} to
+     * PostgreSQL. {@code @Validated} on the repository interface enables Spring's
+     * {@code MethodValidationPostProcessor} to enforce these constraints at call time,
+     * raising {@link jakarta.validation.ConstraintViolationException} on violation.
+     *
+     * @param limit maximum number of rows to claim in one batch (must be in {@code [1, 500]}; recommend 50–200)
      * @return claimed rows in oldest-first order; never {@code null}, may be empty
      */
     @Transactional(propagation = Propagation.MANDATORY)
@@ -43,7 +54,7 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
          LIMIT :limit
          FOR UPDATE SKIP LOCKED
         """, nativeQuery = true)
-    List<NotificationOutboxEntry> claimPendingBatch(@Param("limit") int limit);
+    List<NotificationOutboxEntry> claimPendingBatch(@Param("limit") @Min(1) @Max(500) int limit);
 
     /**
      * Counts rows in a given status — used by health-check and monitoring endpoints
