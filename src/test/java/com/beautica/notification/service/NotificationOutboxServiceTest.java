@@ -3,17 +3,22 @@ package com.beautica.notification.service;
 import com.beautica.notification.crypto.OutboxPayloadCipher;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
+import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -77,7 +82,7 @@ class NotificationOutboxServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("enqueueStatusChanged saves a STATUS_CHANGED entry with the correct aggregateId and null payload")
+    @DisplayName("enqueueStatusChanged saves a STATUS_CHANGED entry with PENDING status, 0 attempts, correct aggregateId and null payload")
     void should_saveStatusChangedEntry_when_enqueueStatusChangedCalled() {
         UUID bookingId = UUID.randomUUID();
         ArgumentCaptor<NotificationOutboxEntry> captor =
@@ -90,6 +95,9 @@ class NotificationOutboxServiceTest {
         assertThat(saved.getEventType()).isEqualTo(OutboxEventType.STATUS_CHANGED);
         assertThat(saved.getAggregateId()).isEqualTo(bookingId);
         assertThat(saved.getPayload()).isNull();
+        // Pin @Builder.Default values so a future refactor that drops them is caught.
+        assertThat(saved.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(saved.getAttempts()).isEqualTo(0);
     }
 
     // -------------------------------------------------------------------------
@@ -97,7 +105,7 @@ class NotificationOutboxServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("enqueueClientCancelled saves a CLIENT_CANCELLED entry with the correct aggregateId and null payload")
+    @DisplayName("enqueueClientCancelled saves a CLIENT_CANCELLED entry with PENDING status, 0 attempts, correct aggregateId and null payload")
     void should_saveClientCancelledEntry_when_enqueueClientCancelledCalled() {
         UUID bookingId = UUID.randomUUID();
         ArgumentCaptor<NotificationOutboxEntry> captor =
@@ -110,6 +118,9 @@ class NotificationOutboxServiceTest {
         assertThat(saved.getEventType()).isEqualTo(OutboxEventType.CLIENT_CANCELLED);
         assertThat(saved.getAggregateId()).isEqualTo(bookingId);
         assertThat(saved.getPayload()).isNull();
+        // Pin @Builder.Default values so a future refactor that drops them is caught.
+        assertThat(saved.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(saved.getAttempts()).isEqualTo(0);
     }
 
     // -------------------------------------------------------------------------
@@ -118,7 +129,7 @@ class NotificationOutboxServiceTest {
 
     @Test
     @DisplayName("enqueueInvite seals inviteUrl via cipher and stores ciphertext under inviteUrlSealed — plaintext URL never appears")
-    void should_saveInviteEntry_withSealedInviteUrl_when_enqueueInviteCalled() {
+    void should_saveInviteEntry_withSealedInviteUrl_when_enqueueInviteCalled() throws Exception {
         // Arrange — real ObjectMapper exercised; cipher mock returns a known sentinel
         // so we can prove the sealed value (not the plaintext) is what hits the payload.
         UUID inviteTokenId = UUID.randomUUID();
@@ -135,18 +146,17 @@ class NotificationOutboxServiceTest {
         assertThat(saved.getEventType()).isEqualTo(OutboxEventType.INVITE);
         assertThat(saved.getAggregateId()).isEqualTo(inviteTokenId);
 
-        // Payload must contain email, salonName, and the sealed invite URL — but NOT
-        // the plaintext URL or the raw token.
+        // Structural JSON assertion — robust to key-ordering changes and falsifiable
+        // on extra/missing keys (vs. brittle substring contains/doesNotContain).
         String payload = saved.getPayload();
         assertThat(payload).isNotNull();
-        assertThat(payload).contains("\"email\"");
-        assertThat(payload).contains("\"salonName\"");
-        assertThat(payload).contains("\"inviteUrlSealed\"");
-        assertThat(payload).contains(toEmail);
-        assertThat(payload).contains(salonName);
-        assertThat(payload).contains(SEALED_STUB);
-        // Plaintext URL substrings must never appear.
-        assertThat(payload).doesNotContain("token=", "rawTokenSentinel", "https://app.beautica.ua");
+        Map<String, String> parsed = MAPPER.readValue(payload,
+                new TypeReference<Map<String, String>>() {});
+        assertThat(parsed).hasSize(3);
+        assertThat(parsed.keySet()).containsExactlyInAnyOrder("email", "salonName", "inviteUrlSealed");
+        assertThat(parsed.get("email")).isEqualTo(toEmail);
+        assertThat(parsed.get("salonName")).isEqualTo(salonName);
+        assertThat(parsed.get("inviteUrlSealed")).isEqualTo(SEALED_STUB);
 
         // Cipher must be called exactly once with the actual plaintext URL.
         verify(cipher, times(1)).seal(eq(VALID_INVITE_URL));
@@ -189,11 +199,48 @@ class NotificationOutboxServiceTest {
     }
 
     @Test
+    @DisplayName("enqueueStatusChanged throws NullPointerException with message when bookingId is null")
+    void should_throwNullPointerException_when_enqueueStatusChangedCalledWithNull() {
+        assertThatThrownBy(() -> service.enqueueStatusChanged(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("bookingId must not be null");
+    }
+
+    @Test
+    @DisplayName("enqueueClientCancelled throws NullPointerException with message when bookingId is null")
+    void should_throwNullPointerException_when_enqueueClientCancelledCalledWithNull() {
+        assertThatThrownBy(() -> service.enqueueClientCancelled(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("bookingId must not be null");
+    }
+
+    @Test
+    @DisplayName("enqueueInvite throws NullPointerException when inviteTokenId is null — cipher.seal must never run")
+    void should_throwNullPointerException_when_enqueueInviteCalledWithNullInviteTokenId() {
+        assertThatThrownBy(() -> service.enqueueInvite(
+                null, "user@x.com", VALID_INVITE_URL, "Salon"))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("inviteTokenId must not be null");
+        verify(cipher, never()).seal(any());
+    }
+
+    @Test
     @DisplayName("enqueueInvite throws IllegalArgumentException when toEmail is null")
     void should_throwIllegalArgumentException_when_toEmailIsNull() {
         assertThatThrownBy(() -> service.enqueueInvite(
                 UUID.randomUUID(), null, VALID_INVITE_URL, "Salon"))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("toEmail");
+        verify(cipher, never()).seal(any());
+    }
+
+    @Test
+    @DisplayName("enqueueInvite throws IllegalArgumentException when toEmail is whitespace-only (blank)")
+    void should_throwIllegalArgument_when_toEmailIsBlank() {
+        assertThatThrownBy(() -> service.enqueueInvite(
+                UUID.randomUUID(), "   ", VALID_INVITE_URL, "Salon"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("toEmail");
         verify(cipher, never()).seal(any());
     }
 
@@ -202,7 +249,8 @@ class NotificationOutboxServiceTest {
     void should_throwIllegalArgumentException_when_salonNameIsBlank() {
         assertThatThrownBy(() -> service.enqueueInvite(
                 UUID.randomUUID(), "test@test.com", VALID_INVITE_URL, " "))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("salonName");
         verify(cipher, never()).seal(any());
     }
 
@@ -214,7 +262,21 @@ class NotificationOutboxServiceTest {
 
         assertThatThrownBy(() -> service.enqueueInvite(
                 UUID.randomUUID(), oversizedEmail, VALID_INVITE_URL, "Salon"))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("toEmail");
+        verify(cipher, never()).seal(any());
+    }
+
+    @Test
+    @DisplayName("enqueueInvite throws IllegalArgumentException when salonName exceeds 255 characters")
+    void should_throwIllegalArgument_when_salonNameExceedsMaxLength() {
+        // 256-character string — one over the cap of 255.
+        String oversizedSalonName = "s".repeat(256);
+
+        assertThatThrownBy(() -> service.enqueueInvite(
+                UUID.randomUUID(), "user@x.com", VALID_INVITE_URL, oversizedSalonName))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("salonName");
         verify(cipher, never()).seal(any());
     }
 
@@ -258,22 +320,63 @@ class NotificationOutboxServiceTest {
         verify(cipher, never()).seal(any());
     }
 
-    @Test
-    @DisplayName("enqueueInvite throws IllegalArgumentException when inviteUrl scheme is not https or http://localhost")
-    void should_throwIllegalArgument_when_inviteUrlSchemeIsNotHttpsOrLocalhost() {
-        // Plain http:// (non-localhost) must be rejected.
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "http://example.com/path",
+            "javascript:void(0)",
+            "ftp://x/",
+            "file:///etc/passwd"
+    })
+    @DisplayName("enqueueInvite rejects disallowed schemes with stable scheme-error message")
+    void should_throwIllegalArgument_when_inviteUrlSchemeIsNotHttpsOrLocalhost(String disallowedUrl) {
+        // Empty-string "" omitted from the set: it is caught by the earlier blank-guard
+        // ("inviteUrl must not be blank") and would not surface the scheme message.
         assertThatThrownBy(() -> service.enqueueInvite(
-                UUID.randomUUID(), "test@test.com", "http://example.com/invite/accept?token=x", "Salon"))
+                UUID.randomUUID(), "test@test.com", disallowedUrl, "Salon"))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("inviteUrl must use https:// scheme or http://localhost for non-prod");
-
-        // javascript: scheme must be rejected.
-        assertThatThrownBy(() -> service.enqueueInvite(
-                UUID.randomUUID(), "test@test.com", "javascript:void(0)", "Salon"))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("inviteUrl must use https:// scheme or http://localhost for non-prod");
-
+                .hasMessageContaining("scheme");
         verify(cipher, never()).seal(any());
+    }
+
+    @Test
+    @DisplayName("enqueueInvite rejects inviteUrl with uppercase HTTPS:// scheme (case-sensitive prefix check)")
+    void should_throwIllegalArgument_when_inviteUrlSchemeIsUppercase() {
+        // String.startsWith is case-sensitive, so "HTTPS://..." must be rejected by the
+        // scheme guard. Pins the contract that the prefix check is not silently relaxed.
+        String uppercaseSchemeUrl = "HTTPS://app.beautica.ua/invite/accept?token=ABC";
+
+        assertThatThrownBy(() -> service.enqueueInvite(
+                UUID.randomUUID(), "test@test.com", uppercaseSchemeUrl, "Salon"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scheme");
+        verify(cipher, never()).seal(any());
+    }
+
+    @Test
+    @DisplayName("enqueueInvite rejects scheme-relative inviteUrl (//app.beautica.ua/...)")
+    void should_throwIllegalArgument_when_inviteUrlIsSchemeRelative() {
+        // No scheme prefix at all — must be rejected by the scheme guard.
+        String schemeRelativeUrl = "//app.beautica.ua/invite/accept?token=ABC";
+
+        assertThatThrownBy(() -> service.enqueueInvite(
+                UUID.randomUUID(), "test@test.com", schemeRelativeUrl, "Salon"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scheme");
+        verify(cipher, never()).seal(any());
+    }
+
+    @Test
+    @DisplayName("enqueueInvite accepts inviteUrl that is exactly 'https://' (8-char prefix-only boundary)")
+    void should_acceptShortHttpsUrl_when_inviteUrlIsExactlyEightChars() {
+        // Boundary pin: the current scheme guard accepts any string starting with
+        // "https://" — including the bare prefix itself. If a future tightening adds
+        // a "host required" check, this test catches the silent contract change.
+        String bareHttpsPrefix = "https://";
+        when(cipher.seal(any(String.class))).thenReturn(SEALED_STUB);
+
+        service.enqueueInvite(UUID.randomUUID(), "test@test.com", bareHttpsPrefix, "Salon");
+
+        verify(cipher, times(1)).seal(eq(bareHttpsPrefix));
     }
 
     @Test
