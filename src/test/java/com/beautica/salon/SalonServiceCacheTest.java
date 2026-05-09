@@ -125,6 +125,32 @@ class SalonServiceCacheTest {
     }
 
     @Test
+    @DisplayName("updateSalon evicts ownerSalons so the next getOwnerSalons re-queries the repository")
+    void should_evictOwnerSalonsCache_when_updateSalonCalled() {
+        // updateSalon's @Caching evicts ownerSalons under key=#actorId — the actor IS the owner
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Salon salon = Mockito.mock(Salon.class);
+
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(salonRepository.save(salon)).thenReturn(salon);
+
+        // Populate ownerSalons cache for this owner
+        salonService.getOwnerSalons(actorId);
+
+        // Evict via updateSalon — second @CacheEvict in @Caching group targets ownerSalons
+        UpdateSalonRequest updateRequest = new UpdateSalonRequest(
+                "Updated Name", null, null, null, null, null, null);
+        salonService.updateSalon(actorId, salonId, updateRequest);
+
+        // Cache was evicted — repository must be queried again
+        salonService.getOwnerSalons(actorId);
+
+        verify(salonRepository, times(2)).findAllByOwnerIdAndIsActiveTrue(actorId);
+    }
+
+    @Test
     @DisplayName("deactivateSalon evicts salon-detail so the next getSalonEntity re-queries the repository")
     void should_evictSalonDetailCache_when_deactivateSalonCalled() {
         UUID ownerId = UUID.randomUUID();
