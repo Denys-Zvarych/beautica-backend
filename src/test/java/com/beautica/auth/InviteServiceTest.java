@@ -8,9 +8,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.config.JwtConfig;
 import com.beautica.master.service.MasterService;
-import com.beautica.notification.EmailService;
+import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
@@ -22,6 +21,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import java.time.Clock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -30,11 +30,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Instant;
-import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -43,6 +40,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -69,7 +67,7 @@ class InviteServiceTest {
     private SalonRepository salonRepository;
 
     @Mock
-    private EmailService emailService;
+    private NotificationOutboxService outboxService;
 
     @Mock
     private TokenGenerator tokenGenerator;
@@ -91,10 +89,10 @@ class InviteServiceTest {
                 userRepository,
                 salonRepository,
                 passwordEncoder,
-                emailService,
                 tokenGenerator,
                 masterService,
                 authResponseBuilder,
+                outboxService,
                 "http://localhost:3000",
                 48L,
                 Clock.systemUTC()
@@ -136,13 +134,13 @@ class InviteServiceTest {
         assertThat(saved.getToken()).isNotEqualTo(rawToken);
 
         ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendInviteEmail(anyString(), linkCaptor.capture(), anyString());
+        verify(outboxService).enqueueInvite(any(), anyString(), linkCaptor.capture(), anyString());
         assertThat(linkCaptor.getValue()).endsWith(rawToken);
     }
 
     @Test
-    @DisplayName("sendInvite saves token and sends email on happy path")
-    void should_saveTokenAndSendEmail_when_sendInviteSucceeds() {
+    @DisplayName("sendInvite saves token and enqueues outbox row on happy path")
+    void should_saveTokenAndEnqueueOutbox_when_sendInviteSucceeds() {
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var request = new InviteRequest("master@example.com", salonId, null);
@@ -169,7 +167,7 @@ class InviteServiceTest {
         assertThat(response.expiresAt()).isAfter(Instant.now());
 
         verify(inviteTokenRepository).save(any(InviteToken.class));
-        verify(emailService).sendInviteEmail(anyString(), anyString(), anyString());
+        verify(outboxService).enqueueInvite(any(), anyString(), anyString(), anyString());
     }
 
     @Test
@@ -306,7 +304,7 @@ class InviteServiceTest {
 
         verify(inviteTokenRepository).delete(expired);
         verify(inviteTokenRepository).save(any(InviteToken.class));
-        verify(emailService).sendInviteEmail(anyString(), anyString(), anyString());
+        verify(outboxService).enqueueInvite(any(), anyString(), anyString(), anyString());
         assertThat(response.invitedEmail()).isEqualTo("expired@example.com");
     }
 
@@ -683,8 +681,8 @@ class InviteServiceTest {
     }
 
     @Test
-    @DisplayName("sendInvite passes salon name to emailService when salon is found")
-    void should_passSalonNameToEmailService_when_salonFoundDuringSendInvite() {
+    @DisplayName("sendInvite passes salon name to outbox enqueue when salon is found")
+    void should_passSalonNameToOutbox_when_salonFoundDuringSendInvite() {
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var request = new InviteRequest("master@example.com", salonId, null);
@@ -702,19 +700,20 @@ class InviteServiceTest {
         when(tokenGenerator.generateToken()).thenReturn("raw-tok");
         when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        log.debug("Act: sendInvite for salon 'Glamour Studio' salonId={} — salon name must be forwarded to emailService", salonId);
+        log.debug("Act: sendInvite for salon 'Glamour Studio' salonId={} — salon name must be forwarded to outbox", salonId);
         inviteService.sendInvite(request, callerId);
 
         ArgumentCaptor<String> salonNameCaptor = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendInviteEmail(anyString(), anyString(), salonNameCaptor.capture());
+        verify(outboxService).enqueueInvite(any(), anyString(), anyString(), salonNameCaptor.capture());
         assertThat(salonNameCaptor.getValue()).isEqualTo("Glamour Studio");
     }
 
     @Test
-    @DisplayName("sendInvite sends email immediately when no active transaction synchronization is present")
-    void should_sendEmailImmediately_when_noActiveTransactionSync() {
+    @DisplayName("sendInvite writes outbox row synchronously inside the @Transactional method body")
+    void should_writeOutboxRow_when_sendInviteSucceeds() {
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
+        var inviteTokenId = UUID.randomUUID();
         var request = new InviteRequest("master@example.com", salonId, null);
         var caller = buildCallerWithSalon(callerId, salonId);
         var salonStub = mock(Salon.class);
@@ -725,49 +724,28 @@ class InviteServiceTest {
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
         when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
-        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-
-        // No TransactionSynchronizationManager.initSynchronization() — synchronization is NOT active
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> {
+            var saved = (InviteToken) inv.getArgument(0);
+            ReflectionTestUtils.setField(saved, "id", inviteTokenId);
+            return saved;
+        });
 
         inviteService.sendInvite(request, callerId);
 
-        // Email must be sent directly, not deferred via afterCommit
-        verify(emailService).sendInviteEmail(eq("master@example.com"), anyString(), eq("Test Salon"));
-    }
+        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
+        // Outbox enqueue must run exactly once with the persisted token id, the invitee
+        // email, the full URL ending in the raw token, and the salon name.
+        verify(outboxService).enqueueInvite(
+                eq(inviteTokenId),
+                eq("master@example.com"),
+                linkCaptor.capture(),
+                eq("Test Salon"));
+        assertThat(linkCaptor.getValue()).endsWith("raw-token");
 
-    @Test
-    @DisplayName("sendInvite registers afterCommit callback — emailService not called before commit fires")
-    void should_notCallEmailDirectly_when_sendInviteRegistersAfterCommitCallback() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
-        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-
-        TransactionSynchronizationManager.initSynchronization();
-        try {
-            inviteService.sendInvite(request, callerId);
-
-            verify(emailService, never()).sendInviteEmail(anyString(), anyString(), anyString());
-
-            List<TransactionSynchronization> synchronizations =
-                    TransactionSynchronizationManager.getSynchronizations();
-            assertThat(synchronizations).hasSize(1);
-
-            synchronizations.forEach(TransactionSynchronization::afterCommit);
-
-            verify(emailService).sendInviteEmail(eq("master@example.com"), anyString(), eq("Test Salon"));
-        } finally {
-            TransactionSynchronizationManager.clearSynchronization();
-        }
+        // Outbox write must come AFTER the invite_tokens row save — same transaction.
+        InOrder inOrder = inOrder(inviteTokenRepository, outboxService);
+        inOrder.verify(inviteTokenRepository).save(any(InviteToken.class));
+        inOrder.verify(outboxService).enqueueInvite(any(), anyString(), anyString(), anyString());
     }
 
     // ── Phase 5.9 — buildInviteLink HTTPS scheme guard ───────────────────────
@@ -785,10 +763,10 @@ class InviteServiceTest {
                 userRepository,
                 salonRepository,
                 passwordEncoder,
-                emailService,
                 tokenGenerator,
                 masterService,
                 authResponseBuilder,
+                outboxService,
                 "http://example.com",
                 48L,
                 Clock.systemUTC()
@@ -821,10 +799,10 @@ class InviteServiceTest {
                 userRepository,
                 salonRepository,
                 passwordEncoder,
-                emailService,
                 tokenGenerator,
                 masterService,
                 authResponseBuilder,
+                outboxService,
                 "https://beautica.app",
                 48L,
                 Clock.systemUTC()
@@ -840,7 +818,7 @@ class InviteServiceTest {
         httpsService.sendInvite(request, callerId);
 
         ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendInviteEmail(anyString(), linkCaptor.capture(), anyString());
+        verify(outboxService).enqueueInvite(any(), anyString(), linkCaptor.capture(), anyString());
         assertThat(linkCaptor.getValue()).startsWith("https://beautica.app");
     }
 

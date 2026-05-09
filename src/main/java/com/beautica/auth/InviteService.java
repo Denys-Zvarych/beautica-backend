@@ -10,7 +10,7 @@ import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.service.MasterService;
-import com.beautica.notification.EmailService;
+import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
@@ -22,8 +22,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -39,10 +37,10 @@ public class InviteService {
     private final UserRepository userRepository;
     private final SalonRepository salonRepository;
     private final PasswordEncoder passwordEncoder;
-    private final EmailService emailService;
     private final TokenGenerator tokenGenerator;
     private final MasterService masterService;
     private final AuthResponseBuilder authResponseBuilder;
+    private final NotificationOutboxService outboxService;
     private final String frontendBaseUrl;
     private final long tokenExpirationHours;
     private final Clock clock;
@@ -52,10 +50,10 @@ public class InviteService {
             UserRepository userRepository,
             SalonRepository salonRepository,
             PasswordEncoder passwordEncoder,
-            EmailService emailService,
             TokenGenerator tokenGenerator,
             MasterService masterService,
             AuthResponseBuilder authResponseBuilder,
+            NotificationOutboxService outboxService,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours,
             Clock clock
@@ -64,10 +62,10 @@ public class InviteService {
         this.userRepository = userRepository;
         this.salonRepository = salonRepository;
         this.passwordEncoder = passwordEncoder;
-        this.emailService = emailService;
         this.tokenGenerator = tokenGenerator;
         this.masterService = masterService;
         this.authResponseBuilder = authResponseBuilder;
+        this.outboxService = outboxService;
         this.frontendBaseUrl = frontendBaseUrl;
         this.tokenExpirationHours = tokenExpirationHours;
         this.clock = clock;
@@ -113,20 +111,13 @@ public class InviteService {
         Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
 
         var inviteToken = new InviteToken(hashedToken, request.email(), request.salonId(), targetRole, expiresAt);
-        inviteTokenRepository.save(inviteToken);
+        var savedInviteToken = inviteTokenRepository.save(inviteToken);
 
+        // Outbox pattern: write encrypted-payload row inside this @Transactional boundary
+        // (NotificationOutboxService.enqueueInvite uses Propagation.MANDATORY). The drain
+        // worker decrypts and dispatches the e-mail asynchronously after commit.
         String inviteLink = buildInviteLink(rawToken);
-        String salonName = salon.getName();
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    emailService.sendInviteEmail(request.email(), inviteLink, salonName);
-                }
-            });
-        } else {
-            emailService.sendInviteEmail(request.email(), inviteLink, salonName);
-        }
+        outboxService.enqueueInvite(savedInviteToken.getId(), request.email(), inviteLink, salon.getName());
 
         return new InviteResponse(request.email(), expiresAt);
     }

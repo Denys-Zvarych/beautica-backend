@@ -7,7 +7,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.service.MasterService;
-import com.beautica.notification.EmailService;
+import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
@@ -60,7 +60,7 @@ class InviteServiceAdminTest {
     private SalonRepository salonRepository;
 
     @Mock
-    private EmailService emailService;
+    private NotificationOutboxService outboxService;
 
     @Mock
     private TokenGenerator tokenGenerator;
@@ -81,10 +81,10 @@ class InviteServiceAdminTest {
                 userRepository,
                 salonRepository,
                 passwordEncoder,
-                emailService,
                 tokenGenerator,
                 masterService,
                 authResponseBuilder,
+                outboxService,
                 "http://localhost:3000",
                 48L,
                 Clock.systemUTC()
