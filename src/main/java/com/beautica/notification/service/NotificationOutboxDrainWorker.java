@@ -31,7 +31,7 @@ import java.util.stream.Collectors;
 @Slf4j
 public class NotificationOutboxDrainWorker {
 
-    private static final int BATCH_SIZE = 50;
+    private static final int BATCH_SIZE = 20;
     private static final int MAX_ATTEMPTS = 3;
     private static final int MAX_ERROR_LENGTH = 500;
 
