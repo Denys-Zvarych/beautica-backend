@@ -13,7 +13,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.Map;
 import java.util.UUID;
@@ -26,6 +25,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -42,7 +42,6 @@ class NotificationServiceTest {
     @BeforeEach
     void setUp() {
         service = new NotificationService(emailService, pushService);
-        ReflectionTestUtils.setField(service, "frontendBaseUrl", "http://localhost:3000");
     }
 
     // -------------------------------------------------------------------------
@@ -179,63 +178,19 @@ class NotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should build invite URL and delegate to emailService when sendInviteEmail is called")
-    void should_buildInviteUrlAndDelegate_when_sendInviteEmailCalled() {
-        String inviteTokenId = UUID.randomUUID().toString();
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+    @DisplayName("sendInviteEmail forwards the pre-built URL verbatim to EmailService")
+    void should_delegateToEmailService_when_sendInviteEmailCalled() {
+        // Arrange
+        String email = "user@example.com";
+        String inviteUrl = "https://app.beautica.ua/invite/accept?token=ABC123";
+        String salonName = "Test Salon";
 
-        service.sendInviteEmail("master@example.com", inviteTokenId, "Salon UA");
+        // Act
+        service.sendInviteEmail(email, inviteUrl, salonName);
 
-        verify(emailService).sendInviteEmail(eq("master@example.com"), urlCaptor.capture(), eq("Salon UA"));
-        assertThat(urlCaptor.getValue())
-                .startsWith("http://localhost:3000/invite/accept?token=")
-                .contains(inviteTokenId);
-    }
-
-    @Test
-    @DisplayName("should throw IllegalStateException when frontendBaseUrl uses plain http with non-localhost origin")
-    void should_throwIllegalState_when_frontendBaseUrlIsPlainHttp() {
-        ReflectionTestUtils.setField(service, "frontendBaseUrl", "http://example.com");
-
-        org.assertj.core.api.Assertions.assertThatThrownBy(
-                () -> service.sendInviteEmail("x@y.com", UUID.randomUUID().toString(), "Salon")
-        ).isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("must use HTTPS scheme");
-    }
-
-    @Test
-    @DisplayName("should accept https URL when frontendBaseUrl is valid https")
-    void should_acceptHttpsUrl_when_frontendBaseUrlIsValidHttps() {
-        ReflectionTestUtils.setField(service, "frontendBaseUrl", "https://app.beautica.example");
-        String inviteTokenId = UUID.randomUUID().toString();
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.sendInviteEmail("master@example.com", inviteTokenId, "Salon UA");
-
-        verify(emailService).sendInviteEmail(eq("master@example.com"), urlCaptor.capture(), eq("Salon UA"));
-        assertThat(urlCaptor.getValue())
-                .startsWith("https://app.beautica.example/invite/accept?token=")
-                .contains(inviteTokenId);
-    }
-
-    @Test
-    @DisplayName("should throw IllegalStateException when frontendBaseUrl spoofs localhost subdomain")
-    void should_throwIllegalState_when_frontendBaseUrlSpoofsLocalhostSubdomain() {
-        ReflectionTestUtils.setField(service, "frontendBaseUrl", "http://localhost.attacker.com");
-
-        org.assertj.core.api.Assertions.assertThatThrownBy(
-                () -> service.sendInviteEmail("x@y.com", UUID.randomUUID().toString(), "Salon")
-        ).isInstanceOf(IllegalStateException.class);
-    }
-
-    @Test
-    @DisplayName("should throw IllegalStateException when frontendBaseUrl is malformed")
-    void should_throwIllegalState_when_frontendBaseUrlIsMalformed() {
-        ReflectionTestUtils.setField(service, "frontendBaseUrl", "not-a-url");
-
-        org.assertj.core.api.Assertions.assertThatThrownBy(
-                () -> service.sendInviteEmail("x@y.com", UUID.randomUUID().toString(), "Salon")
-        ).isInstanceOf(IllegalStateException.class);
+        // Assert — exact-arg forwarding, no transformation
+        verify(emailService).sendInviteEmail(email, inviteUrl, salonName);
+        verifyNoMoreInteractions(emailService);
     }
 
     // -------------------------------------------------------------------------

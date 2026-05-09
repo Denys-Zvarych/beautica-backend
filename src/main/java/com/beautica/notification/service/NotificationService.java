@@ -4,15 +4,18 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.net.URI;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
 
+/**
+ * Thin notification-side facade that dispatches email and push notifications.
+ *
+ * <p>Methods are synchronous — invoked by {@code NotificationOutboxDrainWorker}.
+ * URL composition (and the HTTPS scheme guard) for invite links lives in
+ * {@code InviteService.buildInviteLink}, not in this class.
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -22,9 +25,6 @@ public class NotificationService {
 
     private final EmailNotificationService emailService;
     private final PushNotificationService pushService;
-
-    @Value("${app.frontend.base-url}")
-    private String frontendBaseUrl;
 
     // NOT @Async — called synchronously by NotificationOutboxDrainWorker
 
@@ -90,33 +90,19 @@ public class NotificationService {
         );
     }
 
-    public void sendInviteEmail(String email, String inviteTokenId, String salonName) {
-        String inviteUrl = buildInviteUrl(inviteTokenId);
+    /**
+     * Forwards a pre-built invite acceptance URL to the email transport.
+     *
+     * <p>The caller is responsible for URL construction and validation
+     * (scheme guard, encoding). See {@code InviteService.buildInviteLink}.
+     *
+     * @param email     recipient address
+     * @param inviteUrl the fully-built invite acceptance URL — caller is
+     *                  responsible for URL construction and validation
+     * @param salonName salon display name shown in the email body
+     */
+    public void sendInviteEmail(String email, String inviteUrl, String salonName) {
         emailService.sendInviteEmail(email, inviteUrl, salonName);
-    }
-
-    private String buildInviteUrl(String inviteTokenId) {
-        validateFrontendBaseUrl();
-        return frontendBaseUrl + "/invite/accept?token=" + URLEncoder.encode(inviteTokenId, StandardCharsets.UTF_8);
-    }
-
-    private void validateFrontendBaseUrl() {
-        URI uri;
-        try {
-            uri = URI.create(frontendBaseUrl);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalStateException("app.frontend.base-url is not a valid URI: " + frontendBaseUrl, e);
-        }
-        String scheme = uri.getScheme();
-        String host = uri.getHost();
-        if (scheme == null || host == null) {
-            throw new IllegalStateException("app.frontend.base-url must include scheme and host: " + frontendBaseUrl);
-        }
-        boolean isHttps = "https".equalsIgnoreCase(scheme);
-        boolean isLocalHttp = "http".equalsIgnoreCase(scheme) && "localhost".equalsIgnoreCase(host);
-        if (!isHttps && !isLocalHttp) {
-            throw new IllegalStateException("app.frontend.base-url must use HTTPS scheme for non-localhost origins");
-        }
     }
 
     private static String safe(String value) {
