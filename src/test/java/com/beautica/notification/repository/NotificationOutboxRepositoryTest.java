@@ -4,15 +4,20 @@ import com.beautica.AbstractDataJpaTest;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
+import jakarta.validation.ConstraintViolationException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.validation.beanvalidation.MethodValidationPostProcessor;
 
 import java.time.Instant;
 import java.util.List;
@@ -40,7 +45,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *
  * <p>Uses a real PostgreSQL container so that {@code FOR UPDATE SKIP LOCKED} and
  * {@code CHECK} constraints execute exactly as in production.
+ *
+ * <p>{@link MethodValidationPostProcessor} is imported explicitly because the
+ * {@code @DataJpaTest} slice does not auto-configure it: in production the bean is
+ * registered by Spring Boot's full {@code ValidationAutoConfiguration} (via
+ * {@code @SpringBootApplication}). Without this import the {@code @Validated} guard on
+ * {@link NotificationOutboxRepository#claimPendingBatch(int)} is a no-op inside the slice
+ * context, which would silently mask Bean Validation regressions in this test.
  */
+@Import(MethodValidationPostProcessor.class)
 class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
 
     @Autowired
@@ -161,6 +174,46 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
 
         // Assert
         assertThat(result).hasSize(2);
+    }
+
+    // ── Bean Validation regression ────────────────────────────────────────────
+
+    /**
+     * Regression test for the {@code @Validated} guard on {@link NotificationOutboxRepository}.
+     *
+     * <p>Asserts that {@link MethodValidationPostProcessor}-driven Bean Validation rejects
+     * out-of-range {@code limit} values via {@link ConstraintViolationException} before the
+     * JPQL fires. Without this test a future refactor (e.g. removing {@code @Validated} from
+     * the repository interface, switching to a non-proxied repository implementation, or
+     * dropping {@code @Min}/{@code @Max}) would silently neutralise the guard with no
+     * green/red signal.
+     *
+     * <p>Tested values:
+     * <ul>
+     *   <li>{@code 0} — fails {@code @Min(1)}; would have returned an empty list silently.</li>
+     *   <li>{@code -1} — fails {@code @Min(1)}; PostgreSQL would have rejected with a parse error,
+     *       leaking implementation detail.</li>
+     *   <li>{@code 501} — fails {@code @Max(500)}; first value above the cap.</li>
+     *   <li>{@link Integer#MAX_VALUE} — fails {@code @Max(500)}; sanity check on the upper bound.</li>
+     * </ul>
+     *
+     * <p>The {@code @Transactional} on this test is required because
+     * {@link NotificationOutboxRepository#claimPendingBatch(int)} declares
+     * {@link Propagation#MANDATORY}; the validation interceptor runs on the proxy
+     * <strong>before</strong> the transactional interceptor delegates to the JPQL,
+     * so an active transaction is needed for the repository proxy to be entered.
+     * (Even without a transaction the validation would still fire for
+     * {@code IllegalTransactionStateException} sequencing reasons — we want to assert the
+     * validation specifically, so we run it inside an active transaction.)
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1, 501, Integer.MAX_VALUE})
+    @DisplayName("Rejects out-of-range limit values with ConstraintViolationException (Bean Validation guard)")
+    void should_throwConstraintViolationException_when_claimPendingBatchLimitOutOfRange(int badLimit) {
+        // Service-layer validation runs through MethodValidationPostProcessor.
+        // The repository proxy must reject before the JPQL fires.
+        assertThatThrownBy(() -> repo.claimPendingBatch(badLimit))
+                .isInstanceOf(ConstraintViolationException.class);
     }
 
     // ── LOW-1 ─────────────────────────────────────────────────────────────────
