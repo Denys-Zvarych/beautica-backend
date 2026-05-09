@@ -42,25 +42,38 @@ class EmailServiceTest {
     @DisplayName("sendAdminNotification calls mailSender.send when invoked")
     void should_sendEmail_when_sendAdminNotificationCalled() throws Exception {
         var toEmail = "admin@beautica.app";
+        var subject = "Test Subject";
+        var body = "Test body";
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         log.debug("Arrange: real MimeMessage so fields are inspectable after helper populates them");
 
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
 
         log.debug("Act: sendAdminNotification to={}", toEmail);
-        emailService.sendAdminNotification(toEmail, "Test Subject", "Test body");
+        emailService.sendAdminNotification(toEmail, subject, body);
 
         verify(mailSender).send(realMessage);
 
         assertThat(realMessage.getSubject())
-                .as("Subject must not be blank")
-                .isNotBlank();
+                .as("Subject must equal the value passed to sendAdminNotification")
+                .isEqualTo(subject);
         assertThat(realMessage.getFrom())
-                .as("From: must be populated")
-                .isNotEmpty();
+                .as("From: must be populated with a single address")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getFrom()[0].toString())
+                .as("From: must contain the configured noreply address")
+                .contains("noreply@beautica.app");
         assertThat(realMessage.getAllRecipients())
-                .as("To: must be populated")
-                .isNotEmpty();
+                .as("To: must contain exactly the recipient passed in")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getAllRecipients()[0].toString())
+                .as("To: must contain the admin email")
+                .contains(toEmail);
+        assertThat(realMessage.getContent().toString())
+                .as("Body must contain the text passed to sendAdminNotification")
+                .contains(body);
     }
 
     @Test

@@ -178,7 +178,7 @@ class NotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("sendInviteEmail forwards the pre-built URL verbatim to EmailService")
+    @DisplayName("should forward URL verbatim to EmailService when sendInviteEmail called")
     void should_delegateToEmailService_when_sendInviteEmailCalled() {
         // Arrange
         String email = "user@example.com";

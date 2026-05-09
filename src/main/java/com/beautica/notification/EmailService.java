@@ -46,9 +46,9 @@ public class EmailService {
             helper.setText(body, false);
             mailSender.send(message);
         } catch (MailException ex) {
-            log.error("Failed to send admin notification email: {}", ex.getMessage());
+            log.error("Failed to send admin notification email: {}", ex.getClass().getSimpleName());
         } catch (Exception ex) {
-            log.error("Failed to send admin notification email: {}", ex.getMessage());
+            log.error("Failed to send admin notification email: {}", ex.getClass().getSimpleName());
         }
     }
 }

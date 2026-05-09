@@ -6,6 +6,7 @@ import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import jakarta.mail.Message;
+import jakarta.mail.MessagingException;
 import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
 import org.junit.jupiter.api.BeforeEach;
@@ -97,7 +98,7 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should call mailSender.send with template email/new-booking when sendNewBookingEmail is called")
+    @DisplayName("Sends new-booking notification email to master via mailSender with the email/new-booking template")
     void should_callMailSenderSend_when_sendNewBookingEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
@@ -109,13 +110,20 @@ class EmailNotificationServiceTest {
                 OffsetDateTime.of(2025, 6, 15, 10, 0, 0, 0, ZoneOffset.UTC)
         );
         ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
         service.sendNewBookingEmail("client@example.com", booking);
 
-        verify(templateEngine).process(templateCaptor.capture(), any(IContext.class));
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
         verify(mailSender).send(realMessage);
 
         assertThat(templateCaptor.getValue()).isEqualTo("email/new-booking");
+        assertThat(realMessage.getSubject()).isEqualTo("Нове бронювання");
+
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
+        assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
     }
 
     @Test
@@ -160,7 +168,7 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should call mailSender.send with template email/booking-confirmed when sendBookingConfirmedEmail is called")
+    @DisplayName("Sends booking-confirmed notification email to client with the email/booking-confirmed template")
     void should_callMailSenderSend_when_sendBookingConfirmedEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
@@ -170,13 +178,21 @@ class EmailNotificationServiceTest {
                 OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
         );
         ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
         service.sendBookingConfirmedEmail("client@example.com", booking);
 
-        verify(templateEngine).process(templateCaptor.capture(), any(IContext.class));
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
         verify(mailSender).send(realMessage);
 
         assertThat(templateCaptor.getValue()).isEqualTo("email/booking-confirmed");
+        assertThat(realMessage.getSubject()).isEqualTo("Бронювання підтверджено");
+
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
+        // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date
+        assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
     }
 
     // -------------------------------------------------------------------------
@@ -184,7 +200,7 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should call mailSender.send with template email/booking-declined and pass providerComment when sendBookingDeclinedEmail is called")
+    @DisplayName("Sends booking-declined notification email to client and forwards the provider comment to the template")
     void should_callMailSenderSend_when_sendBookingDeclinedEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
@@ -203,9 +219,12 @@ class EmailNotificationServiceTest {
         verify(mailSender).send(realMessage);
 
         assertThat(templateCaptor.getValue()).isEqualTo("email/booking-declined");
+        assertThat(realMessage.getSubject()).isEqualTo("Бронювання відхилено");
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("comment")).isEqualTo("На жаль, майстер недоступний");
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
     }
 
     // -------------------------------------------------------------------------
@@ -213,7 +232,7 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should call mailSender.send with template email/booking-cancelled-provider and pass clientComment when sendClientCancelledEmail is called")
+    @DisplayName("Sends client-cancelled notification email to master and forwards the client comment to the template")
     void should_callMailSenderSend_when_sendClientCancelledEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
@@ -232,9 +251,13 @@ class EmailNotificationServiceTest {
         verify(mailSender).send(realMessage);
 
         assertThat(templateCaptor.getValue()).isEqualTo("email/booking-cancelled-provider");
+        assertThat(realMessage.getSubject()).isEqualTo("Клієнт скасував бронювання");
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("comment")).isEqualTo("Змінились плани");
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
+        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
     }
 
     // -------------------------------------------------------------------------
@@ -256,12 +279,15 @@ class EmailNotificationServiceTest {
 
     @Test
     @DisplayName("should not throw when MimeMessageHelper setup causes MessagingException")
-    void should_notThrow_when_messagingExceptionThrown() {
-        // Return a mock MimeMessage whose setContent path throws — MimeMessageHelper
-        // writes to the message during helper.setText(); an invalid message causes MessagingException.
-        // Simplest approach: make createMimeMessage() return null so MimeMessageHelper NPEs on construction,
-        // which is caught by the outer Exception catch block.
-        when(mailSender.createMimeMessage()).thenReturn(null);
+    void should_notThrow_when_messagingExceptionThrown() throws MessagingException {
+        // Inject a real MessagingException via a mock MimeMessage whose setSubject throws.
+        // MimeMessageHelper.setSubject delegates to MimeMessage.setSubject, which is declared
+        // to throw MessagingException — exercising the genuine catch (MessagingException | MailException)
+        // branch in EmailNotificationService.send().
+        MimeMessage mockMessage = mock(MimeMessage.class);
+        doThrow(new MessagingException("simulated subject failure"))
+                .when(mockMessage).setSubject(anyString(), anyString());
+        when(mailSender.createMimeMessage()).thenReturn(mockMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
 
         assertThatCode(() ->
