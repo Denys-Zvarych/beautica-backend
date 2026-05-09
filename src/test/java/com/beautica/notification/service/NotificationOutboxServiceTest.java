@@ -294,4 +294,47 @@ class NotificationOutboxServiceTest {
         assertThat(payload).contains(SEALED_STUB);
         assertThat(payload).doesNotContain(localhostUrl);
     }
+
+    // -------------------------------------------------------------------------
+    // Localhost prefix-spoof rejection (boundary-correct scheme guard)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("enqueueInvite rejects http://localhost.attacker.com (prefix-spoof)")
+    void should_throwIllegalArgument_when_inviteUrlIsLocalhostSpoof() {
+        String spoofUrl = "http://localhost.attacker.com/invite/accept?token=abc";
+
+        assertThatThrownBy(() -> service.enqueueInvite(
+                UUID.randomUUID(), "user@x.com", spoofUrl, "Salon"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scheme");
+
+        verify(cipher, never()).seal(any());
+    }
+
+    @Test
+    @DisplayName("enqueueInvite rejects http://localhostXYZ (suffix-spoof, no separator)")
+    void should_throwIllegalArgument_when_inviteUrlIsLocalhostSuffixSpoof() {
+        String spoofUrl = "http://localhostXYZ/invite/accept?token=abc";
+
+        assertThatThrownBy(() -> service.enqueueInvite(
+                UUID.randomUUID(), "user@x.com", spoofUrl, "Salon"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scheme");
+
+        verify(cipher, never()).seal(any());
+    }
+
+    @Test
+    @DisplayName("enqueueInvite accepts http://localhost:3000/invite/accept?token=...")
+    void should_accept_when_inviteUrlIsLocalhostWithPort() {
+        when(cipher.seal(any(String.class))).thenReturn(SEALED_STUB);
+        String url = "http://localhost:3000/invite/accept?token=abc";
+
+        service.enqueueInvite(UUID.randomUUID(), "user@x.com", url, "Salon");
+
+        // Positive proof the URL passed validation: cipher.seal must have been invoked
+        // with the exact plaintext URL.
+        verify(cipher).seal(eq(url));
+    }
 }

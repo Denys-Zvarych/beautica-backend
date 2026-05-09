@@ -13,6 +13,7 @@ import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.RefreshTokenRepository;
@@ -72,6 +73,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
     private InviteTokenRepository inviteTokenRepository;
 
     @Autowired
+    private NotificationOutboxRepository notificationOutboxRepository;
+
+    @Autowired
     private TransactionTemplate transactionTemplate;
 
     @Autowired
@@ -107,6 +111,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
             }
         });
         createdEmails.clear();
+        // Cross-test residue: invite flows write notification_outbox rows that other ITs
+        // sharing this JVM may otherwise observe. Wipe them last so FK order is preserved.
+        notificationOutboxRepository.deleteAll();
     }
 
     @Test

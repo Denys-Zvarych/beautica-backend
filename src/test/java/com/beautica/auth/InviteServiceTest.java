@@ -822,6 +822,119 @@ class InviteServiceTest {
         assertThat(linkCaptor.getValue()).startsWith("https://beautica.app");
     }
 
+    // ── Localhost prefix-spoof rejection (boundary-correct scheme guard) ──────
+
+    @Test
+    @DisplayName("buildInviteLink rejects http://localhost.attacker.com (prefix-spoof)")
+    void should_throwIllegalState_when_frontendBaseUrlIsLocalhostSpoof() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonId, null);
+        var caller = buildCallerWithSalon(callerId, salonId);
+
+        var spoofService = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                outboxService,
+                "http://localhost.attacker.com",
+                48L,
+                Clock.systemUTC()
+        );
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        assertThatThrownBy(() -> spoofService.sendInvite(request, callerId))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("HTTPS scheme");
+
+        verify(outboxService, never()).enqueueInvite(any(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("buildInviteLink rejects http://localhostXYZ (suffix-spoof, no separator)")
+    void should_throwIllegalState_when_frontendBaseUrlIsLocalhostSuffixSpoof() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonId, null);
+        var caller = buildCallerWithSalon(callerId, salonId);
+
+        var spoofService = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                outboxService,
+                "http://localhostXYZ",
+                48L,
+                Clock.systemUTC()
+        );
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        assertThatThrownBy(() -> spoofService.sendInvite(request, callerId))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("HTTPS scheme");
+
+        verify(outboxService, never()).enqueueInvite(any(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("buildInviteLink accepts http://localhost:3000 (positive boundary, with port)")
+    void should_buildInviteLink_when_frontendBaseUrlIsLocalhostWithPort() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonId, null);
+        var caller = buildCallerWithSalon(callerId, salonId);
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
+        var localhostService = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                outboxService,
+                "http://localhost:3000",
+                48L,
+                Clock.systemUTC()
+        );
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        localhostService.sendInvite(request, callerId);
+
+        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
+        // Positive proof the URL passed validation: outbox enqueue was actually invoked.
+        verify(outboxService).enqueueInvite(any(), anyString(), linkCaptor.capture(), anyString());
+        assertThat(linkCaptor.getValue()).startsWith("http://localhost:3000/invite/accept?token=");
+    }
+
     private InviteToken buildInviteToken(String email, Instant expiresAt) {
         return new InviteToken(UUID.randomUUID().toString(), email, UUID.randomUUID(), Role.SALON_MASTER, expiresAt);
     }

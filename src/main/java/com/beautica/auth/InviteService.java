@@ -173,11 +173,30 @@ public class InviteService {
     }
 
     private String buildInviteLink(String rawToken) {
-        if (!frontendBaseUrl.startsWith("https://") && !frontendBaseUrl.startsWith("http://localhost")) {
+        if (!isAllowedScheme(frontendBaseUrl)) {
             throw new IllegalStateException(
                     "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
         }
         return frontendBaseUrl + "/invite/accept?token=" + URLEncoder.encode(rawToken, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Boundary-correct scheme check. Accepts {@code https://...}, exact {@code http://localhost},
+     * {@code http://localhost/...}, or {@code http://localhost:...}. Rejects prefix-spoof shapes
+     * such as {@code http://localhost.attacker.com}, {@code http://localhostXYZ},
+     * {@code http://localhost-evil.com}.
+     */
+    private static boolean isAllowedScheme(String url) {
+        if (url.startsWith("https://")) {
+            return true;
+        }
+        if (url.equals("http://localhost")) {
+            return true;
+        }
+        if (url.startsWith("http://localhost/") || url.startsWith("http://localhost:")) {
+            return true;
+        }
+        return false;
     }
 
     private AuthResponse buildAuthResponse(User user) {

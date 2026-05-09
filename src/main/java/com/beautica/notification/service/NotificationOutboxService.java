@@ -134,7 +134,7 @@ public class NotificationOutboxService {
         if (inviteUrl.length() > MAX_INVITE_URL_LENGTH) {
             throw new IllegalArgumentException("inviteUrl exceeds maximum length of " + MAX_INVITE_URL_LENGTH);
         }
-        if (!inviteUrl.startsWith("https://") && !inviteUrl.startsWith("http://localhost")) {
+        if (!isAllowedScheme(inviteUrl)) {
             throw new IllegalArgumentException(
                     "inviteUrl must use https:// scheme or http://localhost for non-prod");
         }
@@ -162,5 +162,24 @@ public class NotificationOutboxService {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Cannot serialize outbox payload", e);
         }
+    }
+
+    /**
+     * Boundary-correct scheme check. Accepts {@code https://...}, exact {@code http://localhost},
+     * {@code http://localhost/...}, or {@code http://localhost:...}. Rejects prefix-spoof shapes
+     * such as {@code http://localhost.attacker.com}, {@code http://localhostXYZ},
+     * {@code http://localhost-evil.com}.
+     */
+    private static boolean isAllowedScheme(String url) {
+        if (url.startsWith("https://")) {
+            return true;
+        }
+        if (url.equals("http://localhost")) {
+            return true;
+        }
+        if (url.startsWith("http://localhost/") || url.startsWith("http://localhost:")) {
+            return true;
+        }
+        return false;
     }
 }
