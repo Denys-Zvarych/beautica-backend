@@ -36,8 +36,6 @@ import java.math.BigDecimal;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doNothing;
 
 @Import(TestSecurityConfig.class)
 @DisplayName("Service — cross-owner IDOR security regression")
@@ -67,7 +65,10 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
     void configureHttpClient() {
         restTemplate.getRestTemplate().setRequestFactory(
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-        doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
+        // EmailService is @MockBean'd to suppress real SMTP for any sendAdminNotification
+        // path triggered by ServiceCatalogService during these tests. The legacy
+        // sendInviteEmail method was removed (Phase 5.16 cleanup) — invites now flow
+        // through the outbox → NotificationService → EmailNotificationService.
         fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 

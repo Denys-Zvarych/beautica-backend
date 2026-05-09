@@ -1,5 +1,6 @@
 package com.beautica.notification.repository;
 
+import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
 import com.beautica.notification.entity.DeviceToken;
 import com.beautica.notification.entity.Platform;
@@ -8,14 +9,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
-import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.util.List;
 import java.util.UUID;
@@ -23,14 +18,15 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-@DataJpaTest
-@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Testcontainers
-class DeviceTokenRepositoryTest {
-
-    @Container
-    @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+/**
+ * Repository-layer tests for {@link DeviceTokenRepository}.
+ *
+ * <p>Extends {@link AbstractDataJpaTest} so the PostgreSQL container is shared across
+ * {@code @DataJpaTest} slice tests within the JVM. Slice annotations
+ * ({@code @DataJpaTest}, {@code @AutoConfigureTestDatabase}, {@code @Testcontainers},
+ * {@code @ActiveProfiles}) live on the base class.
+ */
+class DeviceTokenRepositoryTest extends AbstractDataJpaTest {
 
     @Autowired
     private DeviceTokenRepository repo;

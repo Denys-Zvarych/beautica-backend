@@ -1,5 +1,6 @@
 package com.beautica.notification.repository;
 
+import com.beautica.AbstractDataJpaTest;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
@@ -7,17 +8,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
-import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.time.Instant;
 import java.util.List;
@@ -38,17 +33,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *   <li>LOW-2: {@code countByStatus} returns accurate per-status counts.</li>
  * </ul>
  *
- * <p>Uses {@code @DataJpaTest} with a real PostgreSQL container so that
- * {@code FOR UPDATE SKIP LOCKED} and {@code CHECK} constraints execute exactly as in production.
+ * <p>Extends {@link AbstractDataJpaTest} so the PostgreSQL container is shared across
+ * {@code @DataJpaTest} slice tests within the JVM. Slice annotations
+ * ({@code @DataJpaTest}, {@code @AutoConfigureTestDatabase}, {@code @Testcontainers},
+ * {@code @ActiveProfiles}) live on the base class.
+ *
+ * <p>Uses a real PostgreSQL container so that {@code FOR UPDATE SKIP LOCKED} and
+ * {@code CHECK} constraints execute exactly as in production.
  */
-@DataJpaTest
-@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Testcontainers
-class NotificationOutboxRepositoryTest {
-
-    @Container
-    @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
 
     @Autowired
     private NotificationOutboxRepository repo;
