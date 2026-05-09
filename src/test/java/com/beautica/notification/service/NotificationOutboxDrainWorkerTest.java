@@ -19,7 +19,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -71,7 +71,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
 
         worker.drain();
 
@@ -90,7 +90,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
 
         worker.drain();
 
@@ -113,7 +113,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         // INVITE entries are excluded from the bookingIds set — stub returns empty to be safe.
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of());
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
 
         workerWithRealMapper.drain();
 
@@ -133,7 +133,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("dispatch error")).when(notificationService).notifyNewBooking(booking);
 
         worker.drain();
@@ -155,7 +155,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("persistent failure")).when(notificationService).notifyNewBooking(booking);
 
         worker.drain();
@@ -175,7 +175,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("x".repeat(600))).when(notificationService).notifyNewBooking(booking);
 
         worker.drain();
@@ -205,7 +205,7 @@ class NotificationOutboxDrainWorkerTest {
         when(booking1.getId()).thenReturn(bookingId1);
         when(booking2.getId()).thenReturn(bookingId2);
         when(booking3.getId()).thenReturn(bookingId3);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking1, booking2, booking3));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking1, booking2, booking3));
         doThrow(new RuntimeException("status change failed"))
                 .when(notificationService).notifyBookingStatusChanged(booking3);
 
@@ -228,7 +228,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Request failed: https://api.example.com/send?token=abc123secret"))
                 .when(notificationService).notifyNewBooking(booking);
 
@@ -254,7 +254,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Auth header invalid: " + jwtLike))
                 .when(notificationService).notifyNewBooking(booking);
 
@@ -276,7 +276,7 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of(booking));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
 
         worker.drain();
 
@@ -293,7 +293,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
-        when(bookingRepository.findAllById(anyCollection())).thenReturn(List.of());
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
 
         worker.drain();
 

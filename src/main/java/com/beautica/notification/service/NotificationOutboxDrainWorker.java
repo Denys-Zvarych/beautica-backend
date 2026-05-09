@@ -16,6 +16,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -62,7 +63,7 @@ public class NotificationOutboxDrainWorker {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
 
-        Map<UUID, Booking> bookingCache = bookingRepository.findAllById(bookingIds)
+        Map<UUID, Booking> bookingCache = bookingRepository.findAllByIdsWithGraph(new ArrayList<>(bookingIds))
                 .stream()
                 .collect(Collectors.toMap(Booking::getId, b -> b));
 

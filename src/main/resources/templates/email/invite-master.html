@@ -15,7 +15,7 @@
     <p>Вас запрошено до команди салону <strong th:text="${salonName}">Beautica</strong>!</p>
     <p>Натисніть на кнопку нижче, щоб прийняти запрошення та розпочати роботу:</p>
     <p style="margin:24px 0;">
-        <a th:href="${inviteUrl}"
+        <a th:href="@{${inviteUrl}}"
            style="background:#5b4fcf;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-size:15px;">
             Прийняти запрошення
         </a>
@@ -23,7 +23,7 @@
     <p style="color:#888;font-size:13px;">
         Якщо кнопка не працює, скопіюйте це посилання в браузер:
         <br/>
-        <a th:href="${inviteUrl}" th:text="${inviteUrl}" style="color:#5b4fcf;">посилання</a>
+        <a th:href="@{${inviteUrl}}" th:text="${inviteUrl}" style="color:#5b4fcf;">посилання</a>
     </p>
     <p style="color:#888;font-size:13px;">Це автоматичне повідомлення від Beautica.</p>
 </body>
