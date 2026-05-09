@@ -53,6 +53,9 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:dev-admin@localhost}
+  outbox:
+    # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
+    payload-key: w+ZLcc1IXPaNHEmD3o7EZu5yS+Uq97Wz61pmYe8NmIc=
 
 springdoc:
   api-docs:

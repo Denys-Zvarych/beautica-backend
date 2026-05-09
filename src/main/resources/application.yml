@@ -114,3 +114,8 @@ app:
     # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
     # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.
     device-token-capacity: 30
+  outbox:
+    # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
+    # Generate with: openssl rand -base64 32
+    # Empty default forces every profile (incl. test) to provide a value or fail fast at startup.
+    payload-key: ${OUTBOX_PAYLOAD_KEY:}
