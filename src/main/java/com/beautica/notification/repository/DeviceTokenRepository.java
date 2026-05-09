@@ -25,6 +25,14 @@ public interface DeviceTokenRepository extends JpaRepository<DeviceToken, UUID> 
      */
     List<DeviceToken> findByUserIdAndIsActiveTrue(UUID userId);
 
+    /**
+     * Idempotency pre-check for POST /api/v1/devices/token.
+     * Backed by the UNIQUE (user_id, token) index from the V29 migration —
+     * an index-only scan that avoids the JPA persistence-context allocation
+     * of {@code findByUserIdAndToken}.
+     */
+    boolean existsByUserIdAndToken(UUID userId, String token);
+
     @Query("SELECT dt.id AS id, dt.token AS token FROM DeviceToken dt WHERE dt.user.id = :userId AND dt.isActive = true")
     List<DeviceTokenSummary> findActiveTokenSummaryByUserId(@Param("userId") java.util.UUID userId);
 

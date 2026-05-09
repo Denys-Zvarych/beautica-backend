@@ -73,7 +73,7 @@ public class WebMvcTestSupport {
     @SuppressWarnings("unchecked")
     public AuthRateLimitFilter authRateLimitFilter() {
         LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
-        return new AuthRateLimitFilter(dummy, dummy, dummy) {
+        return new AuthRateLimitFilter(dummy, dummy, dummy, dummy) {
             @Override
             protected void doFilterInternal(HttpServletRequest req,
                                             HttpServletResponse res,

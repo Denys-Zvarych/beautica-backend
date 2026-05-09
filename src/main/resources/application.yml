@@ -110,3 +110,7 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
+  rate-limit:
+    # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
+    # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.
+    device-token-capacity: 30

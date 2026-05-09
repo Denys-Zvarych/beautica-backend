@@ -144,6 +144,40 @@ class DeviceTokenRepositoryTest {
     }
 
     @Test
+    @DisplayName("Returns true when (userId, token) row exists for the given user")
+    void should_returnTrue_when_userTokenExists() {
+        DeviceToken token = DeviceToken.builder()
+                .user(user)
+                .token("present-token")
+                .platform(Platform.ANDROID)
+                .build();
+        em.persist(token);
+        em.flush();
+        em.clear();
+
+        boolean result = repo.existsByUserIdAndToken(user.getId(), "present-token");
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("Returns false when no (userId, token) row matches — different token, same user")
+    void should_returnFalse_when_userTokenAbsent() {
+        DeviceToken token = DeviceToken.builder()
+                .user(user)
+                .token("existing-token")
+                .platform(Platform.ANDROID)
+                .build();
+        em.persist(token);
+        em.flush();
+        em.clear();
+
+        boolean result = repo.existsByUserIdAndToken(user.getId(), "missing-token");
+
+        assertThat(result).isFalse();
+    }
+
+    @Test
     @DisplayName("should_not_deleteTokensOfOtherUsers_when_deleteByUserIdAndToken")
     void should_not_deleteTokensOfOtherUsers_when_deleteByUserIdAndToken() {
         User userB = new User(
