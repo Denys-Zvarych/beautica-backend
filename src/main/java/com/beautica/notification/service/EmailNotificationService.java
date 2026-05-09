@@ -1,6 +1,7 @@
 package com.beautica.notification.service;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.common.util.SchemeGuard;
 import com.beautica.user.User;
 import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
@@ -48,6 +49,10 @@ public class EmailNotificationService {
     }
 
     public void sendInviteEmail(String to, String inviteUrl, String salonName) {
+        if (!SchemeGuard.isAllowedScheme(inviteUrl)) {
+            throw new IllegalArgumentException(
+                    "inviteUrl must use https:// scheme or http://localhost — caller must validate before reaching email transport");
+        }
         var ctx = new Context();
         ctx.setVariable("salonName", salonName);
         ctx.setVariable("inviteUrl", inviteUrl);

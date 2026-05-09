@@ -9,6 +9,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.util.SchemeGuard;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
@@ -173,30 +174,11 @@ public class InviteService {
     }
 
     private String buildInviteLink(String rawToken) {
-        if (!isAllowedScheme(frontendBaseUrl)) {
+        if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
             throw new IllegalStateException(
                     "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
         }
         return frontendBaseUrl + "/invite/accept?token=" + URLEncoder.encode(rawToken, StandardCharsets.UTF_8);
-    }
-
-    /**
-     * Boundary-correct scheme check. Accepts {@code https://...}, exact {@code http://localhost},
-     * {@code http://localhost/...}, or {@code http://localhost:...}. Rejects prefix-spoof shapes
-     * such as {@code http://localhost.attacker.com}, {@code http://localhostXYZ},
-     * {@code http://localhost-evil.com}.
-     */
-    private static boolean isAllowedScheme(String url) {
-        if (url.startsWith("https://")) {
-            return true;
-        }
-        if (url.equals("http://localhost")) {
-            return true;
-        }
-        if (url.startsWith("http://localhost/") || url.startsWith("http://localhost:")) {
-            return true;
-        }
-        return false;
     }
 
     private AuthResponse buildAuthResponse(User user) {
