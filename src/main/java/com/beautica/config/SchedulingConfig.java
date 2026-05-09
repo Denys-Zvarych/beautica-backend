@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.TaskScheduler;
@@ -16,6 +17,10 @@ public class SchedulingConfig {
         scheduler.setPoolSize(2);
         scheduler.setThreadNamePrefix("sched-");
         scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        scheduler.setAwaitTerminationSeconds(20);
+        scheduler.setErrorHandler(t ->
+                LoggerFactory.getLogger(SchedulingConfig.class)
+                        .error("Scheduled task error [{}]: {}", t.getClass().getSimpleName(), t.getMessage()));
         return scheduler;
     }
 }

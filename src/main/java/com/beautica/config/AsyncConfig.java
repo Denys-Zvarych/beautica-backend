@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import java.util.concurrent.ThreadPoolExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
@@ -16,28 +17,17 @@ public class AsyncConfig implements AsyncConfigurer {
 
     private static final Logger log = LoggerFactory.getLogger(AsyncConfig.class);
 
-    @Bean(name = "notificationExecutor")
-    public TaskExecutor notificationExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(2);
-        executor.setMaxPoolSize(5);
-        executor.setQueueCapacity(50);
-        executor.setThreadNamePrefix("notification-");
-        executor.setRejectedExecutionHandler((r, ex) ->
-                log.warn("Async task rejected — queue saturated: {}", r.getClass().getSimpleName()));
-        executor.initialize();
-        return executor;
-    }
-
+    // SMTP pool for invite and admin notification emails — FCM/APNs push gets a dedicated pool in Phase 5.8+
     @Bean(name = "emailExecutor")
-    public TaskExecutor emailTaskExecutor() {
+    public TaskExecutor emailExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(2);
         executor.setMaxPoolSize(5);
-        executor.setQueueCapacity(100);
+        executor.setQueueCapacity(150);
         executor.setThreadNamePrefix("email-");
-        executor.setRejectedExecutionHandler((r, ex) ->
-                log.warn("Async task rejected — queue saturated: {}", r.getClass().getSimpleName()));
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(20);
         executor.initialize();
         return executor;
     }

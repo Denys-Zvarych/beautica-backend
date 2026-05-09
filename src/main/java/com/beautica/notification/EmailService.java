@@ -34,7 +34,7 @@ public class EmailService {
         this.inviteTokenExpirationHours = inviteTokenExpirationHours;
     }
 
-    @Async("notificationExecutor")
+    @Async("emailExecutor")
     public void sendAdminNotification(String toEmail, String subject, String body) {
         try {
             MimeMessage message = mailSender.createMimeMessage();

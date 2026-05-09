@@ -133,6 +133,16 @@ class EmailServiceTest {
         emailService.sendAdminNotification(toEmail, "Test Subject", "Test body");
 
         verify(mailSender).send(realMessage);
+
+        assertThat(realMessage.getSubject())
+                .as("Subject must not be blank")
+                .isNotBlank();
+        assertThat(realMessage.getFrom())
+                .as("From: must be populated")
+                .isNotEmpty();
+        assertThat(realMessage.getAllRecipients())
+                .as("To: must be populated")
+                .isNotEmpty();
     }
 
     @Test
