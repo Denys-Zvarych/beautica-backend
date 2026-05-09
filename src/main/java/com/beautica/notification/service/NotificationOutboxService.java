@@ -1,5 +1,6 @@
 package com.beautica.notification.service;
 
+import com.beautica.notification.crypto.OutboxPayloadCipher;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.repository.NotificationOutboxRepository;
@@ -32,9 +33,9 @@ import java.util.UUID;
  * </ul>
  *
  * <p><strong>Security note ({@code enqueueInvite}):</strong> The raw invite URL is
- * never stored in the payload column. Only {@code email} and {@code salonName} are
- * persisted. The drain worker reconstructs the invite URL at send time by looking up
- * the {@code invite_tokens} row via {@code aggregateId} (= {@code inviteTokenId}).
+ * never stored in plaintext; the AES-GCM ciphertext is persisted under
+ * {@code inviteUrlSealed} (see {@link OutboxPayloadCipher}). The drain worker decrypts
+ * the sealed value at send time (Phase 5.6).
  */
 @Service
 @RequiredArgsConstructor
@@ -42,9 +43,11 @@ public class NotificationOutboxService {
 
     private static final int MAX_EMAIL_LENGTH = 254;
     private static final int MAX_SALON_NAME_LENGTH = 255;
+    private static final int MAX_INVITE_URL_LENGTH = 2048;
 
     private final NotificationOutboxRepository outboxRepository;
     private final ObjectMapper objectMapper;
+    private final OutboxPayloadCipher cipher;
 
     /**
      * Enqueues a {@code NEW_BOOKING} notification entry.
@@ -87,18 +90,31 @@ public class NotificationOutboxService {
     /**
      * Enqueues an {@code INVITE} notification entry.
      *
-     * <p><strong>Security:</strong> The raw invite URL (which embeds the one-time token)
-     * is NOT stored in the payload. Only {@code email} and {@code salonName} are
-     * persisted. The drain worker resolves the invite URL from the {@code invite_tokens}
-     * table at send time using {@code aggregateId} (= {@code inviteTokenId}).
+     * <p><strong>Security:</strong> {@code inviteUrl} is encrypted with
+     * {@link OutboxPayloadCipher} before persistence; plaintext never reaches the DB.
+     * The sealed ciphertext is stored under the {@code inviteUrlSealed} key. The drain
+     * worker decrypts the sealed value at send time (Phase 5.6).
+     *
+     * <p><strong>{@code inviteUrl} validation:</strong>
+     * <ul>
+     *   <li>Must not be {@code null} or blank — throws {@link IllegalArgumentException}.</li>
+     *   <li>Length must be {@code <= 2048} characters — throws {@link IllegalArgumentException}.</li>
+     *   <li>Must start with {@code https://} or {@code http://localhost} (mirroring the
+     *       guard in {@code InviteService.buildInviteLink}) — throws
+     *       {@link IllegalArgumentException}.</li>
+     * </ul>
+     * Validation runs <strong>before</strong> {@link OutboxPayloadCipher#seal(String)}
+     * is invoked, so malformed input never reaches the cipher.
      *
      * @param inviteTokenId the UUID of the {@code InviteToken} row (used as aggregateId
-     *                      by the drain worker to look up the raw token at send time)
+     *                      by the drain worker to look up the row at send time)
      * @param toEmail       the recipient's e-mail address
+     * @param inviteUrl     the fully-formed invite URL embedding the raw one-time token;
+     *                      will be encrypted before persistence — never logged
      * @param salonName     the salon name displayed in the invite e-mail
      */
     @Transactional(propagation = Propagation.MANDATORY)
-    public void enqueueInvite(UUID inviteTokenId, String toEmail, String salonName) {
+    public void enqueueInvite(UUID inviteTokenId, String toEmail, String inviteUrl, String salonName) {
         Objects.requireNonNull(inviteTokenId, "inviteTokenId must not be null");
         if (toEmail == null || toEmail.isBlank()) {
             throw new IllegalArgumentException("toEmail must not be blank");
@@ -112,7 +128,21 @@ public class NotificationOutboxService {
         if (salonName.length() > MAX_SALON_NAME_LENGTH) {
             throw new IllegalArgumentException("salonName exceeds maximum length of " + MAX_SALON_NAME_LENGTH);
         }
-        String payload = writeJson(Map.of("email", toEmail, "salonName", salonName));
+        if (inviteUrl == null || inviteUrl.isBlank()) {
+            throw new IllegalArgumentException("inviteUrl must not be blank");
+        }
+        if (inviteUrl.length() > MAX_INVITE_URL_LENGTH) {
+            throw new IllegalArgumentException("inviteUrl exceeds maximum length of " + MAX_INVITE_URL_LENGTH);
+        }
+        if (!inviteUrl.startsWith("https://") && !inviteUrl.startsWith("http://localhost")) {
+            throw new IllegalArgumentException(
+                    "inviteUrl must use https:// scheme or http://localhost for non-prod");
+        }
+        String sealedInviteUrl = cipher.seal(inviteUrl);
+        String payload = writeJson(Map.of(
+                "email", toEmail,
+                "salonName", salonName,
+                "inviteUrlSealed", sealedInviteUrl));
         save(OutboxEventType.INVITE, inviteTokenId, payload);
     }
 
