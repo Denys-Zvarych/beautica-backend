@@ -182,6 +182,10 @@ public class InviteService {
     }
 
     private String buildInviteLink(String rawToken) {
+        if (!frontendBaseUrl.startsWith("https://") && !frontendBaseUrl.startsWith("http://localhost")) {
+            throw new IllegalStateException(
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+        }
         return frontendBaseUrl + "/invite/accept?token=" + URLEncoder.encode(rawToken, StandardCharsets.UTF_8);
     }
 

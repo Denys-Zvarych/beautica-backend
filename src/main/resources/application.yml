@@ -38,6 +38,9 @@ spring:
   cache:
     type: caffeine
 
+  thymeleaf:
+    cache: true   # explicit — prevents accidental cache=false if a sibling profile adds thymeleaf.* keys
+
   threads:
     virtual:
       enabled: true

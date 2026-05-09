@@ -770,6 +770,80 @@ class InviteServiceTest {
         }
     }
 
+    // ── Phase 5.9 — buildInviteLink HTTPS scheme guard ───────────────────────
+
+    @Test
+    @DisplayName("buildInviteLink throws IllegalStateException when frontendBaseUrl is plain HTTP")
+    void should_throwIllegalState_when_frontendBaseUrlIsPlainHttp() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonId, null);
+        var caller = buildCallerWithSalon(callerId, salonId);
+
+        var httpService = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                emailService,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                "http://example.com",
+                48L,
+                Clock.systemUTC()
+        );
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        assertThatThrownBy(() -> httpService.sendInvite(request, callerId))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must use HTTPS scheme");
+    }
+
+    @Test
+    @DisplayName("buildInviteLink returns link starting with HTTPS base URL when frontendBaseUrl uses HTTPS")
+    void should_buildInviteLink_withHttps_when_frontendBaseUrlIsHttps() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("master@example.com", salonId, null);
+        var caller = buildCallerWithSalon(callerId, salonId);
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
+        var httpsService = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                emailService,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                "https://beautica.app",
+                48L,
+                Clock.systemUTC()
+        );
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com")).thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        httpsService.sendInvite(request, callerId);
+
+        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
+        verify(emailService).sendInviteEmail(anyString(), linkCaptor.capture(), anyString());
+        assertThat(linkCaptor.getValue()).startsWith("https://beautica.app");
+    }
+
     private InviteToken buildInviteToken(String email, Instant expiresAt) {
         return new InviteToken(UUID.randomUUID().toString(), email, UUID.randomUUID(), Role.SALON_MASTER, expiresAt);
     }
