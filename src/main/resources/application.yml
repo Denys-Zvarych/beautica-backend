@@ -103,7 +103,7 @@ app:
     bucket: ${CLOUDFLARE_R2_BUCKET:beautica-media}
     endpoint: ${CLOUDFLARE_R2_ENDPOINT}
   firebase:
-    service-account: ${FIREBASE_SERVICE_ACCOUNT}
+    service-account: ${FIREBASE_SERVICE_ACCOUNT:}
   frontend:
     base-url: ${FRONTEND_BASE_URL:http://localhost:3000}
   invite:
