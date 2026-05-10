@@ -13,6 +13,7 @@ import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.RefreshTokenRepository;
@@ -47,8 +48,6 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doNothing;
 
 @Import(TestSecurityConfig.class)
 @DisplayName("Invite endpoints — integration")
@@ -70,6 +69,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
 
     @Autowired
     private InviteTokenRepository inviteTokenRepository;
+
+    @Autowired
+    private NotificationOutboxRepository notificationOutboxRepository;
 
     @Autowired
     private TransactionTemplate transactionTemplate;
@@ -107,6 +109,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
             }
         });
         createdEmails.clear();
+        // Cross-test residue: invite flows write notification_outbox rows that other ITs
+        // sharing this JVM may otherwise observe. Wipe them last so FK order is preserved.
+        notificationOutboxRepository.deleteAll();
     }
 
     @Test
@@ -122,7 +127,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
 
-        doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
+        // EmailService.sendInviteEmail was removed in Phase 5.16; the invite path now
+        // writes a notification_outbox row that the drain worker eventually consumes.
+        // EmailService remains @MockBean'd above to suppress the sendAdminNotification path.
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(masterEmail, salonId, null);
@@ -201,7 +208,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
         registerAndGetToken(alreadyRegistered, Role.CLIENT);
 
-        doNothing().when(emailService).sendInviteEmail(anyString(), anyString(), anyString());
+        // EmailService.sendInviteEmail was removed in Phase 5.16 — invites now flow
+        // through the outbox. EmailService remains @MockBean'd to suppress the
+        // sendAdminNotification path on this test class.
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(alreadyRegistered, salonId, null);

@@ -37,6 +37,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> loginBuckets;
     @Mock private LoadingCache<String, Bucket> refreshBuckets;
     @Mock private LoadingCache<String, Bucket> slotsBuckets;
+    @Mock private LoadingCache<String, Bucket> deviceTokenBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -44,7 +45,7 @@ class AuthRateLimitFilterTest {
 
     @BeforeEach
     void setUp() {
-        filter = new AuthRateLimitFilter(loginBuckets, refreshBuckets, slotsBuckets);
+        filter = new AuthRateLimitFilter(loginBuckets, refreshBuckets, slotsBuckets, deviceTokenBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -57,6 +58,12 @@ class AuthRateLimitFilterTest {
 
     private MockHttpServletRequest getRequest(String uri) {
         var req = new MockHttpServletRequest("GET", uri);
+        req.setRemoteAddr(REMOTE_ADDR);
+        return req;
+    }
+
+    private MockHttpServletRequest deleteRequest(String uri) {
+        var req = new MockHttpServletRequest("DELETE", uri);
         req.setRemoteAddr(REMOTE_ADDR);
         return req;
     }
@@ -171,6 +178,60 @@ class AuthRateLimitFilterTest {
             assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
             assertThat(chain.getRequest()).isNull();
             verifyNoInteractions(loginBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("/api/v1/devices/token — POST and DELETE")
+    class DeviceTokenEndpoint {
+
+        @Test
+        @DisplayName("POST routes to deviceTokenBuckets and not loginBuckets/refreshBuckets")
+        void should_routeToDeviceTokenBuckets_when_postDevicesToken() throws Exception {
+            log.debug("Arrange: deviceTokenBuckets returns bucket that allows consumption");
+            when(deviceTokenBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/devices/token");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /devices/token when deviceToken bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when deviceToken bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(deviceTokenBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(refreshBuckets);
+            verifyNoInteractions(slotsBuckets);
+        }
+
+        @Test
+        @DisplayName("DELETE routes to deviceTokenBuckets and not loginBuckets/refreshBuckets")
+        void should_routeToDeviceTokenBuckets_when_deleteDevicesToken() throws Exception {
+            log.debug("Arrange: deviceTokenBuckets returns bucket that allows consumption");
+            when(deviceTokenBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = deleteRequest("/api/v1/devices/token");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for DELETE /devices/token when deviceToken bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when deviceToken bucket allows the DELETE request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(deviceTokenBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(refreshBuckets);
+            verifyNoInteractions(slotsBuckets);
         }
     }
 

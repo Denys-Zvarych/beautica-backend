@@ -26,3 +26,12 @@ springdoc:
   swagger-ui:
     enabled: false
 
+# Override the base application.yml default for FRONTEND_BASE_URL.
+# Base config has `${FRONTEND_BASE_URL:http://localhost:3000}` for local dev convenience;
+# in prod we deliberately omit the default so a missing env var fails the app at
+# property-resolution time (IllegalArgumentException at startup) instead of silently
+# emitting invite links that point at localhost.
+app:
+  frontend:
+    base-url: ${FRONTEND_BASE_URL}
+

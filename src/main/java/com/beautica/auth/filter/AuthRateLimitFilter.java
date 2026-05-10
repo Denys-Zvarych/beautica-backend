@@ -24,19 +24,26 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
+    private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final int RETRY_AFTER_SECONDS = 60;
 
     private final LoadingCache<String, Bucket> loginBuckets;
     private final LoadingCache<String, Bucket> refreshBuckets;
     private final LoadingCache<String, Bucket> slotsBuckets;
+    // IP-keyed (not user-keyed): JWT parsing is the responsibility of JwtAuthenticationFilter
+    // which runs *after* this filter; resolving the principal here would duplicate that work
+    // and couple the rate limiter to the auth subsystem.
+    private final LoadingCache<String, Bucket> deviceTokenBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
             @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
-            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets) {
+            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
+            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets) {
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
         this.slotsBuckets = slotsBuckets;
+        this.deviceTokenBuckets = deviceTokenBuckets;
     }
 
     @Override
@@ -44,16 +51,25 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
         String path = request.getRequestURI();
+        String method = request.getMethod();
+
+        // Device-token rate-limit: POST or DELETE /api/v1/devices/token — checked before
+        // the POST-only branch so DELETE is also covered.
+        if (DEVICE_TOKEN_PATH.equals(path)
+                && (HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))) {
+            applyRateLimit(request, response, filterChain, deviceTokenBuckets);
+            return;
+        }
 
         // Slots rate-limit: GET /api/v1/masters/{masterId}/slots — checked before POST guard
-        if (HttpMethod.GET.matches(request.getMethod())
+        if (HttpMethod.GET.matches(method)
                 && path.startsWith(SLOTS_PATH_PREFIX)
                 && path.endsWith(SLOTS_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, slotsBuckets);
             return;
         }
 
-        if (!HttpMethod.POST.matches(request.getMethod())) {
+        if (!HttpMethod.POST.matches(method)) {
             filterChain.doFilter(request, response);
             return;
         }

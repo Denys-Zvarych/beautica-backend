@@ -1,7 +1,10 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.CacheConfig;
@@ -121,5 +124,167 @@ class BookingServiceCacheTest {
         assertThat(cache.get("sentinel"))
                 .as("master-calendar cache must be fully evicted after confirmBooking")
                 .isNull();
+    }
+
+    @Test
+    @DisplayName("declineBooking evicts the master-calendar cache")
+    void should_evictMasterCalendarCache_when_declineBookingCalled() {
+        UUID actorUserId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Arrange — put a sentinel entry in master-calendar to confirm eviction
+        Cache cache = cacheManager.getCache("master-calendar");
+        assertThat(cache).isNotNull();
+        cache.put("sentinel", "value");
+        assertThat(cache.get("sentinel")).isNotNull();
+
+        Booking booking = mockPendingBooking(bookingId);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
+
+        StatusUpdateRequest request = new StatusUpdateRequest(
+                CancellationReason.PROVIDER_UNAVAILABLE,
+                "Master unavailable"
+        );
+
+        // Act
+        bookingService.declineBooking(actorUserId, bookingId, request);
+
+        // Assert — sentinel must be gone: allEntries=true evicts the entire cache
+        assertThat(cache.get("sentinel"))
+                .as("master-calendar cache must be fully evicted after declineBooking")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("completeBooking evicts the master-calendar cache")
+    void should_evictMasterCalendarCache_when_completeBookingCalled() {
+        UUID actorUserId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Arrange — put a sentinel entry in master-calendar to confirm eviction
+        Cache cache = cacheManager.getCache("master-calendar");
+        assertThat(cache).isNotNull();
+        cache.put("sentinel", "value");
+        assertThat(cache.get("sentinel")).isNotNull();
+
+        Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
+
+        // Act
+        bookingService.completeBooking(actorUserId, bookingId);
+
+        // Assert — sentinel must be gone: allEntries=true evicts the entire cache
+        assertThat(cache.get("sentinel"))
+                .as("master-calendar cache must be fully evicted after completeBooking")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("notCompleteBooking evicts the master-calendar cache")
+    void should_evictMasterCalendarCache_when_notCompleteBookingCalled() {
+        UUID actorUserId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Arrange — put a sentinel entry in master-calendar to confirm eviction
+        Cache cache = cacheManager.getCache("master-calendar");
+        assertThat(cache).isNotNull();
+        cache.put("sentinel", "value");
+        assertThat(cache.get("sentinel")).isNotNull();
+
+        Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
+
+        StatusUpdateRequest request = new StatusUpdateRequest(
+                CancellationReason.CLIENT_NO_SHOW,
+                "Client did not show up"
+        );
+
+        // Act
+        bookingService.notCompleteBooking(actorUserId, bookingId, request);
+
+        // Assert — sentinel must be gone: allEntries=true evicts the entire cache
+        assertThat(cache.get("sentinel"))
+                .as("master-calendar cache must be fully evicted after notCompleteBooking")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("cancelBooking evicts the master-calendar cache")
+    void should_evictMasterCalendarCache_when_cancelBookingCalled() {
+        UUID clientUserId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Arrange — put a sentinel entry in master-calendar to confirm eviction
+        Cache cache = cacheManager.getCache("master-calendar");
+        assertThat(cache).isNotNull();
+        cache.put("sentinel", "value");
+        assertThat(cache.get("sentinel")).isNotNull();
+
+        // cancelBooking checks booking.getClient().getId().equals(clientUserId) — wire it
+        Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
+        when(booking.getClient().getId()).thenReturn(clientUserId);
+
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        CancelBookingRequest request = new CancelBookingRequest(
+                CancellationReason.CLIENT_CANCELLED,
+                "Changed my mind"
+        );
+
+        // Act
+        bookingService.cancelBooking(clientUserId, bookingId, request);
+
+        // Assert — sentinel must be gone: allEntries=true evicts the entire cache
+        assertThat(cache.get("sentinel"))
+                .as("master-calendar cache must be fully evicted after cancelBooking")
+                .isNull();
+    }
+
+    /**
+     * Builds a fully-mocked Booking in PENDING status with every field BookingResponse.from()
+     * and registerSlotEviction() touch. Used by transition tests that start from PENDING
+     * (declineBooking).
+     */
+    private Booking mockPendingBooking(UUID bookingId) {
+        return mockBookingInStatus(bookingId, BookingStatus.PENDING);
+    }
+
+    /**
+     * Builds a fully-mocked Booking in the requested status with every field
+     * BookingResponse.from() and registerSlotEviction() touch.
+     */
+    private Booking mockBookingInStatus(UUID bookingId, BookingStatus status) {
+        Booking booking = mock(Booking.class);
+        User client = mock(User.class);
+        Master master = mock(Master.class);
+        MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+
+        when(booking.getStatus()).thenReturn(status);
+        when(booking.getId()).thenReturn(bookingId);
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getMasterService()).thenReturn(msa);
+        when(msa.getServiceDefinition()).thenReturn(serviceDef);
+        when(msa.getId()).thenReturn(UUID.randomUUID());
+        when(client.getId()).thenReturn(UUID.randomUUID());
+        when(master.getId()).thenReturn(UUID.randomUUID());
+        when(serviceDef.getName()).thenReturn("Test Service");
+        when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).plusHours(2));
+        when(booking.getEndsAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).plusHours(3));
+        when(booking.getPriceAtBooking()).thenReturn(new BigDecimal("200.00"));
+        when(booking.getDurationMinutesAtBooking()).thenReturn(60);
+        when(booking.getCreatedAt()).thenReturn(Instant.now());
+        return booking;
     }
 }

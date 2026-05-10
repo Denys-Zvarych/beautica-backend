@@ -1,31 +1,23 @@
 package com.beautica.notification;
 
-import com.beautica.common.exception.BusinessException;
-import jakarta.mail.Message;
-import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
+import jakarta.mail.Session;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.mail.MailSendException;
 import org.springframework.mail.javamail.JavaMailSender;
-import org.thymeleaf.context.Context;
-import org.thymeleaf.context.IContext;
-import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.util.Properties;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -39,100 +31,49 @@ class EmailServiceTest {
     @Mock
     private JavaMailSender mailSender;
 
-    @Mock
-    private SpringTemplateEngine templateEngine;
-
     private EmailService emailService;
 
     @BeforeEach
     void setUp() {
-        emailService = new EmailService(mailSender, templateEngine, "noreply@beautica.app", 48L);
-    }
-
-    @Test
-    @DisplayName("sendInviteEmail calls mailSender.send with the correct recipient and populates template context")
-    void should_callMailSenderSend_when_sendInviteEmailCalled() throws Exception {
-        var toEmail = "master@example.com";
-        var inviteLink = "http://localhost:3000/invite/accept?token=abc123"; // EmailService accepts the link opaquely; HTTPS scheme validation belongs in InviteService
-        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
-        log.debug("Arrange: real MimeMessage from empty Session so recipient and subject are inspectable");
-
-        when(mailSender.createMimeMessage()).thenReturn(realMessage);
-        when(templateEngine.process(any(String.class), any(IContext.class))).thenReturn("<html>invite</html>");
-
-        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
-        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
-
-        log.debug("Act: sendInviteEmail to={} with invite link and salon name", toEmail);
-        emailService.sendInviteEmail(toEmail, inviteLink, "Test Salon");
-
-        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
-        assertThat(templateCaptor.getValue())
-                .as("template name must be email/invite")
-                .isEqualTo("email/invite");
-
-        Context capturedContext = (Context) contextCaptor.getValue();
-        assertThat(capturedContext.getVariable("salonName"))
-                .as("salonName must equal the passed salon name")
-                .isEqualTo("Test Salon");
-        assertThat(capturedContext.getVariable("expiresHours"))
-                .as("expiresHours must equal the configured 48L")
-                .isEqualTo(48L);
-        assertThat(capturedContext.getVariable("inviteLink"))
-                .as("inviteLink must equal the passed invite link")
-                .isEqualTo(inviteLink);
-
-        verify(mailSender).send(realMessage);
-
-        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
-                .as("To: must be set to the toEmail parameter")
-                .isNotNull()
-                .hasSize(1);
-        assertThat(realMessage.getRecipients(Message.RecipientType.TO)[0].toString())
-                .as("To: address must contain the recipient email")
-                .contains(toEmail);
-        assertThat(realMessage.getFrom())
-                .as("From: must be set to the configured sender address")
-                .isNotNull()
-                .hasSize(1);
-        assertThat(realMessage.getFrom()[0].toString())
-                .as("From: address must equal the configured noreply sender")
-                .contains("noreply@beautica.app");
-        assertThat(realMessage.getSubject())
-                .as("Subject must equal the invite email subject")
-                .isEqualTo("You've been invited to Beautica");
-    }
-
-    @Test
-    @DisplayName("sendInviteEmail completes normally when MailException occurs (async method logs and swallows)")
-    void should_notThrow_when_mailSenderThrowsMailException() {
-        var toEmail = "fail@example.com";
-        var inviteLink = "http://localhost:3000/invite/accept?token=failtoken";
-        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
-        log.debug("Arrange: mailSender.send will throw MailSendException");
-
-        when(mailSender.createMimeMessage()).thenReturn(realMessage);
-        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
-        doThrow(new MailSendException("SMTP connection failed")).when(mailSender).send(any(MimeMessage.class));
-
-        log.debug("Act: sendInviteEmail to={} when mailSender throws — @Async method must not propagate", toEmail);
-        assertThatCode(() -> emailService.sendInviteEmail(toEmail, inviteLink, "Test Salon"))
-                .doesNotThrowAnyException();
+        emailService = new EmailService(mailSender, "noreply@beautica.app");
     }
 
     @Test
     @DisplayName("sendAdminNotification calls mailSender.send when invoked")
     void should_sendEmail_when_sendAdminNotificationCalled() throws Exception {
         var toEmail = "admin@beautica.app";
+        var subject = "Test Subject";
+        var body = "Test body";
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         log.debug("Arrange: real MimeMessage so fields are inspectable after helper populates them");
 
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
 
         log.debug("Act: sendAdminNotification to={}", toEmail);
-        emailService.sendAdminNotification(toEmail, "Test Subject", "Test body");
+        emailService.sendAdminNotification(toEmail, subject, body);
 
         verify(mailSender).send(realMessage);
+
+        assertThat(realMessage.getSubject())
+                .as("Subject must equal the value passed to sendAdminNotification")
+                .isEqualTo(subject);
+        assertThat(realMessage.getFrom())
+                .as("From: must be populated with a single address")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getFrom()[0].toString())
+                .as("From: must contain the configured noreply address")
+                .contains("noreply@beautica.app");
+        assertThat(realMessage.getAllRecipients())
+                .as("To: must contain exactly the recipient passed in")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getAllRecipients()[0].toString())
+                .as("To: must contain the admin email")
+                .contains(toEmail);
+        assertThat(realMessage.getContent().toString())
+                .as("Body must contain the text passed to sendAdminNotification")
+                .contains(body);
     }
 
     @Test

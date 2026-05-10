@@ -23,6 +23,9 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.slots-capacity:60}")
     private long slotsCapacity;
 
+    @Value("${app.rate-limit.device-token-capacity:30}")
+    private long deviceTokenCapacity;
+
     @Bean
     public LoadingCache<String, Bucket> loginBuckets() {
         return Caffeine.newBuilder()
@@ -50,6 +53,16 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofHours(1))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(slotsCapacity, Duration.ofMinutes(1)))
+                        .build());
+    }
+
+    @Bean
+    public LoadingCache<String, Bucket> deviceTokenBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(Duration.ofHours(1))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(deviceTokenCapacity, Duration.ofMinutes(1)))
                         .build());
     }
 

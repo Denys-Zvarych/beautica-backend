@@ -41,6 +41,9 @@ app:
     token-expiration-hours: 72
     from-email: noreply@beautica.app
   admin-email: admin@beautica.test
+  outbox:
+    # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
+    payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 
 management:
   health:

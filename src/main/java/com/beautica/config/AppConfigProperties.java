@@ -1,9 +1,10 @@
 package com.beautica.config;
 
+import com.beautica.notification.crypto.OutboxCipherProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
-@EnableConfigurationProperties(JwtConfig.class)
+@EnableConfigurationProperties({JwtConfig.class, OutboxCipherProperties.class})
 public class AppConfigProperties {
 }

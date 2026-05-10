@@ -9,32 +9,33 @@ import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import org.thymeleaf.context.Context;
-import org.thymeleaf.spring6.SpringTemplateEngine;
 
+/**
+ * Legacy email transport retained only for {@link #sendAdminNotification}, which is
+ * still wired into {@code ServiceCatalogService} (admin notification path, not the
+ * outbox-driven booking/invite flow).
+ *
+ * <p>The invite email path is now owned by {@code NotificationService} →
+ * {@code EmailNotificationService} via the outbox drain worker (Phase 5.10+).
+ * Do not add new methods here — extend {@code EmailNotificationService} instead.
+ */
 @Service
 public class EmailService {
 
     private static final Logger log = LoggerFactory.getLogger(EmailService.class);
 
     private final JavaMailSender mailSender;
-    private final SpringTemplateEngine templateEngine;
     private final String fromEmail;
-    private final long inviteTokenExpirationHours;
 
     public EmailService(
             JavaMailSender mailSender,
-            SpringTemplateEngine templateEngine,
-            @Value("${app.invite.from-email:noreply@beautica.app}") String fromEmail,
-            @Value("${app.invite.token-expiration-hours:48}") long inviteTokenExpirationHours
+            @Value("${app.invite.from-email:noreply@beautica.app}") String fromEmail
     ) {
         this.mailSender = mailSender;
-        this.templateEngine = templateEngine;
         this.fromEmail = fromEmail;
-        this.inviteTokenExpirationHours = inviteTokenExpirationHours;
     }
 
-    @Async("notificationExecutor")
+    @Async("emailExecutor")
     public void sendAdminNotification(String toEmail, String subject, String body) {
         try {
             MimeMessage message = mailSender.createMimeMessage();
@@ -45,33 +46,9 @@ public class EmailService {
             helper.setText(body, false);
             mailSender.send(message);
         } catch (MailException ex) {
-            log.error("Failed to send admin notification email: {}", ex.getMessage());
+            log.error("Failed to send admin notification email: {}", ex.getClass().getSimpleName());
         } catch (Exception ex) {
-            log.error("Failed to send admin notification email: {}", ex.getMessage());
-        }
-    }
-
-    @Async("emailExecutor")
-    public void sendInviteEmail(String toEmail, String inviteLink, String salonName) {
-        var context = new Context();
-        context.setVariable("inviteLink", inviteLink);
-        context.setVariable("expiresHours", inviteTokenExpirationHours);
-        context.setVariable("salonName", salonName);
-
-        String htmlContent = templateEngine.process("email/invite", context);
-
-        try {
-            MimeMessage message = mailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(message, "UTF-8");
-            helper.setFrom(fromEmail);
-            helper.setTo(toEmail);
-            helper.setSubject("You've been invited to Beautica");
-            helper.setText(htmlContent, true);
-            mailSender.send(message);
-        } catch (MailException ex) {
-            log.error("Failed to send invite email: {}", ex.getMessage());
-        } catch (Exception ex) {
-            log.error("Failed to send invite email: {}", ex.getMessage());
+            log.error("Failed to send admin notification email: {}", ex.getClass().getSimpleName());
         }
     }
 }

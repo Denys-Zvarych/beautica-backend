@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!--
+  Template: email/invite-master
+  Wired by:  EmailNotificationService (Phase 5.10) — NOT EmailService.sendInviteEmail
+  Variables: salonName (String), inviteUrl (String, HTTPS-validated at call site)
+  Caller MUST ensure inviteUrl starts with "https://" before populating the template context.
+-->
+<html xmlns:th="http://www.thymeleaf.org" lang="uk">
+<head>
+    <meta charset="UTF-8"/>
+    <title>Запрошення до салону</title>
+</head>
+<body style="font-family:sans-serif;color:#222;max-width:600px;margin:0 auto;padding:24px;">
+    <h2 style="color:#5b4fcf;">Запрошення до салону</h2>
+    <p>Вас запрошено до команди салону <strong th:text="${salonName}">Beautica</strong>!</p>
+    <p>Натисніть на кнопку нижче, щоб прийняти запрошення та розпочати роботу:</p>
+    <p style="margin:24px 0;">
+        <a th:href="@{${inviteUrl}}"
+           style="background:#5b4fcf;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-size:15px;">
+            Прийняти запрошення
+        </a>
+    </p>
+    <p style="color:#888;font-size:13px;">
+        Якщо кнопка не працює, скопіюйте це посилання в браузер:
+        <br/>
+        <a th:href="@{${inviteUrl}}" th:text="${inviteUrl}" style="color:#5b4fcf;">посилання</a>
+    </p>
+    <p style="color:#888;font-size:13px;">Це автоматичне повідомлення від Beautica.</p>
+</body>
+</html>

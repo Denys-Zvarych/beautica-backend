@@ -13,7 +13,6 @@ import com.beautica.salon.dto.SalonResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,8 +31,6 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doNothing;
 
 @Import(TestSecurityConfig.class)
 @DisplayName("GET /api/v1/salons/mine — multi-salon controller")
@@ -55,13 +52,12 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    // EmailService is @MockBean'd to suppress real SMTP for any sendAdminNotification
+    // path triggered by ServiceCatalogService. The legacy sendInviteEmail method was
+    // removed (Phase 5.16 cleanup) — invites now flow through the outbox →
+    // NotificationService → EmailNotificationService.
     @org.springframework.boot.test.mock.mockito.MockBean
     private EmailService emailService;
-
-    @BeforeEach
-    void setUp() {
-        doNothing().when(emailService).sendInviteEmail(any(), any(), any());
-    }
 
     @AfterEach
     void cleanUp() {
