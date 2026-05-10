@@ -16,4 +16,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS region VARCHAR(100);
 CREATE INDEX IF NOT EXISTS idx_users_city_region ON users(city, region);
 CREATE INDEX IF NOT EXISTS idx_salons_city_region ON salons(city, region);
 CREATE INDEX IF NOT EXISTS idx_masters_avg_rating ON masters(avg_rating DESC);
-CREATE INDEX IF NOT EXISTS idx_master_services_price_override ON master_services(price_override);
+-- price_override is a sparse "exception" column (most rows are NULL); a partial index
+-- keeps the index small and only useful for the narrow "find masters who override
+-- the default price" query. A full B-tree on a mostly-null numeric column is wasted writes.
+CREATE INDEX IF NOT EXISTS idx_master_services_price_override ON master_services(price_override) WHERE price_override IS NOT NULL;
+
+-- V3's idx_salons_city is now redundant — the composite idx_salons_city_region (created above)
+-- handles WHERE city = ? queries via leftmost-prefix matching. Drop to save write cost.
+DROP INDEX IF EXISTS idx_salons_city;
