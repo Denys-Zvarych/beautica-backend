@@ -396,10 +396,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters — first 5 pages populate the search:masters cache")
     void should_populateCache_when_firstPagesQueried() {
         ensureHttpClient();
-        seedMasterWithCity("Київ", "4.00");
-
         Cache cache = cacheManager.getCache("search:masters");
         assertThat(cache).as("search:masters cache must be registered").isNotNull();
+        cache.clear();
+
+        seedMasterWithCity("Київ", "4.00");
 
         log.debug("Act: GET {}?city=Київ — expect cache to be populated after the call", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -409,8 +410,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         long cachedEntries = countNativeEntries(cache);
         assertThat(cachedEntries)
-                .as("first call must populate at least one entry in search:masters")
-                .isGreaterThanOrEqualTo(1L);
+                .as("first call must populate exactly one entry in search:masters")
+                .isEqualTo(1L);
     }
 
     @Test
@@ -451,6 +452,202 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
             return caffeine.estimatedSize();
         }
         throw new IllegalStateException("Expected Caffeine cache, got " + native_.getClass());
+    }
+
+    // ── Phase 6.5 QA — combined filters, salons, missing services, cache keys ─
+
+    @Test
+    @DisplayName("GET /search/masters — combines all filters and returns only the matching master")
+    void should_combineAllFiltersAndReturnOnlyMatchingMaster_when_fullFilterRequest() throws Exception {
+        ensureHttpClient();
+        // m1: matches every predicate
+        UUID m1 = seedMasterWithServiceCategoryAndPrice("Київ", "4.50", "MANICURE", new BigDecimal("180.00"));
+        // m2: out of price range — fails minPrice
+        seedMasterWithServiceCategoryAndPrice("Київ", "4.50", "MANICURE", new BigDecimal("50.00"));
+        // m3: wrong category
+        seedMasterWithServiceCategoryAndPrice("Київ", "4.50", "HAIRCUT", new BigDecimal("200.00"));
+        // m4: rating below threshold
+        seedMasterWithServiceCategoryAndPrice("Київ", "3.00", "MANICURE", new BigDecimal("180.00"));
+
+        log.debug("Act: GET {} with full filter set — must return only m1", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?city=Київ&category=MANICURE&minPrice=100.00&maxPrice=300.00&minRating=4.0"
+                        + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode page = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(page.path("totalElements").asLong())
+                .as("only the fully-conforming master must be counted")
+                .isEqualTo(1L);
+        assertThat(page.path("data").size()).isEqualTo(1);
+        assertThat(page.path("data").get(0).path("masterId").asText()).isEqualTo(m1.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — second identical call hits cache without growing entry count")
+    void should_returnCachedResultWithoutHittingDb_when_secondIdenticalCall() throws Exception {
+        ensureHttpClient();
+        Cache cache = cacheManager.getCache("search:masters");
+        assertThat(cache).as("search:masters cache must be registered").isNotNull();
+        cache.clear();
+
+        seedMasterWithCity("Київ", "4.00");
+
+        String url = MASTERS_URL + "?city=Київ&page=0&size=20";
+
+        // First call: cache miss → populates entry
+        ResponseEntity<String> first = restTemplate.exchange(url, HttpMethod.GET, anonymous(), String.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(countNativeEntries(cache))
+                .as("first call must populate exactly one cache entry")
+                .isEqualTo(1L);
+
+        // Second identical call: cache hit → no new entry, identical body
+        ResponseEntity<String> second = restTemplate.exchange(url, HttpMethod.GET, anonymous(), String.class);
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(countNativeEntries(cache))
+                .as("second identical call must reuse the same cache entry")
+                .isEqualTo(1L);
+
+        // Bodies must be byte-identical when cache is hit
+        assertThat(objectMapper.readTree(second.getBody()))
+                .as("cached body must match the original")
+                .isEqualTo(objectMapper.readTree(first.getBody()));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — distinct cache keys produced when requests differ by a single filter")
+    void should_useDistinctCacheKeys_when_requestsDifferByOnlyOneFilter() {
+        ensureHttpClient();
+        Cache cache = cacheManager.getCache("search:masters");
+        assertThat(cache).as("search:masters cache must be registered").isNotNull();
+        cache.clear();
+
+        seedMasterWithCity("Київ", "4.00");
+        seedMasterWithCity("Львів", "4.00");
+
+        restTemplate.exchange(MASTERS_URL + "?city=Київ&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+        restTemplate.exchange(MASTERS_URL + "?city=Львів&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(countNativeEntries(cache))
+                .as("each distinct filter combo must occupy its own cache entry")
+                .isEqualTo(2L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — master without master_services rows surfaces with null minEffectivePrice when no filter applied")
+    void should_returnMasterWithNullPrice_when_masterHasNoMasterServicesRows_andNoFilter() throws Exception {
+        ensureHttpClient();
+        UUID masterId = seedMasterWithoutServices("Київ", "4.00");
+
+        log.debug("Act: GET {}?city=Київ — JOIN must be elided, master visible with null price", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode page = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(page.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(page.path("data").get(0).path("masterId").asText()).isEqualTo(masterId.toString());
+        assertThat(page.path("data").get(0).path("minEffectivePrice").isNull())
+                .as("no service-join branch → minEffectivePrice must project NULL")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — master without services excluded when category filter forces the JOIN")
+    void should_excludeMasterWithoutServices_when_categoryFilterApplied() throws Exception {
+        ensureHttpClient();
+        seedMasterWithoutServices("Київ", "4.00");
+
+        log.debug("Act: GET {}?city=Київ&category=MANICURE — JOIN active, master without services must drop", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?city=Київ&category=MANICURE&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode page = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(page.path("totalElements").asLong())
+                .as("category filter forces JOIN to master_services — master without rows must not appear")
+                .isZero();
+        assertThat(page.path("data").size()).isZero();
+    }
+
+    // ── Phase 6.5 QA — salon search IT parity ────────────────────────────────
+
+    @Test
+    @DisplayName("GET /search/salons — finds salons by city when salons exist in city")
+    void should_findSalonsByCity_when_salonsExistInCity() throws Exception {
+        ensureHttpClient();
+        seedActiveSalon("Київ", "Region-A");
+        seedActiveSalon("Львів", "Region-B");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode page = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(page.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(page.path("data").get(0).path("city").asText()).isEqualTo("Київ");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — empty page when no salons match city")
+    void should_returnEmptyList_when_noSalonsMatchCity() throws Exception {
+        ensureHttpClient();
+        seedActiveSalon("Київ", null);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?city=Одеса&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(objectMapper.readTree(response.getBody())
+                .path("data").path("totalElements").asLong()).isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — first 5 pages populate the search:salons cache")
+    void should_populateSalonCache_when_firstPagesQueried() {
+        ensureHttpClient();
+        Cache cache = cacheManager.getCache("search:salons");
+        assertThat(cache).as("search:salons cache must be registered").isNotNull();
+        cache.clear();
+
+        seedActiveSalon("Київ", null);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        assertThat(countNativeEntries(cache))
+                .as("first salon search call must populate exactly one entry")
+                .isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — page index >= 5 skips the search:salons cache")
+    void should_skipSalonCache_when_pageIndexIsAtOrAboveFive() {
+        ensureHttpClient();
+        Cache cache = cacheManager.getCache("search:salons");
+        assertThat(cache).as("search:salons cache must be registered").isNotNull();
+        cache.clear();
+
+        seedActiveSalon("Київ", null);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?city=Київ&page=5&size=1", HttpMethod.GET,
+                anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        assertThat(countNativeEntries(cache))
+                .as("page=5 is above the cache window — no entry must be written")
+                .isZero();
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -514,6 +711,52 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "SELECT salon_id FROM masters WHERE id = ?", UUID.class, masterId);
         seedServiceWithCategory(masterId, salonId, "MANICURE", basePrice, true, true);
         return masterId;
+    }
+
+    /**
+     * Seeds a master plus one active SALON-owned service definition with the
+     * given category, priced at {@code basePrice}, and an active
+     * {@code master_services} row. Combines the existing {@code seedMaster} +
+     * {@code seedServiceWithCategory} idiom into a single call so the
+     * multi-filter combination test can express each seed line as one statement.
+     */
+    private UUID seedMasterWithServiceCategoryAndPrice(String city, String avgRating,
+                                                       String category, BigDecimal basePrice) {
+        UUID masterId = seedMaster(city, avgRating);
+        UUID salonId = jdbcTemplate.queryForObject(
+                "SELECT salon_id FROM masters WHERE id = ?", UUID.class, masterId);
+        seedServiceWithCategory(masterId, salonId, category, basePrice, true, true);
+        return masterId;
+    }
+
+    /**
+     * Seeds a master with NO {@code master_services} rows. The underlying
+     * {@code seedMaster} already creates an unattached master, so this is a
+     * named alias that makes test intent explicit and protects against a
+     * future refactor of {@code seedMaster} that starts auto-attaching services.
+     */
+    private UUID seedMasterWithoutServices(String city, String avgRating) {
+        return seedMaster(city, avgRating);
+    }
+
+    /**
+     * Seeds a SALON_OWNER + an active {@code salons} row in the given city/region.
+     * Bypasses the master/user hierarchy because the salon search endpoint only
+     * joins {@code salons}; no master or user rows are required.
+     */
+    private UUID seedActiveSalon(String city, String region) {
+        UUID ownerId = UUID.randomUUID();
+        String ownerEmail = "salon-owner-" + UUID.randomUUID() + "@beautica.test";
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                ownerId, ownerEmail, "$2a$04$placeholdervaluefortestonlydigest");
+
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city, region, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, "Salon-" + salonId, city, region);
+        return salonId;
     }
 
     /**

@@ -2,7 +2,10 @@ package com.beautica.search.controller;
 
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
+import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.GlobalExceptionHandler;
 import com.beautica.config.WebMvcTestSupport;
+import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchResult;
 import com.beautica.search.service.SearchService;
@@ -35,6 +38,8 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
 
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
@@ -59,7 +64,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(SearchController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
-@Import(WebMvcTestSupport.class)
+@Import({WebMvcTestSupport.class, GlobalExceptionHandler.class})
 @DisplayName("SearchController — @WebMvcTest slice")
 class SearchControllerTest {
 
@@ -241,6 +246,42 @@ class SearchControllerTest {
                 .andExpect(jsonPath("$.data.size").value(2))
                 .andExpect(jsonPath("$.data.totalElements").value(7))
                 .andExpect(jsonPath("$.data.totalPages").value(4));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when minPrice exceeds maxPrice (service-layer cross-field check)")
+    void should_return400_when_minPriceExceedsMaxPrice() throws Exception {
+        when(searchService.searchMasters(any(MasterSearchRequest.class), any(Pageable.class)))
+                .thenThrow(new BusinessException("minPrice must not exceed maxPrice"));
+
+        log.debug("Act: GET {} with minPrice > maxPrice — service raises BusinessException → 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "500.00")
+                        .param("maxPrice", "100.00")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(containsString("minPrice must not exceed maxPrice")));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 with safe message when city contains a control character")
+    void should_return400AndNotEchoRawInput_when_cityContainsControlChar() throws Exception {
+        // U+0007 BEL — caught by the @Pattern "^[^\\p{Cntrl}]*$" on MasterSearchRequest.city.
+        String controlCharInput = "Київ";
+
+        log.debug("Act: GET {} with city containing BEL — must reject without echoing the raw bytes", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("city", controlCharInput)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(containsString("control character")))
+                .andExpect(jsonPath("$.message").value(not(containsString(""))));
     }
 
     // ── GET /api/v1/search/salons ────────────────────────────────────────────
