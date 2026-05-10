@@ -73,7 +73,12 @@ public class SearchService {
               u.city            AS city,
               m.avg_rating      AS avg_rating,
               m.review_count    AS review_count,
-              u.avatar_url      AS avatar_url,
+              -- Avatar column does not yet exist on users/masters (no migration added it as
+              -- of V35). Emit NULL so the projection still maps cleanly until a future phase
+              -- introduces user/master avatar storage. Discovered by SearchIntegrationTest
+              -- in Phase 6.4 — Phase 6.3 unit tests stub the EntityManager and never executed
+              -- the real SQL. See docs/backlog.md follow-up.
+              CAST(NULL AS TEXT) AS avatar_url,
               MIN(COALESCE(ms.price_override, sd.base_price)) AS min_effective_price
             FROM masters m
             JOIN users u ON u.id = m.user_id
@@ -81,14 +86,14 @@ public class SearchService {
             LEFT JOIN service_definitions sd ON sd.id = ms.service_def_id
             WHERE m.is_active = true
               AND u.is_active = true
-              AND (:city IS NULL OR u.city = :city)
-              AND (:region IS NULL OR u.region = :region)
-              AND (:category IS NULL OR sd.category = :category)
-              AND (:minRating IS NULL OR m.avg_rating >= :minRating)
+              AND (CAST(:city AS VARCHAR) IS NULL OR u.city = CAST(:city AS VARCHAR))
+              AND (CAST(:region AS VARCHAR) IS NULL OR u.region = CAST(:region AS VARCHAR))
+              AND (CAST(:category AS VARCHAR) IS NULL OR sd.category = CAST(:category AS VARCHAR))
+              AND (CAST(:minRating AS NUMERIC) IS NULL OR m.avg_rating >= CAST(:minRating AS NUMERIC))
             GROUP BY m.id, m.user_id, u.first_name, u.last_name, u.city,
-                     m.avg_rating, m.review_count, u.avatar_url
-            HAVING (:minPrice IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) >= :minPrice)
-               AND (:maxPrice IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) <= :maxPrice)
+                     m.avg_rating, m.review_count
+            HAVING (CAST(:minPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) >= CAST(:minPrice AS NUMERIC))
+               AND (CAST(:maxPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) <= CAST(:maxPrice AS NUMERIC))
             ORDER BY m.avg_rating DESC NULLS LAST
             LIMIT :limit OFFSET :offset
             """;
@@ -107,13 +112,13 @@ public class SearchService {
               LEFT JOIN service_definitions sd ON sd.id = ms.service_def_id
               WHERE m.is_active = true
                 AND u.is_active = true
-                AND (:city IS NULL OR u.city = :city)
-                AND (:region IS NULL OR u.region = :region)
-                AND (:category IS NULL OR sd.category = :category)
-                AND (:minRating IS NULL OR m.avg_rating >= :minRating)
+                AND (CAST(:city AS VARCHAR) IS NULL OR u.city = CAST(:city AS VARCHAR))
+                AND (CAST(:region AS VARCHAR) IS NULL OR u.region = CAST(:region AS VARCHAR))
+                AND (CAST(:category AS VARCHAR) IS NULL OR sd.category = CAST(:category AS VARCHAR))
+                AND (CAST(:minRating AS NUMERIC) IS NULL OR m.avg_rating >= CAST(:minRating AS NUMERIC))
               GROUP BY m.id
-              HAVING (:minPrice IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) >= :minPrice)
-                 AND (:maxPrice IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) <= :maxPrice)
+              HAVING (CAST(:minPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) >= CAST(:minPrice AS NUMERIC))
+                 AND (CAST(:maxPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) <= CAST(:maxPrice AS NUMERIC))
             ) AS filtered
             """;
 
