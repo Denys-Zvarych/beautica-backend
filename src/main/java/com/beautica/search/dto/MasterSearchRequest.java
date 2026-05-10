@@ -45,8 +45,13 @@ import java.math.BigDecimal;
  *   <li>{@code minRating} — precision matches
  *       {@code masters.avg_rating NUMERIC(3,2)} (1 integer digit + 2 fraction);
  *       value range 0.00–5.00 reflects the domain rating scale.</li>
- *   <li>{@code page} — capped at 10000 to prevent absurd offset-pagination
- *       abuse against a catalogue that will never approach that size.</li>
+ *   <li>{@code page} — capped at 500 to bound offset-pagination memory usage:
+ *       at the {@code size=100} ceiling that means at most ~50 000 results
+ *       reachable via {@code page}. Deeper pagination requires keyset
+ *       (cursor) pagination, deferred until phase-9 search overhaul.
+ *       The previous cap of 10 000 permitted ~1 000 000-row offsets, which
+ *       degrades into a sort-and-discard scan in Postgres even with the
+ *       covering index on {@code masters.avg_rating} added in V36.</li>
  *   <li>{@code size} — capped at 100 to enforce the global page-size ceiling
  *       defined in {@code application.yml} ({@code spring.data.web.pageable.max-page-size: 100}).
  *       The Spring property sets a default; {@code @PageableDefault} does NOT
@@ -82,7 +87,7 @@ public record MasterSearchRequest(
         Double minRating,
 
         @PositiveOrZero
-        @Max(10_000)
+        @Max(500)
         int page,
 
         @Positive

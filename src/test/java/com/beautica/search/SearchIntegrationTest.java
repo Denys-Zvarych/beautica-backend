@@ -10,6 +10,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -47,6 +49,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private CacheManager cacheManager;
 
     /**
      * Wires the Apache HttpClient factory before the first request in each
@@ -294,6 +299,158 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("totalElements").asLong())
                 .as("HAVING-aware count must reflect actual filtered rows")
                 .isEqualTo(1L);
+    }
+
+    // ── Phase 6.5 — dynamic SQL branches ─────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters — no category/price filter returns null minEffectivePrice (JOIN elided)")
+    void should_returnNullMinEffectivePrice_when_noServiceJoinNeeded() throws Exception {
+        ensureHttpClient();
+        UUID masterId = seedMasterWithService("Київ", "4.50", new BigDecimal("250.00"));
+
+        log.debug("Act: GET {}?city=Київ — no category/price filter, JOIN should be elided", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.size()).isEqualTo(1);
+        assertThat(rows.get(0).path("masterId").asText()).isEqualTo(masterId.toString());
+        assertThat(rows.get(0).path("minEffectivePrice").isNull())
+                .as("JOIN is elided when no category/price filter — minEffectivePrice column projects NULL")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — category filter forces JOIN and returns aggregated minEffectivePrice")
+    void should_returnAggregatedMinEffectivePrice_when_categoryFilterSet() throws Exception {
+        ensureHttpClient();
+        UUID master = seedMaster("Київ", "4.20");
+        UUID salon = jdbcTemplate.queryForObject("SELECT salon_id FROM masters WHERE id = ?", UUID.class, master);
+        seedServiceWithCategory(master, salon, "MANICURE", new BigDecimal("180.00"), true, true);
+        seedServiceWithCategory(master, salon, "MANICURE", new BigDecimal("320.00"), true, true);
+
+        log.debug("Act: GET {}?category=MANICURE — JOIN must be active, MIN must return 180.00", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?category=MANICURE&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.size()).isEqualTo(1);
+        assertThat(new BigDecimal(rows.get(0).path("minEffectivePrice").asText()))
+                .as("MIN(COALESCE(price_override, base_price)) over the two active services")
+                .isEqualByComparingTo(new BigDecimal("180.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — flat count branch returns totalElements without HAVING when no price filter")
+    void should_useFlatCountBranch_when_noPriceFilterApplied() throws Exception {
+        ensureHttpClient();
+        for (int i = 0; i < 5; i++) {
+            seedMasterWithCity("Київ", "4.00");
+        }
+
+        log.debug("Act: GET {}?city=Київ&size=2 — flat count branch — totalElements must equal 5", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?city=Київ&page=0&size=2", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size()).isEqualTo(2);
+        assertThat(data.path("totalElements").asLong())
+                .as("flat COUNT(DISTINCT m.id) must count every active master in Київ")
+                .isEqualTo(5L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — wrapped-subquery count branch honours HAVING price filter")
+    void should_useSubqueryCountBranch_when_priceFilterApplied() throws Exception {
+        ensureHttpClient();
+        // Five candidates; price filter should retain exactly two.
+        seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));   // below
+        seedMasterWithService("Київ", "4.00", new BigDecimal("250.00"));   // in range
+        seedMasterWithService("Київ", "4.00", new BigDecimal("400.00"));   // in range
+        seedMasterWithService("Київ", "4.00", new BigDecimal("700.00"));   // above
+        seedMasterWithService("Київ", "4.00", new BigDecimal("900.00"));   // above
+
+        log.debug("Act: GET {}?minPrice=200&maxPrice=500 — subquery count branch — totalElements must equal 2", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=200&maxPrice=500&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size()).isEqualTo(2);
+        assertThat(data.path("totalElements").asLong())
+                .as("subquery wrapper must respect HAVING — exactly 2 masters fall inside [200,500]")
+                .isEqualTo(2L);
+    }
+
+    // ── Phase 6.5 — caching ──────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters — first 5 pages populate the search:masters cache")
+    void should_populateCache_when_firstPagesQueried() {
+        ensureHttpClient();
+        seedMasterWithCity("Київ", "4.00");
+
+        Cache cache = cacheManager.getCache("search:masters");
+        assertThat(cache).as("search:masters cache must be registered").isNotNull();
+
+        log.debug("Act: GET {}?city=Київ — expect cache to be populated after the call", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        long cachedEntries = countNativeEntries(cache);
+        assertThat(cachedEntries)
+                .as("first call must populate at least one entry in search:masters")
+                .isGreaterThanOrEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — page index >= 5 skips the cache (cold-path)")
+    void should_skipCache_when_pageIndexIsAtOrAboveFive() {
+        ensureHttpClient();
+        seedMasterWithCity("Київ", "4.00");
+
+        Cache cache = cacheManager.getCache("search:masters");
+        assertThat(cache).isNotNull();
+        cache.clear();
+        long before = countNativeEntries(cache);
+
+        // Page 5 (0-indexed) — the @Cacheable condition is `pageNumber < 5`, so
+        // this call must bypass the cache. With size=1 and 1 seeded master, the
+        // service returns an empty content list but the underlying query still
+        // runs.
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?city=Київ&page=5&size=1", HttpMethod.GET,
+                anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        long after = countNativeEntries(cache);
+        assertThat(after)
+                .as("page=5 is above the cache window; no entry must be written")
+                .isEqualTo(before);
+    }
+
+    /**
+     * Caffeine cache size probe — {@link Cache#getNativeCache()} surfaces the
+     * underlying Caffeine cache, which exposes an estimated entry count. The
+     * estimate is exact in single-threaded test code immediately after a
+     * synchronous call.
+     */
+    private long countNativeEntries(Cache cache) {
+        Object native_ = cache.getNativeCache();
+        if (native_ instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeine) {
+            return caffeine.estimatedSize();
+        }
+        throw new IllegalStateException("Expected Caffeine cache, got " + native_.getClass());
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

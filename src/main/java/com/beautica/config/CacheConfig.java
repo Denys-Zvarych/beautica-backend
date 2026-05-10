@@ -26,6 +26,16 @@ public class CacheConfig {
      *   master-calendar     — paginated booking calendar per master/date range — 30 sec TTL, max 500 entries
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
      *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
+     *   search:masters      — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
+     *   search:salons       — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
+     *
+     * <p>Note on {@code search:*}: short TTL is preferred over explicit
+     * {@code @CacheEvict} on master/salon write paths because discovery results
+     * aggregate across many entities — the eviction key set would balloon
+     * (a single rating update touches one master but invalidates every cached
+     * query that returned it). 60-second TTL trades freshness for hit-rate on
+     * the hot-path first 5 pages and avoids tying every write to a fan-out
+     * eviction.
      */
     @Bean
     public CacheManager cacheManager() {
@@ -74,6 +84,16 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
+                        .build());
+        manager.registerCustomCache("search:masters",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS)
+                        .build());
+        manager.registerCustomCache("search:salons",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
         return manager;
     }

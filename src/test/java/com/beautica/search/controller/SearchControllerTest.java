@@ -208,6 +208,17 @@ class SearchControllerTest {
     }
 
     @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when ?page exceeds 500 (tightened cap in Phase 6.5)")
+    void should_return400_when_pageExceedsTightenedCap() throws Exception {
+        log.debug("Act: GET {} with page=501 — must fail @Max(500) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "501")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
     @DisplayName("GET /api/v1/search/masters — paginated envelope is present in response JSON")
     void should_returnPaginatedResponse_when_resultPageReturned() throws Exception {
         MasterSearchResult one = sampleMasterResult();

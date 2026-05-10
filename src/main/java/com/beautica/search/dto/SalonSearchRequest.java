@@ -25,8 +25,12 @@ import jakarta.validation.constraints.Size;
  *       {@code salons.city VARCHAR(100)} / {@code salons.region VARCHAR(100)}
  *       columns. Control-character pattern blocks log injection and obviously
  *       malformed inputs.</li>
- *   <li>{@code page} — capped at 10000 to prevent absurd offset-pagination
- *       abuse.</li>
+ *   <li>{@code page} — capped at 500 to bound offset-pagination memory usage:
+ *       at the {@code size=100} ceiling that means at most ~50 000 results
+ *       reachable via offset pagination. Deeper pagination requires keyset
+ *       (cursor) pagination, deferred until phase-9 search overhaul. The
+ *       previous cap of 10 000 allowed ~1 000 000-row offsets that degrade
+ *       into a sort-and-discard scan in Postgres.</li>
  *   <li>{@code size} — capped at 100 to mirror the global page-size ceiling
  *       defined in {@code application.yml}
  *       ({@code spring.data.web.pageable.max-page-size: 100}). The Spring
@@ -50,7 +54,7 @@ public record SalonSearchRequest(
         String region,
 
         @PositiveOrZero
-        @Max(10_000)
+        @Max(500)
         int page,
 
         @Positive

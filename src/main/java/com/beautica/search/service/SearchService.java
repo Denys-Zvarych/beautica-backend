@@ -10,6 +10,7 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
@@ -19,8 +20,10 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -33,12 +36,33 @@ import java.util.UUID;
  * cleanly while keeping the {@code GROUP BY} → {@code HAVING} pipeline visible.
  * Salon search is plain JPQL on {@link SalonRepository#findByFilter}.
  *
+ * <h3>SQL is built dynamically per request</h3>
+ * The native SQL is assembled by {@link #buildMasterSearchSql} at request time
+ * rather than held as a static constant with {@code (:p IS NULL OR col = :p)}
+ * placeholders. Two reasons:
+ *
+ * <ol>
+ *   <li><b>Index pushdown</b>. The earlier {@code CAST(:city AS VARCHAR) IS NULL OR
+ *       u.city = CAST(:city AS VARCHAR)} form (a workaround for Postgres'
+ *       inability to infer null parameter types in OR predicates over native
+ *       queries) defeats index pushdown — the planner cannot see that the
+ *       parameter is actually constant within the query and emits a sequential
+ *       scan. Dropping the parameter entirely when the value is null restores
+ *       the planner's ability to use {@code idx_users_active_city_region}.</li>
+ *   <li><b>JOIN avoidance</b>. The {@code master_services} / {@code service_definitions}
+ *       LEFT JOINs are only useful when the caller filters by price or category.
+ *       For the common "all masters in city X" query, building without those joins
+ *       shaves a two-table fan-out from every row of the result set.</li>
+ * </ol>
+ *
  * <h3>Why pagination needs a HAVING-aware count</h3>
  * The price filter is applied in {@code HAVING}, not {@code WHERE}, because the
  * effective price is an aggregate. A naive {@code SELECT COUNT(DISTINCT m.id)}
  * without {@code HAVING} would over-count, producing phantom pages on the mobile
  * client (e.g. last page renders empty). The count query therefore wraps the
- * same {@code GROUP BY ... HAVING ...} in a subquery.
+ * same {@code GROUP BY ... HAVING ...} in a subquery — but only when a price
+ * filter is actually present. The no-price-filter case uses a flat
+ * {@code COUNT(DISTINCT m.id)}, avoiding a useless wrapper.
  *
  * <h3>Carry-over Phase 6.2 LOWs fixed here</h3>
  * <ul>
@@ -56,71 +80,6 @@ import java.util.UUID;
 @Service
 @RequiredArgsConstructor
 public class SearchService {
-
-    /**
-     * Native SQL projection for master search. Filters use the standard
-     * {@code (:param IS NULL OR col = :param)} idiom so a single query handles
-     * every combination of optional filters. The price filter must live in
-     * {@code HAVING} because it constrains the {@code MIN(COALESCE(...))}
-     * aggregate.
-     */
-    private static final String MASTER_SEARCH_SQL = """
-            SELECT
-              m.id              AS master_id,
-              m.user_id         AS user_id,
-              u.first_name      AS first_name,
-              u.last_name       AS last_name,
-              u.city            AS city,
-              m.avg_rating      AS avg_rating,
-              m.review_count    AS review_count,
-              -- Avatar column does not yet exist on users/masters (no migration added it as
-              -- of V35). Emit NULL so the projection still maps cleanly until a future phase
-              -- introduces user/master avatar storage. Discovered by SearchIntegrationTest
-              -- in Phase 6.4 — Phase 6.3 unit tests stub the EntityManager and never executed
-              -- the real SQL. See docs/backlog.md follow-up.
-              CAST(NULL AS TEXT) AS avatar_url,
-              MIN(COALESCE(ms.price_override, sd.base_price)) AS min_effective_price
-            FROM masters m
-            JOIN users u ON u.id = m.user_id
-            LEFT JOIN master_services ms ON ms.master_id = m.id AND ms.is_active = true
-            LEFT JOIN service_definitions sd ON sd.id = ms.service_def_id
-            WHERE m.is_active = true
-              AND u.is_active = true
-              AND (CAST(:city AS VARCHAR) IS NULL OR u.city = CAST(:city AS VARCHAR))
-              AND (CAST(:region AS VARCHAR) IS NULL OR u.region = CAST(:region AS VARCHAR))
-              AND (CAST(:category AS VARCHAR) IS NULL OR sd.category = CAST(:category AS VARCHAR))
-              AND (CAST(:minRating AS NUMERIC) IS NULL OR m.avg_rating >= CAST(:minRating AS NUMERIC))
-            GROUP BY m.id, m.user_id, u.first_name, u.last_name, u.city,
-                     m.avg_rating, m.review_count
-            HAVING (CAST(:minPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) >= CAST(:minPrice AS NUMERIC))
-               AND (CAST(:maxPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) <= CAST(:maxPrice AS NUMERIC))
-            ORDER BY m.avg_rating DESC NULLS LAST
-            LIMIT :limit OFFSET :offset
-            """;
-
-    /**
-     * Count companion to {@link #MASTER_SEARCH_SQL}. Wraps the same
-     * {@code GROUP BY} + {@code HAVING} in a subquery so the price filter is
-     * honoured in the total — see class-level Javadoc for why.
-     */
-    private static final String MASTER_SEARCH_COUNT_SQL = """
-            SELECT COUNT(*) FROM (
-              SELECT m.id
-              FROM masters m
-              JOIN users u ON u.id = m.user_id
-              LEFT JOIN master_services ms ON ms.master_id = m.id AND ms.is_active = true
-              LEFT JOIN service_definitions sd ON sd.id = ms.service_def_id
-              WHERE m.is_active = true
-                AND u.is_active = true
-                AND (CAST(:city AS VARCHAR) IS NULL OR u.city = CAST(:city AS VARCHAR))
-                AND (CAST(:region AS VARCHAR) IS NULL OR u.region = CAST(:region AS VARCHAR))
-                AND (CAST(:category AS VARCHAR) IS NULL OR sd.category = CAST(:category AS VARCHAR))
-                AND (CAST(:minRating AS NUMERIC) IS NULL OR m.avg_rating >= CAST(:minRating AS NUMERIC))
-              GROUP BY m.id
-              HAVING (CAST(:minPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) >= CAST(:minPrice AS NUMERIC))
-                 AND (CAST(:maxPrice AS NUMERIC) IS NULL OR MIN(COALESCE(ms.price_override, sd.base_price)) <= CAST(:maxPrice AS NUMERIC))
-            ) AS filtered
-            """;
 
     /** Scale of {@code masters.avg_rating} (NUMERIC(3,2)) — matches column precision. */
     private static final int RATING_SCALE = 2;
@@ -141,22 +100,29 @@ public class SearchService {
      * Discover masters matching optional location, category, rating, and price
      * filters. Returns a page sorted by rating descending.
      *
+     * <p><b>Caching</b>: first 5 pages are cached for 60 seconds. Discovery
+     * results aggregate across many entities, so a write-path
+     * {@code @CacheEvict} would need to fan out across every cached query
+     * containing the touched row — a key-explosion problem we sidestep with a
+     * short TTL. Pages 5+ are intentionally not cached: they are cold-path
+     * exploration, not the hot list.
+     *
      * @throws BusinessException if {@code minPrice} > {@code maxPrice}
      */
+    @Cacheable(
+            value = "search:masters",
+            key = "#request.toString() + ':' + #pageable.pageNumber + ':' + #pageable.pageSize",
+            condition = "#pageable.pageNumber < 5"
+    )
     @Transactional(readOnly = true)
     public Page<MasterSearchResult> searchMasters(MasterSearchRequest request, Pageable pageable) {
         validatePriceRange(request.minPrice(), request.maxPrice());
 
-        String normalizedCity = nullIfBlank(request.city());
-        String normalizedRegion = nullIfBlank(request.region());
-        String normalizedCategory = normalizeCategory(request.category());
-        BigDecimal normalizedMinRating = normalizeRating(request.minRating());
+        MasterSearchFilters filters = normalize(request);
 
-        Query dataQuery = entityManager.createNativeQuery(MASTER_SEARCH_SQL);
-        bindFilterParams(dataQuery, normalizedCity, normalizedRegion, normalizedCategory,
-                normalizedMinRating, request.minPrice(), request.maxPrice());
-        dataQuery.setParameter("limit", pageable.getPageSize());
-        dataQuery.setParameter("offset", (long) pageable.getPageNumber() * pageable.getPageSize());
+        SqlAndParams dataSql = buildMasterSearchSql(filters, pageable, false);
+        Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
+        bind(dataQuery, dataSql.params());
 
         @SuppressWarnings("unchecked")
         List<Object[]> rawRows = dataQuery.getResultList();
@@ -165,9 +131,9 @@ public class SearchService {
             results.add(mapMasterRow(row));
         }
 
-        Query countQuery = entityManager.createNativeQuery(MASTER_SEARCH_COUNT_SQL);
-        bindFilterParams(countQuery, normalizedCity, normalizedRegion, normalizedCategory,
-                normalizedMinRating, request.minPrice(), request.maxPrice());
+        SqlAndParams countSql = buildMasterSearchSql(filters, pageable, true);
+        Query countQuery = entityManager.createNativeQuery(countSql.sql());
+        bind(countQuery, countSql.params());
         long total = ((Number) countQuery.getSingleResult()).longValue();
 
         return new PageImpl<>(results, pageable, total);
@@ -177,11 +143,220 @@ public class SearchService {
      * Discover salons matching optional city/region. Delegates filtering to the
      * repository's JPQL query and maps each entity to a public-facing DTO so the
      * JPA entity never escapes the service layer.
+     *
+     * <p><b>Caching</b>: same trade-off as {@link #searchMasters} — first 5
+     * pages, 60-second TTL, no explicit eviction on salon writes.
      */
+    @Cacheable(
+            value = "search:salons",
+            key = "T(java.util.Objects).toString(#city) + '|' + T(java.util.Objects).toString(#region) "
+                    + "+ ':' + #pageable.pageNumber + ':' + #pageable.pageSize",
+            condition = "#pageable.pageNumber < 5"
+    )
     @Transactional(readOnly = true)
     public Page<SalonSearchResult> searchSalons(String city, String region, Pageable pageable) {
         Page<Salon> page = salonRepository.findByFilter(nullIfBlank(city), nullIfBlank(region), pageable);
         return page.map(this::toSalonSearchResult);
+    }
+
+    // ── SQL builder ──────────────────────────────────────────────────────────
+
+    /**
+     * Normalised filter bag — eliminates the duplicate normalisation paths the
+     * old {@code bindFilterParams} variants carried.
+     */
+    private record MasterSearchFilters(
+            String city,
+            String region,
+            String category,
+            BigDecimal minRating,
+            BigDecimal minPrice,
+            BigDecimal maxPrice
+    ) {
+        boolean hasPriceFilter() {
+            return minPrice != null || maxPrice != null;
+        }
+
+        boolean needsServiceJoin() {
+            return hasPriceFilter() || category != null;
+        }
+    }
+
+    /** Carrier for {@code (sql, params)} pairs returned by {@link #buildMasterSearchSql}. */
+    private record SqlAndParams(String sql, Map<String, Object> params) {}
+
+    private static MasterSearchFilters normalize(MasterSearchRequest request) {
+        return new MasterSearchFilters(
+                nullIfBlank(request.city()),
+                nullIfBlank(request.region()),
+                normalizeCategory(request.category()),
+                normalizeRating(request.minRating()),
+                request.minPrice(),
+                request.maxPrice()
+        );
+    }
+
+    /**
+     * Builds the master-search SQL and the matching parameter bag.
+     *
+     * <p>The shape of the produced SQL is:
+     * <ul>
+     *   <li>{@code isCountQuery=false} → {@code SELECT m.id, ... [, MIN(...)]
+     *       FROM masters m JOIN users u [LEFT JOIN ms LEFT JOIN sd] WHERE ...
+     *       [GROUP BY ... [HAVING ...]] ORDER BY ... LIMIT/OFFSET}.</li>
+     *   <li>{@code isCountQuery=true} + price filter → wrapped subquery so
+     *       {@code COUNT(*)} respects the {@code HAVING} predicate.</li>
+     *   <li>{@code isCountQuery=true} + no price filter → flat
+     *       {@code SELECT COUNT(DISTINCT m.id)} (no GROUP BY needed because the
+     *       JOIN against {@code master_services} can multiply rows when the
+     *       category filter is active — DISTINCT collapses them).</li>
+     * </ul>
+     *
+     * <p>Optional predicates are appended only when the value is present,
+     * eliminating the {@code (:p IS NULL OR col = :p)} idiom that previously
+     * required {@code CAST(:p AS VARCHAR)} workarounds and defeated index
+     * pushdown.
+     */
+    private static SqlAndParams buildMasterSearchSql(
+            MasterSearchFilters filters,
+            Pageable pageable,
+            boolean isCountQuery
+    ) {
+        boolean needsServiceJoin = filters.needsServiceJoin();
+        boolean hasPriceFilter = filters.hasPriceFilter();
+        boolean wrapSubquery = isCountQuery && hasPriceFilter;
+
+        StringBuilder sb = new StringBuilder();
+        Map<String, Object> params = new LinkedHashMap<>();
+
+        if (wrapSubquery) {
+            // Subquery wrapper: the HAVING price filter must be applied before
+            // we count, so we count rows of the (GROUP BY m.id, HAVING ...)
+            // pre-filtered set.
+            sb.append("SELECT COUNT(*) FROM (SELECT m.id ");
+            appendFromClause(sb, needsServiceJoin);
+        } else if (isCountQuery) {
+            // Flat count — DISTINCT collapses the JOIN-induced row multiplication
+            // when the category filter is active (a master may match the category
+            // through multiple service rows; we count masters, not rows).
+            sb.append("SELECT COUNT(DISTINCT m.id) ");
+            appendFromClause(sb, needsServiceJoin);
+        } else {
+            appendDataSelect(sb, needsServiceJoin);
+            appendFromClause(sb, needsServiceJoin);
+        }
+
+        appendWhereClause(sb, filters, params);
+
+        // GROUP BY: required on the data query whenever we have a service-join
+        // (the projection includes MIN()), and required on the count subquery
+        // when a HAVING is about to follow.
+        boolean needsGroupBy =
+                (!isCountQuery && needsServiceJoin)
+                        || (wrapSubquery && needsServiceJoin);
+        if (needsGroupBy) {
+            if (isCountQuery) {
+                sb.append("GROUP BY m.id ");
+            } else {
+                sb.append("GROUP BY m.id, m.user_id, u.first_name, u.last_name, u.city, ")
+                        .append("m.avg_rating, m.review_count ");
+            }
+        }
+
+        appendHavingClause(sb, filters, params, needsServiceJoin);
+
+        if (wrapSubquery) {
+            sb.append(") AS filtered");
+        }
+
+        if (!isCountQuery) {
+            // Deterministic order: rating DESC, then id as the tie-breaker so
+            // the (avg_rating, id) covering index in V36 backs the sort.
+            sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id ");
+            sb.append("LIMIT :limit OFFSET :offset");
+            params.put("limit", pageable.getPageSize());
+            params.put("offset", (long) pageable.getPageNumber() * pageable.getPageSize());
+        }
+
+        return new SqlAndParams(sb.toString(), params);
+    }
+
+    private static void appendDataSelect(StringBuilder sb, boolean needsServiceJoin) {
+        sb.append("SELECT m.id AS master_id, m.user_id AS user_id, ")
+                .append("u.first_name AS first_name, u.last_name AS last_name, u.city AS city, ")
+                .append("m.avg_rating AS avg_rating, m.review_count AS review_count, ");
+        // Avatar column does not yet exist on users/masters (no migration added it
+        // as of V35/V36). Emit NULL so the projection still maps cleanly until a
+        // future phase introduces user/master avatar storage. See docs/backlog.md.
+        sb.append("CAST(NULL AS TEXT) AS avatar_url, ");
+        if (needsServiceJoin) {
+            sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) AS min_effective_price ");
+        } else {
+            // Maintain a stable 9-column projection for mapMasterRow regardless of
+            // whether the service-join branch is selected.
+            sb.append("CAST(NULL AS NUMERIC) AS min_effective_price ");
+        }
+    }
+
+    private static void appendFromClause(StringBuilder sb, boolean needsServiceJoin) {
+        sb.append("FROM masters m JOIN users u ON u.id = m.user_id ");
+        if (needsServiceJoin) {
+            sb.append("LEFT JOIN master_services ms ON ms.master_id = m.id AND ms.is_active = true ");
+            sb.append("LEFT JOIN service_definitions sd ON sd.id = ms.service_def_id ");
+        }
+    }
+
+    private static void appendWhereClause(
+            StringBuilder sb,
+            MasterSearchFilters filters,
+            Map<String, Object> params
+    ) {
+        sb.append("WHERE m.is_active = true AND u.is_active = true ");
+        if (filters.city() != null) {
+            sb.append("AND u.city = :city ");
+            params.put("city", filters.city());
+        }
+        if (filters.region() != null) {
+            sb.append("AND u.region = :region ");
+            params.put("region", filters.region());
+        }
+        if (filters.category() != null) {
+            sb.append("AND sd.category = :category ");
+            params.put("category", filters.category());
+        }
+        if (filters.minRating() != null) {
+            sb.append("AND m.avg_rating >= :minRating ");
+            params.put("minRating", filters.minRating());
+        }
+    }
+
+    private static void appendHavingClause(
+            StringBuilder sb,
+            MasterSearchFilters filters,
+            Map<String, Object> params,
+            boolean needsServiceJoin
+    ) {
+        if (!filters.hasPriceFilter() || !needsServiceJoin) {
+            return;
+        }
+        sb.append("HAVING ");
+        boolean first = true;
+        if (filters.minPrice() != null) {
+            sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) >= :minPrice ");
+            params.put("minPrice", filters.minPrice());
+            first = false;
+        }
+        if (filters.maxPrice() != null) {
+            if (!first) {
+                sb.append("AND ");
+            }
+            sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) <= :maxPrice ");
+            params.put("maxPrice", filters.maxPrice());
+        }
+    }
+
+    private static void bind(Query query, Map<String, Object> params) {
+        params.forEach(query::setParameter);
     }
 
     // ── parameter normalisation ───────────────────────────────────────────────
@@ -224,23 +399,6 @@ public class SearchService {
         return (value == null || value.isBlank()) ? null : value;
     }
 
-    private static void bindFilterParams(
-            Query query,
-            String city,
-            String region,
-            String category,
-            BigDecimal minRating,
-            BigDecimal minPrice,
-            BigDecimal maxPrice
-    ) {
-        query.setParameter("city", city);
-        query.setParameter("region", region);
-        query.setParameter("category", category);
-        query.setParameter("minRating", minRating);
-        query.setParameter("minPrice", minPrice);
-        query.setParameter("maxPrice", maxPrice);
-    }
-
     // ── row mapping ──────────────────────────────────────────────────────────
 
     /**
@@ -251,6 +409,11 @@ public class SearchService {
      * always arrives as {@code BigDecimal}. We coerce via {@code Number} casts
      * rather than direct casts to avoid {@code ClassCastException} drift if a
      * future Postgres/JDBC bump changes the surface type.
+     *
+     * <p>The projection is a stable 9-column shape regardless of the join
+     * variant — column 8 is {@code avatar_url} (currently always NULL) and
+     * column 9 is {@code min_effective_price} (NULL when no service-join was
+     * needed, populated from the {@code MIN(COALESCE(...))} aggregate otherwise).
      */
     private static MasterSearchResult mapMasterRow(Object[] row) {
         UUID masterId = (UUID) row[0];
