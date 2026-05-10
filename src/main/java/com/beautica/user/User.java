@@ -43,6 +43,12 @@ public class User extends AuditableEntity {
     @Column(name = "phone_number", length = 20)
     private String phoneNumber;
 
+    @Column(name = "city", length = 100)
+    private String city;
+
+    @Column(name = "region", length = 100)
+    private String region;
+
     @Column(name = "is_active", nullable = false)
     private boolean isActive = true;
 
@@ -157,5 +163,21 @@ public class User extends AuditableEntity {
 
     public void setPhoneNumber(String phoneNumber) {
         this.phoneNumber = phoneNumber;
+    }
+
+    public String getCity() {
+        return city;
+    }
+
+    public void setCity(String city) {
+        this.city = city;
+    }
+
+    public String getRegion() {
+        return region;
+    }
+
+    public void setRegion(String region) {
+        this.region = region;
     }
 }
