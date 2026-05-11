@@ -7,11 +7,13 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 
 import jakarta.annotation.PostConstruct;
 import java.net.URI;
+import java.time.Duration;
 
 /**
  * Wires the Cloudflare R2 {@link S3Client} bean for media uploads.
@@ -35,6 +37,21 @@ public class S3Config {
 
     /** R2 region alias — Cloudflare ignores this value but the SDK requires one. */
     private static final Region R2_REGION = Region.of("auto");
+
+    /**
+     * Apache HC5 timeouts and pool size for the sync S3 client.
+     *
+     * <p>Closes Phase 7.2 perf LOW: AWS SDK v2's default {@code httpClientBuilder} leaves
+     * {@code socketTimeout=0} (infinite). A hung R2 TCP socket would pin a request thread
+     * forever, eventually exhausting the Tomcat worker pool. Explicit timeouts let the SDK
+     * fail fast and free the thread.
+     *
+     * <p>{@code maxConnections} mirrors the SDK default — declared here for visibility so a
+     * future bump (e.g. for Phase 7.5 portfolio batch uploads) lands in one place.
+     */
+    private static final Duration R2_SOCKET_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration R2_CONNECTION_TIMEOUT = Duration.ofSeconds(5);
+    private static final int R2_MAX_CONNECTIONS = 50;
 
     @Value("${app.cloudflare-r2.enabled:false}")
     private boolean r2Enabled;
@@ -87,6 +104,13 @@ public class S3Config {
                 .endpointOverride(endpoint)
                 .region(R2_REGION)
                 .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                // Explicit Apache HC5 tuning — defaults leave socketTimeout=0 (infinite),
+                // which would pin Tomcat worker threads on a hung R2 socket. See Phase 7.2
+                // perf audit; this closes the tracked LOW.
+                .httpClientBuilder(ApacheHttpClient.builder()
+                        .socketTimeout(R2_SOCKET_TIMEOUT)
+                        .connectionTimeout(R2_CONNECTION_TIMEOUT)
+                        .maxConnections(R2_MAX_CONNECTIONS))
                 .build();
     }
 

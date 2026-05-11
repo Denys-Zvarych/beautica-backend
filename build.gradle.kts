@@ -70,6 +70,9 @@ dependencies {
     // 2.x BOM versions are wire-compatible with the R2 S3-compatible API.
     implementation(platform("software.amazon.awssdk:bom:2.44.4"))
     implementation("software.amazon.awssdk:s3")
+    // Explicit at compile-time so S3Config can configure Apache HC5 timeouts
+    // (default httpClientBuilder leaves socketTimeout=0 / infinite — Phase 7.2 perf LOW).
+    implementation("software.amazon.awssdk:apache-client")
 
     // Firebase Admin SDK (push notifications)
     implementation("com.google.firebase:firebase-admin:9.3.0")
