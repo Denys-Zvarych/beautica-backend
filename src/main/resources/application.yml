@@ -45,6 +45,13 @@ spring:
     virtual:
       enabled: true
 
+  servlet:
+    multipart:
+      # Image uploads are bounded at 10 MB; oversized requests are rejected by the container
+      # before reaching the controller layer, so MediaService never sees an unbounded stream.
+      max-file-size: 10MB
+      max-request-size: 10MB
+
   mail:
     host: smtp-relay.brevo.com
     port: 587
@@ -98,10 +105,16 @@ app:
     access-token-expiration: 900000       # 15 min in ms
     refresh-token-expiration: 604800000   # 7 days in ms
   cloudflare-r2:
-    access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID}
-    secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY}
+    # Master kill-switch. When false (default), S3Config does NOT register an S3Client bean and
+    # R2StorageService (Phase 7.4) will run in stub-safe mode. Set R2_ENABLED=true only when all
+    # four CLOUDFLARE_R2_* env vars below are populated; S3Config fails fast otherwise.
+    enabled: ${R2_ENABLED:false}
+    account-id: ${CLOUDFLARE_R2_ACCOUNT_ID:}
+    access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID:}
+    secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY:}
     bucket: ${CLOUDFLARE_R2_BUCKET:beautica-media}
-    endpoint: ${CLOUDFLARE_R2_ENDPOINT}
+    endpoint: ${CLOUDFLARE_R2_ENDPOINT:}
+    public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
   frontend:

@@ -64,8 +64,11 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-mail")
     implementation("org.springframework.boot:spring-boot-starter-thymeleaf")
 
-    // Cloudflare R2 (S3-compatible)
-    implementation(platform("software.amazon.awssdk:bom:2.25.70"))
+    // Cloudflare R2 (S3-compatible).
+    // BOM pinned to the latest stable GA on Maven Central as of the Phase 7.2 implementation
+    // (2.44.4 — released May 2026). AWS SDK v2 follows semver within the 2.x line, so all
+    // 2.x BOM versions are wire-compatible with the R2 S3-compatible API.
+    implementation(platform("software.amazon.awssdk:bom:2.44.4"))
     implementation("software.amazon.awssdk:s3")
 
     // Firebase Admin SDK (push notifications)
