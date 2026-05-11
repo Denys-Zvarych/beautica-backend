@@ -49,6 +49,9 @@ public class User extends AuditableEntity {
     @Column(name = "region", length = 100)
     private String region;
 
+    @Column(name = "avatar_r2_key", length = 500)
+    private String avatarR2Key;
+
     @Column(name = "is_active", nullable = false)
     private boolean isActive = true;
 
@@ -179,5 +182,13 @@ public class User extends AuditableEntity {
 
     public void setRegion(String region) {
         this.region = region;
+    }
+
+    public String getAvatarR2Key() {
+        return avatarR2Key;
+    }
+
+    public void setAvatarR2Key(String avatarR2Key) {
+        this.avatarR2Key = avatarR2Key;
     }
 }
