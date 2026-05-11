@@ -18,6 +18,10 @@ import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.interceptor.SimpleKey;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -66,6 +70,14 @@ import java.util.function.Supplier;
  * {@code media_files.uploader_id} would otherwise leave R2 objects orphaned because
  * the DB has no hook into R2. Any future user-deletion flow MUST call this BEFORE
  * deleting the row.
+ *
+ * <p><b>Phase 7.7 — portfolio cache.</b> {@link #getPortfolio} is the public
+ * unauthenticated read path; it is annotated with {@link Cacheable} on the
+ * {@code portfolio} cache keyed by {@code (entityType, entityId)}. Eviction on
+ * writes is programmatic — not {@link org.springframework.cache.annotation.CacheEvict} —
+ * so the cache is only invalidated AFTER the write transaction commits. The
+ * existing {@link TransactionTemplate#execute} returns post-commit, so calling
+ * {@link Cache#evictIfPresent} right after that block is naturally post-commit.
  */
 @Slf4j
 @Service
@@ -84,6 +96,9 @@ public class MediaService {
     /** Number of bytes inspected for the magic-byte check. WebP's signature needs the 9th–12th. */
     private static final int HEADER_BYTES = 12;
 
+    /** Cache name for the public portfolio listing — must match {@code CacheConfig.cacheManager()}. */
+    static final String PORTFOLIO_CACHE = "portfolio";
+
     private final R2StorageService r2;
     private final MediaRepository mediaRepo;
     private final UserRepository userRepo;
@@ -92,6 +107,7 @@ public class MediaService {
     private final Clock clock;
     private final TransactionTemplate txRead;
     private final TransactionTemplate txWrite;
+    private final CacheManager cacheManager;
 
     @Autowired
     public MediaService(R2StorageService r2,
@@ -100,7 +116,8 @@ public class MediaService {
                         SalonRepository salonRepo,
                         MasterRepository masterRepo,
                         Clock clock,
-                        PlatformTransactionManager transactionManager) {
+                        PlatformTransactionManager transactionManager,
+                        CacheManager cacheManager) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -112,6 +129,7 @@ public class MediaService {
         this.txRead.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.txWrite = new TransactionTemplate(transactionManager);
         this.txWrite.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        this.cacheManager = cacheManager;
     }
 
     /**
@@ -126,7 +144,8 @@ public class MediaService {
                  MasterRepository masterRepo,
                  Clock clock,
                  TransactionTemplate txRead,
-                 TransactionTemplate txWrite) {
+                 TransactionTemplate txWrite,
+                 CacheManager cacheManager) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -135,6 +154,7 @@ public class MediaService {
         this.clock = clock;
         this.txRead = txRead;
         this.txWrite = txWrite;
+        this.cacheManager = cacheManager;
     }
 
     // ------------------------------------------------------------------ avatar
@@ -235,31 +255,53 @@ public class MediaService {
                     .build());
         });
 
+        // Step 4 — Phase 7.7: eviction is post-commit by construction — txWrite.execute()
+        // returns only after the surrounding transaction has committed.
+        evictPortfolioCache(target.entityType(), target.entityId());
+
         return MediaFileResponse.from(saved);
     }
 
     public void deletePortfolioPhoto(UUID actorId, UUID mediaId) {
-        // Step 1 — read tx: load the row, enforce ownership, capture the key.
-        String key = txRead(() -> {
+        // Step 1 — read tx: load the row, enforce ownership, capture the R2 key and the
+        // owning (entityType, entityId) pair needed for post-commit cache eviction.
+        DeleteTarget target = txRead(() -> {
             MediaFile mf = mediaRepo.findById(mediaId)
                     .orElseThrow(() -> new NotFoundException("Media not found: " + mediaId));
             if (!mf.getUploader().getId().equals(actorId)) {
                 throw new ForbiddenException("Not allowed to delete this media");
             }
-            return mf.getR2Key();
+            return new DeleteTarget(mf.getR2Key(), mf.getEntityType(), mf.getEntityId());
         });
 
         // Step 2 — R2 delete OUTSIDE any transaction. SEC-2 ordering: R2 first; an
         // orphaned DB row can be cleaned up by a re-run, but a leaked R2 blob cannot.
-        r2.deleteFile(key);
+        r2.deleteFile(target.r2Key());
 
         // Step 3 — write tx: delete the row by id (avoids carrying the detached entity).
         txWrite.execute(status -> {
             mediaRepo.deleteById(mediaId);
             return null;
         });
+
+        // Step 4 — Phase 7.7: post-commit cache eviction. txWrite.execute() returns only
+        // after commit, so this runs strictly after the row has been removed.
+        evictPortfolioCache(target.entityType(), target.entityId());
     }
 
+    /** Resolved data for a portfolio delete — captured during the read tx. */
+    private record DeleteTarget(String r2Key, EntityType entityType, UUID entityId) {}
+
+    /**
+     * Public unauthenticated read path. Annotated with {@link Cacheable} on the
+     * {@code portfolio} cache. With no explicit {@code key}, Spring's
+     * {@code SimpleKeyGenerator} builds a {@link SimpleKey} from the method's
+     * two arguments — {@code SimpleKey(entityType, entityId)} — which the
+     * programmatic eviction sites construct identically. (A SpEL
+     * {@code key = "{#entityType, #entityId}"} would produce a {@code List}
+     * instead, breaking the eviction match.)
+     */
+    @Cacheable(PORTFOLIO_CACHE)
     @Transactional(readOnly = true)
     public List<MediaFileResponse> getPortfolio(EntityType entityType, UUID entityId) {
         // No need to touch getUploader() — MediaFileResponse.from does not access it,
@@ -267,6 +309,20 @@ public class MediaService {
         return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId).stream()
                 .map(MediaFileResponse::from)
                 .toList();
+    }
+
+    /**
+     * Narrow eviction of a single {@code portfolio} cache entry. Called from the
+     * write paths AFTER {@link TransactionTemplate#execute} has returned (and the
+     * transaction has therefore committed), so a parallel reader cannot repopulate
+     * stale data between the commit and the eviction. The {@link SimpleKey}
+     * mirrors Spring's materialisation of {@code @Cacheable(key = "{...}")}.
+     */
+    private void evictPortfolioCache(EntityType entityType, UUID entityId) {
+        Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
+        if (cache != null) {
+            cache.evictIfPresent(new SimpleKey(entityType, entityId));
+        }
     }
 
     // ---------------------------------------------------------- SEC-2 sweeper

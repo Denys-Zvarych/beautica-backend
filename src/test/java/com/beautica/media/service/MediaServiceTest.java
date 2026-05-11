@@ -24,6 +24,9 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.interceptor.SimpleKey;
 import org.springframework.http.HttpStatus;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.transaction.TransactionStatus;
@@ -85,6 +88,8 @@ class MediaServiceTest {
     @Mock private MasterRepository masterRepo;
     @Mock private TransactionTemplate txRead;
     @Mock private TransactionTemplate txWrite;
+    @Mock private CacheManager cacheManager;
+    @Mock private Cache portfolioCache;
 
     private final Clock fixedClock = Clock.fixed(Instant.parse("2026-05-11T10:00:00Z"), ZoneOffset.UTC);
 
@@ -102,7 +107,12 @@ class MediaServiceTest {
             TransactionCallback<?> cb = inv.getArgument(0);
             return cb.doInTransaction(mock(TransactionStatus.class));
         });
-        service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite);
+        // Phase 7.7 — portfolio cache eviction is a no-op in unit tests; the IT suite
+        // exercises the real Caffeine cache. lenient() because not every existing test
+        // hits a portfolio write path.
+        lenient().when(cacheManager.getCache("portfolio")).thenReturn(portfolioCache);
+        lenient().when(portfolioCache.evictIfPresent(any())).thenReturn(true);
+        service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite, cacheManager);
     }
 
     // ---------------------------------------------------------------- magic bytes
@@ -403,6 +413,58 @@ class MediaServiceTest {
 
         assertThatThrownBy(() -> service.deletePortfolioPhoto(UUID.randomUUID(), mediaId))
                 .isInstanceOf(NotFoundException.class);
+    }
+
+    // ---------------------------------------------- Phase 7.7 — portfolio cache eviction
+
+    @Test
+    @DisplayName("evicts the portfolio cache AFTER the write tx commits when uploadPortfolioPhoto succeeds")
+    void should_evictPortfolioCache_when_uploadPortfolioPhotoSucceeds() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Salon salon = Salon.builder().id(salonId).isActive(true).build();
+        when(salonRepo.findAllByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salon));
+        when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));
+        when(mediaRepo.save(any(MediaFile.class))).thenAnswer(inv -> {
+            MediaFile mf = inv.getArgument(0);
+            setField(mf, "id", UUID.randomUUID());
+            return mf;
+        });
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/p.jpg");
+
+        service.uploadPortfolioPhoto(actorId, Role.SALON_OWNER, jpegFile());
+
+        // Eviction must happen AFTER the write tx — InOrder over (txWrite, cache) proves it.
+        InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
+        order.verify(txWrite).execute(any());
+        order.verify(cacheManager).getCache("portfolio");
+        order.verify(portfolioCache).evictIfPresent(new SimpleKey(EntityType.SALON, salonId));
+    }
+
+    @Test
+    @DisplayName("evicts the portfolio cache AFTER the write tx commits when deletePortfolioPhoto succeeds")
+    void should_evictPortfolioCache_when_deletePortfolioPhotoSucceeds() {
+        UUID actorId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        UUID masterEntityId = UUID.randomUUID();
+        MediaFile mf = MediaFile.builder()
+                .id(mediaId)
+                .uploader(newUser(actorId))
+                .entityType(EntityType.MASTER)
+                .entityId(masterEntityId)
+                .mediaType(MediaType.PORTFOLIO)
+                .r2Key("portfolio/independent/x/y.jpg")
+                .r2Url("https://r2/y.jpg")
+                .build();
+        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(mf));
+
+        service.deletePortfolioPhoto(actorId, mediaId);
+
+        // Eviction must happen AFTER the write tx — InOrder over (txWrite, cache) proves it.
+        InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
+        order.verify(txWrite).execute(any());
+        order.verify(cacheManager).getCache("portfolio");
+        order.verify(portfolioCache).evictIfPresent(new SimpleKey(EntityType.MASTER, masterEntityId));
     }
 
     @Test

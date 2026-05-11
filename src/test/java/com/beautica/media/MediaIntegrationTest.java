@@ -7,6 +7,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
+import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.service.R2StorageService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,6 +20,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.io.ByteArrayResource;
@@ -40,8 +42,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -75,6 +80,15 @@ class MediaIntegrationTest extends AbstractIntegrationTest {
 
     @MockBean
     private R2StorageService r2StorageService;
+
+    /**
+     * Phase 7.7 — spied so the cache-hit IT can assert the underlying repository was
+     * touched exactly once across two GETs. {@code @SpyBean} keeps the real bean
+     * wired into the application context, so cache-aside semantics on
+     * {@code MediaService.getPortfolio} are exercised end-to-end.
+     */
+    @SpyBean
+    private MediaRepository mediaRepository;
 
     @BeforeEach
     void configureClientAndR2() {
@@ -223,6 +237,83 @@ class MediaIntegrationTest extends AbstractIntegrationTest {
     // is the contract this test would otherwise re-verify. No dedicated test
     // here because spinning up a second Spring context with a different
     // credentials shape would double the suite cost for no incremental signal.
+
+    // ── Phase 7.7 — portfolio cache hit + post-write eviction ─────────────────
+
+    @Test
+    @DisplayName("GET /salons/{id}/portfolio twice — repository is hit exactly once (cache hit on 2nd call)")
+    void should_returnCachedPortfolio_when_calledTwiceInSuccession() throws Exception {
+        // Arrange
+        String ownerEmail = "media-it-cache-hit-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(ownerEmail);
+        UUID salonId = insertSalon(ownerId, "Cache Salon");
+        String ownerToken = loginAndGetToken(ownerEmail);
+
+        // Seed a single portfolio photo. Reset the spy AFTER the upload — the upload
+        // hits mediaRepo.save() which is on the same spied bean, and the upload's own
+        // eviction touches the cache; we want a clean slate before the two GETs.
+        ResponseEntity<String> upload = restTemplate.exchange(
+                PORTFOLIO_URL, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)),
+                String.class);
+        assertThat(upload.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        clearInvocations(mediaRepository);
+
+        // Act — two consecutive public GETs (no auth)
+        ResponseEntity<String> first = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()), String.class);
+        ResponseEntity<String> second = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()), String.class);
+
+        // Assert — both succeed, repository was hit exactly ONCE across the pair.
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(mediaRepository, times(1))
+                .findByEntityTypeAndEntityId(eq(EntityType.SALON), eq(salonId));
+    }
+
+    @Test
+    @DisplayName("Upload between GETs evicts the cache — second GET sees the newly uploaded photo")
+    void should_invalidatePortfolioCache_when_newPhotoUploaded() throws Exception {
+        // Arrange
+        String ownerEmail = "media-it-cache-evict-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(ownerEmail);
+        UUID salonId = insertSalon(ownerId, "Evict Salon");
+        String ownerToken = loginAndGetToken(ownerEmail);
+
+        // Act — initial GET populates an EMPTY result into the cache
+        ResponseEntity<String> empty = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()), String.class);
+        assertThat(empty.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var emptyBody = objectMapper.readValue(
+                empty.getBody(), new TypeReference<ApiResponse<List<MediaFileResponse>>>() {});
+        assertThat(emptyBody.data())
+                .as("first GET — cache must reflect the empty DB state")
+                .isEmpty();
+
+        // Act — upload a photo (must evict the cache entry post-commit)
+        ResponseEntity<String> upload = restTemplate.exchange(
+                PORTFOLIO_URL, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)),
+                String.class);
+        assertThat(upload.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        // Act — second GET must see the new photo, proving eviction fired.
+        ResponseEntity<String> populated = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()), String.class);
+        assertThat(populated.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var populatedBody = objectMapper.readValue(
+                populated.getBody(), new TypeReference<ApiResponse<List<MediaFileResponse>>>() {});
+
+        // Assert — eviction happened: the second GET sees the uploaded photo.
+        assertThat(populatedBody.data())
+                .as("second GET — cache must have been evicted on upload, exposing the new row")
+                .hasSize(1);
+    }
 
     // ── seeding helpers ───────────────────────────────────────────────────────
 
