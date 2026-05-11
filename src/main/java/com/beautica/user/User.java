@@ -52,6 +52,9 @@ public class User extends AuditableEntity {
     @Column(name = "avatar_r2_key", length = 500)
     private String avatarR2Key;
 
+    @Column(name = "avatar_url", length = 1000)
+    private String avatarUrl;
+
     @Column(name = "is_active", nullable = false)
     private boolean isActive = true;
 
@@ -190,5 +193,13 @@ public class User extends AuditableEntity {
 
     public void setAvatarR2Key(String avatarR2Key) {
         this.avatarR2Key = avatarR2Key;
+    }
+
+    public String getAvatarUrl() {
+        return avatarUrl;
+    }
+
+    public void setAvatarUrl(String avatarUrl) {
+        this.avatarUrl = avatarUrl;
     }
 }

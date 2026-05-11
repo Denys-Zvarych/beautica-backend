@@ -25,4 +25,16 @@ public interface MediaRepository extends JpaRepository<MediaFile, UUID> {
      * Backed by composite index {@code idx_media_files_uploader_media (uploader_id, media_type)}.
      */
     Optional<MediaFile> findByUploaderIdAndMediaType(UUID uploaderId, MediaType mediaType);
+
+    /**
+     * Find every media file uploaded by the given user. Drives the SEC-2
+     * {@code MediaService.deleteByUploader} sweep — R2 blobs must be deleted
+     * before the {@code users} row is dropped, otherwise
+     * {@code ON DELETE CASCADE} leaves the R2 objects orphaned.
+     *
+     * <p>Spring Data property traversal walks {@code uploader.id}; backed by the
+     * composite index {@code idx_media_files_uploader_media (uploader_id, media_type)}
+     * via leftmost-prefix.
+     */
+    List<MediaFile> findByUploaderId(UUID uploaderId);
 }
