@@ -2,6 +2,7 @@ package com.beautica.media.entity;
 
 import com.beautica.common.AuditableEntity;
 import com.beautica.user.User;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -35,6 +36,7 @@ public class MediaFile extends AuditableEntity {
     @Column(name = "id", updatable = false, nullable = false)
     private UUID id;
 
+    @JsonIgnore
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "uploader_id", nullable = false)
     private User uploader;

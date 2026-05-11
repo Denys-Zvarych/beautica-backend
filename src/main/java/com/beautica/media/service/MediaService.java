@@ -34,8 +34,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -363,6 +365,21 @@ public class MediaService {
             mediaRepo.deleteAll(rows);
             return null;
         });
+
+        // Step 4 — Phase 7.8/7.9: evict every distinct (entityType, entityId) portfolio
+        // cache entry AFTER the write tx commits. Without this, a future user-deletion
+        // flow would leave deleted portfolio entries readable from the cache for up to
+        // the 5-min TTL.
+        Set<SimpleKey> distinctKeys = new HashSet<>();
+        for (MediaFile row : rows) {
+            distinctKeys.add(new SimpleKey(row.getEntityType(), row.getEntityId()));
+        }
+        Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
+        if (cache != null) {
+            for (SimpleKey key : distinctKeys) {
+                cache.evictIfPresent(key);
+            }
+        }
     }
 
     // -------------------------------------------------------------- internals

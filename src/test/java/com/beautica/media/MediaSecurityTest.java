@@ -35,6 +35,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
 
@@ -105,7 +106,7 @@ class MediaSecurityTest extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("POST /media/avatar — persisted avatar key is bound to the authenticated user (SEC-1 design)")
-    void should_return403_when_clientUploadsAvatarForAnotherUser() throws Exception {
+    void should_scopeAvatarKey_when_clientUploads() throws Exception {
         // SEC-1: the controller derives userId from the JWT — there is no target
         // userId parameter that a caller could spoof. The only IDOR-equivalent
         // check here is to assert the persisted avatar key reflects THE caller,
@@ -257,7 +258,7 @@ class MediaSecurityTest extends AbstractIntegrationTest {
         insertClient(email);
         String token = loginAndGetToken(email);
 
-        byte[] svgBody = "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".getBytes();
+        byte[] svgBody = "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".getBytes(StandardCharsets.UTF_8);
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
         body.add("file", new ByteArrayResource(svgBody) {
             @Override

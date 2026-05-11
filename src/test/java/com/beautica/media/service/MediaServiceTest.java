@@ -68,8 +68,8 @@ import static org.mockito.Mockito.when;
  * SVG and other unsupported bytes are rejected with HTTP 400.
  *
  * <p>SEC-1 (uploader ownership) and SEC-2 (R2-before-DB delete ordering) are both covered
- * explicitly — see {@code should_delete_r2_blob_when_media_row_is_deleted} and
- * {@code should_purge_r2_avatars_when_user_is_deleted_before_cascade}.
+ * explicitly — see {@code should_deleteR2Blob_when_mediaRowIsDeleted} and
+ * {@code should_purgeR2Avatars_when_userIsDeletedBeforeCascade}.
  *
  * <p><b>TransactionTemplate mocking.</b> The Perf MEDIUM #1 / #2 refactor moved every DB
  * mutation behind a {@link TransactionTemplate}; this fixture stubs both the read and the
@@ -498,7 +498,7 @@ class MediaServiceTest {
 
     @Test
     @DisplayName("deletes R2 blob BEFORE deleting the media row")
-    void should_delete_r2_blob_when_media_row_is_deleted() {
+    void should_deleteR2Blob_when_mediaRowIsDeleted() {
         UUID actorId = UUID.randomUUID();
         UUID mediaId = UUID.randomUUID();
         User uploader = newUser(actorId);
@@ -522,7 +522,7 @@ class MediaServiceTest {
 
     @Test
     @DisplayName("purges R2 avatars BEFORE deleting DB rows in deleteByUploader sweep")
-    void should_purge_r2_avatars_when_user_is_deleted_before_cascade() {
+    void should_purgeR2Avatars_when_userIsDeletedBeforeCascade() {
         UUID uploaderId = UUID.randomUUID();
         User uploader = newUser(uploaderId);
         MediaFile a = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
@@ -668,6 +668,40 @@ class MediaServiceTest {
         verify(r2, times(3)).deleteFile(anyString());
         // The DB batch delete still ran exactly once with the full row set.
         verify(mediaRepo, times(1)).deleteAll(rows);
+    }
+
+    // ---------------------------------------------- Phase 7.8/7.9 — sweep cache eviction
+
+    @Test
+    @DisplayName("evicts portfolio cache for each DISTINCT (entityType, entityId) when deleteByUploader succeeds")
+    void should_evictPortfolioCache_for_each_distinctEntity_when_deleteByUploaderSucceeds() {
+        UUID uploaderId = UUID.randomUUID();
+        User uploader = newUser(uploaderId);
+        UUID salonA = UUID.randomUUID();
+        UUID masterB = UUID.randomUUID();
+        // Two rows on (SALON, salonA) — must collapse to a single eviction call — and one
+        // row on (MASTER, masterB). Total: 2 distinct evictions.
+        MediaFile a1 = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
+                .entityType(EntityType.SALON).entityId(salonA)
+                .mediaType(MediaType.PORTFOLIO).r2Key("k-a1").r2Url("u-a1").build();
+        MediaFile a2 = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
+                .entityType(EntityType.SALON).entityId(salonA)
+                .mediaType(MediaType.PORTFOLIO).r2Key("k-a2").r2Url("u-a2").build();
+        MediaFile b1 = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
+                .entityType(EntityType.MASTER).entityId(masterB)
+                .mediaType(MediaType.PORTFOLIO).r2Key("k-b1").r2Url("u-b1").build();
+        List<MediaFile> rows = List.of(a1, a2, b1);
+        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(rows);
+
+        service.deleteByUploader(uploaderId);
+
+        // The eviction must happen after the write tx (post-commit by construction).
+        InOrder order = inOrder(txWrite, portfolioCache);
+        order.verify(txWrite).execute(any());
+        // Exactly 2 eviction calls — duplicate (SALON, salonA) collapsed by Set.
+        verify(portfolioCache, times(1)).evictIfPresent(new SimpleKey(EntityType.SALON, salonA));
+        verify(portfolioCache, times(1)).evictIfPresent(new SimpleKey(EntityType.MASTER, masterB));
+        verify(portfolioCache, times(2)).evictIfPresent(any());
     }
 
     // ------------------------------------------------------------------ helpers

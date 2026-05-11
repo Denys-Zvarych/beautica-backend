@@ -187,6 +187,7 @@ public class User extends AuditableEntity {
         this.region = region;
     }
 
+    @JsonIgnore
     public String getAvatarR2Key() {
         return avatarR2Key;
     }
