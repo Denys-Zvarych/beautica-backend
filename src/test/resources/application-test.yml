@@ -22,6 +22,7 @@ app:
   rate-limit:
     login-capacity: 100000
     refresh-capacity: 100000
+    media-upload-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.

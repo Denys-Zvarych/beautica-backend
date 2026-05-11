@@ -127,6 +127,9 @@ app:
     # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
     # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.
     device-token-capacity: 30
+    # POST/DELETE /api/v1/media/* — 10/min per IP; balances upload retries
+    # (after a 400 on wrong MIME / oversize) with abuse prevention.
+    media-upload-capacity: 10
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32

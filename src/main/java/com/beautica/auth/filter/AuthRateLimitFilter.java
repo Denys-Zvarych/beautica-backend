@@ -25,6 +25,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
+    private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
     private static final int RETRY_AFTER_SECONDS = 60;
 
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -34,16 +35,21 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // which runs *after* this filter; resolving the principal here would duplicate that work
     // and couple the rate limiter to the auth subsystem.
     private final LoadingCache<String, Bucket> deviceTokenBuckets;
+    // Same IP-keyed rationale applies to media uploads — JwtAuthenticationFilter
+    // runs after this one, so the rate limiter sees only the network identity.
+    private final LoadingCache<String, Bucket> mediaUploadBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
             @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
             @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
-            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets) {
+            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
+            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets) {
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
         this.slotsBuckets = slotsBuckets;
         this.deviceTokenBuckets = deviceTokenBuckets;
+        this.mediaUploadBuckets = mediaUploadBuckets;
     }
 
     @Override
@@ -58,6 +64,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (DEVICE_TOKEN_PATH.equals(path)
                 && (HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))) {
             applyRateLimit(request, response, filterChain, deviceTokenBuckets);
+            return;
+        }
+
+        // Media rate-limit: POST or DELETE /api/v1/media/* (avatar + portfolio).
+        // Checked before the POST-only branch so DELETE /api/v1/media/avatar and
+        // DELETE /api/v1/media/portfolio/{id} are also covered. Public GET
+        // listings (/api/v1/salons/{id}/portfolio etc.) are intentionally NOT
+        // rate-limited here — they're read-only and cached behind R2/CDN.
+        if ((HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))
+                && path.startsWith(MEDIA_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, mediaUploadBuckets);
             return;
         }
 

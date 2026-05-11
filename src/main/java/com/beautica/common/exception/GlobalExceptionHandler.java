@@ -20,6 +20,7 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
 import java.util.stream.Collectors;
 
@@ -139,6 +140,19 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
                 .body(ApiResponse.error("Content-Type not supported. Use application/json"));
+    }
+
+    /**
+     * Multipart upload endpoints (e.g. {@code POST /api/v1/media/avatar}) throw this
+     * when the caller omits the required {@code file} part. Without an explicit mapping
+     * the generic {@code Exception} fallback turns the missing-part error into a 500.
+     * Closes the Anti-Bug Playbook § N gap for multipart endpoints.
+     */
+    @ExceptionHandler(MissingServletRequestPartException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMissingPart(MissingServletRequestPartException ex) {
+        return ResponseEntity
+                .badRequest()
+                .body(ApiResponse.error("Required part '" + ex.getRequestPartName() + "' is missing"));
     }
 
     @ExceptionHandler(Exception.class)

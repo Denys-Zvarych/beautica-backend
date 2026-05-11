@@ -26,6 +26,14 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
 
+    // Per-IP cap for POST/DELETE /api/v1/media/* (60 s window). Phase 7.2 backlog
+    // originally suggested 5/min; 10/min is the chosen ceiling because legitimate
+    // clients may retry after a 400 (wrong MIME, oversize) or replace an avatar
+    // immediately after upload — keeping headroom prevents false-positive lockouts
+    // while still blocking sustained abuse.
+    @Value("${app.rate-limit.media-upload-capacity:10}")
+    private long mediaUploadCapacity;
+
     @Bean
     public LoadingCache<String, Bucket> loginBuckets() {
         return Caffeine.newBuilder()
@@ -63,6 +71,16 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofHours(1))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(deviceTokenCapacity, Duration.ofMinutes(1)))
+                        .build());
+    }
+
+    @Bean
+    public LoadingCache<String, Bucket> mediaUploadBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(Duration.ofHours(1))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(mediaUploadCapacity, Duration.ofMinutes(1)))
                         .build());
     }
 

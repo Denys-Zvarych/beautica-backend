@@ -1,0 +1,280 @@
+package com.beautica.media;
+
+import com.beautica.AbstractIntegrationTest;
+import com.beautica.auth.dto.AuthResponse;
+import com.beautica.auth.dto.LoginRequest;
+import com.beautica.common.ApiResponse;
+import com.beautica.config.TestSecurityConfig;
+import com.beautica.media.dto.MediaFileResponse;
+import com.beautica.media.entity.EntityType;
+import com.beautica.media.service.R2StorageService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.context.annotation.Import;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+
+import java.util.List;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Full-context integration test for the media endpoints.
+ *
+ * <p>Validates the read-after-write contract end-to-end: an upload through the
+ * REST API must (a) persist the {@code users.avatar_r2_key} / {@code media_files}
+ * row and (b) be visible to a follow-up GET. {@link R2StorageService} is mocked
+ * so the test never reaches a real R2 bucket — {@code buildPublicUrl} returns a
+ * deterministic URL prefix the controller can echo back.
+ */
+@Import(TestSecurityConfig.class)
+@DisplayName("Media — full-context integration")
+class MediaIntegrationTest extends AbstractIntegrationTest {
+
+    private static final Logger log = LoggerFactory.getLogger(MediaIntegrationTest.class);
+    private static final String AVATAR_URL = "/api/v1/media/avatar";
+    private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
+    private static final String TEST_PASSWORD = "password123";
+    private static final byte[] JPEG_HEADER = new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00};
+
+    @Autowired
+    private TestRestTemplate restTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    @MockBean
+    private R2StorageService r2StorageService;
+
+    @BeforeEach
+    void configureClientAndR2() {
+        restTemplate.getRestTemplate().setRequestFactory(
+                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        when(r2StorageService.buildPublicUrl(anyString()))
+                .thenAnswer(inv -> "https://cdn.example/" + inv.getArgument(0));
+        doNothing().when(r2StorageService).uploadFile(anyString(), any(), anyLong(), anyString());
+        doNothing().when(r2StorageService).deleteFile(anyString());
+    }
+
+    // ── #16 — avatar upload persists the R2 key on the user row ──────────────
+
+    @Test
+    @DisplayName("POST /media/avatar then read users.avatar_r2_key — persisted key is non-null")
+    void should_updateAvatarUrl_when_avatarUploaded() throws Exception {
+        // Arrange
+        String email = "media-it-avatar-" + System.nanoTime() + "@beautica.test";
+        UUID userId = insertClient(email);
+        String token = loginAndGetToken(email);
+
+        // Act
+        log.debug("Act: POST {} as user={}", AVATAR_URL, userId);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                AVATAR_URL, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
+                String.class);
+
+        // Assert — HTTP success
+        assertThat(resp.getStatusCode())
+                .as("avatar upload must return 200")
+                .isEqualTo(HttpStatus.OK);
+
+        // Assert — persisted state (UserProfileResponse does not expose avatarUrl,
+        // so query the DB directly to validate the read-after-write contract).
+        String persistedKey = jdbcTemplate.queryForObject(
+                "SELECT avatar_r2_key FROM users WHERE id = ?", String.class, userId);
+        String persistedUrl = jdbcTemplate.queryForObject(
+                "SELECT avatar_url FROM users WHERE id = ?", String.class, userId);
+        assertThat(persistedKey)
+                .as("users.avatar_r2_key must be persisted for user=%s", userId)
+                .isNotNull()
+                .startsWith("avatars/" + userId + "/");
+        assertThat(persistedUrl)
+                .as("users.avatar_url must mirror the public URL built from the key")
+                .isNotNull()
+                .isNotBlank();
+    }
+
+    // ── #17 — second upload replaces the first (R2 delete + DB swap) ─────────
+
+    @Test
+    @DisplayName("POST /media/avatar twice — second upload replaces first key and deletes the old R2 blob")
+    void should_replaceOldAvatar_when_secondAvatarUploaded() throws Exception {
+        // Arrange
+        String email = "media-it-replace-" + System.nanoTime() + "@beautica.test";
+        UUID userId = insertClient(email);
+        String token = loginAndGetToken(email);
+
+        // Act — first upload
+        ResponseEntity<String> first = restTemplate.exchange(
+                AVATAR_URL, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
+                String.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
+        String firstKey = jdbcTemplate.queryForObject(
+                "SELECT avatar_r2_key FROM users WHERE id = ?", String.class, userId);
+
+        // Act — second upload (must trigger r2.deleteFile(firstKey) before writing)
+        log.debug("Act: POST {} second time as user={} — first key must be deleted", AVATAR_URL, userId);
+        ResponseEntity<String> second = restTemplate.exchange(
+                AVATAR_URL, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
+                String.class);
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
+        String secondKey = jdbcTemplate.queryForObject(
+                "SELECT avatar_r2_key FROM users WHERE id = ?", String.class, userId);
+
+        // Assert — keys differ
+        assertThat(firstKey).isNotNull();
+        assertThat(secondKey).isNotNull();
+        assertThat(secondKey)
+                .as("second upload must produce a different R2 key from the first")
+                .isNotEqualTo(firstKey);
+
+        // Assert — R2 delete invoked with the first (now-superseded) key
+        ArgumentCaptor<String> deletedKey = ArgumentCaptor.forClass(String.class);
+        verify(r2StorageService, atLeastOnce()).deleteFile(deletedKey.capture());
+        assertThat(deletedKey.getAllValues())
+                .as("R2 delete must have been called with the original avatar key")
+                .contains(firstKey);
+    }
+
+    // ── #18 — portfolio uploads visible via public GET listing ───────────────
+
+    @Test
+    @DisplayName("POST /media/portfolio x3 then GET /salons/{id}/portfolio — listing returns 3 items")
+    void should_returnPortfolioList_when_salonOwnerUploadsPhotos() throws Exception {
+        // Arrange
+        String ownerEmail = "media-it-port-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(ownerEmail);
+        UUID salonId = insertSalon(ownerId, "IT Salon");
+        String ownerToken = loginAndGetToken(ownerEmail);
+
+        // Act — upload 3 photos
+        for (int i = 0; i < 3; i++) {
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    PORTFOLIO_URL, HttpMethod.POST,
+                    new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)),
+                    String.class);
+            assertThat(resp.getStatusCode())
+                    .as("portfolio upload #%d must return 201", i + 1)
+                    .isEqualTo(HttpStatus.CREATED);
+        }
+
+        // Act — public GET (no auth)
+        log.debug("Act: GET /api/v1/salons/{}/portfolio without auth — must list 3 items", salonId);
+        ResponseEntity<String> listResp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()),
+                String.class);
+
+        // Assert
+        assertThat(listResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                listResp.getBody(), new TypeReference<ApiResponse<List<MediaFileResponse>>>() {});
+        assertThat(body.data())
+                .as("public portfolio listing must contain all 3 uploaded items for salon=%s", salonId)
+                .hasSize(3);
+        assertThat(body.data())
+                .allSatisfy(item -> {
+                    assertThat(item.id()).as("id non-null").isNotNull();
+                    assertThat(item.entityType()).as("entityType is SALON").isEqualTo(EntityType.SALON);
+                    assertThat(item.entityId()).as("entityId matches seeded salon").isEqualTo(salonId);
+                    assertThat(item.url()).as("url non-blank").isNotBlank();
+                    assertThat(item.mediaType())
+                            .as("mediaType is PORTFOLIO")
+                            .isEqualTo(com.beautica.media.entity.MediaType.PORTFOLIO);
+                });
+    }
+
+    // ── #19 — startup without R2 credentials covered elsewhere ───────────────
+    // Already covered implicitly by AuthIntegrationTest and every other IT in
+    // the suite — the test profile runs with placeholder R2 credentials
+    // (application-test.yml) and the application context boots cleanly, which
+    // is the contract this test would otherwise re-verify. No dedicated test
+    // here because spinning up a second Spring context with a different
+    // credentials shape would double the suite cost for no incremental signal.
+
+    // ── seeding helpers ───────────────────────────────────────────────────────
+
+    private UUID insertClient(String email) {
+        UUID id = UUID.randomUUID();
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'CLIENT', true)",
+                id, email, hash);
+        return id;
+    }
+
+    private UUID insertSalonOwner(String email) {
+        UUID id = UUID.randomUUID();
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                id, email, hash);
+        return id;
+    }
+
+    private UUID insertSalon(UUID ownerId, String name) {
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, name);
+        return salonId;
+    }
+
+    private String loginAndGetToken(String email) throws Exception {
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    private static MultiValueMap<String, Object> jpegMultipartBody() {
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("file", new ByteArrayResource(JPEG_HEADER) {
+            @Override
+            public String getFilename() {
+                return "a.jpg";
+            }
+        });
+        return body;
+    }
+
+    private static HttpHeaders bearerMultipartHeaders(String token) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        return headers;
+    }
+}

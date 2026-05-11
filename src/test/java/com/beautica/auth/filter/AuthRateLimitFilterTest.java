@@ -38,6 +38,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> refreshBuckets;
     @Mock private LoadingCache<String, Bucket> slotsBuckets;
     @Mock private LoadingCache<String, Bucket> deviceTokenBuckets;
+    @Mock private LoadingCache<String, Bucket> mediaUploadBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -45,7 +46,8 @@ class AuthRateLimitFilterTest {
 
     @BeforeEach
     void setUp() {
-        filter = new AuthRateLimitFilter(loginBuckets, refreshBuckets, slotsBuckets, deviceTokenBuckets);
+        filter = new AuthRateLimitFilter(
+                loginBuckets, refreshBuckets, slotsBuckets, deviceTokenBuckets, mediaUploadBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -232,6 +234,86 @@ class AuthRateLimitFilterTest {
             verifyNoInteractions(loginBuckets);
             verifyNoInteractions(refreshBuckets);
             verifyNoInteractions(slotsBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("/api/v1/media/* — POST and DELETE")
+    class MediaUploadEndpoint {
+
+        @Test
+        @DisplayName("POST /api/v1/media/avatar routes to mediaUploadBuckets and not the other 4 buckets")
+        void should_routeToMediaUploadBuckets_when_postMediaAvatar() throws Exception {
+            log.debug("Arrange: mediaUploadBuckets returns bucket that allows consumption");
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/media/avatar");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /api/v1/media/avatar when mediaUpload bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when mediaUpload bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(mediaUploadBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(refreshBuckets);
+            verifyNoInteractions(slotsBuckets);
+            verifyNoInteractions(deviceTokenBuckets);
+        }
+
+        @Test
+        @DisplayName("DELETE /api/v1/media/portfolio/{id} routes to mediaUploadBuckets and not the other 4 buckets")
+        void should_routeToMediaUploadBuckets_when_deleteMediaPortfolio() throws Exception {
+            log.debug("Arrange: mediaUploadBuckets returns bucket that allows consumption");
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = deleteRequest("/api/v1/media/portfolio/" + java.util.UUID.randomUUID());
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for DELETE /api/v1/media/portfolio/{id} when mediaUpload bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when mediaUpload bucket allows the DELETE request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(mediaUploadBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(refreshBuckets);
+            verifyNoInteractions(slotsBuckets);
+            verifyNoInteractions(deviceTokenBuckets);
+        }
+
+        @Test
+        @DisplayName("GET /api/v1/salons/{id}/portfolio passes through without touching ANY bucket (not under /api/v1/media/)")
+        void should_passThrough_when_getSalonsPortfolio() throws Exception {
+            // Public read endpoint at /api/v1/salons/{id}/portfolio is NOT under /api/v1/media/
+            // and uses GET, so none of the upload/auth/slot/device-token branches must fire.
+            // The slots branch is similarly inapplicable because the path does not end in /slots.
+            log.debug("Arrange: GET /api/v1/salons/{id}/portfolio — outside the /api/v1/media/ prefix, GET method, not /slots suffix");
+            var request  = getRequest("/api/v1/salons/" + java.util.UUID.randomUUID() + "/portfolio");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal — public portfolio listing must bypass every rate-limit branch");
+            doFilter(request, response, chain);
+
+            assertThat(chain.getRequest())
+                    .as("chain must be forwarded — public portfolio listing is not rate-limited")
+                    .isNotNull();
+            verifyNoInteractions(mediaUploadBuckets);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(refreshBuckets);
+            verifyNoInteractions(slotsBuckets);
+            verifyNoInteractions(deviceTokenBuckets);
         }
     }
 
