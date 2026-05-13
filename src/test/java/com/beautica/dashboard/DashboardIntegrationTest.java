@@ -17,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -65,6 +66,9 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private CacheManager cacheManager;
 
     private static HttpComponentsClientHttpRequestFactory hc5Factory;
 
@@ -360,6 +364,160 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         assertThat(new BigDecimal(data.path("estimatedRevenue").asText()))
                 .as("revenue must be 100.00 — the booking's price_at_booking snapshot, not the updated 999.00 service price")
                 .isEqualByComparingTo(new BigDecimal("100.00"));
+    }
+
+    // ── 8. INDEPENDENT_MASTER revenue scenario (FIX 10) ──────────────────────
+
+    @Test
+    @DisplayName("GET /revenue — INDEPENDENT_MASTER sees own completed bookings")
+    void should_returnOwnRevenue_when_independentMasterQueriesDashboard() throws Exception {
+        // Arrange — create an INDEPENDENT_MASTER user + master record + service
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        String masterEmail = "indie-master-" + System.nanoTime() + "@beautica.test";
+
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'INDEPENDENT_MASTER', true)",
+                masterUserId, masterEmail, hash);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) VALUES (?, ?, null, 'INDEPENDENT_MASTER', true, NOW(), NOW())",
+                masterId, masterUserId);
+
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'INDEPENDENT_MASTER', ?, 'Indie Service', 60, 200.00, 0, true, NOW(), NOW())",
+                serviceDefId, masterId);
+
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId);
+
+        // Client for booking
+        UUID clientId = UUID.randomUUID();
+        String clientEmail = "client-indie-" + System.nanoTime() + "@beautica.test";
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'CLIENT', true)",
+                clientId, clientEmail, hash);
+
+        OffsetDateTime yesterday = ZonedDateTime.now(KYIV).minusDays(1)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
+        OffsetDateTime endsAt = yesterday.plusMinutes(60);
+
+        jdbcTemplate.update(
+                """
+                INSERT INTO bookings (
+                    id, client_id, master_id, master_service_id, salon_id,
+                    status, starts_at, ends_at,
+                    price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, null,
+                    'COMPLETED', ?, ?,
+                    150.00, 60, 0,
+                    NOW(), NOW()
+                )
+                """,
+                UUID.randomUUID(), clientId, masterId, masterServiceId, yesterday, endsAt);
+
+        String masterToken = loginAndGetToken(masterEmail);
+
+        log.debug("Act: GET {} as INDEPENDENT_MASTER — expect 1 COMPLETED booking, revenue 150.00", REVENUE_URL);
+
+        // Act
+        ResponseEntity<String> response = restTemplate.exchange(
+                REVENUE_URL, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(masterToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalCompletedBookings").asLong())
+                .as("INDEPENDENT_MASTER must see their own 1 completed booking")
+                .isEqualTo(1L);
+        assertThat(new BigDecimal(data.path("estimatedRevenue").asText()))
+                .as("revenue must be 150.00")
+                .isEqualByComparingTo(new BigDecimal("150.00"));
+    }
+
+    // ── 9. Exactly 365-day range boundary (FIX 11) ───────────────────────────
+
+    @Test
+    @DisplayName("GET /revenue — 200 when date range is exactly 365 days (boundary must be > 365, not ≥ 365)")
+    void should_acceptDateRange_when_rangeIsExactly365Days() throws Exception {
+        // Arrange
+        String ownerEmail = "dash-365-owner-" + System.nanoTime() + "@beautica.test";
+        createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+
+        // Exact 365-day range: from=2025-01-01 to=2026-01-01 is exactly 365 days apart
+        log.debug("Act: GET {}?from=2025-01-01&to=2026-01-01 — exactly 365 days — must be 200", REVENUE_URL);
+
+        // Act
+        ResponseEntity<String> response = restTemplate.exchange(
+                REVENUE_URL + "?from=2025-01-01&to=2026-01-01", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert — 365 days is within the allowed range; >365 triggers the 400
+        assertThat(response.getStatusCode())
+                .as("exactly 365-day range must be accepted (constraint is > 365 days)")
+                .isEqualTo(HttpStatus.OK);
+    }
+
+    // ── 10. Cache eviction after booking COMPLETED (FIX 12) ──────────────────
+
+    @Test
+    @DisplayName("GET /revenue — reflects COMPLETED booking after cache evicted")
+    void should_reflectCompletedBooking_when_revenueCacheEvictedAfterBookingCompleted() throws Exception {
+        // Arrange
+        String ownerEmail = "dash-evict-owner-" + System.nanoTime() + "@beautica.test";
+        DataFixture fixture = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+
+        OffsetDateTime yesterday = ZonedDateTime.now(KYIV).minusDays(1)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
+
+        // Prime the cache: first GET with no bookings → cache entry for this actor
+        ResponseEntity<String> primed = restTemplate.exchange(
+                REVENUE_URL, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                String.class);
+        assertThat(primed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode primedData = objectMapper.readTree(primed.getBody()).path("data");
+        assertThat(primedData.path("totalCompletedBookings").asLong())
+                .as("cache should be primed with 0 bookings")
+                .isEqualTo(0L);
+
+        // Insert a COMPLETED booking directly (simulating state-machine completion)
+        insertCompletedBooking(fixture, yesterday, new BigDecimal("250.00"));
+
+        // Evict the revenue-dashboard cache to simulate what BookingService does on COMPLETED transition
+        org.springframework.cache.Cache dashCache = cacheManager.getCache("revenue-dashboard");
+        if (dashCache != null) {
+            dashCache.clear();
+        }
+
+        log.debug("Act: GET {} after cache eviction — must reflect new COMPLETED booking", REVENUE_URL);
+
+        // Act — second GET after eviction
+        ResponseEntity<String> response = restTemplate.exchange(
+                REVENUE_URL, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalCompletedBookings").asLong())
+                .as("after cache eviction, the new COMPLETED booking must be reflected")
+                .isEqualTo(1L);
+        assertThat(new BigDecimal(data.path("estimatedRevenue").asText()))
+                .as("revenue must show 250.00 from the new booking")
+                .isEqualByComparingTo(new BigDecimal("250.00"));
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

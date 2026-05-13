@@ -112,7 +112,8 @@ public class SearchService {
     @Cacheable(
             value = "search:masters",
             key = "#request.toString() + ':' + #pageable.pageNumber + ':' + #pageable.pageSize",
-            condition = "#pageable.pageNumber < 5"
+            condition = "#pageable.pageNumber < 5",
+            sync = true
     )
     @Transactional(readOnly = true)
     public Page<MasterSearchResult> searchMasters(MasterSearchRequest request, Pageable pageable) {
@@ -151,7 +152,8 @@ public class SearchService {
             value = "search:salons",
             key = "T(java.util.Objects).toString(#city) + '|' + T(java.util.Objects).toString(#region) "
                     + "+ ':' + #pageable.pageNumber + ':' + #pageable.pageSize",
-            condition = "#pageable.pageNumber < 5"
+            condition = "#pageable.pageNumber < 5",
+            sync = true
     )
     @Transactional(readOnly = true)
     public Page<SalonSearchResult> searchSalons(String city, String region, Pageable pageable) {

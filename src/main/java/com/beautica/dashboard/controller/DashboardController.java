@@ -18,6 +18,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -56,6 +57,8 @@ public class DashboardController {
      * @param filterMasterId optional master UUID to narrow results (SALON_OWNER only; service
      *                       enforces that the master belongs to the actor's salon)
      * @param serviceDefId   optional service-definition UUID to further narrow results
+     * @param salonId        optional salon UUID to narrow to a single salon (SALON_OWNER only;
+     *                       service validates it belongs to the actor's salons; ignored for INDEPENDENT_MASTER)
      */
     @GetMapping("/revenue")
     public ApiResponse<RevenueResponse> getRevenueSummary(
@@ -67,6 +70,7 @@ public class DashboardController {
 
             @RequestParam(required = false) UUID filterMasterId,
             @RequestParam(required = false) UUID serviceDefId,
+            @RequestParam(required = false) UUID salonId,
 
             Authentication authentication
     ) {
@@ -74,7 +78,8 @@ public class DashboardController {
         Role actorRole = extractRole(authentication);
 
         RevenueResponse result = dashboardService.getRevenueSummary(
-                actorId, actorRole, from, to, filterMasterId, serviceDefId);
+                actorId, actorRole, from, to, filterMasterId, serviceDefId,
+                Optional.ofNullable(salonId));
 
         return ApiResponse.ok(result);
     }

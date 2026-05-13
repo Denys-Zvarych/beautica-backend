@@ -76,11 +76,12 @@ public class ReviewService {
         return ReviewResponse.from(saved);
     }
 
-    // String key format: "<masterId>:<pageNumber>:<pageSize>"
-    // Must be a String (not SimpleKey) so ReviewEventListener can evict by masterId prefix.
+    // String key with typed delimiters to support prefix-based eviction in ReviewEventListener.
+    // sync=true prevents cache stampede when 5-min TTL expires on a popular master page.
     @Cacheable(
             value = "reviews-by-master",
-            key = "#masterId.toString() + ':' + #pageable.pageNumber + ':' + #pageable.pageSize")
+            key = "'master:' + #masterId + ':page:' + #pageable.pageNumber + ':size:' + #pageable.pageSize",
+            sync = true)
     @Transactional(readOnly = true)
     public Page<ReviewResponse> getReviewsForMaster(UUID masterId, Pageable pageable) {
         // Strip caller-supplied sort: the JPQL query has ORDER BY r.createdAt DESC hardcoded.

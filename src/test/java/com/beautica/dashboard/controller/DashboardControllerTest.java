@@ -38,6 +38,7 @@ import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -140,7 +141,7 @@ class DashboardControllerTest {
     void should_return200_when_salonOwnerQueriesDashboard() throws Exception {
         var userId = UUID.randomUUID();
 
-        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any()))
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(emptyResponse());
 
         log.debug("Act: GET {} as SALON_OWNER user={}", REVENUE_URL, userId);
@@ -158,7 +159,7 @@ class DashboardControllerTest {
     void should_return200_when_independentMasterQueriesDashboard() throws Exception {
         var userId = UUID.randomUUID();
 
-        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any()))
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(emptyResponse());
 
         log.debug("Act: GET {} as INDEPENDENT_MASTER user={}", REVENUE_URL, userId);
@@ -215,7 +216,7 @@ class DashboardControllerTest {
     void should_return400_when_dateRangeExceeds365Days() throws Exception {
         var userId = UUID.randomUUID();
 
-        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any()))
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Date range must not exceed 365 days"));
 
         log.debug("Act: GET {}?from=2020-01-01&to=2022-01-01 as SALON_OWNER user={}", REVENUE_URL, userId);
@@ -234,7 +235,7 @@ class DashboardControllerTest {
     void should_return200_when_noDateParamsProvided() throws Exception {
         var userId = UUID.randomUUID();
 
-        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any()))
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(emptyResponse());
 
         log.debug("Act: GET {} without from/to params as SALON_OWNER user={}", REVENUE_URL, userId);
@@ -255,7 +256,7 @@ class DashboardControllerTest {
         var otherMasterId = UUID.randomUUID();
 
         when(dashboardService.getRevenueSummary(
-                any(), any(), any(), any(), eq(otherMasterId), any()))
+                any(), any(), any(), any(), eq(otherMasterId), any(), any()))
                 .thenThrow(new ForbiddenException("Independent master may not filter by another master"));
 
         log.debug("Act: GET {}?filterMasterId={} as INDEPENDENT_MASTER user={} — service enforces IDOR guard",
@@ -289,7 +290,7 @@ class DashboardControllerTest {
         var userId   = UUID.randomUUID();
         var svcDefId = UUID.randomUUID();
 
-        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any()))
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(emptyResponse());
 
         log.debug("Act: GET {}?serviceDefId={} as SALON_OWNER user={}", REVENUE_URL, svcDefId, userId);
@@ -309,7 +310,7 @@ class DashboardControllerTest {
         var userId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
 
-        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any()))
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(emptyResponse());
 
         log.debug("Act: GET {}?filterMasterId={} as SALON_OWNER user={}", REVENUE_URL, masterId, userId);
@@ -319,5 +320,47 @@ class DashboardControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── 11. salonId query param — controller passes Optional to service ────────
+
+    @Test
+    @DisplayName("GET /revenue — 200 when salonId query param is provided for SALON_OWNER")
+    void should_return200_when_salonIdFilterProvided() throws Exception {
+        var userId  = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(),
+                eq(Optional.of(salonId))))
+                .thenReturn(emptyResponse());
+
+        log.debug("Act: GET {}?salonId={} as SALON_OWNER user={}", REVENUE_URL, salonId, userId);
+        mockMvc.perform(get(REVENUE_URL)
+                        .param("salonId", salonId.toString())
+                        .with(authenticatedAs(userId, Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── 12. salonId owned by another owner — service must 403 ─────────────────
+
+    @Test
+    @DisplayName("GET /revenue — 403 when SALON_OWNER passes a salonId they do not own")
+    void should_return403_when_owner_filters_by_salon_they_do_not_own() throws Exception {
+        var userId        = UUID.randomUUID();
+        var foreignSalonId = UUID.randomUUID();
+
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any(),
+                eq(Optional.of(foreignSalonId))))
+                .thenThrow(new ForbiddenException("Salon does not belong to the authenticated owner"));
+
+        log.debug("Act: GET {}?salonId={} as SALON_OWNER user={} — must be 403 (not their salon)",
+                REVENUE_URL, foreignSalonId, userId);
+        mockMvc.perform(get(REVENUE_URL)
+                        .param("salonId", foreignSalonId.toString())
+                        .with(authenticatedAs(userId, Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
     }
 }
