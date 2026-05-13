@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -38,6 +39,8 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(ReviewSecurityTest.class);
     private static final String REVIEWS_URL   = "/api/v1/reviews";
     private static final String TEST_PASSWORD = "password123";
+    private static final HttpComponentsClientHttpRequestFactory HTTP_FACTORY =
+            new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -53,8 +56,7 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
 
     @BeforeEach
     void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        restTemplate.getRestTemplate().setRequestFactory(HTTP_FACTORY);
     }
 
     // ── tests ──────────────────────────────────────────────────────────────────
@@ -216,10 +218,8 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
                 "SELECT id FROM users WHERE email = ?", UUID.class, email);
     }
 
-    private ResponseEntity<String> postReview(String token, UUID bookingId, int rating) {
-        String body = """
-                {"bookingId":"%s","rating":%d}
-                """.formatted(bookingId, rating);
+    private ResponseEntity<String> postReview(String token, UUID bookingId, int rating) throws Exception {
+        String body = objectMapper.writeValueAsString(new CreateReviewRequest(bookingId, rating, null));
         return restTemplate.exchange(
                 REVIEWS_URL, HttpMethod.POST,
                 new HttpEntity<>(body, bearerHeaders(token)),

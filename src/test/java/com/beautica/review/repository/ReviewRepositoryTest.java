@@ -33,6 +33,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+@DisplayName("ReviewRepository")
 class ReviewRepositoryTest extends AbstractDataJpaTest {
 
     @Autowired
@@ -254,6 +255,16 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
 
         assertThat(reloaded.getAvgRating()).isEqualByComparingTo(new BigDecimal("3.00"));
         assertThat(reloaded.getReviewCount()).isEqualTo(2);
+
+        // Cross-master isolation: recalculating master2 must not change master1's stats.
+        Master master1Reloaded = masterRepository.findById(master.getId())
+                .orElseThrow(() -> new AssertionError("master1 not found after recalculation"));
+        assertThat(master1Reloaded.getAvgRating())
+                .as("recalculating master2 must not alter master1's avgRating")
+                .isEqualByComparingTo(BigDecimal.ZERO);
+        assertThat(master1Reloaded.getReviewCount())
+                .as("recalculating master2 must not alter master1's reviewCount")
+                .isEqualTo(0);
     }
 
     @Test

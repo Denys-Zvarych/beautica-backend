@@ -31,9 +31,13 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             """)
     Page<UUID> findIdsByMasterIdOrderByCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
 
-    // Step 2: batch-hydrate the page-size set with full graph (IN list bounded by page size ≤ 100).
-    // No ORDER BY here — ordering is preserved by the stream-reorder in the service layer using the
-    // ID order returned by findIdsByMasterIdOrderByCreatedAtDesc.
+    /**
+     * Batch-hydrates a bounded set of reviews with their associations.
+     *
+     * <p><strong>Result order is undefined.</strong> Callers must reorder the returned list
+     * using the ID sequence from {@link #findIdsByMasterIdOrderByCreatedAtDesc} — for example,
+     * by building a {@code Map<UUID, Review>} and streaming the ID list through it.
+     */
     @EntityGraph(attributePaths = {"booking", "client", "master"})
     @Query("SELECT r FROM Review r WHERE r.id IN :ids")
     List<Review> findByIdsWithGraph(@Param("ids") List<UUID> ids);

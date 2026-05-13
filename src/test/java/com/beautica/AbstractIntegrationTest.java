@@ -46,6 +46,7 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
+        jdbcTemplate.execute("DELETE FROM device_tokens");
         jdbcTemplate.execute("DELETE FROM users");
 
         cacheManager.getCacheNames().forEach(name -> {
