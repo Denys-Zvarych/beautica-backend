@@ -15,6 +15,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
@@ -29,7 +30,15 @@ import java.time.OffsetDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "bookings")
+@Table(
+        name = "bookings",
+        indexes = {
+                // partial index: dashboard revenue query for INDEPENDENT_MASTER path
+                @Index(name = "idx_bookings_master_completed_starts_at", columnList = "master_id, starts_at"),
+                // partial index: dashboard revenue query for SALON_OWNER path
+                @Index(name = "idx_bookings_salon_completed_starts_at", columnList = "salon_id, starts_at")
+        }
+)
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor

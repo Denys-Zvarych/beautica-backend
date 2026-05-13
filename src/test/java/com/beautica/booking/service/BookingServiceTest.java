@@ -41,6 +41,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import org.springframework.cache.Cache;
 import java.math.BigDecimal;
 import org.springframework.data.domain.PageImpl;
 import java.time.Clock;
@@ -56,6 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -596,6 +598,27 @@ class BookingServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
     }
 
+    @Test
+    @DisplayName("revenue-dashboard cache is evicted for the actor when a booking is completed")
+    void should_evictRevenueDashboardCache_when_bookingCompleted() {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        Cache masterCalendarCacheMock = mock(Cache.class);
+        Cache revenueCacheMock = mock(Cache.class);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCacheMock);
+        when(cacheManager.getCache("revenue-dashboard")).thenReturn(revenueCacheMock);
+
+        // Act
+        bookingService.completeBooking(actorId, bookingId);
+
+        // Assert
+        verify(cacheManager).getCache("revenue-dashboard");
+        verify(revenueCacheMock).evict(actorId);
+    }
+
     // ── notCompleteBooking ─────────────────────────────────────────────────────
 
     @Test
@@ -640,6 +663,28 @@ class BookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    @Test
+    @DisplayName("revenue-dashboard cache is evicted for the actor when a booking is marked not-completed")
+    void should_evictRevenueDashboardCache_when_bookingMarkedNotCompleted() {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
+        Cache masterCalendarCacheMock = mock(Cache.class);
+        Cache revenueCacheMock = mock(Cache.class);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCacheMock);
+        when(cacheManager.getCache("revenue-dashboard")).thenReturn(revenueCacheMock);
+
+        // Act
+        bookingService.notCompleteBooking(actorId, bookingId, req);
+
+        // Assert
+        verify(cacheManager).getCache("revenue-dashboard");
+        verify(revenueCacheMock).evict(actorId);
     }
 
     // ── cancelBooking ──────────────────────────────────────────────────────────
