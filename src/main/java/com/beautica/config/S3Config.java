@@ -93,9 +93,7 @@ public class S3Config {
         requireConfigured("app.cloudflare-r2.access-key-id", accessKeyId);
         requireConfigured("app.cloudflare-r2.secret-access-key", secretAccessKey);
 
-        // Log only presence, never the values — credentials must never appear in logs.
-        log.info("Cloudflare R2 enabled — registering S3Client for account {}***",
-                accountId.substring(0, Math.min(4, accountId.length())));
+        log.info("Cloudflare R2 enabled — registering S3Client");
 
         URI endpoint = URI.create(String.format(R2_ENDPOINT_TEMPLATE, accountId));
         AwsBasicCredentials credentials = AwsBasicCredentials.create(accessKeyId, secretAccessKey);

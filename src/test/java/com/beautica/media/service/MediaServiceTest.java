@@ -300,7 +300,8 @@ class MediaServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         Salon salon = Salon.builder().id(salonId).isActive(true).build();
-        when(salonRepo.findAllByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salon));
+        when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
+                .thenReturn(Optional.of(salon));
         when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));
         when(mediaRepo.save(any(MediaFile.class))).thenAnswer(inv -> {
             MediaFile mf = inv.getArgument(0);
@@ -423,7 +424,8 @@ class MediaServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         Salon salon = Salon.builder().id(salonId).isActive(true).build();
-        when(salonRepo.findAllByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salon));
+        when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
+                .thenReturn(Optional.of(salon));
         when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));
         when(mediaRepo.save(any(MediaFile.class))).thenAnswer(inv -> {
             MediaFile mf = inv.getArgument(0);

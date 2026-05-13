@@ -73,6 +73,10 @@ server:
   # Setting it to 'native' would cause Spring's ForwardedHeaderFilter to strip
   # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
   # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
+  tomcat:
+    # Swallow up to 10 MB of an oversized request body so Tomcat returns a clean 413
+    # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.
+    max-swallow-size: 10MB
 
 management:
   endpoints:

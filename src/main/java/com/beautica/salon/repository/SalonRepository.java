@@ -15,6 +15,16 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
 
     List<Salon> findAllByOwnerIdAndIsActiveTrue(UUID ownerId);
 
+    /**
+     * Returns the oldest active salon for the given owner, ordered by {@code created_at ASC}.
+     *
+     * <p>Used by {@code MediaService.resolvePortfolioTarget} to deterministically select
+     * which salon receives a portfolio upload when an owner has more than one active salon.
+     * The {@code findTop} prefix limits the DB result to a single row, avoiding a
+     * non-deterministic {@code salons.get(0)} pick on an unordered list (Perf MEDIUM F6).
+     */
+    Optional<Salon> findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(UUID ownerId);
+
     boolean existsByIdAndOwnerId(UUID id, UUID ownerId);
 
     Optional<Salon> findByIdAndOwnerId(UUID id, UUID ownerId);

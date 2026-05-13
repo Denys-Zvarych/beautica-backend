@@ -1,10 +1,8 @@
 package com.beautica.media;
 
-import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.dto.AuthResponse;
-import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.media.dto.AvatarResponse;
 import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
@@ -23,17 +21,13 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
-import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
 
 import java.util.List;
 import java.util.UUID;
@@ -61,13 +55,11 @@ import static org.mockito.Mockito.when;
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Media — full-context integration")
-class MediaIntegrationTest extends AbstractIntegrationTest {
+class MediaIntegrationTest extends AbstractMediaIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(MediaIntegrationTest.class);
     private static final String AVATAR_URL = "/api/v1/media/avatar";
     private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
-    private static final String TEST_PASSWORD = "password123";
-    private static final byte[] JPEG_HEADER = new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00};
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -89,6 +81,21 @@ class MediaIntegrationTest extends AbstractIntegrationTest {
      */
     @SpyBean
     private MediaRepository mediaRepository;
+
+    @Override
+    protected TestRestTemplate restTemplate() {
+        return restTemplate;
+    }
+
+    @Override
+    protected ObjectMapper objectMapper() {
+        return objectMapper;
+    }
+
+    @Override
+    protected PasswordEncoder passwordEncoder() {
+        return passwordEncoder;
+    }
 
     @BeforeEach
     void configureClientAndR2() {
@@ -227,6 +234,7 @@ class MediaIntegrationTest extends AbstractIntegrationTest {
                     assertThat(item.mediaType())
                             .as("mediaType is PORTFOLIO")
                             .isEqualTo(com.beautica.media.entity.MediaType.PORTFOLIO);
+                    assertThat(item.createdAt()).as("createdAt non-null").isNotNull();
                 });
     }
 
@@ -315,57 +323,40 @@ class MediaIntegrationTest extends AbstractIntegrationTest {
                 .hasSize(1);
     }
 
-    // ── seeding helpers ───────────────────────────────────────────────────────
+    // ── Fix 7 — r2Enabled=false shape test ───────────────────────────────────
 
-    private UUID insertClient(String email) {
-        UUID id = UUID.randomUUID();
-        String hash = passwordEncoder.encode(TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'CLIENT', true)",
-                id, email, hash);
-        return id;
-    }
+    @Test
+    @DisplayName("POST /media/avatar — 200 with valid avatarUrl shape when R2 is disabled (mock mode)")
+    void should_returnExpectedShape_when_r2IsDisabled_onAvatarUpload() throws Exception {
+        // Arrange — R2StorageService is @MockBean; buildPublicUrl returns a stub URL
+        // (configured in @BeforeEach). This exercises the full controller → service path
+        // with the feature-flag-disabled no-op stubs, confirming the response shape.
+        String email = "media-it-r2-off-" + System.nanoTime() + "@beautica.test";
+        insertClient(email);
+        String token = loginAndGetToken(email);
 
-    private UUID insertSalonOwner(String email) {
-        UUID id = UUID.randomUUID();
-        String hash = passwordEncoder.encode(TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
-                id, email, hash);
-        return id;
-    }
+        // Act
+        ResponseEntity<String> resp = restTemplate.exchange(
+                AVATAR_URL, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
+                String.class);
 
-    private UUID insertSalon(UUID ownerId, String name) {
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, name);
-        return salonId;
-    }
+        // Assert — HTTP status
+        assertThat(resp.getStatusCode())
+                .as("avatar upload in disabled-R2 mode must still return 200")
+                .isEqualTo(HttpStatus.OK);
 
-    private String loginAndGetToken(String email) throws Exception {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
-        return body.data().accessToken();
-    }
-
-    private static MultiValueMap<String, Object> jpegMultipartBody() {
-        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-        body.add("file", new ByteArrayResource(JPEG_HEADER) {
-            @Override
-            public String getFilename() {
-                return "a.jpg";
-            }
-        });
-        return body;
-    }
-
-    private static HttpHeaders bearerMultipartHeaders(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
-        return headers;
+        // Assert — response body shape
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<AvatarResponse>>() {});
+        assertThat(body.success())
+                .as("ApiResponse.success must be true")
+                .isTrue();
+        assertThat(body.data())
+                .as("AvatarResponse must be present")
+                .isNotNull();
+        assertThat(body.data().avatarUrl())
+                .as("avatarUrl must be non-blank — stub buildPublicUrl returns https://cdn.example/...")
+                .isNotBlank();
     }
 }

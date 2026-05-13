@@ -12,6 +12,8 @@ import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
+import org.springframework.util.StringUtils;
+
 import java.io.InputStream;
 import java.util.Optional;
 
@@ -68,6 +70,12 @@ public class R2StorageService {
         this.r2Enabled = s3Client.isPresent();
 
         if (r2Enabled) {
+            if (!StringUtils.hasText(bucketName)) {
+                throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.bucket-name is blank");
+            }
+            if (!StringUtils.hasText(publicUrlPrefix)) {
+                throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.public-url is blank");
+            }
             log.info("R2StorageService enabled — uploads will be sent to Cloudflare R2");
         } else {
             log.warn("R2StorageService disabled — uploadFile/deleteFile are no-ops, "

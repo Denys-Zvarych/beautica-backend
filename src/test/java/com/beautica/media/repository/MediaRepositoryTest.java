@@ -14,7 +14,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
-import org.springframework.dao.IncorrectResultSizeDataAccessException;
+import jakarta.persistence.PersistenceException;
 
 import java.util.List;
 import java.util.Optional;
@@ -144,17 +144,22 @@ class MediaRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("Throws IncorrectResultSizeDataAccessException when two AVATAR rows exist for the same uploader — multi-AVATAR is legal at the DB layer today (no partial UNIQUE), so the Optional contract surfaces via Spring Data's translation")
-    void should_throwIncorrectResultSize_when_uploaderHasMultipleAvatars() {
+    @DisplayName("Rejects a second AVATAR for the same (entity_type, entity_id) — ux_media_files_avatar partial unique index (V39)")
+    void should_rejectDuplicateAvatar_when_sameEntityAlreadyHasOne() {
+        // Arrange — first avatar persisted successfully.
         MediaFile first = buildMedia(uploader, EntityType.USER, uploader.getId(), MediaType.AVATAR);
-        MediaFile second = buildMedia(uploader, EntityType.USER, uploader.getId(), MediaType.AVATAR);
         em.persist(first);
-        em.persist(second);
         em.flush();
-        em.clear();
 
-        assertThatThrownBy(() -> repo.findByUploaderIdAndMediaType(uploader.getId(), MediaType.AVATAR))
-                .isInstanceOf(IncorrectResultSizeDataAccessException.class);
+        // Act + Assert — inserting a second AVATAR for the same entity must be rejected at
+        // the DB layer by the partial unique index added in V39. TestEntityManager.flush()
+        // bypasses Spring Data's exception translation, so Hibernate surfaces the violation
+        // as jakarta.persistence.PersistenceException wrapping ConstraintViolationException.
+        MediaFile second = buildMedia(uploader, EntityType.USER, uploader.getId(), MediaType.AVATAR);
+        assertThatThrownBy(() -> {
+            em.persist(second);
+            em.flush();
+        }).isInstanceOf(PersistenceException.class);
     }
 
     @Test
@@ -178,6 +183,60 @@ class MediaRepositoryTest extends AbstractDataJpaTest {
                         MediaType.PORTFOLIO,
                         MediaType.AVATAR
                 );
+    }
+
+    @Test
+    @DisplayName("Rejects r2_key containing path-traversal sequences — chk_media_files_r2_key_shape (V39)")
+    void should_rejectInsert_when_r2KeyContainsPathTraversal() {
+        MediaFile bad = MediaFile.builder()
+                .uploader(uploader)
+                .entityType(EntityType.USER)
+                .entityId(uploader.getId())
+                .mediaType(MediaType.AVATAR)
+                .r2Key("avatars/../../../etc/passwd")
+                .r2Url("https://cdn.example.com/valid.jpg")
+                .build();
+
+        assertThatThrownBy(() -> {
+            em.persist(bad);
+            em.flush();
+        }).isInstanceOf(PersistenceException.class);
+    }
+
+    @Test
+    @DisplayName("Rejects non-HTTPS r2_url — chk_media_files_r2_url_scheme (V39)")
+    void should_rejectInsert_when_r2UrlIsHttp() {
+        MediaFile bad = MediaFile.builder()
+                .uploader(uploader)
+                .entityType(EntityType.USER)
+                .entityId(uploader.getId())
+                .mediaType(MediaType.AVATAR)
+                .r2Key("avatars/valid-" + UUID.randomUUID() + ".jpg")
+                .r2Url("http://cdn.example.com/avatar.jpg")
+                .build();
+
+        assertThatThrownBy(() -> {
+            em.persist(bad);
+            em.flush();
+        }).isInstanceOf(PersistenceException.class);
+    }
+
+    @Test
+    @DisplayName("Rejects PORTFOLIO media_type for USER entity — chk_media_files_media_type_entity_type (V39)")
+    void should_rejectInsert_when_portfolioAssignedToUserEntity() {
+        MediaFile bad = MediaFile.builder()
+                .uploader(uploader)
+                .entityType(EntityType.USER)
+                .entityId(uploader.getId())
+                .mediaType(MediaType.PORTFOLIO)
+                .r2Key("portfolio/valid-" + UUID.randomUUID() + ".jpg")
+                .r2Url("https://cdn.example.com/photo.jpg")
+                .build();
+
+        assertThatThrownBy(() -> {
+            em.persist(bad);
+            em.flush();
+        }).isInstanceOf(PersistenceException.class);
     }
 
     @Test

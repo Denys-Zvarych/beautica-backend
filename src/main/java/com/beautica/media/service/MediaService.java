@@ -392,11 +392,11 @@ public class MediaService {
     /** Resolve which entity a portfolio upload belongs to from the authenticated actor. */
     private PortfolioTarget resolvePortfolioTarget(UUID actorId, Role actorRole) {
         if (actorRole == Role.SALON_OWNER) {
-            List<Salon> salons = salonRepo.findAllByOwnerIdAndIsActiveTrue(actorId);
-            if (salons.isEmpty()) {
-                throw new ForbiddenException("No active salon found for owner");
-            }
-            Salon salon = salons.get(0);
+            // Perf MEDIUM F6: use findTop...OrderByCreatedAtAsc to pick the oldest active salon
+            // deterministically. The former findAllByOwnerIdAndIsActiveTrue + salons.get(0)
+            // had no ORDER BY, so the choice was non-deterministic when an owner has >1 salon.
+            Salon salon = salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(actorId)
+                    .orElseThrow(() -> new ForbiddenException("No active salon found for owner"));
             return new PortfolioTarget(EntityType.SALON, salon.getId(),
                     "portfolio/salons/" + salon.getId() + "/");
         }

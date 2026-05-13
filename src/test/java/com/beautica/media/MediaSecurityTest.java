@@ -1,13 +1,8 @@
 package com.beautica.media;
 
-import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.dto.AuthResponse;
-import com.beautica.auth.dto.LoginRequest;
-import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.service.R2StorageService;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,7 +19,6 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -70,13 +64,11 @@ import static org.mockito.Mockito.when;
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Media — IDOR + content-type security regression")
-class MediaSecurityTest extends AbstractIntegrationTest {
+class MediaSecurityTest extends AbstractMediaIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(MediaSecurityTest.class);
     private static final String AVATAR_URL = "/api/v1/media/avatar";
     private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
-    private static final String TEST_PASSWORD = "password123";
-    private static final byte[] JPEG_HEADER = new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00};
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -89,6 +81,21 @@ class MediaSecurityTest extends AbstractIntegrationTest {
 
     @MockBean
     private R2StorageService r2StorageService;
+
+    @Override
+    protected TestRestTemplate restTemplate() {
+        return restTemplate;
+    }
+
+    @Override
+    protected ObjectMapper objectMapper() {
+        return objectMapper;
+    }
+
+    @Override
+    protected PasswordEncoder passwordEncoder() {
+        return passwordEncoder;
+    }
 
     @BeforeEach
     void configureHttpClient() {
@@ -278,33 +285,7 @@ class MediaSecurityTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
-    // ── seeding helpers ───────────────────────────────────────────────────────
-
-    private UUID insertClient(String email) {
-        UUID id = UUID.randomUUID();
-        String hash = passwordEncoder.encode(TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'CLIENT', true)",
-                id, email, hash);
-        return id;
-    }
-
-    private UUID insertSalonOwner(String email) {
-        UUID id = UUID.randomUUID();
-        String hash = passwordEncoder.encode(TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
-                id, email, hash);
-        return id;
-    }
-
-    private UUID insertSalon(UUID ownerId, String name) {
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, name);
-        return salonId;
-    }
+    // ── seeding helpers (security-test-only) ─────────────────────────────────
 
     /**
      * Insert a {@code media_files} row directly via JDBC — the SEC IT exercises
@@ -326,35 +307,9 @@ class MediaSecurityTest extends AbstractIntegrationTest {
         return mediaId;
     }
 
-    private String loginAndGetToken(String email) throws Exception {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
-        return body.data().accessToken();
-    }
-
-    private static MultiValueMap<String, Object> jpegMultipartBody() {
-        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-        body.add("file", new ByteArrayResource(JPEG_HEADER) {
-            @Override
-            public String getFilename() {
-                return "a.jpg";
-            }
-        });
-        return body;
-    }
-
     private static HttpHeaders bearerHeaders(String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(token);
-        return headers;
-    }
-
-    private static HttpHeaders bearerMultipartHeaders(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
         return headers;
     }
 }
