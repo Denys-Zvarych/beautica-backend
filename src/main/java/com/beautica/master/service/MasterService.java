@@ -183,7 +183,7 @@ public class MasterService {
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         master.setActive(false);
-        masterRepository.save(master);
+        // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
         evictMasterCalendarAfterCommit();
     }
 

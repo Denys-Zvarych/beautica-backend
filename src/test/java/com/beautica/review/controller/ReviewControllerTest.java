@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -260,6 +261,22 @@ class ReviewControllerTest {
     void should_return200_when_getMasterReviewsWithNonExistentMasterId() throws Exception {
         var nonExistentMasterId = UUID.randomUUID();
         when(reviewService.getReviewsForMaster(any(), any())).thenReturn(Page.empty());
+
+        mockMvc.perform(get(MASTERS_REVIEWS_URL, nonExistentMasterId)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.data").isArray())
+                .andExpect(jsonPath("$.data.totalElements").value(0));
+    }
+
+    // ── E5: empty page for non-existent masterId ──────────────────────────────
+
+    @Test
+    @DisplayName("GET /masters/{masterId}/reviews — 200 with empty page when masterId does not exist")
+    void should_returnEmptyPage_when_masterIdDoesNotExist() throws Exception {
+        var nonExistentMasterId = UUID.randomUUID();
+        when(reviewService.getReviewsForMaster(eq(nonExistentMasterId), any())).thenReturn(Page.empty());
 
         mockMvc.perform(get(MASTERS_REVIEWS_URL, nonExistentMasterId)
                         .accept(MediaType.APPLICATION_JSON))

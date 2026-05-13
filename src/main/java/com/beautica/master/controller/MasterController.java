@@ -132,6 +132,14 @@ public class MasterController {
         if (daysBetween > 31) {
             throw new BusinessException("Date range cannot exceed 31 days");
         }
+        // Bounds guard: reject extreme historical or future dates to prevent Caffeine cache-key flooding.
+        // LocalDate.now() is acceptable here — this is a controller sanity check, not business logic.
+        if (from.isBefore(LocalDate.now().minusYears(1))) {
+            throw new BusinessException("Date range out of allowed bounds");
+        }
+        if (to.isAfter(LocalDate.now().plusYears(2))) {
+            throw new BusinessException("Date range out of allowed bounds");
+        }
         UUID actorId = extractUserId(authentication);
         Master actor = masterService.getMasterByUserId(actorId);
         Page<BookingResponse> page = masterService.getMasterCalendar(actor.getId(), from, to, pageable);

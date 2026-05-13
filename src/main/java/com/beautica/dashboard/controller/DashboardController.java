@@ -2,11 +2,13 @@ package com.beautica.dashboard.controller;
 
 import com.beautica.auth.Role;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.dashboard.dto.RevenueResponse;
 import com.beautica.dashboard.service.DashboardService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -74,6 +76,8 @@ public class DashboardController {
 
             Authentication authentication
     ) {
+        validateDateBounds(from, to);
+
         UUID actorId = extractUserId(authentication);
         Role actorRole = extractRole(authentication);
 
@@ -82,6 +86,28 @@ public class DashboardController {
                 Optional.ofNullable(salonId));
 
         return ApiResponse.ok(result);
+    }
+
+    // ── date bounds guard ─────────────────────────────────────────────────────
+
+    /**
+     * Rejects {@code from}/{@code to} values more than 10 years in the past or future.
+     *
+     * <p>Extreme dates produce valid (but useless) Caffeine cache slots and can slow
+     * the SQL DATE range computation. Controller-level sanity check only — uses
+     * {@link LocalDate#now()} which is acceptable here since this is not business logic
+     * that needs a pinnable {@link java.time.Clock}.
+     */
+    private void validateDateBounds(LocalDate from, LocalDate to) {
+        LocalDate today = LocalDate.now();
+        LocalDate tenYearsAgo = today.minusYears(10);
+        LocalDate tenYearsAhead = today.plusYears(10);
+        if (from != null && from.isBefore(tenYearsAgo)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Date parameter out of valid range");
+        }
+        if (to != null && to.isAfter(tenYearsAhead)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Date parameter out of valid range");
+        }
     }
 
     // ── auth helpers (§ B — instanceof UUID id pattern) ───────────────────────

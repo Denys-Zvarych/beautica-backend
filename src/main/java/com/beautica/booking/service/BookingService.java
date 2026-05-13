@@ -145,7 +145,7 @@ public class BookingService {
         booking.setStatus(BookingStatus.CONFIRMED);
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved);
     }
 
@@ -164,7 +164,7 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved);
     }
 
@@ -176,7 +176,7 @@ public class BookingService {
         booking.setStatus(BookingStatus.COMPLETED);
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit();
         return BookingResponse.from(saved);
     }
@@ -194,7 +194,7 @@ public class BookingService {
         booking.setProviderComment(req.comment());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit();
         return BookingResponse.from(saved);
     }
@@ -215,7 +215,7 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved);
     }
 
@@ -328,18 +328,52 @@ public class BookingService {
         }
     }
 
-    private void evictMasterCalendarAfterCommit() {
+    /**
+     * Evicts only the cache entries that belong to the given master from the
+     * {@code master-calendar} cache, running after the current transaction commits.
+     *
+     * <p>The {@code master-calendar} cache key is a {@link org.springframework.cache.interceptor.SimpleKey}
+     * whose first element is the {@code masterId} UUID (see {@code MasterService.getMasterCalendar}).
+     * Because {@code SimpleKey.params} is {@code private final} with no public getter in
+     * Spring 6.x, the filter uses {@code SimpleKey.toString()} — which renders as
+     * {@code "SimpleKey [masterId, from, to, pageNum, pageSize]"} via
+     * {@link java.util.Arrays#deepToString} — and checks whether the first array element
+     * (the UUID string) is present. This avoids blanket {@code cache.clear()} which
+     * would evict ALL masters on every single booking status change (thundering herd).
+     *
+     * <p>Falls back to {@code cache.clear()} when the underlying cache is not a Caffeine
+     * instance (e.g., during tests that use a simple ConcurrentMapCache).
+     */
+    private void evictMasterCalendarAfterCommit(UUID masterId) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    Cache cache = cacheManager.getCache("master-calendar");
-                    if (cache != null) cache.clear();
+                    doEvictMasterCalendarEntries(masterId);
                 }
             });
         } else {
-            Cache cache = cacheManager.getCache("master-calendar");
-            if (cache != null) cache.clear();
+            doEvictMasterCalendarEntries(masterId);
+        }
+    }
+
+    private void doEvictMasterCalendarEntries(UUID masterId) {
+        Cache cache = cacheManager.getCache("master-calendar");
+        if (cache == null) {
+            return;
+        }
+        Object nativeCache = cache.getNativeCache();
+        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
+            // SimpleKey.toString() renders as "SimpleKey [elem0, elem1, ...]" via Arrays.deepToString.
+            // The first element is the masterId UUID string — detect it by substring match on the
+            // toString output, since SimpleKey.params is private with no public getter in Spring 6.x.
+            String masterIdPrefix = "[" + masterId.toString() + ",";
+            caffeineCache.asMap().keySet().removeIf(k ->
+                    k instanceof org.springframework.cache.interceptor.SimpleKey
+                            && k.toString().contains(masterIdPrefix));
+        } else {
+            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
+            cache.clear();
         }
     }
 

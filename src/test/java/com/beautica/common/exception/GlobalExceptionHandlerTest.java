@@ -96,9 +96,10 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("Should return 404 when NotFoundException is thrown")
+    @DisplayName("Should return 404 with generic message when NotFoundException is thrown")
     void should_return404_when_notFoundExceptionThrown() {
-        // Arrange
+        // Arrange — internal message "Master not found" must NOT be echoed in the response
+        // (it leaks internal data model structure e.g. "Salon not found for owner").
         var ex = new NotFoundException("Master not found");
 
         // Act
@@ -114,8 +115,12 @@ class GlobalExceptionHandlerTest {
                 .isFalse();
 
         assertThat(response.getBody().message())
-                .as("message must be non-blank")
-                .isNotBlank();
+                .as("message must be the generic safe string — never ex.getMessage()")
+                .isEqualTo("Resource not found");
+
+        assertThat(response.getBody().message())
+                .as("message must NOT leak the internal exception text")
+                .doesNotContain("Master not found");
     }
 
     @Test

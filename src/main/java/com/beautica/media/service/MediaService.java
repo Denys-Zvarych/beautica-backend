@@ -355,8 +355,9 @@ public class MediaService {
             try {
                 r2.deleteFile(row.getR2Key());
             } catch (RuntimeException ex) {
-                log.warn("R2 delete failed during deleteByUploader sweep (uploader={}, key={}): {}",
-                        uploaderId, row.getR2Key(), ex.getClass().getSimpleName());
+                // Key encodes the user UUID — omit from WARN log to avoid PII in log aggregators.
+                log.warn("R2 delete failed during deleteByUploader sweep (uploader={}, key=[key omitted]): {}",
+                        uploaderId, ex.getClass().getSimpleName());
             }
         }
 

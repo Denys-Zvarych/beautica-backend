@@ -22,4 +22,12 @@ public record OutboxCipherProperties(
         @NotBlank(message = "app.outbox.payload-key must be provided (Base64-encoded 32-byte key)")
         String payloadKey
 ) {
+    /**
+     * Override auto-generated {@code toString()} to prevent the symmetric key from appearing
+     * in Spring's {@code ConfigurationPropertiesReportEndpoint}, debug logs, or heap dumps.
+     */
+    @Override
+    public String toString() {
+        return "OutboxCipherProperties{payloadKey=[REDACTED]}";
+    }
 }

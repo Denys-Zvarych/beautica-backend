@@ -37,6 +37,9 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * <p><strong>Result order is undefined.</strong> Callers must reorder the returned list
      * using the ID sequence from {@link #findIdsByMasterIdOrderByCreatedAtDesc} — for example,
      * by building a {@code Map<UUID, Review>} and streaming the ID list through it.
+     *
+     * <p>No {@code ORDER BY} clause: ordering is driven by the caller's ID stream,
+     * which is cheaper than a redundant DB sort on an unindexed set.
      */
     @EntityGraph(attributePaths = {"booking", "client", "master"})
     @Query("SELECT r FROM Review r WHERE r.id IN :ids")

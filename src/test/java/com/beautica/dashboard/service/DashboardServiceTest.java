@@ -3,7 +3,6 @@ package com.beautica.dashboard.service;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
-import com.beautica.common.exception.NotFoundException;
 import com.beautica.dashboard.dto.RevenueByDateDto;
 import com.beautica.dashboard.dto.RevenueByMasterDto;
 import com.beautica.dashboard.dto.RevenueByServiceDto;
@@ -349,7 +348,7 @@ class DashboardServiceTest {
         UUID otherMasterId = UUID.randomUUID();
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(masterRepository.existsByIdAndSalonId(otherMasterId, salonId)).thenReturn(false);
+        when(masterRepository.existsByIdAndSalonIdIn(otherMasterId, List.of(salonId))).thenReturn(false);
 
         LocalDate from = LocalDate.of(2026, 4, 1);
         LocalDate to   = LocalDate.of(2026, 5, 1);
@@ -388,9 +387,10 @@ class DashboardServiceTest {
     // ── 14. resolveScope — not-found paths ───────────────────────────────────
 
     @Test
-    @DisplayName("SALON_OWNER with no active salon — throws NotFoundException")
-    void should_throwNotFound_when_salonOwnerHasNoActiveSalon() {
-        // Arrange
+    @DisplayName("SALON_OWNER with no active salon — throws ForbiddenException (not 404)")
+    void should_throwForbidden_when_salonOwnerHasNoActiveSalon() {
+        // Arrange — resolveScope now throws ForbiddenException instead of NotFoundException
+        // to prevent authenticated callers from distinguishing "absent resource" from "access denied".
         DashboardService svc = newService(Clock.fixed(FIXED_INSTANT, UTC));
 
         UUID actorId = UUID.randomUUID();
@@ -402,13 +402,15 @@ class DashboardServiceTest {
         // Act & Assert
         assertThatThrownBy(() ->
                 svc.getRevenueSummary(actorId, Role.SALON_OWNER, from, to, null, null, Optional.empty()))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
     }
 
     @Test
-    @DisplayName("INDEPENDENT_MASTER with no master record — throws NotFoundException")
-    void should_throwNotFound_when_independentMasterHasNoMasterRecord() {
-        // Arrange
+    @DisplayName("INDEPENDENT_MASTER with no master record — throws ForbiddenException (not 404)")
+    void should_throwForbidden_when_independentMasterHasNoMasterRecord() {
+        // Arrange — resolveScope now throws ForbiddenException instead of NotFoundException
+        // to prevent authenticated callers from distinguishing "absent resource" from "access denied".
         DashboardService svc = newService(Clock.fixed(FIXED_INSTANT, UTC));
 
         UUID actorId = UUID.randomUUID();
@@ -420,7 +422,8 @@ class DashboardServiceTest {
         // Act & Assert
         assertThatThrownBy(() ->
                 svc.getRevenueSummary(actorId, Role.INDEPENDENT_MASTER, from, to, null, null, Optional.empty()))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
     }
 
     // ── 15. serviceDefId filter binding ──────────────────────────────────────

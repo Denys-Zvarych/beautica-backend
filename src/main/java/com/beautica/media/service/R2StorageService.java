@@ -100,7 +100,8 @@ public class R2StorageService {
      */
     public void uploadFile(String key, InputStream content, long contentLength, String contentType) {
         if (!r2Enabled) {
-            log.warn("uploadFile(key={}, size={}B){}", key, contentLength, DISABLED_SUFFIX);
+            // Key encodes the user UUID — omit from WARN log to avoid PII in log aggregators.
+            log.warn("uploadFile(key=[key omitted], size={}B){}", contentLength, DISABLED_SUFFIX);
             return;
         }
 
@@ -114,8 +115,8 @@ public class R2StorageService {
         try {
             s3Client.get().putObject(request, RequestBody.fromInputStream(content, contentLength));
         } catch (S3Exception | SdkClientException ex) {
-            // Log class + key only — never the SDK message (may include request IDs / partial keys).
-            log.error("R2 upload failed for key={}: {}", key, ex.getClass().getSimpleName());
+            // Key encodes the user UUID — omit from ERROR log to avoid PII in log aggregators.
+            log.error("R2 upload failed for key=[key omitted]: {}", ex.getClass().getSimpleName());
             throw new BusinessException(HttpStatus.BAD_GATEWAY, UPLOAD_FAILED_MESSAGE);
         }
     }
@@ -133,7 +134,8 @@ public class R2StorageService {
      */
     public void deleteFile(String key) {
         if (!r2Enabled) {
-            log.warn("deleteFile(key={}){}", key, DISABLED_SUFFIX);
+            // Key encodes the user UUID — omit from WARN log to avoid PII in log aggregators.
+            log.warn("deleteFile(key=[key omitted]){}", DISABLED_SUFFIX);
             return;
         }
 
@@ -145,7 +147,8 @@ public class R2StorageService {
         try {
             s3Client.get().deleteObject(request);
         } catch (S3Exception | SdkClientException ex) {
-            log.error("R2 delete failed for key={}: {}", key, ex.getClass().getSimpleName());
+            // Key encodes the user UUID — omit from ERROR log to avoid PII in log aggregators.
+            log.error("R2 delete failed for key=[key omitted]: {}", ex.getClass().getSimpleName());
             throw new BusinessException(HttpStatus.BAD_GATEWAY, DELETE_FAILED_MESSAGE);
         }
     }
@@ -166,7 +169,8 @@ public class R2StorageService {
      */
     public String buildPublicUrl(String key) {
         if (!r2Enabled) {
-            log.warn("buildPublicUrl(key={}){}", key, DISABLED_SUFFIX);
+            // Key encodes the user UUID — omit from WARN log to avoid PII in log aggregators.
+            log.warn("buildPublicUrl(key=[key omitted]){}", DISABLED_SUFFIX);
             return "";
         }
         return publicUrlPrefix + "/" + key;

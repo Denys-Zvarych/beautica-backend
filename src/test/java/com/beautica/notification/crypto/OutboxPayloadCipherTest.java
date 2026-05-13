@@ -97,4 +97,68 @@ class OutboxPayloadCipherTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("32 bytes");
     }
+
+    // ── E4: edge cases ─────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_throwIllegalStateException_when_openReceivesUnknownVersionPrefix")
+    void should_throwIllegalStateException_when_openReceivesUnknownVersionPrefix() {
+        // "v2:" prefix is unrecognised — open() must reject it.
+        String unknownPrefix = "v2:" + Base64.getEncoder().encodeToString(new byte[32]);
+
+        assertThatThrownBy(() -> cipher.open(unknownPrefix))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwIllegalStateException_when_openReceivesMalformedBase64")
+    void should_throwIllegalStateException_when_openReceivesMalformedBase64() {
+        // Valid prefix but body contains characters illegal in standard Base64.
+        String malformedBase64 = "v1:not-valid-base64@@@";
+
+        assertThatThrownBy(() -> cipher.open(malformedBase64))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwIllegalStateException_when_openReceivesTruncatedPayload")
+    void should_throwIllegalStateException_when_openReceivesTruncatedPayload() {
+        // 5 bytes is below IV_LENGTH_BYTES (12) + TAG_LENGTH_BYTES (16) = 28 minimum.
+        String truncated = "v1:" + Base64.getEncoder().encodeToString(new byte[5]);
+
+        assertThatThrownBy(() -> cipher.open(truncated))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwIllegalStateException_when_openWithWrongKey")
+    void should_throwIllegalStateException_when_openWithWrongKey() {
+        // Seal with `cipher` (key A), try to open with `cipher2` (key B) → GCM tag fails.
+        byte[] differentKeyBytes = new byte[32];
+        // Flip every bit so the key is definitely different.
+        new java.security.SecureRandom().nextBytes(differentKeyBytes);
+        String differentB64Key = Base64.getEncoder().encodeToString(differentKeyBytes);
+        OutboxPayloadCipher cipher2 = new OutboxPayloadCipher(new OutboxCipherProperties(differentB64Key));
+
+        String sealed = cipher.seal("sensitive-data");
+
+        assertThatThrownBy(() -> cipher2.open(sealed))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwIllegalArgumentException_when_sealReceivesNull (seal(null) → IllegalArgumentException)")
+    void should_throwException_when_sealReceivesNull() {
+        // seal(null) explicitly throws IllegalArgumentException per its Javadoc contract.
+        assertThatThrownBy(() -> cipher.seal(null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwIllegalStateException_when_openReceivesNull (open(null) → IllegalStateException)")
+    void should_throwException_when_openReceivesNull() {
+        // open(null) fails the startsWith check → IllegalStateException("unrecognised version prefix").
+        assertThatThrownBy(() -> cipher.open(null))
+                .isInstanceOf(IllegalStateException.class);
+    }
 }

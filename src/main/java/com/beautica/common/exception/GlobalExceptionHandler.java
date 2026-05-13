@@ -39,9 +39,11 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
+        // Return a generic message — do not echo ex.getMessage() which may reveal internal
+        // data model structure (e.g. "Salon not found for owner", "Master not found for user").
         return ResponseEntity
                 .status(HttpStatus.NOT_FOUND)
-                .body(ApiResponse.error(ex.getMessage()));
+                .body(ApiResponse.error("Resource not found"));
     }
 
     @ExceptionHandler(ForbiddenException.class)

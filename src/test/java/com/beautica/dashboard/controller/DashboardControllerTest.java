@@ -343,6 +343,24 @@ class DashboardControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
     }
 
+    // ── B4. Extreme date params — controller validates bounds ─────────────────
+
+    @Test
+    @DisplayName("GET /revenue — 400 when 'from' param is more than 10 years in the past")
+    void should_return400_when_dateParamIsExtremelyFarInThePast() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // 2000-01-01 is >10 years before today (2026-05-13)
+        log.debug("Act: GET {}?from=2000-01-01 as SALON_OWNER user={} — must be rejected with 400",
+                REVENUE_URL, userId);
+        mockMvc.perform(get(REVENUE_URL)
+                        .param("from", "2000-01-01")
+                        .param("to", "2000-01-31")
+                        .with(authenticatedAs(userId, Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
     // ── 12. salonId owned by another owner — service must 403 ─────────────────
 
     @Test

@@ -54,7 +54,7 @@ public class SlotCalculationService {
     }
 
     @Transactional(readOnly = true)
-    @Cacheable(value = "available-slots", key = "#masterId + ':' + #date + ':' + #masterServiceId")
+    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}")
     public List<AvailableSlotResponse> getAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {
         // Step 1: date range validation — cheapest guard, no DB
         LocalDate today = LocalDate.now(kyivClock);
@@ -135,6 +135,6 @@ public class SlotCalculationService {
     // surrounding transaction suspends so the cache is only invalidated independently of commit/rollback.
     // BookingService must call this from a TransactionSynchronization.afterCommit() callback.
     @Transactional(propagation = org.springframework.transaction.annotation.Propagation.NOT_SUPPORTED)
-    @CacheEvict(value = "available-slots", key = "#masterId + ':' + #date + ':' + #masterServiceId")
+    @CacheEvict(value = "available-slots", key = "{#masterId, #date, #masterServiceId}")
     public void evictAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {}
 }

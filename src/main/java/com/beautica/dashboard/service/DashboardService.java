@@ -3,7 +3,6 @@ package com.beautica.dashboard.service;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
-import com.beautica.common.exception.NotFoundException;
 import com.beautica.dashboard.dto.RevenueByDateDto;
 import com.beautica.dashboard.dto.RevenueByMasterDto;
 import com.beautica.dashboard.dto.RevenueByServiceDto;
@@ -150,8 +149,10 @@ public class DashboardService {
      * salon IDs for the owner. The optional {@code salonIdFilter} narrows to a single salon
      * after verifying it is in the actor's scope (prevents IDOR across unowned salons).
      */
+    // sync=true acts as the null-caching guard: Caffeine throws on null when sync=true,
+    // so unless="#result==null" would be both redundant and illegal (Spring rejects the combo).
     @Cacheable(value = "revenue-dashboard",
-               key   = "{#actorId, #actorRole, #from, #to, #filterMasterId, #serviceDefId, #salonIdFilter}",
+               key   = "{#actorId, #actorRole, #from, #to, #filterMasterId, #serviceDefId, #salonIdFilter?.orElse(null)}",
                sync  = true)
     public RevenueResponse getRevenueSummary(
             UUID           actorId,
@@ -173,9 +174,9 @@ public class DashboardService {
         // ── filterMasterId ownership guard ────────────────────────────────
         if (filterMasterId != null) {
             if (scope.isSalonScope()) {
-                // SALON_OWNER: master must belong to one of the actor's active salons
-                if (scope.salonIds().stream().noneMatch(sid ->
-                        masterRepository.existsByIdAndSalonId(filterMasterId, sid))) {
+                // SALON_OWNER: master must belong to one of the actor's active salons.
+                // Single IN query replaces the previous N-query stream loop.
+                if (!masterRepository.existsByIdAndSalonIdIn(filterMasterId, scope.salonIds())) {
                     throw new ForbiddenException("Master does not belong to actor's salon");
                 }
             } else {
@@ -259,14 +260,17 @@ public class DashboardService {
                 // Collect ALL active salon IDs — multi-salon owners must see all their salons.
                 List<UUID> salonIds = salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId);
                 if (salonIds.isEmpty()) {
-                    throw new NotFoundException("No active salon found for owner");
+                    // Return ForbiddenException (not NotFoundException) so authenticated callers
+                    // cannot distinguish "resource absent" from "access denied" via 404 vs 403.
+                    throw new ForbiddenException("Access denied");
                 }
                 yield new ActorScope(salonIds, null);
             }
             case INDEPENDENT_MASTER -> {
                 Master master = masterRepository
                         .findByUserId(actorId)
-                        .orElseThrow(() -> new NotFoundException("Master not found for user"));
+                        // ForbiddenException instead of NotFoundException — prevents 404/403 oracle.
+                        .orElseThrow(() -> new ForbiddenException("Access denied"));
                 yield new ActorScope(List.of(), master.getId());
             }
             default -> throw new ForbiddenException("Access denied");
