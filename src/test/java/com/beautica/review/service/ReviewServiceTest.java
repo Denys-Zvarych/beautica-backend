@@ -70,7 +70,7 @@ class ReviewServiceTest {
     // ── createReview ─────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_createReview_when_completedBookingAndOwnerClient")
+    @DisplayName("creates review and publishes event when booking is COMPLETED and actor is the booking client")
     void should_createReview_when_completedBookingAndOwnerClient() {
         User client = mock(User.class);
         when(client.getId()).thenReturn(CLIENT_ID);
@@ -116,7 +116,7 @@ class ReviewServiceTest {
     }
 
     @ParameterizedTest
-    @DisplayName("should_throw400_when_bookingStatusIsNotCompleted")
+    @DisplayName("throws 400 BusinessException when booking status is not COMPLETED (covers all non-terminal states)")
     @EnumSource(value = BookingStatus.class, names = {"PENDING", "CONFIRMED", "DECLINED", "CANCELLED", "NOT_COMPLETED"})
     void should_throw400_when_bookingStatusIsNotCompleted(BookingStatus status) {
         // Ownership check runs first (fix for IDOR oracle); stub client so it passes through to status check.

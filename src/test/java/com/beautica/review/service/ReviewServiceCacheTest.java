@@ -51,7 +51,7 @@ class ReviewServiceCacheTest {
     }
 
     @Test
-    @DisplayName("should_returnCachedResult_when_getReviewCalledTwiceWithSameId")
+    @DisplayName("returns cached result on second call for same review ID — repository hit count must be exactly one")
     void should_returnCachedResult_when_getReviewCalledTwiceWithSameId() {
         UUID reviewId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
@@ -86,7 +86,7 @@ class ReviewServiceCacheTest {
     }
 
     @Test
-    @DisplayName("should_hitRepositoryTwice_when_getReviewCalledWithDifferentIds")
+    @DisplayName("does not collide cache entries across different review IDs — each ID hits the repository once")
     void should_hitRepositoryTwice_when_getReviewCalledWithDifferentIds() {
         UUID reviewId1 = UUID.randomUUID();
         UUID reviewId2 = UUID.randomUUID();

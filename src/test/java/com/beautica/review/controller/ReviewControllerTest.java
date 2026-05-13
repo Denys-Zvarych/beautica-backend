@@ -255,6 +255,20 @@ class ReviewControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
     }
 
+    @Test
+    @DisplayName("GET /masters/{masterId}/reviews — 200 with empty page when masterId does not exist")
+    void should_return200_when_getMasterReviewsWithNonExistentMasterId() throws Exception {
+        var nonExistentMasterId = UUID.randomUUID();
+        when(reviewService.getReviewsForMaster(any(), any())).thenReturn(Page.empty());
+
+        mockMvc.perform(get(MASTERS_REVIEWS_URL, nonExistentMasterId)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.data").isArray())
+                .andExpect(jsonPath("$.data.totalElements").value(0));
+    }
+
     // ── GET /reviews/{reviewId} ───────────────────────────────────────────────
 
     @Test

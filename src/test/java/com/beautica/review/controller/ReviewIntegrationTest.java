@@ -189,6 +189,49 @@ class ReviewIntegrationTest extends AbstractIntegrationTest {
                 .isAfterOrEqualTo(second);
     }
 
+    @Test
+    @DisplayName("GET /masters/{masterId}/reviews — review list reflects new review after cache eviction on POST")
+    void should_returnNewReview_when_cacheEvictedAfterCreate() throws Exception {
+        UUID masterId        = createIndependentMaster("im-cache-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        String clientEmail   = "cli-cache-" + System.nanoTime() + "@beautica.test";
+        String clientToken   = createClientAndGetToken(clientEmail);
+        UUID clientId        = resolveUserIdByEmail(clientEmail);
+
+        // Prime the cache with an empty list before any review exists.
+        ResponseEntity<String> firstGet = restTemplate.getForEntity(
+                MASTERS_URL + "/" + masterId + "/reviews", String.class);
+        assertThat(firstGet.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var firstWrapper = objectMapper.readValue(
+                firstGet.getBody(),
+                new com.fasterxml.jackson.core.type.TypeReference<
+                        com.beautica.common.ApiResponse<com.beautica.common.PageResponse<ReviewResponse>>>() {});
+        assertThat(firstWrapper.data().data())
+                .as("no reviews before POST — list must be empty")
+                .isEmpty();
+
+        // Create a booking and submit a review.
+        UUID bookingId = createCompletedBooking(clientId, masterId, masterServiceId);
+        log.debug("Act: POST {} rating=4 for bookingId={}", REVIEWS_URL, bookingId);
+        assertThat(postReview(clientToken, bookingId, 4).getStatusCode())
+                .isEqualTo(HttpStatus.CREATED);
+
+        // Second GET must return the new review — stale cache must have been evicted after commit.
+        ResponseEntity<String> secondGet = restTemplate.getForEntity(
+                MASTERS_URL + "/" + masterId + "/reviews", String.class);
+        assertThat(secondGet.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var secondWrapper = objectMapper.readValue(
+                secondGet.getBody(),
+                new com.fasterxml.jackson.core.type.TypeReference<
+                        com.beautica.common.ApiResponse<com.beautica.common.PageResponse<ReviewResponse>>>() {});
+        assertThat(secondWrapper.data().data())
+                .as("review list must contain the new review after cache was evicted post-commit")
+                .hasSize(1);
+        assertThat(secondWrapper.data().data().get(0).rating())
+                .as("the persisted review rating must be 4")
+                .isEqualTo(4);
+    }
+
     // ── fixtures ───────────────────────────────────────────────────────────────
 
     /**

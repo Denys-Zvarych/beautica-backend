@@ -140,6 +140,28 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
+    @DisplayName("recalculates master rating to 0.00 / count 0 when the master has no reviews (COALESCE path)")
+    void should_recalculateMasterRating_when_noReviewsExist() {
+        // Arrange — master was seeded with avgRating=0, reviewCount=0 but no reviews in DB.
+        // Calling recalculate on a master with zero reviews must leave the row at 0.00 / 0
+        // (not NULL — the COALESCE in the native query handles the empty-aggregation edge case).
+
+        // Act
+        reviewRepository.recalculateMasterRating(master.getId());
+
+        // Assert
+        Master reloaded = masterRepository.findById(master.getId())
+                .orElseThrow(() -> new AssertionError("Master not found after recalculation"));
+
+        assertThat(reloaded.getAvgRating())
+                .as("avgRating must be 0.00 when no reviews exist (COALESCE AVG NULL → 0)")
+                .isEqualByComparingTo(new java.math.BigDecimal("0.00"));
+        assertThat(reloaded.getReviewCount())
+                .as("reviewCount must be 0 when no reviews exist (COALESCE COUNT NULL → 0)")
+                .isEqualTo(0);
+    }
+
+    @Test
     @DisplayName("should_recalculateMasterRating_when_twoReviewsExist")
     void should_recalculateMasterRating_when_twoReviewsExist() {
         User masterUser2 = new User(

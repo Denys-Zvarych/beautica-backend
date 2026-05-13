@@ -94,6 +94,14 @@ class CreateReviewRequestTest {
     }
 
     @Test
+    @DisplayName("accepts comment when comment is exactly 1 non-whitespace character (min boundary)")
+    void should_acceptComment_when_commentIs1Char() {
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, "x");
+
+        assertThat(validator.validate(request)).isEmpty();
+    }
+
+    @Test
     @DisplayName("accepts comment when comment is null (Size skips null)")
     void should_acceptComment_when_commentIsNull() {
         var request = new CreateReviewRequest(UUID.randomUUID(), 3, null);
