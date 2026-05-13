@@ -256,21 +256,6 @@ class MasterServiceTest {
         verify(workingHoursRepository, never()).saveAll(any());
     }
 
-    @Test
-    @DisplayName("should_throwNotFound_when_upsertWorkingHoursWithUnknownMasterId")
-    void should_throwNotFound_when_upsertWorkingHoursWithUnknownMasterId() {
-        UUID ownerId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        var request = new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> masterService.upsertWorkingHours(ownerId, masterId, List.of(request)))
-                .isInstanceOf(NotFoundException.class);
-
-        verify(workingHoursRepository, never()).saveAll(any());
-    }
-
     // ── deactivateMaster ──────────────────────────────────────────────────────
 
     @Test

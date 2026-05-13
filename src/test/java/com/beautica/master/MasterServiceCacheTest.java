@@ -13,6 +13,7 @@ import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -91,10 +92,10 @@ class MasterServiceCacheTest {
 
     @BeforeEach
     void clearCache() {
-        Cache cache = cacheManager.getCache("master-calendar");
-        if (cache != null) {
-            cache.clear();
-        }
+        Cache calendarCache = cacheManager.getCache("master-calendar");
+        if (calendarCache != null) calendarCache.clear();
+        Cache masterByUserCache = cacheManager.getCache("master-by-user");
+        if (masterByUserCache != null) masterByUserCache.clear();
     }
 
     @Test
@@ -193,7 +194,11 @@ class MasterServiceCacheTest {
         cache.put("sentinel", "value");
         assertThat(cache.get("sentinel")).isNotNull();
 
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(UUID.randomUUID());
+
         Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(user);
         when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
         when(masterRepository.save(master)).thenReturn(master);
 
@@ -206,5 +211,42 @@ class MasterServiceCacheTest {
         assertThat(cache.get("sentinel"))
                 .as("master-calendar cache must be evicted after deactivateMaster commits")
                 .isNull();
+    }
+
+    @Test
+    @DisplayName("deactivateMaster evicts only the specific user's master-by-user cache entry")
+    void should_evictMasterByUserCache_forSpecificUserId_when_deactivateMaster() {
+        Cache masterByUserCache = cacheManager.getCache("master-by-user");
+        assertThat(masterByUserCache).isNotNull();
+
+        UUID userAId = UUID.randomUUID();
+        UUID userBId = UUID.randomUUID();
+
+        // Prime both entries
+        masterByUserCache.put(userAId, "master-a");
+        masterByUserCache.put(userBId, "master-b");
+        assertThat(masterByUserCache.get(userAId)).isNotNull();
+        assertThat(masterByUserCache.get(userBId)).isNotNull();
+
+        User userA = mock(User.class);
+        when(userA.getId()).thenReturn(userAId);
+
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(userA);
+        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
+
+        // Act — wrap in transaction so afterCommit() fires
+        transactionTemplate.execute(status -> {
+            masterService.deactivateMaster(ACTOR_ID, MASTER_ID);
+            return null;
+        });
+
+        // Only user A's entry must be evicted; user B must survive
+        assertThat(masterByUserCache.get(userAId))
+                .as("master-by-user cache entry for userA must be evicted after deactivateMaster commits")
+                .isNull();
+        assertThat(masterByUserCache.get(userBId))
+                .as("master-by-user cache entry for userB must NOT be evicted")
+                .isNotNull();
     }
 }

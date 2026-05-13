@@ -37,7 +37,7 @@ import java.util.UUID;
  *
  * <p>All methods are read-only; the class-level {@code @Transactional(readOnly = true)}
  * covers every public method. Cache key is the 6-element composite
- * {@code {actorId, actorRole, from, to, filterMasterId, serviceDefId}}. Eviction uses
+ * {@code {actorId, from, to, filterMasterId, serviceDefId, salonIdFilter}}. Eviction uses
  * {@code cache.clear()} on the whole {@code revenue-dashboard} region, called from
  * {@code BookingService.evictRevenueDashboardAfterCommit()} after any COMPLETED /
  * NOT_COMPLETED transition. Targeted single-key eviction is not feasible because
@@ -139,7 +139,7 @@ public class DashboardService {
      * Returns a revenue summary for the given actor scoped to their salons (SALON_OWNER)
      * or their own master record (INDEPENDENT_MASTER).
      *
-     * <p>Cache key is the 7-element composite {@code {actorId, actorRole, from, to,
+     * <p>Cache key is the 6-element composite {@code {actorId, from, to,
      * filterMasterId, serviceDefId, salonIdFilter}}. Eviction clears the whole
      * {@code revenue-dashboard} region (see {@code BookingService.evictRevenueDashboardAfterCommit()})
      * because the date/filter parameters are not available in {@code BookingService} at
@@ -152,7 +152,7 @@ public class DashboardService {
     // sync=true acts as the null-caching guard: Caffeine throws on null when sync=true,
     // so unless="#result==null" would be both redundant and illegal (Spring rejects the combo).
     @Cacheable(value = "revenue-dashboard",
-               key   = "{#actorId, #actorRole, #from, #to, #filterMasterId, #serviceDefId, #salonIdFilter?.orElse(null)}",
+               key   = "{#actorId, #from, #to, #filterMasterId, #serviceDefId, #salonIdFilter?.orElse(null)}",
                sync  = true)
     public RevenueResponse getRevenueSummary(
             UUID           actorId,

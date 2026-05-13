@@ -90,7 +90,7 @@ public class ServiceCatalogService {
                 .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
 
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
-            throw new ForbiddenException("Master does not belong to salon: " + salonId);
+            throw new ForbiddenException("Access denied");
         }
 
         ServiceDefinition serviceDef = serviceRepository.findById(request.serviceDefId())

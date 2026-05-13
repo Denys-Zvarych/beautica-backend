@@ -359,6 +359,30 @@ class DashboardServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    @Test
+    @DisplayName("SALON_OWNER: filterMasterId from own salon — query executes without throwing")
+    void should_allowFilterMasterId_when_masterBelongsToOwnersSalon() {
+        // Arrange
+        DashboardService svc = newService(Clock.fixed(FIXED_INSTANT, UTC));
+
+        UUID actorId  = UUID.randomUUID();
+        UUID salonId  = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(masterRepository.existsByIdAndSalonIdIn(masterId, List.of(salonId))).thenReturn(true);
+        stubEmptyQuery(em, query);
+
+        LocalDate from = LocalDate.of(2026, 4, 1);
+        LocalDate to   = LocalDate.of(2026, 5, 1);
+
+        // Act — must not throw
+        RevenueResponse result = svc.getRevenueSummary(actorId, Role.SALON_OWNER, from, to, masterId, null, Optional.empty());
+
+        // Assert — query executed and returned empty result
+        assertThat(result.totalCompletedBookings()).isZero();
+    }
+
     // ── 13. INDEPENDENT_MASTER filterMasterId IDOR guard ─────────────────────
 
     @Test

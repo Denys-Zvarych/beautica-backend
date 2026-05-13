@@ -147,6 +147,22 @@ class OutboxPayloadCipherTest {
     }
 
     @Test
+    @DisplayName("OutboxPayloadCipher constructor — throws IllegalStateException when key property is null")
+    void should_throwWhenKeyIsNull() {
+        assertThatThrownBy(() -> new OutboxPayloadCipher(new OutboxCipherProperties(null)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must be provided");
+    }
+
+    @Test
+    @DisplayName("OutboxPayloadCipher constructor — throws IllegalStateException when key is blank")
+    void should_throwIllegalStateException_when_keyIsBlank() {
+        assertThatThrownBy(() -> new OutboxPayloadCipher(new OutboxCipherProperties("")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must be provided");
+    }
+
+    @Test
     @DisplayName("should_throwIllegalStateException_when_sealReceivesNull (seal(null) → IllegalStateException)")
     void should_throwException_when_sealReceivesNull() {
         // seal(null) throws IllegalStateException("plaintext must not be null") per production code.

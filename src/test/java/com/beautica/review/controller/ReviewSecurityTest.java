@@ -10,6 +10,7 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -53,6 +54,11 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
 
     @MockBean
     private NotificationOutboxService notificationOutboxService;
+
+    @AfterAll
+    static void destroyHttpFactory() throws Exception {
+        HTTP_FACTORY.destroy();
+    }
 
     @BeforeEach
     void configureHttpClient() {

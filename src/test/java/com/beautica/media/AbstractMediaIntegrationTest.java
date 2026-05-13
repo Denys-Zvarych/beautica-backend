@@ -19,6 +19,8 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 
+import org.junit.jupiter.api.AfterAll;
+
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -42,6 +44,11 @@ abstract class AbstractMediaIntegrationTest extends AbstractIntegrationTest {
      */
     protected static final HttpComponentsClientHttpRequestFactory HC5_FACTORY =
             new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
+
+    @AfterAll
+    static void destroyHttpFactory() throws Exception {
+        HC5_FACTORY.destroy();
+    }
 
     // Declared abstract so subclasses resolve the correct @MockBean-scoped context beans.
     protected abstract TestRestTemplate restTemplate();

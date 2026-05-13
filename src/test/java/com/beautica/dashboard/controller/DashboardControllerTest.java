@@ -302,7 +302,7 @@ class DashboardControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
     }
 
-    // ── 8. filterMasterId query param — controller passes it through ──────────
+    // ── 11b. filterMasterId query param — controller passes it through (positive case) ──────
 
     @Test
     @DisplayName("GET /revenue — 200 when filterMasterId query param is provided")
@@ -356,6 +356,18 @@ class DashboardControllerTest {
         mockMvc.perform(get(REVENUE_URL)
                         .param("from", "2000-01-01")
                         .param("to", "2000-01-31")
+                        .with(authenticatedAs(userId, Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /revenue — 400 when 'from' param is not a valid date")
+    void should_return400_when_fromParamIsNotAValidDate() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(get(REVENUE_URL)
+                        .param("from", "not-a-date")
                         .with(authenticatedAs(userId, Role.SALON_OWNER))
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest());

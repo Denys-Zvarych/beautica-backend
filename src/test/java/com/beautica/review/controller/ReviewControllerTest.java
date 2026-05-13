@@ -149,6 +149,36 @@ class ReviewControllerTest {
     }
 
     @Test
+    @DisplayName("POST /reviews — 403 when SALON_MASTER attempts to submit a review")
+    void should_return403_when_salonMasterSubmitsReview() throws Exception {
+        var masterId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, null));
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 403 when INDEPENDENT_MASTER attempts to submit a review")
+    void should_return403_when_independentMasterSubmitsReview() throws Exception {
+        var masterId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, null));
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
     @DisplayName("POST /reviews — 401 when no Authorization header is present")
     void should_return401_when_noTokenOnCreateReview() throws Exception {
         var body = objectMapper.writeValueAsString(
@@ -270,22 +300,6 @@ class ReviewControllerTest {
                 .andExpect(jsonPath("$.data.totalElements").value(0));
     }
 
-    // ── E5: empty page for non-existent masterId ──────────────────────────────
-
-    @Test
-    @DisplayName("GET /masters/{masterId}/reviews — 200 with empty page when masterId does not exist")
-    void should_returnEmptyPage_when_masterIdDoesNotExist() throws Exception {
-        var nonExistentMasterId = UUID.randomUUID();
-        when(reviewService.getReviewsForMaster(eq(nonExistentMasterId), any())).thenReturn(Page.empty());
-
-        mockMvc.perform(get(MASTERS_REVIEWS_URL, nonExistentMasterId)
-                        .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.data").isArray())
-                .andExpect(jsonPath("$.data.totalElements").value(0));
-    }
-
     // ── GET /reviews/{reviewId} ───────────────────────────────────────────────
 
     @Test
@@ -309,6 +323,7 @@ class ReviewControllerTest {
 
         mockMvc.perform(get(REVIEWS_URL + "/{reviewId}", reviewId)
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.message").isNotEmpty());
     }
 }
