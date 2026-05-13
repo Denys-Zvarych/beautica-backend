@@ -14,7 +14,11 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @DisplayName("GlobalExceptionHandler — unit")
 class GlobalExceptionHandlerTest {
@@ -201,6 +205,34 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody().message())
                 .as("message must reference the missing part name")
                 .contains("file");
+    }
+
+    @Test
+    @DisplayName("should return 400 with safe param name when UUID request param is malformed")
+    void should_return400_with_safe_param_name_when_UUID_param_is_malformed() {
+        // Arrange — mock avoids the complex MethodParameter constructor setup
+        MethodArgumentTypeMismatchException ex = mock(MethodArgumentTypeMismatchException.class);
+        when(ex.getName()).thenReturn("filterMasterId");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleTypeMismatch(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 400 for a malformed request parameter")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("message must contain the safe parameter name")
+                .contains("filterMasterId");
+
+        assertThat(response.getBody().message())
+                .as("message must not echo any user-supplied value")
+                .doesNotContain("not-a-uuid");
     }
 
     /**

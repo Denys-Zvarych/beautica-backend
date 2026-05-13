@@ -36,8 +36,8 @@ import java.util.UUID;
  * Read-only analytics service for the revenue dashboard.
  *
  * <p>All methods are read-only; the class-level {@code @Transactional(readOnly = true)}
- * covers every public method. Cache key is the 5-element composite
- * {@code {actorId, from, to, filterMasterId, serviceDefId}}. Eviction uses
+ * covers every public method. Cache key is the 6-element composite
+ * {@code {actorId, actorRole, from, to, filterMasterId, serviceDefId}}. Eviction uses
  * {@code cache.clear()} on the whole {@code revenue-dashboard} region, called from
  * {@code BookingService.evictRevenueDashboardAfterCommit()} after any COMPLETED /
  * NOT_COMPLETED transition. Targeted single-key eviction is not feasible because
@@ -117,13 +117,13 @@ public class DashboardService {
      * Returns a revenue summary for the given actor scoped to their salon (SALON_OWNER)
      * or their own master record (INDEPENDENT_MASTER).
      *
-     * <p>Cache key is the 5-element composite {@code {actorId, from, to, filterMasterId,
+     * <p>Cache key is the 6-element composite {@code {actorId, actorRole, from, to, filterMasterId,
      * serviceDefId}}. Eviction clears the whole {@code revenue-dashboard} region
      * (see {@code BookingService.evictRevenueDashboardAfterCommit()}) because the date/filter
      * parameters are not available in {@code BookingService} at eviction time.
      */
     @Cacheable(value = "revenue-dashboard",
-               key   = "{#actorId, #from, #to, #filterMasterId, #serviceDefId}",
+               key   = "{#actorId, #actorRole, #from, #to, #filterMasterId, #serviceDefId}",
                sync  = true)
     public RevenueResponse getRevenueSummary(
             UUID      actorId,
@@ -195,8 +195,7 @@ public class DashboardService {
                         .orElseThrow(() -> new NotFoundException("Master not found for user"));
                 yield new ActorScope(null, master.getId());
             }
-            default -> throw new ForbiddenException(
-                    "Role " + actorRole + " is not permitted to access revenue dashboard");
+            default -> throw new ForbiddenException("Access denied");
         };
     }
 

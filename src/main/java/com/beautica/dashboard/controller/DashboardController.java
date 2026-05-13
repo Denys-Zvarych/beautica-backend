@@ -99,15 +99,20 @@ public class DashboardController {
     /**
      * Resolves the authenticated user's {@link Role} from the granted authorities.
      *
+     * <p>Uses the {@code instanceof UsernamePasswordAuthenticationToken} guard (Anti-Bug
+     * Playbook § B), mirroring {@link #extractUserId}: a non-{@code UsernamePasswordAuthentication}
+     * principal (e.g. {@code AnonymousAuthenticationToken} if the security config ever changes)
+     * surfaces as 403 instead of a potential NPE on {@code getAuthorities()}.
+     *
      * <p>Each principal carries exactly one {@code ROLE_*} authority. The first matching entry is
      * translated; unrecognised authority strings are skipped rather than thrown — the loop
      * exhausts and then throws {@link ForbiddenException} with "No role assigned".
      */
     private Role extractRole(Authentication authentication) {
-        if (authentication == null) {
+        if (!(authentication instanceof UsernamePasswordAuthenticationToken token)) {
             throw new ForbiddenException("Not authenticated");
         }
-        for (GrantedAuthority authority : authentication.getAuthorities()) {
+        for (GrantedAuthority authority : token.getAuthorities()) {
             String name = authority.getAuthority();
             if (name != null && name.startsWith("ROLE_")) {
                 try {
