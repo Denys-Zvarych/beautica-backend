@@ -29,6 +29,7 @@ public class CacheConfig {
      *   search:masters      — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
      *   search:salons       — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
      *   portfolio           — per-entity portfolio listing, public unauthenticated GET — 5 min TTL, max 2000 entries
+     *   reviews-by-master   — paginated review list per master, public endpoint — 5 min TTL, max 1000 entries
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -102,6 +103,12 @@ public class CacheConfig {
         manager.registerCustomCache("portfolio",
                 Caffeine.newBuilder()
                         .maximumSize(2000)
+                        .expireAfterWrite(5, TimeUnit.MINUTES)
+                        .build());
+        // Phase 8 — public review listing per master; evicted by ReviewEventListener on new review creation.
+        manager.registerCustomCache("reviews-by-master",
+                Caffeine.newBuilder()
+                        .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
         return manager;

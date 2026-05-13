@@ -9,8 +9,11 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.entity.Review;
+import com.beautica.review.event.ReviewCreatedEvent;
 import com.beautica.review.repository.ReviewRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -31,6 +34,7 @@ public class ReviewService {
 
     private final ReviewRepository reviewRepository;
     private final BookingRepository bookingRepository;
+    private final ApplicationEventPublisher eventPublisher;
 
     @PreAuthorize("hasRole('CLIENT')")
     @Transactional
@@ -64,15 +68,16 @@ public class ReviewService {
 
         Review saved;
         try {
-            saved = reviewRepository.save(review);
+            saved = reviewRepository.saveAndFlush(review);
         } catch (DataIntegrityViolationException e) {
             throw new BusinessException(HttpStatus.CONFLICT,
                     "Review already exists for this booking");
         }
-        reviewRepository.recalculateMasterRating(booking.getMaster().getId());
+        eventPublisher.publishEvent(new ReviewCreatedEvent(booking.getMaster().getId()));
         return ReviewResponse.from(saved);
     }
 
+    @Cacheable(value = "reviews-by-master", key = "#masterId.toString() + '_' + #pageable.pageNumber + '_' + #pageable.pageSize")
     @Transactional(readOnly = true)
     public Page<ReviewResponse> getReviewsForMaster(UUID masterId, Pageable pageable) {
         Page<UUID> idPage = reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, pageable);

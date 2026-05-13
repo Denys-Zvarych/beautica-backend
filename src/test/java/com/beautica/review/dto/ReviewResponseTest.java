@@ -1,6 +1,5 @@
 package com.beautica.review.dto;
 
-import com.beautica.booking.entity.Booking;
 import com.beautica.master.entity.Master;
 import com.beautica.review.entity.Review;
 import com.beautica.user.User;
@@ -21,14 +20,10 @@ class ReviewResponseTest {
     private static final Instant CREATED_AT = Instant.parse("2025-08-01T10:00:00Z");
 
     @Test
-    @DisplayName("maps all seven fields correctly when review is fully populated")
+    @DisplayName("maps all six fields correctly when review is fully populated")
     void should_mapAllFields_when_reviewMappedToResponse() {
-        UUID reviewId     = UUID.randomUUID();
-        UUID bookingId    = UUID.randomUUID();
-        UUID masterId     = UUID.randomUUID();
-
-        var booking = mock(Booking.class);
-        when(booking.getId()).thenReturn(bookingId);
+        UUID reviewId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
 
         var client = mock(User.class);
         when(client.getFirstName()).thenReturn("Іван");
@@ -39,7 +34,6 @@ class ReviewResponseTest {
 
         var review = mock(Review.class);
         when(review.getId()).thenReturn(reviewId);
-        when(review.getBooking()).thenReturn(booking);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
         when(review.getRating()).thenReturn((short) 4);
@@ -49,7 +43,6 @@ class ReviewResponseTest {
         var response = ReviewResponse.from(review);
 
         assertThat(response.id()).isEqualTo(reviewId);
-        assertThat(response.bookingId()).isEqualTo(bookingId);
         assertThat(response.masterId()).isEqualTo(masterId);
         assertThat(response.clientDisplayName()).isEqualTo("Іван Франко");
         assertThat(response.rating()).isEqualTo(4);
@@ -65,12 +58,10 @@ class ReviewResponseTest {
         when(client.getFirstName()).thenReturn("Іван");
         when(client.getLastName()).thenReturn("Франко");
 
-        var booking = mock(Booking.class);
-        var master  = mock(Master.class);
+        var master = mock(Master.class);
 
         var review = mock(Review.class);
         when(review.getId()).thenReturn(UUID.randomUUID());
-        when(review.getBooking()).thenReturn(booking);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
         when(review.getRating()).thenReturn((short) 5);
@@ -89,12 +80,10 @@ class ReviewResponseTest {
         when(client.getFirstName()).thenReturn(null);
         when(client.getLastName()).thenReturn(null);
 
-        var booking = mock(Booking.class);
-        var master  = mock(Master.class);
+        var master = mock(Master.class);
 
         var review = mock(Review.class);
         when(review.getId()).thenReturn(UUID.randomUUID());
-        when(review.getBooking()).thenReturn(booking);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
         when(review.getRating()).thenReturn((short) 3);
@@ -113,12 +102,10 @@ class ReviewResponseTest {
         when(client.getFirstName()).thenReturn("Іван");
         when(client.getLastName()).thenReturn(null);
 
-        var booking = mock(Booking.class);
-        var master  = mock(Master.class);
+        var master = mock(Master.class);
 
         var review = mock(Review.class);
         when(review.getId()).thenReturn(UUID.randomUUID());
-        when(review.getBooking()).thenReturn(booking);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
         when(review.getRating()).thenReturn((short) 5);
@@ -137,12 +124,10 @@ class ReviewResponseTest {
         when(client.getFirstName()).thenReturn(null);
         when(client.getLastName()).thenReturn("Франко");
 
-        var booking = mock(Booking.class);
-        var master  = mock(Master.class);
+        var master = mock(Master.class);
 
         var review = mock(Review.class);
         when(review.getId()).thenReturn(UUID.randomUUID());
-        when(review.getBooking()).thenReturn(booking);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
         when(review.getRating()).thenReturn((short) 3);

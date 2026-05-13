@@ -10,6 +10,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.entity.Review;
+import com.beautica.review.event.ReviewCreatedEvent;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.user.User;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -48,6 +50,9 @@ class ReviewServiceTest {
 
     @Mock
     private BookingRepository bookingRepository;
+
+    @Mock
+    private ApplicationEventPublisher eventPublisher;
 
     @InjectMocks
     private ReviewService reviewService;
@@ -80,7 +85,6 @@ class ReviewServiceTest {
 
         Review saved = mock(Review.class);
         when(saved.getId()).thenReturn(REVIEW_ID);
-        when(saved.getBooking()).thenReturn(booking);
         when(saved.getClient()).thenReturn(savedClient);
         when(saved.getMaster()).thenReturn(master);
         when(saved.getRating()).thenReturn((short) 5);
@@ -91,14 +95,14 @@ class ReviewServiceTest {
 
         when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
         when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.empty());
-        when(reviewRepository.save(any(Review.class))).thenReturn(saved);
+        when(reviewRepository.saveAndFlush(any(Review.class))).thenReturn(saved);
 
         ReviewResponse response = reviewService.createReview(CLIENT_ID, request);
 
         assertThat(response).isNotNull();
         assertThat(response.masterId()).isEqualTo(MASTER_ID);
-        verify(reviewRepository).save(any(Review.class));
-        verify(reviewRepository).recalculateMasterRating(MASTER_ID);
+        verify(reviewRepository).saveAndFlush(any(Review.class));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID));
     }
 
     @ParameterizedTest
@@ -195,14 +199,14 @@ class ReviewServiceTest {
 
         when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
         when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.empty());
-        when(reviewRepository.save(any(Review.class))).thenThrow(new DataIntegrityViolationException("duplicate"));
+        when(reviewRepository.saveAndFlush(any(Review.class))).thenThrow(new DataIntegrityViolationException("duplicate"));
 
         assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.CONFLICT));
 
-        verify(reviewRepository, never()).recalculateMasterRating(any());
+        verify(eventPublisher, never()).publishEvent(any());
     }
 
     // ── getReviewsForMaster ───────────────────────────────────────────────────
@@ -216,12 +220,8 @@ class ReviewServiceTest {
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(MASTER_ID);
 
-        Booking booking = mock(Booking.class);
-        when(booking.getId()).thenReturn(BOOKING_ID);
-
         Review review = mock(Review.class);
         when(review.getId()).thenReturn(REVIEW_ID);
-        when(review.getBooking()).thenReturn(booking);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
         when(review.getRating()).thenReturn((short) 4);
@@ -269,12 +269,8 @@ class ReviewServiceTest {
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(MASTER_ID);
 
-        Booking booking = mock(Booking.class);
-        when(booking.getId()).thenReturn(BOOKING_ID);
-
         Review review = mock(Review.class);
         when(review.getId()).thenReturn(REVIEW_ID);
-        when(review.getBooking()).thenReturn(booking);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
         when(review.getRating()).thenReturn((short) 5);

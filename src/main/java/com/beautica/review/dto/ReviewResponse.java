@@ -9,7 +9,6 @@ import java.util.UUID;
 public record ReviewResponse(
 
         UUID id,
-        UUID bookingId,
         UUID masterId,
         String clientDisplayName,
         Integer rating,
@@ -18,7 +17,7 @@ public record ReviewResponse(
 
 ) {
 
-    // Callers must ensure booking, master, and client are loaded (JOIN FETCH / @EntityGraph) — all three are FetchType.LAZY.
+    // Callers must ensure master and client are loaded (JOIN FETCH / @EntityGraph) — both are FetchType.LAZY.
     public static ReviewResponse from(Review review) {
         String firstName  = review.getClient().getFirstName();
         String lastName   = review.getClient().getLastName();
@@ -32,7 +31,6 @@ public record ReviewResponse(
         }
         return new ReviewResponse(
                 review.getId(),
-                review.getBooking().getId(),
                 review.getMaster().getId(),
                 displayName,
                 review.getRating().intValue(),
