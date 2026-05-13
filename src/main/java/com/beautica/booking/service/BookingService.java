@@ -21,7 +21,8 @@ import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -61,6 +62,7 @@ public class BookingService {
     private final NotificationOutboxService outboxService;
     private final SlotCalculationService slotCalculationService;
     private final Clock clock;
+    private final CacheManager cacheManager;
 
     @Transactional
     public BookingResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
@@ -135,7 +137,6 @@ public class BookingService {
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 
-    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse confirmBooking(UUID actorUserId, UUID bookingId) {
         Booking booking = loadBookingOrThrow(bookingId);
@@ -144,10 +145,10 @@ public class BookingService {
         booking.setStatus(BookingStatus.CONFIRMED);
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        evictMasterCalendarAfterCommit();
         return BookingResponse.from(saved);
     }
 
-    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         // Fix M4: require a reason, consistent with notCompleteBooking
@@ -163,10 +164,10 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        evictMasterCalendarAfterCommit();
         return BookingResponse.from(saved);
     }
 
-    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse completeBooking(UUID actorUserId, UUID bookingId) {
         Booking booking = loadBookingOrThrow(bookingId);
@@ -175,10 +176,10 @@ public class BookingService {
         booking.setStatus(BookingStatus.COMPLETED);
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        evictMasterCalendarAfterCommit();
         return BookingResponse.from(saved);
     }
 
-    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse notCompleteBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking booking = loadBookingOrThrow(bookingId);
@@ -192,10 +193,10 @@ public class BookingService {
         booking.setProviderComment(req.comment());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        evictMasterCalendarAfterCommit();
         return BookingResponse.from(saved);
     }
 
-    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, CancelBookingRequest req) {
         Booking booking = loadBookingOrThrow(bookingId);
@@ -212,6 +213,7 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        evictMasterCalendarAfterCommit();
         return BookingResponse.from(saved);
     }
 
@@ -321,6 +323,21 @@ public class BookingService {
         if (booking.getStatus() != expected) {
             throw new BusinessException(
                     "Cannot transition from %s to %s".formatted(booking.getStatus(), target));
+        }
+    }
+
+    private void evictMasterCalendarAfterCommit() {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    Cache cache = cacheManager.getCache("master-calendar");
+                    if (cache != null) cache.clear();
+                }
+            });
+        } else {
+            Cache cache = cacheManager.getCache("master-calendar");
+            if (cache != null) cache.clear();
         }
     }
 }

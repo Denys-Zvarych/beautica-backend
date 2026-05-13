@@ -34,6 +34,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
@@ -77,6 +78,8 @@ class BookingServiceTest {
     private NotificationOutboxService outboxService;
     @Mock
     private SlotCalculationService slotCalculationService;
+    @Mock
+    private CacheManager cacheManager;
 
     private Clock clock;
 
@@ -106,7 +109,8 @@ class BookingServiceTest {
                 authz,
                 outboxService,
                 slotCalculationService,
-                clock
+                clock,
+                cacheManager
         );
 
         clientId = UUID.randomUUID();

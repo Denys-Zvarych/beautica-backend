@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
     @AfterEach
     void cleanDb() {
         jdbcTemplate.execute("DELETE FROM notification_outbox");
+        jdbcTemplate.execute("DELETE FROM reviews");
         jdbcTemplate.execute("DELETE FROM bookings");
         jdbcTemplate.execute("DELETE FROM media_files");
         jdbcTemplate.execute("DELETE FROM master_services");
@@ -45,6 +46,7 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
+        jdbcTemplate.execute("DELETE FROM device_tokens");
         jdbcTemplate.execute("DELETE FROM users");
 
         cacheManager.getCacheNames().forEach(name -> {

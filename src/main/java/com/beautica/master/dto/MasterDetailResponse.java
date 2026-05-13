@@ -11,7 +11,6 @@ import java.util.UUID;
 
 public record MasterDetailResponse(
         UUID masterId,
-        UUID userId,
         String firstName,
         String lastName,
         String city,
@@ -26,7 +25,6 @@ public record MasterDetailResponse(
     public static MasterDetailResponse from(Master master, List<WorkingHours> hours) {
         return new MasterDetailResponse(
                 master.getId(),
-                master.getUser().getId(),
                 master.getUser().getFirstName(),
                 master.getUser().getLastName(),
                 null, // TODO: map from user.city once Phase 2-B adds it to User

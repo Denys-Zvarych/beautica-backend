@@ -70,7 +70,7 @@ public class NotificationService {
                         Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId)
                 );
             }
-            default -> log.info("No notification action for booking status [{}], bookingId={}", status, bookingId);
+            default -> log.debug("No notification action for booking status [{}], bookingId={}", status, bookingId);
         }
     }
 

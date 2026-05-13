@@ -13,6 +13,7 @@ import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
+import com.beautica.master.entity.Master;
 import com.beautica.master.service.MasterService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Size;
@@ -132,7 +133,8 @@ public class MasterController {
             throw new BusinessException("Date range cannot exceed 31 days");
         }
         UUID actorId = extractUserId(authentication);
-        Page<BookingResponse> page = masterService.getMasterCalendar(actorId, from, to, pageable);
+        Master actor = masterService.getMasterByUserId(actorId);
+        Page<BookingResponse> page = masterService.getMasterCalendar(actor.getId(), from, to, pageable);
         return ApiResponse.ok(PageResponse.of(
                 page.getContent(),
                 page.getNumber(),
@@ -154,9 +156,10 @@ public class MasterController {
     }
 
     private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token) {
-            return (UUID) token.getDetails();
+        if (authentication instanceof UsernamePasswordAuthenticationToken token
+                && token.getDetails() instanceof UUID id) {
+            return id;
         }
-        throw new ForbiddenException("Not authenticated");
+        throw new ForbiddenException("Access denied");
     }
 }

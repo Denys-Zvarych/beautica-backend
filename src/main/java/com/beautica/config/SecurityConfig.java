@@ -70,6 +70,8 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/search/**").permitAll();

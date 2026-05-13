@@ -20,13 +20,16 @@ import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -48,6 +51,7 @@ public class MasterService {
     private final WorkingHoursRepository workingHoursRepository;
     private final ScheduleExceptionRepository scheduleExceptionRepository;
     private final BookingRepository bookingRepository;
+    private final CacheManager cacheManager;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -122,9 +126,11 @@ public class MasterService {
             toSave.add(wh);
         }
 
-        return workingHoursRepository.saveAll(toSave).stream()
+        List<WorkingHoursResponse> saved = workingHoursRepository.saveAll(toSave).stream()
                 .map(WorkingHoursResponse::from)
                 .toList();
+        evictMasterCalendarAfterCommit();
+        return saved;
     }
 
     @Transactional
@@ -137,21 +143,24 @@ public class MasterService {
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         var existing = scheduleExceptionRepository.findByMasterIdAndDate(masterId, request.date());
+        ScheduleException result;
         if (existing.isPresent()) {
             var ex = existing.get();
             ex.setReason(request.reason());
             ex.setNote(request.note());
-            return scheduleExceptionRepository.save(ex);
+            result = scheduleExceptionRepository.save(ex);
+        } else {
+            var exception = ScheduleException.builder()
+                    .master(master)
+                    .date(request.date())
+                    .reason(request.reason())
+                    .note(request.note())
+                    .build();
+            result = scheduleExceptionRepository.save(exception);
         }
 
-        var exception = ScheduleException.builder()
-                .master(master)
-                .date(request.date())
-                .reason(request.reason())
-                .note(request.note())
-                .build();
-
-        return scheduleExceptionRepository.save(exception);
+        evictMasterCalendarAfterCommit();
+        return result;
     }
 
     @Transactional
@@ -163,9 +172,9 @@ public class MasterService {
 
         scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
                 .ifPresent(scheduleExceptionRepository::delete);
+        evictMasterCalendarAfterCommit();
     }
 
-    @CacheEvict(value = "master-calendar", allEntries = true)
     @Transactional
     public void deactivateMaster(UUID actorId, UUID masterId) {
         // Ownership already enforced by @PreAuthorize("@authz.canManageMaster(...)") on
@@ -175,6 +184,27 @@ public class MasterService {
 
         master.setActive(false);
         masterRepository.save(master);
+        evictMasterCalendarAfterCommit();
+    }
+
+    // Eviction is registered as a post-commit callback rather than via @CacheEvict.
+    // @CacheEvict fires before the transaction commits, allowing a concurrent reader
+    // to repopulate the cache with stale data within the commit window.
+    // Registering afterCommit() ensures the cache is cleared only after the write is durable.
+    // Guard: synchronization must be active (i.e. called within a @Transactional context).
+    private void evictMasterCalendarAfterCommit() {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache cache = cacheManager.getCache("master-calendar");
+                if (cache != null) {
+                    cache.clear();
+                }
+            }
+        });
     }
 
     // Fix 8: use JOIN FETCH query to eliminate per-master user lazy-loads
@@ -184,18 +214,22 @@ public class MasterService {
                 .map(MasterSummaryResponse::from);
     }
 
-    @Cacheable(value = "master-calendar", key = "#actorUserId + '-' + #from + '-' + #to + '-' + #pageable.pageNumber + '-' + #pageable.pageSize")
     @Transactional(readOnly = true)
-    public Page<BookingResponse> getMasterCalendar(UUID actorUserId, LocalDate from, LocalDate to, Pageable pageable) {
-        Master master = masterRepository.findByUserId(actorUserId)
+    public Master getMasterByUserId(UUID userId) {
+        return masterRepository.findByUserId(userId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
+    }
+
+    @Cacheable(value = "master-calendar", key = "{#masterId, #from, #to, #pageable.pageNumber, #pageable.pageSize}")
+    @Transactional(readOnly = true)
+    public Page<BookingResponse> getMasterCalendar(UUID masterId, LocalDate from, LocalDate to, Pageable pageable) {
         OffsetDateTime fromOdt = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime toOdt = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
         // Two-query pattern (Fix H1 — HHH90003004): paginate on IDs only so the DB
         // applies LIMIT/OFFSET correctly, then hydrate the full graph for those IDs.
         Page<UUID> idPage = bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
-                master.getId(), fromOdt, toOdt, pageable);
+                masterId, fromOdt, toOdt, pageable);
 
         if (idPage.isEmpty()) {
             return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
