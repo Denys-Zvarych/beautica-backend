@@ -11,6 +11,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
@@ -23,7 +24,16 @@ import lombok.Setter;
 import java.util.UUID;
 
 @Entity
-@Table(name = "media_files")
+@Table(
+    name = "media_files",
+    indexes = {
+        @Index(name = "idx_media_files_entity", columnList = "entity_type, entity_id"),
+        @Index(name = "idx_media_files_uploader_media", columnList = "uploader_id, media_type"),
+        // ux_media_files_avatar is a partial unique index (media_type = 'AVATAR') defined in V39 migration;
+        // JPA @Index has no WHERE clause support — the actual DB constraint is enforced by the migration only
+        @Index(name = "ux_media_files_avatar", columnList = "entity_type, entity_id", unique = true)
+    }
+)
 @Getter
 @Setter
 @NoArgsConstructor

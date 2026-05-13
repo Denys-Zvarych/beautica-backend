@@ -51,6 +51,8 @@ spring:
       # before reaching the controller layer, so MediaService never sees an unbounded stream.
       max-file-size: 10MB
       max-request-size: 10MB
+      # Explicit temp directory avoids platform-specific default locations on non-Railway hosts.
+      location: ${java.io.tmpdir}/beautica-uploads
 
   mail:
     host: smtp-relay.brevo.com

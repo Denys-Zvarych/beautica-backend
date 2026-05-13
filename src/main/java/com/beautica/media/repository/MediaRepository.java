@@ -16,6 +16,8 @@ public interface MediaRepository extends JpaRepository<MediaFile, UUID> {
     /**
      * Find all media files attached to a polymorphic entity (e.g., portfolio listing for a master).
      * Used by Phase 7.5 portfolio listing.
+     *
+     * <p>uploader is intentionally LAZY — {@code MediaFileResponse.from} never accesses uploader fields.
      */
     List<MediaFile> findByEntityTypeAndEntityId(EntityType entityType, UUID entityId);
 

@@ -9,7 +9,6 @@ import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.service.R2StorageService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -26,7 +25,6 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.util.List;
@@ -99,8 +97,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
 
     @BeforeEach
     void configureClientAndR2() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        restTemplate.getRestTemplate().setRequestFactory(HC5_FACTORY);
         when(r2StorageService.buildPublicUrl(anyString()))
                 .thenAnswer(inv -> "https://cdn.example/" + inv.getArgument(0));
         doNothing().when(r2StorageService).uploadFile(anyString(), any(), anyLong(), anyString());
@@ -118,7 +115,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         String token = loginAndGetToken(email);
 
         // Act
-        log.debug("Act: POST {} as user={}", AVATAR_URL, userId);
+        log.debug("Act: POST {} as user={} — first upload, avatar_r2_key must be persisted", AVATAR_URL, userId);
         ResponseEntity<String> resp = restTemplate.exchange(
                 AVATAR_URL, HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),

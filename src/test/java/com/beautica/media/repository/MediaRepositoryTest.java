@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import jakarta.persistence.PersistenceException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 import java.util.List;
 import java.util.Optional;
@@ -62,7 +63,7 @@ class MediaRepositoryTest extends AbstractDataJpaTest {
     void setUp() {
         uploader = new User(
                 "media-" + UUID.randomUUID() + "@test.com",
-                "$2a$10$hash",
+                new BCryptPasswordEncoder(4).encode("test-password"),
                 Role.CLIENT,
                 "Media",
                 "User",
@@ -237,6 +238,33 @@ class MediaRepositoryTest extends AbstractDataJpaTest {
             em.persist(bad);
             em.flush();
         }).isInstanceOf(PersistenceException.class);
+    }
+
+    @Test
+    @DisplayName("Finds portfolio items for a SALON entity via findByEntityTypeAndEntityId")
+    void should_findSalonPortfolioItems_when_entityTypeIsSalon() {
+        // Arrange
+        UUID salonId = UUID.randomUUID();
+        MediaFile salonPhoto = MediaFile.builder()
+                .uploader(uploader)
+                .entityType(EntityType.SALON)
+                .entityId(salonId)
+                .mediaType(MediaType.PORTFOLIO)
+                .r2Key("portfolio/salon-photo-" + UUID.randomUUID() + ".jpg")
+                .r2Url("https://cdn.example.com/salon-photo.jpg")
+                .build();
+        em.persist(salonPhoto);
+        em.flush();
+        em.clear();
+
+        // Act
+        List<MediaFile> results = repo.findByEntityTypeAndEntityId(EntityType.SALON, salonId);
+
+        // Assert
+        assertThat(results).hasSize(1);
+        assertThat(results.get(0).getEntityType()).isEqualTo(EntityType.SALON);
+        assertThat(results.get(0).getEntityId()).isEqualTo(salonId);
+        assertThat(results.get(0).getMediaType()).isEqualTo(MediaType.PORTFOLIO);
     }
 
     @Test

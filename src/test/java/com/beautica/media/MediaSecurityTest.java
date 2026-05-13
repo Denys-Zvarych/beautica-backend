@@ -4,7 +4,6 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.service.R2StorageService;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -20,7 +19,6 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.core.Authentication;
 import org.springframework.util.LinkedMultiValueMap;
@@ -99,8 +97,7 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
 
     @BeforeEach
     void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        restTemplate.getRestTemplate().setRequestFactory(HC5_FACTORY);
         // Stub R2 so test paths do not fan out to a real bucket. buildPublicUrl
         // returns a deterministic URL so MediaFileResponse.url has a value.
         when(r2StorageService.buildPublicUrl(anyString()))

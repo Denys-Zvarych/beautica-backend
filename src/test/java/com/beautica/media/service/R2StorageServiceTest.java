@@ -68,14 +68,20 @@ class R2StorageServiceTest {
     }
 
     @Test
-    @DisplayName("uploadFile returns early without S3 interaction when R2 is disabled")
+    @DisplayName("uploadFile returns early without S3 interaction and never reads the stream when R2 is disabled")
     void should_returnEarly_when_uploadFileCalledWithR2Disabled() {
         R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
-        InputStream content = new ByteArrayInputStream(PAYLOAD);
+        ByteArrayInputStream content = new ByteArrayInputStream(PAYLOAD);
 
         service.uploadFile(KEY, content, PAYLOAD.length, CONTENT_TYPE);
 
+        // No S3 interaction — disabled mode is a pure no-op.
         verifyNoInteractions(s3Client);
+        // Stream must be untouched — available() on ByteArrayInputStream reflects remaining bytes.
+        // If the service had read any bytes, available() would be less than PAYLOAD.length.
+        assertThat(content.available())
+                .as("disabled-mode uploadFile must not consume any bytes from the input stream")
+                .isEqualTo(PAYLOAD.length);
     }
 
     @Test
@@ -228,5 +234,67 @@ class R2StorageServiceTest {
         // Sanity: the failing call was attempted exactly once, never silently swallowed.
         verify(s3Client).deleteObject(any(DeleteObjectRequest.class));
         verify(s3Client, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+    }
+
+    // ── Fix 9 — null/empty key boundary: pin current behaviour ───────────────
+
+    @Test
+    @DisplayName("forwards null key to SDK without service-level guard on uploadFile (enabled mode) — behaviour pinned")
+    void should_forwardNullKey_when_keyIsNullOnUpload() {
+        // The service has no null-key guard: a null key is forwarded straight to the AWS SDK
+        // builder. In the Mockito-mock context the builder accepts null and the mock's putObject
+        // returns null (no exception). Pin this observable behaviour so a future null-guard
+        // addition is a visible, deliberate change tracked by a green→red flip here.
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        ByteArrayInputStream content = new ByteArrayInputStream("data".getBytes());
+        ArgumentCaptor<PutObjectRequest> captor = ArgumentCaptor.forClass(PutObjectRequest.class);
+
+        service.uploadFile(null, content, 4L, CONTENT_TYPE);
+
+        verify(s3Client).putObject(captor.capture(), any(RequestBody.class));
+        assertThat(captor.getValue().key())
+                .as("null key must be forwarded to the SDK unchanged — no service-level guard exists")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("calls deleteObject with an empty key when deleteFile receives empty string (enabled mode — no service-level guard)")
+    void should_callDeleteObjectWithEmptyKey_when_keyIsEmptyOnDelete() {
+        // The service has no empty-key guard; an empty key is passed straight to the SDK.
+        // With a Mockito mock the call completes without exception — pin this behaviour so
+        // a future null/empty guard is a visible, deliberate change.
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        ArgumentCaptor<DeleteObjectRequest> captor = ArgumentCaptor.forClass(DeleteObjectRequest.class);
+
+        service.deleteFile("");
+
+        verify(s3Client).deleteObject(captor.capture());
+        assertThat(captor.getValue().key())
+                .as("empty key must be forwarded to the SDK unchanged — no service-level guard exists")
+                .isEmpty();
+    }
+
+    // ── Fix 10 — disabled-mode uploadFile return shape ────────────────────────
+
+    @Test
+    @DisplayName("returns disabled-mode response with empty URL when R2 is disabled — uploadFile is no-op, buildPublicUrl returns empty")
+    void should_returnEmptyUrl_when_r2IsDisabledOnUploadFile() {
+        // Arrange
+        R2StorageService disabledService = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        ByteArrayInputStream content = new ByteArrayInputStream(PAYLOAD);
+
+        // Act — uploadFile is void; the disabled-mode contract is: no S3 interaction,
+        // stream untouched. buildPublicUrl on the same disabled instance returns empty.
+        disabledService.uploadFile(KEY, content, PAYLOAD.length, CONTENT_TYPE);
+        String url = disabledService.buildPublicUrl(KEY);
+
+        // Assert — disabled-mode shape
+        verifyNoInteractions(s3Client);
+        assertThat(content.available())
+                .as("stream must be untouched in disabled mode")
+                .isEqualTo(PAYLOAD.length);
+        assertThat(url)
+                .as("buildPublicUrl must return empty string when R2 is disabled")
+                .isEmpty();
     }
 }

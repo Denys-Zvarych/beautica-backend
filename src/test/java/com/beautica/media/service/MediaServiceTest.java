@@ -292,6 +292,20 @@ class MediaServiceTest {
         verify(userRepo, never()).save(any(User.class));
     }
 
+    @Test
+    @DisplayName("throws NotFoundException when user does not exist on deleteAvatar")
+    void should_throwNotFound_when_userNotFoundOnDeleteAvatar() {
+        // Arrange
+        UUID userId = UUID.randomUUID();
+        when(userRepo.findById(any(UUID.class))).thenReturn(Optional.empty());
+
+        // Act & Assert
+        assertThatThrownBy(() -> service.deleteAvatar(userId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(r2, never()).deleteFile(anyString());
+    }
+
     // ----------------------------------------------------------------- portfolio
 
     @Test
@@ -346,6 +360,21 @@ class MediaServiceTest {
                 .endsWith(".jpg");
         assertThat(response.entityType()).isEqualTo(EntityType.MASTER);
         assertThat(response.entityId()).isEqualTo(masterId);
+    }
+
+    @Test
+    @DisplayName("throws ForbiddenException when SALON_OWNER has no active salon on uploadPortfolioPhoto")
+    void should_throwForbidden_when_salonOwnerHasNoActiveSalon() {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
+                .thenReturn(Optional.empty());
+
+        // Act & Assert
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(actorId, Role.SALON_OWNER, jpegFile()))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(r2, never()).uploadFile(anyString(), any(), anyLong(), anyString());
     }
 
     @Test
