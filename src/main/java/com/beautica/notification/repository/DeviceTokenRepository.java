@@ -20,9 +20,12 @@ public interface DeviceTokenRepository extends JpaRepository<DeviceToken, UUID> 
     }
 
     /**
-     * Hot read path: fetches only active tokens for a user.
-     * Backed by the partial index idx_device_tokens_user_active (V31 migration).
+     * @deprecated Use {@link #findActiveTokenSummaryByUserId(UUID)} for the push-notification
+     * hot path — it returns a lightweight projection and avoids loading full entities.
+     * This overload fetches full entities and risks N+1 if associations are added to
+     * {@link com.beautica.notification.entity.DeviceToken} in the future.
      */
+    @Deprecated
     List<DeviceToken> findByUserIdAndIsActiveTrue(UUID userId);
 
     /**

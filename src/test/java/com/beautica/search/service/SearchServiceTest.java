@@ -116,7 +116,7 @@ class SearchServiceTest {
                 "manicure",
                 new BigDecimal("100.00"),
                 new BigDecimal("500.00"),
-                4.5,
+                new BigDecimal("4.5"),
                 0,
                 20
         );
@@ -190,10 +190,8 @@ class SearchServiceTest {
     @DisplayName("parses minEffectivePrice from the BigDecimal aggregate column on each row")
     void should_computeEffectivePriceFromRow_when_rowContainsBigDecimal() {
         UUID masterId = UUID.randomUUID();
-        UUID userId = UUID.randomUUID();
         Object[] row = new Object[]{
                 masterId,
-                userId,
                 "Olena",
                 "Kovalenko",
                 "Київ",
@@ -213,7 +211,6 @@ class SearchServiceTest {
         assertThat(mapped.avgRating()).isEqualTo(4.85);
         assertThat(mapped.reviewCount()).isEqualTo(42);
         assertThat(mapped.masterId()).isEqualTo(masterId);
-        assertThat(mapped.userId()).isEqualTo(userId);
     }
 
     // ── Phase 6.2 carry-over LOWs ──────────────────────────────────────────
@@ -252,12 +249,12 @@ class SearchServiceTest {
     }
 
     @Test
-    @DisplayName("converts Double minRating to BigDecimal with scale 2 before binding (avoids float drift on NUMERIC(3,2))")
+    @DisplayName("normalises BigDecimal minRating to scale 2 before binding (consistent NUMERIC(3,2) comparison)")
     void should_convertDoubleMinRatingToBigDecimal_before_binding() {
         stubNativeQueries(List.of(), 0L);
         Pageable pageable = PageRequest.of(0, 20);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null, null, null, 4.5, 0, 20
+                null, null, null, null, null, new BigDecimal("4.5"), 0, 20
         );
 
         service.searchMasters(request, pageable);
@@ -268,7 +265,7 @@ class SearchServiceTest {
         assertThat(bound).isInstanceOf(BigDecimal.class);
         BigDecimal scaled = (BigDecimal) bound;
         assertThat(scaled.scale()).isEqualTo(2);
-        assertThat(scaled).isEqualTo(BigDecimal.valueOf(4.5).setScale(2, RoundingMode.HALF_UP));
+        assertThat(scaled).isEqualTo(new BigDecimal("4.50"));
     }
 
     // ── Phase 6.3 active-flag filtering ────────────────────────────────────

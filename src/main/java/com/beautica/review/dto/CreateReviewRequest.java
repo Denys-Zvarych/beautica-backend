@@ -18,7 +18,8 @@ public record CreateReviewRequest(
         @Max(5)
         Integer rating,
 
-        // null = no comment; if provided, first character must be non-whitespace (rejects blank and leading-whitespace strings)
+        // null means "no comment" — intentionally valid; do NOT add @NotBlank here.
+        // @Size(min=1) rejects empty string while allowing null.
         @Size(min = 1, max = 2000)
         @Pattern(regexp = "^\\S[\\s\\S]{0,1999}$", message = "comment must start with a non-whitespace character")
         String comment

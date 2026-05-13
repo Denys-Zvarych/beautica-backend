@@ -147,11 +147,12 @@ class OutboxPayloadCipherTest {
     }
 
     @Test
-    @DisplayName("should_throwIllegalArgumentException_when_sealReceivesNull (seal(null) → IllegalArgumentException)")
+    @DisplayName("should_throwIllegalStateException_when_sealReceivesNull (seal(null) → IllegalStateException)")
     void should_throwException_when_sealReceivesNull() {
-        // seal(null) explicitly throws IllegalArgumentException per its Javadoc contract.
+        // seal(null) throws IllegalStateException("plaintext must not be null") per production code.
         assertThatThrownBy(() -> cipher.seal(null))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("plaintext must not be null");
     }
 
     @Test

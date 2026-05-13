@@ -185,6 +185,22 @@ public class MasterService {
         master.setActive(false);
         // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
         evictMasterCalendarAfterCommit();
+
+        // Capture the user UUID while the transaction is still open (user is JOIN FETCH-ed by
+        // findByIdWithSalonAndOwner, so getUser() is initialized). A stale master-by-user entry
+        // would allow the deactivated master to pass the isActive guard for up to the cache TTL.
+        final UUID masterUserId = master.getUser().getId();
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    Cache c = cacheManager.getCache("master-by-user");
+                    if (c != null) {
+                        c.evict(masterUserId);
+                    }
+                }
+            });
+        }
     }
 
     // Eviction is registered as a post-commit callback rather than via @CacheEvict.
@@ -214,6 +230,7 @@ public class MasterService {
                 .map(MasterSummaryResponse::from);
     }
 
+    @Cacheable(value = "master-by-user", key = "#userId")
     @Transactional(readOnly = true)
     public Master getMasterByUserId(UUID userId) {
         return masterRepository.findByUserId(userId)

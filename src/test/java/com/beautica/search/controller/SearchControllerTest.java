@@ -112,7 +112,6 @@ class SearchControllerTest {
     private static MasterSearchResult sampleMasterResult() {
         return new MasterSearchResult(
                 UUID.randomUUID(),
-                UUID.randomUUID(),
                 "Olha",
                 "Master",
                 "Київ",
@@ -246,6 +245,21 @@ class SearchControllerTest {
                 .andExpect(jsonPath("$.data.size").value(2))
                 .andExpect(jsonPath("$.data.totalElements").value(7))
                 .andExpect(jsonPath("$.data.totalPages").value(4));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — response must not contain userId (internal UUID must not leak to anonymous callers)")
+    void should_not_expose_userId_in_publicMasterSearchResponse() throws Exception {
+        MasterSearchResult result = sampleMasterResult();
+        Page<MasterSearchResult> page = new PageImpl<>(List.of(result), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[*].userId").doesNotExist());
     }
 
     @Test

@@ -12,8 +12,7 @@ public record PublicSalonResponse(
         String region,
         String address,
         String instagramUrl,
-        String avatarUrl,
-        boolean isActive
+        String avatarUrl
 ) {
     public static PublicSalonResponse from(Salon salon) {
         return new PublicSalonResponse(
@@ -24,8 +23,7 @@ public record PublicSalonResponse(
                 salon.getRegion(),
                 salon.getAddress(),
                 salon.getInstagramUrl(),
-                salon.getAvatarUrl(),
-                salon.isActive()
+                salon.getAvatarUrl()
         );
     }
 }

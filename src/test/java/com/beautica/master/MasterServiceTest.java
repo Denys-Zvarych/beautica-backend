@@ -280,11 +280,16 @@ class MasterServiceTest {
         // save() is no longer called — Hibernate dirty-checking flushes the mutation on commit.
         UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(userId);
 
         Master master = Master.builder()
                 .masterType(MasterType.SALON_MASTER)
                 .isActive(true)
                 .build();
+        ReflectionTestUtils.setField(master, "user", user);
 
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
 

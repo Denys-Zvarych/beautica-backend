@@ -96,7 +96,7 @@ public class OutboxPayloadCipher {
      */
     public String seal(String plaintext) {
         if (plaintext == null) {
-            throw new IllegalArgumentException("plaintext must not be null");
+            throw new IllegalStateException("plaintext must not be null");
         }
         byte[] iv = new byte[IV_LENGTH_BYTES];
         secureRandom.nextBytes(iv);
