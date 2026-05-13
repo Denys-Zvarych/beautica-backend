@@ -27,7 +27,7 @@ public record ReviewResponse(
         } else {
             displayName = (firstName != null ? firstName : "")
                     + (firstName != null && lastName != null ? " " : "")
-                    + (lastName != null ? lastName : "");
+                    + (lastName != null ? lastName.charAt(0) + "." : "");
         }
         return new ReviewResponse(
                 review.getId(),

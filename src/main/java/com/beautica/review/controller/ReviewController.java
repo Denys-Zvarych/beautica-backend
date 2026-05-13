@@ -64,6 +64,6 @@ public class ReviewController {
                 && token.getDetails() instanceof UUID id) {
             return id;
         }
-        throw new ForbiddenException("Invalid authentication context");
+        throw new ForbiddenException("Access denied");
     }
 }

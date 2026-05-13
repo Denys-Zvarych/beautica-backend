@@ -305,7 +305,6 @@ class SalonServiceTest {
 
         assertThat(result.getTotalElements()).isEqualTo(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
-        assertThat(result.getContent().get(0).userId()).isEqualTo(userId);
         verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, pageable);
     }
 

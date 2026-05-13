@@ -26,6 +26,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
@@ -57,6 +58,7 @@ class MasterServiceTest {
     @Mock private WorkingHoursRepository workingHoursRepository;
     @Mock private ScheduleExceptionRepository scheduleExceptionRepository;
     @Mock private BookingRepository bookingRepository;
+    @Mock private CacheManager cacheManager;
 
     @InjectMocks
     private MasterService masterService;
@@ -173,10 +175,8 @@ class MasterServiceTest {
     @DisplayName("should_returnWorkingHours_when_masterDetailRequested")
     void should_returnWorkingHours_when_masterDetailRequested() {
         UUID masterId = UUID.randomUUID();
-        UUID userId = UUID.randomUUID();
 
         User user = mock(User.class);
-        when(user.getId()).thenReturn(userId);
         when(user.getFirstName()).thenReturn("Anna");
         when(user.getLastName()).thenReturn("Kovalenko");
 
@@ -464,11 +464,9 @@ class MasterServiceTest {
     void should_returnPagedMasters_when_getMastersByPageCalled() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
-        UUID userId = UUID.randomUUID();
         Pageable pageable = Pageable.ofSize(10);
 
         User user = mock(User.class);
-        when(user.getId()).thenReturn(userId);
         when(user.getFirstName()).thenReturn("Olena");
         when(user.getLastName()).thenReturn("Bondar");
 
@@ -490,7 +488,6 @@ class MasterServiceTest {
         assertThat(result.getTotalElements()).isEqualTo(1);
         assertThat(result.getContent()).hasSize(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
-        assertThat(result.getContent().get(0).userId()).isEqualTo(userId);
         assertThat(result.getContent().get(0).masterType()).isEqualTo(MasterType.SALON_MASTER);
         verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, pageable);
     }

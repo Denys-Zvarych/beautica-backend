@@ -13,6 +13,7 @@ import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.user.User;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -42,6 +43,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@DisplayName("ReviewService — unit")
 @ExtendWith(MockitoExtension.class)
 class ReviewServiceTest {
 
@@ -65,6 +67,7 @@ class ReviewServiceTest {
     // ── createReview ─────────────────────────────────────────────────────────
 
     @Test
+    @DisplayName("should_createReview_when_completedBookingAndOwnerClient")
     void should_createReview_when_completedBookingAndOwnerClient() {
         User client = mock(User.class);
         when(client.getId()).thenReturn(CLIENT_ID);
@@ -100,12 +103,17 @@ class ReviewServiceTest {
         ReviewResponse response = reviewService.createReview(CLIENT_ID, request);
 
         assertThat(response).isNotNull();
+        assertThat(response.id()).isEqualTo(REVIEW_ID);
         assertThat(response.masterId()).isEqualTo(MASTER_ID);
+        assertThat(response.rating()).isEqualTo(5);
+        assertThat(response.comment()).isEqualTo("Great service");
+        assertThat(response.clientDisplayName()).isEqualTo("Anna K.");
         verify(reviewRepository).saveAndFlush(any(Review.class));
         verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID));
     }
 
     @ParameterizedTest
+    @DisplayName("should_throw400_when_bookingStatusIsNotCompleted")
     @EnumSource(value = BookingStatus.class, names = {"PENDING", "CONFIRMED", "DECLINED", "CANCELLED", "NOT_COMPLETED"})
     void should_throw400_when_bookingStatusIsNotCompleted(BookingStatus status) {
         Booking booking = mock(Booking.class);
@@ -124,6 +132,7 @@ class ReviewServiceTest {
     }
 
     @Test
+    @DisplayName("should_throwForbidden_when_actorIsNotBookingClient")
     void should_throwForbidden_when_actorIsNotBookingClient() {
         UUID differentClientId = UUID.randomUUID();
 
@@ -145,6 +154,7 @@ class ReviewServiceTest {
     }
 
     @Test
+    @DisplayName("should_throw409_when_reviewAlreadyExistsForBooking")
     void should_throw409_when_reviewAlreadyExistsForBooking() {
         User client = mock(User.class);
         when(client.getId()).thenReturn(CLIENT_ID);
@@ -169,6 +179,7 @@ class ReviewServiceTest {
     }
 
     @Test
+    @DisplayName("should_throw404_when_bookingNotFound")
     void should_throw404_when_bookingNotFound() {
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, null);
 
@@ -181,6 +192,7 @@ class ReviewServiceTest {
     }
 
     @Test
+    @DisplayName("should_notCallRecalculate_when_saveThrowsDataIntegrityViolation")
     void should_notCallRecalculate_when_saveThrowsDataIntegrityViolation() {
         User client = mock(User.class);
         when(client.getId()).thenReturn(CLIENT_ID);
@@ -211,7 +223,11 @@ class ReviewServiceTest {
 
     // ── getReviewsForMaster ───────────────────────────────────────────────────
 
+    // @Cacheable on getReviewsForMaster is not exercised here (MockitoExtension bypasses AOP);
+    // cache hit/miss behaviour is covered by ReviewIntegrationTest.
+
     @Test
+    @DisplayName("should_returnPagedReviews_when_masterHasReviews")
     void should_returnPagedReviews_when_masterHasReviews() {
         User client = mock(User.class);
         when(client.getFirstName()).thenReturn("Anna");
@@ -244,6 +260,7 @@ class ReviewServiceTest {
     }
 
     @Test
+    @DisplayName("should_returnEmptyPage_when_masterHasNoReviews")
     void should_returnEmptyPage_when_masterHasNoReviews() {
         Pageable pageable = PageRequest.of(0, 20);
         Page<UUID> emptyIdPage = Page.empty(pageable);
@@ -258,9 +275,25 @@ class ReviewServiceTest {
         verify(reviewRepository, never()).findByIdsWithGraph(any());
     }
 
+    @Test
+    @DisplayName("should_returnEmptyPage_when_masterIdDoesNotExist")
+    void should_returnEmptyPage_when_masterIdDoesNotExist() {
+        Pageable pageable = PageRequest.of(0, 20);
+        UUID nonExistentMasterId = UUID.randomUUID();
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(nonExistentMasterId, pageable))
+                .thenReturn(Page.empty(pageable));
+
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(nonExistentMasterId, pageable);
+
+        assertThat(result.getTotalElements()).isZero();
+        assertThat(result.getContent()).isEmpty();
+        verify(reviewRepository, never()).findByIdsWithGraph(any());
+    }
+
     // ── getReview ─────────────────────────────────────────────────────────────
 
     @Test
+    @DisplayName("should_returnReview_when_reviewIdExists")
     void should_returnReview_when_reviewIdExists() {
         User client = mock(User.class);
         when(client.getFirstName()).thenReturn("Ivan");
@@ -283,10 +316,65 @@ class ReviewServiceTest {
 
         assertThat(response.id()).isEqualTo(REVIEW_ID);
         assertThat(response.masterId()).isEqualTo(MASTER_ID);
-        assertThat(response.clientDisplayName()).isEqualTo("Ivan Petrenko");
+        assertThat(response.clientDisplayName()).isEqualTo("Ivan P.");
     }
 
     @Test
+    @DisplayName("should_returnAnonymous_when_clientHasNoName")
+    void should_returnAnonymous_when_clientHasNoName() {
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn(null);
+        when(client.getLastName()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+
+        Review review = mock(Review.class);
+        when(review.getId()).thenReturn(REVIEW_ID);
+        when(review.getClient()).thenReturn(client);
+        when(review.getMaster()).thenReturn(master);
+        when(review.getRating()).thenReturn((short) 3);
+        when(review.getComment()).thenReturn(null);
+        when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        when(reviewRepository.findByIdWithAssociations(REVIEW_ID)).thenReturn(Optional.of(review));
+
+        ReviewResponse response = reviewService.getReview(REVIEW_ID);
+
+        assertThat(response.clientDisplayName())
+                .as("clientDisplayName must be 'Anonymous' when both firstName and lastName are null")
+                .isEqualTo("Anonymous");
+    }
+
+    @Test
+    @DisplayName("should_returnFirstNameOnly_when_clientHasNoLastName")
+    void should_returnFirstNameOnly_when_clientHasNoLastName() {
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn("Anna");
+        when(client.getLastName()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+
+        Review review = mock(Review.class);
+        when(review.getId()).thenReturn(REVIEW_ID);
+        when(review.getClient()).thenReturn(client);
+        when(review.getMaster()).thenReturn(master);
+        when(review.getRating()).thenReturn((short) 4);
+        when(review.getComment()).thenReturn(null);
+        when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        when(reviewRepository.findByIdWithAssociations(REVIEW_ID)).thenReturn(Optional.of(review));
+
+        ReviewResponse response = reviewService.getReview(REVIEW_ID);
+
+        assertThat(response.clientDisplayName())
+                .as("clientDisplayName must be firstName only when lastName is null")
+                .isEqualTo("Anna");
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_reviewByIdNotFound")
     void should_throwNotFound_when_reviewByIdNotFound() {
         when(reviewRepository.findByIdWithAssociations(REVIEW_ID)).thenReturn(Optional.empty());
 

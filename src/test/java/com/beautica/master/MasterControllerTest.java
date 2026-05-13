@@ -47,7 +47,9 @@ import java.util.List;
 import java.util.UUID;
 
 import com.beautica.master.dto.MasterSummaryResponse;
+import com.beautica.master.entity.Master;
 import org.springframework.data.domain.Page;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import static org.mockito.ArgumentMatchers.any;
@@ -135,7 +137,7 @@ class MasterControllerTest {
 
     private MasterDetailResponse stubMasterDetail(UUID masterId, UUID userId) {
         return new MasterDetailResponse(
-                masterId, userId, "Oksana", "Kovalenko", null, null, null,
+                masterId, "Oksana", "Kovalenko", null, null, null,
                 BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
     }
 
@@ -191,7 +193,7 @@ class MasterControllerTest {
         var clientId = UUID.randomUUID();
 
         var summary = new MasterSummaryResponse(
-                masterId, userId, "Oksana", "Kovalenko", null,
+                masterId, "Oksana", "Kovalenko", null,
                 BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER);
         Page<MasterSummaryResponse> page =
                 new PageImpl<>(List.of(summary), PageRequest.of(0, 20), 1);
@@ -532,6 +534,10 @@ class MasterControllerTest {
     @DisplayName("GET /me/calendar — 200 when SALON_MASTER requests valid date range")
     void should_return200_when_validCalendarRequest() throws Exception {
         var masterUserId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        Master master = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+        when(masterService.getMasterByUserId(any())).thenReturn(master);
         when(masterService.getMasterCalendar(any(), any(), any(), any())).thenReturn(Page.empty());
 
         log.debug("Act: GET {}/me/calendar as SALON_MASTER with valid range", MASTERS_URL);

@@ -27,6 +27,11 @@ import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+import org.springframework.transaction.support.DefaultTransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -57,6 +62,28 @@ class BookingServiceCacheTest {
         Clock clock() {
             return Clock.fixed(Instant.parse("2026-05-08T10:00:00Z"), ZoneId.of("Europe/Kyiv"));
         }
+
+        @Bean
+        PlatformTransactionManager transactionManager() {
+            return new AbstractPlatformTransactionManager() {
+                @Override
+                protected Object doGetTransaction() { return new Object(); }
+
+                @Override
+                protected void doBegin(Object transaction, TransactionDefinition definition) {}
+
+                @Override
+                protected void doCommit(DefaultTransactionStatus status) {}
+
+                @Override
+                protected void doRollback(DefaultTransactionStatus status) {}
+            };
+        }
+
+        @Bean
+        TransactionTemplate transactionTemplate(PlatformTransactionManager tm) {
+            return new TransactionTemplate(tm);
+        }
     }
 
     @MockBean BookingRepository bookingRepository;
@@ -69,6 +96,7 @@ class BookingServiceCacheTest {
 
     @Autowired BookingService bookingService;
     @Autowired CacheManager cacheManager;
+    @Autowired TransactionTemplate transactionTemplate;
 
     @BeforeEach
     void clearCache() {
@@ -117,8 +145,11 @@ class BookingServiceCacheTest {
         when(bookingRepository.save(any())).thenReturn(booking);
         doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
 
-        // Act
-        bookingService.confirmBooking(actorUserId, bookingId);
+        // Act — wrap in transaction so afterCommit() fires
+        transactionTemplate.execute(status -> {
+            bookingService.confirmBooking(actorUserId, bookingId);
+            return null;
+        });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
         assertThat(cache.get("sentinel"))
@@ -149,8 +180,11 @@ class BookingServiceCacheTest {
                 "Master unavailable"
         );
 
-        // Act
-        bookingService.declineBooking(actorUserId, bookingId, request);
+        // Act — wrap in transaction so afterCommit() fires
+        transactionTemplate.execute(status -> {
+            bookingService.declineBooking(actorUserId, bookingId, request);
+            return null;
+        });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
         assertThat(cache.get("sentinel"))
@@ -176,8 +210,11 @@ class BookingServiceCacheTest {
         when(bookingRepository.save(any())).thenReturn(booking);
         doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
 
-        // Act
-        bookingService.completeBooking(actorUserId, bookingId);
+        // Act — wrap in transaction so afterCommit() fires
+        transactionTemplate.execute(status -> {
+            bookingService.completeBooking(actorUserId, bookingId);
+            return null;
+        });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
         assertThat(cache.get("sentinel"))
@@ -208,8 +245,11 @@ class BookingServiceCacheTest {
                 "Client did not show up"
         );
 
-        // Act
-        bookingService.notCompleteBooking(actorUserId, bookingId, request);
+        // Act — wrap in transaction so afterCommit() fires
+        transactionTemplate.execute(status -> {
+            bookingService.notCompleteBooking(actorUserId, bookingId, request);
+            return null;
+        });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
         assertThat(cache.get("sentinel"))
@@ -241,8 +281,11 @@ class BookingServiceCacheTest {
                 "Changed my mind"
         );
 
-        // Act
-        bookingService.cancelBooking(clientUserId, bookingId, request);
+        // Act — wrap in transaction so afterCommit() fires
+        transactionTemplate.execute(status -> {
+            bookingService.cancelBooking(clientUserId, bookingId, request);
+            return null;
+        });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
         assertThat(cache.get("sentinel"))

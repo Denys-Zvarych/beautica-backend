@@ -19,7 +19,6 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
-import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -36,7 +35,6 @@ public class ReviewService {
     private final BookingRepository bookingRepository;
     private final ApplicationEventPublisher eventPublisher;
 
-    @PreAuthorize("hasRole('CLIENT')")
     @Transactional
     public ReviewResponse createReview(UUID clientId, CreateReviewRequest request) {
         // clientId must come from Authentication in the controller — never from request body
@@ -77,7 +75,7 @@ public class ReviewService {
         return ReviewResponse.from(saved);
     }
 
-    @Cacheable(value = "reviews-by-master", key = "#masterId.toString() + '_' + #pageable.pageNumber + '_' + #pageable.pageSize")
+    @Cacheable(value = "reviews-by-master", key = "{#masterId, #pageable.pageNumber, #pageable.pageSize}")
     @Transactional(readOnly = true)
     public Page<ReviewResponse> getReviewsForMaster(UUID masterId, Pageable pageable) {
         Page<UUID> idPage = reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, pageable);

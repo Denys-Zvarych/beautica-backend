@@ -17,6 +17,7 @@ public record CreateReviewRequest(
         @Max(5)
         Integer rating,
 
+        // null = no comment; if provided, must not be blank
         @Size(min = 1, max = 2000)
         String comment
 
