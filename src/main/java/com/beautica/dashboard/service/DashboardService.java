@@ -75,6 +75,8 @@ public class DashboardService {
     // UUID parameters are wrapped in CAST(... AS uuid) so PostgreSQL can resolve the type
     // even when the value is NULL. Without the explicit cast, the JDBC driver sends an
     // untyped NULL and Postgres raises "could not determine data type of parameter $N".
+    // NOTE: the 'Europe/Kyiv' timezone literal in this SQL must match the KYIV constant above.
+    // JDBC parameterised queries cannot pass a ZoneId, so the literal cannot be extracted.
     private static final String REVENUE_SQL = """
             SELECT
               DATE(b.starts_at AT TIME ZONE 'Europe/Kyiv') AS booking_date,

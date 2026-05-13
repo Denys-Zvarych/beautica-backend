@@ -33,9 +33,12 @@ import java.util.UUID;
 @Table(
         name = "bookings",
         indexes = {
-                // partial index: dashboard revenue query for INDEPENDENT_MASTER path
+                // partial index (V43): dashboard revenue — INDEPENDENT_MASTER path
+                // JPA cannot encode WHERE status='COMPLETED' — predicate lives in V43 only;
+                // do NOT remove it from the migration thinking the annotation is the source of truth.
                 @Index(name = "idx_bookings_master_completed_starts_at", columnList = "master_id, starts_at"),
-                // partial index: dashboard revenue query for SALON_OWNER path
+                // partial index (V43): dashboard revenue — SALON_OWNER path
+                // same JPA partial-index limitation as above; V43 is authoritative for the WHERE clause.
                 @Index(name = "idx_bookings_salon_completed_starts_at", columnList = "salon_id, starts_at")
         }
 )
