@@ -17,6 +17,7 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -48,11 +49,6 @@ public class ReviewService {
         if (booking.getStatus() != BookingStatus.COMPLETED) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "Review can only be submitted for completed bookings");
-        }
-
-        if (request.comment() != null && request.comment().isBlank()) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Comment must not consist solely of whitespace");
         }
 
         if (reviewRepository.existsByBookingId(booking.getId())) {
@@ -87,7 +83,10 @@ public class ReviewService {
             key = "#masterId.toString() + ':' + #pageable.pageNumber + ':' + #pageable.pageSize")
     @Transactional(readOnly = true)
     public Page<ReviewResponse> getReviewsForMaster(UUID masterId, Pageable pageable) {
-        Page<UUID> idPage = reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, pageable);
+        // Strip caller-supplied sort: the JPQL query has ORDER BY r.createdAt DESC hardcoded.
+        // A caller-supplied sort field can trigger PropertyReferenceException, leaking entity property names.
+        Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
+        Page<UUID> idPage = reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, unsortedPage);
         if (idPage.isEmpty()) {
             return Page.empty(pageable);
         }

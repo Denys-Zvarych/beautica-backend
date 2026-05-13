@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -27,6 +28,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 
 import java.time.OffsetDateTime;
@@ -38,6 +40,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -159,28 +162,6 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_commentIsBlankWhitespace")
-    void should_throw400_when_commentIsBlankWhitespace() {
-        User client = mock(User.class);
-        when(client.getId()).thenReturn(CLIENT_ID);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
-        when(booking.getClient()).thenReturn(client);
-
-        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 4, "   ");
-
-        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
-
-        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
-                        .isEqualTo(HttpStatus.BAD_REQUEST));
-
-        verify(reviewRepository, never()).save(any());
-    }
-
-    @Test
     @DisplayName("should_throw409_when_reviewAlreadyExistsForBooking")
     void should_throw409_when_reviewAlreadyExistsForBooking() {
         User client = mock(User.class);
@@ -270,10 +251,11 @@ class ReviewServiceTest {
         when(review.getComment()).thenReturn(null);
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
 
+        // The service strips caller sort before hitting the repository, so stub with any(Pageable.class).
         Pageable pageable = PageRequest.of(0, 20);
         Page<UUID> idPage = new PageImpl<>(List.of(REVIEW_ID), pageable, 1);
 
-        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(MASTER_ID, pageable))
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), any(Pageable.class)))
                 .thenReturn(idPage);
         when(reviewRepository.findByIdsWithGraph(List.of(REVIEW_ID)))
                 .thenReturn(List.of(review));
@@ -291,7 +273,7 @@ class ReviewServiceTest {
         Pageable pageable = PageRequest.of(0, 20);
         Page<UUID> emptyIdPage = Page.empty(pageable);
 
-        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(MASTER_ID, pageable))
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), any(Pageable.class)))
                 .thenReturn(emptyIdPage);
 
         Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, pageable);
@@ -306,7 +288,7 @@ class ReviewServiceTest {
     void should_returnEmptyPage_when_masterIdDoesNotExist() {
         Pageable pageable = PageRequest.of(0, 20);
         UUID nonExistentMasterId = UUID.randomUUID();
-        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(nonExistentMasterId, pageable))
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(nonExistentMasterId), any(Pageable.class)))
                 .thenReturn(Page.empty(pageable));
 
         Page<ReviewResponse> result = reviewService.getReviewsForMaster(nonExistentMasterId, pageable);
@@ -314,6 +296,27 @@ class ReviewServiceTest {
         assertThat(result.getTotalElements()).isZero();
         assertThat(result.getContent()).isEmpty();
         verify(reviewRepository, never()).findByIdsWithGraph(any());
+    }
+
+    @Test
+    @DisplayName("should_ignoreCallerSort_when_gettingReviewsForMaster")
+    void should_ignoreCallerSort_when_gettingReviewsForMaster() {
+        // Arrange — caller supplies a sort that must not reach the repository
+        Pageable callerPageable = PageRequest.of(0, 20, Sort.by("comment"));
+        Page<UUID> emptyIdPage = Page.empty(PageRequest.of(0, 20));
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), any(Pageable.class)))
+                .thenReturn(emptyIdPage);
+
+        // Act
+        reviewService.getReviewsForMaster(MASTER_ID, callerPageable);
+
+        // Assert — repository received an unsorted Pageable
+        verify(reviewRepository).findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), pageableCaptor.capture());
+        assertThat(pageableCaptor.getValue().getSort())
+                .as("repository must receive Sort.unsorted() regardless of caller-supplied sort")
+                .isEqualTo(Sort.unsorted());
     }
 
     // ── getReview ─────────────────────────────────────────────────────────────

@@ -142,4 +142,15 @@ class CreateReviewRequestTest {
 
         assertThat(validator.validate(request)).isEmpty();
     }
+
+    @Test
+    @DisplayName("rejects comment when comment starts with whitespace (leading-space)")
+    void should_rejectComment_when_commentStartsWithWhitespace() {
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, " leading-space");
+
+        Set<ConstraintViolation<CreateReviewRequest>> violations = validator.validate(request);
+
+        assertThat(violations).isNotEmpty();
+        assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
+    }
 }
