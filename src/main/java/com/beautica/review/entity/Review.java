@@ -31,7 +31,7 @@ import java.util.UUID;
 @Table(
         name = "reviews",
         indexes = {
-                @Index(name = "idx_reviews_master_created", columnList = "master_id"),
+                @Index(name = "idx_reviews_master_created", columnList = "master_id, created_at DESC"),
                 @Index(name = "idx_reviews_client_id",      columnList = "client_id"),
                 // idx_reviews_salon_created and idx_reviews_independent_master are partial indexes
                 // (WHERE salon_id IS NOT NULL / IS NULL) — defined in V40/V41, not expressible in JPA @Index
@@ -69,7 +69,7 @@ public class Review extends AuditableEntity {
     @Column(nullable = false)
     private Short rating;
 
-    @Size(min = 1, max = 2000)
+    @Size(max = 2000)
     @Column(length = 2000)
     private String comment;
 }
