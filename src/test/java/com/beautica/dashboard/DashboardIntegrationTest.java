@@ -9,6 +9,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -65,10 +66,22 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    private static HttpComponentsClientHttpRequestFactory hc5Factory;
+
     @BeforeEach
     void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        if (hc5Factory == null) {
+            hc5Factory = new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
+        }
+        restTemplate.getRestTemplate().setRequestFactory(hc5Factory);
+    }
+
+    @AfterAll
+    static void destroyHttpClient() throws Exception {
+        if (hc5Factory != null) {
+            hc5Factory.destroy();
+            hc5Factory = null;
+        }
     }
 
     // ── 1. Correct totals from COMPLETED bookings ─────────────────────────────
@@ -300,6 +313,53 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         assertThat(new BigDecimal(data.path("estimatedRevenue").asText()))
                 .as("total revenue must be 350.00")
                 .isEqualByComparingTo(new BigDecimal("350.00"));
+    }
+
+    // ── 7. Snapshot price — revenue does not drift when service price is updated ─
+
+    @Test
+    @DisplayName("GET /revenue — estimatedRevenue uses price_at_booking snapshot, not live service price")
+    void should_useSnapshotPrice_when_masterServicePriceUpdatedAfterBooking() throws Exception {
+        // Arrange
+        String ownerEmail = "dash-snapshot-owner-" + System.nanoTime() + "@beautica.test";
+        DataFixture fixture = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken   = loginAndGetToken(ownerEmail);
+
+        OffsetDateTime yesterday = ZonedDateTime.now(KYIV).minusDays(1)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
+
+        // Insert booking with price_at_booking = 100.00
+        insertCompletedBooking(fixture, yesterday, new BigDecimal("100.00"));
+
+        // Simulate post-booking price change: update the service definition base price
+        // to 999.00. The dashboard must still report 100.00 from the booking snapshot.
+        jdbcTemplate.update(
+                "UPDATE service_definitions SET base_price = 999.00 WHERE id = ?",
+                fixture.serviceDefId());
+
+        // Also update master_services price_override if it exists (belt-and-suspenders)
+        jdbcTemplate.update(
+                "UPDATE master_services SET price_override = 999.00 WHERE id = ?",
+                fixture.masterServiceId());
+
+        log.debug("Act: GET {} as SALON_OWNER after price update — estimatedRevenue must be 100.00 (snapshot)", REVENUE_URL);
+
+        // Act
+        ResponseEntity<String> response = restTemplate.exchange(
+                REVENUE_URL, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalCompletedBookings").asLong())
+                .as("exactly 1 COMPLETED booking must be counted")
+                .isEqualTo(1L);
+        assertThat(new BigDecimal(data.path("estimatedRevenue").asText()))
+                .as("revenue must be 100.00 — the booking's price_at_booking snapshot, not the updated 999.00 service price")
+                .isEqualByComparingTo(new BigDecimal("100.00"));
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

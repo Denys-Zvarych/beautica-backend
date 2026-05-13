@@ -14,6 +14,7 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.Query;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
@@ -57,6 +58,7 @@ class DashboardServiceTest {
     // ── 1. Date defaulting ────────────────────────────────────────────────
 
     @Test
+    @DisplayName("null from/to — defaults to last 30 days from today (Kyiv)")
     void should_defaultDateRange_when_fromAndToAreNull() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -79,6 +81,7 @@ class DashboardServiceTest {
     // ── 2. Range validation ───────────────────────────────────────────────
 
     @Test
+    @DisplayName("range >365 days — throws BusinessException(400)")
     void should_throw400_when_dateRangeExceeds365Days() {
         // Arrange
         Clock     fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -98,6 +101,7 @@ class DashboardServiceTest {
     // ── 3. Salon scope binding ────────────────────────────────────────────
 
     @Test
+    @DisplayName("SALON_OWNER — binds salonId and null actorMasterId to query")
     void should_bindSalonId_when_actorIsSalonOwner() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -125,6 +129,7 @@ class DashboardServiceTest {
     // ── 4. Master scope binding ───────────────────────────────────────────
 
     @Test
+    @DisplayName("INDEPENDENT_MASTER — binds actorMasterId and null salonId to query")
     void should_bindActorMasterId_when_actorIsIndependentMaster() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -151,6 +156,7 @@ class DashboardServiceTest {
     // ── 5. Aggregate by master ────────────────────────────────────────────
 
     @Test
+    @DisplayName("same master in 2 rows — collapses to 1 byMaster entry with summed totals")
     void should_aggregateRevenueByMaster_when_multipleRowsWithSameMaster() {
         // Arrange
         UUID masterId = UUID.randomUUID();
@@ -179,6 +185,7 @@ class DashboardServiceTest {
     // ── 6. Aggregate by service ───────────────────────────────────────────
 
     @Test
+    @DisplayName("same service in 2 rows — collapses to 1 byService entry with summed totals")
     void should_aggregateRevenueByService_when_multipleRowsWithSameService() {
         // Arrange
         UUID svcDefId  = UUID.randomUUID();
@@ -206,6 +213,7 @@ class DashboardServiceTest {
     // ── 7. Aggregate by date ──────────────────────────────────────────────
 
     @Test
+    @DisplayName("same date in 2 rows — collapses to 1 byDate entry with summed count and revenue")
     void should_aggregateRevenueByDate_when_multipleRowsWithSameDate() {
         // Arrange
         LocalDate date = LocalDate.of(2026, 5, 5);
@@ -233,6 +241,7 @@ class DashboardServiceTest {
     // ── 8. Total computation ──────────────────────────────────────────────
 
     @Test
+    @DisplayName("2 rows — grand totals match sum of all booking counts and revenue")
     void should_computeTotals_when_multipleRowsReturned() {
         // Arrange
         Object[] row1 = buildRow(LocalDate.of(2026, 5, 1), UUID.randomUUID(), "A",
@@ -256,6 +265,7 @@ class DashboardServiceTest {
     // ── 9. Empty result ───────────────────────────────────────────────────
 
     @Test
+    @DisplayName("no completed bookings — returns zeros and empty breakdowns")
     void should_returnZeroTotals_when_noCompletedBookings() {
         // Arrange
         DashboardService svc = serviceWithRows(List.of());
@@ -277,6 +287,7 @@ class DashboardServiceTest {
     // ── 10. resolveScope — forbidden roles ───────────────────────────────────
 
     @Test
+    @DisplayName("CLIENT role — throws ForbiddenException with 'Access denied'")
     void should_throw403_when_actorRoleIsClient() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -288,10 +299,12 @@ class DashboardServiceTest {
         // Act & Assert
         assertThatThrownBy(() ->
                 svc.getRevenueSummary(UUID.randomUUID(), Role.CLIENT, from, to, null, null))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
     }
 
     @Test
+    @DisplayName("SALON_ADMIN role — throws ForbiddenException with 'Access denied'")
     void should_throw403_when_actorRoleIsSalonAdmin() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -303,10 +316,12 @@ class DashboardServiceTest {
         // Act & Assert
         assertThatThrownBy(() ->
                 svc.getRevenueSummary(UUID.randomUUID(), Role.SALON_ADMIN, from, to, null, null))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
     }
 
     @Test
+    @DisplayName("SALON_MASTER role — throws ForbiddenException with 'Access denied'")
     void should_throw403_when_actorRoleIsSalonMaster() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -318,12 +333,14 @@ class DashboardServiceTest {
         // Act & Assert
         assertThatThrownBy(() ->
                 svc.getRevenueSummary(UUID.randomUUID(), Role.SALON_MASTER, from, to, null, null))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
     }
 
     // ── 11. validateRange — inverted dates ────────────────────────────────────
 
     @Test
+    @DisplayName("from after to — throws BusinessException(400)")
     void should_throw400_when_fromIsAfterTo() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -343,6 +360,7 @@ class DashboardServiceTest {
     // ── 12. filterMasterId ownership ─────────────────────────────────────────
 
     @Test
+    @DisplayName("SALON_OWNER: filterMasterId from other salon — throws ForbiddenException")
     void should_throw403_when_filterMasterIdBelongsToOtherSalon() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -370,6 +388,7 @@ class DashboardServiceTest {
     // ── 13. INDEPENDENT_MASTER filterMasterId IDOR guard ─────────────────────
 
     @Test
+    @DisplayName("INDEPENDENT_MASTER: filterMasterId != own master — throws ForbiddenException")
     void should_throw403_when_independentMasterFiltersOtherMasterId() {
         // Arrange
         Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
@@ -390,6 +409,73 @@ class DashboardServiceTest {
         assertThatThrownBy(() ->
                 svc.getRevenueSummary(actorId, Role.INDEPENDENT_MASTER, from, to, otherMasterId, null))
                 .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── 14. resolveScope — not-found paths ───────────────────────────────────
+
+    @Test
+    @DisplayName("SALON_OWNER with no active salon — throws NotFoundException")
+    void should_throwNotFound_when_salonOwnerHasNoActiveSalon() {
+        // Arrange
+        Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
+        DashboardService svc = new DashboardService(em, masterRepository, salonRepository, fixedClock);
+
+        UUID actorId = UUID.randomUUID();
+        when(salonRepository.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(actorId))
+                .thenReturn(Optional.empty());
+
+        LocalDate from = LocalDate.of(2026, 4, 1);
+        LocalDate to   = LocalDate.of(2026, 5, 1);
+
+        // Act & Assert
+        assertThatThrownBy(() ->
+                svc.getRevenueSummary(actorId, Role.SALON_OWNER, from, to, null, null))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER with no master record — throws NotFoundException")
+    void should_throwNotFound_when_independentMasterHasNoMasterRecord() {
+        // Arrange
+        Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
+        DashboardService svc = new DashboardService(em, masterRepository, salonRepository, fixedClock);
+
+        UUID actorId = UUID.randomUUID();
+        when(masterRepository.findByUserId(actorId))
+                .thenReturn(Optional.empty());
+
+        LocalDate from = LocalDate.of(2026, 4, 1);
+        LocalDate to   = LocalDate.of(2026, 5, 1);
+
+        // Act & Assert
+        assertThatThrownBy(() ->
+                svc.getRevenueSummary(actorId, Role.INDEPENDENT_MASTER, from, to, null, null))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    // ── 15. serviceDefId filter binding ──────────────────────────────────────
+
+    @Test
+    @DisplayName("serviceDefId provided — binds :serviceDefId parameter to query")
+    void should_bindServiceDefIdFilter_when_serviceDefIdPassed() {
+        // Arrange
+        Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
+        DashboardService svc = new DashboardService(em, masterRepository, salonRepository, fixedClock);
+
+        UUID actorId  = UUID.randomUUID();
+        UUID svcDefId = UUID.randomUUID();
+
+        stubSalon(salonRepository, actorId);
+        stubEmptyQuery(em, query);
+
+        LocalDate from = LocalDate.of(2026, 4, 1);
+        LocalDate to   = LocalDate.of(2026, 5, 1);
+
+        // Act
+        svc.getRevenueSummary(actorId, Role.SALON_OWNER, from, to, null, svcDefId);
+
+        // Assert
+        verify(query).setParameter("serviceDefId", svcDefId);
     }
 
     // ── test helpers ──────────────────────────────────────────────────────

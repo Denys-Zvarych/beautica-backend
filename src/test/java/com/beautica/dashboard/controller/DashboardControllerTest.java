@@ -267,6 +267,40 @@ class DashboardControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    // ── 9. SALON_ADMIN — must be denied ──────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /revenue — 403 when SALON_ADMIN queries the dashboard")
+    void should_return403_when_salonAdminQueriesDashboard() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: GET {} as SALON_ADMIN user={} — @PreAuthorize must deny with 403", REVENUE_URL, userId);
+        mockMvc.perform(get(REVENUE_URL)
+                        .with(authenticatedAs(userId, Role.SALON_ADMIN))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+    }
+
+    // ── 10. serviceDefId query param — controller passes it through ───────────
+
+    @Test
+    @DisplayName("GET /revenue — 200 when serviceDefId query param is provided")
+    void should_return200_when_serviceDefIdProvided() throws Exception {
+        var userId   = UUID.randomUUID();
+        var svcDefId = UUID.randomUUID();
+
+        when(dashboardService.getRevenueSummary(any(), any(), any(), any(), any(), any()))
+                .thenReturn(emptyResponse());
+
+        log.debug("Act: GET {}?serviceDefId={} as SALON_OWNER user={}", REVENUE_URL, svcDefId, userId);
+        mockMvc.perform(get(REVENUE_URL)
+                        .param("serviceDefId", svcDefId.toString())
+                        .with(authenticatedAs(userId, Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
     // ── 8. filterMasterId query param — controller passes it through ──────────
 
     @Test
