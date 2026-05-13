@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
     @AfterEach
     void cleanDb() {
         jdbcTemplate.execute("DELETE FROM notification_outbox");
+        jdbcTemplate.execute("DELETE FROM reviews");
         jdbcTemplate.execute("DELETE FROM bookings");
         jdbcTemplate.execute("DELETE FROM media_files");
         jdbcTemplate.execute("DELETE FROM master_services");
