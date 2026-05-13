@@ -72,6 +72,9 @@ public class DashboardService {
     // ── native SQL constant ────────────────────────────────────────────────
     // price_at_booking is the snapshot captured at booking creation time;
     // never reference master_services.price (live price) here.
+    // UUID parameters are wrapped in CAST(... AS uuid) so PostgreSQL can resolve the type
+    // even when the value is NULL. Without the explicit cast, the JDBC driver sends an
+    // untyped NULL and Postgres raises "could not determine data type of parameter $N".
     private static final String REVENUE_SQL = """
             SELECT
               DATE(b.starts_at AT TIME ZONE 'Europe/Kyiv') AS booking_date,
@@ -89,13 +92,13 @@ public class DashboardService {
             WHERE b.status = 'COMPLETED'
               AND b.starts_at >= :fromDate
               AND b.starts_at  < :toDate
-              AND (:filterMasterId IS NULL OR ms.master_id        = :filterMasterId)
-              AND (:serviceDefId   IS NULL OR ms.service_def_id   = :serviceDefId)
+              AND (CAST(:filterMasterId AS uuid) IS NULL OR ms.master_id        = CAST(:filterMasterId AS uuid))
+              AND (CAST(:serviceDefId   AS uuid) IS NULL OR ms.service_def_id   = CAST(:serviceDefId   AS uuid))
               AND (
-                    (:salonId       IS NOT NULL AND b.salon_id  = :salonId
-                                                AND m.salon_id  = :salonId)
-                 OR (:actorMasterId IS NOT NULL AND b.master_id = :actorMasterId
-                                                AND m.id        = :actorMasterId)
+                    (CAST(:salonId       AS uuid) IS NOT NULL AND b.salon_id  = CAST(:salonId       AS uuid)
+                                                              AND m.salon_id  = CAST(:salonId       AS uuid))
+                 OR (CAST(:actorMasterId AS uuid) IS NOT NULL AND b.master_id = CAST(:actorMasterId AS uuid)
+                                                              AND m.id        = CAST(:actorMasterId AS uuid))
               )
             GROUP BY booking_date, ms.master_id, master_name, sd.id, sd.name
             ORDER BY booking_date
@@ -120,7 +123,8 @@ public class DashboardService {
      * parameters are not available in {@code BookingService} at eviction time.
      */
     @Cacheable(value = "revenue-dashboard",
-               key   = "{#actorId, #from, #to, #filterMasterId, #serviceDefId}")
+               key   = "{#actorId, #from, #to, #filterMasterId, #serviceDefId}",
+               sync  = true)
     public RevenueResponse getRevenueSummary(
             UUID      actorId,
             Role      actorRole,
@@ -137,9 +141,17 @@ public class DashboardService {
 
         ActorScope scope = resolveScope(actorId, actorRole);
 
-        if (filterMasterId != null && scope.salonId() != null) {
-            if (!masterRepository.existsByIdAndSalonId(filterMasterId, scope.salonId())) {
-                throw new ForbiddenException("Master does not belong to actor's salon");
+        if (filterMasterId != null) {
+            if (scope.salonId() != null) {
+                // SALON_OWNER: master must belong to actor's salon
+                if (!masterRepository.existsByIdAndSalonId(filterMasterId, scope.salonId())) {
+                    throw new ForbiddenException("Master does not belong to actor's salon");
+                }
+            } else {
+                // INDEPENDENT_MASTER: may only filter by their own master record
+                if (!filterMasterId.equals(scope.actorMasterId())) {
+                    throw new ForbiddenException("Independent master may not filter by another master");
+                }
             }
         }
 

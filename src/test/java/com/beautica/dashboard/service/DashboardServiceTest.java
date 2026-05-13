@@ -367,6 +367,31 @@ class DashboardServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    // ── 13. INDEPENDENT_MASTER filterMasterId IDOR guard ─────────────────────
+
+    @Test
+    void should_throw403_when_independentMasterFiltersOtherMasterId() {
+        // Arrange
+        Clock fixedClock = Clock.fixed(FIXED_INSTANT, UTC);
+        DashboardService svc = new DashboardService(em, masterRepository, salonRepository, fixedClock);
+
+        UUID actorId       = UUID.randomUUID();
+        UUID actorMasterId = UUID.randomUUID();
+        UUID otherMasterId = UUID.randomUUID(); // different from actor's own master
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(actorMasterId);
+        when(masterRepository.findByUserId(actorId)).thenReturn(Optional.of(master));
+
+        LocalDate from = LocalDate.of(2026, 4, 1);
+        LocalDate to   = LocalDate.of(2026, 5, 1);
+
+        // Act & Assert — must reject without executing any SQL
+        assertThatThrownBy(() ->
+                svc.getRevenueSummary(actorId, Role.INDEPENDENT_MASTER, from, to, otherMasterId, null))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
     // ── test helpers ──────────────────────────────────────────────────────
 
     /**

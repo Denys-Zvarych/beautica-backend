@@ -30,6 +30,7 @@ EXPOSE 8080
 
 ENTRYPOINT ["java", \
   "-XX:+UseSerialGC", \
+  "-XX:+ExitOnOutOfMemoryError", \
   "-Xms128m", \
   "-Xmx256m", \
   "-XX:MaxMetaspaceSize=192m", \
