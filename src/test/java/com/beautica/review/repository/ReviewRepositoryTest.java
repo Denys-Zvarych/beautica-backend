@@ -26,6 +26,8 @@ import org.springframework.data.domain.PageRequest;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -274,12 +276,19 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
 
         em.clear();
 
-        Page<Review> result = reviewRepository.findByMasterIdOrderByCreatedAtDesc(
+        // Two-query pattern (Fix 5 — HHH90003004): paginate IDs, then hydrate graph.
+        Page<UUID> idPage = reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(
                 master.getId(), PageRequest.of(0, 10));
+        List<Review> hydrated = reviewRepository.findByIdsWithGraph(idPage.getContent());
+        Map<UUID, Review> byId = hydrated.stream()
+                .collect(java.util.stream.Collectors.toMap(Review::getId, r -> r));
+        List<Review> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .toList();
 
-        assertThat(result.getTotalElements()).isEqualTo(2);
-        assertThat(result.getContent().get(0).getId()).isEqualTo(newerReview.getId());
-        assertThat(result.getContent().get(1).getId()).isEqualTo(olderReview.getId());
+        assertThat(idPage.getTotalElements()).isEqualTo(2);
+        assertThat(ordered.get(0).getId()).isEqualTo(newerReview.getId());
+        assertThat(ordered.get(1).getId()).isEqualTo(olderReview.getId());
     }
 
     @Test

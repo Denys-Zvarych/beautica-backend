@@ -3,11 +3,13 @@ package com.beautica.review.repository;
 import com.beautica.review.entity.Review;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -15,7 +17,29 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
 
     Optional<Review> findByBookingId(UUID bookingId);
 
-    Page<Review> findByMasterIdOrderByCreatedAtDesc(UUID masterId, Pageable pageable);
+    // Two-query pattern — avoids HHH90003004 (Hibernate in-memory pagination warning).
+    // Step 1: paginate on IDs only — SQL LIMIT/OFFSET, no JOIN FETCH.
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.master.id = :masterId
+            ORDER BY r.createdAt DESC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.master.id = :masterId
+            """)
+    Page<UUID> findIdsByMasterIdOrderByCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
+
+    // Step 2: batch-hydrate the page-size set with full graph (IN list bounded by page size ≤ 100).
+    @EntityGraph(attributePaths = {"booking", "client", "master"})
+    @Query("SELECT r FROM Review r WHERE r.id IN :ids ORDER BY r.createdAt DESC")
+    List<Review> findByIdsWithGraph(@Param("ids") List<UUID> ids);
+
+    // Named to distinguish from the inherited JpaRepository.findById (which is lazy).
+    // Use this method whenever ReviewResponse.from() will be called on the result.
+    @EntityGraph(attributePaths = {"booking", "client", "master"})
+    @Query("SELECT r FROM Review r WHERE r.id = :id")
+    Optional<Review> findByIdWithAssociations(@Param("id") UUID id);
 
     // Single-pass native SQL: FROM subquery aggregates AVG + COUNT in one index scan.
     // COALESCE handles the no-reviews edge case (AVG of empty set = NULL → 0.00).

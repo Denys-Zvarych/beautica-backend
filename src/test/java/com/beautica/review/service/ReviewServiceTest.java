@@ -1,0 +1,300 @@
+package com.beautica.review.service;
+
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.NotFoundException;
+import com.beautica.master.entity.Master;
+import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.entity.Review;
+import com.beautica.review.repository.ReviewRepository;
+import com.beautica.user.User;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.HttpStatus;
+
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class ReviewServiceTest {
+
+    @Mock
+    private ReviewRepository reviewRepository;
+
+    @Mock
+    private BookingRepository bookingRepository;
+
+    @InjectMocks
+    private ReviewService reviewService;
+
+    private static final UUID CLIENT_ID  = UUID.randomUUID();
+    private static final UUID BOOKING_ID = UUID.randomUUID();
+    private static final UUID MASTER_ID  = UUID.randomUUID();
+    private static final UUID REVIEW_ID  = UUID.randomUUID();
+
+    // ── createReview ─────────────────────────────────────────────────────────
+
+    @Test
+    void should_createReview_when_completedBookingAndOwnerClient() {
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(BOOKING_ID);
+        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getSalon()).thenReturn(null);
+
+        User savedClient = mock(User.class);
+        when(savedClient.getFirstName()).thenReturn("Anna");
+        when(savedClient.getLastName()).thenReturn("Koval");
+
+        Review saved = mock(Review.class);
+        when(saved.getId()).thenReturn(REVIEW_ID);
+        when(saved.getBooking()).thenReturn(booking);
+        when(saved.getClient()).thenReturn(savedClient);
+        when(saved.getMaster()).thenReturn(master);
+        when(saved.getRating()).thenReturn((short) 5);
+        when(saved.getComment()).thenReturn("Great service");
+        when(saved.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, "Great service");
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+        when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.empty());
+        when(reviewRepository.save(any(Review.class))).thenReturn(saved);
+
+        ReviewResponse response = reviewService.createReview(CLIENT_ID, request);
+
+        assertThat(response).isNotNull();
+        assertThat(response.masterId()).isEqualTo(MASTER_ID);
+        verify(reviewRepository).save(any(Review.class));
+        verify(reviewRepository).recalculateMasterRating(MASTER_ID);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = BookingStatus.class, names = {"PENDING", "CONFIRMED", "DECLINED", "CANCELLED", "NOT_COMPLETED"})
+    void should_throw400_when_bookingStatusIsNotCompleted(BookingStatus status) {
+        Booking booking = mock(Booking.class);
+        when(booking.getStatus()).thenReturn(status);
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 4, null);
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    void should_throwForbidden_when_actorIsNotBookingClient() {
+        UUID differentClientId = UUID.randomUUID();
+
+        User actualClient = mock(User.class);
+        when(actualClient.getId()).thenReturn(CLIENT_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
+        when(booking.getClient()).thenReturn(actualClient);
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 3, null);
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> reviewService.createReview(differentClientId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    void should_throw409_when_reviewAlreadyExistsForBooking() {
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(BOOKING_ID);
+        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
+        when(booking.getClient()).thenReturn(client);
+
+        Review existingReview = mock(Review.class);
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, null);
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+        when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.of(existingReview));
+
+        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+
+        verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    void should_throw404_when_bookingNotFound() {
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, null);
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    void should_notCallRecalculate_when_saveThrowsDataIntegrityViolation() {
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
+        Master master = mock(Master.class);
+        // master.getId() is NOT stubbed — recalculateMasterRating must never be reached
+
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(BOOKING_ID);
+        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getSalon()).thenReturn(null);
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, "Great service");
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+        when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.empty());
+        when(reviewRepository.save(any(Review.class))).thenThrow(new DataIntegrityViolationException("duplicate"));
+
+        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+
+        verify(reviewRepository, never()).recalculateMasterRating(any());
+    }
+
+    // ── getReviewsForMaster ───────────────────────────────────────────────────
+
+    @Test
+    void should_returnPagedReviews_when_masterHasReviews() {
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn("Anna");
+        when(client.getLastName()).thenReturn("Koval");
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(BOOKING_ID);
+
+        Review review = mock(Review.class);
+        when(review.getId()).thenReturn(REVIEW_ID);
+        when(review.getBooking()).thenReturn(booking);
+        when(review.getClient()).thenReturn(client);
+        when(review.getMaster()).thenReturn(master);
+        when(review.getRating()).thenReturn((short) 4);
+        when(review.getComment()).thenReturn(null);
+        when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        Pageable pageable = PageRequest.of(0, 20);
+        Page<UUID> idPage = new PageImpl<>(List.of(REVIEW_ID), pageable, 1);
+
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(MASTER_ID, pageable))
+                .thenReturn(idPage);
+        when(reviewRepository.findByIdsWithGraph(List.of(REVIEW_ID)))
+                .thenReturn(List.of(review));
+
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, pageable);
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.getContent()).hasSize(1);
+        assertThat(result.getContent().get(0).masterId()).isEqualTo(MASTER_ID);
+    }
+
+    @Test
+    void should_returnEmptyPage_when_masterHasNoReviews() {
+        Pageable pageable = PageRequest.of(0, 20);
+        Page<UUID> emptyIdPage = Page.empty(pageable);
+
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(MASTER_ID, pageable))
+                .thenReturn(emptyIdPage);
+
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, pageable);
+
+        assertThat(result.getTotalElements()).isZero();
+        assertThat(result.getContent()).isEmpty();
+        verify(reviewRepository, never()).findByIdsWithGraph(any());
+    }
+
+    // ── getReview ─────────────────────────────────────────────────────────────
+
+    @Test
+    void should_returnReview_when_reviewIdExists() {
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn("Ivan");
+        when(client.getLastName()).thenReturn("Petrenko");
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(BOOKING_ID);
+
+        Review review = mock(Review.class);
+        when(review.getId()).thenReturn(REVIEW_ID);
+        when(review.getBooking()).thenReturn(booking);
+        when(review.getClient()).thenReturn(client);
+        when(review.getMaster()).thenReturn(master);
+        when(review.getRating()).thenReturn((short) 5);
+        when(review.getComment()).thenReturn("Excellent");
+        when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        when(reviewRepository.findByIdWithAssociations(REVIEW_ID)).thenReturn(Optional.of(review));
+
+        ReviewResponse response = reviewService.getReview(REVIEW_ID);
+
+        assertThat(response.id()).isEqualTo(REVIEW_ID);
+        assertThat(response.masterId()).isEqualTo(MASTER_ID);
+        assertThat(response.clientDisplayName()).isEqualTo("Ivan Petrenko");
+    }
+
+    @Test
+    void should_throwNotFound_when_reviewByIdNotFound() {
+        when(reviewRepository.findByIdWithAssociations(REVIEW_ID)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> reviewService.getReview(REVIEW_ID))
+                .isInstanceOf(NotFoundException.class);
+    }
+}
