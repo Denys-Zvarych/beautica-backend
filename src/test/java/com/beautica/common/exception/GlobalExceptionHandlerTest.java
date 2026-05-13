@@ -12,6 +12,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -177,6 +178,29 @@ class GlobalExceptionHandlerTest {
                 .as("message must contain the constraint violation text")
                 .isNotBlank()
                 .contains("must not be blank");
+    }
+
+    @Test
+    @DisplayName("Should return 400 when MissingServletRequestPartException is thrown")
+    void should_return400_when_missingRequestPart() {
+        // Arrange — multipart endpoint called without the required 'file' part
+        var ex = new MissingServletRequestPartException("file");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMissingPart(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 400 for missing multipart part")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("message must reference the missing part name")
+                .contains("file");
     }
 
     /**

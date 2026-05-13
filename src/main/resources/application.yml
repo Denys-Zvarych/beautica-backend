@@ -45,6 +45,15 @@ spring:
     virtual:
       enabled: true
 
+  servlet:
+    multipart:
+      # Image uploads are bounded at 10 MB; oversized requests are rejected by the container
+      # before reaching the controller layer, so MediaService never sees an unbounded stream.
+      max-file-size: 10MB
+      max-request-size: 10MB
+      # Explicit temp directory avoids platform-specific default locations on non-Railway hosts.
+      location: ${java.io.tmpdir}/beautica-uploads
+
   mail:
     host: smtp-relay.brevo.com
     port: 587
@@ -66,6 +75,10 @@ server:
   # Setting it to 'native' would cause Spring's ForwardedHeaderFilter to strip
   # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
   # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
+  tomcat:
+    # Swallow up to 10 MB of an oversized request body so Tomcat returns a clean 413
+    # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.
+    max-swallow-size: 10MB
 
 management:
   endpoints:
@@ -98,10 +111,16 @@ app:
     access-token-expiration: 900000       # 15 min in ms
     refresh-token-expiration: 604800000   # 7 days in ms
   cloudflare-r2:
-    access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID}
-    secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY}
+    # Master kill-switch. When false (default), S3Config does NOT register an S3Client bean and
+    # R2StorageService (Phase 7.4) will run in stub-safe mode. Set R2_ENABLED=true only when all
+    # four CLOUDFLARE_R2_* env vars below are populated; S3Config fails fast otherwise.
+    enabled: ${R2_ENABLED:false}
+    account-id: ${CLOUDFLARE_R2_ACCOUNT_ID:}
+    access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID:}
+    secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY:}
     bucket: ${CLOUDFLARE_R2_BUCKET:beautica-media}
-    endpoint: ${CLOUDFLARE_R2_ENDPOINT}
+    endpoint: ${CLOUDFLARE_R2_ENDPOINT:}
+    public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
   frontend:
@@ -114,6 +133,9 @@ app:
     # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
     # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.
     device-token-capacity: 30
+    # POST/DELETE /api/v1/media/* — 10/min per IP; balances upload retries
+    # (after a 400 on wrong MIME / oversize) with abuse prevention.
+    media-upload-capacity: 10
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32
