@@ -177,7 +177,7 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         evictMasterCalendarAfterCommit();
-        evictRevenueDashboardAfterCommit(actorUserId);
+        evictRevenueDashboardAfterCommit();
         return BookingResponse.from(saved);
     }
 
@@ -195,7 +195,7 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         evictMasterCalendarAfterCommit();
-        evictRevenueDashboardAfterCommit(actorUserId);
+        evictRevenueDashboardAfterCommit();
         return BookingResponse.from(saved);
     }
 
@@ -343,18 +343,18 @@ public class BookingService {
         }
     }
 
-    private void evictRevenueDashboardAfterCommit(UUID actorId) {
+    private void evictRevenueDashboardAfterCommit() {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
                     Cache cache = cacheManager.getCache("revenue-dashboard");
-                    if (cache != null) cache.evict(actorId);
+                    if (cache != null) cache.clear();
                 }
             });
         } else {
             Cache cache = cacheManager.getCache("revenue-dashboard");
-            if (cache != null) cache.evict(actorId);
+            if (cache != null) cache.clear();
         }
     }
 }

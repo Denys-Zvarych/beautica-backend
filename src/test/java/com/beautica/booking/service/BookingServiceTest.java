@@ -616,7 +616,7 @@ class BookingServiceTest {
 
         // Assert
         verify(cacheManager).getCache("revenue-dashboard");
-        verify(revenueCacheMock).evict(actorId);
+        verify(revenueCacheMock).clear();
     }
 
     // ── notCompleteBooking ─────────────────────────────────────────────────────
@@ -684,7 +684,7 @@ class BookingServiceTest {
 
         // Assert
         verify(cacheManager).getCache("revenue-dashboard");
-        verify(revenueCacheMock).evict(actorId);
+        verify(revenueCacheMock).clear();
     }
 
     // ── cancelBooking ──────────────────────────────────────────────────────────
