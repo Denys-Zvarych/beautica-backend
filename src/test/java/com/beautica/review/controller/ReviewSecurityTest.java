@@ -83,6 +83,30 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
+    @Test
+    @DisplayName("POST /reviews — 403 (not 400) when client B submits a review for a PENDING booking not owned by client B")
+    void should_return403_when_clientSubmitsReviewForPendingBookingNotOwned() throws Exception {
+        UUID masterId        = createIndependentMaster("sec-im2-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+
+        // Client A owns the PENDING booking
+        String clientAEmail = "sec-cli-a2-" + System.nanoTime() + "@beautica.test";
+        createClientAndGetToken(clientAEmail);
+        UUID clientAId  = resolveUserIdByEmail(clientAEmail);
+        UUID bookingId  = createPendingBooking(clientAId, masterId, masterServiceId);
+
+        // Client B has no relationship to this booking
+        String clientBEmail = "sec-cli-b2-" + System.nanoTime() + "@beautica.test";
+        String clientBToken = createClientAndGetToken(clientBEmail);
+
+        log.debug("Act: client B posts review on client A's PENDING bookingId={} — must return 403, not 400", bookingId);
+        ResponseEntity<String> response = postReview(clientBToken, bookingId, 5);
+
+        assertThat(response.getStatusCode())
+                .as("ownership check must run before status check — client B must get 403, not 400")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
     // ── fixtures ───────────────────────────────────────────────────────────────
 
     /**
@@ -126,6 +150,25 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
                 masterServiceId, masterId, serviceDefId);
 
         return masterServiceId;
+    }
+
+    /**
+     * Inserts a booking directly with status=PENDING.
+     * starts_at/ends_at are set in the future so no past-booking constraint is triggered.
+     * salon_id is omitted — INDEPENDENT_MASTER bookings have no salon (V18 schema, nullable).
+     */
+    private UUID createPendingBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings " +
+                "(id, client_id, master_id, master_service_id, status, " +
+                "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, " +
+                "buffer_minutes_at_booking, created_at, updated_at) " +
+                "VALUES (?, ?, ?, ?, 'PENDING', " +
+                "NOW() + interval '1 day', NOW() + interval '1 day 1 hour', " +
+                "500.00, 60, 0, NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId);
+        return bookingId;
     }
 
     /**

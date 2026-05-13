@@ -41,16 +41,21 @@ public class ReviewService {
         Booking booking = bookingRepository.findByIdWithFullGraph(request.bookingId())
                 .orElseThrow(() -> new NotFoundException("Booking not found"));
 
+        if (!booking.getClient().getId().equals(clientId)) {
+            throw new ForbiddenException("Not authorized to review this booking");
+        }
+
         if (booking.getStatus() != BookingStatus.COMPLETED) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "Review can only be submitted for completed bookings");
         }
 
-        if (!booking.getClient().getId().equals(clientId)) {
-            throw new ForbiddenException("Not authorized to review this booking");
+        if (request.comment() != null && request.comment().isBlank()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Comment must not consist solely of whitespace");
         }
 
-        if (reviewRepository.findByBookingId(booking.getId()).isPresent()) {
+        if (reviewRepository.existsByBookingId(booking.getId())) {
             throw new BusinessException(HttpStatus.CONFLICT,
                     "Review already exists for this booking");
         }
@@ -75,7 +80,11 @@ public class ReviewService {
         return ReviewResponse.from(saved);
     }
 
-    @Cacheable(value = "reviews-by-master", key = "{#masterId, #pageable.pageNumber, #pageable.pageSize}")
+    // String key format: "<masterId>:<pageNumber>:<pageSize>"
+    // Must be a String (not SimpleKey) so ReviewEventListener can evict by masterId prefix.
+    @Cacheable(
+            value = "reviews-by-master",
+            key = "#masterId.toString() + ':' + #pageable.pageNumber + ':' + #pageable.pageSize")
     @Transactional(readOnly = true)
     public Page<ReviewResponse> getReviewsForMaster(UUID masterId, Pageable pageable) {
         Page<UUID> idPage = reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, pageable);
@@ -92,6 +101,8 @@ public class ReviewService {
         return new PageImpl<>(content, pageable, idPage.getTotalElements());
     }
 
+    // Reviews are immutable after creation — no @CacheEvict path needed.
+    @Cacheable(value = "review-detail", key = "#reviewId")
     @Transactional(readOnly = true)
     public ReviewResponse getReview(UUID reviewId) {
         Review review = reviewRepository.findByIdWithAssociations(reviewId)

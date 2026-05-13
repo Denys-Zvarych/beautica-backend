@@ -28,7 +28,6 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -53,7 +52,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
     void setUp() {
         clientUser = new User(
                 "client-" + UUID.randomUUID() + "@test.com",
-                "$2a$10$hash",
+                "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
                 Role.CLIENT,
                 "Client",
                 "User",
@@ -63,7 +62,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
 
         User masterUser = new User(
                 "master-" + UUID.randomUUID() + "@test.com",
-                "$2a$10$hash",
+                "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
                 Role.INDEPENDENT_MASTER,
                 "Master",
                 "User",
@@ -115,8 +114,8 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("should_findReviewByBookingId_when_reviewExists")
-    void should_findReviewByBookingId_when_reviewExists() {
+    @DisplayName("should_returnTrue_when_reviewExistsForBooking")
+    void should_returnTrue_when_reviewExistsForBooking() {
         Review review = Review.builder()
                 .booking(completedBooking)
                 .client(clientUser)
@@ -127,19 +126,17 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
         em.persist(review);
         em.flush();
 
-        Optional<Review> result = reviewRepository.findByBookingId(completedBooking.getId());
+        boolean exists = reviewRepository.existsByBookingId(completedBooking.getId());
 
-        assertThat(result).isPresent();
-        assertThat(result.get().getId()).isEqualTo(review.getId());
-        assertThat(result.get().getRating()).isEqualTo((short) 5);
+        assertThat(exists).isTrue();
     }
 
     @Test
-    @DisplayName("should_returnEmpty_when_noReviewForBooking")
-    void should_returnEmpty_when_noReviewForBooking() {
-        Optional<Review> result = reviewRepository.findByBookingId(completedBooking.getId());
+    @DisplayName("should_returnFalse_when_noReviewForBooking")
+    void should_returnFalse_when_noReviewForBooking() {
+        boolean exists = reviewRepository.existsByBookingId(completedBooking.getId());
 
-        assertThat(result).isEmpty();
+        assertThat(exists).isFalse();
     }
 
     @Test
@@ -147,7 +144,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
     void should_recalculateMasterRating_when_twoReviewsExist() {
         User masterUser2 = new User(
                 "master2-" + UUID.randomUUID() + "@test.com",
-                "$2a$10$hash",
+                "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
                 Role.INDEPENDENT_MASTER,
                 "Master2",
                 "User",

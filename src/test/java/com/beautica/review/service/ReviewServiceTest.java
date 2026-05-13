@@ -97,7 +97,7 @@ class ReviewServiceTest {
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, "Great service");
 
         when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
-        when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.empty());
+        when(reviewRepository.existsByBookingId(BOOKING_ID)).thenReturn(false);
         when(reviewRepository.saveAndFlush(any(Review.class))).thenReturn(saved);
 
         ReviewResponse response = reviewService.createReview(CLIENT_ID, request);
@@ -116,7 +116,12 @@ class ReviewServiceTest {
     @DisplayName("should_throw400_when_bookingStatusIsNotCompleted")
     @EnumSource(value = BookingStatus.class, names = {"PENDING", "CONFIRMED", "DECLINED", "CANCELLED", "NOT_COMPLETED"})
     void should_throw400_when_bookingStatusIsNotCompleted(BookingStatus status) {
+        // Ownership check runs first (fix for IDOR oracle); stub client so it passes through to status check.
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
         Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(client);
         when(booking.getStatus()).thenReturn(status);
 
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 4, null);
@@ -136,11 +141,11 @@ class ReviewServiceTest {
     void should_throwForbidden_when_actorIsNotBookingClient() {
         UUID differentClientId = UUID.randomUUID();
 
+        // Ownership check runs first — getStatus() is never reached, so do not stub it.
         User actualClient = mock(User.class);
         when(actualClient.getId()).thenReturn(CLIENT_ID);
 
         Booking booking = mock(Booking.class);
-        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
         when(booking.getClient()).thenReturn(actualClient);
 
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 3, null);
@@ -149,6 +154,28 @@ class ReviewServiceTest {
 
         assertThatThrownBy(() -> reviewService.createReview(differentClientId, request))
                 .isInstanceOf(ForbiddenException.class);
+
+        verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throw400_when_commentIsBlankWhitespace")
+    void should_throw400_when_commentIsBlankWhitespace() {
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
+        when(booking.getClient()).thenReturn(client);
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 4, "   ");
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(reviewRepository, never()).save(any());
     }
@@ -164,11 +191,10 @@ class ReviewServiceTest {
         when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
         when(booking.getClient()).thenReturn(client);
 
-        Review existingReview = mock(Review.class);
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, null);
 
         when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
-        when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.of(existingReview));
+        when(reviewRepository.existsByBookingId(BOOKING_ID)).thenReturn(true);
 
         assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
                 .isInstanceOf(BusinessException.class)
@@ -210,7 +236,7 @@ class ReviewServiceTest {
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, "Great service");
 
         when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
-        when(reviewRepository.findByBookingId(BOOKING_ID)).thenReturn(Optional.empty());
+        when(reviewRepository.existsByBookingId(BOOKING_ID)).thenReturn(false);
         when(reviewRepository.saveAndFlush(any(Review.class))).thenThrow(new DataIntegrityViolationException("duplicate"));
 
         assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))

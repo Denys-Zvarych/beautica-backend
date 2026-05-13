@@ -24,10 +24,12 @@ public record ReviewResponse(
         String displayName;
         if (firstName == null && lastName == null) {
             displayName = "Anonymous";
+        } else if (firstName != null && lastName != null) {
+            displayName = firstName + " " + lastName.charAt(0) + ".";
+        } else if (firstName != null) {
+            displayName = firstName;
         } else {
-            displayName = (firstName != null ? firstName : "")
-                    + (firstName != null && lastName != null ? " " : "")
-                    + (lastName != null ? lastName.charAt(0) + "." : "");
+            displayName = lastName.charAt(0) + ".";
         }
         return new ReviewResponse(
                 review.getId(),

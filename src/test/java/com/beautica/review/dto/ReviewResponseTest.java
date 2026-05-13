@@ -44,7 +44,7 @@ class ReviewResponseTest {
 
         assertThat(response.id()).isEqualTo(reviewId);
         assertThat(response.masterId()).isEqualTo(masterId);
-        assertThat(response.clientDisplayName()).isEqualTo("Іван Франко");
+        assertThat(response.clientDisplayName()).isEqualTo("Іван Ф.");
         assertThat(response.rating()).isEqualTo(4);
         assertThat(response.comment()).isEqualTo("Great");
         assertThat(response.createdAt().toInstant()).isEqualTo(CREATED_AT);
@@ -52,7 +52,7 @@ class ReviewResponseTest {
     }
 
     @Test
-    @DisplayName("concatenates first and last name with a single space for clientDisplayName")
+    @DisplayName("uses first name and last initial with dot for clientDisplayName (privacy masking)")
     void should_concatFirstAndLastName_when_buildingClientDisplayName() {
         var client = mock(User.class);
         when(client.getFirstName()).thenReturn("Іван");
@@ -70,7 +70,7 @@ class ReviewResponseTest {
 
         var response = ReviewResponse.from(review);
 
-        assertThat(response.clientDisplayName()).isEqualTo("Іван Франко");
+        assertThat(response.clientDisplayName()).isEqualTo("Іван Ф.");
     }
 
     @Test
@@ -118,7 +118,7 @@ class ReviewResponseTest {
     }
 
     @Test
-    @DisplayName("uses lastName only when firstName is null")
+    @DisplayName("uses last initial with dot when firstName is null (privacy masking)")
     void should_useLastNameOnly_when_firstNameIsNull() {
         var client = mock(User.class);
         when(client.getFirstName()).thenReturn(null);
@@ -136,6 +136,6 @@ class ReviewResponseTest {
 
         var response = ReviewResponse.from(review);
 
-        assertThat(response.clientDisplayName()).isEqualTo("Франко");
+        assertThat(response.clientDisplayName()).isEqualTo("Ф.");
     }
 }

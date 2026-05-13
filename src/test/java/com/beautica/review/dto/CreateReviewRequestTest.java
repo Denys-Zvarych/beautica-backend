@@ -119,4 +119,27 @@ class CreateReviewRequestTest {
         assertThat(violations).isNotEmpty();
         assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
     }
+
+    // -------------------------------------------------------------------------
+    // comment — whitespace-only rejection (@Pattern guard)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("rejects comment when comment consists solely of whitespace")
+    void should_rejectComment_when_commentIsBlankWhitespace() {
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, "   ");
+
+        Set<ConstraintViolation<CreateReviewRequest>> violations = validator.validate(request);
+
+        assertThat(violations).isNotEmpty();
+        assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
+    }
+
+    @Test
+    @DisplayName("accepts comment when comment starts with non-whitespace followed by spaces")
+    void should_acceptComment_when_commentStartsWithNonWhitespace() {
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, "Great service!");
+
+        assertThat(validator.validate(request)).isEmpty();
+    }
 }

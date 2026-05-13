@@ -15,7 +15,8 @@ import java.util.UUID;
 
 public interface ReviewRepository extends JpaRepository<Review, UUID> {
 
-    Optional<Review> findByBookingId(UUID bookingId);
+    // Cheaper than findByBookingId(...).isPresent() — derived as SELECT COUNT(*) > 0.
+    boolean existsByBookingId(UUID bookingId);
 
     // Two-query pattern — avoids HHH90003004 (Hibernate in-memory pagination warning).
     // Step 1: paginate on IDs only — SQL LIMIT/OFFSET, no JOIN FETCH.
