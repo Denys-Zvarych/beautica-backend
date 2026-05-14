@@ -7,7 +7,6 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.security.AuthorizationService;
-import com.beautica.config.CacheConfig;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -25,6 +24,9 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.concurrent.ConcurrentMapCache;
+import org.springframework.cache.support.SimpleCacheManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -39,6 +41,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -49,18 +52,30 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {BookingService.class, CacheConfig.class},
+        classes = {BookingService.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @Import(BookingServiceCacheTest.FixedClockConfig.class)
 @DisplayName("BookingService — @CacheEvict behaviour")
 class BookingServiceCacheTest {
 
+    @EnableCaching
     @TestConfiguration
     static class FixedClockConfig {
         @Bean
         Clock clock() {
             return Clock.fixed(Instant.parse("2026-05-08T10:00:00Z"), ZoneId.of("Europe/Kyiv"));
+        }
+
+        @Bean
+        CacheManager cacheManager() {
+            SimpleCacheManager m = new SimpleCacheManager();
+            m.setCaches(List.of(
+                    new ConcurrentMapCache("master-calendar"),
+                    new ConcurrentMapCache("revenue-dashboard"),
+                    new ConcurrentMapCache("available-slots")
+            ));
+            return m;
         }
 
         @Bean

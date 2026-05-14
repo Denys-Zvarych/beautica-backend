@@ -43,6 +43,9 @@ class GlobalExceptionHandlerTest {
     @BeforeEach
     void attachListAppender() {
         Logger handlerLogger = (Logger) LoggerFactory.getLogger(GlobalExceptionHandler.class);
+        // Force DEBUG so the appender receives events regardless of the active log profile.
+        // CI runs with -PtestLogLevel=INFO which would suppress debug() calls otherwise.
+        handlerLogger.setLevel(Level.DEBUG);
         listAppender = new ListAppender<>();
         listAppender.start();
         handlerLogger.addAppender(listAppender);
@@ -52,6 +55,7 @@ class GlobalExceptionHandlerTest {
     void detachListAppender() {
         Logger handlerLogger = (Logger) LoggerFactory.getLogger(GlobalExceptionHandler.class);
         handlerLogger.detachAppender(listAppender);
+        handlerLogger.setLevel(null);
         listAppender.stop();
     }
 
