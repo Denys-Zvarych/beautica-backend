@@ -1,10 +1,17 @@
 package com.beautica.common.exception;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import jakarta.validation.constraints.NotNull;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.MethodParameter;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -16,6 +23,8 @@ import org.springframework.web.multipart.support.MissingServletRequestPartExcept
 
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -24,6 +33,27 @@ import static org.mockito.Mockito.when;
 class GlobalExceptionHandlerTest {
 
     private final GlobalExceptionHandler handler = new GlobalExceptionHandler();
+
+    // ── Logback ListAppender wiring ───────────────────────────────────────────
+    // Attached to the GlobalExceptionHandler logger so tests can assert
+    // that DEBUG-level messages are emitted without leaking to the client.
+
+    private ListAppender<ILoggingEvent> listAppender;
+
+    @BeforeEach
+    void attachListAppender() {
+        Logger handlerLogger = (Logger) LoggerFactory.getLogger(GlobalExceptionHandler.class);
+        listAppender = new ListAppender<>();
+        listAppender.start();
+        handlerLogger.addAppender(listAppender);
+    }
+
+    @AfterEach
+    void detachListAppender() {
+        Logger handlerLogger = (Logger) LoggerFactory.getLogger(GlobalExceptionHandler.class);
+        handlerLogger.detachAppender(listAppender);
+        listAppender.stop();
+    }
 
     @Test
     @DisplayName("Should return safe message when enum error occurs on array element")
@@ -124,9 +154,9 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("Should return 403 when ForbiddenException is thrown")
+    @DisplayName("Should return 403 with generic message when ForbiddenException is thrown")
     void should_return403_when_forbiddenExceptionThrown() {
-        // Arrange
+        // Arrange — use an internal message that must NOT be echoed to the client
         var ex = new ForbiddenException("Access denied");
 
         // Act
@@ -140,6 +170,54 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody().success())
                 .as("success must be false")
                 .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("response body must be the generic 'Access denied' string")
+                .isEqualTo("Access denied");
+    }
+
+    @Test
+    @DisplayName("Should not leak internal UUID when ForbiddenException carries master UUID")
+    void should_notLeakUuid_when_forbiddenExceptionContainsMasterUuid() {
+        // Arrange — simulates ForbiddenException("Master " + uuid + " does not own ...") pattern
+        var internalUuid = "550e8400-e29b-41d4-a716-446655440000";
+        var ex = new ForbiddenException("Master " + internalUuid + " does not own this booking");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleForbidden(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 403")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+
+        assertThat(response.getBody().message())
+                .as("response must not leak the UUID from the internal exception message")
+                .doesNotContain(internalUuid)
+                .isEqualTo("Access denied");
+    }
+
+    @Test
+    @DisplayName("handleForbidden — internal message is emitted at DEBUG level so ops can triage without client exposure")
+    void should_emitDebugLog_when_forbiddenExceptionThrown() {
+        // Arrange — internal message that must appear in the server log but NOT in the response body
+        String internalMessage = "Master 550e8400-e29b-41d4-a716-446655440000 does not own salon abc";
+        var ex = new ForbiddenException(internalMessage);
+        listAppender.list.clear();
+
+        // Act
+        handler.handleForbidden(ex);
+
+        // Assert — exactly one DEBUG event was emitted containing the internal message
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleForbidden must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must contain the original internal message for ops visibility")
+                .contains(internalMessage);
     }
 
     @Test

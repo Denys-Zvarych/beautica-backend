@@ -48,9 +48,12 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ForbiddenException.class)
     public ResponseEntity<ApiResponse<Void>> handleForbidden(ForbiddenException ex) {
+        // Log the original message at DEBUG for server-side triage — never echoed to the
+        // client because it may contain internal UUIDs or data model details (Anti-Bug § I).
+        log.debug("Forbidden: {}", ex.getMessage());
         return ResponseEntity
                 .status(HttpStatus.FORBIDDEN)
-                .body(ApiResponse.error(ex.getMessage()));
+                .body(ApiResponse.error("Access denied"));
     }
 
     @ExceptionHandler(AuthorizationDeniedException.class)

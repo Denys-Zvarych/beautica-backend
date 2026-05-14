@@ -8,6 +8,7 @@ import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.service.R2StorageService;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -29,6 +30,8 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.util.List;
 import java.util.UUID;
+
+import org.springframework.data.domain.Pageable;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -215,14 +218,16 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 new HttpEntity<>(new HttpHeaders()),
                 String.class);
 
-        // Assert
+        // Assert — endpoint now returns Page<MediaFileResponse>; unwrap via JsonNode to read content[]
         assertThat(listResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(
-                listResp.getBody(), new TypeReference<ApiResponse<List<MediaFileResponse>>>() {});
-        assertThat(body.data())
+        JsonNode root = objectMapper.readTree(listResp.getBody());
+        JsonNode contentNode = root.path("data").path("content");
+        List<MediaFileResponse> items = objectMapper.convertValue(
+                contentNode, new TypeReference<List<MediaFileResponse>>() {});
+        assertThat(items)
                 .as("public portfolio listing must contain all 3 uploaded items for salon=%s", salonId)
                 .hasSize(3);
-        assertThat(body.data())
+        assertThat(items)
                 .allSatisfy(item -> {
                     assertThat(item.id()).as("id non-null").isNotNull();
                     assertThat(item.entityType()).as("entityType is SALON").isEqualTo(EntityType.SALON);
@@ -246,8 +251,8 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
     // ── Phase 7.7 — portfolio cache hit + post-write eviction ─────────────────
 
     @Test
-    @DisplayName("GET /salons/{id}/portfolio twice — repository is hit exactly once (cache hit on 2nd call)")
-    void should_returnCachedPortfolio_when_calledTwiceInSuccession() throws Exception {
+    @DisplayName("GET /salons/{id}/portfolio twice — repository is hit twice (paginated path is not cached)")
+    void should_returnPortfolio_when_calledTwiceInSuccession() throws Exception {
         // Arrange
         String ownerEmail = "media-it-cache-hit-" + System.nanoTime() + "@beautica.test";
         UUID ownerId = insertSalonOwner(ownerEmail);
@@ -272,11 +277,14 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
                 new HttpEntity<>(new HttpHeaders()), String.class);
 
-        // Assert — both succeed, repository was hit exactly ONCE across the pair.
+        // Assert — both succeed, repository is hit TWICE (once per call).
+        // The controller dispatches to the paginated overload getPortfolio(EntityType, UUID, Pageable)
+        // which calls findByEntityTypeAndEntityId(EntityType, UUID, Pageable). The paginated path
+        // is intentionally not cached (cache-key explosion per page/size), so both GETs reach the repo.
         assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
-        verify(mediaRepository, times(1))
-                .findByEntityTypeAndEntityId(eq(EntityType.SALON), eq(salonId));
+        verify(mediaRepository, times(2))
+                .findByEntityTypeAndEntityId(eq(EntityType.SALON), eq(salonId), any(Pageable.class));
     }
 
     @Test
@@ -293,9 +301,10 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
                 new HttpEntity<>(new HttpHeaders()), String.class);
         assertThat(empty.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var emptyBody = objectMapper.readValue(
-                empty.getBody(), new TypeReference<ApiResponse<List<MediaFileResponse>>>() {});
-        assertThat(emptyBody.data())
+        JsonNode emptyRoot = objectMapper.readTree(empty.getBody());
+        List<MediaFileResponse> emptyItems = objectMapper.convertValue(
+                emptyRoot.path("data").path("content"), new TypeReference<List<MediaFileResponse>>() {});
+        assertThat(emptyItems)
                 .as("first GET — cache must reflect the empty DB state")
                 .isEmpty();
 
@@ -311,11 +320,12 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
                 new HttpEntity<>(new HttpHeaders()), String.class);
         assertThat(populated.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var populatedBody = objectMapper.readValue(
-                populated.getBody(), new TypeReference<ApiResponse<List<MediaFileResponse>>>() {});
+        JsonNode populatedRoot = objectMapper.readTree(populated.getBody());
+        List<MediaFileResponse> populatedItems = objectMapper.convertValue(
+                populatedRoot.path("data").path("content"), new TypeReference<List<MediaFileResponse>>() {});
 
         // Assert — eviction happened: the second GET sees the uploaded photo.
-        assertThat(populatedBody.data())
+        assertThat(populatedItems)
                 .as("second GET — cache must have been evicted on upload, exposing the new row")
                 .hasSize(1);
     }

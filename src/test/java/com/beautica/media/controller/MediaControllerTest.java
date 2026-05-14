@@ -36,10 +36,16 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import org.springframework.web.multipart.MultipartFile;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -48,6 +54,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+
+import org.mockito.ArgumentCaptor;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -278,7 +286,7 @@ class MediaControllerTest {
     // ── GET /api/v1/salons/{salonId}/portfolio — public ──────────────────────
 
     @Test
-    @DisplayName("GET /salons/{id}/portfolio — 200 without authentication (public endpoint)")
+    @DisplayName("GET /salons/{id}/portfolio — 200 without authentication (public endpoint, paginated)")
     void should_return200_when_publicGetSalonPortfolio() throws Exception {
         var salonId = UUID.randomUUID();
         var mediaId = UUID.randomUUID();
@@ -286,32 +294,60 @@ class MediaControllerTest {
                 mediaId, EntityType.SALON, salonId,
                 com.beautica.media.entity.MediaType.PORTFOLIO,
                 "https://cdn.example/p.jpg", Instant.now());
-        when(mediaService.getPortfolio(eq(EntityType.SALON), eq(salonId)))
-                .thenReturn(List.of(stub));
+        Page<MediaFileResponse> page = new PageImpl<>(List.of(stub), PageRequest.of(0, 20), 1);
+        when(mediaService.getPortfolio(eq(EntityType.SALON), eq(salonId), any()))
+                .thenReturn(page);
 
         log.debug("Act: GET /api/v1/salons/{}/portfolio without authentication", salonId);
         mockMvc.perform(get("/api/v1/salons/" + salonId + "/portfolio")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.length()").value(1));
+                .andExpect(jsonPath("$.data.content.length()").value(1))
+                .andExpect(jsonPath("$.data.totalElements").value(1));
     }
 
     // ── GET /api/v1/masters/{masterId}/portfolio — public ────────────────────
 
     @Test
-    @DisplayName("GET /masters/{id}/portfolio — 200 without authentication (public endpoint)")
+    @DisplayName("GET /masters/{id}/portfolio — 200 without authentication (public endpoint, paginated)")
     void should_return200_when_publicGetMasterPortfolio() throws Exception {
         var masterId = UUID.randomUUID();
-        when(mediaService.getPortfolio(eq(EntityType.MASTER), eq(masterId)))
-                .thenReturn(List.of());
+        when(mediaService.getPortfolio(eq(EntityType.MASTER), eq(masterId), any()))
+                .thenReturn(Page.empty());
 
         log.debug("Act: GET /api/v1/masters/{}/portfolio without authentication", masterId);
         mockMvc.perform(get("/api/v1/masters/" + masterId + "/portfolio")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.length()").value(0));
+                .andExpect(jsonPath("$.data.content.length()").value(0))
+                .andExpect(jsonPath("$.data.totalElements").value(0));
+    }
+
+    @Test
+    @DisplayName("GET /salons/{id}/portfolio — size=101 is capped to 100 by spring.data.web.pageable.max-page-size")
+    void should_capPageSize_when_callerRequestsMoreThanMaxPageSize() throws Exception {
+        var salonId = UUID.randomUUID();
+        // Service stub accepts any Pageable — the assertion is on the Pageable argument
+        // captured by Mockito, which proves the framework capped the caller-supplied size.
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        when(mediaService.getPortfolio(eq(EntityType.SALON), eq(salonId), pageableCaptor.capture()))
+                .thenReturn(Page.empty());
+
+        log.debug("Act: GET /api/v1/salons/{}/portfolio?size=101 — framework must cap to 100", salonId);
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/portfolio")
+                        .param("size", "101")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        // Assert — Spring Data Web capped the effective page size at the max-page-size=100 ceiling
+        // configured in application.yml. If the property were absent or misconfigured in the test
+        // profile the captor would see size=101 and this assertion fails, exposing the regression.
+        Pageable captured = pageableCaptor.getValue();
+        assertThat(captured.getPageSize())
+                .as("max-page-size=100 from application.yml must cap caller-supplied size=101 to 100")
+                .isLessThanOrEqualTo(100);
     }
 
     // ── INDEPENDENT_MASTER role coverage ──────────────────────────────────────
