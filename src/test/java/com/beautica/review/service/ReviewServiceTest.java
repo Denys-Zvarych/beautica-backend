@@ -410,4 +410,28 @@ class ReviewServiceTest {
         assertThatThrownBy(() -> reviewService.getReview(REVIEW_ID))
                 .isInstanceOf(NotFoundException.class);
     }
+
+    // ── getReviewsForMaster — timing oracle (FIX 5) ──────────────────────────
+
+    @Test
+    @DisplayName("should_return_empty_page_when_masterId_does_not_exist")
+    void should_return_empty_page_when_masterId_does_not_exist() {
+        // Arrange — unknown master: repository returns empty page (no rows)
+        UUID unknownMasterId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(unknownMasterId, PageRequest.of(0, 20)))
+                .thenReturn(Page.empty(pageable));
+
+        // Act — must not throw NotFoundException; same shape as a master with zero reviews
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(unknownMasterId, pageable);
+
+        // Assert — empty page returned; timing oracle is not present
+        assertThat(result.isEmpty())
+                .as("unknown master must produce an empty page, not an exception")
+                .isTrue();
+        assertThat(result.getTotalElements())
+                .as("total elements must be 0 for unknown master")
+                .isZero();
+    }
 }

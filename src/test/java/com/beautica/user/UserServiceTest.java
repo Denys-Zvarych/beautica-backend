@@ -105,6 +105,24 @@ class UserServiceTest {
         verify(userRepository).save(user);
     }
 
+    @Test
+    @DisplayName("updateProfile patches phoneNumber when non-null phoneNumber provided")
+    void should_updatePhoneNumber_when_phoneNumberPatched() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master@example.com", Role.INDEPENDENT_MASTER,
+                "Ivan", "Kovalenko", "+380631111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        UpdateProfileRequest request = new UpdateProfileRequest(null, null, "+380991234567");
+
+        UserProfileResponse response = userService.updateProfile(userId, request);
+
+        assertThat(response.phoneNumber()).isEqualTo("+380991234567");
+        verify(userRepository).save(user);
+    }
+
     private User buildUser(UUID id, String email, Role role,
                            String firstName, String lastName, String phoneNumber) {
         var user = new User(email, "hashed-password", role, firstName, lastName, phoneNumber);

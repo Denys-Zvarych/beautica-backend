@@ -15,6 +15,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
@@ -29,7 +30,18 @@ import java.time.OffsetDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "bookings")
+@Table(
+        name = "bookings",
+        indexes = {
+                // partial index (V43): dashboard revenue — INDEPENDENT_MASTER path
+                // JPA cannot encode WHERE status='COMPLETED' — predicate lives in V43 only;
+                // do NOT remove it from the migration thinking the annotation is the source of truth.
+                @Index(name = "idx_bookings_master_completed_starts_at", columnList = "master_id, starts_at"),
+                // partial index (V43): dashboard revenue — SALON_OWNER path
+                // same JPA partial-index limitation as above; V43 is authoritative for the WHERE clause.
+                @Index(name = "idx_bookings_salon_completed_starts_at", columnList = "salon_id, starts_at")
+        }
+)
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor

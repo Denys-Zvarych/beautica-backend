@@ -50,10 +50,8 @@ public class ReviewEventListener {
 
     // Evicts only the cached review pages belonging to the given master.
     //
-    // The "reviews-by-master" cache uses string keys of the form
-    // "<masterId>:<pageNumber>:<pageSize>" (see ReviewService.getReviewsForMaster).
-    // All pages for a master share the same UUID prefix, so a startsWith check
-    // evicts exactly those entries and leaves all other masters' pages intact.
+    // Cache keys use the format "master:<uuid>:page:<n>:size:<m>" (set in ReviewService).
+    // Prefix scan on "master:<uuid>:" is safe — the UUID delimiter ':' cannot appear inside a UUID.
     //
     // Coupling note: getNativeCache() returns Caffeine's public Cache<Object,Object>.
     // If the cache manager backend ever changes away from Caffeine, this method must be updated.
@@ -65,7 +63,7 @@ public class ReviewEventListener {
             return;
         }
         Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
-        String prefix = masterId.toString() + ':';
+        String prefix = "master:" + masterId + ":";
         nativeCache.invalidateAll(
                 nativeCache.asMap().keySet().stream()
                         .filter(k -> k instanceof String s && s.startsWith(prefix))

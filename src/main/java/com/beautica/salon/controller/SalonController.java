@@ -112,8 +112,9 @@ public class SalonController {
     }
 
     private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token) {
-            return (UUID) token.getDetails();
+        if (authentication instanceof UsernamePasswordAuthenticationToken token
+                && token.getDetails() instanceof UUID id) {
+            return id;
         }
         throw new com.beautica.common.exception.ForbiddenException("Not authenticated");
     }

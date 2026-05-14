@@ -18,7 +18,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -111,8 +110,11 @@ public class SearchService {
      */
     @Cacheable(
             value = "search:masters",
-            key = "#request.toString() + ':' + #pageable.pageNumber + ':' + #pageable.pageSize",
-            condition = "#pageable.pageNumber < 5"
+            key = "{#request.city, #request.region, #request.category, " +
+                  "#request.minPrice, #request.maxPrice, #request.minRating, " +
+                  "#pageable.pageNumber, #pageable.pageSize}",
+            condition = "#pageable.pageNumber < 5",
+            sync = true
     )
     @Transactional(readOnly = true)
     public Page<MasterSearchResult> searchMasters(MasterSearchRequest request, Pageable pageable) {
@@ -149,9 +151,9 @@ public class SearchService {
      */
     @Cacheable(
             value = "search:salons",
-            key = "T(java.util.Objects).toString(#city) + '|' + T(java.util.Objects).toString(#region) "
-                    + "+ ':' + #pageable.pageNumber + ':' + #pageable.pageSize",
-            condition = "#pageable.pageNumber < 5"
+            key = "{#city, #region, #pageable.pageNumber, #pageable.pageSize}",
+            condition = "#pageable.pageNumber < 5",
+            sync = true
     )
     @Transactional(readOnly = true)
     public Page<SalonSearchResult> searchSalons(String city, String region, Pageable pageable) {
@@ -258,7 +260,7 @@ public class SearchService {
             if (isCountQuery) {
                 sb.append("GROUP BY m.id ");
             } else {
-                sb.append("GROUP BY m.id, m.user_id, u.first_name, u.last_name, u.city, ")
+                sb.append("GROUP BY m.id, u.first_name, u.last_name, u.city, ")
                         .append("m.avg_rating, m.review_count ");
             }
         }
@@ -275,14 +277,14 @@ public class SearchService {
             sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id ");
             sb.append("LIMIT :limit OFFSET :offset");
             params.put("limit", pageable.getPageSize());
-            params.put("offset", (long) pageable.getPageNumber() * pageable.getPageSize());
+            params.put("offset", pageable.getOffset());
         }
 
         return new SqlAndParams(sb.toString(), params);
     }
 
     private static void appendDataSelect(StringBuilder sb, boolean needsServiceJoin) {
-        sb.append("SELECT m.id AS master_id, m.user_id AS user_id, ")
+        sb.append("SELECT m.id AS master_id, ")
                 .append("u.first_name AS first_name, u.last_name AS last_name, u.city AS city, ")
                 .append("m.avg_rating AS avg_rating, m.review_count AS review_count, ");
         // Avatar column does not yet exist on users/masters (no migration added it
@@ -383,16 +385,16 @@ public class SearchService {
     }
 
     /**
-     * Converts the {@code Double minRating} on the request DTO to a
-     * {@code BigDecimal} with scale 2, matching {@code masters.avg_rating}
-     * (NUMERIC(3,2)). Direct {@code Double} → {@code NUMERIC} comparison
-     * exhibits float drift on boundary values (4.10 vs 4.0999...).
+     * Normalises the {@code BigDecimal minRating} from the request DTO to scale 2,
+     * matching {@code masters.avg_rating} (NUMERIC(3,2)). The DTO field is already
+     * {@code BigDecimal}, so no float-to-decimal conversion is needed; we only enforce
+     * consistent scale so {@code 4.1} and {@code 4.10} produce identical DB parameters.
      */
-    private static BigDecimal normalizeRating(Double minRating) {
+    private static BigDecimal normalizeRating(BigDecimal minRating) {
         if (minRating == null) {
             return null;
         }
-        return BigDecimal.valueOf(minRating).setScale(RATING_SCALE, RoundingMode.HALF_UP);
+        return minRating.setScale(RATING_SCALE, java.math.RoundingMode.HALF_UP);
     }
 
     private static String nullIfBlank(String value) {
@@ -410,25 +412,25 @@ public class SearchService {
      * rather than direct casts to avoid {@code ClassCastException} drift if a
      * future Postgres/JDBC bump changes the surface type.
      *
-     * <p>The projection is a stable 9-column shape regardless of the join
-     * variant — column 8 is {@code avatar_url} (currently always NULL) and
-     * column 9 is {@code min_effective_price} (NULL when no service-join was
+     * <p>The projection is a stable 8-column shape regardless of the join
+     * variant — column 7 is {@code avatar_url} (currently always NULL) and
+     * column 8 is {@code min_effective_price} (NULL when no service-join was
      * needed, populated from the {@code MIN(COALESCE(...))} aggregate otherwise).
+     * {@code user_id} was removed from the projection: it is an internal identifier
+     * that must not be exposed on a {@code permitAll} endpoint.
      */
     private static MasterSearchResult mapMasterRow(Object[] row) {
         UUID masterId = (UUID) row[0];
-        UUID userId = (UUID) row[1];
-        String firstName = (String) row[2];
-        String lastName = (String) row[3];
-        String city = (String) row[4];
-        Double avgRating = row[5] == null ? null : ((BigDecimal) row[5]).doubleValue();
-        Integer reviewCount = row[6] == null ? null : ((Number) row[6]).intValue();
-        String avatarUrl = (String) row[7];
-        BigDecimal minEffectivePrice = (BigDecimal) row[8];
+        String firstName = (String) row[1];
+        String lastName = (String) row[2];
+        String city = (String) row[3];
+        Double avgRating = row[4] == null ? null : ((BigDecimal) row[4]).doubleValue();
+        Integer reviewCount = row[5] == null ? null : ((Number) row[5]).intValue();
+        String avatarUrl = (String) row[6];
+        BigDecimal minEffectivePrice = (BigDecimal) row[7];
 
         return new MasterSearchResult(
                 masterId,
-                userId,
                 firstName,
                 lastName,
                 city,

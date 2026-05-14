@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -11,6 +12,8 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 @EnableScheduling
 public class SchedulingConfig {
 
+    private static final Logger log = LoggerFactory.getLogger(SchedulingConfig.class);
+
     @Bean
     public TaskScheduler taskScheduler() {
         ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
@@ -19,8 +22,7 @@ public class SchedulingConfig {
         scheduler.setWaitForTasksToCompleteOnShutdown(true);
         scheduler.setAwaitTerminationSeconds(20);
         scheduler.setErrorHandler(t ->
-                LoggerFactory.getLogger(SchedulingConfig.class)
-                        .error("Scheduled task error [{}]: {}", t.getClass().getSimpleName(), t.getMessage()));
+                log.error("Scheduled task error [{}]: {}", t.getClass().getSimpleName(), t.getMessage()));
         return scheduler;
     }
 }

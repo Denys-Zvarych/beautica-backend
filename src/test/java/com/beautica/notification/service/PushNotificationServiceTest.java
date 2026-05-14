@@ -14,6 +14,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.lang.reflect.Field;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -158,6 +159,65 @@ class PushNotificationServiceTest {
         Field titleField = notification.getClass().getDeclaredField("title");
         titleField.setAccessible(true);
         return (String) titleField.get(notification);
+    }
+
+    private static String getBodyFromMessage(Message message) throws Exception {
+        Field notifField = Message.class.getDeclaredField("notification");
+        notifField.setAccessible(true);
+        Object notification = notifField.get(message);
+
+        Field bodyField = notification.getClass().getDeclaredField("body");
+        bodyField.setAccessible(true);
+        return (String) bodyField.get(notification);
+    }
+
+    @Test
+    @DisplayName("should truncate body when body exceeds limit")
+    void should_truncateBody_when_bodyExceedsLimit() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(UUID.randomUUID(), "fcm-token-body");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
+        String longBody = "B".repeat(600);
+        ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+
+        pushNotificationService.sendToUser(userId, "Title", longBody, Map.of());
+
+        verify(firebaseSender).send(captor.capture());
+        String capturedBody = getBodyFromMessage(captor.getValue());
+        assertThat(capturedBody).isNotNull();
+        assertThat(capturedBody.length()).isLessThanOrEqualTo(500);
+    }
+
+    @Test
+    @DisplayName("should not throw and should not delete token when unexpected RuntimeException occurs")
+    void should_notThrowAndNotDeleteToken_when_unexpectedRuntimeException() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(UUID.randomUUID(), "fcm-runtime-err-token");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
+        doThrow(new RuntimeException("unexpected")).when(firebaseSender).send(any(Message.class));
+
+        assertThatCode(() -> pushNotificationService.sendToUser(userId, "T", "B", Map.of()))
+                .doesNotThrowAnyException();
+        verify(deviceTokenRepository, never()).deleteByUserIdAndTokenIn(any(), any());
+    }
+
+    @Test
+    @DisplayName("should batch-delete both stale tokens when two tokens return UNREGISTERED")
+    void should_batchDeleteBothStaleTokens_when_twoTokensReturnUnregistered() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token1 = buildSummary(UUID.randomUUID(), "stale-token-1");
+        DeviceTokenRepository.DeviceTokenSummary token2 = buildSummary(UUID.randomUUID(), "stale-token-2");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token1, token2));
+
+        FirebaseMessagingException mockEx = mock(FirebaseMessagingException.class);
+        when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.UNREGISTERED);
+        doThrow(mockEx).when(firebaseSender).send(any(Message.class));
+
+        pushNotificationService.sendToUser(userId, "Title", "Body", Map.of());
+
+        ArgumentCaptor<Collection<String>> tokensCaptor = ArgumentCaptor.forClass(Collection.class);
+        verify(deviceTokenRepository, times(1)).deleteByUserIdAndTokenIn(eq(userId), tokensCaptor.capture());
+        assertThat(tokensCaptor.getValue()).containsExactlyInAnyOrder("stale-token-1", "stale-token-2");
     }
 
     private DeviceTokenRepository.DeviceTokenSummary buildSummary(UUID id, String rawToken) {

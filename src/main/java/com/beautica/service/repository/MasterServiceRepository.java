@@ -31,6 +31,42 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
 
     boolean existsByMasterIdAndServiceDefinitionId(UUID masterId, UUID serviceDefinitionId);
 
+    /**
+     * Returns true if any active master service assignment uses the given service definition
+     * and belongs to a master in one of the provided salons.
+     *
+     * <p>Used by {@code DashboardService} to validate that a {@code serviceDefId} filter
+     * belongs to the SALON_OWNER's scope before binding it to the revenue query (FIX 3).
+     */
+    @Query("""
+            SELECT COUNT(msa) > 0
+            FROM MasterServiceAssignment msa
+            WHERE msa.serviceDefinition.id = :serviceDefId
+              AND msa.master.salon.id IN :salonIds
+              AND msa.isActive = true
+            """)
+    boolean existsByServiceDefIdAndSalonIdIn(
+            @Param("serviceDefId") UUID serviceDefId,
+            @Param("salonIds") List<UUID> salonIds);
+
+    /**
+     * Returns true if any active master service assignment uses the given service definition
+     * and belongs to the given master.
+     *
+     * <p>Used by {@code DashboardService} to validate that a {@code serviceDefId} filter
+     * belongs to the INDEPENDENT_MASTER's scope (FIX 3).
+     */
+    @Query("""
+            SELECT COUNT(msa) > 0
+            FROM MasterServiceAssignment msa
+            WHERE msa.serviceDefinition.id = :serviceDefId
+              AND msa.master.id = :masterId
+              AND msa.isActive = true
+            """)
+    boolean existsByServiceDefIdAndMasterId(
+            @Param("serviceDefId") UUID serviceDefId,
+            @Param("masterId") UUID masterId);
+
     @Query("""
             SELECT msa FROM MasterServiceAssignment msa
             JOIN FETCH msa.serviceDefinition sd

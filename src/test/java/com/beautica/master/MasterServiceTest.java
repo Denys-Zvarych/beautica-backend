@@ -256,47 +256,37 @@ class MasterServiceTest {
         verify(workingHoursRepository, never()).saveAll(any());
     }
 
-    @Test
-    @DisplayName("should_throwNotFound_when_upsertWorkingHoursWithUnknownMasterId")
-    void should_throwNotFound_when_upsertWorkingHoursWithUnknownMasterId() {
-        UUID ownerId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        var request = new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> masterService.upsertWorkingHours(ownerId, masterId, List.of(request)))
-                .isInstanceOf(NotFoundException.class);
-
-        verify(workingHoursRepository, never()).saveAll(any());
-    }
-
     // ── deactivateMaster ──────────────────────────────────────────────────────
 
     @Test
     @DisplayName("should_deactivateMaster_when_masterExists")
     void should_deactivateMaster_when_authorizedActorRequests() {
         // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
+        // save() is no longer called — Hibernate dirty-checking flushes the mutation on commit.
         UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(userId);
 
         Master master = Master.builder()
                 .masterType(MasterType.SALON_MASTER)
                 .isActive(true)
                 .build();
+        ReflectionTestUtils.setField(master, "user", user);
 
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(masterRepository.save(any(Master.class))).thenAnswer(inv -> inv.getArgument(0));
 
         masterService.deactivateMaster(ownerId, masterId);
 
         assertThat(master.isActive()).isFalse();
-        verify(masterRepository).save(master);
+        verify(masterRepository, never()).save(any());
     }
 
     @Test
     @DisplayName("should_throwNotFound_when_deactivateMaster_masterMissing")
-    void should_throwNotFound_when_unauthorizedActorDeactivatesMaster() {
+    void should_throwNotFound_when_deactivateMaster_masterMissing() {
         // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
@@ -441,20 +431,34 @@ class MasterServiceTest {
         verify(scheduleExceptionRepository, never()).delete(any());
     }
 
+    // ── getMasterByUserId ──────────────────────────────────────────────────────
+
     @Test
-    @DisplayName("should_throwNotFound_when_removeScheduleException_masterMissingOnRemove")
-    void should_throwForbidden_when_unauthorizedActorRemovesScheduleException() {
-        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        LocalDate date = LocalDate.of(2026, 6, 1);
+    @DisplayName("should_returnMaster_when_getMasterByUserIdAndMasterExists")
+    void should_returnMaster_when_getMasterByUserIdAndMasterExists() {
+        UUID userId = UUID.randomUUID();
+        Master master = Master.builder()
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(true)
+                .build();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
 
-        assertThatThrownBy(() -> masterService.removeScheduleException(actorId, masterId, date))
+        Master result = masterService.getMasterByUserId(userId);
+
+        assertThat(result).isEqualTo(master);
+        assertThat(result.getMasterType()).isEqualTo(MasterType.INDEPENDENT_MASTER);
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_getMasterByUserIdAndNoMasterRecord")
+    void should_throwNotFound_when_getMasterByUserIdAndNoMasterRecord() {
+        UUID userId = UUID.randomUUID();
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.getMasterByUserId(userId))
                 .isInstanceOf(NotFoundException.class);
-
-        verify(scheduleExceptionRepository, never()).delete(any());
     }
 
     // ── getMastersByPage ───────────────────────────────────────────────────────

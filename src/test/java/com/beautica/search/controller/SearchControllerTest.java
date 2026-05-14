@@ -112,7 +112,6 @@ class SearchControllerTest {
     private static MasterSearchResult sampleMasterResult() {
         return new MasterSearchResult(
                 UUID.randomUUID(),
-                UUID.randomUUID(),
                 "Olha",
                 "Master",
                 "Київ",
@@ -249,6 +248,21 @@ class SearchControllerTest {
     }
 
     @Test
+    @DisplayName("GET /api/v1/search/masters — response must not contain userId (internal UUID must not leak to anonymous callers)")
+    void should_not_expose_userId_in_publicMasterSearchResponse() throws Exception {
+        MasterSearchResult result = sampleMasterResult();
+        Page<MasterSearchResult> page = new PageImpl<>(List.of(result), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[*].userId").doesNotExist());
+    }
+
+    @Test
     @DisplayName("GET /api/v1/search/masters — 400 when minPrice exceeds maxPrice (service-layer cross-field check)")
     void should_return400_when_minPriceExceedsMaxPrice() throws Exception {
         when(searchService.searchMasters(any(MasterSearchRequest.class), any(Pageable.class)))
@@ -301,5 +315,57 @@ class SearchControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.totalElements").value(1));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when page is negative (validates @PositiveOrZero)")
+    void should_return400_when_negativePage_forSalonSearch() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "-1")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when ?size exceeds 100 (@Max enforcement)")
+    void should_return400_when_sizeExceedsMax_forSalonSearch() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "101")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when ?page exceeds 500 (tightened cap)")
+    void should_return400_when_pageExceedsTightenedCap_forSalonSearch() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "501")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when ?size is zero (@Positive lower bound)")
+    void should_return400_when_sizeIsZero() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "0")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 with default paging when page and size are absent")
+    void should_return200_with_defaultPaging_when_pageAndSizeAbsentFromRequest() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
     }
 }

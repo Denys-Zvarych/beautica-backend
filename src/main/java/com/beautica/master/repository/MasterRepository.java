@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -30,6 +31,13 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
 
     boolean existsByIdAndSalonId(UUID id, UUID salonId);
+
+    /**
+     * Returns {@code true} if a master with the given {@code id} belongs to any of the
+     * provided {@code salonIds}. Collapses the N-query ownership loop into a single
+     * {@code WHERE id = ? AND salon_id IN (...)} existence check.
+     */
+    boolean existsByIdAndSalonIdIn(UUID id, Collection<UUID> salonIds);
 
     /**
      * Eagerly fetches the master together with its user, salon, and salon owner.

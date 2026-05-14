@@ -1,12 +1,19 @@
 package com.beautica.media.service;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.common.exception.BusinessException;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -17,7 +24,10 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -48,6 +58,117 @@ class R2StorageServiceTest {
 
     @Mock
     private S3Client s3Client;
+
+    // ── Logback ListAppender wiring ───────────────────────────────────────────
+
+    private ListAppender<ILoggingEvent> listAppender;
+
+    @BeforeEach
+    void attachListAppender() {
+        Logger r2Logger = (Logger) LoggerFactory.getLogger(R2StorageService.class);
+        listAppender = new ListAppender<>();
+        listAppender.start();
+        r2Logger.addAppender(listAppender);
+    }
+
+    @AfterEach
+    void detachListAppender() {
+        Logger r2Logger = (Logger) LoggerFactory.getLogger(R2StorageService.class);
+        r2Logger.detachAppender(listAppender);
+        listAppender.stop();
+    }
+
+    // ── A8: disabled-mode log-key-redaction tests ─────────────────────────────
+
+    private static final Pattern UUID_PATTERN =
+            Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+
+    @Test
+    @DisplayName("disabled-mode uploadFile WARN log contains '[key omitted]' and no UUID-shaped string")
+    void should_redactKeyInLog_when_uploadFileCalledWithR2DisabledAndUuidKey() {
+        // Arrange — key that is UUID-shaped; must not appear in the WARN log
+        String uuidKey = UUID.randomUUID().toString();
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        listAppender.list.clear(); // discard boot-time WARN from constructor
+
+        // Act
+        service.uploadFile(uuidKey, new ByteArrayInputStream(PAYLOAD), PAYLOAD.length, CONTENT_TYPE);
+
+        // Assert
+        List<ILoggingEvent> warns = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warns).as("exactly one WARN emitted during disabled-mode uploadFile").hasSize(1);
+
+        String formattedMessage = warns.get(0).getFormattedMessage();
+        assertThat(formattedMessage)
+                .as("log must contain the sentinel '[key omitted]'")
+                .contains("[key omitted]");
+        assertThat(UUID_PATTERN.matcher(formattedMessage).find())
+                .as("log must not contain a UUID-shaped string (key redacted)")
+                .isFalse();
+        assertThat(formattedMessage)
+                .as("log must not contain the raw key value")
+                .doesNotContain(uuidKey);
+    }
+
+    @Test
+    @DisplayName("disabled-mode deleteFile WARN log contains '[key omitted]' and no UUID-shaped string")
+    void should_redactKeyInLog_when_deleteFileCalledWithR2DisabledAndUuidKey() {
+        // Arrange
+        String uuidKey = UUID.randomUUID().toString();
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        listAppender.list.clear();
+
+        // Act
+        service.deleteFile(uuidKey);
+
+        // Assert
+        List<ILoggingEvent> warns = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warns).as("exactly one WARN emitted during disabled-mode deleteFile").hasSize(1);
+
+        String formattedMessage = warns.get(0).getFormattedMessage();
+        assertThat(formattedMessage)
+                .as("log must contain the sentinel '[key omitted]'")
+                .contains("[key omitted]");
+        assertThat(UUID_PATTERN.matcher(formattedMessage).find())
+                .as("log must not contain a UUID-shaped string (key redacted)")
+                .isFalse();
+        assertThat(formattedMessage)
+                .as("log must not contain the raw key value")
+                .doesNotContain(uuidKey);
+    }
+
+    @Test
+    @DisplayName("disabled-mode buildPublicUrl WARN log contains '[key omitted]' and no UUID-shaped string")
+    void should_redactKeyInLog_when_buildPublicUrlCalledWithR2DisabledAndUuidKey() {
+        // Arrange
+        String uuidKey = UUID.randomUUID().toString();
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        listAppender.list.clear();
+
+        // Act
+        service.buildPublicUrl(uuidKey);
+
+        // Assert
+        List<ILoggingEvent> warns = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warns).as("exactly one WARN emitted during disabled-mode buildPublicUrl").hasSize(1);
+
+        String formattedMessage = warns.get(0).getFormattedMessage();
+        assertThat(formattedMessage)
+                .as("log must contain the sentinel '[key omitted]'")
+                .contains("[key omitted]");
+        assertThat(UUID_PATTERN.matcher(formattedMessage).find())
+                .as("log must not contain a UUID-shaped string (key redacted)")
+                .isFalse();
+        assertThat(formattedMessage)
+                .as("log must not contain the raw key value")
+                .doesNotContain(uuidKey);
+    }
 
     @Test
     @DisplayName("throws IllegalStateException when R2 is enabled and bucket name is blank")
@@ -234,6 +355,71 @@ class R2StorageServiceTest {
         // Sanity: the failing call was attempted exactly once, never silently swallowed.
         verify(s3Client).deleteObject(any(DeleteObjectRequest.class));
         verify(s3Client, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+    }
+
+    // ── MEDIUM-1: enabled-mode error log key redaction ────────────────────────
+
+    @Test
+    @DisplayName("ERROR log omits R2 key and contains '[key omitted]' when uploadFile fails in enabled mode")
+    void should_omitKeyInErrorLog_when_uploadFailsInEnabledMode() {
+        // Arrange
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        listAppender.list.clear();
+        S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
+        when(s3Client.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenThrow(sdkException);
+        InputStream content = new ByteArrayInputStream(PAYLOAD);
+
+        // Act — expect the BusinessException to be thrown; we are testing the log side-effect
+        try {
+            service.uploadFile("test-key", content, PAYLOAD.length, CONTENT_TYPE);
+        } catch (Exception ignored) {
+            // BusinessException is expected — we care only about the ERROR log entry
+        }
+
+        // Assert
+        List<ILoggingEvent> errors = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.ERROR)
+                .toList();
+        assertThat(errors).as("exactly one ERROR log emitted on upload failure").hasSize(1);
+        String formattedMessage = errors.get(0).getFormattedMessage();
+        assertThat(formattedMessage)
+                .as("ERROR log must contain '[key omitted]' sentinel")
+                .contains("[key omitted]");
+        assertThat(formattedMessage)
+                .as("ERROR log must not contain the raw R2 key")
+                .doesNotContain("test-key");
+    }
+
+    @Test
+    @DisplayName("ERROR log omits R2 key and contains '[key omitted]' when deleteFile fails in enabled mode")
+    void should_omitKeyInErrorLog_when_deleteFailsInEnabledMode() {
+        // Arrange
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        listAppender.list.clear();
+        S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
+        when(s3Client.deleteObject(any(DeleteObjectRequest.class)))
+                .thenThrow(sdkException);
+
+        // Act — expect the BusinessException to be thrown; we are testing the log side-effect
+        try {
+            service.deleteFile("test-key");
+        } catch (Exception ignored) {
+            // BusinessException is expected — we care only about the ERROR log entry
+        }
+
+        // Assert
+        List<ILoggingEvent> errors = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.ERROR)
+                .toList();
+        assertThat(errors).as("exactly one ERROR log emitted on delete failure").hasSize(1);
+        String formattedMessage = errors.get(0).getFormattedMessage();
+        assertThat(formattedMessage)
+                .as("ERROR log must contain '[key omitted]' sentinel")
+                .contains("[key omitted]");
+        assertThat(formattedMessage)
+                .as("ERROR log must not contain the raw R2 key")
+                .doesNotContain("test-key");
     }
 
     // ── Fix 9 — null/empty key boundary: pin current behaviour ───────────────

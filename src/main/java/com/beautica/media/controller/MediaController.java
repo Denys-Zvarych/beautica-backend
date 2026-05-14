@@ -23,7 +23,10 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
+
 import java.util.UUID;
 
 /**
@@ -101,13 +104,17 @@ public class MediaController {
     // ── portfolio listings (public) ───────────────────────────────────────────
 
     @GetMapping("/salons/{salonId}/portfolio")
-    public ApiResponse<List<MediaFileResponse>> getSalonPortfolio(@PathVariable UUID salonId) {
-        return ApiResponse.ok(mediaService.getPortfolio(EntityType.SALON, salonId));
+    public ApiResponse<Page<MediaFileResponse>> getSalonPortfolio(
+            @PathVariable UUID salonId,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ApiResponse.ok(mediaService.getPortfolio(EntityType.SALON, salonId, pageable));
     }
 
     @GetMapping("/masters/{masterId}/portfolio")
-    public ApiResponse<List<MediaFileResponse>> getMasterPortfolio(@PathVariable UUID masterId) {
-        return ApiResponse.ok(mediaService.getPortfolio(EntityType.MASTER, masterId));
+    public ApiResponse<Page<MediaFileResponse>> getMasterPortfolio(
+            @PathVariable UUID masterId,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ApiResponse.ok(mediaService.getPortfolio(EntityType.MASTER, masterId, pageable));
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

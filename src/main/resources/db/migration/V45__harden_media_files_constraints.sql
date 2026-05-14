@@ -1,0 +1,14 @@
+-- V45: media_files constraint hardening
+--
+-- NOTE: All three constraints originally requested for this migration were already
+-- applied in V39__harden_media_files_constraints.sql:
+--
+--   chk_media_files_r2_key_shape  (shape + path-traversal guard on r2_key)
+--   chk_media_files_r2_url_scheme (https:// scheme check on r2_url)
+--   chk_media_files_media_type_entity_type (PORTFOLIO only for SALON/MASTER; AVATAR for all)
+--   ux_media_files_avatar (partial UNIQUE index WHERE media_type = 'AVATAR')
+--
+-- V39 uses the constraint name `chk_media_files_r2_key_shape` (not `chk_media_files_r2_key`);
+-- functionally identical coverage. No DDL changes needed in this migration.
+--
+-- This file is retained as a version checkpoint confirming the constraints are present.

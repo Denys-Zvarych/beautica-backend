@@ -396,7 +396,8 @@ class BookingControllerTest {
                         .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.message").value("Booking not found"));
+                // GlobalExceptionHandler returns a generic message (B3 hardening — no model leakage)
+                .andExpect(jsonPath("$.message").value("Resource not found"));
     }
 
     // ── PATCH /{bookingId}/confirm ────────────────────────────────────────────

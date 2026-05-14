@@ -21,6 +21,10 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -286,5 +290,118 @@ class MediaRepositoryTest extends AbstractDataJpaTest {
         assertThat(result).hasSize(2);
         assertThat(statistics.getEntityFetchCount()).isLessThanOrEqualTo(2);
         assertThat(statistics.getEntityLoadCount()).isEqualTo(2);
+    }
+
+    // ── Paginated overload: findByEntityTypeAndEntityId(EntityType, UUID, Pageable) ─
+    // These tests cover the new three-argument overload added in the Phase 9.6
+    // hardening pass. The controller dispatches to this overload on every public
+    // GET portfolio request — a broken derived query would not surface without
+    // repository-level assertions.
+
+    @Test
+    @DisplayName("Paginated finder returns empty Page when no rows exist for (entity_type, entity_id)")
+    void should_returnEmptyPage_when_noMediaExistsForEntity_paginated() {
+        UUID entityId = UUID.randomUUID();
+
+        Page<MediaFile> result = repo.findByEntityTypeAndEntityId(
+                EntityType.SALON, entityId, PageRequest.of(0, 20));
+
+        assertThat(result.getContent())
+                .as("content must be empty when no rows exist")
+                .isEmpty();
+        assertThat(result.getTotalElements())
+                .as("totalElements must be 0")
+                .isZero();
+        assertThat(result.getTotalPages())
+                .as("totalPages must be 0")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("Paginated finder returns correct content and metadata when rows exist")
+    void should_returnPageWithCorrectMetadata_when_rowsExist_paginated() {
+        UUID salonId = UUID.randomUUID();
+        em.persist(buildMedia(uploader, EntityType.SALON, salonId, MediaType.PORTFOLIO));
+        em.persist(buildMedia(uploader, EntityType.SALON, salonId, MediaType.PORTFOLIO));
+        em.persist(buildMedia(uploader, EntityType.SALON, salonId, MediaType.PORTFOLIO));
+        em.flush();
+        em.clear();
+
+        Page<MediaFile> result = repo.findByEntityTypeAndEntityId(
+                EntityType.SALON, salonId, PageRequest.of(0, 20));
+
+        assertThat(result.getContent())
+                .as("content must contain all 3 items on page 0 with size=20")
+                .hasSize(3);
+        assertThat(result.getTotalElements())
+                .as("totalElements must be 3")
+                .isEqualTo(3L);
+        assertThat(result.getTotalPages())
+                .as("totalPages must be 1")
+                .isEqualTo(1);
+        assertThat(result.getContent())
+                .allSatisfy(m -> assertThat(m.getEntityType())
+                        .as("every item must be typed SALON")
+                        .isEqualTo(EntityType.SALON));
+    }
+
+    @Test
+    @DisplayName("Paginated finder returns page 1 items correctly when result set spans two pages")
+    void should_returnSecondPageItems_when_resultSetSpansTwoPages_paginated() {
+        // Arrange — 3 rows, page size 2 → page 0 has 2 items, page 1 has 1 item.
+        UUID masterId = UUID.randomUUID();
+        MediaFile first  = buildMedia(uploader, EntityType.MASTER, masterId, MediaType.PORTFOLIO);
+        MediaFile second = buildMedia(uploader, EntityType.MASTER, masterId, MediaType.PORTFOLIO);
+        MediaFile third  = buildMedia(uploader, EntityType.MASTER, masterId, MediaType.PORTFOLIO);
+        em.persist(first);
+        em.persist(second);
+        em.persist(third);
+        em.flush();
+        em.clear();
+
+        // Act — request page 1 (zero-indexed) with size 2
+        Page<MediaFile> page1 = repo.findByEntityTypeAndEntityId(
+                EntityType.MASTER, masterId, PageRequest.of(1, 2));
+
+        // Assert — offset arithmetic must be correct, not always returning page 0
+        assertThat(page1.getContent())
+                .as("page 1 must contain exactly 1 item when there are 3 total with page size 2")
+                .hasSize(1);
+        assertThat(page1.getTotalElements())
+                .as("totalElements must be 3 regardless of which page is fetched")
+                .isEqualTo(3L);
+        assertThat(page1.getTotalPages())
+                .as("totalPages must be 2")
+                .isEqualTo(2);
+        assertThat(page1.isLast())
+                .as("page 1 must be the last page")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("Paginated finder does not bleed across entity types when the same UUID exists under another type")
+    void should_notBleedAcrossEntityTypes_when_sameEntityIdExistsUnderAnotherType_paginated() {
+        UUID sharedId = UUID.randomUUID();
+        em.persist(buildMedia(uploader, EntityType.SALON, sharedId, MediaType.PORTFOLIO));
+        em.persist(buildMedia(uploader, EntityType.SALON, sharedId, MediaType.PORTFOLIO));
+        em.persist(buildMedia(uploader, EntityType.MASTER, sharedId, MediaType.PORTFOLIO));
+        em.flush();
+        em.clear();
+
+        Page<MediaFile> salonPage = repo.findByEntityTypeAndEntityId(
+                EntityType.SALON, sharedId, PageRequest.of(0, 20));
+        Page<MediaFile> masterPage = repo.findByEntityTypeAndEntityId(
+                EntityType.MASTER, sharedId, PageRequest.of(0, 20));
+
+        assertThat(salonPage.getTotalElements())
+                .as("SALON query must return only the 2 SALON rows")
+                .isEqualTo(2L);
+        assertThat(masterPage.getTotalElements())
+                .as("MASTER query must return only the 1 MASTER row")
+                .isEqualTo(1L);
+        assertThat(salonPage.getContent())
+                .allSatisfy(m -> assertThat(m.getEntityType()).isEqualTo(EntityType.SALON));
+        assertThat(masterPage.getContent())
+                .allSatisfy(m -> assertThat(m.getEntityType()).isEqualTo(EntityType.MASTER));
     }
 }

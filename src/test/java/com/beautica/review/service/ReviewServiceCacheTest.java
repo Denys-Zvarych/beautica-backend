@@ -16,9 +16,14 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -32,7 +37,7 @@ import static org.mockito.Mockito.when;
         classes = {ReviewService.class, CacheConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
-@DisplayName("ReviewService — @Cacheable(\"review-detail\") cache-hit behaviour")
+@DisplayName("ReviewService — @Cacheable cache-hit behaviour")
 class ReviewServiceCacheTest {
 
     @MockBean ReviewRepository reviewRepository;
@@ -43,11 +48,12 @@ class ReviewServiceCacheTest {
     @Autowired CacheManager cacheManager;
 
     @BeforeEach
-    void clearReviewDetailCache() {
-        Cache cache = cacheManager.getCache("review-detail");
-        if (cache != null) {
-            cache.clear();
-        }
+    void clearCaches() {
+        Cache reviewDetail = cacheManager.getCache("review-detail");
+        if (reviewDetail != null) reviewDetail.clear();
+
+        Cache reviewsByMaster = cacheManager.getCache("reviews-by-master");
+        if (reviewsByMaster != null) reviewsByMaster.clear();
     }
 
     @Test
@@ -115,6 +121,47 @@ class ReviewServiceCacheTest {
         verify(reviewRepository, times(1)).findByIdWithAssociations(reviewId2);
         assertThat(first.id()).isEqualTo(reviewId1);
         assertThat(second.id()).isEqualTo(reviewId2);
+    }
+
+    // ── reviews-by-master cache (FIX 13) ─────────────────────────────────────
+
+    @Test
+    @DisplayName("should_returnCachedPage_when_getReviewsForMasterCalledTwice")
+    void should_returnCachedPage_when_getReviewsForMasterCalledTwice() {
+        UUID masterId = UUID.randomUUID();
+        UUID reviewId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+
+        // Arrange — one review page from repository
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn("Olha");
+        when(client.getLastName()).thenReturn("Bondar");
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+
+        Review review = mock(Review.class);
+        when(review.getId()).thenReturn(reviewId);
+        when(review.getClient()).thenReturn(client);
+        when(review.getMaster()).thenReturn(master);
+        when(review.getRating()).thenReturn((short) 4);
+        when(review.getComment()).thenReturn("Good");
+        when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        Page<UUID> idPage = new PageImpl<>(List.of(reviewId), pageable, 1);
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, PageRequest.of(0, 20)))
+                .thenReturn(idPage);
+        when(reviewRepository.findByIdsWithGraph(List.of(reviewId)))
+                .thenReturn(List.of(review));
+
+        // Act — two calls with same masterId + page args
+        Page<ReviewResponse> first  = reviewService.getReviewsForMaster(masterId, pageable);
+        Page<ReviewResponse> second = reviewService.getReviewsForMaster(masterId, pageable);
+
+        // Assert — repository accessed only once; second result is from cache
+        verify(reviewRepository, times(1)).findIdsByMasterIdOrderByCreatedAtDesc(masterId, PageRequest.of(0, 20));
+        assertThat(second.getContent()).hasSize(1);
+        assertThat(second.getContent().get(0).id()).isEqualTo(first.getContent().get(0).id());
     }
 
     private Review buildReview(UUID id, User client, Master master, short rating, String comment) {

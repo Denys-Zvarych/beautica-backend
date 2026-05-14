@@ -29,9 +29,10 @@ import java.util.UUID;
     indexes = {
         @Index(name = "idx_media_files_entity", columnList = "entity_type, entity_id"),
         @Index(name = "idx_media_files_uploader_media", columnList = "uploader_id, media_type"),
-        // ux_media_files_avatar is a partial unique index (media_type = 'AVATAR') defined in V39 migration;
-        // JPA @Index has no WHERE clause support — the actual DB constraint is enforced by the migration only
-        @Index(name = "ux_media_files_avatar", columnList = "entity_type, entity_id", unique = true)
+        // ux_media_files_avatar is a PARTIAL unique index (WHERE media_type = 'AVATAR') defined in V39 migration.
+        // JPA @Index has no WHERE clause support — `unique=true` here would misrepresent a full unique constraint.
+        // The actual partial-unique DB constraint is enforced by the Flyway migration only, not by this annotation.
+        @Index(name = "ux_media_files_avatar", columnList = "entity_type, entity_id")
     }
 )
 @Getter
@@ -62,6 +63,7 @@ public class MediaFile extends AuditableEntity {
     @Column(name = "media_type", nullable = false, length = 20)
     private MediaType mediaType;
 
+    @JsonIgnore
     @Column(name = "r2_key", nullable = false, length = 500)
     private String r2Key;
 

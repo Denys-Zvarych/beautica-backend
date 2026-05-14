@@ -244,7 +244,8 @@ class ServiceCatalogControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.message").value("Category not found"));
+                // GlobalExceptionHandler returns a generic message (B3 hardening — no model leakage)
+                .andExpect(jsonPath("$.message").value("Resource not found"));
     }
 
     // ── POST /api/v1/service-types/suggest ────────────────────────────────────

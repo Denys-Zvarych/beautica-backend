@@ -31,6 +31,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
 
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -152,6 +153,6 @@ public class BookingController {
                 && token.getDetails() instanceof UUID id) {
             return id;
         }
-        throw new IllegalStateException("Authentication details do not contain a UUID principal — JWT filter misconfiguration");
+        throw new ForbiddenException("Not authenticated");
     }
 }

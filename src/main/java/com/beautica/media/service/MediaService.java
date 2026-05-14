@@ -30,6 +30,9 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.Clock;
@@ -303,7 +306,7 @@ public class MediaService {
      * {@code key = "{#entityType, #entityId}"} would produce a {@code List}
      * instead, breaking the eviction match.)
      */
-    @Cacheable(PORTFOLIO_CACHE)
+    @Cacheable(value = PORTFOLIO_CACHE, sync = true)
     @Transactional(readOnly = true)
     public List<MediaFileResponse> getPortfolio(EntityType entityType, UUID entityId) {
         // No need to touch getUploader() — MediaFileResponse.from does not access it,
@@ -311,6 +314,21 @@ public class MediaService {
         return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId).stream()
                 .map(MediaFileResponse::from)
                 .toList();
+    }
+
+    /**
+     * Paginated portfolio listing for the public GET portfolio controller endpoints.
+     *
+     * <p>This overload is intentionally NOT annotated with {@link Cacheable} — each
+     * distinct (page, size, sort) tuple would produce a separate Caffeine entry,
+     * creating unbounded heap growth proportional to the number of unique query
+     * combinations. The 5-min TTL on the non-paginated {@link #getPortfolio(EntityType, UUID)}
+     * variant is sufficient for the internal cached path (Anti-Bug Playbook § F rule 6).
+     */
+    @Transactional(readOnly = true)
+    public Page<MediaFileResponse> getPortfolio(EntityType entityType, UUID entityId, Pageable pageable) {
+        return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId, pageable)
+                .map(MediaFileResponse::from);
     }
 
     /**
@@ -355,8 +373,9 @@ public class MediaService {
             try {
                 r2.deleteFile(row.getR2Key());
             } catch (RuntimeException ex) {
-                log.warn("R2 delete failed during deleteByUploader sweep (uploader={}, key={}): {}",
-                        uploaderId, row.getR2Key(), ex.getClass().getSimpleName());
+                // Key encodes the user UUID — omit from WARN log to avoid PII in log aggregators.
+                log.warn("R2 delete failed during deleteByUploader sweep (uploader={}, key=[key omitted]): {}",
+                        uploaderId, ex.getClass().getSimpleName());
             }
         }
 

@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -141,6 +142,36 @@ class ReviewControllerTest {
 
         mockMvc.perform(post(REVIEWS_URL)
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 403 when SALON_MASTER attempts to submit a review")
+    void should_return403_when_salonMasterSubmitsReview() throws Exception {
+        var masterId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, null));
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 403 when INDEPENDENT_MASTER attempts to submit a review")
+    void should_return403_when_independentMasterSubmitsReview() throws Exception {
+        var masterId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, null));
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
@@ -292,6 +323,7 @@ class ReviewControllerTest {
 
         mockMvc.perform(get(REVIEWS_URL + "/{reviewId}", reviewId)
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.message").isNotEmpty());
     }
 }

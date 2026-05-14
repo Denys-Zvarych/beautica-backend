@@ -24,6 +24,7 @@ public class CacheConfig {
      *   masterServices      — service list per master, public endpoint — 10 min TTL, max 500 entries
      *   available-slots     — slot availability per master/date/service — 60 sec TTL, max 500 entries
      *   master-calendar     — paginated booking calendar per master/date range — 30 sec TTL, max 500 entries
+     *   master-by-user      — stable userId→Master mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
      *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
      *   search:masters      — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
@@ -31,6 +32,7 @@ public class CacheConfig {
      *   portfolio           — per-entity portfolio listing, public unauthenticated GET — 5 min TTL, max 2000 entries
      *   reviews-by-master   — paginated review list per master, public endpoint — 5 min TTL, max 1000 entries
      *   review-detail       — single review by ID, public endpoint — 10 min TTL, max 2000 entries (immutable; no evict path)
+     *   revenue-dashboard   — revenue summary per actor (master or salon owner) — 5 min TTL, max 500 entries
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -78,6 +80,11 @@ public class CacheConfig {
                         .maximumSize(500)
                         .expireAfterWrite(30, TimeUnit.SECONDS)
                         .build());
+        manager.registerCustomCache("master-by-user",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
         manager.registerCustomCache("service-type-search",
                 Caffeine.newBuilder()
                         .maximumSize(1000)
@@ -117,6 +124,12 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(2000)
                         .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
+        // Phase 9 — revenue dashboard per actor; evicted by DashboardService after any booking status change.
+        manager.registerCustomCache("revenue-dashboard",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
         return manager;
     }

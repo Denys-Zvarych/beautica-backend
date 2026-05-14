@@ -601,4 +601,61 @@ class MasterControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
     }
+
+    // ── D2 — calendar date bounds ─────────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /me/calendar — 400 when 'from' is more than 1 year in the past")
+    void should_return400_when_calendarFromIsTooFarInThePast() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        // 2 years ago is beyond the 1-year-past limit
+        String from = LocalDate.now().minusYears(2).toString();
+        String to   = LocalDate.now().minusYears(2).plusDays(7).toString();
+
+        log.debug("Act: GET {}/me/calendar with from={} more than 1 year in the past — must be 400",
+                MASTERS_URL, from);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", from)
+                        .param("to", to)
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /me/calendar — 400 when 'to' is more than 2 years in the future")
+    void should_return400_when_calendarToIsTooFarInTheFuture() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        // 3 years ahead is beyond the 2-year-future limit
+        String from = LocalDate.now().plusYears(3).toString();
+        String to   = LocalDate.now().plusYears(3).plusDays(7).toString();
+
+        log.debug("Act: GET {}/me/calendar with to={} more than 2 years in the future — must be 400",
+                MASTERS_URL, to);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", from)
+                        .param("to", to)
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    // ── E2 — GET /me/calendar — 404 when no master record ────────────────────
+
+    @Test
+    @DisplayName("GET /me/calendar — 404 when getMasterByUserId throws NotFoundException")
+    void should_return404_when_getMasterByUserIdThrowsNotFoundException() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        when(masterService.getMasterByUserId(any()))
+                .thenThrow(new NotFoundException("Master not found"));
+
+        log.debug("Act: GET {}/me/calendar when masterService.getMasterByUserId throws NotFoundException",
+                MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me/calendar")
+                        .param("from", "2027-01-01")
+                        .param("to", "2027-01-15")
+                        .with(authenticatedAs(masterUserId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
 }

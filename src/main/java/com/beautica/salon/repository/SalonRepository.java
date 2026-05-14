@@ -25,6 +25,16 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     Optional<Salon> findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(UUID ownerId);
 
+    /**
+     * Returns the IDs of all active salons owned by the given owner.
+     *
+     * <p>Used by {@code DashboardService.resolveScope} to collect every salon the SALON_OWNER
+     * is allowed to see so that multi-salon owners receive revenue data across all their salons,
+     * not just the oldest one (FIX 1 — HIGH security/correctness finding).
+     */
+    @Query("SELECT s.id FROM Salon s WHERE s.owner.id = :ownerId AND s.isActive = true")
+    List<UUID> findIdsByOwnerIdAndIsActiveTrue(@Param("ownerId") UUID ownerId);
+
     boolean existsByIdAndOwnerId(UUID id, UUID ownerId);
 
     Optional<Salon> findByIdAndOwnerId(UUID id, UUID ownerId);

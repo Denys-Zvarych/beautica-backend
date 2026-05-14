@@ -45,7 +45,7 @@ public class FirebaseConfig {
             log.warn("Firebase is disabled or credentials are absent — push notifications will be suppressed");
             return message -> {
                 log.warn("No-op FirebaseSender invoked — push notification not sent");
-                return null;
+                return "no-op";
             };
         }
 
@@ -55,6 +55,8 @@ public class FirebaseConfig {
         if (FirebaseApp.getApps().isEmpty()) {
             FirebaseOptions options = FirebaseOptions.builder()
                     .setCredentials(credentials)
+                    .setConnectTimeout(5000)
+                    .setReadTimeout(10000)
                     .build();
             FirebaseApp.initializeApp(options);
         }

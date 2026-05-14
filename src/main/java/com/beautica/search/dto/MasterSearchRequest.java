@@ -45,18 +45,19 @@ import java.math.BigDecimal;
  *   <li>{@code minRating} — precision matches
  *       {@code masters.avg_rating NUMERIC(3,2)} (1 integer digit + 2 fraction);
  *       value range 0.00–5.00 reflects the domain rating scale.</li>
- *   <li>{@code page} — capped at 500 to bound offset-pagination memory usage:
- *       at the {@code size=100} ceiling that means at most ~50 000 results
- *       reachable via {@code page}. Deeper pagination requires keyset
- *       (cursor) pagination, deferred until phase-9 search overhaul.
- *       The previous cap of 10 000 permitted ~1 000 000-row offsets, which
- *       degrades into a sort-and-discard scan in Postgres even with the
- *       covering index on {@code masters.avg_rating} added in V36.</li>
- *   <li>{@code size} — capped at 100 to enforce the global page-size ceiling
- *       defined in {@code application.yml} ({@code spring.data.web.pageable.max-page-size: 100}).
- *       The Spring property sets a default; {@code @PageableDefault} does NOT
- *       cap caller-supplied {@code ?size}, so the explicit {@code @Max} on the
- *       DTO is the actual enforcement on this endpoint.</li>
+ *   <li>{@code page} — boxed {@code Integer}; {@code null} = use server default (0).
+ *       Capped at 500 to bound offset-pagination memory usage: at the {@code size=100}
+ *       ceiling that means at most ~50 000 results reachable via {@code page}. Deeper
+ *       pagination requires keyset (cursor) pagination, deferred until phase-9 search
+ *       overhaul. The previous cap of 10 000 permitted ~1 000 000-row offsets, which
+ *       degrades into a sort-and-discard scan in Postgres even with the covering index
+ *       on {@code masters.avg_rating} added in V36.</li>
+ *   <li>{@code size} — boxed {@code Integer}; {@code null} = use server default (20).
+ *       Capped at 100 to enforce the global page-size ceiling defined in
+ *       {@code application.yml} ({@code spring.data.web.pageable.max-page-size: 100}).
+ *       The Spring property sets a default; {@code @PageableDefault} does NOT cap
+ *       caller-supplied {@code ?size}, so the explicit {@code @Max} on the DTO is the
+ *       actual enforcement on this endpoint.</li>
  * </ul>
  */
 public record MasterSearchRequest(
@@ -84,14 +85,14 @@ public record MasterSearchRequest(
         @DecimalMin("0.0")
         @DecimalMax("5.0")
         @Digits(integer = 1, fraction = 2)
-        Double minRating,
+        BigDecimal minRating,
 
         @PositiveOrZero
         @Max(500)
-        int page,
+        Integer page,
 
         @Positive
         @Max(100)
-        int size
+        Integer size
 ) {
 }

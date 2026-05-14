@@ -25,18 +25,18 @@ import jakarta.validation.constraints.Size;
  *       {@code salons.city VARCHAR(100)} / {@code salons.region VARCHAR(100)}
  *       columns. Control-character pattern blocks log injection and obviously
  *       malformed inputs.</li>
- *   <li>{@code page} — capped at 500 to bound offset-pagination memory usage:
- *       at the {@code size=100} ceiling that means at most ~50 000 results
- *       reachable via offset pagination. Deeper pagination requires keyset
- *       (cursor) pagination, deferred until phase-9 search overhaul. The
- *       previous cap of 10 000 allowed ~1 000 000-row offsets that degrade
- *       into a sort-and-discard scan in Postgres.</li>
- *   <li>{@code size} — capped at 100 to mirror the global page-size ceiling
- *       defined in {@code application.yml}
- *       ({@code spring.data.web.pageable.max-page-size: 100}). The Spring
- *       property only constrains Spring-resolved {@code Pageable}s; the
- *       explicit {@code @Max} on the DTO is the actual enforcement when the
- *       controller builds its own {@code PageRequest}.</li>
+ *   <li>{@code page} — boxed {@code Integer}; {@code null} = use server default (0).
+ *       Capped at 500 to bound offset-pagination memory usage: at the {@code size=100}
+ *       ceiling that means at most ~50 000 results reachable via offset pagination.
+ *       Deeper pagination requires keyset (cursor) pagination, deferred until
+ *       phase-9 search overhaul. The previous cap of 10 000 allowed ~1 000 000-row
+ *       offsets that degrade into a sort-and-discard scan in Postgres.</li>
+ *   <li>{@code size} — boxed {@code Integer}; {@code null} = use server default (20).
+ *       Capped at 100 to mirror the global page-size ceiling defined in
+ *       {@code application.yml} ({@code spring.data.web.pageable.max-page-size: 100}).
+ *       The Spring property only constrains Spring-resolved {@code Pageable}s; the
+ *       explicit {@code @Max} on the DTO is the actual enforcement when the controller
+ *       builds its own {@code PageRequest}.</li>
  * </ul>
  *
  * <p>Mirror of {@link MasterSearchRequest} for the salon search endpoint —
@@ -55,10 +55,10 @@ public record SalonSearchRequest(
 
         @PositiveOrZero
         @Max(500)
-        int page,
+        Integer page,
 
         @Positive
         @Max(100)
-        int size
+        Integer size
 ) {
 }

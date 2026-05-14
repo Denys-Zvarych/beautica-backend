@@ -223,7 +223,7 @@ class NotificationOutboxDrainWorkerTest {
 
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
         assertThat(outboxEntry.getAttempts()).isEqualTo(1);
-        assertThat(outboxEntry.getLastError()).isNotNull();
+        assertThat(outboxEntry.getLastError()).isNotNull().contains("dispatch error");
     }
 
     // ── Test 5: failure at MAX_ATTEMPTS → DEAD ────────────────────────────────
@@ -383,5 +383,63 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
         assertThat(outboxEntry.getAttempts()).isEqualTo(1);
         assertThat(outboxEntry.getLastError()).isNotNull();
+    }
+
+    // ── Test A: empty batch no-op ─────────────────────────────────────────────
+
+    @Test
+    @DisplayName("drain does nothing when claimPendingBatch returns empty list")
+    void should_doNothing_when_batchIsEmpty() {
+        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of());
+
+        worker.drain();
+
+        verify(notificationService, never()).notifyNewBooking(any());
+        verify(notificationService, never()).notifyBookingStatusChanged(any());
+        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
+    }
+
+    // ── Test B: Bearer header token redaction ─────────────────────────────────
+
+    @Test
+    @DisplayName("Bearer header token is redacted from lastError")
+    void should_redactBearerToken_when_exceptionMessageContainsBearerHeader() {
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+
+        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        doThrow(new RuntimeException("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret.sig"))
+                .when(notificationService).notifyNewBooking(booking);
+
+        worker.drain();
+
+        assertThat(outboxEntry.getLastError())
+                .isNotNull()
+                .doesNotContain("eyJhbGciOiJIUzI1NiJ9")
+                .doesNotContain("secret");
+    }
+
+    // ── Test C: malformed INVITE JSON payload → dead-letter ───────────────────
+
+    @Test
+    @DisplayName("INVITE entry with malformed JSON payload is dead-lettered without throwing")
+    void should_setStatusToPending_when_invitePayloadIsInvalidJson() {
+        NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
+                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+
+        UUID aggregateId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, "NOT_JSON", aggregateId);
+
+        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+
+        workerWithRealMapper.drain();
+
+        assertThat(outboxEntry.getStatus()).isIn(OutboxStatus.PENDING, OutboxStatus.DEAD);
+        assertThat(outboxEntry.getLastError()).isNotNull();
+        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
     }
 }

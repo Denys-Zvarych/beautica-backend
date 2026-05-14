@@ -16,10 +16,13 @@ import java.util.UUID;
  * It is intended to be assembled by the search service from a JPQL/SQL
  * projection query, not mapped from a JPA entity graph (avoids dragging
  * unrelated associations into the response).</p>
+ *
+ * <p>{@code userId} is intentionally absent: this record is returned from
+ * a {@code permitAll} endpoint, and exposing internal user UUIDs would
+ * enable enumeration of the user table by anonymous callers.</p>
  */
 public record MasterSearchResult(
         UUID masterId,
-        UUID userId,
         String firstName,
         String lastName,
         String city,

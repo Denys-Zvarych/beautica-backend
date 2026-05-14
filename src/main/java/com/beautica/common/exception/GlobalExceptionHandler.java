@@ -20,6 +20,7 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
 import java.util.stream.Collectors;
@@ -38,16 +39,21 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
+        // Return a generic message — do not echo ex.getMessage() which may reveal internal
+        // data model structure (e.g. "Salon not found for owner", "Master not found for user").
         return ResponseEntity
                 .status(HttpStatus.NOT_FOUND)
-                .body(ApiResponse.error(ex.getMessage()));
+                .body(ApiResponse.error("Resource not found"));
     }
 
     @ExceptionHandler(ForbiddenException.class)
     public ResponseEntity<ApiResponse<Void>> handleForbidden(ForbiddenException ex) {
+        // Log the original message at DEBUG for server-side triage — never echoed to the
+        // client because it may contain internal UUIDs or data model details (Anti-Bug § I).
+        log.debug("Forbidden: {}", ex.getMessage());
         return ResponseEntity
                 .status(HttpStatus.FORBIDDEN)
-                .body(ApiResponse.error(ex.getMessage()));
+                .body(ApiResponse.error("Access denied"));
     }
 
     @ExceptionHandler(AuthorizationDeniedException.class)
@@ -153,6 +159,27 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .badRequest()
                 .body(ApiResponse.error("Required part '" + ex.getRequestPartName() + "' is missing"));
+    }
+
+    /**
+     * Handles type-conversion failures for {@code @RequestParam} values.
+     *
+     * <p>When a caller passes a malformed value for a typed request parameter (e.g.
+     * {@code ?filterMasterId=not-a-uuid}), Spring throws
+     * {@link MethodArgumentTypeMismatchException} before the controller method is invoked.
+     * Without this handler the exception falls through to {@link #handleGeneric}, producing
+     * HTTP 500 and an "Unhandled exception" log entry. The correct status is 400.
+     *
+     * <p>{@link MethodArgumentTypeMismatchException#getName()} returns the parameter name
+     * defined in the controller source (e.g. {@code "filterMasterId"}) — it is
+     * framework-controlled, not user-supplied, so interpolating it into the response is safe.
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ApiResponse<Void>> handleTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        String paramName = ex.getName() != null ? ex.getName() : "parameter";
+        return ResponseEntity
+                .badRequest()
+                .body(ApiResponse.error("Invalid value for parameter '" + paramName + "'"));
     }
 
     @ExceptionHandler(Exception.class)

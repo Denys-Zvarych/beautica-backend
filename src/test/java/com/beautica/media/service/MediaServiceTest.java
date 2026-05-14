@@ -1,5 +1,9 @@
 package com.beautica.media.service;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
@@ -16,6 +20,7 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -24,6 +29,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.interceptor.SimpleKey;
@@ -94,6 +100,25 @@ class MediaServiceTest {
     private final Clock fixedClock = Clock.fixed(Instant.parse("2026-05-11T10:00:00Z"), ZoneOffset.UTC);
 
     private MediaService service;
+
+    // ── Logback ListAppender wiring ───────────────────────────────────────────
+
+    private ListAppender<ILoggingEvent> listAppender;
+
+    @BeforeEach
+    void attachListAppender() {
+        Logger mediaLogger = (Logger) LoggerFactory.getLogger(MediaService.class);
+        listAppender = new ListAppender<>();
+        listAppender.start();
+        mediaLogger.addAppender(listAppender);
+    }
+
+    @AfterEach
+    void detachListAppender() {
+        Logger mediaLogger = (Logger) LoggerFactory.getLogger(MediaService.class);
+        mediaLogger.detachAppender(listAppender);
+        listAppender.stop();
+    }
 
     @BeforeEach
     void setUp() {
@@ -699,6 +724,45 @@ class MediaServiceTest {
         verify(r2, times(3)).deleteFile(anyString());
         // The DB batch delete still ran exactly once with the full row set.
         verify(mediaRepo, times(1)).deleteAll(rows);
+    }
+
+    // ---------------------------------------------------- MEDIUM-2 — sweep WARN log key redaction
+
+    @Test
+    @DisplayName("WARN log omits R2 key and contains '[key omitted]' when deleteByUploader R2 delete fails")
+    void should_omitKeyInWarnLog_when_deleteByUploaderFails() {
+        // Arrange
+        UUID uploaderId = UUID.randomUUID();
+        User uploader = newUser(uploaderId);
+        String mockedKey = "portfolio/salons/" + UUID.randomUUID() + "/avatar.jpg";
+        MediaFile mf = MediaFile.builder()
+                .id(UUID.randomUUID())
+                .uploader(uploader)
+                .entityType(EntityType.SALON)
+                .entityId(UUID.randomUUID())
+                .mediaType(MediaType.PORTFOLIO)
+                .r2Key(mockedKey)
+                .r2Url("https://r2/" + mockedKey)
+                .build();
+        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of(mf));
+        doThrow(new RuntimeException("mock delete failure")).when(r2).deleteFile(mockedKey);
+        listAppender.list.clear();
+
+        // Act — must not throw even though R2 delete fails
+        service.deleteByUploader(uploaderId);
+
+        // Assert
+        List<ILoggingEvent> warns = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warns).as("exactly one WARN emitted when one R2 delete fails in sweep").hasSize(1);
+        String formattedMessage = warns.get(0).getFormattedMessage();
+        assertThat(formattedMessage)
+                .as("WARN log must contain '[key omitted]' sentinel")
+                .contains("[key omitted]");
+        assertThat(formattedMessage)
+                .as("WARN log must not contain the raw R2 key")
+                .doesNotContain(mockedKey);
     }
 
     // ---------------------------------------------- Phase 7.8/7.9 — sweep cache eviction
