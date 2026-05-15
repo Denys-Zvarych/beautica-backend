@@ -78,7 +78,7 @@ dependencies {
     implementation("com.google.firebase:firebase-admin:9.3.0")
 
     // API docs
-    implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.6.0")
+    implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.8")
 
     // Observability
     implementation("org.springframework.boot:spring-boot-starter-actuator")
