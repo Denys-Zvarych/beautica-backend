@@ -671,7 +671,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID ownerId = UUID.randomUUID();
         String ownerEmail = "search-owner-" + UUID.randomUUID() + "@beautica.test";
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 ownerId, ownerEmail, "$2a$04$placeholdervaluefortestonlydigest");
 
         UUID salonId = UUID.randomUUID();
@@ -683,8 +683,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "search-master-" + UUID.randomUUID() + "@beautica.test";
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active) " +
-                        "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true)",
+                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true, true)",
                 masterUserId, masterEmail, "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
 
         UUID masterId = UUID.randomUUID();
@@ -748,7 +748,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID ownerId = UUID.randomUUID();
         String ownerEmail = "salon-owner-" + UUID.randomUUID() + "@beautica.test";
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 ownerId, ownerEmail, "$2a$04$placeholdervaluefortestonlydigest");
 
         UUID salonId = UUID.randomUUID();

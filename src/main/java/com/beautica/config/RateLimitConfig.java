@@ -14,6 +14,9 @@ import java.time.Duration;
 @Configuration
 public class RateLimitConfig {
 
+    @Value("${app.rate-limit.register-capacity:3}")
+    private long registerCapacity;
+
     @Value("${app.rate-limit.login-capacity:5}")
     private long loginCapacity;
 
@@ -33,6 +36,22 @@ public class RateLimitConfig {
     // while still blocking sustained abuse.
     @Value("${app.rate-limit.media-upload-capacity:10}")
     private long mediaUploadCapacity;
+
+    // Per-IP cap for POST /api/v1/auth/verify-email (15-minute window).
+    // 10 attempts per window is generous for legitimate users while still
+    // preventing brute-force of the 6-digit OTP space (1,000,000 combinations).
+    private static final long VERIFY_EMAIL_CAPACITY = 10;
+    private static final Duration VERIFY_EMAIL_WINDOW = Duration.ofMinutes(15);
+
+    @Bean
+    public LoadingCache<String, Bucket> registerBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(Duration.ofHours(1))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(registerCapacity, Duration.ofMinutes(1)))
+                        .build());
+    }
 
     @Bean
     public LoadingCache<String, Bucket> loginBuckets() {
@@ -81,6 +100,30 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofHours(1))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(mediaUploadCapacity, Duration.ofMinutes(1)))
+                        .build());
+    }
+
+    @Bean
+    public LoadingCache<String, Bucket> verifyEmailBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(VERIFY_EMAIL_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(VERIFY_EMAIL_CAPACITY, VERIFY_EMAIL_WINDOW))
+                        .build());
+    }
+
+    // Per-IP cap for POST /api/v1/auth/resend-verification (60-second window).
+    // 3 requests per minute matches the per-account RESEND_COOLDOWN (60 s) and
+    // is generous enough for a legitimate retry (network hiccup, paste error)
+    // while blocking rapid volumetric abuse from a single IP.
+    @Bean
+    public LoadingCache<String, Bucket> resendVerificationBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(90, java.util.concurrent.TimeUnit.SECONDS)
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(3, Duration.ofSeconds(60)))
                         .build());
     }
 

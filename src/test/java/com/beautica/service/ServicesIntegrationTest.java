@@ -5,7 +5,6 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.EmailService;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -57,19 +56,12 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
-    @org.springframework.boot.test.mock.mockito.MockBean
-    private EmailService emailService;
-
     private ServiceTestFixtures fixtures;
 
     @BeforeEach
     void configureHttpClient() {
         restTemplate.getRestTemplate().setRequestFactory(
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-        // EmailService is @MockBean'd to suppress real SMTP for any sendAdminNotification
-        // path triggered by ServiceCatalogService during these tests. The legacy
-        // sendInviteEmail method was removed (Phase 5.16 cleanup) — invites now flow
-        // through the outbox → NotificationService → EmailNotificationService.
         fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 

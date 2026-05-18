@@ -7,6 +7,7 @@ import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.mail.MailException;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
@@ -32,6 +33,8 @@ public class EmailNotificationService {
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final DateTimeFormatter DATE_FMT =
             DateTimeFormatter.ofPattern("HH:mm, d MMMM yyyy", Locale.forLanguageTag("uk"));
+    private static final ClassPathResource LOGO =
+            new ClassPathResource("static/email/beautica-logo.png");
 
     private final JavaMailSender mailSender;
     private final SpringTemplateEngine templateEngine;
@@ -82,6 +85,30 @@ public class EmailNotificationService {
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("comment", booking.getProviderComment());
         send(to, "Бронювання відхилено", "email/booking-declined", ctx);
+    }
+
+    public void sendVerificationEmail(String to, String rawOtp) {
+        try {
+            var message = mailSender.createMimeMessage();
+            var helper = new MimeMessageHelper(message, true, "UTF-8");
+            helper.setFrom(fromAddress);
+            helper.setTo(to);
+            helper.setSubject("Код підтвердження Beautica");
+
+            // Render template — code is ONLY passed as a context variable, never logged
+            var ctx = new Context();
+            ctx.setVariable("code", rawOtp);
+            String html = templateEngine.process("email/verify-email", ctx);
+            helper.setText(html, true);
+
+            // Embed logo as CID inline attachment
+            helper.addInline("beauticaLogo", LOGO);
+
+            mailSender.send(message);
+        } catch (MessagingException | MailException e) {
+            log.error("sendVerificationEmail failed: template=email/verify-email exception={}", e.getClass().getSimpleName());
+            // delivery failure is non-fatal — caller retries via resend endpoint
+        }
     }
 
     public void sendClientCancelledEmail(String to, Booking booking) {

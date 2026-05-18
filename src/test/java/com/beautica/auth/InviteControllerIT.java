@@ -12,7 +12,6 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.EmailService;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
@@ -79,9 +78,6 @@ class InviteControllerIT extends AbstractIntegrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
-    @MockBean
-    private EmailService emailService;
-
     private final List<String> createdEmails = new ArrayList<>();
     private final List<UUID> createdSalonIds = new ArrayList<>();
 
@@ -126,10 +122,6 @@ class InviteControllerIT extends AbstractIntegrationTest {
 
         String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
-
-        // EmailService.sendInviteEmail was removed in Phase 5.16; the invite path now
-        // writes a notification_outbox row that the drain worker eventually consumes.
-        // EmailService remains @MockBean'd above to suppress the sendAdminNotification path.
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(masterEmail, salonId, null);
@@ -208,10 +200,6 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
         registerAndGetToken(alreadyRegistered, Role.CLIENT);
 
-        // EmailService.sendInviteEmail was removed in Phase 5.16 — invites now flow
-        // through the outbox. EmailService remains @MockBean'd to suppress the
-        // sendAdminNotification path on this test class.
-
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(alreadyRegistered, salonId, null);
 
@@ -244,8 +232,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String salonOwnerEmail = uniqueEmail("salon-owner");
         createdEmails.add(salonOwnerEmail);
         jdbcTemplate.update(
-                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, created_at, updated_at) " +
-                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, now(), now())",
+                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, email_verified, created_at, updated_at) " +
+                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
                 salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
@@ -480,15 +468,37 @@ class InviteControllerIT extends AbstractIntegrationTest {
         return headers;
     }
 
+    /**
+     * Registers a user via the public registration endpoint, verifies their email directly in the
+     * DB (Phase 1.7 gate: unverified users get 403 on login), then logs in and returns the access
+     * token. The {@code ignoredRole} parameter is kept for call-site readability but has no effect
+     * — self-registration always produces a CLIENT.
+     */
     private String registerAndGetToken(String email, Role ignoredRole) throws Exception {
-        var registerResp = restTemplate.postForEntity(
+        restTemplate.postForEntity(
                 "/api/v1/auth/register",
                 new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class
         );
+        // Phase 1.7: mark email as verified so login does not return 403 EMAIL_NOT_VERIFIED
+        verifyEmailInDb(email);
+        var loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, "password123"),
+                String.class
+        );
         var body = objectMapper.readValue(
-                registerResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
+    }
+
+    private void verifyEmailInDb(String email) {
+        transactionTemplate.executeWithoutResult(status ->
+            userRepository.findByEmail(email).ifPresent(user -> {
+                user.setEmailVerified(true);
+                userRepository.save(user);
+            })
+        );
     }
 
     /**

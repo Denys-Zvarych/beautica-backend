@@ -24,6 +24,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -46,17 +47,28 @@ class AuthSecurityTest extends AbstractIntegrationTest {
     @Autowired
     private JwtConfig jwtConfig;
 
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
     @Test
     @DisplayName("GET /api/v1/users/me with expired JWT returns 401")
     void should_return401_when_expiredJwtTokenUsed() throws Exception {
         var email = "security-expired-" + System.nanoTime() + "@beautica.test";
         log.debug("Arrange: register email={}", email);
 
-        var resp = restTemplate.postForEntity("/api/v1/auth/register",
+        // Register (now returns RegistrationResponse — no tokens, no userId)
+        restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
-        var auth = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
-        var userId = auth.data().userId();
+
+        // Force email verification so login succeeds (phase 1.7 will add the gate, not yet active)
+        jdbcTemplate.update("UPDATE users SET email_verified = TRUE WHERE email = ?", email);
+
+        // Login to get userId (phase 1.7 not yet active — login does not check emailVerified yet)
+        var loginResp = restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "password123"), String.class);
+        var loginBody = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        var userId = loginBody.data().userId();
 
         // Build a JwtTokenProvider pinned to 60 seconds in the past so the token is
         // expired before it is even generated — no Thread.sleep required.
@@ -84,10 +96,13 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         var email = "security-rbac-" + System.nanoTime() + "@beautica.test";
         log.debug("Arrange: register CLIENT email={}", email);
 
-        var resp = restTemplate.postForEntity("/api/v1/auth/register",
+        restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
-        var auth = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        jdbcTemplate.update("UPDATE users SET email_verified = TRUE WHERE email = ?", email);
+        var loginResp = restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "password123"), String.class);
+        var auth = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         String clientToken = auth.data().accessToken();
 
         HttpHeaders headers = new HttpHeaders();
@@ -140,6 +155,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
 
         restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null), String.class);
+        jdbcTemplate.update("UPDATE users SET email_verified = TRUE WHERE email = ?", email);
 
         log.debug("Arrange: login to obtain tokens");
         ResponseEntity<String> loginResp = restTemplate.postForEntity("/api/v1/auth/login",

@@ -20,16 +20,22 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final byte[] TOO_MANY_REQUESTS_BODY =
             "{\"error\":\"Too many requests\"}".getBytes(StandardCharsets.UTF_8);
 
+    private static final String REGISTER_PATH = "/api/v1/auth/register";
+    private static final String REGISTER_IM_PATH = "/api/v1/auth/register/independent-master";
     private static final String LOGIN_PATH = "/api/v1/auth/login";
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
+    private static final String VERIFY_EMAIL_PATH = "/api/v1/auth/verify-email";
+    private static final String RESEND_VERIFICATION_PATH = "/api/v1/auth/resend-verification";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
     private static final int RETRY_AFTER_SECONDS = 60;
 
+    private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
     private final LoadingCache<String, Bucket> refreshBuckets;
+    private final LoadingCache<String, Bucket> verifyEmailBuckets;
     private final LoadingCache<String, Bucket> slotsBuckets;
     // IP-keyed (not user-keyed): JWT parsing is the responsibility of JwtAuthenticationFilter
     // which runs *after* this filter; resolving the principal here would duplicate that work
@@ -38,18 +44,25 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Same IP-keyed rationale applies to media uploads — JwtAuthenticationFilter
     // runs after this one, so the rate limiter sees only the network identity.
     private final LoadingCache<String, Bucket> mediaUploadBuckets;
+    private final LoadingCache<String, Bucket> resendVerificationBuckets;
 
     public AuthRateLimitFilter(
+            @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
             @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("verifyEmailBuckets") LoadingCache<String, Bucket> verifyEmailBuckets,
             @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
             @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
-            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets) {
+            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
+            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets) {
+        this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
+        this.verifyEmailBuckets = verifyEmailBuckets;
         this.slotsBuckets = slotsBuckets;
         this.deviceTokenBuckets = deviceTokenBuckets;
         this.mediaUploadBuckets = mediaUploadBuckets;
+        this.resendVerificationBuckets = resendVerificationBuckets;
     }
 
     @Override
@@ -93,10 +106,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
 
         LoadingCache<String, Bucket> cache;
 
-        if (LOGIN_PATH.equals(path)) {
+        if (REGISTER_PATH.equals(path) || REGISTER_IM_PATH.equals(path)) {
+            cache = registerBuckets;
+        } else if (LOGIN_PATH.equals(path)) {
             cache = loginBuckets;
         } else if (REFRESH_PATH.equals(path)) {
             cache = refreshBuckets;
+        } else if (VERIFY_EMAIL_PATH.equals(path)) {
+            cache = verifyEmailBuckets;
+        } else if (RESEND_VERIFICATION_PATH.equals(path)) {
+            cache = resendVerificationBuckets;
         } else {
             filterChain.doFilter(request, response);
             return;

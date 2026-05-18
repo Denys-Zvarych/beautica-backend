@@ -1,9 +1,9 @@
 package com.beautica.auth;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.user.RefreshTokenRepository;
@@ -80,7 +80,7 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("returns 201 with INDEPENDENT_MASTER role when request is valid")
+    @DisplayName("returns 200 with email and verification message when request is valid")
     void should_return201WithIndependentMasterRole_when_validRequest() {
         var request = new RegisterIndependentMasterRequest(
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
@@ -90,21 +90,16 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
 
         assertThat(response.getStatusCode())
                 .as("status for valid independent master registration, email=%s", registeredEmail)
-                .isEqualTo(HttpStatus.CREATED);
+                .isEqualTo(HttpStatus.OK);
 
         var body = response.getBody();
         assertThat(body).isNotNull();
         assertThat(body.success()).isTrue();
-        assertThat(body.message()).isNull();
 
         var data = body.data();
         assertThat(data).isNotNull();
-        assertThat(data.role()).isEqualTo(Role.INDEPENDENT_MASTER);
         assertThat(data.email()).isEqualTo(registeredEmail);
-        assertThat(data.tokenType()).isEqualTo("Bearer");
-        assertThat(data.accessToken()).isNotBlank();
-        assertThat(data.refreshToken()).isNotBlank();
-        assertThat(data.userId()).isNotNull();
+        assertThat(data.message()).contains("verification code");
     }
 
     @Test
@@ -128,7 +123,7 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("returns 409 when email is already registered as a client")
+    @DisplayName("returns 200 with success=true for duplicate email (anti-enumeration — Phase 1.3)")
     void should_return409_when_emailAlreadyRegisteredAsClient() {
         var clientRequest = new RegisterRequest(
                 registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, TEST_PHONE, null);
@@ -136,19 +131,20 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
         log.debug("Arrange: register email={} as CLIENT first", registeredEmail);
         postClient(clientRequest);
 
-        log.debug("Act: register same email={} as INDEPENDENT_MASTER when already a CLIENT", registeredEmail);
+        log.debug("Act: register same email={} as INDEPENDENT_MASTER when already a CLIENT — anti-enumeration must return 200", registeredEmail);
         var masterRequest = new RegisterIndependentMasterRequest(
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
         var response = postIndependentMaster(masterRequest);
 
+        // Phase 1.3: duplicate-email registration silently returns 200 to prevent email enumeration.
         assertThat(response.getStatusCode())
-                .as("status must be 409 when email is already registered as CLIENT")
-                .isEqualTo(HttpStatus.CONFLICT);
+                .as("anti-enumeration: duplicate email must return 200, not 409")
+                .isEqualTo(HttpStatus.OK);
 
         var body = response.getBody();
         assertThat(body).isNotNull();
-        assertThat(body.success()).isFalse();
-        assertThat(body.message()).containsIgnoringCase("already registered");
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().email()).isEqualTo(registeredEmail);
     }
 
     @Test
@@ -194,7 +190,7 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
         assertThat(response.getBody().success()).isFalse();
     }
 
-    private ResponseEntity<ApiResponse<AuthResponse>> postIndependentMaster(
+    private ResponseEntity<ApiResponse<RegistrationResponse>> postIndependentMaster(
             RegisterIndependentMasterRequest request) {
         return restTemplate.exchange(
                 REGISTER_URL,
@@ -204,7 +200,7 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
         );
     }
 
-    private ResponseEntity<ApiResponse<AuthResponse>> postClient(RegisterRequest request) {
+    private ResponseEntity<ApiResponse<RegistrationResponse>> postClient(RegisterRequest request) {
         return restTemplate.exchange(
                 CLIENT_REGISTER_URL,
                 HttpMethod.POST,

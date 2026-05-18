@@ -2,6 +2,7 @@ package com.beautica.auth;
 
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
@@ -9,6 +10,8 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.ResendVerificationRequest;
+import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.ApiResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -42,19 +45,19 @@ public class AuthController {
     }
 
     @PostMapping("/register")
-    public ResponseEntity<ApiResponse<AuthResponse>> register(
+    public ResponseEntity<ApiResponse<RegistrationResponse>> register(
             @Valid @RequestBody RegisterRequest request
     ) {
-        AuthResponse response = authService.register(request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(response));
+        RegistrationResponse response = authService.register(request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     @PostMapping("/register/independent-master")
-    public ResponseEntity<ApiResponse<AuthResponse>> registerIndependentMaster(
+    public ResponseEntity<ApiResponse<RegistrationResponse>> registerIndependentMaster(
             @Valid @RequestBody RegisterIndependentMasterRequest request
     ) {
-        AuthResponse response = authService.registerIndependentMaster(request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(response));
+        RegistrationResponse response = authService.registerIndependentMaster(request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     @PostMapping("/login")
@@ -71,6 +74,19 @@ public class AuthController {
     ) {
         AuthResponse response = authService.refresh(request);
         return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    @PostMapping("/verify-email")
+    public ResponseEntity<ApiResponse<AuthResponse>> verifyEmail(
+            @Valid @RequestBody VerifyEmailRequest request) {
+        AuthResponse response = authService.verifyEmail(request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    @PostMapping("/resend-verification")
+    public ResponseEntity<ApiResponse<RegistrationResponse>> resendVerification(
+            @Valid @RequestBody ResendVerificationRequest request) {
+        return ResponseEntity.ok(ApiResponse.ok(authService.resendVerification(request)));
     }
 
     @PostMapping("/logout")

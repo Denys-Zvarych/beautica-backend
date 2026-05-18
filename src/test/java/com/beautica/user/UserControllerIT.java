@@ -3,6 +3,7 @@ package com.beautica.user;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.AuthResponse;
+import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
@@ -287,8 +288,8 @@ class UserControllerIT extends AbstractIntegrationTest {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /**
-     * Registers a new user and returns the access token from the 201 response.
-     * Uses unique emails per test — @AfterEach wipes the table between tests.
+     * Registers a new user, bypasses the email-verification gate via a direct DB update,
+     * then logs in and returns the access token.
      */
     private String registerAndGetToken(
             String email, String password,
@@ -297,11 +298,17 @@ class UserControllerIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        // Phase 1.7: registration no longer issues tokens; mark email verified then login.
+        jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, password), String.class);
+        assertThat(loginResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
     }
 

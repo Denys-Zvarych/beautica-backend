@@ -12,6 +12,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 
+import java.time.Instant;
 import java.util.UUID;
 
 
@@ -57,6 +58,21 @@ public class User extends AuditableEntity {
 
     @Column(name = "is_active", nullable = false)
     private boolean isActive = true;
+
+    @Column(name = "email_verified", nullable = false)
+    private boolean emailVerified = false;
+
+    @JsonIgnore
+    @Column(name = "verification_code_hash", length = 64)
+    private String verificationCodeHash;
+
+    @JsonIgnore
+    @Column(name = "verification_code_expires_at")
+    private Instant verificationCodeExpiresAt;
+
+    @JsonIgnore
+    @Column(name = "verification_attempts", nullable = false)
+    private short verificationAttempts = 0;
 
     @Column(name = "business_name", length = 255)
     private String businessName;
@@ -141,6 +157,41 @@ public class User extends AuditableEntity {
 
     public boolean isActive() {
         return isActive;
+    }
+
+    public boolean isEmailVerified() {
+        return emailVerified;
+    }
+
+    public void setEmailVerified(boolean emailVerified) {
+        this.emailVerified = emailVerified;
+    }
+
+    @JsonIgnore
+    public String getVerificationCodeHash() {
+        return verificationCodeHash;
+    }
+
+    public void setVerificationCodeHash(String verificationCodeHash) {
+        this.verificationCodeHash = verificationCodeHash;
+    }
+
+    @JsonIgnore
+    public Instant getVerificationCodeExpiresAt() {
+        return verificationCodeExpiresAt;
+    }
+
+    public void setVerificationCodeExpiresAt(Instant verificationCodeExpiresAt) {
+        this.verificationCodeExpiresAt = verificationCodeExpiresAt;
+    }
+
+    @JsonIgnore
+    public short getVerificationAttempts() {
+        return verificationAttempts;
+    }
+
+    public void setVerificationAttempts(short verificationAttempts) {
+        this.verificationAttempts = verificationAttempts;
     }
 
     public UUID getSalonId() {

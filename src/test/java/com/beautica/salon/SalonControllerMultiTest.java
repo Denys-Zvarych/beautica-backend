@@ -7,7 +7,6 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.EmailService;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -51,13 +50,6 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
-
-    // EmailService is @MockBean'd to suppress real SMTP for any sendAdminNotification
-    // path triggered by ServiceCatalogService. The legacy sendInviteEmail method was
-    // removed (Phase 5.16 cleanup) — invites now flow through the outbox →
-    // NotificationService → EmailNotificationService.
-    @org.springframework.boot.test.mock.mockito.MockBean
-    private EmailService emailService;
 
     @AfterEach
     void cleanUp() {
@@ -219,7 +211,7 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
     private String createSalonOwnerAndGetToken(String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 UUID.randomUUID(), email, hash);
 
         ResponseEntity<String> resp = restTemplate.postForEntity(
@@ -233,8 +225,13 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
         var request = new RegisterRequest(email, TEST_PASSWORD, SelfRegistrationRole.CLIENT, null, null, null, null);
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        // Phase 1.7: registration no longer issues tokens; mark email verified then login.
+        jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(loginResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
     }
 

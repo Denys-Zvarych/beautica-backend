@@ -1,7 +1,7 @@
 package com.beautica.auth;
 
-import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.user.RefreshTokenRepository;
@@ -108,7 +108,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
     class HappyPath {
 
         @Test
-        @DisplayName("returns 201 with tokens and correct user metadata")
+        @DisplayName("returns 200 with RegistrationResponse email and message (no tokens at registration)")
         void should_return201WithTokensAndUserMetadata_when_requestIsValid() {
             log.debug("Act: POST {} to register CLIENT with all required and optional fields, email={}", REGISTER_URL, registeredEmail);
 
@@ -116,21 +116,16 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
 
             assertThat(response.getStatusCode())
                     .as("status for valid CLIENT registration with all fields")
-                    .isEqualTo(HttpStatus.CREATED);
+                    .isEqualTo(HttpStatus.OK);
 
             var body = response.getBody();
             assertThat(body).isNotNull();
             assertThat(body.success()).isTrue();
-            assertThat(body.message()).isNull();
 
             var data = body.data();
             assertThat(data).isNotNull();
             assertThat(data.email()).isEqualTo(registeredEmail);
-            assertThat(data.role()).isEqualTo(Role.CLIENT);
-            assertThat(data.tokenType()).isEqualTo("Bearer");
-            assertThat(data.accessToken()).isNotBlank();
-            assertThat(data.refreshToken()).isNotBlank();
-            assertThat(data.userId()).isNotNull();
+            assertThat(data.message()).isNotBlank();
         }
 
         @Test
@@ -168,27 +163,17 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("persists a refresh token row linked to the new user")
-        void should_persistRefreshToken_when_registrationSucceeds() {
-            log.debug("Act: POST {} — verifying refresh token row is persisted for the new user", REGISTER_URL);
+        @DisplayName("does not create a refresh token row on registration (tokens issued only after email verification)")
+        void should_notCreateRefreshToken_when_registrationSucceeds() {
+            log.debug("Act: POST {} — verifying no refresh token row is created at registration time", REGISTER_URL);
 
-            var response = post(validRequest);
+            post(validRequest);
 
-            var userId = response.getBody().data().userId();
-            // There is no findByUserId on RefreshTokenRepository, so we verify
-            // through the count of tokens tied to this user by deleting them and
-            // checking that at least one deletion took place. We use deleteByUserId
-            // which is a @Modifying JPQL delete — if the row does not exist the
-            // delete is a no-op, meaning findByEmail would still work but we can
-            // verify indirectly via the service not throwing on logout.
-            //
-            // The cleanest assertion available without adding a test-only query is
-            // to check that the raw refresh token returned by register is not null
-            // (already covered above) AND that the token round-trips through the
-            // login endpoint — but that is a separate concern. Here we verify the
-            // userId in the response matches the persisted user's id.
             var persisted = userRepository.findByEmail(registeredEmail).orElseThrow();
-            assertThat(persisted.getId()).isEqualTo(userId);
+            long tokenCount = refreshTokenRepository.countByUserId(persisted.getId());
+            assertThat(tokenCount)
+                    .as("no refresh token should be created at registration time")
+                    .isZero();
         }
     }
 
@@ -198,22 +183,22 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
     class DuplicateEmail {
 
         @Test
-        @DisplayName("returns 409 when the email is already registered")
+        @DisplayName("returns 200 with RegistrationResponse for duplicate email (anti-enumeration)")
         void should_return409_when_emailIsAlreadyRegistered() {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
-            log.debug("Act: register email={} a second time to trigger duplicate conflict", registeredEmail);
+            log.debug("Act: register email={} a second time — anti-enumeration returns same 200", registeredEmail);
             var secondResponse = post(validRequest);
 
             assertThat(secondResponse.getStatusCode())
-                    .as("status for second registration attempt with same email=%s", registeredEmail)
-                    .isEqualTo(HttpStatus.CONFLICT);
+                    .as("anti-enumeration: status for second registration attempt with same email=%s", registeredEmail)
+                    .isEqualTo(HttpStatus.OK);
 
             var body = secondResponse.getBody();
             assertThat(body).isNotNull();
-            assertThat(body.success()).isFalse();
-            assertThat(body.message()).containsIgnoringCase("already registered");
+            assertThat(body.success()).isTrue();
+            assertThat(body.data().email()).isEqualTo(registeredEmail);
         }
 
         @Test
@@ -234,19 +219,17 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("does not return tokens when registration is rejected")
+        @DisplayName("returns same RegistrationResponse shape on duplicate email (no tokens ever issued)")
         void should_notReturnTokens_when_duplicateEmailRejected() {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
-            log.debug("Act: POST with already-registered email={} to verify no tokens are returned", registeredEmail);
+            log.debug("Act: POST with already-registered email={} — same response shape returned", registeredEmail);
             var response = post(validRequest);
 
             var body = response.getBody();
             assertThat(body).isNotNull();
-            assertThat(body.data())
-                    .as("data payload must be null when duplicate registration is rejected")
-                    .isNull();
+            assertThat(body.data().email()).isEqualTo(registeredEmail);
         }
     }
 
@@ -312,7 +295,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("returns 201 when optional fields firstName, lastName, phoneNumber are absent")
+        @DisplayName("returns 200 when optional fields firstName, lastName, phoneNumber are absent")
         void should_return201_when_optionalFieldsAreNull() {
             // firstName, lastName, phoneNumber are optional in RegisterRequest — null is valid
             var minimalRequest = new RegisterRequest(registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT, null, null, null, null);
@@ -320,7 +303,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
             log.debug("Act: POST {} with only required fields", REGISTER_URL);
             var response = post(minimalRequest);
 
-            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(response.getBody().success()).isTrue();
         }
 
@@ -342,7 +325,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
 
     // ── helper ─────────────────────────────────────────────────────────────────
 
-    private ResponseEntity<ApiResponse<AuthResponse>> post(RegisterRequest request) {
+    private ResponseEntity<ApiResponse<RegistrationResponse>> post(RegisterRequest request) {
         return restTemplate.exchange(
                 REGISTER_URL,
                 HttpMethod.POST,

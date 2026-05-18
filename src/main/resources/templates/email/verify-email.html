@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="uk">
+<head><meta charset="UTF-8"/></head>
+<body style="margin:0;background:#0D0906;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr><td align="center" style="padding:32px;">
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0"
+             style="background:#1a1410;border-radius:16px;padding:40px;">
+
+        <!-- Logo — CID inline attachment, 64px rendered height -->
+        <tr><td align="center" style="padding-bottom:24px;">
+          <img src="cid:beauticaLogo"
+               alt="Beautica"
+               width="64" height="64"
+               style="display:block;border:0;outline:none;"/>
+        </td></tr>
+
+        <tr><td style="color:#F5EDE0;font-size:22px;font-weight:700;padding-bottom:16px;">
+          Підтвердьте вашу електронну пошту
+        </td></tr>
+        <tr><td style="color:#B89A7A;font-size:15px;line-height:1.6;padding-bottom:24px;">
+          Введіть цей код у застосунку Beautica, щоб завершити реєстрацію.
+        </td></tr>
+        <tr><td align="center" style="padding:16px 0 24px;">
+          <span th:text="${code}"
+                style="display:inline-block;font-size:34px;font-weight:700;
+                       letter-spacing:10px;color:#F5EDE0;background:#0D0906;
+                       padding:18px 28px;border-radius:12px;font-family:monospace;">
+            000000
+          </span>
+        </td></tr>
+        <tr><td style="color:#B89A7A;font-size:13px;padding-bottom:8px;">
+          Код дійсний протягом 15 хвилин.
+        </td></tr>
+        <tr><td style="color:#6b5b4a;font-size:12px;padding-top:16px;">
+          Якщо ви не реєструвалися в Beautica, проігноруйте цей лист.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

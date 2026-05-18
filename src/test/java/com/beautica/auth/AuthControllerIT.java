@@ -4,10 +4,12 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.user.UserRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
@@ -23,6 +25,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -38,8 +41,23 @@ class AuthControllerIT extends AbstractIntegrationTest {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    private void verifyEmailInDb(String email) {
+        transactionTemplate.executeWithoutResult(status ->
+            userRepository.findByEmail(email).ifPresent(user -> {
+                user.setEmailVerified(true);
+                userRepository.save(user);
+            })
+        );
+    }
+
     @Test
-    @DisplayName("should return 201 with token pair and user metadata when registering with valid data")
+    @DisplayName("should return 200 with RegistrationResponse when registering with valid data")
     void should_return201_when_registerWithValidData() throws Exception {
         var request = new RegisterRequest(
                 "register@beautica.com", "password123",
@@ -52,20 +70,17 @@ class AuthControllerIT extends AbstractIntegrationTest {
 
         assertThat(response.getStatusCode())
                 .as("status for valid CLIENT registration, email=%s", request.email())
-                .isEqualTo(HttpStatus.CREATED);
+                .isEqualTo(HttpStatus.OK);
 
         var apiResponse = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+                response.getBody(), new TypeReference<ApiResponse<RegistrationResponse>>() {});
         assertThat(apiResponse.success()).isTrue();
-        assertThat(apiResponse.data().accessToken()).isNotBlank();
-        assertThat(apiResponse.data().refreshToken()).isNotBlank();
-        assertThat(apiResponse.data().tokenType()).isEqualTo("Bearer");
         assertThat(apiResponse.data().email()).isEqualTo("register@beautica.com");
-        assertThat(apiResponse.data().role()).isEqualTo(com.beautica.auth.Role.CLIENT);
+        assertThat(apiResponse.data().message()).isNotBlank();
     }
 
     @Test
-    @DisplayName("should return 409 when registering with an email that is already taken")
+    @DisplayName("should return 200 with RegistrationResponse for duplicate email (anti-enumeration)")
     void should_return409_when_registerWithDuplicateEmail() throws Exception {
         log.debug("Arrange: registering email={} twice", "duplicate@beautica.com");
         var request = new RegisterRequest(
@@ -79,13 +94,13 @@ class AuthControllerIT extends AbstractIntegrationTest {
                 "/api/v1/auth/register", request, String.class);
 
         assertThat(secondResponse.getStatusCode())
-                .as("status when same email is registered twice")
-                .isEqualTo(HttpStatus.CONFLICT);
+                .as("anti-enumeration: same 200 returned for duplicate email")
+                .isEqualTo(HttpStatus.OK);
 
         var apiResponse = objectMapper.readValue(
-                secondResponse.getBody(), new TypeReference<ApiResponse<Void>>() {});
-        assertThat(apiResponse.success()).isFalse();
-        assertThat(apiResponse.message()).isNotBlank();
+                secondResponse.getBody(), new TypeReference<ApiResponse<RegistrationResponse>>() {});
+        assertThat(apiResponse.success()).isTrue();
+        assertThat(apiResponse.data().email()).isEqualTo("duplicate@beautica.com");
     }
 
     @Test
@@ -98,6 +113,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
+        verifyEmailInDb(email);
 
         log.debug("Act: POST /auth/login with correct credentials for email={}", email);
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -149,6 +165,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
+        verifyEmailInDb(email);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login",
@@ -187,6 +204,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
+        verifyEmailInDb(email);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login",
@@ -237,6 +255,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         restTemplate.postForEntity("/api/v1/auth/register",
                 new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
+        verifyEmailInDb(email);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login",

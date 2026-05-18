@@ -1,5 +1,6 @@
 package com.beautica.common.exception;
 
+import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
@@ -30,11 +31,26 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    @ExceptionHandler(VerificationException.class)
+    public ResponseEntity<ApiResponse<VerificationErrorResponse>> handleVerification(VerificationException ex) {
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(new ApiResponse<>(false, new VerificationErrorResponse(ex.getCode().name()), "Verification failed"));
+    }
+
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
         return ResponseEntity
                 .status(ex.getStatus())
                 .body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(ResendThrottledException.class)
+    public ResponseEntity<ApiResponse<Void>> handleResendThrottled(ResendThrottledException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Please wait before requesting another code"));
     }
 
     @ExceptionHandler(NotFoundException.class)
@@ -180,6 +196,17 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .badRequest()
                 .body(ApiResponse.error("Invalid value for parameter '" + paramName + "'"));
+    }
+
+    @ExceptionHandler(EmailNotVerifiedException.class)
+    public ResponseEntity<ApiResponse<EmailNotVerifiedResponse>> handleEmailNotVerified(
+            EmailNotVerifiedException ex) {
+        log.debug("Login rejected — email not verified: {}", ex.getEmail());
+        return ResponseEntity
+                .status(HttpStatus.FORBIDDEN)
+                .body(new ApiResponse<>(false,
+                        new EmailNotVerifiedResponse("EMAIL_NOT_VERIFIED", ex.getEmail()),
+                        "Email not verified"));
     }
 
     @ExceptionHandler(Exception.class)

@@ -10,6 +10,7 @@ public record UserProfileResponse(
         String lastName,
         String phoneNumber,
         boolean isActive,
+        boolean emailVerified,
         UUID salonId
 ) {
 
@@ -22,6 +23,7 @@ public record UserProfileResponse(
                 user.getLastName(),
                 user.getPhoneNumber(),
                 user.isActive(),
+                user.isEmailVerified(),
                 user.getSalonId()
         );
     }
