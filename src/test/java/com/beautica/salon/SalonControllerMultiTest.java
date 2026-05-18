@@ -219,7 +219,7 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
     private String createSalonOwnerAndGetToken(String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 UUID.randomUUID(), email, hash);
 
         ResponseEntity<String> resp = restTemplate.postForEntity(

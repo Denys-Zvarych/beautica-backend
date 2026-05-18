@@ -244,8 +244,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String salonOwnerEmail = uniqueEmail("salon-owner");
         createdEmails.add(salonOwnerEmail);
         jdbcTemplate.update(
-                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, created_at, updated_at) " +
-                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, now(), now())",
+                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, email_verified, created_at, updated_at) " +
+                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
                 salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
