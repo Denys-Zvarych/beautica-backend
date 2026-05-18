@@ -112,7 +112,7 @@ class UserControllerTest {
         var userId = UUID.randomUUID();
         var profile = new UserProfileResponse(
                 userId, "jane@example.com", "CLIENT",
-                "Jane", "Doe", "+380671234567", true, null
+                "Jane", "Doe", "+380671234567", true, false, null
         );
         when(userService.getProfile(userId)).thenReturn(profile);
 
@@ -144,7 +144,7 @@ class UserControllerTest {
         var userId = UUID.randomUUID();
         var updated = new UserProfileResponse(
                 userId, "jane@example.com", "CLIENT",
-                "Oksana", "Kovalenko", null, true, null
+                "Oksana", "Kovalenko", null, true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
