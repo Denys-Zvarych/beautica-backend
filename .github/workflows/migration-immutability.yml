@@ -1,0 +1,55 @@
+name: Migration Immutability
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  check-migration-immutability:
+    name: Check Migration Immutability
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: git fetch origin "$BASE_REF"
+
+      - name: Detect modified or deleted migrations
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # Collect files that are Modified (M), Deleted (D), or Renamed (R)
+          # relative to the PR merge-base.  The three-dot form ("$BASE_SHA...HEAD")
+          # diffs against the merge-base of the two tips rather than the raw base
+          # tip, so advances on the base branch never attribute base-side mutations
+          # to this PR.  Added (A) files are intentionally excluded so brand-new
+          # migrations always pass.  Renamed migrations are caught because Flyway
+          # uses the script name as part of its checksum identity -- a rename
+          # changes that identity and will fail validation in prod.
+          CHANGED=$(git diff --name-status --diff-filter=MDR "$BASE_SHA...HEAD" -- "$MIGRATION_PATH")
+
+          if [ -z "$CHANGED" ]; then
+            echo "No existing migration files were modified, deleted, or renamed. Check passed."
+            exit 0
+          fi
+
+          echo "ERROR: The following already-merged Flyway migration file(s) were modified, deleted, or renamed:"
+          echo ""
+          echo "$CHANGED"
+          echo ""
+          echo "Applied/merged migrations are immutable -- never edit or rename V*.sql after it is merged."
+          echo "Add a new forward migration with the next version number instead."
+          echo "If you did NOT touch the file(s) listed above, rebase your branch onto the base branch to bring your history up to date."
+          exit 1
