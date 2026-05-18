@@ -5,7 +5,6 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.EmailService;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -54,9 +53,6 @@ class SalonSecurityTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
-
-    @org.springframework.boot.test.mock.mockito.MockBean
-    private EmailService emailService;
 
     @BeforeEach
     void configureHttpClient() {

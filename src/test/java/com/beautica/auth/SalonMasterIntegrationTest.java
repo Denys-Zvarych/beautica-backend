@@ -12,7 +12,6 @@ import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.service.MasterService;
-import com.beautica.notification.EmailService;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -80,9 +79,6 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
 
     @SpyBean
     private MasterService masterService;
-
-    @MockBean
-    private EmailService emailService;
 
     /** Tracks all emails created per test so @AfterEach can delete them in FK-safe order. */
     private final List<String> createdEmails = new ArrayList<>();

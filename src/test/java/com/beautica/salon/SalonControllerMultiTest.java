@@ -7,7 +7,6 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.EmailService;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -51,13 +50,6 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
-
-    // EmailService is @MockBean'd to suppress real SMTP for any sendAdminNotification
-    // path triggered by ServiceCatalogService. The legacy sendInviteEmail method was
-    // removed (Phase 5.16 cleanup) — invites now flow through the outbox →
-    // NotificationService → EmailNotificationService.
-    @org.springframework.boot.test.mock.mockito.MockBean
-    private EmailService emailService;
 
     @AfterEach
     void cleanUp() {

@@ -1,8 +1,11 @@
 package com.beautica;
 
+import com.beautica.notification.EmailService;
+import com.beautica.notification.service.EmailNotificationService;
 import org.junit.jupiter.api.AfterEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
@@ -25,6 +28,12 @@ import org.testcontainers.containers.PostgreSQLContainer;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 public abstract class AbstractIntegrationTest {
+
+    @MockBean
+    protected EmailNotificationService emailNotificationService;
+
+    @MockBean
+    protected EmailService emailService;
 
     @Autowired
     protected JdbcTemplate jdbcTemplate;

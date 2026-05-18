@@ -12,7 +12,6 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.EmailService;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
@@ -79,9 +78,6 @@ class InviteControllerIT extends AbstractIntegrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
-    @MockBean
-    private EmailService emailService;
-
     private final List<String> createdEmails = new ArrayList<>();
     private final List<UUID> createdSalonIds = new ArrayList<>();
 
@@ -126,10 +122,6 @@ class InviteControllerIT extends AbstractIntegrationTest {
 
         String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
-
-        // EmailService.sendInviteEmail was removed in Phase 5.16; the invite path now
-        // writes a notification_outbox row that the drain worker eventually consumes.
-        // EmailService remains @MockBean'd above to suppress the sendAdminNotification path.
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(masterEmail, salonId, null);
@@ -207,10 +199,6 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
         registerAndGetToken(alreadyRegistered, Role.CLIENT);
-
-        // EmailService.sendInviteEmail was removed in Phase 5.16 — invites now flow
-        // through the outbox. EmailService remains @MockBean'd to suppress the
-        // sendAdminNotification path on this test class.
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(alreadyRegistered, salonId, null);
