@@ -53,6 +53,13 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:dev-admin@localhost}
+  security:
+    # Local dev only — never use in prod. Generate prod value: openssl rand -base64 32
+    otp-pepper: local-dev-otp-pepper-not-for-prod-min32chars
+  verification:
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    stale-code-retention: 24h
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
     payload-key: w+ZLcc1IXPaNHEmD3o7EZu5yS+Uq97Wz61pmYe8NmIc=

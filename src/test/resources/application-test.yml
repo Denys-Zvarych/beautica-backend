@@ -51,6 +51,13 @@ app:
     token-expiration-hours: 72
     from-email: noreply@beautica.app
   admin-email: admin@beautica.test
+  security:
+    # Test profile only — fixed 32+ char value so the context loads under `test`.
+    otp-pepper: test-otp-pepper-fixed-value-min-32-characters
+  verification:
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    stale-code-retention: 24h
   outbox:
     # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
     payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=

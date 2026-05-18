@@ -201,7 +201,10 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(EmailNotVerifiedException.class)
     public ResponseEntity<ApiResponse<EmailNotVerifiedResponse>> handleEmailNotVerified(
             EmailNotVerifiedException ex) {
-        log.debug("Login rejected — email not verified: {}", ex.getEmail());
+        // No PII at any log level — log only the non-PII exception marker.
+        // The email is still returned in the response body by design (the
+        // authenticating account owner needs it to route to the verify screen).
+        log.debug("Login rejected — {}", ex.getClass().getSimpleName());
         return ResponseEntity
                 .status(HttpStatus.FORBIDDEN)
                 .body(new ApiResponse<>(false,

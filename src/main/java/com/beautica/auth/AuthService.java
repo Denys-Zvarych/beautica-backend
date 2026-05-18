@@ -15,7 +15,6 @@ import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
-import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -28,8 +27,6 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -42,7 +39,6 @@ public class AuthService {
 
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
     private static final Duration RESEND_COOLDOWN = Duration.ofSeconds(60);
-    private static final short MAX_VERIFICATION_ATTEMPTS = 5;
 
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
@@ -53,6 +49,7 @@ public class AuthService {
     private final Clock clock;
     private final EmailNotificationService emailNotificationService;
     private final TaskExecutor emailExecutor;
+    private final EmailVerificationProcessor emailVerificationProcessor;
 
     public AuthService(
             UserRepository userRepository,
@@ -63,7 +60,8 @@ public class AuthService {
             AuthResponseBuilder authResponseBuilder,
             Clock clock,
             EmailNotificationService emailNotificationService,
-            @Qualifier("emailExecutor") TaskExecutor emailExecutor
+            @Qualifier("emailExecutor") TaskExecutor emailExecutor,
+            EmailVerificationProcessor emailVerificationProcessor
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -74,6 +72,7 @@ public class AuthService {
         this.clock = clock;
         this.emailNotificationService = emailNotificationService;
         this.emailExecutor = emailExecutor;
+        this.emailVerificationProcessor = emailVerificationProcessor;
     }
 
     @Transactional
@@ -108,7 +107,7 @@ public class AuthService {
                 request.phoneNumber(),
                 businessName
         );
-        user.setVerificationCodeHash(tokenGenerator.hash(rawOtp));
+        user.setVerificationCodeHash(tokenGenerator.hashOtp(rawOtp));
         user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
 
         var savedUser = userRepository.save(user);
@@ -138,7 +137,7 @@ public class AuthService {
                 request.lastName(),
                 request.phoneNumber()
         );
-        user.setVerificationCodeHash(tokenGenerator.hash(rawOtp));
+        user.setVerificationCodeHash(tokenGenerator.hashOtp(rawOtp));
         user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
 
         var savedUser = userRepository.save(user);
@@ -229,62 +228,32 @@ public class AuthService {
         return buildAuthResponse(user);
     }
 
-    @Transactional(noRollbackFor = VerificationException.class)
+    /**
+     * Verifies the submitted OTP and, on success, issues an auth response.
+     *
+     * <p>Performance: the pessimistic row lock is held ONLY for the attempt /
+     * cumulative-lock / constant-time-match critical section
+     * ({@link #runVerificationCriticalSection}). JWT signing and the
+     * refresh-token INSERT happen AFTER that transaction commits and the lock
+     * is released, so concurrent verifies are no longer serialised across the
+     * full token round-trip.
+     *
+     * <p>Anti-enumeration: unknown-email, already-verified, exhausted, locked
+     * and wrong-code all surface as the generic {@code INVALID_CODE} /
+     * {@code CODE_EXPIRED} shapes — no status, body, exception-code or timing
+     * difference. The unknown-email branch performs a decoy hash + constant-time
+     * compare so it is time-equivalent to a wrong-code attempt on a real user.
+     */
     public AuthResponse verifyEmail(VerifyEmailRequest request) {
-        String email = request.email().toLowerCase(Locale.ROOT).strip();
-        // Pessimistic write lock serializes concurrent OTP submissions for the same account,
-        // preventing attempt-counter double-spend under concurrent requests.
-        var user = userRepository.findByEmailForUpdate(email)
+        // The locked critical section runs in EmailVerificationProcessor's
+        // @Transactional proxy. Token issuance happens AFTER that transaction
+        // commits and the PESSIMISTIC_WRITE lock is released — so concurrent
+        // verifies are no longer serialised across JWT signing + the
+        // refresh-token INSERT (a separate bean is required because a this.-call
+        // to a @Transactional method bypasses the proxy — Anti-Bug §F3).
+        UUID verifiedUserId = emailVerificationProcessor.verifyAndReturnUserId(request);
+        User user = userRepository.findById(verifiedUserId)
                 .orElseThrow(() -> new VerificationException(VerificationException.Code.INVALID_CODE));
-
-        // Fix 2: anti-enumeration — ALREADY_VERIFIED leaks account existence to probers.
-        // Return INVALID_CODE so unknown-email, already-verified, and wrong-code are wire-identical.
-        if (user.isEmailVerified()) {
-            throw new VerificationException(VerificationException.Code.INVALID_CODE);
-        }
-
-        if (user.getVerificationCodeHash() == null || user.getVerificationCodeExpiresAt() == null) {
-            throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
-        }
-
-        // Phase 1.8: clear the expired code on the user record so that a stale hash
-        // cannot be re-submitted after a resend (defence-in-depth; the resend endpoint
-        // already issues a new OTP that overwrites the hash, but clearing eagerly here
-        // prevents any window where two valid hashes coexist in the DB).
-        if (user.getVerificationCodeExpiresAt().isBefore(clock.instant())) {
-            user.setVerificationCodeHash(null);
-            user.setVerificationCodeExpiresAt(null);
-            userRepository.save(user);
-            throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
-        }
-
-        // Fix 3: enforce attempt cap before the hash comparison so brute-force is bounded.
-        // Treat exhausted attempts identically to expiry (CODE_EXPIRED) to avoid leaking the limit.
-        if (user.getVerificationAttempts() >= MAX_VERIFICATION_ATTEMPTS) {
-            throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
-        }
-        user.setVerificationAttempts((short) (user.getVerificationAttempts() + 1));
-        // Explicit save is required here: noRollbackFor = VerificationException.class causes the
-        // transaction to COMMIT even when INVALID_CODE is thrown below. Without an explicit save,
-        // Hibernate's dirty-checking would flush at commit — but we want the intent to be clear
-        // and the increment to be persisted on both the failure path (INVALID_CODE throws,
-        // transaction commits) and the success path (no exception, transaction commits normally).
-        userRepository.save(user);
-
-        String incomingHash = tokenGenerator.hash(request.code());
-        boolean match = MessageDigest.isEqual(
-                incomingHash.getBytes(StandardCharsets.UTF_8),
-                user.getVerificationCodeHash().getBytes(StandardCharsets.UTF_8));
-
-        if (!match) {
-            throw new VerificationException(VerificationException.Code.INVALID_CODE);
-        }
-
-        user.setEmailVerified(true);
-        user.setVerificationCodeHash(null);
-        user.setVerificationCodeExpiresAt(null);
-        user.setVerificationAttempts((short) 0);
-        userRepository.save(user);
         return buildAuthResponse(user);
     }
 
@@ -292,33 +261,47 @@ public class AuthService {
      * Resends a verification OTP to the given email address, subject to a 60-second
      * per-account cooldown.
      *
-     * <p>Anti-enumeration: unknown emails and already-verified accounts both return
-     * the same success-shaped {@link RegistrationResponse} without sending any mail.
-     * The response is wire-identical to a real resend, so probers cannot distinguish
-     * the three states (unknown / already-verified / resent).
+     * <p>Lock minimisation: a non-locking {@link UserRepository#findByEmail} read
+     * runs first. Unknown-email and already-verified branches take NO row lock
+     * (they short-circuit). The {@code PESSIMISTIC_WRITE} lock is escalated only
+     * on the real write path (user exists, unverified, code present).
      *
-     * <p>Throttle derivation: we do not store a dedicated {@code sent_at} column (see
-     * Phase 1.6 spec). Instead, {@code issuedAt} is derived as
-     * {@code verificationCodeExpiresAt - OTP_TTL}, since
-     * {@code expiresAt = issuedAt + OTP_TTL} at issue time. The next allowed send is
-     * {@code issuedAt + RESEND_COOLDOWN}. If the clock has not yet passed that instant,
-     * {@link ResendThrottledException} is thrown with the remaining wait in seconds.
+     * <p>Anti-enumeration: unknown emails, already-verified accounts and locked
+     * accounts all return the same success-shaped {@link RegistrationResponse}
+     * without sending mail. The response is wire-identical to a real resend.
+     *
+     * <p>Throttle derivation: we do not store a dedicated {@code sent_at} column.
+     * {@code issuedAt} is derived as {@code verificationCodeExpiresAt - OTP_TTL}.
+     * If {@code clock.now} has not passed {@code issuedAt + RESEND_COOLDOWN},
+     * {@link ResendThrottledException} is thrown.
      */
     @Transactional
     public RegistrationResponse resendVerification(ResendVerificationRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
-        var userOpt = userRepository.findByEmailForUpdate(email);
 
-        // Anti-enumeration: unknown email and already-verified both return the same
-        // generic success shape without sending mail.
-        if (userOpt.isEmpty() || userOpt.get().isEmailVerified()) {
+        // Non-locking pre-read — unknown / verified take NO row lock.
+        var preReadOpt = userRepository.findByEmail(email);
+        if (preReadOpt.isEmpty()
+                || preReadOpt.get().isEmailVerified()
+                || preReadOpt.get().getVerificationCodeHash() == null) {
             return RegistrationResponse.of(email);
         }
 
-        var user = userOpt.get();
+        // Real write path — escalate to the pessimistic lock now (closes the
+        // TOCTOU window between the cooldown read and the OTP write).
+        var user = userRepository.findByEmailForUpdate(email)
+                .orElse(null);
+        if (user == null || user.isEmailVerified() || user.getVerificationCodeHash() == null) {
+            return RegistrationResponse.of(email);
+        }
 
-        // Throttle check: derive issuedAt from expiresAt - OTP_TTL
-        // (avoids adding a verification_code_sent_at column; see Phase 1.6 spec).
+        // Locked accounts: respect the cumulative lock. Wire-identical generic
+        // success shape — no oracle that resend is being rejected for lock state.
+        if (emailVerificationProcessor.isLocked(user)) {
+            return RegistrationResponse.of(email);
+        }
+
+        // Throttle check: derive issuedAt from expiresAt - OTP_TTL.
         if (user.getVerificationCodeExpiresAt() != null) {
             Instant issuedAt = user.getVerificationCodeExpiresAt().minus(OTP_TTL);
             Instant nextAllowed = issuedAt.plus(RESEND_COOLDOWN);
@@ -329,10 +312,11 @@ public class AuthService {
         }
 
         String rawOtp = tokenGenerator.generateOtp();
-        user.setVerificationCodeHash(tokenGenerator.hash(rawOtp));
+        user.setVerificationCodeHash(tokenGenerator.hashOtp(rawOtp));
         user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
-        user.setVerificationAttempts((short) 0); // reset on fresh OTP
-        userRepository.save(user);
+        // Reset the per-OTP attempt window only. verificationFailedTotal is
+        // deliberately NOT reset here — that is the resend-surviving bound.
+        user.setVerificationAttempts((short) 0);
 
         scheduleVerificationEmail(user.getEmail(), rawOtp);
 

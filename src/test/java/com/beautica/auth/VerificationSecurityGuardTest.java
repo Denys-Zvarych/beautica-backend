@@ -41,6 +41,7 @@ class VerificationSecurityGuardTest {
     private static final Path PROJECT_ROOT = Paths.get(System.getProperty("user.dir"));
     private static final Path AUTH_SRC     = PROJECT_ROOT.resolve("src/main/java/com/beautica/auth");
     private static final Path NOTIF_SRC    = PROJECT_ROOT.resolve("src/main/java/com/beautica/notification");
+    private static final Path EXC_SRC      = PROJECT_ROOT.resolve("src/main/java/com/beautica/common/exception");
 
     // ──────────────────────────────────────────────────────────────────────────────
     @Nested
@@ -50,15 +51,26 @@ class VerificationSecurityGuardTest {
         @Test
         @DisplayName("should_useMessageDigestIsEqual_when_comparingOtp")
         void should_useMessageDigestIsEqual_when_comparingOtp() throws IOException {
-            String source = Files.readString(AUTH_SRC.resolve("AuthService.java"));
+            // The locked OTP critical section was extracted from AuthService into
+            // EmailVerificationProcessor (a this.-call to a @Transactional method
+            // bypasses the proxy — Anti-Bug §F3). The constant-time guard now
+            // pins the processor where the compare actually lives.
+            String source = Files.readString(AUTH_SRC.resolve("EmailVerificationProcessor.java"));
 
             assertThat(source)
-                    .as("AuthService must use MessageDigest.isEqual for OTP hash comparison — "
+                    .as("EmailVerificationProcessor must use MessageDigest.isEqual for OTP hash comparison — "
                             + "String.equals exits early on first mismatch, creating a timing oracle on a 6-digit secret")
                     .contains("MessageDigest.isEqual");
 
             assertThat(source)
                     .as("OTP comparison must not call request.code().equals() — timing oracle risk")
+                    .doesNotContain("request.code().equals(");
+
+            // Neither AuthService nor the processor may fall back to String.equals
+            // on the stored hash anywhere in the verification path.
+            String authServiceSource = Files.readString(AUTH_SRC.resolve("AuthService.java"));
+            assertThat(authServiceSource)
+                    .as("AuthService must not compare the OTP via String.equals")
                     .doesNotContain("request.code().equals(");
         }
     }
@@ -125,6 +137,63 @@ class VerificationSecurityGuardTest {
 
             assertThat(violations)
                     .as("No source file in auth/ or notification/ may pass the OTP value (rawOtp) to any log statement")
+                    .isEmpty();
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────
+    @Nested
+    @DisplayName("§4b — Broadened PII/secret log-hygiene guard (auth + notification + common.exception)")
+    class BroadenedLogHygieneGuard {
+
+        // A log line that references any of these tokens is a PII/secret leak.
+        // ".getEmail(" — email address PII (the GlobalExceptionHandler regression).
+        // "rawOtp" / ".code()" / "request.code()" — the plaintext OTP.
+        private static final String[] FORBIDDEN_ON_LOG_LINE = {
+                ".getEmail(", "rawOtp", "request.code()", ".code()"
+        };
+
+        @Test
+        @DisplayName("should_neverLogEmailOrCode_when_scanningAuthNotificationAndExceptionTrees")
+        void should_neverLogEmailOrCode_when_scanningAuthNotificationAndExceptionTrees() throws IOException {
+            List<String> violations;
+            try (Stream<Path> authFiles  = Files.walk(AUTH_SRC);
+                 Stream<Path> notifFiles = Files.walk(NOTIF_SRC);
+                 Stream<Path> excFiles   = Files.walk(EXC_SRC)) {
+
+                violations = Stream.of(authFiles, notifFiles, excFiles)
+                        .flatMap(s -> s)
+                        .filter(p -> p.toString().endsWith(".java"))
+                        .flatMap(file -> {
+                            String src;
+                            try {
+                                src = Files.readString(file);
+                            } catch (IOException e) {
+                                throw new RuntimeException("Failed to read " + file, e);
+                            }
+                            String[] lines = src.split("\n");
+                            List<String> hits = new java.util.ArrayList<>();
+                            for (int i = 0; i < lines.length; i++) {
+                                String line = lines[i];
+                                if (!line.contains("log.")) {
+                                    continue;
+                                }
+                                for (String forbidden : FORBIDDEN_ON_LOG_LINE) {
+                                    if (line.contains(forbidden)) {
+                                        hits.add(file.getFileName() + ":" + (i + 1)
+                                                + " [" + forbidden + "] " + line.trim());
+                                    }
+                                }
+                            }
+                            return hits.stream();
+                        })
+                        .collect(Collectors.toList());
+            }
+
+            assertThat(violations)
+                    .as("No log statement in auth/, notification/ or common.exception/ "
+                            + "may reference an email address (.getEmail()) or the OTP "
+                            + "(rawOtp / request.code() / .code())")
                     .isEmpty();
         }
     }

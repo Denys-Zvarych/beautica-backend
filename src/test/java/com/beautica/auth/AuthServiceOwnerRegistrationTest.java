@@ -52,6 +52,9 @@ class AuthServiceOwnerRegistrationTest {
     @Mock
     private EmailNotificationService emailNotificationService;
 
+    @Mock
+    private EmailVerificationProcessor emailVerificationProcessor;
+
     private AuthService authService;
 
     @BeforeEach
@@ -67,7 +70,8 @@ class AuthServiceOwnerRegistrationTest {
                 authResponseBuilder,
                 Clock.systemUTC(),
                 emailNotificationService,
-                syncExecutor
+                syncExecutor,
+                emailVerificationProcessor
         );
     }
 
@@ -109,7 +113,7 @@ class AuthServiceOwnerRegistrationTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("111111");
-        when(tokenGenerator.hash("111111")).thenReturn("d".repeat(64));
+        when(tokenGenerator.hashOtp("111111")).thenReturn("d".repeat(64));
 
         var response = authService.register(request);
 
@@ -156,7 +160,7 @@ class AuthServiceOwnerRegistrationTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("555555");
-        when(tokenGenerator.hash("555555")).thenReturn("a".repeat(64));
+        when(tokenGenerator.hashOtp("555555")).thenReturn("a".repeat(64));
 
         authService.register(request);
 

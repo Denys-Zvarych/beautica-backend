@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import jakarta.validation.constraints.NotNull;
@@ -320,6 +321,43 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody().message())
                 .as("message must not echo any user-supplied value")
                 .doesNotContain("not-a-uuid");
+    }
+
+    @Test
+    @DisplayName("Should NOT log the email at any level when handling EmailNotVerifiedException (PII)")
+    void should_notLogEmail_when_handlingEmailNotVerified() {
+        // Arrange — a recognisably-unique email so a leak is unambiguous.
+        String email = "pii-leak-canary-7f3a@beautica.test";
+        var ex = new EmailNotVerifiedException(email);
+
+        // Act
+        ResponseEntity<ApiResponse<EmailNotVerifiedResponse>> response =
+                handler.handleEmailNotVerified(ex);
+
+        // Assert — status + body contract preserved (email returned BY DESIGN
+        // in the body so the account owner can route to the verify screen).
+        assertThat(response.getStatusCode())
+                .as("unverified login must map to 403")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getBody().data().email())
+                .as("email is intentionally returned in the response body")
+                .isEqualTo(email);
+
+        // The log MUST NOT contain the email at any level (the §I regression).
+        boolean leaked = listAppender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(m -> m.contains(email));
+        assertThat(leaked)
+                .as("no log event may contain the email address — PII at any level")
+                .isFalse();
+
+        // A non-PII marker IS logged for server-side triage.
+        boolean markerLogged = listAppender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(m -> m.contains("EmailNotVerifiedException"));
+        assertThat(markerLogged)
+                .as("a non-PII exception marker should still be logged at DEBUG")
+                .isTrue();
     }
 
     /**

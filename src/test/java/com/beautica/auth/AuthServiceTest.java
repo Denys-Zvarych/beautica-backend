@@ -47,7 +47,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -76,6 +75,9 @@ class AuthServiceTest {
 
     @Mock
     private EmailNotificationService emailNotificationService;
+
+    @Mock
+    private EmailVerificationProcessor emailVerificationProcessor;
 
     @Mock
     private Clock clock;
@@ -107,7 +109,8 @@ class AuthServiceTest {
                 authResponseBuilder,
                 clock,
                 emailNotificationService,
-                syncExecutor
+                syncExecutor,
+                emailVerificationProcessor
         );
     }
 
@@ -126,7 +129,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("123456");
-        when(tokenGenerator.hash("123456")).thenReturn("a".repeat(64));
+        when(tokenGenerator.hashOtp("123456")).thenReturn("a".repeat(64));
 
         log.debug("Act: register CLIENT with valid email new@example.com");
         var response = authService.register(request);
@@ -174,7 +177,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("654321");
-        when(tokenGenerator.hash("654321")).thenReturn("b".repeat(64));
+        when(tokenGenerator.hashOtp("654321")).thenReturn("b".repeat(64));
 
         log.debug("Act: register independent master with valid email master@example.com");
         var response = authService.registerIndependentMaster(request);
@@ -388,7 +391,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("111111");
-        when(tokenGenerator.hash("111111")).thenReturn("e".repeat(64));
+        when(tokenGenerator.hashOtp("111111")).thenReturn("e".repeat(64));
 
         log.debug("Act: register SALON_OWNER with businessName='Beauty Studio Lviv'");
         authService.register(request);
@@ -449,7 +452,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("222222");
-        when(tokenGenerator.hash("222222")).thenReturn("f".repeat(64));
+        when(tokenGenerator.hashOtp("222222")).thenReturn("f".repeat(64));
 
         log.debug("Act: register CLIENT without businessName — should succeed");
         var response = authService.register(request);
@@ -476,7 +479,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("333333");
-        when(tokenGenerator.hash("333333")).thenReturn("9".repeat(64));
+        when(tokenGenerator.hashOtp("333333")).thenReturn("9".repeat(64));
 
         log.debug("Act: register with permitted self-registration role={}", role);
         var response = authService.register(request);
@@ -497,7 +500,7 @@ class AuthServiceTest {
 
         when(userRepository.existsByEmail("otp@example.com")).thenReturn(false);
         when(tokenGenerator.generateOtp()).thenReturn("042873");
-        when(tokenGenerator.hash("042873")).thenReturn("c".repeat(64));
+        when(tokenGenerator.hashOtp("042873")).thenReturn("c".repeat(64));
         ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
@@ -535,7 +538,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("708142");
-        when(tokenGenerator.hash("708142")).thenReturn("d".repeat(64));
+        when(tokenGenerator.hashOtp("708142")).thenReturn("d".repeat(64));
 
         authService.register(request);
 
@@ -558,7 +561,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("512034");
-        when(tokenGenerator.hash("512034")).thenReturn("a".repeat(64));
+        when(tokenGenerator.hashOtp("512034")).thenReturn("a".repeat(64));
 
         var response = authService.register(request);
 
@@ -584,7 +587,7 @@ class AuthServiceTest {
             return u;
         });
         when(tokenGenerator.generateOtp()).thenReturn("019283");
-        when(tokenGenerator.hash("019283")).thenReturn("f".repeat(64));
+        when(tokenGenerator.hashOtp("019283")).thenReturn("f".repeat(64));
 
         var response = authService.registerIndependentMaster(request);
 
@@ -595,226 +598,77 @@ class AuthServiceTest {
         assertThat(response).isNotInstanceOf(AuthResponse.class);
     }
 
-    // ─── verifyEmail ──────────────────────────────────────────────────────────
+    // ─── verifyEmail (orchestration) ──────────────────────────────────────────
+    // The locked critical section now lives in EmailVerificationProcessor (a
+    // separate bean — a this.-call to its @Transactional method would bypass the
+    // proxy and hold the PESSIMISTIC_WRITE lock across token issuance). These
+    // tests assert AuthService's orchestration: delegate to the processor INSIDE
+    // its transaction, then load + build the auth response OUTSIDE the lock.
+    // The detailed critical-section behaviour (attempt cap, anti-enumeration,
+    // cumulative lock, expiry) is covered by EmailVerificationProcessorTest.
 
     @Test
-    @DisplayName("verifyEmail — returns AuthResponse and marks account verified when valid code provided")
+    @DisplayName("verifyEmail — issues tokens AFTER the locked critical section commits (token issuance outside the lock)")
     void should_verifyAndReturnTokens_when_validCodeProvided() {
         var userId = UUID.randomUUID();
         var email = "verify@example.com";
         var rawCode = "123456";
-        var codeHash = "a".repeat(64);
         var user = buildUser(userId, email, passwordEncoder.encode("pass"), Role.CLIENT);
-        ReflectionTestUtils.setField(user, "emailVerified", false);
-        ReflectionTestUtils.setField(user, "verificationCodeHash", codeHash);
-        ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", FIXED_NOW.plusSeconds(900));
-        ReflectionTestUtils.setField(user, "verificationAttempts", (short) 0);
-        log.debug("Arrange: user with valid non-expired code, emailVerified=false");
+        ReflectionTestUtils.setField(user, "emailVerified", true);
+        log.debug("Arrange: processor returns verified userId; user loaded post-commit");
 
         var stubResponse = AuthResponse.of("access-tok", "refresh-tok", userId, email, Role.CLIENT);
-        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
-        when(tokenGenerator.hash(rawCode)).thenReturn(codeHash);
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(emailVerificationProcessor.verifyAndReturnUserId(any(VerifyEmailRequest.class)))
+                .thenReturn(userId);
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
         log.debug("Act: verifyEmail with correct code for email={}", email);
         var response = authService.verifyEmail(new VerifyEmailRequest(email, rawCode));
 
         assertThat(response).isNotNull();
+        assertThat(response.accessToken()).isEqualTo("access-tok");
+        // End-state assertion (not save-count): the processor performed the
+        // single-flush mutation; AuthService loads the now-verified user and
+        // builds the response. No userRepository.save() from AuthService itself.
         assertThat(user.isEmailVerified()).isTrue();
-        assertThat(user.getVerificationCodeHash()).isNull();
-        assertThat(user.getVerificationCodeExpiresAt()).isNull();
-        assertThat(user.getVerificationAttempts())
-                .as("verificationAttempts must be reset to 0 on successful verification")
-                .isEqualTo((short) 0);
-        // Two saves on the success path:
-        //   1. Explicit save for the attempt increment (noRollbackFor fix, F1).
-        //   2. Save for the terminal verified state (clears hash/expiry, resets counter).
-        verify(userRepository, times(2)).save(user);
+        verify(emailVerificationProcessor).verifyAndReturnUserId(any(VerifyEmailRequest.class));
+        verify(userRepository).findById(userId);
+        verify(userRepository, never()).save(any());
     }
 
     @Test
-    @DisplayName("verifyEmail — throws INVALID_CODE and does NOT clear the code when wrong code provided")
-    void should_throwInvalidCode_when_wrongCodeProvided() {
-        var userId = UUID.randomUUID();
+    @DisplayName("verifyEmail — propagates the generic VerificationException from the locked critical section unchanged")
+    void should_propagateVerificationException_when_processorRejects() {
         var email = "verify@example.com";
-        var storedHash = "a".repeat(64);
-        var user = buildUser(userId, email, passwordEncoder.encode("pass"), Role.CLIENT);
-        ReflectionTestUtils.setField(user, "emailVerified", false);
-        ReflectionTestUtils.setField(user, "verificationCodeHash", storedHash);
-        ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", FIXED_NOW.plusSeconds(900));
-        ReflectionTestUtils.setField(user, "verificationAttempts", (short) 0);
-        log.debug("Arrange: user with valid non-expired code, wrong code will be submitted");
+        when(emailVerificationProcessor.verifyAndReturnUserId(any(VerifyEmailRequest.class)))
+                .thenThrow(new VerificationException(VerificationException.Code.INVALID_CODE));
 
-        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
-        when(tokenGenerator.hash("000000")).thenReturn("b".repeat(64));
-        // Stub required: noRollbackFor fix (F1) added an explicit save() on the attempt-increment
-        // path. MockitoExtension STRICT_STUBS mode would fail on an un-stubbed save call.
-        when(userRepository.save(any(User.class))).thenReturn(user);
-
-        log.debug("Act: verifyEmail with wrong code '000000' for email={}", email);
+        log.debug("Act: verifyEmail when the processor rejects — exception must pass through unchanged");
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "000000")))
                 .isInstanceOf(VerificationException.class)
                 .extracting(ex -> ((VerificationException) ex).getCode())
                 .isEqualTo(VerificationException.Code.INVALID_CODE);
 
-        // Wrong code must NOT clear the stored hash — the resend endpoint (Phase 1.6) handles renewal.
-        assertThat(user.getVerificationCodeHash()).isEqualTo(storedHash);
-        // One explicit save() for the attempt increment (noRollbackFor fix, F1).
-        verify(userRepository).save(user);
-        assertThat(user.getVerificationAttempts())
-                .as("verificationAttempts must be incremented on wrong code")
-                .isEqualTo((short) 1);
+        // No token issuance attempted when the critical section rejected.
+        verify(authResponseBuilder, never()).buildAuthResponse(any());
+        verify(userRepository, never()).findById(any());
     }
 
     @Test
-    @DisplayName("verifyEmail — throws CODE_EXPIRED when max verification attempts exceeded")
-    void should_throwCodeExpired_when_maxAttemptsExceeded() {
+    @DisplayName("verifyEmail — throws INVALID_CODE when the verified user vanished before token issuance (no info leak)")
+    void should_throwInvalidCode_when_userMissingAfterCommit() {
+        var email = "verify@example.com";
         var userId = UUID.randomUUID();
-        var email = "locked@example.com";
-        var storedHash = "a".repeat(64);
-        var user = buildUser(userId, email, passwordEncoder.encode("pass"), Role.CLIENT);
-        ReflectionTestUtils.setField(user, "emailVerified", false);
-        ReflectionTestUtils.setField(user, "verificationCodeHash", storedHash);
-        ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", FIXED_NOW.plusSeconds(900));
-        ReflectionTestUtils.setField(user, "verificationAttempts", (short) 5);
-        log.debug("Arrange: user with verificationAttempts=5 (at limit), valid non-expired code");
+        when(emailVerificationProcessor.verifyAndReturnUserId(any(VerifyEmailRequest.class)))
+                .thenReturn(userId);
+        when(userRepository.findById(userId)).thenReturn(Optional.empty());
 
-        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
-
-        log.debug("Act: verifyEmail with attempts already at max — expects CODE_EXPIRED");
-        assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
-                .isInstanceOf(VerificationException.class)
-                .extracting(ex -> ((VerificationException) ex).getCode())
-                .isEqualTo(VerificationException.Code.CODE_EXPIRED);
-
-        // Lockout path exits before the attempt-increment — no persistence.
-        verify(userRepository, never()).save(any());
-    }
-
-    @Test
-    @DisplayName("verifyEmail — succeeds when verificationAttempts is exactly MAX minus one (4)")
-    void should_verifyAndReturnTokens_when_attemptsAtMaxMinusOne() {
-        var userId = UUID.randomUUID();
-        var email = "boundary@example.com";
-        var rawCode = "123456";
-        var codeHash = "a".repeat(64);
-        var user = buildUser(userId, email, passwordEncoder.encode("pass"), Role.CLIENT);
-        ReflectionTestUtils.setField(user, "emailVerified", false);
-        ReflectionTestUtils.setField(user, "verificationCodeHash", codeHash);
-        // Code is still valid — not expired
-        ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", FIXED_NOW.plusSeconds(900));
-        // Attempt 4 = MAX - 1: still within the allowed window, must not be rejected
-        ReflectionTestUtils.setField(user, "verificationAttempts", (short) 4);
-        log.debug("Arrange: user at verificationAttempts=4 (boundary, MAX-1), valid non-expired code");
-
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok", userId, email, Role.CLIENT);
-        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
-        when(tokenGenerator.hash(rawCode)).thenReturn(codeHash);
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
-
-        log.debug("Act: verifyEmail at the boundary attempt (4 of 5 max) for email={}", email);
-        var result = authService.verifyEmail(new VerifyEmailRequest(email, rawCode));
-
-        assertThat(result).isNotNull();
-        // Verification succeeds at the boundary: account is marked verified and counter reset
-        assertThat(user.isEmailVerified())
-                .as("emailVerified must be true after successful verification at attempt boundary")
-                .isTrue();
-        assertThat(user.getVerificationAttempts())
-                .as("verificationAttempts must be reset to 0 on successful verification")
-                .isEqualTo((short) 0);
-    }
-
-    @Test
-    @DisplayName("verifyEmail — throws CODE_EXPIRED and clears stored code when code has expired (Phase 1.8)")
-    void should_throwCodeExpired_when_codeExpired() {
-        var userId = UUID.randomUUID();
-        var email = "expired@example.com";
-        var storedHash = "c".repeat(64);
-        var user = buildUser(userId, email, passwordEncoder.encode("pass"), Role.CLIENT);
-        ReflectionTestUtils.setField(user, "emailVerified", false);
-        ReflectionTestUtils.setField(user, "verificationCodeHash", storedHash);
-        // Expiry 1 second before FIXED_NOW
-        ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", FIXED_NOW.minusSeconds(1));
-        log.debug("Arrange: user with expired code (expiresAt = FIXED_NOW - 1s)");
-
-        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
-
-        log.debug("Act: verifyEmail with any code for expired-OTP email={}", email);
-        assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
-                .isInstanceOf(VerificationException.class)
-                .extracting(ex -> ((VerificationException) ex).getCode())
-                .isEqualTo(VerificationException.Code.CODE_EXPIRED);
-
-        // Phase 1.8: expired code is cleared on the user record (defence-in-depth).
-        // The resend endpoint issues a fresh OTP that overwrites the fields; clearing
-        // here prevents any window where a stale hash survives alongside a fresh one.
-        assertThat(user.getVerificationCodeHash())
-                .as("verificationCodeHash must be null after expiry — Phase 1.8 clearing")
-                .isNull();
-        assertThat(user.getVerificationCodeExpiresAt())
-                .as("verificationCodeExpiresAt must be null after expiry — Phase 1.8 clearing")
-                .isNull();
-        verify(userRepository).save(user);
-    }
-
-    @Test
-    @DisplayName("verifyEmail — throws INVALID_CODE (not ALREADY_VERIFIED) when user is already verified — anti-enumeration")
-    void should_throwInvalidCode_when_userAlreadyVerified() {
-        var userId = UUID.randomUUID();
-        var email = "done@example.com";
-        var user = buildUser(userId, email, passwordEncoder.encode("pass"), Role.CLIENT);
-        ReflectionTestUtils.setField(user, "emailVerified", true);
-        log.debug("Arrange: user with emailVerified=true");
-
-        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
-
-        log.debug("Act: verifyEmail on already-verified account email={} — expects INVALID_CODE (anti-enumeration)", email);
+        log.debug("Act: verifyEmail when post-commit findById is empty — must surface generic INVALID_CODE");
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
                 .isInstanceOf(VerificationException.class)
                 .extracting(ex -> ((VerificationException) ex).getCode())
                 .isEqualTo(VerificationException.Code.INVALID_CODE);
-
-        // Already-verified path exits before the attempt-increment save — no persistence expected.
-        verify(userRepository, never()).save(any());
-    }
-
-    @Test
-    @DisplayName("verifyEmail — throws INVALID_CODE (not 404) when email is unknown — anti-enumeration")
-    void should_throwInvalidCode_when_emailUnknown() {
-        log.debug("Arrange: userRepository returns empty for unknown email");
-        when(userRepository.findByEmailForUpdate("ghost@example.com")).thenReturn(Optional.empty());
-
-        log.debug("Act: verifyEmail with unknown email — expects INVALID_CODE, not a 404");
-        assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest("ghost@example.com", "123456")))
-                .isInstanceOf(VerificationException.class)
-                .extracting(ex -> ((VerificationException) ex).getCode())
-                .isEqualTo(VerificationException.Code.INVALID_CODE);
-    }
-
-    @Test
-    @DisplayName("verifyEmail — throws CODE_EXPIRED when verificationCodeHash is null (never-issued or already consumed)")
-    void should_throwCodeExpired_when_verificationCodeIsNull() {
-        var userId = UUID.randomUUID();
-        var email = "nocode@example.com";
-        var user = buildUser(userId, email, passwordEncoder.encode("pass"), Role.CLIENT);
-        ReflectionTestUtils.setField(user, "emailVerified", false);
-        ReflectionTestUtils.setField(user, "verificationCodeHash", null);
-        ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", null);
-        log.debug("Arrange: user with null verificationCodeHash and null expiresAt");
-
-        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
-
-        log.debug("Act: verifyEmail for user with no stored code email={}", email);
-        assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
-                .isInstanceOf(VerificationException.class)
-                .extracting(ex -> ((VerificationException) ex).getCode())
-                .isEqualTo(VerificationException.Code.CODE_EXPIRED);
-
-        verify(userRepository, never()).save(any());
     }
 
     // ─── resendVerification ───────────────────────────────────────────────────
@@ -827,17 +681,21 @@ class AuthServiceTest {
         User user = buildUnverifiedUser();
         user.setVerificationCodeHash("oldhash");
         user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
+        // Non-locking pre-read first; lock escalated only on the real write path.
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(tokenGenerator.generateOtp()).thenReturn("654321");
-        when(tokenGenerator.hash("654321")).thenReturn("newhash");
+        when(tokenGenerator.hashOtp("654321")).thenReturn("newhash");
 
         RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
         assertThat(resp.email()).isEqualTo(TEST_EMAIL);
         assertThat(user.getVerificationCodeHash()).isEqualTo("newhash");
         assertThat(user.getVerificationCodeExpiresAt()).isEqualTo(FIXED_NOW.plus(OTP_TTL));
+        // Per-OTP attempt window reset; lifetime counter deliberately NOT reset.
         assertThat(user.getVerificationAttempts()).isZero();
-        verify(userRepository).save(user);
+        // Managed entity flushes at commit — no explicit save() from the service.
+        verify(userRepository).findByEmailForUpdate(TEST_EMAIL);
     }
 
     @Test
@@ -848,6 +706,7 @@ class AuthServiceTest {
         User user = buildUnverifiedUser();
         user.setVerificationCodeHash("somehash");
         user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
 
         assertThatThrownBy(() -> authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL)))
@@ -858,60 +717,91 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("resendVerification — returns generic response for unknown email (anti-enumeration)")
+    @DisplayName("resendVerification — returns generic response and takes NO row lock for unknown email (anti-enumeration)")
     void should_returnGenericResponse_when_emailUnknown() {
-        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.empty());
+        // Unknown email short-circuits on the non-locking pre-read — the
+        // PESSIMISTIC_WRITE lock is never acquired (blocker #6).
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
 
         RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
         assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(userRepository, never()).findByEmailForUpdate(anyString());
         verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }
 
     @Test
-    @DisplayName("resendVerification — returns generic response for already-verified user (anti-enumeration)")
+    @DisplayName("resendVerification — returns generic response and takes NO row lock for already-verified user (anti-enumeration)")
     void should_returnGenericResponse_when_alreadyVerified() {
         User user = buildUnverifiedUser();
         user.setEmailVerified(true);
-        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+        user.setVerificationCodeHash("somehash");
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
 
         RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
         assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(userRepository, never()).findByEmailForUpdate(anyString());
         verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }
 
     @Test
-    @DisplayName("resendVerification — extends expiry and resets attempts when resend succeeds")
+    @DisplayName("resendVerification — extends expiry and resets the per-OTP attempt window when resend succeeds")
     void should_extendExpiryAndResetAttempts_when_resendSucceeds() {
         Instant issuedAt = FIXED_NOW.minusSeconds(61);
         User user = buildUnverifiedUser();
+        user.setVerificationCodeHash("oldhash");
         user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
         user.setVerificationAttempts((short) 3);
+        user.setVerificationFailedTotal((short) 4);
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(tokenGenerator.generateOtp()).thenReturn("999999");
-        when(tokenGenerator.hash("999999")).thenReturn("hash999");
+        when(tokenGenerator.hashOtp("999999")).thenReturn("hash999");
 
         authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
         assertThat(user.getVerificationCodeExpiresAt()).isEqualTo(FIXED_NOW.plus(OTP_TTL));
         assertThat(user.getVerificationAttempts()).isZero();
+        // The resend-surviving lifetime counter must NOT be reset by a resend —
+        // that is the cumulative brute-force bound (blocker #2).
+        assertThat(user.getVerificationFailedTotal())
+                .as("verificationFailedTotal must survive a resend")
+                .isEqualTo((short) 4);
     }
 
     @Test
-    @DisplayName("resendVerification — resends without throttle when user has no existing code (verificationCodeExpiresAt is null)")
-    void should_resendWithoutThrottle_when_noExistingCode() {
+    @DisplayName("resendVerification — returns generic response and takes NO lock when no pending code exists (nothing to resend)")
+    void should_returnGenericResponse_when_noPendingCode() {
         User user = buildUnverifiedUser();
         user.setVerificationCodeHash(null);
         user.setVerificationCodeExpiresAt(null);
-        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
-        when(tokenGenerator.generateOtp()).thenReturn("111111");
-        when(tokenGenerator.hash("111111")).thenReturn("hash111");
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
 
         RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
         assertThat(resp.email()).isEqualTo(TEST_EMAIL);
-        verify(userRepository).save(user);
+        // No pending verification → wire-identical generic response, no lock.
+        verify(userRepository, never()).findByEmailForUpdate(anyString());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+    }
+
+    @Test
+    @DisplayName("resendVerification — returns generic response while the account is under a cumulative lockout (no oracle)")
+    void should_returnGenericResponse_when_accountLocked() {
+        User user = buildUnverifiedUser();
+        user.setVerificationCodeHash("oldhash");
+        user.setVerificationCodeExpiresAt(FIXED_NOW.minusSeconds(61).plus(OTP_TTL));
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(emailVerificationProcessor.isLocked(user)).thenReturn(true);
+
+        RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        // Wire-identical generic success — locked state must not leak via resend.
+        assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+        verify(tokenGenerator, never()).generateOtp();
     }
 
     // ─── login gate (Phase 1.7) ───────────────────────────────────────────────

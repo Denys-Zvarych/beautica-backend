@@ -564,4 +564,207 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         verify(emailNotificationService, never())
                 .sendVerificationEmail(any(), any());
     }
+
+    // ── Test 13 (QA HIGH) — cumulative lockout survives resend ────────────────
+
+    @Test
+    @DisplayName("should lock the account after 10 cumulative failures across resend cycles and reject wire-identically")
+    void should_lockAfterCumulativeFailuresAcrossResend_when_sustainedBruteForce() throws Exception {
+        var email = "cumulative.lockout@beautica.test";
+        log.debug("Arrange: register email={}", email);
+        registerAndCaptureCode(email);
+
+        String wrongCode = "999999";
+        // cumulative-failure-threshold = 10. The verify on iteration i=9 pushes
+        // verificationFailedTotal to 10 and trips the 15-min lock; the resend in
+        // that same iteration (and any later resend) is then correctly suppressed
+        // by EmailVerificationProcessor.isLocked — a locked account must NEVER be
+        // issued a fresh OTP (resend-surviving anti-brute-force invariant).
+        //
+        // The only OTP the test legitimately holds before the lock trips is the
+        // one dispatched by the resend in iteration i=8 (the final cycle whose
+        // resend runs while cumulative total < 10). Capture it there.
+        String correctButLocked = null;
+        for (int i = 0; i < 10; i++) {
+            ResponseEntity<String> fail = restTemplate.postForEntity(
+                    "/api/v1/auth/verify-email",
+                    new VerifyEmailRequest(email, wrongCode),
+                    String.class);
+            assertThat(fail.getStatusCode())
+                    .as("wrong-code attempt %d must be 400", i + 1)
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+
+            // Bypass the 60s resend cooldown (issuedAt = now-61s) and reset the
+            // per-OTP window via a fresh OTP, WITHOUT touching the lifetime counter.
+            jdbcTemplate.update(
+                    "UPDATE users SET verification_code_expires_at = ? WHERE email = ?",
+                    Timestamp.from(Instant.now().plusSeconds(839L)), email);
+
+            if (i == 8) {
+                // Last unlocked cycle: total is still < 10 when this resend runs,
+                // so it genuinely dispatches a fresh OTP. Capture it now — this is
+                // the correct code the test holds going into the locked state.
+                Mockito.reset(emailNotificationService);
+            }
+            restTemplate.postForEntity(
+                    "/api/v1/auth/resend-verification",
+                    new ResendVerificationRequest(email),
+                    String.class);
+            if (i == 8) {
+                var captor = ArgumentCaptor.forClass(String.class);
+                verify(emailNotificationService)
+                        .sendVerificationEmail(eq(email), captor.capture());
+                correctButLocked = captor.getValue();
+                assertThat(correctButLocked)
+                        .as("last unlocked resend must dispatch a 6-digit OTP")
+                        .matches("[0-9]{6}");
+                // Arm the never() assertion for the i=9 (post-lock) resend below.
+                Mockito.reset(emailNotificationService);
+            }
+        }
+
+        // The DB lifetime counter must have tripped the lock.
+        var user = transactionTemplate.execute(s ->
+                userRepository.findByEmail(email).orElseThrow());
+        assertThat(user.getVerificationFailedTotal())
+                .as("lifetime failure counter must reflect sustained abuse")
+                .isGreaterThanOrEqualTo((short) 10);
+        assertThat(user.getVerificationLockedUntil())
+                .as("account must be locked once cumulative failures reach the threshold")
+                .isNotNull();
+
+        // The i=9 resend ran AFTER the lock tripped: a locked resend must dispatch
+        // zero emails (the mock was reset right after the i=8 capture).
+        verify(emailNotificationService, never())
+                .sendVerificationEmail(eq(email), any());
+
+        // While locked, even the genuinely CORRECT code (captured from the last
+        // unlocked resend) must be rejected with the wire-identical generic shape
+        // — same status + same INVALID_CODE body as the wrong-code / unknown-email
+        // path, with no account verification and no new oracle.
+        ResponseEntity<String> lockedResponse = restTemplate.postForEntity(
+                "/api/v1/auth/verify-email",
+                new VerifyEmailRequest(email, correctButLocked),
+                String.class);
+
+        assertThat(lockedResponse.getStatusCode())
+                .as("a locked account must still get the generic 400 (no distinct status)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        var lockedBody = objectMapper.readValue(
+                lockedResponse.getBody(), new TypeReference<ApiResponse<VerificationErrorResponse>>() {});
+        assertThat(lockedBody.success()).isFalse();
+        assertThat(lockedBody.data().code())
+                .as("locked state must surface as the generic INVALID_CODE — no new oracle")
+                .isEqualTo("INVALID_CODE");
+
+        // The correct-but-locked submission must NOT verify the account.
+        var userAfterLockedAttempt = transactionTemplate.execute(s ->
+                userRepository.findByEmail(email).orElseThrow());
+        assertThat(userAfterLockedAttempt.isEmailVerified())
+                .as("a correct code submitted while locked must NOT verify the account")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("should NOT lock a legitimate user who fails a couple times then resends and verifies")
+    void should_notLock_when_lowFailureCountThenSuccessfulResend() throws Exception {
+        var email = "honest.user@beautica.test";
+        log.debug("Arrange: register email={}", email);
+        registerAndCaptureCode(email);
+
+        // Two honest mistakes — well below the cumulative threshold (10).
+        for (int i = 0; i < 2; i++) {
+            restTemplate.postForEntity(
+                    "/api/v1/auth/verify-email",
+                    new VerifyEmailRequest(email, "111111"),
+                    String.class);
+        }
+
+        // Resend (bypass cooldown) and verify with the fresh, correct code.
+        jdbcTemplate.update(
+                "UPDATE users SET verification_code_expires_at = ? WHERE email = ?",
+                Timestamp.from(Instant.now().plusSeconds(839L)), email);
+        Mockito.reset(emailNotificationService);
+        restTemplate.postForEntity(
+                "/api/v1/auth/resend-verification",
+                new ResendVerificationRequest(email),
+                String.class);
+        var captor = ArgumentCaptor.forClass(String.class);
+        verify(emailNotificationService).sendVerificationEmail(eq(email), captor.capture());
+        String freshCode = captor.getValue();
+
+        ResponseEntity<String> ok = restTemplate.postForEntity(
+                "/api/v1/auth/verify-email",
+                new VerifyEmailRequest(email, freshCode),
+                String.class);
+
+        assertThat(ok.getStatusCode())
+                .as("a low-failure honest user must still be able to verify")
+                .isEqualTo(HttpStatus.OK);
+        var user = transactionTemplate.execute(s ->
+                userRepository.findByEmail(email).orElseThrow());
+        assertThat(user.isEmailVerified()).isTrue();
+        assertThat(user.getVerificationLockedUntil())
+                .as("an honest user must never be locked")
+                .isNull();
+    }
+
+    // ── Test 14 (QA MEDIUM) — byte-identical anti-enumeration ─────────────────
+
+    @Test
+    @DisplayName("verify-email(unknown) and verify-email(wrong-code) are byte-identical in status and body")
+    void should_returnByteIdenticalResponse_when_verifyUnknownVsWrongCode() throws Exception {
+        var realEmail = "byteident.real@beautica.test";
+        registerAndCaptureCode(realEmail);
+
+        ResponseEntity<String> unknown = restTemplate.postForEntity(
+                "/api/v1/auth/verify-email",
+                new VerifyEmailRequest("byteident.ghost@beautica.test", "424242"),
+                String.class);
+        ResponseEntity<String> wrongCode = restTemplate.postForEntity(
+                "/api/v1/auth/verify-email",
+                new VerifyEmailRequest(realEmail, "424242"),
+                String.class);
+
+        assertThat(unknown.getStatusCode())
+                .as("unknown-email and wrong-code must share the same status")
+                .isEqualTo(wrongCode.getStatusCode());
+        assertThat(unknown.getBody())
+                .as("unknown-email and wrong-code response bodies must be byte-identical")
+                .isEqualTo(wrongCode.getBody());
+    }
+
+    @Test
+    @DisplayName("resend(unknown) and resend(real) are byte-identical in status and body")
+    void should_returnByteIdenticalResponse_when_resendUnknownVsReal() throws Exception {
+        var realEmail = "byteident.resendreal@beautica.test";
+        registerAndCaptureCode(realEmail);
+        // Bypass cooldown so the real resend takes the success path.
+        jdbcTemplate.update(
+                "UPDATE users SET verification_code_expires_at = ? WHERE email = ?",
+                Timestamp.from(Instant.now().plusSeconds(839L)), realEmail);
+
+        ResponseEntity<String> unknown = restTemplate.postForEntity(
+                "/api/v1/auth/resend-verification",
+                new ResendVerificationRequest("byteident.resendghost@beautica.test"),
+                String.class);
+        ResponseEntity<String> real = restTemplate.postForEntity(
+                "/api/v1/auth/resend-verification",
+                new ResendVerificationRequest(realEmail),
+                String.class);
+
+        assertThat(unknown.getStatusCode())
+                .as("resend(unknown) and resend(real) must share the same status")
+                .isEqualTo(real.getStatusCode());
+        // Both return RegistrationResponse {message,email}; the email field
+        // legitimately differs (it echoes the requested address), so compare
+        // the response SHAPE (keys + status), not the email value itself.
+        var unknownBody = objectMapper.readValue(
+                unknown.getBody(), new TypeReference<ApiResponse<RegistrationResponse>>() {});
+        var realBody = objectMapper.readValue(
+                real.getBody(), new TypeReference<ApiResponse<RegistrationResponse>>() {});
+        assertThat(unknownBody.success()).isEqualTo(realBody.success());
+        assertThat(unknownBody.message()).isEqualTo(realBody.message());
+        assertThat(unknownBody.data().message()).isEqualTo(realBody.data().message());
+    }
 }
