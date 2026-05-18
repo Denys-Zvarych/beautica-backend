@@ -245,8 +245,14 @@ public class AuthService {
             throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
         }
 
-        // Fix 1: do not clear/save on expiry — the resend endpoint (Phase 1.6) overwrites the code.
+        // Phase 1.8: clear the expired code on the user record so that a stale hash
+        // cannot be re-submitted after a resend (defence-in-depth; the resend endpoint
+        // already issues a new OTP that overwrites the hash, but clearing eagerly here
+        // prevents any window where two valid hashes coexist in the DB).
         if (user.getVerificationCodeExpiresAt().isBefore(clock.instant())) {
+            user.setVerificationCodeHash(null);
+            user.setVerificationCodeExpiresAt(null);
+            userRepository.save(user);
             throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
         }
 

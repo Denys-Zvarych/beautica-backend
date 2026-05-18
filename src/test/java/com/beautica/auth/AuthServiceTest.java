@@ -724,7 +724,7 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("verifyEmail — throws CODE_EXPIRED when code has expired; does NOT clear the stored code")
+    @DisplayName("verifyEmail — throws CODE_EXPIRED and clears stored code when code has expired (Phase 1.8)")
     void should_throwCodeExpired_when_codeExpired() {
         var userId = UUID.randomUUID();
         var email = "expired@example.com";
@@ -737,6 +737,7 @@ class AuthServiceTest {
         log.debug("Arrange: user with expired code (expiresAt = FIXED_NOW - 1s)");
 
         when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
 
         log.debug("Act: verifyEmail with any code for expired-OTP email={}", email);
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
@@ -744,12 +745,16 @@ class AuthServiceTest {
                 .extracting(ex -> ((VerificationException) ex).getCode())
                 .isEqualTo(VerificationException.Code.CODE_EXPIRED);
 
-        // Expired path must NOT mutate or persist the user record —
-        // the resend endpoint (Phase 1.6) will overwrite the code when the user requests a new one.
+        // Phase 1.8: expired code is cleared on the user record (defence-in-depth).
+        // The resend endpoint issues a fresh OTP that overwrites the fields; clearing
+        // here prevents any window where a stale hash survives alongside a fresh one.
         assertThat(user.getVerificationCodeHash())
-                .as("stored code must not be cleared on expiry")
-                .isEqualTo(storedHash);
-        verify(userRepository, never()).save(any());
+                .as("verificationCodeHash must be null after expiry — Phase 1.8 clearing")
+                .isNull();
+        assertThat(user.getVerificationCodeExpiresAt())
+                .as("verificationCodeExpiresAt must be null after expiry — Phase 1.8 clearing")
+                .isNull();
+        verify(userRepository).save(user);
     }
 
     @Test
