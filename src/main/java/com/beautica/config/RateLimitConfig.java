@@ -40,8 +40,16 @@ public class RateLimitConfig {
     // Per-IP cap for POST /api/v1/auth/verify-email (15-minute window).
     // 10 attempts per window is generous for legitimate users while still
     // preventing brute-force of the 6-digit OTP space (1,000,000 combinations).
-    private static final long VERIFY_EMAIL_CAPACITY = 10;
+    // Configurable so integration tests running on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.verify-email-capacity:10}")
+    private long verifyEmailCapacity;
+
     private static final Duration VERIFY_EMAIL_WINDOW = Duration.ofMinutes(15);
+
+    // Per-IP cap for POST /api/v1/auth/resend-verification (60-second window).
+    // Configurable so integration tests running on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.resend-verification-capacity:3}")
+    private long resendVerificationCapacity;
 
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
@@ -109,7 +117,7 @@ public class RateLimitConfig {
                 .maximumSize(100_000)
                 .expireAfterAccess(VERIFY_EMAIL_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(VERIFY_EMAIL_CAPACITY, VERIFY_EMAIL_WINDOW))
+                        .addLimit(bandwidthOf(verifyEmailCapacity, VERIFY_EMAIL_WINDOW))
                         .build());
     }
 
@@ -123,7 +131,7 @@ public class RateLimitConfig {
                 .maximumSize(100_000)
                 .expireAfterAccess(90, java.util.concurrent.TimeUnit.SECONDS)
                 .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(3, Duration.ofSeconds(60)))
+                        .addLimit(bandwidthOf(resendVerificationCapacity, Duration.ofSeconds(60)))
                         .build());
     }
 

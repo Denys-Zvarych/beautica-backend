@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.config.OtpPepperConfig;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -9,11 +10,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("SecureTokenGenerator — unit")
 class SecureTokenGeneratorTest {
 
+    // Fixed 32+ char test pepper — the real HMAC key path exercises misuse.
+    private static final String TEST_PEPPER = "unit-test-otp-pepper-min-32-characters!";
+
     private SecureTokenGenerator tokenGenerator;
 
     @BeforeEach
     void setUp() {
-        tokenGenerator = new SecureTokenGenerator();
+        tokenGenerator = new SecureTokenGenerator(new OtpPepperConfig(TEST_PEPPER));
     }
 
     @Test
@@ -72,6 +76,51 @@ class SecureTokenGeneratorTest {
 
         assertThat(hash).hasSize(64);
         assertThat(hash).matches("[0-9a-f]{64}");
+    }
+
+    @Test
+    @DisplayName("hashOtp is deterministic for the same OTP under the same pepper")
+    void should_beDeterministic_when_hashOtpCalledWithSameInput() {
+        var first = tokenGenerator.hashOtp("123456");
+        var second = tokenGenerator.hashOtp("123456");
+
+        assertThat(first).isEqualTo(second);
+    }
+
+    @Test
+    @DisplayName("hashOtp output is exactly 64 lowercase hex characters (HMAC-SHA256)")
+    void should_return64HexChars_when_hashOtpCalled() {
+        var hash = tokenGenerator.hashOtp("000000");
+
+        assertThat(hash).hasSize(64);
+        assertThat(hash)
+                .as("HMAC-SHA256 hex must satisfy the V49 chk_verification_code_hash_format constraint")
+                .matches("[0-9a-f]{64}");
+    }
+
+    @Test
+    @DisplayName("hashOtp is keyed — output differs from the unkeyed hash() for the same input")
+    void should_differFromUnkeyedHash_when_sameOtpInput() {
+        var keyed = tokenGenerator.hashOtp("424242");
+        var unkeyed = tokenGenerator.hash("424242");
+
+        assertThat(keyed)
+                .as("a keyed HMAC must not equal the bare SHA-256 of the same value")
+                .isNotEqualTo(unkeyed);
+    }
+
+    @Test
+    @DisplayName("hashOtp output depends on the pepper — different pepper yields a different digest")
+    void should_produceDifferentDigest_when_pepperDiffers() {
+        var otherGenerator = new SecureTokenGenerator(
+                new OtpPepperConfig("a-completely-different-pepper-min-32-chars"));
+
+        var digestA = tokenGenerator.hashOtp("987654");
+        var digestB = otherGenerator.hashOtp("987654");
+
+        assertThat(digestA)
+                .as("a leaked digest must be useless without the exact server pepper")
+                .isNotEqualTo(digestB);
     }
 
     @Test

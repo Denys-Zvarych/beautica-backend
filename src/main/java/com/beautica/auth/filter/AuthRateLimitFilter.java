@@ -31,6 +31,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
     private static final int RETRY_AFTER_SECONDS = 60;
+    // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
+    // so clients do not spin-retry every 60 s and waste their remaining IP quota.
+    private static final int VERIFY_EMAIL_RETRY_AFTER_SECONDS = 900;
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -76,7 +79,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // the POST-only branch so DELETE is also covered.
         if (DEVICE_TOKEN_PATH.equals(path)
                 && (HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))) {
-            applyRateLimit(request, response, filterChain, deviceTokenBuckets);
+            applyRateLimit(request, response, filterChain, deviceTokenBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -87,7 +90,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // rate-limited here — they're read-only and cached behind R2/CDN.
         if ((HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))
                 && path.startsWith(MEDIA_PATH_PREFIX)) {
-            applyRateLimit(request, response, filterChain, mediaUploadBuckets);
+            applyRateLimit(request, response, filterChain, mediaUploadBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -95,7 +98,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (HttpMethod.GET.matches(method)
                 && path.startsWith(SLOTS_PATH_PREFIX)
                 && path.endsWith(SLOTS_PATH_SUFFIX)) {
-            applyRateLimit(request, response, filterChain, slotsBuckets);
+            applyRateLimit(request, response, filterChain, slotsBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -106,6 +109,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
 
         LoadingCache<String, Bucket> cache;
 
+        int retryAfterSeconds = RETRY_AFTER_SECONDS;
+
         if (REGISTER_PATH.equals(path) || REGISTER_IM_PATH.equals(path)) {
             cache = registerBuckets;
         } else if (LOGIN_PATH.equals(path)) {
@@ -114,6 +119,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             cache = refreshBuckets;
         } else if (VERIFY_EMAIL_PATH.equals(path)) {
             cache = verifyEmailBuckets;
+            retryAfterSeconds = VERIFY_EMAIL_RETRY_AFTER_SECONDS;
         } else if (RESEND_VERIFICATION_PATH.equals(path)) {
             cache = resendVerificationBuckets;
         } else {
@@ -121,13 +127,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        applyRateLimit(request, response, filterChain, cache);
+        applyRateLimit(request, response, filterChain, cache, retryAfterSeconds);
     }
 
     private void applyRateLimit(HttpServletRequest request,
                                 HttpServletResponse response,
                                 FilterChain filterChain,
-                                LoadingCache<String, Bucket> cache) throws ServletException, IOException {
+                                LoadingCache<String, Bucket> cache,
+                                int retryAfterSeconds) throws ServletException, IOException {
         String ip = resolveClientIp(request);
         // Clamp to max IPv6 length (45 chars) to prevent oversized Caffeine cache keys
         // crafted via a long X-Forwarded-For header value.
@@ -141,7 +148,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else {
             response.setStatus(429);
             response.setContentType("application/json");
-            response.setHeader("Retry-After", String.valueOf(RETRY_AFTER_SECONDS));
+            response.setHeader("Retry-After", String.valueOf(retryAfterSeconds));
             response.setContentLength(TOO_MANY_REQUESTS_BODY.length);
             response.getOutputStream().write(TOO_MANY_REQUESTS_BODY);
         }

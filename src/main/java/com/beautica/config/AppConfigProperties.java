@@ -5,6 +5,11 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
-@EnableConfigurationProperties({JwtConfig.class, OutboxCipherProperties.class})
+@EnableConfigurationProperties({
+        JwtConfig.class,
+        OutboxCipherProperties.class,
+        OtpPepperConfig.class,
+        VerificationPolicyConfig.class
+})
 public class AppConfigProperties {
 }

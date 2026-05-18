@@ -10,6 +10,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 
 import java.time.Instant;
@@ -17,7 +18,14 @@ import java.util.UUID;
 
 
 @Entity
-@Table(name = "users")
+@Table(
+        name = "users",
+        // Mirrors the partial index idx_users_stale_unverified_otp from V50 so
+        // ddl-auto=validate catches drift. JPA cannot express the partial
+        // predicate (WHERE email_verified = false) — the column list documents it.
+        indexes = @Index(
+                name = "idx_users_stale_unverified_otp",
+                columnList = "verification_code_expires_at"))
 public class User extends AuditableEntity {
 
     @Id
@@ -73,6 +81,18 @@ public class User extends AuditableEntity {
     @JsonIgnore
     @Column(name = "verification_attempts", nullable = false)
     private short verificationAttempts = 0;
+
+    // Lifetime failed-verify counter that resend does NOT reset. Backs the
+    // resend-surviving cumulative brute-force bound (see V50 migration).
+    @JsonIgnore
+    @Column(name = "verification_failed_total", nullable = false)
+    private short verificationFailedTotal = 0;
+
+    // When non-null and in the future, both verifyEmail and resendVerification
+    // reject — but with the wire-identical generic failure shape (no new oracle).
+    @JsonIgnore
+    @Column(name = "verification_locked_until")
+    private Instant verificationLockedUntil;
 
     @Column(name = "business_name", length = 255)
     private String businessName;
@@ -192,6 +212,24 @@ public class User extends AuditableEntity {
 
     public void setVerificationAttempts(short verificationAttempts) {
         this.verificationAttempts = verificationAttempts;
+    }
+
+    @JsonIgnore
+    public short getVerificationFailedTotal() {
+        return verificationFailedTotal;
+    }
+
+    public void setVerificationFailedTotal(short verificationFailedTotal) {
+        this.verificationFailedTotal = verificationFailedTotal;
+    }
+
+    @JsonIgnore
+    public Instant getVerificationLockedUntil() {
+        return verificationLockedUntil;
+    }
+
+    public void setVerificationLockedUntil(Instant verificationLockedUntil) {
+        this.verificationLockedUntil = verificationLockedUntil;
     }
 
     public UUID getSalonId() {

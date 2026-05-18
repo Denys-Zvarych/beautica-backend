@@ -130,6 +130,19 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
+  security:
+    # Keyed HMAC-SHA256 pepper for the 6-digit verification OTP. Distinct from
+    # JWT_SECRET. Generate: openssl rand -base64 32. Empty default forces every
+    # profile to supply a value or fail fast at startup (>= 32 chars required).
+    otp-pepper: ${APP_OTP_PEPPER:}
+  verification:
+    # Resend-surviving cumulative brute-force bound: after this many lifetime
+    # failed verifies (NOT reset by resend) the account is locked for
+    # lockout-duration. A couple of honest mistakes + a resend never trips it.
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    # Abandoned unverified OTP rows older than this are nulled by the daily sweep.
+    stale-code-retention: 24h
   rate-limit:
     # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
     # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.

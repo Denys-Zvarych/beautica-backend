@@ -954,7 +954,8 @@ class AuthRateLimitFilterTest {
             assertThat(response.getStatus())
                     .as("status must be 429 when verifyEmail bucket is exhausted")
                     .isEqualTo(429);
-            assertThat(response.getHeader("Retry-After")).isEqualTo("60");
+            // verify-email bucket window is 15 minutes — Retry-After must reflect 900 s
+            assertThat(response.getHeader("Retry-After")).isEqualTo("900");
             assertThat(response.getContentType())
                     .as("Content-Type must be application/json on 429 verify-email response")
                     .startsWith("application/json");
