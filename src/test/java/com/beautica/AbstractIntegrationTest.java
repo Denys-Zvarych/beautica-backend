@@ -2,11 +2,16 @@ package com.beautica;
 
 import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
+import com.beautica.support.SlowTestExtension;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.cache.CacheManager;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -27,6 +32,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
+@ExtendWith(SlowTestExtension.class)
 public abstract class AbstractIntegrationTest {
 
     @MockBean
@@ -40,6 +46,9 @@ public abstract class AbstractIntegrationTest {
 
     @Autowired
     private CacheManager cacheManager;
+
+    @Autowired
+    private TestRestTemplate baseRestTemplate;
 
     @AfterEach
     void cleanDb() {
@@ -62,6 +71,11 @@ public abstract class AbstractIntegrationTest {
             var cache = cacheManager.getCache(name);
             if (cache != null) cache.clear();
         });
+
+        // Reset to a fresh Apache HttpClient after every test so context-sharing
+        // classes never inherit a stale/closed connection pool from a previous test.
+        baseRestTemplate.getRestTemplate().setRequestFactory(
+                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
     }
 
     private static final PostgreSQLContainer<?> POSTGRES =
