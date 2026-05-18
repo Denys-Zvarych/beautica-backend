@@ -37,6 +37,12 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.media-upload-capacity:10}")
     private long mediaUploadCapacity;
 
+    // Per-IP cap for POST /api/v1/auth/verify-email (15-minute window).
+    // 10 attempts per window is generous for legitimate users while still
+    // preventing brute-force of the 6-digit OTP space (1,000,000 combinations).
+    private static final long VERIFY_EMAIL_CAPACITY = 10;
+    private static final Duration VERIFY_EMAIL_WINDOW = Duration.ofMinutes(15);
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
         return Caffeine.newBuilder()
@@ -94,6 +100,16 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofHours(1))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(mediaUploadCapacity, Duration.ofMinutes(1)))
+                        .build());
+    }
+
+    @Bean
+    public LoadingCache<String, Bucket> verifyEmailBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(VERIFY_EMAIL_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(VERIFY_EMAIL_CAPACITY, VERIFY_EMAIL_WINDOW))
                         .build());
     }
 

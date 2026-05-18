@@ -59,7 +59,7 @@ public class SecurityConfig {
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint(unauthorizedEntryPoint()))
                 .authorizeHttpRequests(auth -> {
-                    auth.requestMatchers("/api/v1/auth/register", "/api/v1/auth/register/independent-master", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/invite/accept").permitAll();
+                    auth.requestMatchers("/api/v1/auth/register", "/api/v1/auth/register/independent-master", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/invite/accept", "/api/v1/auth/verify-email").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll();
                     if (isDevProfile) {
                         auth.requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll();

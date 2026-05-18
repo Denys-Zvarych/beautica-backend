@@ -24,6 +24,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String REGISTER_IM_PATH = "/api/v1/auth/register/independent-master";
     private static final String LOGIN_PATH = "/api/v1/auth/login";
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
+    private static final String VERIFY_EMAIL_PATH = "/api/v1/auth/verify-email";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
@@ -33,6 +34,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
     private final LoadingCache<String, Bucket> refreshBuckets;
+    private final LoadingCache<String, Bucket> verifyEmailBuckets;
     private final LoadingCache<String, Bucket> slotsBuckets;
     // IP-keyed (not user-keyed): JWT parsing is the responsibility of JwtAuthenticationFilter
     // which runs *after* this filter; resolving the principal here would duplicate that work
@@ -46,12 +48,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
             @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("verifyEmailBuckets") LoadingCache<String, Bucket> verifyEmailBuckets,
             @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
             @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
             @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
+        this.verifyEmailBuckets = verifyEmailBuckets;
         this.slotsBuckets = slotsBuckets;
         this.deviceTokenBuckets = deviceTokenBuckets;
         this.mediaUploadBuckets = mediaUploadBuckets;
@@ -104,6 +108,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             cache = loginBuckets;
         } else if (REFRESH_PATH.equals(path)) {
             cache = refreshBuckets;
+        } else if (VERIFY_EMAIL_PATH.equals(path)) {
+            cache = verifyEmailBuckets;
         } else {
             filterChain.doFilter(request, response);
             return;

@@ -7,7 +7,9 @@ import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
+import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.VerificationException;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshToken;
@@ -23,6 +25,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -33,6 +37,7 @@ import java.util.UUID;
 public class AuthService {
 
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
+    private static final short MAX_VERIFICATION_ATTEMPTS = 5;
 
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
@@ -199,6 +204,51 @@ public class AuthService {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found");
         }
 
+        return buildAuthResponse(user);
+    }
+
+    @Transactional
+    public AuthResponse verifyEmail(VerifyEmailRequest request) {
+        var user = userRepository.findByEmail(request.email())
+                .orElseThrow(() -> new VerificationException(VerificationException.Code.INVALID_CODE));
+
+        // Fix 2: anti-enumeration — ALREADY_VERIFIED leaks account existence to probers.
+        // Return INVALID_CODE so unknown-email, already-verified, and wrong-code are wire-identical.
+        if (user.isEmailVerified()) {
+            throw new VerificationException(VerificationException.Code.INVALID_CODE);
+        }
+
+        if (user.getVerificationCodeHash() == null || user.getVerificationCodeExpiresAt() == null) {
+            throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
+        }
+
+        // Fix 1: do not clear/save on expiry — the resend endpoint (Phase 1.6) overwrites the code.
+        if (user.getVerificationCodeExpiresAt().isBefore(clock.instant())) {
+            throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
+        }
+
+        // Fix 3: enforce attempt cap before the hash comparison so brute-force is bounded.
+        // Treat exhausted attempts identically to expiry (CODE_EXPIRED) to avoid leaking the limit.
+        if (user.getVerificationAttempts() >= MAX_VERIFICATION_ATTEMPTS) {
+            throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
+        }
+        user.setVerificationAttempts((short) (user.getVerificationAttempts() + 1));
+        userRepository.save(user);  // persist attempt increment; committed even when the next check fails
+
+        String incomingHash = tokenGenerator.hash(request.code());
+        boolean match = MessageDigest.isEqual(
+                incomingHash.getBytes(StandardCharsets.UTF_8),
+                user.getVerificationCodeHash().getBytes(StandardCharsets.UTF_8));
+
+        if (!match) {
+            throw new VerificationException(VerificationException.Code.INVALID_CODE);
+        }
+
+        user.setEmailVerified(true);
+        user.setVerificationCodeHash(null);
+        user.setVerificationCodeExpiresAt(null);
+        user.setVerificationAttempts((short) 0);
+        userRepository.save(user);
         return buildAuthResponse(user);
     }
 
