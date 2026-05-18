@@ -51,8 +51,9 @@ abstract class AbstractMediaIntegrationTest extends AbstractIntegrationTest {
     protected UUID insertClient(String email) {
         UUID id = UUID.randomUUID();
         String hash = passwordEncoder().encode(TEST_PASSWORD);
+        // email_verified = true so Phase 1.7 login gate does not return 403 EMAIL_NOT_VERIFIED
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'CLIENT', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'CLIENT', true, true)",
                 id, email, hash);
         return id;
     }
@@ -60,8 +61,9 @@ abstract class AbstractMediaIntegrationTest extends AbstractIntegrationTest {
     protected UUID insertSalonOwner(String email) {
         UUID id = UUID.randomUUID();
         String hash = passwordEncoder().encode(TEST_PASSWORD);
+        // email_verified = true so Phase 1.7 login gate does not return 403 EMAIL_NOT_VERIFIED
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 id, email, hash);
         return id;
     }
