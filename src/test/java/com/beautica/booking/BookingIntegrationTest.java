@@ -471,8 +471,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
     private String createClientAndGetToken(String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
+        // email_verified = true so Phase 1.7 login gate does not return 403 EMAIL_NOT_VERIFIED
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'CLIENT', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'CLIENT', true, true)",
                 UUID.randomUUID(), email, hash);
         return loginAndGetToken(email);
     }
@@ -488,8 +489,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     private UUID createSalonOwnerSalonAndMaster(String ownerEmail) {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         UUID ownerId = UUID.randomUUID();
+        // email_verified = true so Phase 1.7 login gate does not return 403 EMAIL_NOT_VERIFIED
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 ownerId, ownerEmail, hash);
 
         UUID salonId = UUID.randomUUID();
@@ -499,8 +501,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "master-" + System.nanoTime() + "@beautica.test";
+        // email_verified = true — master does not log in here but follows the same contract
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active) VALUES (?, ?, ?, 'SALON_MASTER', ?, true)",
+                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) VALUES (?, ?, ?, 'SALON_MASTER', ?, true, true)",
                 masterUserId, masterEmail, hash, salonId);
 
         UUID masterId = UUID.randomUUID();

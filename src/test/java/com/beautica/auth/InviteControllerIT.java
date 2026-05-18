@@ -480,15 +480,37 @@ class InviteControllerIT extends AbstractIntegrationTest {
         return headers;
     }
 
+    /**
+     * Registers a user via the public registration endpoint, verifies their email directly in the
+     * DB (Phase 1.7 gate: unverified users get 403 on login), then logs in and returns the access
+     * token. The {@code ignoredRole} parameter is kept for call-site readability but has no effect
+     * — self-registration always produces a CLIENT.
+     */
     private String registerAndGetToken(String email, Role ignoredRole) throws Exception {
-        var registerResp = restTemplate.postForEntity(
+        restTemplate.postForEntity(
                 "/api/v1/auth/register",
                 new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class
         );
+        // Phase 1.7: mark email as verified so login does not return 403 EMAIL_NOT_VERIFIED
+        verifyEmailInDb(email);
+        var loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, "password123"),
+                String.class
+        );
         var body = objectMapper.readValue(
-                registerResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
+    }
+
+    private void verifyEmailInDb(String email) {
+        transactionTemplate.executeWithoutResult(status ->
+            userRepository.findByEmail(email).ifPresent(user -> {
+                user.setEmailVerified(true);
+                userRepository.save(user);
+            })
+        );
     }
 
     /**

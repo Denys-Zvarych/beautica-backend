@@ -5,6 +5,7 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.master.dto.MasterDetailResponse;
@@ -218,18 +219,23 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/register/independent-master", request, String.class);
 
-        // Assert: registration succeeded
+        // Assert: Phase 1.3 — registration returns 200 OK with RegistrationResponse (email + message),
+        // not 201 CREATED with an AuthResponse. The user must verify email before a JWT is issued.
         assertThat(response.getStatusCode())
-                .as("status must be 201 when independent master registration succeeds, email=%s", email)
-                .isEqualTo(HttpStatus.CREATED);
+                .as("status must be 200 when independent master registration succeeds, email=%s", email)
+                .isEqualTo(HttpStatus.OK);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+                response.getBody(), new TypeReference<ApiResponse<RegistrationResponse>>() {});
         assertThat(body.success()).isTrue();
-        assertThat(body.data().role()).isEqualTo(Role.INDEPENDENT_MASTER);
+        assertThat(body.data().email()).isEqualTo(email);
+
+        // Assert: look up the persisted user by email to verify the master row
+        UUID userId = jdbcTemplate.queryForObject(
+                "SELECT id FROM users WHERE email = ?", UUID.class, email);
+        assertThat(userId).as("user row must exist for email=%s", email).isNotNull();
 
         // Assert: master row exists with no salon_id
-        UUID userId = body.data().userId();
         Integer masterCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM masters WHERE user_id = ? AND salon_id IS NULL",
                 Integer.class, userId);
@@ -425,13 +431,14 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = UUID.randomUUID();
         createSalonOwnerWithSalon(ownerEmail, salonId);
 
-        // Create the SALON_MASTER user and master row
+        // Create the SALON_MASTER user and master row.
+        // email_verified = true so Phase 1.7 login gate does not block token retrieval.
         String masterEmail = uniqueEmail("salon-master-self");
         createdEmails.add(masterEmail);
         UUID masterUserId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, salon_id) " +
-                "VALUES (?, ?, ?, 'SALON_MASTER', true, ?)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, salon_id, email_verified) " +
+                "VALUES (?, ?, ?, 'SALON_MASTER', true, ?, true)",
                 masterUserId, masterEmail, passwordEncoder.encode(TEST_PASSWORD), salonId);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -469,10 +476,11 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
     private void createSalonOwnerWithSalon(String email, UUID salonId) {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         UUID ownerId = UUID.randomUUID();
-        // Insert user without salon_id first (FK on salons doesn't exist yet)
+        // Insert user without salon_id first (FK on salons doesn't exist yet).
+        // email_verified = true so Phase 1.7 login gate does not block token retrieval.
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active) " +
-                "VALUES (?, ?, ?, 'SALON_OWNER', true)",
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) " +
+                "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 ownerId, email, hash);
         // Insert salon referencing the owner
         jdbcTemplate.update(
