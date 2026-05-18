@@ -20,4 +20,7 @@ public interface RefreshTokenRepository extends JpaRepository<RefreshToken, UUID
     @Modifying
     @Query("DELETE FROM RefreshToken rt WHERE rt.expiresAt < :cutoff")
     void deleteAllByExpiresAtBefore(@Param("cutoff") Instant cutoff);
+
+    @Query("SELECT COUNT(rt) FROM RefreshToken rt WHERE rt.userId = :userId")
+    long countByUserId(@Param("userId") UUID userId);
 }
