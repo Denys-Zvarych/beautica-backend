@@ -14,6 +14,8 @@ import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.task.TaskExecutor;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -40,6 +42,7 @@ public class AuthService {
     private final AuthResponseBuilder authResponseBuilder;
     private final Clock clock;
     private final EmailNotificationService emailNotificationService;
+    private final TaskExecutor emailExecutor;
 
     public AuthService(
             UserRepository userRepository,
@@ -49,7 +52,8 @@ public class AuthService {
             MasterService masterService,
             AuthResponseBuilder authResponseBuilder,
             Clock clock,
-            EmailNotificationService emailNotificationService
+            EmailNotificationService emailNotificationService,
+            @Qualifier("emailExecutor") TaskExecutor emailExecutor
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -59,6 +63,7 @@ public class AuthService {
         this.authResponseBuilder = authResponseBuilder;
         this.clock = clock;
         this.emailNotificationService = emailNotificationService;
+        this.emailExecutor = emailExecutor;
     }
 
     @Transactional
@@ -144,12 +149,14 @@ public class AuthService {
                     new TransactionSynchronization() {
                         @Override
                         public void afterCommit() {
-                            emailNotificationService.sendVerificationEmail(email, rawOtp);
+                            emailExecutor.execute(() ->
+                                    emailNotificationService.sendVerificationEmail(email, rawOtp));
                         }
                     }
             );
         } else {
-            emailNotificationService.sendVerificationEmail(email, rawOtp);
+            emailExecutor.execute(() ->
+                    emailNotificationService.sendVerificationEmail(email, rawOtp));
         }
     }
 

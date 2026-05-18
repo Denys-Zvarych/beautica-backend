@@ -5,10 +5,12 @@ import com.beautica.master.entity.Master;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
+import jakarta.mail.BodyPart;
 import jakarta.mail.Message;
 import jakarta.mail.MessagingException;
 import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
+import jakarta.mail.internet.MimeMultipart;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -30,6 +32,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -328,6 +331,197 @@ class EmailNotificationServiceTest {
                 .hasSize(1);
         assertThat(realMessage.getRecipients(Message.RecipientType.TO)[0].toString())
                 .contains("master@example.com");
+    }
+
+    // -------------------------------------------------------------------------
+    // sendVerificationEmail
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("should call mailSender.send when sendVerificationEmail is called")
+    void should_callMailSenderSend_when_sendVerificationEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>verify</html>");
+
+        service.sendVerificationEmail("user@example.com", "123456");
+
+        verify(templateEngine).process(eq("email/verify-email"), any(IContext.class));
+        verify(mailSender).send(realMessage);
+    }
+
+    @Test
+    @DisplayName("should set Ukrainian subject when sendVerificationEmail is called")
+    void should_setSubjectToUkrainian_when_sendVerificationEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>verify</html>");
+
+        service.sendVerificationEmail("user@example.com", "123456");
+
+        assertThat(realMessage.getSubject()).isEqualTo("Код підтвердження Beautica");
+    }
+
+    @Test
+    @DisplayName("should set correct From address when sendVerificationEmail is called")
+    void should_setFromAddress_when_sendVerificationEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>verify</html>");
+
+        service.sendVerificationEmail("user@example.com", "123456");
+
+        assertThat(realMessage.getFrom())
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getFrom()[0].toString()).contains(FROM_ADDRESS);
+    }
+
+    @Test
+    @DisplayName("should set correct To recipient when sendVerificationEmail is called")
+    void should_setToRecipient_when_sendVerificationEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>verify</html>");
+
+        service.sendVerificationEmail("user@example.com", "123456");
+
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO)[0].toString())
+                .contains("user@example.com");
+    }
+
+    @Test
+    @DisplayName("should render code in HTML body when sendVerificationEmail is called")
+    void should_renderCodeInBody_when_sendVerificationEmailCalled() throws Exception {
+        String expectedCode = "987654";
+        String renderedHtml = "<html><body><span>" + expectedCode + "</span></body></html>";
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn(renderedHtml);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendVerificationEmail("user@example.com", expectedCode);
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("code")).isEqualTo(expectedCode);
+    }
+
+    @Test
+    @DisplayName("should attach logo as CID inline part when sendVerificationEmail is called")
+    void should_attachLogoAsCid_when_sendVerificationEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>verify</html>");
+
+        service.sendVerificationEmail("user@example.com", "111111");
+
+        // mailSender.send is mocked — it never calls saveChanges(), so we do it here
+        // to flush MimeMessageHelper's in-memory part tree before reading getContent().
+        realMessage.saveChanges();
+
+        // MimeMessageHelper with multipart=true produces a MimeMultipart body
+        Object content = realMessage.getContent();
+        assertThat(content).isInstanceOf(MimeMultipart.class);
+        MimeMultipart multipart = (MimeMultipart) content;
+
+        // MimeMessageHelper(message, true) nests: multipart/mixed → multipart/related → [html, image]
+        BodyPart relatedBodyPart = multipart.getBodyPart(0);
+        MimeMultipart related = (MimeMultipart) relatedBodyPart.getContent();
+
+        boolean foundLogoPart = false;
+        for (int i = 0; i < related.getCount(); i++) {
+            BodyPart part = related.getBodyPart(i);
+            String[] contentIds = part.getHeader("Content-ID");
+            String contentType = part.getContentType();
+            if (contentIds != null && contentType != null
+                    && contentType.startsWith("image/png")
+                    && java.util.Arrays.stream(contentIds).anyMatch(id -> id.contains("beauticaLogo"))) {
+                foundLogoPart = true;
+                break;
+            }
+        }
+        assertThat(foundLogoPart)
+                .as("Expected inline image/png with Content-ID beauticaLogo in multipart/related")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("should not throw when mailSender.send throws MailException in sendVerificationEmail")
+    void should_notThrow_when_mailSenderThrowsMailException_in_sendVerificationEmail() {
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>verify</html>");
+        doThrow(new MailSendException("SMTP unavailable")).when(mailSender).send(any(MimeMessage.class));
+
+        assertThatCode(() ->
+                service.sendVerificationEmail("fail@example.com", "000000")
+        ).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("should not throw when MimeMessage.setSubject throws MessagingException in sendVerificationEmail")
+    void should_notThrow_when_messagingExceptionInSendVerificationEmail() throws MessagingException {
+        MimeMessage mockMessage = mock(MimeMessage.class);
+        doThrow(new MessagingException("simulated header failure"))
+                .when(mockMessage).setSubject(anyString(), anyString());
+        when(mailSender.createMimeMessage()).thenReturn(mockMessage);
+
+        assertThatCode(() ->
+                service.sendVerificationEmail("fail@example.com", "000000")
+        ).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("should contain expiry warning in Ukrainian when template is rendered")
+    void should_containExpiryWarning_when_templateRendered() throws Exception {
+        String fixture = """
+                <html>
+                  <body>
+                    <span>123456</span>
+                    <td>Код дійсний протягом 15 хвилин.</td>
+                  </body>
+                </html>
+                """;
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn(fixture);
+
+        service.sendVerificationEmail("user@example.com", "123456");
+
+        realMessage.saveChanges();
+        // Extract the text/html body part from multipart/related (inside multipart/mixed)
+        MimeMultipart outer = (MimeMultipart) realMessage.getContent();
+        MimeMultipart related = (MimeMultipart) outer.getBodyPart(0).getContent();
+        String body = (String) related.getBodyPart(0).getContent();
+        assertThat(body).contains("15 хвилин");
+    }
+
+    @Test
+    @DisplayName("should contain CID logo reference in rendered template HTML")
+    void should_containCidLogoReference_when_templateRendered() throws Exception {
+        String fixture = """
+                <html>
+                  <body>
+                    <img src="cid:beauticaLogo" alt="Beautica" width="64" height="64"/>
+                    <span>123456</span>
+                  </body>
+                </html>
+                """;
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn(fixture);
+
+        service.sendVerificationEmail("user@example.com", "123456");
+
+        realMessage.saveChanges();
+        MimeMultipart outer = (MimeMultipart) realMessage.getContent();
+        MimeMultipart related = (MimeMultipart) outer.getBodyPart(0).getContent();
+        String body = (String) related.getBodyPart(0).getContent();
+        assertThat(body).contains("src=\"cid:beauticaLogo\"");
     }
 
     // -------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.core.task.TaskExecutor;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -56,6 +57,7 @@ class AuthServiceOwnerRegistrationTest {
     @BeforeEach
     void setUp() {
         PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(4);
+        TaskExecutor syncExecutor = Runnable::run;
         authService = new AuthService(
                 userRepository,
                 refreshTokenRepository,
@@ -64,7 +66,8 @@ class AuthServiceOwnerRegistrationTest {
                 masterService,
                 authResponseBuilder,
                 Clock.systemUTC(),
-                emailNotificationService
+                emailNotificationService,
+                syncExecutor
         );
     }
 

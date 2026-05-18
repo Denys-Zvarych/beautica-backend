@@ -25,6 +25,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.task.TaskExecutor;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import java.time.Clock;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -74,6 +75,9 @@ class AuthServiceTest {
     @BeforeEach
     void setUp() {
         passwordEncoder = new BCryptPasswordEncoder(4);
+        // Inline synchronous TaskExecutor: runs the Runnable on the calling thread so
+        // verify(emailNotificationService) assertions remain deterministic without CountDownLatch.
+        TaskExecutor syncExecutor = Runnable::run;
         authService = new AuthService(
                 userRepository,
                 refreshTokenRepository,
@@ -82,7 +86,8 @@ class AuthServiceTest {
                 masterService,
                 authResponseBuilder,
                 Clock.systemUTC(),
-                emailNotificationService
+                emailNotificationService,
+                syncExecutor
         );
     }
 
