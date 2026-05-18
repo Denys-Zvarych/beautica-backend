@@ -229,7 +229,7 @@ public class AuthService {
         return buildAuthResponse(user);
     }
 
-    @Transactional
+    @Transactional(noRollbackFor = VerificationException.class)
     public AuthResponse verifyEmail(VerifyEmailRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
         // Pessimistic write lock serializes concurrent OTP submissions for the same account,
@@ -264,10 +264,12 @@ public class AuthService {
             throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
         }
         user.setVerificationAttempts((short) (user.getVerificationAttempts() + 1));
-        // No explicit save() here: the entity is managed (fetched via findByEmailForUpdate),
-        // so Hibernate dirty-checking flushes the attempt increment at transaction commit
-        // along with the terminal state change. Removing the redundant mid-transaction save()
-        // eliminates one DB round-trip on every verification attempt.
+        // Explicit save is required here: noRollbackFor = VerificationException.class causes the
+        // transaction to COMMIT even when INVALID_CODE is thrown below. Without an explicit save,
+        // Hibernate's dirty-checking would flush at commit — but we want the intent to be clear
+        // and the increment to be persisted on both the failure path (INVALID_CODE throws,
+        // transaction commits) and the success path (no exception, transaction commits normally).
+        userRepository.save(user);
 
         String incomingHash = tokenGenerator.hash(request.code());
         boolean match = MessageDigest.isEqual(

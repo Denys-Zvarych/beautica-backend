@@ -1,5 +1,6 @@
 package com.beautica;
 
+import com.beautica.config.TestAsyncConfig;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.support.SlowTestExtension;
@@ -11,6 +12,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.cache.CacheManager;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
@@ -33,6 +35,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 @ExtendWith(SlowTestExtension.class)
+@Import(TestAsyncConfig.class)
 public abstract class AbstractIntegrationTest {
 
     @MockBean

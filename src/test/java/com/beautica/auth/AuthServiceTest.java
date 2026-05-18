@@ -47,6 +47,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -626,9 +627,10 @@ class AuthServiceTest {
         assertThat(user.getVerificationAttempts())
                 .as("verificationAttempts must be reset to 0 on successful verification")
                 .isEqualTo((short) 0);
-        // One save for the terminal verified state. Attempt increment is handled by Hibernate
-        // dirty-checking at commit flush (no explicit mid-transaction save since Phase 1.8).
-        verify(userRepository).save(user);
+        // Two saves on the success path:
+        //   1. Explicit save for the attempt increment (noRollbackFor fix, F1).
+        //   2. Save for the terminal verified state (clears hash/expiry, resets counter).
+        verify(userRepository, times(2)).save(user);
     }
 
     @Test
@@ -646,6 +648,9 @@ class AuthServiceTest {
 
         when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
         when(tokenGenerator.hash("000000")).thenReturn("b".repeat(64));
+        // Stub required: noRollbackFor fix (F1) added an explicit save() on the attempt-increment
+        // path. MockitoExtension STRICT_STUBS mode would fail on an un-stubbed save call.
+        when(userRepository.save(any(User.class))).thenReturn(user);
 
         log.debug("Act: verifyEmail with wrong code '000000' for email={}", email);
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "000000")))
@@ -655,11 +660,10 @@ class AuthServiceTest {
 
         // Wrong code must NOT clear the stored hash — the resend endpoint (Phase 1.6) handles renewal.
         assertThat(user.getVerificationCodeHash()).isEqualTo(storedHash);
-        // No explicit save() on wrong-code path: Hibernate dirty-check persists the attempt
-        // increment at transaction commit. Unit tests confirm the field is mutated in memory.
-        verify(userRepository, never()).save(any());
+        // One explicit save() for the attempt increment (noRollbackFor fix, F1).
+        verify(userRepository).save(user);
         assertThat(user.getVerificationAttempts())
-                .as("verificationAttempts must be incremented on wrong code (mutation confirmed in-memory)")
+                .as("verificationAttempts must be incremented on wrong code")
                 .isEqualTo((short) 1);
     }
 
