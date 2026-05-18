@@ -232,7 +232,9 @@ public class AuthService {
     @Transactional
     public AuthResponse verifyEmail(VerifyEmailRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
-        var user = userRepository.findByEmail(email)
+        // Pessimistic write lock serializes concurrent OTP submissions for the same account,
+        // preventing attempt-counter double-spend under concurrent requests.
+        var user = userRepository.findByEmailForUpdate(email)
                 .orElseThrow(() -> new VerificationException(VerificationException.Code.INVALID_CODE));
 
         // Fix 2: anti-enumeration — ALREADY_VERIFIED leaks account existence to probers.
@@ -262,7 +264,10 @@ public class AuthService {
             throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
         }
         user.setVerificationAttempts((short) (user.getVerificationAttempts() + 1));
-        userRepository.save(user);  // persist attempt increment; committed even when the next check fails
+        // No explicit save() here: the entity is managed (fetched via findByEmailForUpdate),
+        // so Hibernate dirty-checking flushes the attempt increment at transaction commit
+        // along with the terminal state change. Removing the redundant mid-transaction save()
+        // eliminates one DB round-trip on every verification attempt.
 
         String incomingHash = tokenGenerator.hash(request.code());
         boolean match = MessageDigest.isEqual(

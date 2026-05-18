@@ -611,7 +611,7 @@ class AuthServiceTest {
         log.debug("Arrange: user with valid non-expired code, emailVerified=false");
 
         var stubResponse = AuthResponse.of("access-tok", "refresh-tok", userId, email, Role.CLIENT);
-        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
         when(tokenGenerator.hash(rawCode)).thenReturn(codeHash);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
@@ -626,9 +626,9 @@ class AuthServiceTest {
         assertThat(user.getVerificationAttempts())
                 .as("verificationAttempts must be reset to 0 on successful verification")
                 .isEqualTo((short) 0);
-        // Two saves: one for attempt increment, one for the verified state.
-        // Spring batches them in the same transaction flush.
-        verify(userRepository, org.mockito.Mockito.times(2)).save(user);
+        // One save for the terminal verified state. Attempt increment is handled by Hibernate
+        // dirty-checking at commit flush (no explicit mid-transaction save since Phase 1.8).
+        verify(userRepository).save(user);
     }
 
     @Test
@@ -644,9 +644,8 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "verificationAttempts", (short) 0);
         log.debug("Arrange: user with valid non-expired code, wrong code will be submitted");
 
-        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
         when(tokenGenerator.hash("000000")).thenReturn("b".repeat(64));
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
 
         log.debug("Act: verifyEmail with wrong code '000000' for email={}", email);
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "000000")))
@@ -656,10 +655,11 @@ class AuthServiceTest {
 
         // Wrong code must NOT clear the stored hash — the resend endpoint (Phase 1.6) handles renewal.
         assertThat(user.getVerificationCodeHash()).isEqualTo(storedHash);
-        // Exactly one save for the attempt increment — no additional save on wrong-code path.
-        verify(userRepository).save(user);
+        // No explicit save() on wrong-code path: Hibernate dirty-check persists the attempt
+        // increment at transaction commit. Unit tests confirm the field is mutated in memory.
+        verify(userRepository, never()).save(any());
         assertThat(user.getVerificationAttempts())
-                .as("verificationAttempts must be incremented on wrong code")
+                .as("verificationAttempts must be incremented on wrong code (mutation confirmed in-memory)")
                 .isEqualTo((short) 1);
     }
 
@@ -676,7 +676,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "verificationAttempts", (short) 5);
         log.debug("Arrange: user with verificationAttempts=5 (at limit), valid non-expired code");
 
-        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
 
         log.debug("Act: verifyEmail with attempts already at max — expects CODE_EXPIRED");
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
@@ -684,7 +684,7 @@ class AuthServiceTest {
                 .extracting(ex -> ((VerificationException) ex).getCode())
                 .isEqualTo(VerificationException.Code.CODE_EXPIRED);
 
-        // Lockout path exits before the attempt-increment save — no additional persistence.
+        // Lockout path exits before the attempt-increment — no persistence.
         verify(userRepository, never()).save(any());
     }
 
@@ -705,7 +705,7 @@ class AuthServiceTest {
         log.debug("Arrange: user at verificationAttempts=4 (boundary, MAX-1), valid non-expired code");
 
         var stubResponse = AuthResponse.of("access-tok", "refresh-tok", userId, email, Role.CLIENT);
-        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
         when(tokenGenerator.hash(rawCode)).thenReturn(codeHash);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
@@ -736,7 +736,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", FIXED_NOW.minusSeconds(1));
         log.debug("Arrange: user with expired code (expiresAt = FIXED_NOW - 1s)");
 
-        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
         when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
 
         log.debug("Act: verifyEmail with any code for expired-OTP email={}", email);
@@ -766,7 +766,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "emailVerified", true);
         log.debug("Arrange: user with emailVerified=true");
 
-        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
 
         log.debug("Act: verifyEmail on already-verified account email={} — expects INVALID_CODE (anti-enumeration)", email);
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
@@ -782,7 +782,7 @@ class AuthServiceTest {
     @DisplayName("verifyEmail — throws INVALID_CODE (not 404) when email is unknown — anti-enumeration")
     void should_throwInvalidCode_when_emailUnknown() {
         log.debug("Arrange: userRepository returns empty for unknown email");
-        when(userRepository.findByEmail("ghost@example.com")).thenReturn(Optional.empty());
+        when(userRepository.findByEmailForUpdate("ghost@example.com")).thenReturn(Optional.empty());
 
         log.debug("Act: verifyEmail with unknown email — expects INVALID_CODE, not a 404");
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest("ghost@example.com", "123456")))
@@ -802,7 +802,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "verificationCodeExpiresAt", null);
         log.debug("Arrange: user with null verificationCodeHash and null expiresAt");
 
-        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
 
         log.debug("Act: verifyEmail for user with no stored code email={}", email);
         assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "123456")))
