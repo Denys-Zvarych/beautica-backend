@@ -84,6 +84,11 @@ public class EmailNotificationService {
         send(to, "Бронювання відхилено", "email/booking-declined", ctx);
     }
 
+    public void sendVerificationEmail(String to, String rawOtp) {
+        // Implemented in phase-1.4 (Thymeleaf template + OTP sending).
+        // Stub intentionally empty — callers depend on this method; phase 1.4 fills the body.
+    }
+
     public void sendClientCancelledEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));

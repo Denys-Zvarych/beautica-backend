@@ -14,6 +14,9 @@ import java.time.Duration;
 @Configuration
 public class RateLimitConfig {
 
+    @Value("${app.rate-limit.register-capacity:3}")
+    private long registerCapacity;
+
     @Value("${app.rate-limit.login-capacity:5}")
     private long loginCapacity;
 
@@ -33,6 +36,16 @@ public class RateLimitConfig {
     // while still blocking sustained abuse.
     @Value("${app.rate-limit.media-upload-capacity:10}")
     private long mediaUploadCapacity;
+
+    @Bean
+    public LoadingCache<String, Bucket> registerBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(Duration.ofHours(1))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(registerCapacity, Duration.ofMinutes(1)))
+                        .build());
+    }
 
     @Bean
     public LoadingCache<String, Bucket> loginBuckets() {

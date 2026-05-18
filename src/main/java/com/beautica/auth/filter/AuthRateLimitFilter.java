@@ -20,6 +20,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final byte[] TOO_MANY_REQUESTS_BODY =
             "{\"error\":\"Too many requests\"}".getBytes(StandardCharsets.UTF_8);
 
+    private static final String REGISTER_PATH = "/api/v1/auth/register";
+    private static final String REGISTER_IM_PATH = "/api/v1/auth/register/independent-master";
     private static final String LOGIN_PATH = "/api/v1/auth/login";
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
@@ -28,6 +30,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
     private static final int RETRY_AFTER_SECONDS = 60;
 
+    private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
     private final LoadingCache<String, Bucket> refreshBuckets;
     private final LoadingCache<String, Bucket> slotsBuckets;
@@ -40,11 +43,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> mediaUploadBuckets;
 
     public AuthRateLimitFilter(
+            @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
             @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
             @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
             @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
             @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets) {
+        this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
         this.slotsBuckets = slotsBuckets;
@@ -93,7 +98,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
 
         LoadingCache<String, Bucket> cache;
 
-        if (LOGIN_PATH.equals(path)) {
+        if (REGISTER_PATH.equals(path) || REGISTER_IM_PATH.equals(path)) {
+            cache = registerBuckets;
+        } else if (LOGIN_PATH.equals(path)) {
             cache = loginBuckets;
         } else if (REFRESH_PATH.equals(path)) {
             cache = refreshBuckets;

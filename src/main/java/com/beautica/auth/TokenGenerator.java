@@ -5,4 +5,6 @@ public interface TokenGenerator {
     String generateToken();
 
     String hash(String rawToken);
+
+    String generateOtp();
 }

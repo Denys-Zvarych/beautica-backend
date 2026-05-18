@@ -2,6 +2,7 @@ package com.beautica.auth;
 
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
@@ -42,19 +43,19 @@ public class AuthController {
     }
 
     @PostMapping("/register")
-    public ResponseEntity<ApiResponse<AuthResponse>> register(
+    public ResponseEntity<ApiResponse<RegistrationResponse>> register(
             @Valid @RequestBody RegisterRequest request
     ) {
-        AuthResponse response = authService.register(request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(response));
+        RegistrationResponse response = authService.register(request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     @PostMapping("/register/independent-master")
-    public ResponseEntity<ApiResponse<AuthResponse>> registerIndependentMaster(
+    public ResponseEntity<ApiResponse<RegistrationResponse>> registerIndependentMaster(
             @Valid @RequestBody RegisterIndependentMasterRequest request
     ) {
-        AuthResponse response = authService.registerIndependentMaster(request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(response));
+        RegistrationResponse response = authService.registerIndependentMaster(request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     @PostMapping("/login")

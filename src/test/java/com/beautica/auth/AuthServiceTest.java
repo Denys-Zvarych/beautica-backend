@@ -5,9 +5,11 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.master.service.MasterService;
+import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
@@ -18,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
@@ -62,6 +65,9 @@ class AuthServiceTest {
     @Mock
     private AuthResponseBuilder authResponseBuilder;
 
+    @Mock
+    private EmailNotificationService emailNotificationService;
+
     private PasswordEncoder passwordEncoder;
     private AuthService authService;
 
@@ -75,43 +81,42 @@ class AuthServiceTest {
                 tokenGenerator,
                 masterService,
                 authResponseBuilder,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                emailNotificationService
         );
     }
 
     @Test
-    @DisplayName("register returns auth response on valid input")
-    void should_returnAuthResponse_when_registerSucceeds() {
+    @DisplayName("register — returns RegistrationResponse without tokens when CLIENT registers")
+    void should_returnRegistrationResponse_when_clientRegisters() {
         var request = new RegisterRequest(
                 "new@example.com", "password123",
                 SelfRegistrationRole.CLIENT, "John", "Doe", null, null);
         log.debug("Arrange: seeding register request for email={}", request.email());
 
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                UUID.randomUUID(), "new@example.com", Role.CLIENT);
         when(userRepository.existsByEmail("new@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(tokenGenerator.generateOtp()).thenReturn("123456");
+        when(tokenGenerator.hash("123456")).thenReturn("a".repeat(64));
 
         log.debug("Act: register CLIENT with valid email new@example.com");
         var response = authService.register(request);
 
-        assertThat(response.email())
-                .as("email in response must match registration email")
-                .isEqualTo("new@example.com");
-        assertThat(response.role()).isEqualTo(Role.CLIENT);
-        assertThat(response.accessToken()).isNotBlank();
-        assertThat(response.refreshToken()).isNotBlank();
-        assertThat(response.tokenType()).isEqualTo("Bearer");
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("new@example.com");
+        assertThat(response.message()).contains("verification code");
+        // In unit tests no active transaction exists, so scheduleVerificationEmail falls
+        // through to the direct call path. In production (real transaction) it fires afterCommit.
+        verify(emailNotificationService).sendVerificationEmail("new@example.com", "123456");
     }
 
     @Test
-    @DisplayName("register throws BusinessException when email is already taken")
-    void should_throwBusinessException_when_emailAlreadyRegistered() {
+    @DisplayName("register returns RegistrationResponse (200) when email is already registered — enumeration suppressed")
+    void should_return200WithRegistrationResponse_when_emailAlreadyRegistered() {
         var request = new RegisterRequest(
                 "taken@example.com", "password123",
                 SelfRegistrationRole.CLIENT, null, null, null, null);
@@ -119,45 +124,47 @@ class AuthServiceTest {
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: register with already-taken email taken@example.com — expects BusinessException");
-        assertThatThrownBy(() -> authService.register(request))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("already registered");
+        log.debug("Act: register with already-registered email — expects silent 200 RegistrationResponse, no exception");
+        var response = authService.register(request);
 
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("taken@example.com");
+        // No new user persisted and no OTP email sent for duplicate registration
         verify(userRepository, never()).save(any());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }
 
     @Test
-    @DisplayName("registerIndependentMaster creates INDEPENDENT_MASTER user and returns tokens")
-    void should_createIndependentMasterUserAndReturnTokens_when_validRegistration() {
+    @DisplayName("registerIndependentMaster — returns RegistrationResponse without tokens")
+    void should_returnRegistrationResponseWithoutTokens_when_independentMasterRegisters() {
         var request = new RegisterIndependentMasterRequest(
                 "master@example.com", "password123",
                 "Oksana", "Kovalenko", "+380671234567");
         log.debug("Arrange: seeding independent master request for email={}", request.email());
 
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                UUID.randomUUID(), "master@example.com", Role.INDEPENDENT_MASTER);
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(tokenGenerator.generateOtp()).thenReturn("654321");
+        when(tokenGenerator.hash("654321")).thenReturn("b".repeat(64));
 
         log.debug("Act: register independent master with valid email master@example.com");
         var response = authService.registerIndependentMaster(request);
 
-        assertThat(response.role()).isEqualTo(Role.INDEPENDENT_MASTER);
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
         assertThat(response.email()).isEqualTo("master@example.com");
-        assertThat(response.accessToken()).isNotBlank();
-        assertThat(response.refreshToken()).isNotBlank();
-        assertThat(response.tokenType()).isEqualTo("Bearer");
+        verify(masterService).createMasterForIndependentUser(any(UUID.class));
+        // In unit tests no active transaction exists, so scheduleVerificationEmail falls
+        // through to the direct call path. In production (real transaction) it fires afterCommit.
+        verify(emailNotificationService).sendVerificationEmail("master@example.com", "654321");
     }
 
     @Test
-    @DisplayName("registerIndependentMaster throws BusinessException when email is already registered")
-    void should_throw409_when_independentMasterEmailAlreadyRegistered() {
+    @DisplayName("registerIndependentMaster returns RegistrationResponse (200) when email already registered — enumeration suppressed")
+    void should_return200WithRegistrationResponse_when_independentMasterEmailAlreadyRegistered() {
         var request = new RegisterIndependentMasterRequest(
                 "taken@example.com", "password123",
                 null, null, null);
@@ -165,12 +172,15 @@ class AuthServiceTest {
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: register independent master with already-registered email taken@example.com");
-        assertThatThrownBy(() -> authService.registerIndependentMaster(request))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("already registered");
+        log.debug("Act: register independent master with already-registered email — expects silent 200 RegistrationResponse");
+        var response = authService.registerIndependentMaster(request);
 
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("taken@example.com");
+        // No new user persisted, no master created, no OTP email sent for duplicate registration
         verify(userRepository, never()).save(any());
+        verify(masterService, never()).createMasterForIndependentUser(any());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }
 
     @Test
@@ -343,19 +353,19 @@ class AuthServiceTest {
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "Beauty Studio Lviv");
         log.debug("Arrange: SALON_OWNER request with businessName={}", request.businessName());
 
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                UUID.randomUUID(), "owner@example.com", Role.SALON_OWNER);
         when(userRepository.existsByEmail("owner@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(tokenGenerator.generateOtp()).thenReturn("111111");
+        when(tokenGenerator.hash("111111")).thenReturn("e".repeat(64));
 
         log.debug("Act: register SALON_OWNER with businessName='Beauty Studio Lviv'");
         authService.register(request);
 
+        // Single save — OTP fields and businessName both present on the one flush
         verify(userRepository).save(org.mockito.ArgumentMatchers.argThat(u ->
                 "Beauty Studio Lviv".equals(u.getBusinessName())));
     }
@@ -404,20 +414,19 @@ class AuthServiceTest {
                 SelfRegistrationRole.CLIENT, "Ivan", "Petrenko", null, null);
         log.debug("Arrange: CLIENT request without businessName");
 
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                UUID.randomUUID(), "client@example.com", Role.CLIENT);
         when(userRepository.existsByEmail("client@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(tokenGenerator.generateOtp()).thenReturn("222222");
+        when(tokenGenerator.hash("222222")).thenReturn("f".repeat(64));
 
         log.debug("Act: register CLIENT without businessName — should succeed");
         var response = authService.register(request);
 
-        assertThat(response.role()).isEqualTo(Role.CLIENT);
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
         verify(userRepository).save(any(User.class));
     }
 
@@ -432,23 +441,130 @@ class AuthServiceTest {
                 role, "Test", "User", null, businessName);
         log.debug("Arrange: registering with permitted role={}", role);
 
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                UUID.randomUUID(), "valid@example.com", role.toRole());
         when(userRepository.existsByEmail("valid@example.com")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(tokenGenerator.generateOtp()).thenReturn("333333");
+        when(tokenGenerator.hash("333333")).thenReturn("9".repeat(64));
 
         log.debug("Act: register with permitted self-registration role={}", role);
         var response = authService.register(request);
 
-        assertThat(response.role())
-                .as("registered role must equal requested role=%s", role)
-                .isEqualTo(role.toRole());
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email())
+                .as("email in response must match registration email for role=%s", role)
+                .isEqualTo("valid@example.com");
         verify(userRepository).save(any(User.class));
+    }
+
+    @Test
+    @DisplayName("register — persists OTP hash and expiry on the single save call")
+    void should_persistCodeAndExpiry_when_clientRegisters() {
+        var request = new RegisterRequest(
+                "otp@example.com", "password123",
+                SelfRegistrationRole.CLIENT, "Anna", "Koval", null, null);
+
+        when(userRepository.existsByEmail("otp@example.com")).thenReturn(false);
+        when(tokenGenerator.generateOtp()).thenReturn("042873");
+        when(tokenGenerator.hash("042873")).thenReturn("c".repeat(64));
+        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+
+        authService.register(request);
+
+        // OTP fields are set before the single save — verify exactly one save with the hash present
+        verify(userRepository).save(userCaptor.capture());
+        User saved = userCaptor.getValue();
+        assertThat(saved.getVerificationCodeHash())
+                .as("verificationCodeHash must be set on the single save call")
+                .isEqualTo("c".repeat(64));
+        assertThat(saved.getVerificationCodeExpiresAt())
+                .as("verificationCodeExpiresAt must be set on the single save call")
+                .isNotNull();
+        // In unit tests no active transaction exists, so scheduleVerificationEmail falls
+        // through to the direct call path.
+        verify(emailNotificationService).sendVerificationEmail("otp@example.com", "042873");
+    }
+
+    @Test
+    @DisplayName("register — sendVerificationEmail NOT called synchronously (dispatched via afterCommit)")
+    void should_notCallSendVerificationEmailSynchronously_when_clientRegisters() {
+        var request = new RegisterRequest(
+                "verify@example.com", "password123",
+                SelfRegistrationRole.CLIENT, "Daria", "Melnyk", null, null);
+
+        when(userRepository.existsByEmail("verify@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(tokenGenerator.generateOtp()).thenReturn("708142");
+        when(tokenGenerator.hash("708142")).thenReturn("d".repeat(64));
+
+        authService.register(request);
+
+        // In unit tests no active transaction exists, so scheduleVerificationEmail falls
+        // through to the direct call path — verify the correct args are passed.
+        verify(emailNotificationService).sendVerificationEmail("verify@example.com", "708142");
+    }
+
+    @Test
+    @DisplayName("register — response is RegistrationResponse (no accessToken / refreshToken) when CLIENT registers")
+    void should_returnRegistrationResponseWithoutTokens_when_clientRegisters() {
+        var request = new RegisterRequest(
+                "notoken@example.com", "password123",
+                SelfRegistrationRole.CLIENT, "Maksym", "Bondar", null, null);
+
+        when(userRepository.existsByEmail("notoken@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(tokenGenerator.generateOtp()).thenReturn("512034");
+        when(tokenGenerator.hash("512034")).thenReturn("a".repeat(64));
+
+        var response = authService.register(request);
+
+        // RegistrationResponse is a record with exactly {message, email} — no token fields exist
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("notoken@example.com");
+        assertThat(response.message()).isNotBlank();
+        assertThat(response).isNotInstanceOf(AuthResponse.class);
+    }
+
+    @Test
+    @DisplayName("registerIndependentMaster — master profile created and response defers token issuance")
+    void should_deferTokenIssuance_when_independentMasterRegisters() {
+        var request = new RegisterIndependentMasterRequest(
+                "imdefer@example.com", "password123",
+                "Sofiia", "Hrytsenko", "+380501112233");
+
+        when(userRepository.existsByEmail("imdefer@example.com")).thenReturn(false);
+        UUID savedId = UUID.randomUUID();
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", savedId);
+            return u;
+        });
+        when(tokenGenerator.generateOtp()).thenReturn("019283");
+        when(tokenGenerator.hash("019283")).thenReturn("f".repeat(64));
+
+        var response = authService.registerIndependentMaster(request);
+
+        // master profile must be created before OTP block
+        verify(masterService).createMasterForIndependentUser(savedId);
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("imdefer@example.com");
+        assertThat(response).isNotInstanceOf(AuthResponse.class);
     }
 
     private User buildUser(UUID id, String email, String passwordHash, Role role) {

@@ -5,9 +5,11 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.master.service.MasterService;
+import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
@@ -16,14 +18,19 @@ import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 
 
 @Service
 public class AuthService {
+
+    private static final Duration OTP_TTL = Duration.ofMinutes(15);
 
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
@@ -32,6 +39,7 @@ public class AuthService {
     private final MasterService masterService;
     private final AuthResponseBuilder authResponseBuilder;
     private final Clock clock;
+    private final EmailNotificationService emailNotificationService;
 
     public AuthService(
             UserRepository userRepository,
@@ -40,7 +48,8 @@ public class AuthService {
             TokenGenerator tokenGenerator,
             MasterService masterService,
             AuthResponseBuilder authResponseBuilder,
-            Clock clock
+            Clock clock,
+            EmailNotificationService emailNotificationService
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -49,12 +58,15 @@ public class AuthService {
         this.masterService = masterService;
         this.authResponseBuilder = authResponseBuilder;
         this.clock = clock;
+        this.emailNotificationService = emailNotificationService;
     }
 
     @Transactional
-    public AuthResponse register(RegisterRequest request) {
+    public RegistrationResponse register(RegisterRequest request) {
+        // Return the same 200 response for already-registered emails to prevent
+        // enumeration attacks — callers cannot distinguish new from existing registrations.
         if (userRepository.existsByEmail(request.email())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
+            return RegistrationResponse.of(request.email());
         }
 
         if (request.role() == SelfRegistrationRole.SALON_OWNER) {
@@ -68,6 +80,8 @@ public class AuthService {
                 ? request.businessName()
                 : null;
 
+        String rawOtp = tokenGenerator.generateOtp();
+
         var user = new User(
                 request.email(),
                 passwordEncoder.encode(request.password()),
@@ -77,17 +91,25 @@ public class AuthService {
                 request.phoneNumber(),
                 businessName
         );
+        user.setVerificationCodeHash(tokenGenerator.hash(rawOtp));
+        user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
 
         var savedUser = userRepository.save(user);
 
-        return buildAuthResponse(savedUser);
+        scheduleVerificationEmail(savedUser.getEmail(), rawOtp);
+
+        return RegistrationResponse.of(savedUser.getEmail());
     }
 
     @Transactional
-    public AuthResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
+    public RegistrationResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
+        // Return the same 200 response for already-registered emails to prevent
+        // enumeration attacks — callers cannot distinguish new from existing registrations.
         if (userRepository.existsByEmail(request.email())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
+            return RegistrationResponse.of(request.email());
         }
+
+        String rawOtp = tokenGenerator.generateOtp();
 
         var user = new User(
                 request.email(),
@@ -97,11 +119,38 @@ public class AuthService {
                 request.lastName(),
                 request.phoneNumber()
         );
+        user.setVerificationCodeHash(tokenGenerator.hash(rawOtp));
+        user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
+
         var savedUser = userRepository.save(user);
 
+        // Master profile requires the persisted user ID — created after save.
         masterService.createMasterForIndependentUser(savedUser.getId());
 
-        return buildAuthResponse(savedUser);
+        scheduleVerificationEmail(savedUser.getEmail(), rawOtp);
+
+        return RegistrationResponse.of(savedUser.getEmail());
+    }
+
+    /**
+     * Schedules a verification email to be sent after the current transaction commits.
+     * When no active transaction synchronization exists (e.g. in unit tests where the
+     * {@code @Transactional} proxy is bypassed), the email is sent immediately so
+     * tests can still verify the call without standing up a transaction manager.
+     */
+    private void scheduleVerificationEmail(String email, String rawOtp) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            emailNotificationService.sendVerificationEmail(email, rawOtp);
+                        }
+                    }
+            );
+        } else {
+            emailNotificationService.sendVerificationEmail(email, rawOtp);
+        }
     }
 
     @Transactional

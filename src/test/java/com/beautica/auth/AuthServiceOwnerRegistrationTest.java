@@ -1,10 +1,10 @@
 package com.beautica.auth;
 
-import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.master.service.MasterService;
+import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -48,6 +48,9 @@ class AuthServiceOwnerRegistrationTest {
     @Mock
     private AuthResponseBuilder authResponseBuilder;
 
+    @Mock
+    private EmailNotificationService emailNotificationService;
+
     private AuthService authService;
 
     @BeforeEach
@@ -60,7 +63,8 @@ class AuthServiceOwnerRegistrationTest {
                 tokenGenerator,
                 masterService,
                 authResponseBuilder,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                emailNotificationService
         );
     }
 
@@ -95,21 +99,20 @@ class AuthServiceOwnerRegistrationTest {
                 "owner@beautica.test", "password123",
                 SelfRegistrationRole.SALON_OWNER, null, null, null, "Beauty Studio");
 
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER);
-
         when(userRepository.existsByEmail("owner@beautica.test")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(tokenGenerator.generateOtp()).thenReturn("111111");
+        when(tokenGenerator.hash("111111")).thenReturn("d".repeat(64));
 
         var response = authService.register(request);
 
-        assertThat(response.role()).isEqualTo(Role.SALON_OWNER);
-        verify(userRepository).save(any(User.class));
+        assertThat(response.email()).isEqualTo("owner@beautica.test");
+        assertThat(response.message()).isNotBlank();
+        verify(userRepository, org.mockito.Mockito.atLeastOnce()).save(any(User.class));
     }
 
     // -------------------------------------------------------------------------
@@ -143,24 +146,24 @@ class AuthServiceOwnerRegistrationTest {
                 "owner@beautica.test", "password123",
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "Lviv Beauty Hub");
 
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER);
-
         when(userRepository.existsByEmail("owner@beautica.test")).thenReturn(false);
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
             return u;
         });
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(tokenGenerator.generateOtp()).thenReturn("555555");
+        when(tokenGenerator.hash("555555")).thenReturn("a".repeat(64));
 
         authService.register(request);
 
         ArgumentCaptor<User> captor = ArgumentCaptor.forClass(User.class);
-        verify(userRepository).save(captor.capture());
+        verify(userRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
 
-        assertThat(captor.getValue().getBusinessName())
+        // The first save is the initial user creation — it carries businessName
+        assertThat(captor.getAllValues().stream()
+                .anyMatch(u -> "Lviv Beauty Hub".equals(u.getBusinessName())))
                 .as("businessName stored on User must match the value from the registration request")
-                .isEqualTo("Lviv Beauty Hub");
+                .isTrue();
     }
 }

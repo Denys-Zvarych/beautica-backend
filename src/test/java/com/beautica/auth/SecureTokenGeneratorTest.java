@@ -73,4 +73,23 @@ class SecureTokenGeneratorTest {
         assertThat(hash).hasSize(64);
         assertThat(hash).matches("[0-9a-f]{64}");
     }
+
+    @Test
+    @DisplayName("generateOtp produces a 6-digit zero-padded numeric string")
+    void should_generateSixDigitNumericCode_when_generateOtpCalled() {
+        for (int i = 0; i < 100; i++) {
+            var otp = tokenGenerator.generateOtp();
+            assertThat(otp).matches("^\\d{6}$");
+        }
+    }
+
+    @Test
+    @DisplayName("generateOtp produces high distinctness across 1000 calls")
+    void should_generateDifferentCodes_when_generateOtpCalledRepeatedly() {
+        var codes = java.util.stream.IntStream.range(0, 1000)
+                .mapToObj(i -> tokenGenerator.generateOtp())
+                .collect(java.util.stream.Collectors.toSet());
+        // 1000 calls with 1M possible values — collision probability negligible
+        assertThat(codes.size()).isGreaterThan(900);
+    }
 }
