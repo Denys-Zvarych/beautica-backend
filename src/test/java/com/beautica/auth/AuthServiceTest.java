@@ -6,9 +6,11 @@ import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.RegistrationResponse;
+import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -33,6 +35,7 @@ import java.time.Clock;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
@@ -80,6 +83,11 @@ class AuthServiceTest {
 
     // Fixed reference instant used as "now" across all time-sensitive tests.
     private static final Instant FIXED_NOW = Instant.parse("2025-06-01T12:00:00Z");
+
+    // Mirrors AuthService.OTP_TTL — used to construct expiresAt in stubs.
+    private static final Duration OTP_TTL = Duration.ofMinutes(15);
+
+    private static final String TEST_EMAIL = "test@example.com";
 
     @BeforeEach
     void setUp() {
@@ -796,7 +804,112 @@ class AuthServiceTest {
         verify(userRepository, never()).save(any());
     }
 
+    // ─── resendVerification ───────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("resendVerification — resends new code and returns RegistrationResponse when called after cooldown")
+    void should_resendNewCode_when_requestedAfterCooldown() {
+        // issuedAt is 61 seconds before FIXED_NOW → cooldown (60s) has elapsed
+        Instant issuedAt = FIXED_NOW.minusSeconds(61);
+        User user = buildUnverifiedUser();
+        user.setVerificationCodeHash("oldhash");
+        user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateOtp()).thenReturn("654321");
+        when(tokenGenerator.hash("654321")).thenReturn("newhash");
+
+        RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        assertThat(user.getVerificationCodeHash()).isEqualTo("newhash");
+        assertThat(user.getVerificationCodeExpiresAt()).isEqualTo(FIXED_NOW.plus(OTP_TTL));
+        assertThat(user.getVerificationAttempts()).isZero();
+        verify(userRepository).save(user);
+    }
+
+    @Test
+    @DisplayName("resendVerification — throws ResendThrottledException when resend called within 60 seconds")
+    void should_throw429_when_resendCalledWithin60Seconds() {
+        // issuedAt is only 30 seconds ago → cooldown window has not elapsed
+        Instant issuedAt = FIXED_NOW.minusSeconds(30);
+        User user = buildUnverifiedUser();
+        user.setVerificationCodeHash("somehash");
+        user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL)))
+                .isInstanceOf(ResendThrottledException.class)
+                .satisfies(ex -> assertThat(((ResendThrottledException) ex).getRetryAfterSeconds()).isGreaterThan(0));
+
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+    }
+
+    @Test
+    @DisplayName("resendVerification — returns generic response for unknown email (anti-enumeration)")
+    void should_returnGenericResponse_when_emailUnknown() {
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.empty());
+
+        RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+    }
+
+    @Test
+    @DisplayName("resendVerification — returns generic response for already-verified user (anti-enumeration)")
+    void should_returnGenericResponse_when_alreadyVerified() {
+        User user = buildUnverifiedUser();
+        user.setEmailVerified(true);
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+
+        RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+    }
+
+    @Test
+    @DisplayName("resendVerification — extends expiry and resets attempts when resend succeeds")
+    void should_extendExpiryAndResetAttempts_when_resendSucceeds() {
+        Instant issuedAt = FIXED_NOW.minusSeconds(61);
+        User user = buildUnverifiedUser();
+        user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
+        user.setVerificationAttempts((short) 3);
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateOtp()).thenReturn("999999");
+        when(tokenGenerator.hash("999999")).thenReturn("hash999");
+
+        authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        assertThat(user.getVerificationCodeExpiresAt()).isEqualTo(FIXED_NOW.plus(OTP_TTL));
+        assertThat(user.getVerificationAttempts()).isZero();
+    }
+
+    @Test
+    @DisplayName("resendVerification — resends without throttle when user has no existing code (verificationCodeExpiresAt is null)")
+    void should_resendWithoutThrottle_when_noExistingCode() {
+        User user = buildUnverifiedUser();
+        user.setVerificationCodeHash(null);
+        user.setVerificationCodeExpiresAt(null);
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateOtp()).thenReturn("111111");
+        when(tokenGenerator.hash("111111")).thenReturn("hash111");
+
+        RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(userRepository).save(user);
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────────────
+
+    private User buildUnverifiedUser() {
+        User user = new User(TEST_EMAIL, passwordEncoder.encode("test-password"), Role.CLIENT, null, null, null);
+        ReflectionTestUtils.setField(user, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(user, "emailVerified", false);
+        ReflectionTestUtils.setField(user, "verificationAttempts", (short) 0);
+        return user;
+    }
 
     private User buildUser(UUID id, String email, String passwordHash, Role role) {
         var user = new User(email, passwordHash, role, null, null, null);

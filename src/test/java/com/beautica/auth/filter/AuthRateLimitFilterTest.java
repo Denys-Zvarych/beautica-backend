@@ -41,6 +41,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> slotsBuckets;
     @Mock private LoadingCache<String, Bucket> deviceTokenBuckets;
     @Mock private LoadingCache<String, Bucket> mediaUploadBuckets;
+    @Mock private LoadingCache<String, Bucket> resendVerificationBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -50,7 +51,7 @@ class AuthRateLimitFilterTest {
     void setUp() {
         filter = new AuthRateLimitFilter(
                 registerBuckets, loginBuckets, refreshBuckets, verifyEmailBuckets,
-                slotsBuckets, deviceTokenBuckets, mediaUploadBuckets);
+                slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, resendVerificationBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -962,6 +963,70 @@ class AuthRateLimitFilterTest {
             verifyNoInteractions(loginBuckets);
             verifyNoInteractions(registerBuckets);
             verifyNoInteractions(refreshBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("POST /api/v1/auth/resend-verification")
+    class ResendVerificationEndpoint {
+
+        @Test
+        @DisplayName("passes through when resend-verification bucket has tokens")
+        void should_allowRequest_when_resendVerificationWithinLimit() throws Exception {
+            log.debug("Arrange: resendVerificationBuckets returns bucket that allows consumption");
+            when(resendVerificationBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/auth/resend-verification");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/resend-verification when bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when resend-verification bucket allows the request")
+                    .isNotEqualTo(429);
+            assertThat(chain.getRequest())
+                    .as("filter chain must be forwarded when the bucket allows the request")
+                    .isNotNull();
+            verify(resendVerificationBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(registerBuckets);
+            verifyNoInteractions(refreshBuckets);
+            verifyNoInteractions(verifyEmailBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 when resend-verification rate limit exceeded")
+        void should_return429_when_resendVerificationRateLimitExceeded() throws Exception {
+            log.debug("Arrange: resendVerificationBuckets returns bucket that denies consumption");
+            when(resendVerificationBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/resend-verification");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/resend-verification when bucket is exhausted");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when resend-verification bucket is exhausted")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("Retry-After")).isEqualTo("60");
+            assertThat(response.getContentType())
+                    .as("Content-Type must be application/json on 429 resend-verification response")
+                    .startsWith("application/json");
+            assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(chain.getRequest())
+                    .as("filter chain must NOT be forwarded when the bucket is exhausted")
+                    .isNull();
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(registerBuckets);
+            verifyNoInteractions(refreshBuckets);
+            verifyNoInteractions(verifyEmailBuckets);
         }
     }
 }

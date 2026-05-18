@@ -10,6 +10,7 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.ApiResponse;
 import jakarta.validation.Valid;
@@ -80,6 +81,12 @@ public class AuthController {
             @Valid @RequestBody VerifyEmailRequest request) {
         AuthResponse response = authService.verifyEmail(request);
         return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    @PostMapping("/resend-verification")
+    public ResponseEntity<ApiResponse<RegistrationResponse>> resendVerification(
+            @Valid @RequestBody ResendVerificationRequest request) {
+        return ResponseEntity.ok(ApiResponse.ok(authService.resendVerification(request)));
     }
 
     @PostMapping("/logout")

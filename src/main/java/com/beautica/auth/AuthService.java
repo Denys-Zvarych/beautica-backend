@@ -6,9 +6,11 @@ import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.RegistrationResponse;
+import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -30,6 +32,7 @@ import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Locale;
 import java.util.UUID;
 
 
@@ -37,6 +40,7 @@ import java.util.UUID;
 public class AuthService {
 
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
+    private static final Duration RESEND_COOLDOWN = Duration.ofSeconds(60);
     private static final short MAX_VERIFICATION_ATTEMPTS = 5;
 
     private final UserRepository userRepository;
@@ -73,10 +77,12 @@ public class AuthService {
 
     @Transactional
     public RegistrationResponse register(RegisterRequest request) {
+        String email = request.email().toLowerCase(Locale.ROOT).strip();
+
         // Return the same 200 response for already-registered emails to prevent
         // enumeration attacks — callers cannot distinguish new from existing registrations.
-        if (userRepository.existsByEmail(request.email())) {
-            return RegistrationResponse.of(request.email());
+        if (userRepository.existsByEmail(email)) {
+            return RegistrationResponse.of(email);
         }
 
         if (request.role() == SelfRegistrationRole.SALON_OWNER) {
@@ -93,7 +99,7 @@ public class AuthService {
         String rawOtp = tokenGenerator.generateOtp();
 
         var user = new User(
-                request.email(),
+                email,
                 passwordEncoder.encode(request.password()),
                 request.role().toRole(),
                 request.firstName(),
@@ -113,16 +119,18 @@ public class AuthService {
 
     @Transactional
     public RegistrationResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
+        String email = request.email().toLowerCase(Locale.ROOT).strip();
+
         // Return the same 200 response for already-registered emails to prevent
         // enumeration attacks — callers cannot distinguish new from existing registrations.
-        if (userRepository.existsByEmail(request.email())) {
-            return RegistrationResponse.of(request.email());
+        if (userRepository.existsByEmail(email)) {
+            return RegistrationResponse.of(email);
         }
 
         String rawOtp = tokenGenerator.generateOtp();
 
         var user = new User(
-                request.email(),
+                email,
                 passwordEncoder.encode(request.password()),
                 Role.INDEPENDENT_MASTER,
                 request.firstName(),
@@ -167,7 +175,8 @@ public class AuthService {
 
     @Transactional
     public AuthResponse login(LoginRequest request) {
-        var user = userRepository.findByEmail(request.email())
+        String email = request.email().toLowerCase(Locale.ROOT).strip();
+        var user = userRepository.findByEmail(email)
                 .orElseThrow(() -> new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password"));
 
         if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
@@ -209,7 +218,8 @@ public class AuthService {
 
     @Transactional
     public AuthResponse verifyEmail(VerifyEmailRequest request) {
-        var user = userRepository.findByEmail(request.email())
+        String email = request.email().toLowerCase(Locale.ROOT).strip();
+        var user = userRepository.findByEmail(email)
                 .orElseThrow(() -> new VerificationException(VerificationException.Code.INVALID_CODE));
 
         // Fix 2: anti-enumeration — ALREADY_VERIFIED leaks account existence to probers.
@@ -250,6 +260,57 @@ public class AuthService {
         user.setVerificationAttempts((short) 0);
         userRepository.save(user);
         return buildAuthResponse(user);
+    }
+
+    /**
+     * Resends a verification OTP to the given email address, subject to a 60-second
+     * per-account cooldown.
+     *
+     * <p>Anti-enumeration: unknown emails and already-verified accounts both return
+     * the same success-shaped {@link RegistrationResponse} without sending any mail.
+     * The response is wire-identical to a real resend, so probers cannot distinguish
+     * the three states (unknown / already-verified / resent).
+     *
+     * <p>Throttle derivation: we do not store a dedicated {@code sent_at} column (see
+     * Phase 1.6 spec). Instead, {@code issuedAt} is derived as
+     * {@code verificationCodeExpiresAt - OTP_TTL}, since
+     * {@code expiresAt = issuedAt + OTP_TTL} at issue time. The next allowed send is
+     * {@code issuedAt + RESEND_COOLDOWN}. If the clock has not yet passed that instant,
+     * {@link ResendThrottledException} is thrown with the remaining wait in seconds.
+     */
+    @Transactional
+    public RegistrationResponse resendVerification(ResendVerificationRequest request) {
+        String email = request.email().toLowerCase(Locale.ROOT).strip();
+        var userOpt = userRepository.findByEmailForUpdate(email);
+
+        // Anti-enumeration: unknown email and already-verified both return the same
+        // generic success shape without sending mail.
+        if (userOpt.isEmpty() || userOpt.get().isEmailVerified()) {
+            return RegistrationResponse.of(email);
+        }
+
+        var user = userOpt.get();
+
+        // Throttle check: derive issuedAt from expiresAt - OTP_TTL
+        // (avoids adding a verification_code_sent_at column; see Phase 1.6 spec).
+        if (user.getVerificationCodeExpiresAt() != null) {
+            Instant issuedAt = user.getVerificationCodeExpiresAt().minus(OTP_TTL);
+            Instant nextAllowed = issuedAt.plus(RESEND_COOLDOWN);
+            if (clock.instant().isBefore(nextAllowed)) {
+                long retryAfter = Duration.between(clock.instant(), nextAllowed).getSeconds() + 1;
+                throw new ResendThrottledException(retryAfter);
+            }
+        }
+
+        String rawOtp = tokenGenerator.generateOtp();
+        user.setVerificationCodeHash(tokenGenerator.hash(rawOtp));
+        user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
+        user.setVerificationAttempts((short) 0); // reset on fresh OTP
+        userRepository.save(user);
+
+        scheduleVerificationEmail(user.getEmail(), rawOtp);
+
+        return RegistrationResponse.of(user.getEmail());
     }
 
     @Transactional

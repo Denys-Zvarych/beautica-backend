@@ -113,6 +113,20 @@ public class RateLimitConfig {
                         .build());
     }
 
+    // Per-IP cap for POST /api/v1/auth/resend-verification (60-second window).
+    // 3 requests per minute matches the per-account RESEND_COOLDOWN (60 s) and
+    // is generous enough for a legitimate retry (network hiccup, paste error)
+    // while blocking rapid volumetric abuse from a single IP.
+    @Bean
+    public LoadingCache<String, Bucket> resendVerificationBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(90, java.util.concurrent.TimeUnit.SECONDS)
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(3, Duration.ofSeconds(60)))
+                        .build());
+    }
+
     private Bandwidth bandwidthOf(long capacity, Duration period) {
         return BandwidthBuilder.builder()
                 .capacity(capacity)
