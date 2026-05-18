@@ -10,6 +10,7 @@ import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
 import com.beautica.master.service.MasterService;
@@ -187,6 +188,14 @@ public class AuthService {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
         }
 
+        // By design: the 403 response reveals that the password was correct and the account is
+        // unverified. The caller (the account owner) needs this signal to route to the
+        // verification screen. An attacker reaching this branch already knows the correct
+        // password — the verification state is not the secret being protected here.
+        if (!user.isEmailVerified()) {
+            throw new EmailNotVerifiedException(user.getEmail());
+        }
+
         return buildAuthResponse(user);
     }
 
@@ -210,6 +219,10 @@ public class AuthService {
                 .orElseThrow(() -> new BusinessException(HttpStatus.UNAUTHORIZED, "User not found"));
 
         if (!user.isActive()) {
+            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found");
+        }
+
+        if (!user.isEmailVerified()) {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found");
         }
 

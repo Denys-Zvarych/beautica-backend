@@ -10,6 +10,7 @@ import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
 import com.beautica.master.service.MasterService;
@@ -213,6 +214,7 @@ class AuthServiceTest {
         var hashed = passwordEncoder.encode(rawPassword);
         var userId = UUID.randomUUID();
         var user = buildUser(userId, "login@example.com", hashed, Role.SALON_OWNER);
+        ReflectionTestUtils.setField(user, "emailVerified", true);
         log.debug("Arrange: seeding user email=login@example.com role={}", Role.SALON_OWNER);
 
         var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
@@ -283,6 +285,8 @@ class AuthServiceTest {
         var storedToken = new RefreshToken(hashedToken, userId, Instant.now().plusSeconds(3600));
         var user = buildUser(userId, "ref@example.com",
                 passwordEncoder.encode("pass"), Role.CLIENT);
+        // A user who holds a refresh token must have completed email verification first.
+        ReflectionTestUtils.setField(user, "emailVerified", true);
         log.debug("Arrange: generated refresh token for userId={}", userId);
 
         var stubResponse = AuthResponse.of("new-access-tok", "new-refresh-tok",
@@ -899,6 +903,118 @@ class AuthServiceTest {
 
         assertThat(resp.email()).isEqualTo(TEST_EMAIL);
         verify(userRepository).save(user);
+    }
+
+    // ─── login gate (Phase 1.7) ───────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should throw EmailNotVerifiedException when unverified user logs in with correct password")
+    void should_throwEmailNotVerified_when_unverifiedUserLogsInWithCorrectPassword() {
+        User user = new User(TEST_EMAIL, new BCryptPasswordEncoder(4).encode("correctpassword"),
+                Role.CLIENT, null, null, null);
+        ReflectionTestUtils.setField(user, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(user, "emailVerified", false);
+        ReflectionTestUtils.setField(user, "isActive", true);
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "correctpassword")))
+                .isInstanceOf(EmailNotVerifiedException.class)
+                .satisfies(ex -> assertThat(((EmailNotVerifiedException) ex).getEmail()).isEqualTo(TEST_EMAIL));
+    }
+
+    @Test
+    @DisplayName("should return generic 401 when unverified user logs in with wrong password (gate not reached)")
+    void should_return401_when_unverifiedUserLogsInWithWrongPassword() {
+        User user = new User(TEST_EMAIL, new BCryptPasswordEncoder(4).encode("correctpassword"),
+                Role.CLIENT, null, null, null);
+        ReflectionTestUtils.setField(user, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(user, "emailVerified", false);
+        ReflectionTestUtils.setField(user, "isActive", true);
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "wrongpassword")))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED));
+    }
+
+    @Test
+    @DisplayName("should return AuthResponse when verified user logs in")
+    void should_returnAuthResponse_when_verifiedUserLogsIn() {
+        UUID userId = UUID.randomUUID();
+        User user = new User(TEST_EMAIL, new BCryptPasswordEncoder(4).encode("correctpassword"),
+                Role.CLIENT, null, null, null);
+        ReflectionTestUtils.setField(user, "id", userId);
+        ReflectionTestUtils.setField(user, "emailVerified", true);
+        ReflectionTestUtils.setField(user, "isActive", true);
+        var stubResponse = AuthResponse.of("access-token", "refresh-token", userId, TEST_EMAIL, Role.CLIENT);
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+
+        AuthResponse response = authService.login(new LoginRequest(TEST_EMAIL, "correctpassword"));
+
+        assertThat(response.accessToken()).isEqualTo("access-token");
+    }
+
+    @Test
+    @DisplayName("should return generic 401 for inactive account regardless of emailVerified (active check precedes gate)")
+    void should_return401_when_inactiveAccountRegardlessOfVerification() {
+        User user = new User(TEST_EMAIL, new BCryptPasswordEncoder(4).encode("correctpassword"),
+                Role.CLIENT, null, null, null);
+        ReflectionTestUtils.setField(user, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(user, "emailVerified", false);
+        ReflectionTestUtils.setField(user, "isActive", false);
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "correctpassword")))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED));
+    }
+
+    @Test
+    @DisplayName("should echo the login email in EmailNotVerifiedException")
+    void should_echoLoginEmail_when_emailNotVerified() {
+        User user = new User(TEST_EMAIL, new BCryptPasswordEncoder(4).encode("pass"),
+                Role.CLIENT, null, null, null);
+        ReflectionTestUtils.setField(user, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(user, "emailVerified", false);
+        ReflectionTestUtils.setField(user, "isActive", true);
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "pass")))
+                .isInstanceOf(EmailNotVerifiedException.class)
+                .satisfies(ex -> {
+                    assertThat(((EmailNotVerifiedException) ex).getEmail()).isEqualTo(TEST_EMAIL);
+                    assertThat(((EmailNotVerifiedException) ex).getMessage()).isEqualTo("Email not verified");
+                });
+    }
+
+    @Test
+    @DisplayName("should return 401 when refresh token belongs to unverified user")
+    void should_return401_when_refreshTokenBelongsToUnverifiedUser() {
+        // arrange: unverified user with a valid non-expired, non-revoked refresh token
+        UUID userId = UUID.randomUUID();
+        User user = new User(TEST_EMAIL, new BCryptPasswordEncoder(4).encode("pass"),
+                Role.CLIENT, null, null, null);
+        ReflectionTestUtils.setField(user, "id", userId);
+        ReflectionTestUtils.setField(user, "emailVerified", false);
+        ReflectionTestUtils.setField(user, "isActive", true);
+
+        String rawToken = "raw-refresh-token-unverified";
+        String hashedToken = "hashed-token-unverified";
+        RefreshToken refreshToken = new RefreshToken(hashedToken, userId, FIXED_NOW.plusSeconds(3600));
+
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(refreshToken));
+        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(clock.instant()).thenReturn(FIXED_NOW);
+
+        assertThatThrownBy(() -> authService.refresh(new RefreshRequest(rawToken)))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED));
     }
 
     // ─── helpers ──────────────────────────────────────────────────────────────

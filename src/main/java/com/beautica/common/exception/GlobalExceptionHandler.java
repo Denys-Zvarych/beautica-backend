@@ -1,5 +1,6 @@
 package com.beautica.common.exception;
 
+import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
@@ -195,6 +196,17 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .badRequest()
                 .body(ApiResponse.error("Invalid value for parameter '" + paramName + "'"));
+    }
+
+    @ExceptionHandler(EmailNotVerifiedException.class)
+    public ResponseEntity<ApiResponse<EmailNotVerifiedResponse>> handleEmailNotVerified(
+            EmailNotVerifiedException ex) {
+        log.debug("Login rejected — email not verified: {}", ex.getEmail());
+        return ResponseEntity
+                .status(HttpStatus.FORBIDDEN)
+                .body(new ApiResponse<>(false,
+                        new EmailNotVerifiedResponse("EMAIL_NOT_VERIFIED", ex.getEmail()),
+                        "Email not verified"));
     }
 
     @ExceptionHandler(Exception.class)
