@@ -17,6 +17,12 @@ spring:
     username: test
     password: test
     test-connection: false
+    properties:
+      mail:
+        smtp:
+          connectiontimeout: 1000
+          timeout: 1000
+          writetimeout: 1000
 
 app:
   rate-limit:

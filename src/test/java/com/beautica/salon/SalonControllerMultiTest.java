@@ -233,8 +233,13 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
         var request = new RegisterRequest(email, TEST_PASSWORD, SelfRegistrationRole.CLIENT, null, null, null, null);
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        // Phase 1.7: registration no longer issues tokens; mark email verified then login.
+        jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(loginResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
     }
 
