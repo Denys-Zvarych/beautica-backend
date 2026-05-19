@@ -340,6 +340,62 @@ class LocalityTaxonomySeedMigrationTest extends AbstractIntegrationTest {
         }
 
         @Test
+        @DisplayName("katotth_code is NOT NULL in all three taxonomy tables (information_schema, Phase 10.9 Step 1)")
+        void should_haveNotNullKatotthCode_when_v52Applied() {
+            // The sibling tests prove katotth_code is UNIQUE and that every
+            // seeded value is a real 'UA…' string, but neither pins the column
+            // NULLABILITY constraint itself. Phase 10.9 Step 1 requires the
+            // NOT NULL invariant asserted directly through the catalog so a
+            // future ALTER that relaxed it (allowing a NULL business key, which
+            // breaks idempotent upsert-by-code) fails here, not silently.
+            for (String table : new String[] {"oblasts", "cities", "city_districts"}) {
+                String isNullable = jdbcTemplate.queryForObject(
+                        "SELECT is_nullable FROM information_schema.columns "
+                                + "WHERE table_name = ? AND column_name = 'katotth_code'",
+                        String.class, table);
+
+                assertThat(isNullable)
+                        .as("%s.katotth_code must be NOT NULL — it is the stable "
+                                + "external business key for idempotent seed upserts", table)
+                        .isEqualTo("NO");
+            }
+        }
+
+        @Test
+        @DisplayName("V52→V53→V54 applied as one clean ordered chain — every Part A migration recorded success, none failed (Phase 10.9 Step 1)")
+        void should_applyV52V53V54AsOneCleanOrderedChain_when_freshDb() {
+            // Step 1 contract: the three Part A migrations boot cleanly on a
+            // fresh Testcontainers Postgres with no checksum/ordering issue.
+            // Flyway records execution order in installed_rank; a checksum
+            // mismatch or out-of-order apply would either crash the context
+            // (no rows) or leave success=false. Assert all three present,
+            // success, and strictly increasing installed_rank in V-order.
+            List<Map<String, Object>> chain = jdbcTemplate.queryForList(
+                    "SELECT version, success, installed_rank "
+                            + "FROM flyway_schema_history "
+                            + "WHERE version IN ('52','53','54') "
+                            + "ORDER BY installed_rank");
+
+            assertThat(chain)
+                    .as("V52, V53 and V54 must all be present in the history")
+                    .hasSize(3);
+            assertThat(chain)
+                    .as("the Part A chain must apply strictly in V52→V53→V54 order")
+                    .extracting(r -> r.get("version"))
+                    .containsExactly("52", "53", "54");
+            assertThat(chain)
+                    .as("no Part A migration may be recorded as a failure")
+                    .allSatisfy(r -> assertThat(r.get("success")).isEqualTo(Boolean.TRUE));
+
+            Integer failedAnywhere = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM flyway_schema_history WHERE success = false",
+                    Integer.class);
+            assertThat(failedAnywhere)
+                    .as("a fresh-DB boot must have ZERO failed migrations in the whole chain")
+                    .isZero();
+        }
+
+        @Test
         @DisplayName("every KATOTTH business key is unique within its table (no UUID leakage into the key)")
         void should_haveUniqueKatotthCodes_when_v53Applied() {
             Integer dupOblasts = jdbcTemplate.queryForObject(
