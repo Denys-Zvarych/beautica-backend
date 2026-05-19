@@ -112,7 +112,9 @@ class UserControllerTest {
         var userId = UUID.randomUUID();
         var profile = new UserProfileResponse(
                 userId, "jane@example.com", "CLIENT",
-                "Jane", "Doe", "+380671234567", true, false, null
+                "Jane", "Doe", "+380671234567",
+                null, null, null, null, null,
+                true, false, null
         );
         when(userService.getProfile(userId)).thenReturn(profile);
 
@@ -144,12 +146,15 @@ class UserControllerTest {
         var userId = UUID.randomUUID();
         var updated = new UserProfileResponse(
                 userId, "jane@example.com", "CLIENT",
-                "Oksana", "Kovalenko", null, true, false, null
+                "Oksana", "Kovalenko", null,
+                null, null, null, null, null,
+                true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
 
-        var body = new UpdateProfileRequest("Oksana", "Kovalenko", null);
+        var body = new UpdateProfileRequest("Oksana", "Kovalenko", null,
+                null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -168,7 +173,8 @@ class UserControllerTest {
         var userId = UUID.randomUUID();
         // 101 characters — violates @Size(max = 100)
         var tooLong = "A".repeat(101);
-        var body = new UpdateProfileRequest(tooLong, "Doe", null);
+        var body = new UpdateProfileRequest(tooLong, "Doe", null,
+                null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -183,7 +189,8 @@ class UserControllerTest {
     @Test
     @DisplayName("PATCH /me with no JWT → 401")
     void should_return401_when_patchProfileWithoutJwt() throws Exception {
-        var body = new UpdateProfileRequest("Jane", "Doe", null);
+        var body = new UpdateProfileRequest("Jane", "Doe", null,
+                null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(csrf())

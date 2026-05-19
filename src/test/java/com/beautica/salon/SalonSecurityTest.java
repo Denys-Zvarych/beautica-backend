@@ -78,7 +78,8 @@ class SalonSecurityTest extends AbstractIntegrationTest {
         String ownerBToken = createSalonOwnerAndGetToken(
                 "owner-b-patch-" + System.nanoTime() + "@beautica.test");
 
-        var patchRequest = new UpdateSalonRequest("Stolen Salon", null, null, null, null, null, null);
+        var patchRequest = new UpdateSalonRequest("Stolen Salon", null, null, null, null,
+                null, null, null, null, null, null, null);
 
         log.debug("Act: PATCH {}/{} with Owner B's token targeting Owner A's salon — cross-owner patch must be denied", SALONS_URL, salonAId);
         ResponseEntity<String> response = restTemplate.exchange(

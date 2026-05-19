@@ -6,6 +6,7 @@ import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -34,6 +35,7 @@ public class SalonService {
     private final UserRepository userRepository;
     private final InviteService inviteService;
     private final MasterRepository masterRepository;
+    private final LocalityWriteValidator localityWriteValidator;
 
     @Transactional
     @CacheEvict(value = "ownerSalons", key = "#ownerId")
@@ -72,21 +74,24 @@ public class SalonService {
         // Ownership already enforced by @PreAuthorize("... @authz.canManageSalon(...)") on
         // the controller — no redundant DB round-trip needed here.
 
+        // Phase 10.6: a salon is a discoverable provider — its persisted
+        // locality must satisfy the most-specific-node rule (city mandatory;
+        // district mandatory iff the city has urban districts; district a child
+        // of the city). The legacy free-text city/region/address are NO LONGER
+        // written (kept nullable per Phase 10.3, no longer the source of truth).
+        localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+
         if (request.name() != null) {
             salon.setName(request.name());
         }
         if (request.description() != null) {
             salon.setDescription(request.description());
         }
-        if (request.city() != null) {
-            salon.setCity(request.city());
-        }
-        if (request.region() != null) {
-            salon.setRegion(request.region());
-        }
-        if (request.address() != null) {
-            salon.setAddress(request.address());
-        }
+        salon.setCityId(request.cityId());
+        salon.setDistrictId(request.districtId());
+        salon.setStreet(request.street());
+        salon.setBuildingNo(request.buildingNo());
+        salon.setLocationNote(request.locationNote());
         if (request.phone() != null) {
             salon.setPhone(request.phone());
         }
