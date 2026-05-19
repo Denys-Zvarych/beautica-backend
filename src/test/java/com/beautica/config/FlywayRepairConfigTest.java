@@ -1,24 +1,22 @@
 package com.beautica.config;
 
-import ch.qos.logback.classic.Level;
-import ch.qos.logback.classic.Logger;
-import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.read.ListAppender;
 import org.flywaydb.core.Flyway;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import org.flywaydb.core.api.ErrorDetails;
+import org.flywaydb.core.api.exception.FlywayValidateException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.flyway.FlywayMigrationStrategy;
+import org.springframework.context.annotation.Profile;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -26,24 +24,15 @@ import static org.mockito.Mockito.verify;
  * context: the bean is a plain {@link FlywayMigrationStrategy} lambda over
  * {@link Flyway}, so the strategy is exercised directly by instantiating
  * {@code new FlywayRepairConfig()} (package-private, same package as this test)
- * and calling {@code flywayMigrationStrategy(boolean)}.
+ * and calling the no-arg {@code flywayMigrationStrategy()}.
  *
- * <p><strong>Default-contract approach (test 3):</strong> the production default
- * is declared by {@code @Value("${beautica.flyway.repair-on-migrate:false}")} —
- * an absent property is bound by Spring to {@code false}, which selects the
- * migrate-only path. Driving an {@link org.springframework.boot.test.context.runner.ApplicationContextRunner}
- * under the {@code prod} profile would be awkward here: it would still be unable
- * to feed a {@code Flyway} mock into the strategy, so the property-binding step
- * could not be observed end-to-end anyway. Instead this test exercises the
- * resolved default by invoking the factory with the documented default literal
- * ({@code false}) and asserting the migrate-only / never-repair contract — the
- * same "assert the documented default by exercising the factory's default path"
- * convention {@code S3ConfigTest} documents for its activation policy.
- *
- * <p>Log assertions use a Logback {@link ListAppender} attached to the
- * {@link FlywayRepairConfig} logger — the established log-capture precedent in
- * this repo ({@code R2StorageServiceTest}, {@code ReviewEventListenerTest});
- * no {@code OutputCaptureExtension} usage exists in the codebase.
+ * <p>The strategy is intentionally <em>not</em> env-flag-gated (the old
+ * {@code @Value}-bound {@code repair-on-migrate} boolean is gone). Its contract
+ * is now purely reactive: {@code validate()} first; on
+ * {@link FlywayValidateException} run a one-shot {@code repair()} + re-validate;
+ * always {@code migrate()} at the end. The two behavioural cases below pin the
+ * healthy fast path (== Spring Boot default, no repair) and the self-healing
+ * checksum-drift path (validate → repair → validate → migrate).
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("FlywayRepairConfig — migration strategy unit")
@@ -52,80 +41,56 @@ class FlywayRepairConfigTest {
     @Mock
     private Flyway flyway;
 
-    private ListAppender<ILoggingEvent> listAppender;
-
-    @BeforeEach
-    void attachListAppender() {
-        Logger configLogger = (Logger) LoggerFactory.getLogger(FlywayRepairConfig.class);
-        listAppender = new ListAppender<>();
-        listAppender.start();
-        configLogger.addAppender(listAppender);
+    private FlywayMigrationStrategy strategy() {
+        return new FlywayRepairConfig().flywayMigrationStrategy();
     }
 
-    @AfterEach
-    void detachListAppender() {
-        Logger configLogger = (Logger) LoggerFactory.getLogger(FlywayRepairConfig.class);
-        configLogger.detachAppender(listAppender);
-        listAppender.stop();
+    private static FlywayValidateException validateException() {
+        return new FlywayValidateException(
+                new ErrorDetails(null, "Migration checksum mismatch for migration version 42"),
+                "validate failed");
     }
 
     @Test
-    @DisplayName("calls migrate() only when the repair flag is false")
-    void should_callMigrateOnly_when_repairFlagFalse() {
-        FlywayMigrationStrategy strategy = new FlywayRepairConfig().flywayMigrationStrategy(false);
+    @DisplayName("healthy DB: validate() succeeds → migrate() once, repair() never")
+    void should_skipRepair_when_validateSucceeds() {
+        // validate() does not throw (default Mockito void no-op)
 
-        strategy.migrate(flyway);
-
-        verify(flyway).migrate();
-        verify(flyway, never()).repair();
-    }
-
-    @Test
-    @DisplayName("calls repair() strictly before migrate() when the repair flag is true")
-    void should_callRepairThenMigrate_when_repairFlagTrue() {
-        FlywayMigrationStrategy strategy = new FlywayRepairConfig().flywayMigrationStrategy(true);
-
-        strategy.migrate(flyway);
+        strategy().migrate(flyway);
 
         InOrder ordered = inOrder(flyway);
-        ordered.verify(flyway).repair();
+        ordered.verify(flyway).validate();
         ordered.verify(flyway).migrate();
-    }
-
-    @Test
-    @DisplayName("defaults to migrate-only (never repair) per the @Value(:false) default contract")
-    void should_defaultToMigrateOnly_when_flagAbsent() {
-        // The @Value("${beautica.flyway.repair-on-migrate:false}") default binds
-        // an absent property to false; exercise that resolved default literal.
-        FlywayMigrationStrategy strategy = new FlywayRepairConfig().flywayMigrationStrategy(false);
-
-        strategy.migrate(flyway);
-
-        verify(flyway).migrate();
+        verify(flyway, times(1)).validate();
+        verify(flyway, times(1)).migrate();
         verify(flyway, never()).repair();
     }
 
     @Test
-    @DisplayName("emits operator-visible WARN logs on the repair path and none on the migrate-only path")
-    void should_logWarn_when_repairFlagTrue() {
-        new FlywayRepairConfig().flywayMigrationStrategy(true).migrate(flyway);
+    @DisplayName("checksum drift: validate() throws once → repair(), re-validate, then migrate()")
+    void should_repairAndRevalidate_when_firstValidateThrows() {
+        doThrow(validateException())
+                .doNothing()
+                .when(flyway).validate();
 
-        assertThat(listAppender.list)
-                .as("repair path must emit operator-visible WARN logs")
-                .filteredOn(event -> event.getLevel() == Level.WARN)
-                .hasSize(2)
-                .anySatisfy(event -> assertThat(event.getFormattedMessage())
-                        .contains("FLYWAY REPAIR ENABLED"))
-                .anySatisfy(event -> assertThat(event.getFormattedMessage())
-                        .contains("FLYWAY REPAIR COMPLETE"));
+        strategy().migrate(flyway);
 
-        listAppender.list.clear();
+        InOrder ordered = inOrder(flyway);
+        ordered.verify(flyway).validate();
+        ordered.verify(flyway).repair();
+        ordered.verify(flyway).validate();
+        ordered.verify(flyway).migrate();
+        verify(flyway, times(2)).validate();
+        verify(flyway, times(1)).repair();
+        verify(flyway, times(1)).migrate();
+    }
 
-        new FlywayRepairConfig().flywayMigrationStrategy(false).migrate(flyway);
+    @Test
+    @DisplayName("is scoped to the prod profile only")
+    void should_beScopedToProdProfile() {
+        Profile profile = FlywayRepairConfig.class.getAnnotation(Profile.class);
 
-        assertThat(listAppender.list)
-                .as("migrate-only path must stay silent — no WARN noise on normal deploys")
-                .filteredOn(event -> event.getLevel() == Level.WARN)
-                .isEmpty();
+        assertThat(profile).as("@Profile must be present").isNotNull();
+        assertThat(profile.value()).containsExactly("prod");
     }
 }

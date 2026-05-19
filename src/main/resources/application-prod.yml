@@ -6,16 +6,6 @@ spring:
   flyway:
     enabled: true
 
-# One-shot Flyway self-heal for applied-migration checksum drift.
-# Bound by FlywayRepairConfig (@Profile("prod")) to a guarded flyway.repair()
-# before migrate(). Default false == Spring Boot default behaviour (migrate only).
-# Set Railway env FLYWAY_REPAIR_ON_MIGRATE=true for ONE boot to recover from a
-# "Migration checksum mismatch" crash, then REMOVE it — leaving it on would mask
-# a genuinely dangerous future edit to an already-applied migration.
-beautica:
-  flyway:
-    repair-on-migrate: ${FLYWAY_REPAIR_ON_MIGRATE:false}
-
 server:
   port: ${PORT:8080}
   error:
