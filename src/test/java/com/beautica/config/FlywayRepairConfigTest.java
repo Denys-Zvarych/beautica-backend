@@ -29,10 +29,14 @@ import static org.mockito.Mockito.verify;
  * <p>The strategy is intentionally <em>not</em> env-flag-gated (the old
  * {@code @Value}-bound {@code repair-on-migrate} boolean is gone). Its contract
  * is now purely reactive: {@code validate()} first; on
- * {@link FlywayValidateException} run a one-shot {@code repair()} + re-validate;
- * always {@code migrate()} at the end. The two behavioural cases below pin the
- * healthy fast path (== Spring Boot default, no repair) and the self-healing
- * checksum-drift path (validate → repair → validate → migrate).
+ * {@link FlywayValidateException} run a one-shot {@code repair()} (NO second
+ * {@code validate()} — that would re-throw for a pending migration and make
+ * {@code migrate()} unreachable); always {@code migrate()} at the end as the
+ * single terminal step. The behavioural cases below pin the healthy fast path
+ * (== Spring Boot default, no repair), the self-healing recovery path
+ * (validate → repair → migrate), and the regression where {@code validate()}
+ * throws for a pending migration that {@code repair()} cannot fix yet
+ * {@code migrate()} must still run.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("FlywayRepairConfig — migration strategy unit")
@@ -48,6 +52,13 @@ class FlywayRepairConfigTest {
     private static FlywayValidateException validateException() {
         return new FlywayValidateException(
                 new ErrorDetails(null, "Migration checksum mismatch for migration version 42"),
+                "validate failed");
+    }
+
+    private static FlywayValidateException pendingMigrationException() {
+        return new FlywayValidateException(
+                new ErrorDetails(null,
+                        "Detected resolved migration not applied to database: 52"),
                 "validate failed");
     }
 
@@ -67,20 +78,34 @@ class FlywayRepairConfigTest {
     }
 
     @Test
-    @DisplayName("checksum drift: validate() throws once → repair(), re-validate, then migrate()")
-    void should_repairAndRevalidate_when_firstValidateThrows() {
-        doThrow(validateException())
-                .doNothing()
-                .when(flyway).validate();
+    @DisplayName("checksum drift: validate() throws → repair() then migrate(), no re-validate")
+    void should_repairThenMigrate_when_validateThrows() {
+        doThrow(validateException()).when(flyway).validate();
 
         strategy().migrate(flyway);
 
         InOrder ordered = inOrder(flyway);
         ordered.verify(flyway).validate();
         ordered.verify(flyway).repair();
-        ordered.verify(flyway).validate();
         ordered.verify(flyway).migrate();
-        verify(flyway, times(2)).validate();
+        verify(flyway, times(1)).validate();
+        verify(flyway, times(1)).repair();
+        verify(flyway, times(1)).migrate();
+    }
+
+    @Test
+    @DisplayName("pending migration (V52): validate() throws, repair() is a no-op → migrate() still runs once")
+    void should_stillMigrate_when_validateThrowsForPendingMigrationAndRepairDoesNothing() {
+        doThrow(pendingMigrationException()).when(flyway).validate();
+        // repair() is a no-op for a pending migration (default Mockito void no-op)
+
+        strategy().migrate(flyway);
+
+        InOrder ordered = inOrder(flyway);
+        ordered.verify(flyway).validate();
+        ordered.verify(flyway).repair();
+        ordered.verify(flyway).migrate();
+        verify(flyway, times(1)).validate();
         verify(flyway, times(1)).repair();
         verify(flyway, times(1)).migrate();
     }
