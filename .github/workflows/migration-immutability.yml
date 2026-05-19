@@ -5,6 +5,18 @@ on:
     branches:
       - main
       - dev
+  # Defense-in-depth: re-run the gates on the merged tip of the
+  # protected branches. A bad migration that reaches dev/main via a
+  # merge-commit (or a direct push) is NOT covered by the
+  # pull_request trigger and would otherwise deploy to prod
+  # unchecked (this exact gap crash-looped Railway on a V49
+  # checksum mismatch). The base-revision resolution step below is
+  # event-aware: PR -> pull_request.base.sha; push ->
+  # github.event.before with a safe merge-base fallback.
+  push:
+    branches:
+      - main
+      - dev
 
 jobs:
   check-migration-immutability:
@@ -22,9 +34,114 @@ jobs:
           # ("$BASE_SHA...HEAD") can resolve. Do not lower this.
           fetch-depth: 0
 
-      - name: Detect modified or deleted migrations
+      # Event-aware base-revision resolution. This is the ONLY place
+      # event type is interpreted; the gate step (and its hermetic
+      # mirror) consume the resulting $BASE_SHA verbatim, so the
+      # SHARED block stays byte-identical and verify-gate-mirror-parity
+      # still passes.
+      #   pull_request -> the PR base tip (unchanged behavior).
+      #   push         -> github.event.before, the pre-push tip; the
+      #                    before...HEAD diff catches a V49-style
+      #                    mutation introduced by the merge-commit.
+      #   zero-SHA / unresolved (branch creation, first push,
+      #   force-push, shallow) -> fall back to merge-base vs
+      #   origin/main, then HEAD^, and FAIL loudly if neither
+      #   resolves (a poisoned push must never silently pass).
+      - name: Resolve base revision
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:baserev:BEGIN
+          # =========================================================
+          # SHARED BASE-REVISION RESOLVER LOGIC -- keep this block
+          # BYTE-IDENTICAL with the copy in
+          # `check-migration-version-monotonicity` and the hermetic
+          # mirror in `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs all extracted copies
+          # and fails CI if they drift, so a typo in one place is
+          # caught before it can ship.
+          # =========================================================
+          #
+          # Event-aware base-revision resolution. This is the ONLY
+          # place event type is interpreted; the gate step (and its
+          # hermetic mirror) consume the resulting SHA verbatim as
+          # $BASE_SHA, so the gate SHARED blocks stay byte-identical.
+          #   pull_request -> the PR base tip (unchanged behavior).
+          #   push         -> github.event.before, the pre-push tip;
+          #                    the before...HEAD diff catches a
+          #                    V49-style mutation introduced by the
+          #                    merge-commit.
+          #   zero-SHA / unresolved (branch creation, first push,
+          #   force-push, shallow) -> fall back to merge-base vs
+          #   origin/main, then HEAD^, and FAIL loudly if neither
+          #   resolves (a poisoned push must never silently pass).
+          #
+          # Reads EVENT_NAME / PR_BASE_SHA / PUSH_BEFORE_SHA from the
+          # environment. Prints ONLY the resolved SHA on stdout (the
+          # caller is responsible for exporting it to $GITHUB_ENV, so
+          # this block is hermetic and reusable from the self-test).
+          # Diagnostics go to stderr. Exits 1 (fail-loud) if no safe
+          # base can be resolved.
+          resolve_base_revision() {
+            local zero_sha="0000000000000000000000000000000000000000"
+            local candidate
+
+            resolve_base_revision_fallback() {
+              # Prefer the merge-base against the protected mainline so
+              # only commits unique to this push/tip are evaluated.
+              if git rev-parse --verify --quiet origin/main >/dev/null; then
+                local mb
+                if mb="$(git merge-base origin/main HEAD 2>/dev/null)" && [ -n "$mb" ]; then
+                  printf '%s' "$mb"
+                  return 0
+                fi
+              fi
+              # Otherwise the immediate parent, if HEAD has one.
+              if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+                git rev-parse "HEAD^"
+                return 0
+              fi
+              return 1
+            }
+
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              candidate="${PR_BASE_SHA:-}"
+            else
+              candidate="${PUSH_BEFORE_SHA:-}"
+            fi
+
+            # Treat the zero-SHA sentinel or any non-resolvable value
+            # as unresolved and fall back; never let it silently pass.
+            if [ -z "$candidate" ] || [ "$candidate" = "$zero_sha" ] \
+               || ! git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              echo "Base revision '$candidate' for event '${EVENT_NAME:-}' is unresolved (zero-SHA, missing, or shallow). Falling back." >&2
+              if ! candidate="$(resolve_base_revision_fallback)"; then
+                echo "ERROR: could not resolve any safe base revision (no origin/main merge-base and no HEAD parent)." >&2
+                echo "Refusing to pass the migration gate without a base to diff against." >&2
+                return 1
+              fi
+              echo "Resolved fallback base revision: $candidate" >&2
+            fi
+
+            printf '%s' "$candidate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED BASE-REVISION RESOLVER LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:baserev:END
+
+          if ! BASE_SHA="$(resolve_base_revision)"; then
+            exit 1
+          fi
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "Using BASE_SHA=$BASE_SHA (event=$EVENT_NAME)"
+
+      - name: Detect modified or deleted migrations
         run: |
           set -euo pipefail
 
@@ -274,9 +391,114 @@ jobs:
           # Do not lower this.
           fetch-depth: 0
 
-      - name: Enforce monotonic, non-duplicate Flyway versions
+      # Event-aware base-revision resolution. This is the ONLY place
+      # event type is interpreted; the gate step (and its hermetic
+      # mirror) consume the resulting $BASE_SHA verbatim, so the
+      # SHARED block stays byte-identical and verify-gate-mirror-parity
+      # still passes.
+      #   pull_request -> the PR base tip (unchanged behavior).
+      #   push         -> github.event.before, the pre-push tip; the
+      #                    before...HEAD diff catches a V49-style
+      #                    mutation introduced by the merge-commit.
+      #   zero-SHA / unresolved (branch creation, first push,
+      #   force-push, shallow) -> fall back to merge-base vs
+      #   origin/main, then HEAD^, and FAIL loudly if neither
+      #   resolves (a poisoned push must never silently pass).
+      - name: Resolve base revision
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:baserev:BEGIN
+          # =========================================================
+          # SHARED BASE-REVISION RESOLVER LOGIC -- keep this block
+          # BYTE-IDENTICAL with the copy in
+          # `check-migration-version-monotonicity` and the hermetic
+          # mirror in `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs all extracted copies
+          # and fails CI if they drift, so a typo in one place is
+          # caught before it can ship.
+          # =========================================================
+          #
+          # Event-aware base-revision resolution. This is the ONLY
+          # place event type is interpreted; the gate step (and its
+          # hermetic mirror) consume the resulting SHA verbatim as
+          # $BASE_SHA, so the gate SHARED blocks stay byte-identical.
+          #   pull_request -> the PR base tip (unchanged behavior).
+          #   push         -> github.event.before, the pre-push tip;
+          #                    the before...HEAD diff catches a
+          #                    V49-style mutation introduced by the
+          #                    merge-commit.
+          #   zero-SHA / unresolved (branch creation, first push,
+          #   force-push, shallow) -> fall back to merge-base vs
+          #   origin/main, then HEAD^, and FAIL loudly if neither
+          #   resolves (a poisoned push must never silently pass).
+          #
+          # Reads EVENT_NAME / PR_BASE_SHA / PUSH_BEFORE_SHA from the
+          # environment. Prints ONLY the resolved SHA on stdout (the
+          # caller is responsible for exporting it to $GITHUB_ENV, so
+          # this block is hermetic and reusable from the self-test).
+          # Diagnostics go to stderr. Exits 1 (fail-loud) if no safe
+          # base can be resolved.
+          resolve_base_revision() {
+            local zero_sha="0000000000000000000000000000000000000000"
+            local candidate
+
+            resolve_base_revision_fallback() {
+              # Prefer the merge-base against the protected mainline so
+              # only commits unique to this push/tip are evaluated.
+              if git rev-parse --verify --quiet origin/main >/dev/null; then
+                local mb
+                if mb="$(git merge-base origin/main HEAD 2>/dev/null)" && [ -n "$mb" ]; then
+                  printf '%s' "$mb"
+                  return 0
+                fi
+              fi
+              # Otherwise the immediate parent, if HEAD has one.
+              if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+                git rev-parse "HEAD^"
+                return 0
+              fi
+              return 1
+            }
+
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              candidate="${PR_BASE_SHA:-}"
+            else
+              candidate="${PUSH_BEFORE_SHA:-}"
+            fi
+
+            # Treat the zero-SHA sentinel or any non-resolvable value
+            # as unresolved and fall back; never let it silently pass.
+            if [ -z "$candidate" ] || [ "$candidate" = "$zero_sha" ] \
+               || ! git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              echo "Base revision '$candidate' for event '${EVENT_NAME:-}' is unresolved (zero-SHA, missing, or shallow). Falling back." >&2
+              if ! candidate="$(resolve_base_revision_fallback)"; then
+                echo "ERROR: could not resolve any safe base revision (no origin/main merge-base and no HEAD parent)." >&2
+                echo "Refusing to pass the migration gate without a base to diff against." >&2
+                return 1
+              fi
+              echo "Resolved fallback base revision: $candidate" >&2
+            fi
+
+            printf '%s' "$candidate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED BASE-REVISION RESOLVER LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:baserev:END
+
+          if ! BASE_SHA="$(resolve_base_revision)"; then
+            exit 1
+          fi
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "Using BASE_SHA=$BASE_SHA (event=$EVENT_NAME)"
+
+      - name: Enforce monotonic, non-duplicate Flyway versions
         run: |
           set -euo pipefail
 
@@ -732,6 +954,212 @@ jobs:
 
           echo "All version-monotonicity self-test scenarios passed."
 
+  self-test-base-revision-resolution:
+    name: Self-test Base Revision Resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Assert the resolver picks the right base per event and fails loud when none resolves
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:baserev:BEGIN
+          # =========================================================
+          # SHARED BASE-REVISION RESOLVER LOGIC -- keep this block
+          # BYTE-IDENTICAL with the copy in
+          # `check-migration-version-monotonicity` and the hermetic
+          # mirror in `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs all extracted copies
+          # and fails CI if they drift, so a typo in one place is
+          # caught before it can ship.
+          # =========================================================
+          #
+          # Event-aware base-revision resolution. This is the ONLY
+          # place event type is interpreted; the gate step (and its
+          # hermetic mirror) consume the resulting SHA verbatim as
+          # $BASE_SHA, so the gate SHARED blocks stay byte-identical.
+          #   pull_request -> the PR base tip (unchanged behavior).
+          #   push         -> github.event.before, the pre-push tip;
+          #                    the before...HEAD diff catches a
+          #                    V49-style mutation introduced by the
+          #                    merge-commit.
+          #   zero-SHA / unresolved (branch creation, first push,
+          #   force-push, shallow) -> fall back to merge-base vs
+          #   origin/main, then HEAD^, and FAIL loudly if neither
+          #   resolves (a poisoned push must never silently pass).
+          #
+          # Reads EVENT_NAME / PR_BASE_SHA / PUSH_BEFORE_SHA from the
+          # environment. Prints ONLY the resolved SHA on stdout (the
+          # caller is responsible for exporting it to $GITHUB_ENV, so
+          # this block is hermetic and reusable from the self-test).
+          # Diagnostics go to stderr. Exits 1 (fail-loud) if no safe
+          # base can be resolved.
+          resolve_base_revision() {
+            local zero_sha="0000000000000000000000000000000000000000"
+            local candidate
+
+            resolve_base_revision_fallback() {
+              # Prefer the merge-base against the protected mainline so
+              # only commits unique to this push/tip are evaluated.
+              if git rev-parse --verify --quiet origin/main >/dev/null; then
+                local mb
+                if mb="$(git merge-base origin/main HEAD 2>/dev/null)" && [ -n "$mb" ]; then
+                  printf '%s' "$mb"
+                  return 0
+                fi
+              fi
+              # Otherwise the immediate parent, if HEAD has one.
+              if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+                git rev-parse "HEAD^"
+                return 0
+              fi
+              return 1
+            }
+
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              candidate="${PR_BASE_SHA:-}"
+            else
+              candidate="${PUSH_BEFORE_SHA:-}"
+            fi
+
+            # Treat the zero-SHA sentinel or any non-resolvable value
+            # as unresolved and fall back; never let it silently pass.
+            if [ -z "$candidate" ] || [ "$candidate" = "$zero_sha" ] \
+               || ! git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              echo "Base revision '$candidate' for event '${EVENT_NAME:-}' is unresolved (zero-SHA, missing, or shallow). Falling back." >&2
+              if ! candidate="$(resolve_base_revision_fallback)"; then
+                echo "ERROR: could not resolve any safe base revision (no origin/main merge-base and no HEAD parent)." >&2
+                echo "Refusing to pass the migration gate without a base to diff against." >&2
+                return 1
+              fi
+              echo "Resolved fallback base revision: $candidate" >&2
+            fi
+
+            printf '%s' "$candidate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED BASE-REVISION RESOLVER LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:baserev:END
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # Local copy of the REAL immutability gate one-liner. This is
+          # deliberately NOT wrapped in a SHARED-BLOCK:immutability
+          # sentinel: that id must keep EXACTLY two occurrences (the
+          # production gate + its dedicated mirror) so check_pair
+          # immutability stays valid. Scenario 2 still exercises the
+          # genuine `git diff --diff-filter=MDRCT base...HEAD` behavior
+          # end-to-end on a real V49 mutation -- the headline
+          # regression that crash-looped Railway.
+          run_gate() {
+            local base_sha="$1"
+            local changed
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            if [ -z "$changed" ]; then
+              return 0
+            fi
+            return 1
+          }
+
+          fail() { echo "SELF-TEST FAILED: $1"; exit 1; }
+
+          # Hermetic repo: no checkout, no network.
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "CI Self Test"
+
+          mkdir -p "$MIGRATION_PATH"
+          printf 'CREATE TABLE existing (id int);\n' > "$MIGRATION_PATH/V49__existing.sql"
+          git add -A
+          git commit -q -m "base tip (pre-push 'before')"
+          BEFORE_SHA="$(git rev-parse HEAD)"
+
+          printf 'CREATE TABLE next_table (id int);\n' > "$MIGRATION_PATH/V50__next.sql"
+          git add -A
+          git commit -q -m "advance HEAD with a clean add (acts as merge tip)"
+          HEAD_SHA="$(git rev-parse HEAD)"
+
+          # --- Scenario 1: pull_request + valid PR base -> PR_BASE_SHA ---
+          OUT="$(EVENT_NAME=pull_request PR_BASE_SHA="$BEFORE_SHA" PUSH_BEFORE_SHA="$HEAD_SHA" resolve_base_revision)"
+          [ "$OUT" = "$BEFORE_SHA" ] || fail "pull_request must resolve to PR_BASE_SHA (got '$OUT', want '$BEFORE_SHA')"
+          echo "OK: pull_request resolves to PR_BASE_SHA"
+
+          # --- Scenario 2: push + valid before -> PUSH_BEFORE_SHA, then
+          # feed it through the REAL immutability gate on a planted V49
+          # modify across before...HEAD -> MUST exit 1 (the headline
+          # regression that crash-looped Railway, now executable). ---
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$BEFORE_SHA" resolve_base_revision)"
+          [ "$OUT" = "$BEFORE_SHA" ] || fail "push must resolve to PUSH_BEFORE_SHA (got '$OUT', want '$BEFORE_SHA')"
+          # Plant a V49-style mutation on top of HEAD: the merge tip
+          # edits an already-merged migration. before...HEAD must catch it.
+          printf 'CREATE TABLE existing (id int, poisoned text);\n' > "$MIGRATION_PATH/V49__existing.sql"
+          git add -A
+          git commit -q -m "merge-commit mutates already-merged V49 (the Railway crash-loop)"
+          POISONED_HEAD="$(git rev-parse HEAD)"
+          if run_gate "$OUT"; then
+            fail "push->V49-modify across before...HEAD MUST fail the immutability gate (exit 1)"
+          fi
+          echo "OK: push resolves to PUSH_BEFORE_SHA and the V49 mutation trips the real gate (exit 1)"
+          git reset -q --hard "$HEAD_SHA"
+
+          # --- Scenario 3: push + zero-SHA before, origin/main present
+          # -> falls back to merge-base origin/main HEAD ---
+          ZERO_SHA="0000000000000000000000000000000000000000"
+          git branch -f main "$BEFORE_SHA"
+          # Simulate a remote-tracking ref the resolver looks for.
+          git update-ref refs/remotes/origin/main "$BEFORE_SHA"
+          EXPECTED_MB="$(git merge-base origin/main HEAD)"
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$ZERO_SHA" resolve_base_revision)"
+          [ "$OUT" = "$EXPECTED_MB" ] || fail "zero-SHA push with origin/main must fall back to merge-base (got '$OUT', want '$EXPECTED_MB')"
+          echo "OK: zero-SHA + origin/main falls back to merge-base origin/main HEAD"
+          git update-ref -d refs/remotes/origin/main
+          git branch -D main >/dev/null 2>&1 || true
+
+          # --- Scenario 4: zero-SHA, no origin/main, HEAD^ exists
+          # -> falls back to HEAD^ ---
+          EXPECTED_PARENT="$(git rev-parse 'HEAD^')"
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$ZERO_SHA" resolve_base_revision)"
+          [ "$OUT" = "$EXPECTED_PARENT" ] || fail "zero-SHA push with no origin/main must fall back to HEAD^ (got '$OUT', want '$EXPECTED_PARENT')"
+          echo "OK: zero-SHA + no origin/main falls back to HEAD^"
+
+          # --- Scenario 5: zero-SHA, no origin/main, no HEAD^ (root
+          # commit) -> exit 1, NO silent pass (the fail-loud invariant,
+          # the single most important assertion). ---
+          ROOT_WORK="$(mktemp -d)"
+          (
+            cd "$ROOT_WORK"
+            git init -q
+            git config user.email "ci@example.com"
+            git config user.name "CI Self Test"
+            mkdir -p "$MIGRATION_PATH"
+            printf 'CREATE TABLE only (id int);\n' > "$MIGRATION_PATH/V1__only.sql"
+            git add -A
+            git commit -q -m "root commit (no parent, no origin/main)"
+            if EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$ZERO_SHA" resolve_base_revision >/dev/null 2>&1; then
+              fail "root commit with no base MUST fail loud (exit 1), never silently pass"
+            fi
+          )
+          echo "OK: root commit with no resolvable base fails loud (exit 1, no silent pass)"
+          rm -rf "$ROOT_WORK"
+
+          # --- Scenario 6: garbage PUSH_BEFORE_SHA that fails
+          # rev-parse --verify -> fallback path taken, NOT silent pass.
+          # HEAD^ still exists here so it must resolve to that, proving
+          # an unresolvable candidate is treated as unresolved (not
+          # passed through verbatim, which would later break the gate). ---
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="not-a-real-sha-deadbeef" resolve_base_revision)"
+          [ "$OUT" = "$EXPECTED_PARENT" ] || fail "garbage PUSH_BEFORE_SHA must take the fallback path, not pass verbatim (got '$OUT', want '$EXPECTED_PARENT')"
+          echo "OK: unresolvable/garbage PUSH_BEFORE_SHA takes the fallback path (no silent pass)"
+
+          echo "All base-revision-resolution self-test scenarios passed."
+
   verify-gate-mirror-parity:
     name: Verify Gate <-> Mirror Parity
     runs-on: ubuntu-latest
@@ -756,8 +1184,11 @@ jobs:
           # that <id> in file order. The two production/mirror copies
           # therefore extract as one stream each pairing collapses to.
           # We then split that stream back into the N occurrences and
-          # diff occurrence #1 vs #2. There are exactly two occurrences
-          # of each id (the production gate and its self-test mirror).
+          # diff occurrence #1 against every other occurrence. Each id
+          # declares its expected occurrence count: the single-gate ids
+          # (immutability, monotonicity) have exactly 2 (production gate
+          # + self-test mirror); baserev has 3 (the resolver is shared
+          # by BOTH gate jobs plus its self-test mirror).
           extract_occurrence() {
             local id="$1" want="$2"
             awk -v id="$id" -v want="$want" '
@@ -768,30 +1199,40 @@ jobs:
           }
 
           check_pair() {
-            local id="$1"
-            local a b count
+            local id="$1" expected="$2"
+            local a b count i
             count="$(grep -c "# >>> SHARED-BLOCK:${id}:BEGIN" "$WF")"
-            if [ "$count" -ne 2 ]; then
-              echo "PARITY FAILED: expected exactly 2 '${id}' SHARED blocks, found ${count}"
+            if [ "$count" -ne "$expected" ]; then
+              echo "PARITY FAILED: expected exactly ${expected} '${id}' SHARED blocks, found ${count}"
               exit 1
             fi
-            a="$(mktemp)"; b="$(mktemp)"
+            a="$(mktemp)"
             extract_occurrence "$id" 1 > "$a"
-            extract_occurrence "$id" 2 > "$b"
-            if [ ! -s "$a" ] || [ ! -s "$b" ]; then
+            if [ ! -s "$a" ]; then
               echo "PARITY FAILED: extracted an empty '${id}' SHARED block"
               exit 1
             fi
-            if ! diff -u "$a" "$b"; then
-              echo "PARITY FAILED: '${id}' gate block differs from its self-test mirror."
-              echo "The SHARED block must be BYTE-IDENTICAL across the production"
-              echo "job and its hermetic mirror. Re-sync the two copies."
-              exit 1
-            fi
-            echo "OK: '${id}' SHARED block is byte-identical across gate and mirror"
+            i=2
+            while [ "$i" -le "$count" ]; do
+              b="$(mktemp)"
+              extract_occurrence "$id" "$i" > "$b"
+              if [ ! -s "$b" ]; then
+                echo "PARITY FAILED: extracted an empty '${id}' SHARED block (occurrence ${i})"
+                exit 1
+              fi
+              if ! diff -u "$a" "$b"; then
+                echo "PARITY FAILED: '${id}' SHARED block occurrence ${i} differs from occurrence 1."
+                echo "The SHARED block must be BYTE-IDENTICAL across the production"
+                echo "job(s) and its hermetic mirror. Re-sync the copies."
+                exit 1
+              fi
+              i=$((i + 1))
+            done
+            echo "OK: all ${count} '${id}' SHARED block copies are byte-identical"
           }
 
-          check_pair immutability
-          check_pair monotonicity
+          check_pair immutability 2
+          check_pair monotonicity 2
+          check_pair baserev 3
 
           echo "All SHARED gate<->mirror blocks are byte-identical."

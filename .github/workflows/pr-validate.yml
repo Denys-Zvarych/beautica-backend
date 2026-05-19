@@ -5,6 +5,15 @@ on:
     branches:
       - main
       - dev
+  # Defense-in-depth: also compile + test the merged tip of the
+  # protected branches. The pull_request trigger does not cover a
+  # merge-commit or a direct push reaching dev/main. This job is
+  # prod-secret-free (test profile + CI dummy JWT only), so it is
+  # safe to run on push.
+  push:
+    branches:
+      - main
+      - dev
 
 # CI-only, non-production dummy value. The `test` Spring profile
 # (src/test/resources/application-test.yml) hardcodes all other infrastructure
