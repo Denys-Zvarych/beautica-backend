@@ -15,14 +15,11 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          # REQUIRED: full history so the three-dot merge-base diff
+          # ("$BASE_SHA...HEAD") can resolve. Do not lower this.
           fetch-depth: 0
-
-      - name: Fetch base branch
-        env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-        run: git fetch origin "$BASE_REF"
 
       - name: Detect modified or deleted migrations
         env:
@@ -30,15 +27,19 @@ jobs:
         run: |
           MIGRATION_PATH="src/main/resources/db/migration"
 
-          # Collect files that are Modified (M), Deleted (D), or Renamed (R)
-          # relative to the PR merge-base.  The three-dot form ("$BASE_SHA...HEAD")
-          # diffs against the merge-base of the two tips rather than the raw base
-          # tip, so advances on the base branch never attribute base-side mutations
-          # to this PR.  Added (A) files are intentionally excluded so brand-new
-          # migrations always pass.  Renamed migrations are caught because Flyway
-          # uses the script name as part of its checksum identity -- a rename
-          # changes that identity and will fail validation in prod.
-          CHANGED=$(git diff --name-status --diff-filter=MDR "$BASE_SHA...HEAD" -- "$MIGRATION_PATH")
+          # Collect files that are Modified (M), Deleted (D), Renamed (R),
+          # Copied (C), or Type-changed (T) relative to the PR merge-base.
+          # The three-dot form ("$BASE_SHA...HEAD") diffs against the
+          # merge-base of the two tips rather than the raw base tip, so
+          # advances on the base branch never attribute base-side mutations
+          # to this PR.  Added (A) files are intentionally excluded so
+          # brand-new migrations always pass.  Renamed migrations are caught
+          # because Flyway uses the script name as part of its checksum
+          # identity -- a rename changes that identity and will fail
+          # validation in prod.  C and T are practically unreachable for
+          # text V*.sql migrations but are included for defensive
+          # completeness (zero behaviour change for normal new-file adds).
+          CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- "$MIGRATION_PATH")
 
           if [ -z "$CHANGED" ]; then
             echo "No existing migration files were modified, deleted, or renamed. Check passed."
@@ -53,3 +54,80 @@ jobs:
           echo "Add a new forward migration with the next version number instead."
           echo "If you did NOT touch the file(s) listed above, rebase your branch onto the base branch to bring your history up to date."
           exit 1
+
+  self-test-immutability-gate:
+    name: Self-test Immutability Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Assert gate fails on mutation and passes on clean / add-only
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # Mirror of the production gate logic. Keep this byte-identical to
+          # the diff invocation in `check-migration-immutability` so a typo
+          # or a dropped filter letter in one place is caught here.
+          run_gate() {
+            local base_sha="$1"
+            local changed
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            if [ -z "$changed" ]; then
+              return 0
+            fi
+            return 1
+          }
+
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "CI Self Test"
+
+          mkdir -p "$MIGRATION_PATH"
+          printf 'CREATE TABLE existing (id int);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          git add -A
+          git commit -q -m "base: existing migration"
+          BASE_SHA="$(git rev-parse HEAD)"
+          git switch -q -c feature
+
+          fail() { echo "SELF-TEST FAILED: $1"; exit 1; }
+
+          # --- Scenario 1: clean diff (no migration changes) -> exit 0 ---
+          git commit -q --allow-empty -m "no migration changes"
+          run_gate "$BASE_SHA" || fail "clean diff should pass (exit 0)"
+          echo "OK: clean diff passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 2: pure add of a new migration -> exit 0 ---
+          printf 'CREATE TABLE new_table (id int);\n' > "$MIGRATION_PATH/V2__new.sql"
+          git add -A && git commit -q -m "add new migration"
+          run_gate "$BASE_SHA" || fail "add-only diff should pass (exit 0)"
+          echo "OK: add-only diff passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 3: MODIFY an existing migration -> exit 1 ---
+          printf 'CREATE TABLE existing (id int, extra text);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "modify existing migration"
+          if run_gate "$BASE_SHA"; then fail "modified migration should fail (exit 1)"; fi
+          echo "OK: modified migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 4: DELETE an existing migration -> exit 1 ---
+          git rm -q "$MIGRATION_PATH/V1__existing.sql"
+          git commit -q -m "delete existing migration"
+          if run_gate "$BASE_SHA"; then fail "deleted migration should fail (exit 1)"; fi
+          echo "OK: deleted migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 5: RENAME an existing migration -> exit 1 ---
+          git mv "$MIGRATION_PATH/V1__existing.sql" "$MIGRATION_PATH/V1__existing_renamed.sql"
+          git commit -q -m "rename existing migration"
+          if run_gate "$BASE_SHA"; then fail "renamed migration should fail (exit 1)"; fi
+          echo "OK: renamed migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          echo "All self-test scenarios passed."

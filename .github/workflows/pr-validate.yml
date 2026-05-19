@@ -6,6 +6,14 @@ on:
       - main
       - dev
 
+# CI-only, non-production dummy value. The `test` Spring profile
+# (src/test/resources/application-test.yml) hardcodes all other infrastructure
+# placeholders and Testcontainers supplies the real PostgreSQL via
+# @ServiceConnection, so the only env var the test profile actually consumes
+# is JWT_SECRET. This is a fixed throwaway value and MUST NOT be a real secret.
+env:
+  CI_DUMMY_JWT_SECRET: ci-only-dummy-jwt-secret-not-a-real-secret-min-32-bytes
+
 jobs:
   build-and-test:
     name: Build & Test
@@ -17,43 +25,29 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
 
       - name: Build
         run: ./gradlew build -x test
         env:
-          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          APP_OTP_PEPPER: ${{ secrets.APP_OTP_PEPPER }}
-          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          BREVO_SMTP_LOGIN: ${{ secrets.BREVO_SMTP_LOGIN }}
-          BREVO_SMTP_KEY: ${{ secrets.BREVO_SMTP_KEY }}
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
 
       - name: Run tests
         run: ./gradlew test -PtestLogLevel=INFO -PtestRootLogLevel=INFO
         env:
-          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          APP_OTP_PEPPER: ${{ secrets.APP_OTP_PEPPER }}
-          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          BREVO_SMTP_LOGIN: ${{ secrets.BREVO_SMTP_LOGIN }}
-          BREVO_SMTP_KEY: ${{ secrets.BREVO_SMTP_KEY }}
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
 
       - name: Publish test results
-        uses: dorny/test-reporter@v1
+        uses: dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5 # v1.9.1
         if: always()
         with:
           name: JUnit Tests
@@ -63,7 +57,7 @@ jobs:
 
       - name: Upload test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-reports
           path: build/reports/tests/
