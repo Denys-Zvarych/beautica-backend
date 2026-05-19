@@ -58,6 +58,30 @@ public class User extends AuditableEntity {
     @Column(name = "region", length = 100)
     private String region;
 
+    // ---- Phase 10.3 locality (raw UUID FK columns, NULLABLE) -------------
+    // FKs to the Phase 10.1 taxonomy (cities / city_districts). Modeled as raw
+    // UUIDs — not @ManyToOne — to keep this schema-only phase free of any
+    // association traversal surface (no accidental N+1 / LazyInit on existing
+    // user read paths) and consistent with the existing raw-UUID salonId
+    // reference. Read/write semantics are owned by Phases 10.4/10.6.
+    @Column(name = "city_id")
+    private UUID cityId;
+
+    @Column(name = "district_id")
+    private UUID districtId;
+
+    // Light, unvalidated structured address (M1) — separate street / building /
+    // landmark fields, no geocoding now. Lengths mirror V54 exactly so
+    // ddl-auto=validate catches drift.
+    @Column(name = "street", length = 255)
+    private String street;
+
+    @Column(name = "building_no", length = 50)
+    private String buildingNo;
+
+    @Column(name = "location_note", columnDefinition = "TEXT")
+    private String locationNote;
+
     @Column(name = "avatar_r2_key", length = 500)
     private String avatarR2Key;
 
@@ -274,6 +298,46 @@ public class User extends AuditableEntity {
 
     public void setRegion(String region) {
         this.region = region;
+    }
+
+    public UUID getCityId() {
+        return cityId;
+    }
+
+    public void setCityId(UUID cityId) {
+        this.cityId = cityId;
+    }
+
+    public UUID getDistrictId() {
+        return districtId;
+    }
+
+    public void setDistrictId(UUID districtId) {
+        this.districtId = districtId;
+    }
+
+    public String getStreet() {
+        return street;
+    }
+
+    public void setStreet(String street) {
+        this.street = street;
+    }
+
+    public String getBuildingNo() {
+        return buildingNo;
+    }
+
+    public void setBuildingNo(String buildingNo) {
+        this.buildingNo = buildingNo;
+    }
+
+    public String getLocationNote() {
+        return locationNote;
+    }
+
+    public void setLocationNote(String locationNote) {
+        this.locationNote = locationNote;
     }
 
     @JsonIgnore

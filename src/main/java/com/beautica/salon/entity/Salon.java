@@ -47,6 +47,30 @@ public class Salon extends AuditableEntity {
 
     private String address;
 
+    // ---- Phase 10.3 locality (raw UUID FK columns, NULLABLE) -------------
+    // FKs to the Phase 10.1 taxonomy (cities / city_districts). Modeled as raw
+    // UUIDs — not @ManyToOne — to avoid adding an association traversal surface
+    // on Salon (existing salon read paths must not N+1 / LazyInit on locality)
+    // and consistent with the User-side representation. Read/write semantics
+    // are owned by Phases 10.4/10.6. Legacy city/region/address stay (nullable).
+    @Column(name = "city_id")
+    private UUID cityId;
+
+    @Column(name = "district_id")
+    private UUID districtId;
+
+    // Light, unvalidated structured address (M1) — separate street / building /
+    // landmark fields, no geocoding now. Lengths mirror V54 exactly so
+    // ddl-auto=validate catches drift.
+    @Column(name = "street", length = 255)
+    private String street;
+
+    @Column(name = "building_no", length = 50)
+    private String buildingNo;
+
+    @Column(name = "location_note", columnDefinition = "TEXT")
+    private String locationNote;
+
     private String phone;
 
     @Column(name = "instagram_url")
