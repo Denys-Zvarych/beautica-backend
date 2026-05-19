@@ -20,8 +20,20 @@ import org.springframework.context.annotation.Profile;
  * a normal deploy is completely unaffected (true no-op). Only when
  * {@code validate()} throws {@link FlywayValidateException} does it run a
  * one-shot {@code flyway.repair()} to realign
- * {@code flyway_schema_history.checksum} with the current script content,
- * re-validate, then migrate.
+ * {@code flyway_schema_history.checksum} with the current script content, then
+ * hand off to {@code migrate()}.
+ *
+ * <p>The catch block deliberately does <em>not</em> re-validate after
+ * {@code repair()}. {@code validate()} also throws for a legitimately
+ * <em>pending</em> migration ("Detected resolved migration not applied to
+ * database"), which {@code repair()} cannot resolve (it never runs migration
+ * bodies). A second {@code validate()} inside the catch block would re-throw
+ * that same exception and escape, making {@code migrate()} unreachable and
+ * crash-looping production on every deploy that ships a new migration. Instead,
+ * {@code migrate()} is the single, always-reached terminal step for both the
+ * healthy path and the recovered path: it applies any legitimately pending
+ * migrations and re-runs Flyway's own {@code validateOnMigrate}, which still
+ * fails fast on a genuinely unrecoverable history.
  *
  * <p>{@code flyway.repair()} does NOT re-run migration bodies — it only
  * rewrites the history-row checksums for already-applied migrations, so it is
@@ -44,14 +56,13 @@ class FlywayRepairConfig {
             try {
                 flyway.validate();
             } catch (FlywayValidateException e) {
-                log.warn("FLYWAY VALIDATE FAILED ({}). Running one-shot flyway.repair() "
-                        + "to realign flyway_schema_history checksums for already-applied "
-                        + "migrations, then re-validating. repair() does NOT re-run "
-                        + "migration bodies — safe only for checksum drift, never for "
-                        + "schema changes.", e.getMessage());
+                log.warn("FLYWAY VALIDATE FAILED ({}). Running one-shot flyway.repair() to realign "
+                        + "flyway_schema_history checksums for already-applied migrations whose script "
+                        + "content drifted, then proceeding to migrate(). repair() does NOT re-run migration "
+                        + "bodies; migrate() applies legitimately pending migrations and re-runs Flyway's own "
+                        + "validateOnMigrate.", e.getMessage());
                 flyway.repair();
-                flyway.validate();
-                log.warn("FLYWAY REPAIR COMPLETE: checksums realigned and re-validated.");
+                log.warn("FLYWAY REPAIR COMPLETE: history realigned; handing off to migrate().");
             }
             flyway.migrate();
         };
