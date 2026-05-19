@@ -451,6 +451,172 @@ class UserControllerIT extends AbstractIntegrationTest {
                 .isEqualTo("Lesi Ukrainky");
     }
 
+    // ── Phase 10.7 — write-path security properties (AC 2/3) ─────────────────
+
+    @Test
+    @DisplayName("PATCH /me (CLIENT) — provider-only fields supplied are silently dropped, never persisted (AC 2)")
+    void should_dropProviderOnlyFields_when_clientSuppliesThem() throws Exception {
+        log.debug("Arrange: register a CLIENT and resolve a real seeded city id");
+        String accessToken = registerAndGetToken(
+                "client-provfields@beautica.com", "password123", "Kli", "Ent", null);
+        UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
+
+        // A CLIENT explicitly supplies the provider-only structured address.
+        // The per-role write routing must NOT persist street/buildingNo/
+        // locationNote for a CLIENT (they are a physical-address concept that
+        // only providers own); only the discovery-default city_id is kept.
+        var patchRequest = new UpdateProfileRequest(null, null, null,
+                cityId, null, "Provider Street", "42", "Hidden entrance");
+
+        log.debug("Act: PATCH /api/v1/users/me as CLIENT supplying provider-only address fields");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(accessToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("CLIENT save must still succeed — extra fields are dropped, not an error")
+                .isEqualTo(HttpStatus.OK);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().cityId()).isEqualTo(cityId);
+        assertThat(apiResponse.data().street())
+                .as("CLIENT must NOT be able to write the provider-only street field")
+                .isNull();
+        assertThat(apiResponse.data().buildingNo())
+                .as("CLIENT must NOT be able to write the provider-only building_no field")
+                .isNull();
+        assertThat(apiResponse.data().locationNote())
+                .as("CLIENT must NOT be able to write the provider-only location_note field")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("PATCH /me (SALON_MASTER) — has no personal-locality write path; locality fields ignored (AC 2)")
+    void should_notWritePersonalLocality_when_salonMasterPatchesProfile() throws Exception {
+        log.debug("Arrange: seed + log in a SALON_MASTER; resolve a real seeded city id");
+        String token = createUserWithRoleAndGetToken("sm-noloc@beautica.com", "SALON_MASTER");
+        UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
+
+        var patchRequest = new UpdateProfileRequest("Sal", "Master", null,
+                cityId, null, "Some St", "1", "note");
+
+        log.debug("Act: PATCH /api/v1/users/me as SALON_MASTER supplying locality — must be ignored, not persisted");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("SALON_MASTER profile save succeeds but writes no personal locality")
+                .isEqualTo(HttpStatus.OK);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().firstName()).isEqualTo("Sal");
+        assertThat(apiResponse.data().cityId())
+                .as("SALON_MASTER has NO personal-locality write path — city_id stays null")
+                .isNull();
+        assertThat(apiResponse.data().street())
+                .as("SALON_MASTER has NO personal-locality write path — street stays null")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("PATCH /me (SALON_ADMIN) — has no personal-locality write path; locality fields ignored (AC 2)")
+    void should_notWritePersonalLocality_when_salonAdminPatchesProfile() throws Exception {
+        log.debug("Arrange: seed + log in a SALON_ADMIN; resolve a real seeded city id");
+        String token = createUserWithRoleAndGetToken("sa-noloc@beautica.com", "SALON_ADMIN");
+        UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
+
+        var patchRequest = new UpdateProfileRequest("Adm", "In", null,
+                cityId, null, "Admin St", "2", "note");
+
+        log.debug("Act: PATCH /api/v1/users/me as SALON_ADMIN supplying locality — must be ignored");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("SALON_ADMIN profile save succeeds but writes no personal locality")
+                .isEqualTo(HttpStatus.OK);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().cityId())
+                .as("SALON_ADMIN has NO personal-locality write path — city_id stays null")
+                .isNull();
+        assertThat(apiResponse.data().street())
+                .as("SALON_ADMIN has NO personal-locality write path — street stays null")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 400 when street exceeds 255 chars (length bound enforced at the boundary, AC 3)")
+    void should_return400_when_streetExceedsLengthBound() throws Exception {
+        log.debug("Arrange: seed + log in an INDEPENDENT_MASTER");
+        String token = createUserWithRoleAndGetToken("im-longstreet@beautica.com", "INDEPENDENT_MASTER");
+
+        String tooLongStreet = "S".repeat(256);
+        var patchRequest = new UpdateProfileRequest(null, null, null,
+                null, null, tooLongStreet, null, null);
+
+        log.debug("Act: PATCH /api/v1/users/me with a 256-char street — must be a clean 400, not a 500");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("street over the 255 @Size/@Column bound must be rejected at the boundary (AC 3)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 400 when buildingNo exceeds 50 chars (length bound enforced, AC 3)")
+    void should_return400_when_buildingNoExceedsLengthBound() throws Exception {
+        log.debug("Arrange: seed + log in an INDEPENDENT_MASTER");
+        String token = createUserWithRoleAndGetToken("im-longbno@beautica.com", "INDEPENDENT_MASTER");
+
+        String tooLongBuildingNo = "9".repeat(51);
+        var patchRequest = new UpdateProfileRequest(null, null, null,
+                null, null, null, tooLongBuildingNo, null);
+
+        log.debug("Act: PATCH /api/v1/users/me with a 51-char buildingNo — must be a clean 400");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("buildingNo over the 50 @Size/@Column bound must be rejected (AC 3)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 400 when locationNote exceeds 1000 chars (length bound enforced, AC 3)")
+    void should_return400_when_locationNoteExceedsLengthBound() throws Exception {
+        log.debug("Arrange: seed + log in an INDEPENDENT_MASTER");
+        String token = createUserWithRoleAndGetToken("im-longnote@beautica.com", "INDEPENDENT_MASTER");
+
+        String tooLongNote = "N".repeat(1001);
+        var patchRequest = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, tooLongNote);
+
+        log.debug("Act: PATCH /api/v1/users/me with a 1001-char locationNote — must be a clean 400");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(token)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("locationNote over the 1000 @Size bound must be rejected (AC 3 — TEXT column, "
+                        + "so the DTO @Size is the only enforced bound)")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /** Resolves a seeded city id by its stable KATOTTH business key. */
@@ -477,11 +643,22 @@ class UserControllerIT extends AbstractIntegrationTest {
      * the production {@link PasswordEncoder} (§M: no fake hashes).
      */
     private String createIndependentMasterAndGetToken(String email) throws Exception {
+        return createUserWithRoleAndGetToken(email, "INDEPENDENT_MASTER");
+    }
+
+    /**
+     * Seeds an email-verified user with the given role directly (roles other
+     * than CLIENT / SALON_OWNER cannot self-register) and returns a fresh
+     * access token via login. Real BCrypt via the production
+     * {@link PasswordEncoder} (§M: no fake hashes). {@code role} is a fixed
+     * enum constant supplied by the test, never user input — safe to inline.
+     */
+    private String createUserWithRoleAndGetToken(String email, String role) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', true, true)",
-                UUID.randomUUID(), email, hash);
+                        + "VALUES (?, ?, ?, ?, true, true)",
+                UUID.randomUUID(), email, hash, role);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);

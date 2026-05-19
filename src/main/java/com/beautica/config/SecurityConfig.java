@@ -74,6 +74,29 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
+                    // Phase 10.4 KATOTTH locality reference reads — DELIBERATE
+                    // public allow-list (not incidental). These three GETs
+                    // expose only non-sensitive reference data (oblast/city/
+                    // district name_uk/name_en + stable KATOTTH codes + a
+                    // boolean hasDistricts) — no provider counts, no PII, no
+                    // owner UUIDs — and back the unauthenticated mobile
+                    // cascading picker, exactly like /service-categories and
+                    // /service-types above. GET-only and path-scoped: writes
+                    // are Flyway-only (no controller mutation surface).
+                    //
+                    // Rate-limit posture (Phase 10.7 Step 1 decision): NOT
+                    // added to the Bucket4j per-IP throttle (AuthRateLimitFilter,
+                    // scoped to /auth/*, /devices/token, /media/*, /slots).
+                    // Rationale: the taxonomy is a tiny, fully static dataset
+                    // (V53 seed) served by LocationQueryService behind a
+                    // long-lived @Cacheable with NO write/eviction path — after
+                    // a single cold miss per JVM every response is cache-served
+                    // with zero DB cost, so the uncached-miss surface is bounded
+                    // by deploy frequency, not request volume. This matches the
+                    // existing un-throttled public reference reads
+                    // (/service-categories, /service-types); a dedicated bucket
+                    // would be wasted state. Revisit only if Part B adds a
+                    // dynamic/parameterised locality query.
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts/{oblastId}/cities").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/cities/{cityId}/districts").permitAll();

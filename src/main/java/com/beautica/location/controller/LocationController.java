@@ -28,6 +28,18 @@ import java.util.UUID;
  * Caching and the no-N+1 {@code hasDistricts} computation live in
  * {@link LocationQueryService}. Endpoints are auto-discovered by SpringDoc
  * (the mobile Dio client is generated from the resulting spec later).
+ *
+ * <p><b>Phase 10.7 — rate-limit posture (decision, not a TODO):</b> these
+ * GETs are intentionally NOT added to the Bucket4j per-IP throttle
+ * ({@code AuthRateLimitFilter}, scoped to {@code /auth/*} and a few mutating
+ * paths). The KATOTTH taxonomy is a tiny, fully static dataset (V53 seed)
+ * served by {@link LocationQueryService} behind a long-lived
+ * {@code @Cacheable} with no write/eviction path: after one cold miss per
+ * JVM the uncached-miss surface is bounded by deploy frequency, not request
+ * volume, so a dedicated bucket would be wasted state. This is consistent
+ * with the sibling un-throttled public reference reads
+ * ({@code /service-categories}, {@code /service-types}). The full rationale
+ * and the explicit security-config allow-list live in {@code SecurityConfig}.
  */
 @RestController
 @RequestMapping("/api/v1")
