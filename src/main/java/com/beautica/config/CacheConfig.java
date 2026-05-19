@@ -33,6 +33,9 @@ public class CacheConfig {
      *   reviews-by-master   — paginated review list per master, public endpoint — 5 min TTL, max 1000 entries
      *   review-detail       — single review by ID, public endpoint — 10 min TTL, max 2000 entries (immutable; no evict path)
      *   revenue-dashboard   — revenue summary per actor (master or salon owner) — 5 min TTL, max 500 entries
+     *   locationOblasts        — full serviced-oblast list (single entry) — 24 h TTL, max 4 entries
+     *   locationCitiesByOblast — cities (+hasDistricts) per oblast — 24 h TTL, max 50 entries
+     *   locationDistrictsByCity— urban districts per city — 24 h TTL, max 200 entries
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -130,6 +133,27 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
+                        .build());
+        // Phase 10.4 — KATOTTH locality taxonomy (~370 static reference rows, written
+        // only by Flyway seed migrations). Long 24-hour TTL with NO @CacheEvict path:
+        // the data cannot change at runtime, so the only invalidation is JVM restart
+        // (a redeploy — also the only time the seed can change). This is the documented
+        // exception to the "every @Cacheable needs a @CacheEvict" rule: there is no
+        // write path to evict against and the locality repositories expose no mutations.
+        manager.registerCustomCache("locationOblasts",
+                Caffeine.newBuilder()
+                        .maximumSize(4)
+                        .expireAfterWrite(24, TimeUnit.HOURS)
+                        .build());
+        manager.registerCustomCache("locationCitiesByOblast",
+                Caffeine.newBuilder()
+                        .maximumSize(50)
+                        .expireAfterWrite(24, TimeUnit.HOURS)
+                        .build());
+        manager.registerCustomCache("locationDistrictsByCity",
+                Caffeine.newBuilder()
+                        .maximumSize(200)
+                        .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
         return manager;
     }

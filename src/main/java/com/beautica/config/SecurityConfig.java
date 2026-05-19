@@ -74,6 +74,9 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts/{oblastId}/cities").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/cities/{cityId}/districts").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/search/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
