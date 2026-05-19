@@ -34,10 +34,15 @@ public interface CityDistrictRepository extends JpaRepository<CityDistrict, UUID
     /**
      * Checks whether the given city has any urban districts defined.
      *
-     * <p>Used by the <em>single-city write-validation</em> rule in Phase 10.6:
-     * if a city has urban districts, a booking/salon address must specify a
-     * district; if it does not, the city itself is the locality leaf and no
-     * district is required.
+     * <p><strong>Retained, not the write path (Phase 10.6 perf fix):</strong>
+     * the {@code LocalityWriteValidator} no longer calls this per save — the
+     * three former existence round-trips were fused and cached behind
+     * {@link CityRepository#resolveTaxonomyFacts}
+     * /{@code LocalityTaxonomyLookup}. This single-key predicate is kept
+     * deliberately (§E "document the non-graph variant inline"): it pins the
+     * "picker path never does a per-row {@code existsByCityId} loop"
+     * regression guard in {@code LocationQueryServiceTest} and remains a
+     * correct, index-served leaf check should a future caller need it.
      *
      * <p>Backed by {@code idx_city_districts_city_id}; the index seek returns
      * immediately on the first matching row.

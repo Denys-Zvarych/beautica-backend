@@ -1,8 +1,7 @@
 package com.beautica.location;
 
 import com.beautica.common.exception.BusinessException;
-import com.beautica.location.repository.CityDistrictRepository;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.LocalityTaxonomyLookup.LocalityFacts;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
@@ -38,6 +37,14 @@ import java.util.UUID;
  * persist a {@code null} {@code district_id}, and {@code city_id} is promoted
  * to "required going forward for providers" without any data-altering
  * migration (Phase 10.3 throwaway-cleanup note).
+ *
+ * <p><strong>Perf (Phase 10.6 fix):</strong> the three former sequential
+ * existence round-trips ({@code existsById}, {@code existsByCityId},
+ * {@code existsByIdAndCityId}) are fused and cached behind
+ * {@link LocalityTaxonomyLookup}: a save now issues <strong>≤1</strong>
+ * taxonomy query (cold) and <strong>0</strong> when warm-cached. The
+ * branching/exception semantics below are unchanged — only the data-access
+ * shape moved.
  */
 @Component
 @RequiredArgsConstructor
@@ -56,8 +63,7 @@ public class LocalityWriteValidator {
     private static final String DISTRICT_WITHOUT_CITY =
             "District cannot be set without a city";
 
-    private final CityRepository cityRepository;
-    private final CityDistrictRepository cityDistrictRepository;
+    private final LocalityTaxonomyLookup taxonomyLookup;
 
     /**
      * Validates the locality of a discoverable provider (salon or
@@ -82,18 +88,18 @@ public class LocalityWriteValidator {
         if (cityId == null) {
             throw new BusinessException(CITY_REQUIRED);
         }
-        if (!cityRepository.existsById(cityId)) {
+        UUID districtId = input.districtId();
+        LocalityFacts facts = taxonomyLookup.resolve(cityId, districtId);
+
+        if (!facts.cityExists()) {
             throw new BusinessException(CITY_UNKNOWN);
         }
 
-        boolean cityHasDistricts = cityDistrictRepository.existsByCityId(cityId);
-        UUID districtId = input.districtId();
-
-        if (cityHasDistricts) {
+        if (facts.cityHasDistricts()) {
             if (districtId == null) {
                 throw new BusinessException(DISTRICT_REQUIRED);
             }
-            requireDistrictBelongsToCity(districtId, cityId);
+            requireDistrictBelongsToCity(facts);
         } else if (districtId != null) {
             throw new BusinessException(DISTRICT_NOT_ALLOWED);
         }
@@ -122,16 +128,17 @@ public class LocalityWriteValidator {
             }
             return;
         }
-        if (!cityRepository.existsById(cityId)) {
+        LocalityFacts facts = taxonomyLookup.resolve(cityId, districtId);
+        if (!facts.cityExists()) {
             throw new BusinessException(CITY_UNKNOWN);
         }
         if (districtId != null) {
-            requireDistrictBelongsToCity(districtId, cityId);
+            requireDistrictBelongsToCity(facts);
         }
     }
 
-    private void requireDistrictBelongsToCity(UUID districtId, UUID cityId) {
-        if (!cityDistrictRepository.existsByIdAndCityId(districtId, cityId)) {
+    private void requireDistrictBelongsToCity(LocalityFacts facts) {
+        if (!facts.districtBelongsToCity()) {
             throw new BusinessException(DISTRICT_NOT_IN_CITY);
         }
     }

@@ -29,6 +29,15 @@ import java.util.UUID;
  * matching eviction is required), and the locality repositories expose no
  * mutation methods.
  *
+ * <p>All three reads are {@code @Cacheable(sync = true)}: these back the
+ * unauthenticated cascading-picker endpoint, so on a cold start (or once the
+ * 24-hour TTL lapses) a popular key — e.g. the single {@code listOblasts}
+ * entry, or Kyiv's districts — would otherwise let every concurrent request
+ * run the same DB query simultaneously. {@code sync = true} collapses that
+ * per-key stampede to a single loader (§F.7 — the matching gap to the
+ * {@code search:*} caches, which already use {@code sync = true}). It changes
+ * no result, only loader concurrency.
+ *
  * <p><strong>No N+1 (§E):</strong> {@code listCitiesByOblast} computes
  * {@code hasDistricts} from a single set-based query
  * ({@code findCityIdsWithDistrictsByOblastId}) plus in-memory
@@ -57,7 +66,7 @@ public class LocationQueryService {
      * already excluded at the data layer (V53), so this naturally returns only
      * serviced oblasts — no territory logic lives here.
      */
-    @Cacheable(CACHE_OBLASTS)
+    @Cacheable(value = CACHE_OBLASTS, sync = true)
     @Transactional(readOnly = true)
     public List<OblastResponse> listOblasts() {
         return oblastRepository.findAllByOrderByNameUkAsc().stream()
@@ -72,7 +81,7 @@ public class LocationQueryService {
      * <p>Exactly two queries regardless of city count: the ordered city list
      * and the distinct set of city ids that have urban districts.
      */
-    @Cacheable(value = CACHE_CITIES_BY_OBLAST, key = "#oblastId")
+    @Cacheable(value = CACHE_CITIES_BY_OBLAST, key = "#oblastId", sync = true)
     @Transactional(readOnly = true)
     public List<CityResponse> listCitiesByOblast(UUID oblastId) {
         Set<UUID> cityIdsWithDistricts =
@@ -90,7 +99,7 @@ public class LocationQueryService {
      * Urban districts in the given city, ordered by Ukrainian name. Cities
      * without urban districts return an empty list.
      */
-    @Cacheable(value = CACHE_DISTRICTS_BY_CITY, key = "#cityId")
+    @Cacheable(value = CACHE_DISTRICTS_BY_CITY, key = "#cityId", sync = true)
     @Transactional(readOnly = true)
     public List<CityDistrictResponse> listDistrictsByCity(UUID cityId) {
         return cityDistrictRepository.findByCityIdOrderByNameUkAsc(cityId).stream()

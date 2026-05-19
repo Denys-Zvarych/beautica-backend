@@ -39,11 +39,20 @@ public record UpdateSalonRequest(
         @Size(max = 500) String address,
 
         // ---- Phase 10.6 taxonomy locality + light structured address -------
+        // Control-char @Pattern alongside @Size (MasterSearchRequest.q
+        // precedent): @Size caps length only — an embedded NUL/newline would
+        // otherwise reach the DB and yield a 500 instead of a clean 400 (§A).
         UUID cityId,
         UUID districtId,
-        @Size(max = 255) String street,
-        @Size(max = 50) String buildingNo,
-        @Size(max = 1000) String locationNote,
+        @Size(max = 255)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String street,
+        @Size(max = 50)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String buildingNo,
+        @Size(max = 1000)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String locationNote,
 
         @Pattern(regexp = "^[+\\d\\s\\-()/]*$", message = "Invalid phone format")
         @Size(max = 20) String phone,

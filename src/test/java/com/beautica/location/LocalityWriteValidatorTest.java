@@ -1,8 +1,7 @@
 package com.beautica.location;
 
 import com.beautica.common.exception.BusinessException;
-import com.beautica.location.repository.CityDistrictRepository;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.LocalityTaxonomyLookup.LocalityFacts;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -23,18 +22,24 @@ import static org.mockito.Mockito.when;
 /**
  * Unit coverage for the Phase 10.6 most-specific-node write rule and the
  * per-role locality model. Pure JUnit 5 + Mockito (§M: a slice/unit test is
- * the right tool — the rule is logic over two existence predicates, no HTTP
+ * the right tool — the rule is logic over the resolved taxonomy facts, no HTTP
  * or DB needed).
+ *
+ * <p>Phase 10.6 perf fix: the validator no longer calls the city/district
+ * repositories directly — it consumes a single cached {@link LocalityFacts}
+ * resolution from {@link LocalityTaxonomyLookup}. These tests therefore stub
+ * the lookup, but every assertion on the {@link BusinessException}
+ * type/message and the branch condition that triggers it is unchanged from
+ * the pre-fix suite (the semantics are byte-identical; only the collaborator
+ * moved). The "no taxonomy query when short-circuited" expectation is
+ * preserved as {@code verify(taxonomyLookup, never()).resolve(...)}.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("LocalityWriteValidator — unit")
 class LocalityWriteValidatorTest {
 
     @Mock
-    private CityRepository cityRepository;
-
-    @Mock
-    private CityDistrictRepository cityDistrictRepository;
+    private LocalityTaxonomyLookup taxonomyLookup;
 
     @InjectMocks
     private LocalityWriteValidator validator;
@@ -48,14 +53,15 @@ class LocalityWriteValidatorTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("City is required");
 
-        verify(cityRepository, never()).existsById(any(UUID.class));
+        verify(taxonomyLookup, never()).resolve(any(), any());
     }
 
     @Test
     @DisplayName("provider — rejects when city_id does not exist")
     void should_rejectProvider_when_cityUnknown() {
         UUID cityId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(false);
+        when(taxonomyLookup.resolve(cityId, null))
+                .thenReturn(new LocalityFacts(false, false, false));
 
         assertThatThrownBy(() -> validator.validateProviderLocality(LocalityWriteInput.of(cityId, null)))
                 .isInstanceOf(BusinessException.class)
@@ -68,8 +74,8 @@ class LocalityWriteValidatorTest {
     @DisplayName("provider — rejects when city has districts but district_id is absent (AC 2)")
     void should_rejectProvider_when_districtRequiredButMissing() {
         UUID cityId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByCityId(cityId)).thenReturn(true);
+        when(taxonomyLookup.resolve(cityId, null))
+                .thenReturn(new LocalityFacts(true, true, false));
 
         assertThatThrownBy(() -> validator.validateProviderLocality(LocalityWriteInput.of(cityId, null)))
                 .isInstanceOf(BusinessException.class)
@@ -80,8 +86,8 @@ class LocalityWriteValidatorTest {
     @DisplayName("provider — succeeds when city has no districts and district_id is null (AC 2)")
     void should_acceptProvider_when_cityHasNoDistricts() {
         UUID cityId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByCityId(cityId)).thenReturn(false);
+        when(taxonomyLookup.resolve(cityId, null))
+                .thenReturn(new LocalityFacts(true, false, false));
 
         assertThatCode(() -> validator.validateProviderLocality(LocalityWriteInput.of(cityId, null)))
                 .doesNotThrowAnyException();
@@ -92,8 +98,8 @@ class LocalityWriteValidatorTest {
     void should_rejectProvider_when_districtSuppliedButCityHasNone() {
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByCityId(cityId)).thenReturn(false);
+        when(taxonomyLookup.resolve(cityId, districtId))
+                .thenReturn(new LocalityFacts(true, false, false));
 
         assertThatThrownBy(() -> validator.validateProviderLocality(LocalityWriteInput.of(cityId, districtId)))
                 .isInstanceOf(BusinessException.class)
@@ -105,9 +111,8 @@ class LocalityWriteValidatorTest {
     void should_rejectProvider_when_districtNotChildOfCity() {
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByCityId(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByIdAndCityId(districtId, cityId)).thenReturn(false);
+        when(taxonomyLookup.resolve(cityId, districtId))
+                .thenReturn(new LocalityFacts(true, true, false));
 
         assertThatThrownBy(() -> validator.validateProviderLocality(LocalityWriteInput.of(cityId, districtId)))
                 .isInstanceOf(BusinessException.class)
@@ -119,9 +124,8 @@ class LocalityWriteValidatorTest {
     void should_acceptProvider_when_districtIsChildOfCity() {
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByCityId(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByIdAndCityId(districtId, cityId)).thenReturn(true);
+        when(taxonomyLookup.resolve(cityId, districtId))
+                .thenReturn(new LocalityFacts(true, true, true));
 
         assertThatCode(() -> validator.validateProviderLocality(LocalityWriteInput.of(cityId, districtId)))
                 .doesNotThrowAnyException();
@@ -135,7 +139,7 @@ class LocalityWriteValidatorTest {
         assertThatCode(() -> validator.validateClientLocality(LocalityWriteInput.of(null, null)))
                 .doesNotThrowAnyException();
 
-        verify(cityRepository, never()).existsById(any(UUID.class));
+        verify(taxonomyLookup, never()).resolve(any(), any());
     }
 
     @Test
@@ -146,26 +150,29 @@ class LocalityWriteValidatorTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("District cannot be set without a city");
 
-        verify(cityRepository, never()).existsById(any(UUID.class));
+        verify(taxonomyLookup, never()).resolve(any(), any());
     }
 
     @Test
     @DisplayName("client — accepts a valid city alone (district not required for the discovery default)")
     void should_acceptClient_when_cityOnly() {
         UUID cityId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(true);
+        // A city that HAS districts: the client path must still accept a
+        // city-only locality (it intentionally ignores cityHasDistricts —
+        // the discovery default never requires a district).
+        when(taxonomyLookup.resolve(cityId, null))
+                .thenReturn(new LocalityFacts(true, true, false));
 
         assertThatCode(() -> validator.validateClientLocality(LocalityWriteInput.of(cityId, null)))
                 .doesNotThrowAnyException();
-
-        verify(cityDistrictRepository, never()).existsByCityId(any(UUID.class));
     }
 
     @Test
     @DisplayName("client — rejects an unknown city when one is supplied")
     void should_rejectClient_when_cityUnknown() {
         UUID cityId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(false);
+        when(taxonomyLookup.resolve(cityId, null))
+                .thenReturn(new LocalityFacts(false, false, false));
 
         assertThatThrownBy(() -> validator.validateClientLocality(LocalityWriteInput.of(cityId, null)))
                 .isInstanceOf(BusinessException.class)
@@ -177,8 +184,8 @@ class LocalityWriteValidatorTest {
     void should_rejectClient_when_districtNotChildOfCity() {
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
-        when(cityRepository.existsById(cityId)).thenReturn(true);
-        when(cityDistrictRepository.existsByIdAndCityId(districtId, cityId)).thenReturn(false);
+        when(taxonomyLookup.resolve(cityId, districtId))
+                .thenReturn(new LocalityFacts(true, true, false));
 
         assertThatThrownBy(() -> validator.validateClientLocality(LocalityWriteInput.of(cityId, districtId)))
                 .isInstanceOf(BusinessException.class)
