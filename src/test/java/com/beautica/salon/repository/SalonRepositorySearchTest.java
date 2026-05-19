@@ -20,17 +20,19 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Repository-layer slice tests for {@link SalonRepository#findByFilter}.
+ * Repository-layer slice tests for {@link SalonRepository#findByLocation}
+ * (Phase 10.5 — FK-based, district-primary salon location filter).
  *
  * <p>Uses {@link AbstractDataJpaTest} for the JVM-singleton PostgreSQL
- * Testcontainers instance (no per-class container spin-up). Persists three
- * salons across two cities and verifies the JPQL query honours optional
- * city/region filters and pagination metadata.
+ * Testcontainers instance. Flyway runs in the slice context, so the V53
+ * KATOTTH taxonomy is present — real {@code cities} ids are resolved by
+ * Ukrainian name and stamped onto {@code salons.city_id} (the legacy
+ * free-text {@code city}/{@code region} columns and the old
+ * {@code findByFilter} string-equality query are gone in Phase 10.5).
  *
- * <p>Tests are transactional via {@code @DataJpaTest}'s default rollback —
- * no manual cleanup required.
+ * <p>Tests are transactional via {@code @DataJpaTest}'s default rollback.
  */
-@DisplayName("SalonRepository.findByFilter — search slice")
+@DisplayName("SalonRepository.findByLocation — FK search slice")
 class SalonRepositorySearchTest extends AbstractDataJpaTest {
 
     @Autowired
@@ -40,6 +42,8 @@ class SalonRepositorySearchTest extends AbstractDataJpaTest {
     private TestEntityManager em;
 
     private User owner;
+    private UUID kyivCityId;
+    private UUID lvivCityId;
 
     @BeforeEach
     void seedOwner() {
@@ -52,56 +56,70 @@ class SalonRepositorySearchTest extends AbstractDataJpaTest {
                 "+380501112233"
         );
         em.persist(owner);
+
+        kyivCityId = cityIdByName("Київ");
+        lvivCityId = cityIdByName("Львів");
     }
 
-    private Salon salonIn(String city, String region, String name) {
-        return salonIn(city, region, name, true);
+    /**
+     * Resolves a Flyway-seeded {@code cities.id} by canonical Ukrainian name
+     * (V53). Reference data — present in the slice context, never rolled back.
+     */
+    private UUID cityIdByName(String nameUk) {
+        return (UUID) em.getEntityManager()
+                .createNativeQuery(
+                        "SELECT id FROM cities WHERE name_uk = :n ORDER BY katotth_code LIMIT 1")
+                .setParameter("n", nameUk)
+                .getSingleResult();
     }
 
-    private Salon salonIn(String city, String region, String name, boolean isActive) {
+    private Salon salonIn(UUID cityId, String name) {
+        return salonIn(cityId, name, true);
+    }
+
+    private Salon salonIn(UUID cityId, String name, boolean isActive) {
         return Salon.builder()
                 .owner(owner)
                 .name(name)
-                .city(city)
-                .region(region)
+                .cityId(cityId)
                 .isActive(isActive)
                 .build();
     }
 
     @Test
-    @DisplayName("returns only salons in the target city when a city filter is applied")
+    @DisplayName("returns only salons in the target city when a cityId filter is applied")
     void should_returnOnlySalonsInCity_when_cityFilterApplied() {
-        em.persist(salonIn("Київ", "Kyivska", "Kyiv Salon One"));
-        em.persist(salonIn("Київ", "Kyivska", "Kyiv Salon Two"));
-        em.persist(salonIn("Львів", "Lvivska", "Lviv Salon"));
+        em.persist(salonIn(kyivCityId, "Kyiv Salon One"));
+        em.persist(salonIn(kyivCityId, "Kyiv Salon Two"));
+        em.persist(salonIn(lvivCityId, "Lviv Salon"));
         em.flush();
         em.clear();
 
-        Page<Salon> page = salonRepository.findByFilter(
-                "Київ",
+        Page<Salon> page = salonRepository.findByLocation(
+                kyivCityId,
                 null,
                 PageRequest.of(0, 20, Sort.by("name"))
         );
 
         assertThat(page.getTotalElements()).isEqualTo(2);
         assertThat(page.getContent())
-                .extracting(Salon::getCity)
-                .containsOnly("Київ");
+                .extracting(Salon::getCityId)
+                .containsOnly(kyivCityId);
         assertThat(page.getContent())
                 .extracting(Salon::getName)
                 .containsExactlyInAnyOrder("Kyiv Salon One", "Kyiv Salon Two");
     }
 
     @Test
-    @DisplayName("returns every salon when neither city nor region is supplied")
-    void should_returnAllSalons_when_noCityFilter() {
-        em.persist(salonIn("Київ", "Kyivska", "Kyiv Salon One"));
-        em.persist(salonIn("Київ", "Kyivska", "Kyiv Salon Two"));
-        em.persist(salonIn("Львів", "Lvivska", "Lviv Salon"));
+    @DisplayName("returns every salon when no location filter is supplied")
+    void should_returnAllSalons_when_noLocationFilter() {
+        em.persist(salonIn(kyivCityId, "Kyiv Salon One"));
+        em.persist(salonIn(kyivCityId, "Kyiv Salon Two"));
+        em.persist(salonIn(lvivCityId, "Lviv Salon"));
         em.flush();
         em.clear();
 
-        Page<Salon> page = salonRepository.findByFilter(
+        Page<Salon> page = salonRepository.findByLocation(
                 null,
                 null,
                 PageRequest.of(0, 20, Sort.by("name"))
@@ -114,15 +132,15 @@ class SalonRepositorySearchTest extends AbstractDataJpaTest {
     @Test
     @DisplayName("paginates correctly: pageSize 1 over 2 matches gives totalElements 2 and content size 1")
     void should_returnCorrectPage_when_pageSizeIsOne() {
-        em.persist(salonIn("Київ", "Kyivska", "Kyiv Salon One"));
-        em.persist(salonIn("Київ", "Kyivska", "Kyiv Salon Two"));
-        em.persist(salonIn("Львів", "Lvivska", "Lviv Salon"));
+        em.persist(salonIn(kyivCityId, "Kyiv Salon One"));
+        em.persist(salonIn(kyivCityId, "Kyiv Salon Two"));
+        em.persist(salonIn(lvivCityId, "Lviv Salon"));
         em.flush();
         em.clear();
 
         Pageable firstPageOfOne = PageRequest.of(0, 1, Sort.by("name"));
 
-        Page<Salon> page = salonRepository.findByFilter("Київ", null, firstPageOfOne);
+        Page<Salon> page = salonRepository.findByLocation(kyivCityId, null, firstPageOfOne);
 
         assertThat(page.getTotalElements()).isEqualTo(2);
         assertThat(page.getContent()).hasSize(1);
@@ -131,21 +149,21 @@ class SalonRepositorySearchTest extends AbstractDataJpaTest {
 
     /**
      * Public-facing salon discovery must not leak deactivated salons. Seeds one
-     * active salon plus one inactive salon (same city/region) and asserts the
-     * inactive row is filtered out by the {@code s.isActive = true} predicate
-     * added to {@link SalonRepository#findByFilter}.
+     * active plus one inactive salon (same city) and asserts the inactive row
+     * is filtered out by the {@code s.isActive = true} predicate in
+     * {@link SalonRepository#findByLocation}.
      */
     @Test
     @DisplayName("excludes deactivated salons from search results")
     void should_excludeSalon_when_isActiveFalse() {
-        Salon active = salonIn("Київ", "Kyivska", "Active Kyiv Salon", true);
-        Salon inactive = salonIn("Київ", "Kyivska", "Hidden Kyiv Salon", false);
+        Salon active = salonIn(kyivCityId, "Active Kyiv Salon", true);
+        Salon inactive = salonIn(kyivCityId, "Hidden Kyiv Salon", false);
         em.persist(active);
         em.persist(inactive);
         em.flush();
         em.clear();
 
-        Page<Salon> page = salonRepository.findByFilter(
+        Page<Salon> page = salonRepository.findByLocation(
                 null,
                 null,
                 PageRequest.of(0, 20, Sort.by("name"))

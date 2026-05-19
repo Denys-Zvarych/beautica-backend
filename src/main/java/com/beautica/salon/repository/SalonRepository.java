@@ -43,25 +43,40 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     Optional<Salon> findByIdAndIsActiveTrueWithOwner(@Param("id") UUID id);
 
     /**
-     * Filter salons by optional city/region for the public salon search endpoint.
+     * Filter active salons by the Phase 10.5 FK location filter
+     * (district-primary) for the public salon search endpoint.
      *
-     * <p>Uses {@code (:param IS NULL OR col = :param)} so a single query covers all
-     * four filter combinations (city only, region only, both, neither). Spring Data
-     * generates a {@code COUNT(*)} companion query automatically for the {@code Page}
-     * return type — no HAVING here so the default count query is correct.
+     * <p>Replaces the removed free-text {@code findByFilter} (exact
+     * string-equality on {@code city}/{@code region} — the Phase 10.5 bug).
+     * No non-graph/legacy variant is kept alongside (§E): the free-text form
+     * is deleted, not deprecated, because it produced silently wrong results
+     * ("Київ" ≠ "Киев").
      *
-     * <p>Backed by the composite index {@code idx_salons_city_region} added in V35;
-     * exact-match comparison on both columns preserves the leftmost-prefix index hit.
+     * <p>District-primary, read side: a supplied {@code districtId} wins;
+     * otherwise {@code cityId}; both {@code null} → no location filter (all
+     * active salons). {@code (:param IS NULL OR col = :param)} keeps a single
+     * query covering every combination; the {@code Page} return type makes
+     * Spring Data emit the matching {@code COUNT(*)} companion (no HAVING, so
+     * the default count is correct).
+     *
+     * <p>Backed by {@code idx_salons_district_id} / {@code idx_salons_city_id}
+     * (V54). A salon's discovery locality is its own {@code city_id} /
+     * {@code district_id} — there is no salon-to-salon link to resolve through
+     * (that resolution is the master-only {@code SALON_MASTER → salon} case).
+     *
+     * @param cityId     resolved discovery city id, or {@code null}
+     * @param districtId resolved discovery district id, or {@code null}
      */
     @Query("""
             SELECT s FROM Salon s
             WHERE s.isActive = true
-              AND (:city IS NULL OR s.city = :city)
-              AND (:region IS NULL OR s.region = :region)
+              AND (:districtId IS NOT NULL AND s.districtId = :districtId
+                   OR :districtId IS NULL
+                      AND (:cityId IS NULL OR s.cityId = :cityId))
             """)
-    Page<Salon> findByFilter(
-            @Param("city") String city,
-            @Param("region") String region,
+    Page<Salon> findByLocation(
+            @Param("cityId") UUID cityId,
+            @Param("districtId") UUID districtId,
             Pageable pageable
     );
 }

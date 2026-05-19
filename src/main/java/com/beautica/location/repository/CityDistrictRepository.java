@@ -5,6 +5,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -77,4 +78,22 @@ public interface CityDistrictRepository extends JpaRepository<CityDistrict, UUID
             WHERE d.city.oblast.id = :oblastId
             """)
     Set<UUID> findCityIdsWithDistrictsByOblastId(@Param("oblastId") UUID oblastId);
+
+    /**
+     * Batch-resolves urban-district {@code name_uk} labels for a set of
+     * district ids in a single {@code IN (...)} query.
+     *
+     * <p>Used by {@link com.beautica.location.DiscoveryLocationResolver} to
+     * stamp {@code districtLabel}s onto a whole page of search results at
+     * once. Set-based on purpose (§E): the caller collects the distinct
+     * district ids of the page and resolves them with <em>one</em> query —
+     * never per-row. The 2-element projection {@code [id, name_uk]} avoids
+     * hydrating the {@link CityDistrict} entity (and its LAZY {@code city}).
+     *
+     * @param ids distinct district ids appearing on the current result page
+     * @return rows of {@code [UUID id, String nameUk]}; empty when {@code ids}
+     *         is empty
+     */
+    @Query("SELECT d.id, d.nameUk FROM CityDistrict d WHERE d.id IN :ids")
+    List<Object[]> findNameUkByIdIn(@Param("ids") Collection<UUID> ids);
 }

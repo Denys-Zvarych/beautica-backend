@@ -40,7 +40,22 @@ import org.springframework.web.bind.annotation.RestController;
  * salon/owner UUIDs from masters and any internal flags. Each result record
  * already filters its public surface; do not add owner-identifying fields to
  * the response without re-auditing the public-PII policy in
- * {@code ARCHITECTURE-backend.md} §0.7.</p>
+ * {@code ARCHITECTURE-backend.md} §0.7. The Phase 10.5 locality labels are
+ * resolved {@code name_uk} strings only — the internal city/district UUIDs
+ * are NOT exposed (§I).</p>
+ *
+ * <p><b>BREAKING CHANGE (Phase 10.5, pre-launch):</b> the free-text
+ * {@code ?city=} / {@code ?region=} query params on <em>both</em> endpoints
+ * are <b>removed</b> and replaced by the structured, FK-based location filter
+ * {@code ?location.cityId=&lt;uuid&gt;} (+ optional
+ * {@code &location.districtId=&lt;uuid&gt;}). The old exact string-equality
+ * filter was a real bug ("Київ" ≠ "Киев" ≠ "kyiv"); this is a clean
+ * replacement, not a migration — there are no real clients yet. Result DTOs
+ * replace the free-text {@code city}/{@code region} fields with resolved
+ * {@code cityLabel}/{@code districtLabel}. Mobile-client adoption of the new
+ * contract is a separate later follow-up. See
+ * {@code docs/backend-phases/phase-10.5-search-rework.md} § "OpenAPI / change
+ * notes".</p>
  */
 @RestController
 @RequestMapping("/api/v1/search")
@@ -51,9 +66,12 @@ public class SearchController {
     private final SearchService searchService;
 
     /**
-     * Search active masters by optional location (city/region), service
-     * category, minimum rating, and effective price range. Sorted by rating
-     * descending.
+     * Search active masters by optional FK location filter
+     * ({@code location.cityId} / {@code location.districtId},
+     * district-primary), service category, minimum rating, and effective price
+     * range. Sorted by rating descending. {@code SALON_ADMIN} accounts are
+     * never returned; an employed {@code SALON_MASTER}'s locality resolves
+     * through its salon at query time.
      *
      * <p>Validation on the bound record is enforced by the class-level
      * {@link Validated} annotation; constraint violations surface as a 400
@@ -79,7 +97,9 @@ public class SearchController {
     }
 
     /**
-     * Search active salons by optional location (city/region).
+     * Search active salons by the optional FK location filter
+     * ({@code location.cityId} / {@code location.districtId},
+     * district-primary).
      *
      * <p>Mirrors the master endpoint's wiring — bound DTO, class-level
      * {@code @Validated} drives the constraints, identical {@code PageResponse}
@@ -92,7 +112,7 @@ public class SearchController {
         int pageNum = request.page() != null ? request.page() : 0;
         int pageSize = request.size() != null ? request.size() : 20;
         Pageable pageable = PageRequest.of(pageNum, pageSize);
-        Page<SalonSearchResult> result = searchService.searchSalons(request.city(), request.region(), pageable);
+        Page<SalonSearchResult> result = searchService.searchSalons(request, pageable);
         return ApiResponse.ok(PageResponse.of(
                 result.getContent(),
                 result.getNumber(),

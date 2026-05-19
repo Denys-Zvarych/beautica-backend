@@ -1,10 +1,15 @@
 package com.beautica.search.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.location.DiscoveryLocationKey;
+import com.beautica.location.DiscoveryLocationResolver;
+import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
+import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
@@ -20,9 +25,11 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -33,7 +40,41 @@ import java.util.UUID;
  * {@code master_services}) and applies an aggregate filter on
  * {@code MIN(COALESCE(price_override, base_price))}, which JPQL cannot express
  * cleanly while keeping the {@code GROUP BY} → {@code HAVING} pipeline visible.
- * Salon search is plain JPQL on {@link SalonRepository#findByFilter}.
+ * Salon search is plain JPQL on {@link SalonRepository#findByLocation}.
+ *
+ * <h3>Phase 10.5 — FK-based, district-primary location filter</h3>
+ * The earlier free-text {@code AND u.city = :city AND u.region = :region}
+ * filter was a real bug — exact string equality over un-normalised free text
+ * ("Київ" ≠ "Киев" ≠ "kyiv"). Location filtering is now an FK match on the
+ * Phase 10.3 {@code city_id} / {@code district_id} columns, district-primary
+ * (a supplied district wins; otherwise the city; a districted city without a
+ * district widens to city-level on the read side — write-side enforcement is
+ * Phase 10.6).
+ *
+ * <p><b>Discovery locality is obtained exclusively through the M2 seam</b>
+ * ({@link DiscoveryLocationResolver}). This service never reads
+ * {@code district_id} directly to <em>decide</em> the filter — it asks the
+ * resolver for a {@link DiscoveryLocationKey} and only then binds the chosen
+ * column. The SQL still references the FK columns to express the predicate,
+ * but which one (district vs city) and the resolved display labels both come
+ * from the seam, so Part B (geocoded point/radius) swaps the resolver impl
+ * with zero change here.</p>
+ *
+ * <p><b>Employed {@code SALON_MASTER} locality resolves via the salon link at
+ * query time:</b> a salon master's discovery locality is its salon's locality
+ * ({@code masters.salon_id → salons.city_id/district_id}); an
+ * {@code INDEPENDENT_MASTER} uses its own user-row locality. The query uses
+ * {@code COALESCE(sal.city_id, u.city_id)} /
+ * {@code COALESCE(sal.district_id, u.district_id)} — the salon address is
+ * never copied/denormalised onto the master row, and multi-salon
+ * (phases 2.11–2.14) is honoured because the join is evaluated per request.
+ * The {@code salons} LEFT JOIN is a single-row PK join (no fan-out), unlike
+ * the conditional {@code master_services} join.</p>
+ *
+ * <p><b>{@code SALON_ADMIN} exclusion:</b> the master query carries an
+ * explicit {@code AND u.role <> 'SALON_ADMIN'} predicate on the
+ * {@code masters m JOIN users u} join so an admin account can never surface in
+ * public master discovery, independent of any future data shape.</p>
  *
  * <h3>SQL is built dynamically per request</h3>
  * The native SQL is assembled by {@link #buildMasterSearchSql} at request time
@@ -41,40 +82,24 @@ import java.util.UUID;
  * placeholders. Two reasons:
  *
  * <ol>
- *   <li><b>Index pushdown</b>. The earlier {@code CAST(:city AS VARCHAR) IS NULL OR
- *       u.city = CAST(:city AS VARCHAR)} form (a workaround for Postgres'
- *       inability to infer null parameter types in OR predicates over native
- *       queries) defeats index pushdown — the planner cannot see that the
- *       parameter is actually constant within the query and emits a sequential
- *       scan. Dropping the parameter entirely when the value is null restores
- *       the planner's ability to use {@code idx_users_active_city_region}.</li>
- *   <li><b>JOIN avoidance</b>. The {@code master_services} / {@code service_definitions}
- *       LEFT JOINs are only useful when the caller filters by price or category.
- *       For the common "all masters in city X" query, building without those joins
- *       shaves a two-table fan-out from every row of the result set.</li>
+ *   <li><b>Index pushdown</b>. Dropping the parameter entirely when the value
+ *       is null (instead of a {@code CAST(:p AS ...) IS NULL OR ...} idiom)
+ *       restores the planner's ability to use the
+ *       {@code idx_users_district_id} / {@code idx_users_city_id} indexes
+ *       (V54).</li>
+ *   <li><b>JOIN avoidance</b>. The {@code master_services} /
+ *       {@code service_definitions} LEFT JOINs are only useful when the caller
+ *       filters by price or category. For the common "all masters in district
+ *       X" query, building without those joins shaves a two-table fan-out from
+ *       every row.</li>
  * </ol>
  *
  * <h3>Why pagination needs a HAVING-aware count</h3>
  * The price filter is applied in {@code HAVING}, not {@code WHERE}, because the
  * effective price is an aggregate. A naive {@code SELECT COUNT(DISTINCT m.id)}
- * without {@code HAVING} would over-count, producing phantom pages on the mobile
- * client (e.g. last page renders empty). The count query therefore wraps the
- * same {@code GROUP BY ... HAVING ...} in a subquery — but only when a price
- * filter is actually present. The no-price-filter case uses a flat
- * {@code COUNT(DISTINCT m.id)}, avoiding a useless wrapper.
- *
- * <h3>Carry-over Phase 6.2 LOWs fixed here</h3>
- * <ul>
- *   <li>{@code minRating}: {@code Double} → {@code BigDecimal} with scale 2 before
- *       binding, to avoid float drift against {@code NUMERIC(3,2)}.</li>
- *   <li>{@code category}: upper-cased at the service boundary (matches the
- *       {@code ServiceCategory} enum stored as VARCHAR via {@code EnumType.STRING}),
- *       so the plain B-tree {@code idx_service_def_category} stays usable. Using
- *       {@code LOWER(sd.category) = LOWER(:category)} would bypass it.</li>
- *   <li>Cross-field {@code minPrice} ≤ {@code maxPrice} validation in the service
- *       layer — fail-fast prevents wasting a DB round-trip on a tautologically-
- *       empty query.</li>
- * </ul>
+ * without {@code HAVING} would over-count, producing phantom pages. The count
+ * query therefore wraps the same {@code GROUP BY ... HAVING ...} in a subquery
+ * — but only when a price filter is actually present.
  */
 @Service
 @RequiredArgsConstructor
@@ -83,36 +108,45 @@ public class SearchService {
     /** Scale of {@code masters.avg_rating} (NUMERIC(3,2)) — matches column precision. */
     private static final int RATING_SCALE = 2;
 
+    /** Role value (stored via {@code EnumType.STRING}) excluded from master discovery. */
+    private static final String ROLE_SALON_ADMIN = "SALON_ADMIN";
+
+    /**
+     * Discovery-locality SQL expressions. A {@code SALON_MASTER}'s locality is
+     * its salon's; an {@code INDEPENDENT_MASTER}'s is its own user row. The
+     * salon link wins when present — never denormalised onto the master row.
+     */
+    private static final String DISCOVERY_CITY_EXPR = "COALESCE(sal.city_id, u.city_id)";
+    private static final String DISCOVERY_DISTRICT_EXPR = "COALESCE(sal.district_id, u.district_id)";
+
     /**
      * EntityManager is field-injected via {@link PersistenceContext} rather than
      * constructor-injected: Spring intercepts this annotation specifically to
-     * supply a transaction-aware shared proxy. Constructor-injecting the raw
-     * bean would yield an EntityManager without the per-call delegation logic.
-     * This is the documented Spring exception to the constructor-injection rule.
+     * supply a transaction-aware shared proxy. This is the documented Spring
+     * exception to the constructor-injection rule.
      */
     @PersistenceContext
     private EntityManager entityManager;
 
     private final SalonRepository salonRepository;
+    private final DiscoveryLocationResolver discoveryLocationResolver;
 
     /**
-     * Discover masters matching optional location, category, rating, and price
-     * filters. Returns a page sorted by rating descending.
+     * Discover masters matching optional location (FK, district-primary),
+     * category, rating, and price filters. Returns a page sorted by rating
+     * descending with resolved {@code cityLabel}/{@code districtLabel}.
      *
-     * <p><b>Caching</b>: first 5 pages are cached for 60 seconds. Discovery
-     * results aggregate across many entities, so a write-path
-     * {@code @CacheEvict} would need to fan out across every cached query
-     * containing the touched row — a key-explosion problem we sidestep with a
-     * short TTL. Pages 5+ are intentionally not cached: they are cold-path
-     * exploration, not the hot list.
+     * <p><b>Caching</b>: first 5 pages are cached for 60 seconds; the cache
+     * key is now the {@code (cityId, districtId)} FK pair, not the removed
+     * free-text params.
      *
      * @throws BusinessException if {@code minPrice} > {@code maxPrice}
      */
     @Cacheable(
             value = "search:masters",
-            key = "{#request.city, #request.region, #request.category, " +
-                  "#request.minPrice, #request.maxPrice, #request.minRating, " +
-                  "#pageable.pageNumber, #pageable.pageSize}",
+            key = "{#request.location?.cityId, #request.location?.districtId, " +
+                  "#request.category, #request.minPrice, #request.maxPrice, " +
+                  "#request.minRating, #pageable.pageNumber, #pageable.pageSize}",
             condition = "#pageable.pageNumber < 5",
             sync = true
     )
@@ -128,9 +162,11 @@ public class SearchService {
 
         @SuppressWarnings("unchecked")
         List<Object[]> rawRows = dataQuery.getResultList();
+
+        DiscoveryLabels labels = resolveLabelsForRows(rawRows, 6, 7);
         List<MasterSearchResult> results = new ArrayList<>(rawRows.size());
         for (Object[] row : rawRows) {
-            results.add(mapMasterRow(row));
+            results.add(mapMasterRow(row, labels));
         }
 
         SqlAndParams countSql = buildMasterSearchSql(filters, pageable, true);
@@ -142,34 +178,60 @@ public class SearchService {
     }
 
     /**
-     * Discover salons matching optional city/region. Delegates filtering to the
-     * repository's JPQL query and maps each entity to a public-facing DTO so the
-     * JPA entity never escapes the service layer.
+     * Discover salons matching the optional FK location filter
+     * (district-primary). Delegates filtering to the repository's JPQL query
+     * and maps each entity to a public-facing DTO with resolved locality
+     * labels so the JPA entity never escapes the service layer.
      *
      * <p><b>Caching</b>: same trade-off as {@link #searchMasters} — first 5
-     * pages, 60-second TTL, no explicit eviction on salon writes.
+     * pages, 60-second TTL, FK-pair key.
      */
     @Cacheable(
             value = "search:salons",
-            key = "{#city, #region, #pageable.pageNumber, #pageable.pageSize}",
+            key = "{#request.location?.cityId, #request.location?.districtId, " +
+                  "#pageable.pageNumber, #pageable.pageSize}",
             condition = "#pageable.pageNumber < 5",
             sync = true
     )
     @Transactional(readOnly = true)
-    public Page<SalonSearchResult> searchSalons(String city, String region, Pageable pageable) {
-        Page<Salon> page = salonRepository.findByFilter(nullIfBlank(city), nullIfBlank(region), pageable);
-        return page.map(this::toSalonSearchResult);
+    public Page<SalonSearchResult> searchSalons(SalonSearchRequest request, Pageable pageable) {
+        DiscoveryLocationKey key = resolveLocation(request.location());
+        UUID cityId = key == null ? null : key.cityId();
+        UUID districtId = key == null ? null : key.districtId();
+
+        Page<Salon> page = salonRepository.findByLocation(cityId, districtId, pageable);
+
+        List<Salon> salons = page.getContent();
+        DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
+                distinct(salons, Salon::getCityId),
+                distinct(salons, Salon::getDistrictId));
+
+        return page.map(salon -> toSalonSearchResult(salon, labels));
+    }
+
+    // ── location seam (M2) ────────────────────────────────────────────────────
+
+    /**
+     * Obtains the discovery-locality key through the M2 seam — never reads
+     * {@code district_id} directly to decide the filter. Returns {@code null}
+     * when no location filter was supplied.
+     */
+    private DiscoveryLocationKey resolveLocation(LocationFilter location) {
+        if (location == null) {
+            return null;
+        }
+        return discoveryLocationResolver.resolveFilter(location.cityId(), location.districtId());
     }
 
     // ── SQL builder ──────────────────────────────────────────────────────────
 
     /**
-     * Normalised filter bag — eliminates the duplicate normalisation paths the
-     * old {@code bindFilterParams} variants carried.
+     * Normalised filter bag. {@code cityId}/{@code districtId} are the resolved
+     * discovery-locality FK ids (from the M2 seam), not free text.
      */
     private record MasterSearchFilters(
-            String city,
-            String region,
+            UUID cityId,
+            UUID districtId,
             String category,
             BigDecimal minRating,
             BigDecimal minPrice,
@@ -182,15 +244,24 @@ public class SearchService {
         boolean needsServiceJoin() {
             return hasPriceFilter() || category != null;
         }
+
+        boolean hasDistrictFilter() {
+            return districtId != null;
+        }
+
+        boolean hasCityFilter() {
+            return districtId == null && cityId != null;
+        }
     }
 
     /** Carrier for {@code (sql, params)} pairs returned by {@link #buildMasterSearchSql}. */
     private record SqlAndParams(String sql, Map<String, Object> params) {}
 
-    private static MasterSearchFilters normalize(MasterSearchRequest request) {
+    private MasterSearchFilters normalize(MasterSearchRequest request) {
+        DiscoveryLocationKey key = resolveLocation(request.location());
         return new MasterSearchFilters(
-                nullIfBlank(request.city()),
-                nullIfBlank(request.region()),
+                key == null ? null : key.cityId(),
+                key == null ? null : key.districtId(),
                 normalizeCategory(request.category()),
                 normalizeRating(request.minRating()),
                 request.minPrice(),
@@ -198,27 +269,6 @@ public class SearchService {
         );
     }
 
-    /**
-     * Builds the master-search SQL and the matching parameter bag.
-     *
-     * <p>The shape of the produced SQL is:
-     * <ul>
-     *   <li>{@code isCountQuery=false} → {@code SELECT m.id, ... [, MIN(...)]
-     *       FROM masters m JOIN users u [LEFT JOIN ms LEFT JOIN sd] WHERE ...
-     *       [GROUP BY ... [HAVING ...]] ORDER BY ... LIMIT/OFFSET}.</li>
-     *   <li>{@code isCountQuery=true} + price filter → wrapped subquery so
-     *       {@code COUNT(*)} respects the {@code HAVING} predicate.</li>
-     *   <li>{@code isCountQuery=true} + no price filter → flat
-     *       {@code SELECT COUNT(DISTINCT m.id)} (no GROUP BY needed because the
-     *       JOIN against {@code master_services} can multiply rows when the
-     *       category filter is active — DISTINCT collapses them).</li>
-     * </ul>
-     *
-     * <p>Optional predicates are appended only when the value is present,
-     * eliminating the {@code (:p IS NULL OR col = :p)} idiom that previously
-     * required {@code CAST(:p AS VARCHAR)} workarounds and defeated index
-     * pushdown.
-     */
     private static SqlAndParams buildMasterSearchSql(
             MasterSearchFilters filters,
             Pageable pageable,
@@ -232,15 +282,9 @@ public class SearchService {
         Map<String, Object> params = new LinkedHashMap<>();
 
         if (wrapSubquery) {
-            // Subquery wrapper: the HAVING price filter must be applied before
-            // we count, so we count rows of the (GROUP BY m.id, HAVING ...)
-            // pre-filtered set.
             sb.append("SELECT COUNT(*) FROM (SELECT m.id ");
             appendFromClause(sb, needsServiceJoin);
         } else if (isCountQuery) {
-            // Flat count — DISTINCT collapses the JOIN-induced row multiplication
-            // when the category filter is active (a master may match the category
-            // through multiple service rows; we count masters, not rows).
             sb.append("SELECT COUNT(DISTINCT m.id) ");
             appendFromClause(sb, needsServiceJoin);
         } else {
@@ -250,9 +294,6 @@ public class SearchService {
 
         appendWhereClause(sb, filters, params);
 
-        // GROUP BY: required on the data query whenever we have a service-join
-        // (the projection includes MIN()), and required on the count subquery
-        // when a HAVING is about to follow.
         boolean needsGroupBy =
                 (!isCountQuery && needsServiceJoin)
                         || (wrapSubquery && needsServiceJoin);
@@ -260,7 +301,9 @@ public class SearchService {
             if (isCountQuery) {
                 sb.append("GROUP BY m.id ");
             } else {
-                sb.append("GROUP BY m.id, u.first_name, u.last_name, u.city, ")
+                sb.append("GROUP BY m.id, u.first_name, u.last_name, ")
+                        .append(DISCOVERY_CITY_EXPR).append(", ")
+                        .append(DISCOVERY_DISTRICT_EXPR).append(", ")
                         .append("m.avg_rating, m.review_count ");
             }
         }
@@ -272,8 +315,6 @@ public class SearchService {
         }
 
         if (!isCountQuery) {
-            // Deterministic order: rating DESC, then id as the tie-breaker so
-            // the (avg_rating, id) covering index in V36 backs the sort.
             sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id ");
             sb.append("LIMIT :limit OFFSET :offset");
             params.put("limit", pageable.getPageSize());
@@ -285,42 +326,61 @@ public class SearchService {
 
     private static void appendDataSelect(StringBuilder sb, boolean needsServiceJoin) {
         sb.append("SELECT m.id AS master_id, ")
-                .append("u.first_name AS first_name, u.last_name AS last_name, u.city AS city, ")
-                .append("m.avg_rating AS avg_rating, m.review_count AS review_count, ");
-        // Avatar column does not yet exist on users/masters (no migration added it
-        // as of V35/V36). Emit NULL so the projection still maps cleanly until a
-        // future phase introduces user/master avatar storage. See docs/backlog.md.
-        sb.append("CAST(NULL AS TEXT) AS avatar_url, ");
+                .append("u.first_name AS first_name, u.last_name AS last_name, ")
+                .append("m.avg_rating AS avg_rating, m.review_count AS review_count, ")
+                // Avatar column does not yet exist on users/masters as a search
+                // projection source. Emit NULL so the projection still maps
+                // cleanly until a future phase wires master avatar storage.
+                .append("CAST(NULL AS TEXT) AS avatar_url, ")
+                // Discovery-locality FK ids (district-primary via salon link
+                // for SALON_MASTER, else the user's own). Labels are resolved
+                // through the M2 seam; columns 6/7 carry the ids only.
+                .append(DISCOVERY_CITY_EXPR).append(" AS discovery_city_id, ")
+                .append(DISCOVERY_DISTRICT_EXPR).append(" AS discovery_district_id, ");
         if (needsServiceJoin) {
             sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) AS min_effective_price ");
         } else {
-            // Maintain a stable 9-column projection for mapMasterRow regardless of
-            // whether the service-join branch is selected.
             sb.append("CAST(NULL AS NUMERIC) AS min_effective_price ");
         }
     }
 
+    /**
+     * {@code masters m JOIN users u} is the spine. The {@code salons sal}
+     * LEFT JOIN on {@code m.salon_id} is always present (single-row PK join,
+     * no fan-out) so an employed {@code SALON_MASTER}'s discovery locality
+     * resolves through its salon at query time. The {@code master_services} /
+     * {@code service_definitions} joins remain conditional (fan-out).
+     */
     private static void appendFromClause(StringBuilder sb, boolean needsServiceJoin) {
         sb.append("FROM masters m JOIN users u ON u.id = m.user_id ");
+        sb.append("LEFT JOIN salons sal ON sal.id = m.salon_id ");
         if (needsServiceJoin) {
             sb.append("LEFT JOIN master_services ms ON ms.master_id = m.id AND ms.is_active = true ");
             sb.append("LEFT JOIN service_definitions sd ON sd.id = ms.service_def_id ");
         }
     }
 
+    /**
+     * District-primary FK location filter + {@code SALON_ADMIN} exclusion.
+     * The exclusion sits on the {@code users} join (the role lives there) so
+     * an admin account never surfaces in public master discovery regardless
+     * of any future data shape.
+     */
     private static void appendWhereClause(
             StringBuilder sb,
             MasterSearchFilters filters,
             Map<String, Object> params
     ) {
         sb.append("WHERE m.is_active = true AND u.is_active = true ");
-        if (filters.city() != null) {
-            sb.append("AND u.city = :city ");
-            params.put("city", filters.city());
-        }
-        if (filters.region() != null) {
-            sb.append("AND u.region = :region ");
-            params.put("region", filters.region());
+        sb.append("AND u.role <> :excludedRole ");
+        params.put("excludedRole", ROLE_SALON_ADMIN);
+
+        if (filters.hasDistrictFilter()) {
+            sb.append("AND ").append(DISCOVERY_DISTRICT_EXPR).append(" = :districtId ");
+            params.put("districtId", filters.districtId());
+        } else if (filters.hasCityFilter()) {
+            sb.append("AND ").append(DISCOVERY_CITY_EXPR).append(" = :cityId ");
+            params.put("cityId", filters.cityId());
         }
         if (filters.category() != null) {
             sb.append("AND sd.category = :category ");
@@ -372,10 +432,6 @@ public class SearchService {
     /**
      * Upper-cases the category so the bound value matches what
      * {@code EnumType.STRING} writes to {@code service_definitions.category}.
-     * Preserving the exact column value lets the plain B-tree
-     * {@code idx_service_def_category} (V6) serve the lookup; switching to
-     * {@code LOWER(sd.category) = LOWER(:category)} in SQL would force a
-     * sequential scan or require a separate functional index.
      */
     private static String normalizeCategory(String category) {
         if (category == null || category.isBlank()) {
@@ -385,10 +441,8 @@ public class SearchService {
     }
 
     /**
-     * Normalises the {@code BigDecimal minRating} from the request DTO to scale 2,
-     * matching {@code masters.avg_rating} (NUMERIC(3,2)). The DTO field is already
-     * {@code BigDecimal}, so no float-to-decimal conversion is needed; we only enforce
-     * consistent scale so {@code 4.1} and {@code 4.10} produce identical DB parameters.
+     * Normalises {@code BigDecimal minRating} to scale 2, matching
+     * {@code masters.avg_rating} (NUMERIC(3,2)).
      */
     private static BigDecimal normalizeRating(BigDecimal minRating) {
         if (minRating == null) {
@@ -397,43 +451,72 @@ public class SearchService {
         return minRating.setScale(RATING_SCALE, java.math.RoundingMode.HALF_UP);
     }
 
-    private static String nullIfBlank(String value) {
-        return (value == null || value.isBlank()) ? null : value;
+    // ── label resolution (M2 seam, batched — §E no N+1) ───────────────────────
+
+    /**
+     * Collects the distinct discovery city/district ids from a raw result page
+     * and batch-resolves their {@code name_uk} labels through the M2 seam in a
+     * fixed two queries — never a per-row taxonomy lookup.
+     *
+     * @param rows         the raw native-query rows of the page
+     * @param cityIdIdx    projection index of the discovery city id
+     * @param districtIdIdx projection index of the discovery district id
+     */
+    private DiscoveryLabels resolveLabelsForRows(
+            List<Object[]> rows, int cityIdIdx, int districtIdIdx) {
+        Set<UUID> cityIds = new LinkedHashSet<>();
+        Set<UUID> districtIds = new LinkedHashSet<>();
+        for (Object[] row : rows) {
+            if (row[cityIdIdx] != null) {
+                cityIds.add((UUID) row[cityIdIdx]);
+            }
+            if (row[districtIdIdx] != null) {
+                districtIds.add((UUID) row[districtIdIdx]);
+            }
+        }
+        return discoveryLocationResolver.resolveLabels(cityIds, districtIds);
+    }
+
+    private static <T> Set<UUID> distinct(List<T> items, java.util.function.Function<T, UUID> extractor) {
+        Set<UUID> ids = new LinkedHashSet<>();
+        for (T item : items) {
+            UUID id = extractor.apply(item);
+            if (id != null) {
+                ids.add(id);
+            }
+        }
+        return ids;
     }
 
     // ── row mapping ──────────────────────────────────────────────────────────
 
     /**
-     * Maps a raw native-query row to {@link MasterSearchResult}.
+     * Maps a raw native-query row to {@link MasterSearchResult}, stamping the
+     * resolved locality labels from the batched M2-seam result.
      *
-     * <p>Defensive coercion: JDBC may surface integer columns as {@code Integer}
-     * or {@code Long} depending on the driver and column type, and {@code NUMERIC}
-     * always arrives as {@code BigDecimal}. We coerce via {@code Number} casts
-     * rather than direct casts to avoid {@code ClassCastException} drift if a
-     * future Postgres/JDBC bump changes the surface type.
-     *
-     * <p>The projection is a stable 8-column shape regardless of the join
-     * variant — column 7 is {@code avatar_url} (currently always NULL) and
-     * column 8 is {@code min_effective_price} (NULL when no service-join was
-     * needed, populated from the {@code MIN(COALESCE(...))} aggregate otherwise).
-     * {@code user_id} was removed from the projection: it is an internal identifier
-     * that must not be exposed on a {@code permitAll} endpoint.
+     * <p>Stable 8-column projection: {@code [master_id, first_name, last_name,
+     * avg_rating, review_count, avatar_url, discovery_city_id,
+     * discovery_district_id, min_effective_price]}. The internal city/district
+     * UUIDs are consumed here for label resolution and are NOT placed on the
+     * public DTO (§I).
      */
-    private static MasterSearchResult mapMasterRow(Object[] row) {
+    private static MasterSearchResult mapMasterRow(Object[] row, DiscoveryLabels labels) {
         UUID masterId = (UUID) row[0];
         String firstName = (String) row[1];
         String lastName = (String) row[2];
-        String city = (String) row[3];
-        Double avgRating = row[4] == null ? null : ((BigDecimal) row[4]).doubleValue();
-        Integer reviewCount = row[5] == null ? null : ((Number) row[5]).intValue();
-        String avatarUrl = (String) row[6];
-        BigDecimal minEffectivePrice = (BigDecimal) row[7];
+        Double avgRating = row[3] == null ? null : ((BigDecimal) row[3]).doubleValue();
+        Integer reviewCount = row[4] == null ? null : ((Number) row[4]).intValue();
+        String avatarUrl = (String) row[5];
+        UUID cityId = (UUID) row[6];
+        UUID districtId = (UUID) row[7];
+        BigDecimal minEffectivePrice = (BigDecimal) row[8];
 
         return new MasterSearchResult(
                 masterId,
                 firstName,
                 lastName,
-                city,
+                labels.cityLabel(cityId),
+                labels.districtLabel(districtId),
                 avgRating,
                 reviewCount,
                 avatarUrl,
@@ -441,12 +524,12 @@ public class SearchService {
         );
     }
 
-    private SalonSearchResult toSalonSearchResult(Salon salon) {
+    private static SalonSearchResult toSalonSearchResult(Salon salon, DiscoveryLabels labels) {
         return new SalonSearchResult(
                 salon.getId(),
                 salon.getName(),
-                salon.getCity(),
-                salon.getRegion(),
+                labels.cityLabel(salon.getCityId()),
+                labels.districtLabel(salon.getDistrictId()),
                 salon.getAvatarUrl()
         );
     }
