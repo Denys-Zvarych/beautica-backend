@@ -58,6 +58,9 @@ class SalonServiceTest {
     @Mock
     private MasterRepository masterRepository;
 
+    @Mock
+    private com.beautica.location.LocalityWriteValidator localityWriteValidator;
+
     @InjectMocks
     private SalonService salonService;
 
@@ -125,23 +128,31 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("updateSalon — applies non-null patch fields and saves when actor has management access")
+    @DisplayName("updateSalon — writes taxonomy locality (city_id/district_id/address) and stops writing legacy city/region/address")
     void should_updateSalon_when_ownerPatchesSalon() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Old Name");
 
-        var request = new UpdateSalonRequest("New Name", null, "Lviv", null, null, null, null);
+        // Legacy free-text "Lviv" is supplied but Phase 10.6 must NOT persist it.
+        var request = new UpdateSalonRequest("New Name", null, "Lviv", null, null,
+                cityId, districtId, "Shevchenka St", "12", "Near the park", null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(salon)).thenReturn(salon);
-        // authorizationService.enforceCanManageSalon is void — Mockito does nothing by default (access granted)
+        // localityWriteValidator is a mock — validateProviderLocality is a no-op (valid input).
 
         SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
 
         assertThat(response.name()).isEqualTo("New Name");
-        assertThat(response.city()).isEqualTo("Lviv");
+        assertThat(response.cityId()).isEqualTo(cityId);
+        assertThat(response.districtId()).isEqualTo(districtId);
+        assertThat(response.street()).isEqualTo("Shevchenka St");
+        assertThat(salon.getCity()).isNull();
+        verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
     }
 
     @Test
@@ -154,7 +165,8 @@ class SalonServiceTest {
         User owner = buildUser(UUID.randomUUID(), "real@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Salon");
 
-        var request = new UpdateSalonRequest("Updated Name", null, null, null, null, null, null);
+        var request = new UpdateSalonRequest("Updated Name", null, null, null, null,
+                UUID.randomUUID(), null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(salon)).thenReturn(salon);
@@ -162,6 +174,29 @@ class SalonServiceTest {
         SalonResponse response = salonService.updateSalon(actorId, salonId, request);
 
         assertThat(response.name()).isEqualTo("Updated Name");
+    }
+
+    @Test
+    @DisplayName("updateSalon — propagates BusinessException from LocalityWriteValidator and does not save")
+    void should_rejectUpdateSalon_when_localityValidationFails() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+
+        // City omitted — validator (the real one) would reject; here the mock is
+        // configured to throw to assert the service propagates and aborts the save.
+        var request = new UpdateSalonRequest("New Name", null, null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
+                .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
+
+        assertThatThrownBy(() -> salonService.updateSalon(ownerId, salonId, request))
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+
+        verify(salonRepository, never()).save(any());
     }
 
     @Test

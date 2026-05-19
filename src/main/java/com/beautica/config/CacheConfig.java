@@ -36,6 +36,8 @@ public class CacheConfig {
      *   locationOblasts        — full serviced-oblast list (single entry) — 24 h TTL, max 4 entries
      *   locationCitiesByOblast — cities (+hasDistricts) per oblast — 24 h TTL, max 50 entries
      *   locationDistrictsByCity— urban districts per city — 24 h TTL, max 200 entries
+     *   localityTaxonomyFacts  — fused city-exists/has-districts/district-child resolution
+     *                            per (cityId,districtId) write-validation pair — 24 h TTL, max 600 entries
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -153,6 +155,18 @@ public class CacheConfig {
         manager.registerCustomCache("locationDistrictsByCity",
                 Caffeine.newBuilder()
                         .maximumSize(200)
+                        .expireAfterWrite(24, TimeUnit.HOURS)
+                        .build());
+        // Phase 10.6 — fused write-path taxonomy resolution per (cityId, districtId)
+        // pair, backing LocalityWriteValidator. Same static-reference-data rationale
+        // as the locationOblasts/* read caches above: KATOTTH rows are Flyway-seed
+        // only and never mutate at runtime, so a long 24-hour TTL with NO @CacheEvict
+        // path is correct (the only invalidation is JVM restart / redeploy — also
+        // the only time the seed can change). 600 entries comfortably hold every
+        // distinct (city, district) pair a real client submits (~600 taxonomy rows).
+        manager.registerCustomCache("localityTaxonomyFacts",
+                Caffeine.newBuilder()
+                        .maximumSize(600)
                         .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
         return manager;

@@ -56,6 +56,9 @@ class SalonServiceAdminTest {
     @Mock
     private MasterRepository masterRepository;
 
+    @Mock
+    private com.beautica.location.LocalityWriteValidator localityWriteValidator;
+
     @InjectMocks
     private SalonService salonService;
 
@@ -69,7 +72,8 @@ class SalonServiceAdminTest {
         User owner = buildOwner(UUID.randomUUID(), salonId);
         Salon salon = buildSalon(salonId, owner, "Original Name");
 
-        var request = new UpdateSalonRequest("Updated Name", null, null, null, null, null, null);
+        var request = new UpdateSalonRequest("Updated Name", null, null, null, null,
+                null, null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.save(salon)).thenReturn(salon);

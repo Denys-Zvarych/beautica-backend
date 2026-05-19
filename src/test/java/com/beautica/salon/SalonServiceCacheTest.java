@@ -3,6 +3,7 @@ package com.beautica.salon;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.config.CacheConfig;
+import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
@@ -38,6 +39,7 @@ class SalonServiceCacheTest {
     @MockBean UserRepository userRepository;
     @MockBean InviteService inviteService;
     @MockBean MasterRepository masterRepository;
+    @MockBean LocalityWriteValidator localityWriteValidator;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;
@@ -115,7 +117,8 @@ class SalonServiceCacheTest {
 
         // Evict via updateSalon
         UpdateSalonRequest updateRequest = new UpdateSalonRequest(
-                "Updated Name", null, null, null, null, null, null);
+                "Updated Name", null, null, null, null,
+                null, null, null, null, null, null, null);
         salonService.updateSalon(actorId, salonId, updateRequest);
 
         // Cache was evicted — repository must be queried again
@@ -141,7 +144,8 @@ class SalonServiceCacheTest {
 
         // Evict via updateSalon — second @CacheEvict in @Caching group targets ownerSalons
         UpdateSalonRequest updateRequest = new UpdateSalonRequest(
-                "Updated Name", null, null, null, null, null, null);
+                "Updated Name", null, null, null, null,
+                null, null, null, null, null, null, null);
         salonService.updateSalon(actorId, salonId, updateRequest);
 
         // Cache was evicted — repository must be queried again

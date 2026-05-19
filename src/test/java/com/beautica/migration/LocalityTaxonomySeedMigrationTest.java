@@ -340,6 +340,62 @@ class LocalityTaxonomySeedMigrationTest extends AbstractIntegrationTest {
         }
 
         @Test
+        @DisplayName("katotth_code is NOT NULL in all three taxonomy tables (information_schema, Phase 10.9 Step 1)")
+        void should_haveNotNullKatotthCode_when_v52Applied() {
+            // The sibling tests prove katotth_code is UNIQUE and that every
+            // seeded value is a real 'UA…' string, but neither pins the column
+            // NULLABILITY constraint itself. Phase 10.9 Step 1 requires the
+            // NOT NULL invariant asserted directly through the catalog so a
+            // future ALTER that relaxed it (allowing a NULL business key, which
+            // breaks idempotent upsert-by-code) fails here, not silently.
+            for (String table : new String[] {"oblasts", "cities", "city_districts"}) {
+                String isNullable = jdbcTemplate.queryForObject(
+                        "SELECT is_nullable FROM information_schema.columns "
+                                + "WHERE table_name = ? AND column_name = 'katotth_code'",
+                        String.class, table);
+
+                assertThat(isNullable)
+                        .as("%s.katotth_code must be NOT NULL — it is the stable "
+                                + "external business key for idempotent seed upserts", table)
+                        .isEqualTo("NO");
+            }
+        }
+
+        @Test
+        @DisplayName("V52→V53→V54 applied as one clean ordered chain — every Part A migration recorded success, none failed (Phase 10.9 Step 1)")
+        void should_applyV52V53V54AsOneCleanOrderedChain_when_freshDb() {
+            // Step 1 contract: the three Part A migrations boot cleanly on a
+            // fresh Testcontainers Postgres with no checksum/ordering issue.
+            // Flyway records execution order in installed_rank; a checksum
+            // mismatch or out-of-order apply would either crash the context
+            // (no rows) or leave success=false. Assert all three present,
+            // success, and strictly increasing installed_rank in V-order.
+            List<Map<String, Object>> chain = jdbcTemplate.queryForList(
+                    "SELECT version, success, installed_rank "
+                            + "FROM flyway_schema_history "
+                            + "WHERE version IN ('52','53','54') "
+                            + "ORDER BY installed_rank");
+
+            assertThat(chain)
+                    .as("V52, V53 and V54 must all be present in the history")
+                    .hasSize(3);
+            assertThat(chain)
+                    .as("the Part A chain must apply strictly in V52→V53→V54 order")
+                    .extracting(r -> r.get("version"))
+                    .containsExactly("52", "53", "54");
+            assertThat(chain)
+                    .as("no Part A migration may be recorded as a failure")
+                    .allSatisfy(r -> assertThat(r.get("success")).isEqualTo(Boolean.TRUE));
+
+            Integer failedAnywhere = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM flyway_schema_history WHERE success = false",
+                    Integer.class);
+            assertThat(failedAnywhere)
+                    .as("a fresh-DB boot must have ZERO failed migrations in the whole chain")
+                    .isZero();
+        }
+
+        @Test
         @DisplayName("every KATOTTH business key is unique within its table (no UUID leakage into the key)")
         void should_haveUniqueKatotthCodes_when_v53Applied() {
             Integer dupOblasts = jdbcTemplate.queryForObject(
@@ -380,6 +436,67 @@ class LocalityTaxonomySeedMigrationTest extends AbstractIntegrationTest {
             assertThat(v53.get("checksum"))
                     .as("V53 must carry a deterministic (non-null) checksum")
                     .isNotNull();
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 10.8 AC6 — seed migration runtime is acceptable on a cold start
+    // ---------------------------------------------------------------------
+
+    @Nested
+    @DisplayName("Phase 10.8 AC6 — V53 seed migration runtime")
+    class SeedMigrationRuntime {
+
+        /**
+         * Cold-start ceiling for the V53 seed. The seed is ~455 single-row
+         * {@code INSERT ... SELECT ... WHERE katotth_code = ?} statements
+         * (FK resolved by business key — the deterministic/idempotent form the
+         * V53 header mandates), all inside ONE Flyway migration transaction
+         * (one begin/commit round-trip, not 455 transactions) over ≤356-row
+         * reference tables. Testcontainers spins a cold {@code postgres:16}
+         * with no warm cache — a fair, if anything pessimistic, proxy for a
+         * cold Neon start (Neon's compute resumes warm). Flyway records the
+         * applied duration in {@code execution_time} (milliseconds); a generous
+         * 10s ceiling is a coarse regression tripwire that a pathological
+         * rewrite (e.g. a per-row correlated cross join, or accidental
+         * {@code O(n^2)} re-seed) would trip, while not flaking on CI jitter.
+         * V53 is an immutable shipped migration — Phase 10.8 only CONFIRMS its
+         * runtime (Step 4), it does not and must not rewrite it.
+         */
+        private static final int V53_RUNTIME_CEILING_MS = 10_000;
+
+        @Test
+        @DisplayName("V53 applied well within the cold-start runtime ceiling (batched in one migration tx)")
+        void should_applyWithinRuntimeCeiling_when_seedRunOnColdContainer() {
+            Integer executionTimeMs = jdbcTemplate.queryForObject(
+                    "SELECT execution_time FROM flyway_schema_history "
+                            + "WHERE version = '53'",
+                    Integer.class);
+
+            assertThat(executionTimeMs)
+                    .as("Flyway must have recorded a V53 execution_time")
+                    .isNotNull();
+            assertThat(executionTimeMs)
+                    .as("V53 (~455 single-row inserts in ONE migration tx over "
+                            + "≤356-row ref tables) must not bloat cold-start "
+                            + "migration runtime — recorded %d ms, ceiling %d ms",
+                            executionTimeMs, V53_RUNTIME_CEILING_MS)
+                    .isLessThan(V53_RUNTIME_CEILING_MS);
+        }
+
+        @Test
+        @DisplayName("V53 is a single atomic migration entry — not row-by-row reapplied (no repeat/retry rows)")
+        void should_haveExactlyOneV53HistoryRow_when_chainApplied() {
+            // A single flyway_schema_history row for V53 proves the ~455
+            // inserts ran as ONE migration unit (one tx, one round-trip to
+            // start/commit), not as fragmented re-applied chunks.
+            Integer rows = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM flyway_schema_history WHERE version = '53'",
+                    Integer.class);
+
+            assertThat(rows)
+                    .as("V53 must appear exactly once in the migration history")
+                    .isEqualTo(1);
         }
     }
 }

@@ -136,7 +136,8 @@ class SalonControllerTest {
     }
 
     private SalonResponse stubSalonResponse(UUID salonId, String name) {
-        return new SalonResponse(salonId, null, name, null, null, null, null, null, null, null, true, null);
+        return new SalonResponse(salonId, null, name, null, null, null, null,
+                null, null, null, null, null, null, null, null, true, null);
     }
 
     // ── POST /api/v1/salons ───────────────────────────────────────────────────
@@ -245,7 +246,8 @@ class SalonControllerTest {
         // authz returns false for the attacker (different owner)
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
 
-        var request = new UpdateSalonRequest("Hijacked", null, null, null, null, null, null);
+        var request = new UpdateSalonRequest("Hijacked", null, null, null, null,
+                null, null, null, null, null, null, null);
 
         log.debug("Act: PATCH {}/{} with attacker's token — different owner must be denied", SALONS_URL, salonId);
         mockMvc.perform(patch(SALONS_URL + "/" + salonId)
@@ -309,7 +311,8 @@ class SalonControllerTest {
         when(salonService.updateSalon(eq(adminUserId), eq(salonId), any(UpdateSalonRequest.class)))
                 .thenReturn(updated);
 
-        var request = new UpdateSalonRequest("Updated By Admin", null, null, null, null, null, null);
+        var request = new UpdateSalonRequest("Updated By Admin", null, null, null, null,
+                null, null, null, null, null, null, null);
 
         log.debug("Act: PATCH {}/{} as SALON_ADMIN belonging to that salon", SALONS_URL, salonId);
         mockMvc.perform(patch(SALONS_URL + "/" + salonId)

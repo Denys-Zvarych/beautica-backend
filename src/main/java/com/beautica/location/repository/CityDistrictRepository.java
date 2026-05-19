@@ -34,10 +34,15 @@ public interface CityDistrictRepository extends JpaRepository<CityDistrict, UUID
     /**
      * Checks whether the given city has any urban districts defined.
      *
-     * <p>Used by the <em>single-city write-validation</em> rule in Phase 10.6:
-     * if a city has urban districts, a booking/salon address must specify a
-     * district; if it does not, the city itself is the locality leaf and no
-     * district is required.
+     * <p><strong>Retained, not the write path (Phase 10.6 perf fix):</strong>
+     * the {@code LocalityWriteValidator} no longer calls this per save — the
+     * three former existence round-trips were fused and cached behind
+     * {@link CityRepository#resolveTaxonomyFacts}
+     * /{@code LocalityTaxonomyLookup}. This single-key predicate is kept
+     * deliberately (§E "document the non-graph variant inline"): it pins the
+     * "picker path never does a per-row {@code existsByCityId} loop"
+     * regression guard in {@code LocationQueryServiceTest} and remains a
+     * correct, index-served leaf check should a future caller need it.
      *
      * <p>Backed by {@code idx_city_districts_city_id}; the index seek returns
      * immediately on the first matching row.
@@ -52,6 +57,30 @@ public interface CityDistrictRepository extends JpaRepository<CityDistrict, UUID
      * @return {@code true} if at least one urban district belongs to this city
      */
     boolean existsByCityId(UUID cityId);
+
+    /**
+     * Checks whether the given district both exists and belongs to the given
+     * city.
+     *
+     * <p>This is the canonical Phase 10.6 write-path parentage check: a
+     * supplied {@code district_id} is only accepted if it is a child of the
+     * supplied {@code city_id} (the most-specific-node rule rejects mismatched
+     * pairs). Combining the existence and parentage checks into one predicate
+     * avoids a second round-trip ({@code existsById} + a separate city lookup).
+     *
+     * <p>Backed by {@code idx_city_districts_city_id} (the {@code city_id}
+     * prefix) plus the primary key.
+     *
+     * <p><strong>Not a §E "non-graph variant" violation:</strong> like
+     * {@link #existsByCityId(UUID)} this is a deliberately distinct
+     * single-key write-path predicate, not a list/picker query.
+     *
+     * @param id     surrogate PK of the candidate district
+     * @param cityId surrogate PK of the city it must belong to
+     * @return {@code true} if the district exists and its parent city is
+     *         {@code cityId}
+     */
+    boolean existsByIdAndCityId(UUID id, UUID cityId);
 
     /**
      * Returns the set of city ids (within the given oblast) that have at least
