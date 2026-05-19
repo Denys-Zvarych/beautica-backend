@@ -7,6 +7,7 @@ import com.beautica.common.exception.GlobalExceptionHandler;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
+import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
 import com.beautica.search.service.SearchService;
 import jakarta.servlet.http.HttpServletResponse;
@@ -39,9 +40,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.hamcrest.Matchers.containsString;
-import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -115,6 +114,7 @@ class SearchControllerTest {
                 "Olha",
                 "Master",
                 "Київ",
+                "Голосіївський район",
                 4.6,
                 17,
                 null,
@@ -127,13 +127,9 @@ class SearchControllerTest {
                 UUID.randomUUID(),
                 "Salon Beautica",
                 "Львів",
-                "Lviv Oblast",
+                null,
                 null
         );
-    }
-
-    private static String repeat(char c, int n) {
-        return String.valueOf(c).repeat(n);
     }
 
     // ── GET /api/v1/search/masters ───────────────────────────────────────────
@@ -144,9 +140,9 @@ class SearchControllerTest {
         Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
         when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
 
-        log.debug("Act: GET {}?city=Київ without auth — must be 200", MASTERS_URL);
+        log.debug("Act: GET {}?location.cityId=<uuid> without auth — must be 200", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
-                        .param("city", "Київ")
+                        .param("location.cityId", UUID.randomUUID().toString())
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
@@ -160,10 +156,10 @@ class SearchControllerTest {
         Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
         when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
 
-        log.debug("Act: GET {} with city/region/category/min+maxPrice/minRating — must be 200", MASTERS_URL);
+        log.debug("Act: GET {} with location.cityId/districtId/category/min+maxPrice/minRating — must be 200", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
-                        .param("city", "Київ")
-                        .param("region", "Kyiv Oblast")
+                        .param("location.cityId", UUID.randomUUID().toString())
+                        .param("location.districtId", UUID.randomUUID().toString())
                         .param("category", "MANICURE")
                         .param("minPrice", "100.00")
                         .param("maxPrice", "999.99")
@@ -187,17 +183,16 @@ class SearchControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — 400 when ?city length exceeds 100 chars (@Size enforcement)")
-    void should_return400_when_cityExceeds100Chars() throws Exception {
-        String oversizedCity = repeat('a', 101);
-
-        log.debug("Act: GET {} with city length=101 — must fail @Size and return 400", MASTERS_URL);
+    @DisplayName("GET /api/v1/search/masters — 400 when location.cityId is not a valid UUID (generic 400, no surface leak)")
+    void should_return400_when_locationCityIdMalformed() throws Exception {
+        log.debug("Act: GET {} with location.cityId=not-a-uuid — binder must reject with a generic 400", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
-                        .param("city", oversizedCity)
+                        .param("location.cityId", "not-a-uuid")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isBadRequest());
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
     }
 
     @Test
@@ -280,35 +275,17 @@ class SearchControllerTest {
                 .andExpect(jsonPath("$.message").value(containsString("minPrice must not exceed maxPrice")));
     }
 
-    @Test
-    @DisplayName("GET /api/v1/search/masters — 400 with safe message when city contains a control character")
-    void should_return400AndNotEchoRawInput_when_cityContainsControlChar() throws Exception {
-        // U+0007 BEL — caught by the @Pattern "^[^\\p{Cntrl}]*$" on MasterSearchRequest.city.
-        String controlCharInput = "Київ";
-
-        log.debug("Act: GET {} with city containing BEL — must reject without echoing the raw bytes", MASTERS_URL);
-        mockMvc.perform(get(MASTERS_URL)
-                        .param("city", controlCharInput)
-                        .param("page", "0")
-                        .param("size", "20")
-                        .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.message").value(containsString("control character")))
-                .andExpect(jsonPath("$.message").value(not(containsString(""))));
-    }
-
-    // ── GET /api/v1/search/salons ────────────────────────────────────────────
+    // ── GET /api/v1/search/salons ───────────────────────────────────────────────────
 
     @Test
     @DisplayName("GET /api/v1/search/salons — 200 without authentication (public)")
     void should_return200_when_publicSalonSearch() throws Exception {
         Page<SalonSearchResult> page = new PageImpl<>(List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
-        when(searchService.searchSalons(eq("Львів"), any(), any(Pageable.class))).thenReturn(page);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
 
-        log.debug("Act: GET {}?city=Львів without auth — must be 200", SALONS_URL);
+        log.debug("Act: GET {}?location.cityId=<uuid> without auth — must be 200", SALONS_URL);
         mockMvc.perform(get(SALONS_URL)
-                        .param("city", "Львів")
+                        .param("location.cityId", UUID.randomUUID().toString())
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))

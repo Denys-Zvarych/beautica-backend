@@ -78,7 +78,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — must return 3 masters", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -161,7 +161,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ&size=3 — must return 3 in content, totalElements=7", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=3", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=3", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -179,7 +179,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Одеса — must return 0 masters", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Одеса&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Одеса") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -223,7 +223,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — inactive master must NOT appear", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -244,7 +244,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — master with inactive user must NOT appear", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -311,7 +311,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — no category/price filter, JOIN should be elided", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -355,7 +355,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ&size=2 — flat count branch — totalElements must equal 5", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=2", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=2", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -404,7 +404,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — expect cache to be populated after the call", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -430,7 +430,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // service returns an empty content list but the underlying query still
         // runs.
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=5&size=1", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=5&size=1", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -471,7 +471,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {} with full filter set — must return only m1", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&category=MANICURE&minPrice=100.00&maxPrice=300.00&minRating=4.0"
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&category=MANICURE&minPrice=100.00&maxPrice=300.00&minRating=4.0"
                         + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -494,7 +494,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         seedMasterWithCity("Київ", "4.00");
 
-        String url = MASTERS_URL + "?city=Київ&page=0&size=20";
+        String url = MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20";
 
         // First call: cache miss → populates entry
         ResponseEntity<String> first = restTemplate.exchange(url, HttpMethod.GET, anonymous(), String.class);
@@ -527,9 +527,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedMasterWithCity("Київ", "4.00");
         seedMasterWithCity("Львів", "4.00");
 
-        restTemplate.exchange(MASTERS_URL + "?city=Київ&page=0&size=20",
+        restTemplate.exchange(MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
-        restTemplate.exchange(MASTERS_URL + "?city=Львів&page=0&size=20",
+        restTemplate.exchange(MASTERS_URL + "?location.cityId=" + cityIdByName("Львів") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(countNativeEntries(cache))
@@ -545,7 +545,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — JOIN must be elided, master visible with null price", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -565,7 +565,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ&category=MANICURE — JOIN active, master without services must drop", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?city=Київ&category=MANICURE&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&category=MANICURE&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -586,13 +586,13 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Львів", "Region-B");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode page = objectMapper.readTree(response.getBody()).path("data");
         assertThat(page.path("totalElements").asLong()).isEqualTo(1L);
-        assertThat(page.path("data").get(0).path("city").asText()).isEqualTo("Київ");
+        assertThat(page.path("data").get(0).path("cityLabel").asText()).isEqualTo("Київ");
     }
 
     @Test
@@ -602,7 +602,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?city=Одеса&page=0&size=20", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + cityIdByName("Одеса") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -621,7 +621,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?city=Київ&page=0&size=20", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -641,7 +641,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?city=Київ&page=5&size=1", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=5&size=1", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -650,7 +650,357 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isZero();
     }
 
+    // ── Phase 10.5 — SALON_ADMIN exclusion (Q6 verify-not-present + Q9 cross-role) ─
+
+    @Test
+    @DisplayName("GET /search/masters — a SALON_ADMIN account never appears in master results AND is not counted (no pagination leak)")
+    void should_excludeSalonAdmin_fromBothResultsAndTotalElements() throws Exception {
+        ensureHttpClient();
+        UUID legitMaster = seedMasterWithCity("Київ", "4.40");
+        UUID adminMasterId = seedSalonAdminMaster("Київ", "4.95");
+
+        log.debug("Act: GET {}?location.cityId=Київ — SALON_ADMIN must be absent from data AND from totalElements", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("only the non-admin master is discoverable")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText())
+                .isEqualTo(legitMaster.toString());
+        // Q6: assert the admin id is NOT present, not merely that size==1.
+        for (JsonNode row : data.path("data")) {
+            assertThat(row.path("masterId").asText())
+                    .as("the SALON_ADMIN master row must never surface")
+                    .isNotEqualTo(adminMasterId.toString());
+        }
+        // Q9: the predicate must live in the COUNT path too — a leaked admin in
+        // totalElements would let an anonymous caller infer admin existence via
+        // phantom pages even when the row itself is filtered from the content.
+        assertThat(data.path("totalElements").asLong())
+                .as("count path excludes SALON_ADMIN — no pagination existence-oracle")
+                .isEqualTo(1L);
+    }
+
+    // ── Phase 10.5 — district-primary FK filter (read side, end-to-end) ──────
+
+    @Test
+    @DisplayName("GET /search/masters — district-primary: ?location.districtId returns only masters in that district, not the rest of the city")
+    void should_filterMastersByDistrict_when_districtIdSupplied() throws Exception {
+        ensureHttpClient();
+        UUID districtA = districtIdInCity("Київ", 0);
+        UUID districtB = districtIdInCity("Київ", 1);
+        UUID inDistrictA = seedMasterInDistrict("Київ", districtA, "4.30");
+        seedMasterInDistrict("Київ", districtB, "4.70");
+
+        log.debug("Act: GET {}?location.cityId=Київ&location.districtId=A — district wins, only district-A master", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&location.districtId=" + districtA + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("district-primary: a supplied districtId wins over the city")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText())
+                .isEqualTo(inDistrictA.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — districted city WITHOUT a districtId widens to city-level (both district masters returned)")
+    void should_widenToCityLevel_when_districtedCityHasNoDistrictId() throws Exception {
+        ensureHttpClient();
+        UUID districtA = districtIdInCity("Київ", 0);
+        UUID districtB = districtIdInCity("Київ", 1);
+        seedMasterInDistrict("Київ", districtA, "4.30");
+        seedMasterInDistrict("Київ", districtB, "4.70");
+
+        log.debug("Act: GET {}?location.cityId=Київ (no districtId) — read side widens to whole city", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("a districted city without a district widens to city-level on the read side (write-side is Phase 10.6)")
+                .isEqualTo(2L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — district-primary: ?location.districtId filters salons by district, not the whole city")
+    void should_filterSalonsByDistrict_when_districtIdSupplied() throws Exception {
+        ensureHttpClient();
+        UUID districtA = districtIdInCity("Київ", 0);
+        UUID districtB = districtIdInCity("Київ", 1);
+        seedSalonInDistrict("Київ", districtA, "Salon District A");
+        seedSalonInDistrict("Київ", districtB, "Salon District B");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&location.districtId=" + districtA + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode page = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(page.path("totalElements").asLong())
+                .as("salon search honours the district-primary FK filter")
+                .isEqualTo(1L);
+        assertThat(page.path("data").get(0).path("name").asText()).isEqualTo("Salon District A");
+        assertThat(page.path("data").get(0).path("districtLabel").asText())
+                .as("resolved districtLabel is the taxonomy name_uk — no extra round-trip")
+                .isNotBlank();
+    }
+
+    // ── Phase 10.5 — SALON_MASTER salon-link locality (multi-salon 2.11–2.14) ─
+
+    @Test
+    @DisplayName("GET /search/masters — an employed SALON_MASTER is discovered at its SALON's district (salon link resolved at query time, not denormalised)")
+    void should_resolveSalonMasterLocalityViaSalonLink_when_searchedByDistrict() throws Exception {
+        ensureHttpClient();
+        UUID salonDistrict = districtIdInCity("Київ", 0);
+        UUID otherDistrict = districtIdInCity("Київ", 1);
+        // Master's USER row carries a different (stale) district than its salon.
+        // The COALESCE(sal.*, u.*) salon link must win — the master is found
+        // under the SALON's district, never the user-row district.
+        UUID masterId = seedSalonMasterWithSalonDistrictAndUserDistrict(
+                "Київ", salonDistrict, otherDistrict, "4.60");
+
+        log.debug("Act: GET {} filtered by the SALON's district — salon-link locality must win over the user row", MASTERS_URL);
+        ResponseEntity<String> bySalonDistrict = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&location.districtId=" + salonDistrict + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+        ResponseEntity<String> byUserDistrict = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&location.districtId=" + otherDistrict + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode bySalon = objectMapper.readTree(bySalonDistrict.getBody()).path("data");
+        assertThat(bySalon.path("totalElements").asLong())
+                .as("SALON_MASTER discovered under its salon's district (link resolved per request)")
+                .isEqualTo(1L);
+        assertThat(bySalon.path("data").get(0).path("masterId").asText())
+                .isEqualTo(masterId.toString());
+        assertThat(objectMapper.readTree(byUserDistrict.getBody()).path("data").path("totalElements").asLong())
+                .as("the stale user-row district must NOT discover the master — no denormalised address")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — an INDEPENDENT_MASTER (no salon) is discovered via its own user-row district (COALESCE falls through)")
+    void should_resolveIndependentMasterLocalityViaUserRow_when_searchedByDistrict() throws Exception {
+        ensureHttpClient();
+        UUID district = districtIdInCity("Київ", 0);
+        UUID masterId = seedIndependentMasterInDistrict("Київ", district, "4.10");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&location.districtId=" + district + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("no salon link → COALESCE falls through to the user row's district")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(masterId.toString());
+    }
+
+    // ── Phase 10.5 — resolved labels (no round-trip; null districtLabel for non-districted) ─
+
+    @Test
+    @DisplayName("GET /search/masters — district master carries resolved cityLabel AND districtLabel name_uk in one response")
+    void should_stampBothLabels_when_masterIsInADistrict() throws Exception {
+        ensureHttpClient();
+        UUID district = districtIdInCity("Київ", 0);
+        seedSalonMasterWithSalonDistrictAndUserDistrict("Київ", district, district, "4.80");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&location.districtId=" + district + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        assertThat(row.path("cityLabel").asText())
+                .as("cityLabel resolved from taxonomy name_uk with no extra client round-trip")
+                .isEqualTo("Київ");
+        assertThat(row.path("districtLabel").isNull())
+                .as("districted master → districtLabel is the taxonomy name_uk, not null")
+                .isFalse();
+        assertThat(row.path("districtLabel").asText()).isNotBlank();
+        // §I — internal FK UUIDs are not exposed on this permitAll endpoint.
+        assertThat(row.path("cityId").isMissingNode())
+                .as("internal city UUID must not leak on the public search DTO")
+                .isTrue();
+        assertThat(row.path("districtId").isMissingNode()).isTrue();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — non-districted salon has resolved cityLabel and a null districtLabel")
+    void should_returnNullDistrictLabel_when_salonCityIsNotDistricted() throws Exception {
+        ensureHttpClient();
+        seedActiveSalon("Львів", null);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Львів") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        assertThat(row.path("cityLabel").asText()).isEqualTo("Львів");
+        assertThat(row.path("districtLabel").isNull())
+                .as("salon with no district FK → districtLabel surfaces as JSON null")
+                .isTrue();
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Resolves the Nth Flyway-seeded {@code city_districts.id} of a city by the
+     * city's Ukrainian name (V53 KATOTTH seed). Київ has multiple urban
+     * districts; the deterministic {@code ORDER BY katotth_code} makes index
+     * {@code 0} and {@code 1} stable across runs. Reference data — never
+     * deleted by {@code cleanDb()}.
+     */
+    private UUID districtIdInCity(String cityNameUk, int index) {
+        return jdbcTemplate.queryForObject(
+                "SELECT cd.id FROM city_districts cd " +
+                        "JOIN cities c ON c.id = cd.city_id " +
+                        "WHERE c.name_uk = ? ORDER BY cd.katotth_code OFFSET ? LIMIT 1",
+                UUID.class, cityNameUk, index);
+    }
+
+    /**
+     * Seeds a {@code SALON_ADMIN} user with a backing {@code masters} row in
+     * the given city. A SALON_ADMIN must never surface in public master
+     * discovery regardless of having a masters row — the
+     * {@code AND u.role <> 'SALON_ADMIN'} predicate (data + count) is what
+     * enforces it.
+     */
+    private UUID seedSalonAdminMaster(String city, String avgRating) {
+        UUID cityId = cityIdByName(city);
+
+        UUID ownerId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
+                ownerId, "admin-owner-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest");
+
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, "AdminSalon-" + salonId, city, cityId);
+
+        UUID adminUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, city, city_id, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'SALON_ADMIN', ?, ?, ?, true, true)",
+                adminUserId, "salon-admin-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", salonId, city, cityId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, adminUserId, salonId, avgRating);
+        return masterId;
+    }
+
+    /**
+     * Seeds a SALON_MASTER whose SALON carries {@code district_id}. The
+     * master's discovery locality resolves through the salon link
+     * ({@code COALESCE(sal.district_id, u.district_id)}) at query time.
+     */
+    private UUID seedMasterInDistrict(String city, UUID districtId, String avgRating) {
+        return seedSalonMasterWithSalonDistrictAndUserDistrict(city, districtId, null, avgRating);
+    }
+
+    /**
+     * Seeds a SALON_OWNER + a salon stamped with {@code salonDistrictId}, plus
+     * an employed SALON_MASTER whose own user row carries
+     * {@code userDistrictId} (may differ from the salon's, or be {@code null}).
+     * Proves the salon link wins at query time and is never denormalised onto
+     * the master/user row.
+     */
+    private UUID seedSalonMasterWithSalonDistrictAndUserDistrict(
+            String city, UUID salonDistrictId, UUID userDistrictId, String avgRating) {
+        UUID cityId = cityIdByName(city);
+
+        UUID ownerId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
+                ownerId, "dist-owner-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest");
+
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, "DistSalon-" + salonId, city, cityId, salonDistrictId);
+
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, city, city_id, district_id, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, ?, ?, true, true)",
+                masterUserId, "dist-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", salonId, city, cityId, userDistrictId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, masterUserId, salonId, avgRating);
+        return masterId;
+    }
+
+    /**
+     * Seeds an INDEPENDENT_MASTER (no {@code salon_id}) whose own user row
+     * carries the district FK. With no salon link the
+     * {@code COALESCE(sal.district_id, u.district_id)} expression falls through
+     * to the user row.
+     */
+    private UUID seedIndependentMasterInDistrict(String city, UUID districtId, String avgRating) {
+        UUID cityId = cityIdByName(city);
+
+        UUID userId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, city, city_id, district_id, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', ?, ?, ?, true, true)",
+                userId, "indep-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", city, cityId, districtId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, userId, avgRating);
+        return masterId;
+    }
+
+    /** Seeds a SALON_OWNER + an active salon stamped with a district FK. */
+    private UUID seedSalonInDistrict(String city, UUID districtId, String name) {
+        UUID cityId = cityIdByName(city);
+
+        UUID ownerId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
+                ownerId, "dsalon-owner-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest");
+
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, name, city, cityId, districtId);
+        return salonId;
+    }
 
     private static HttpHeaders anonymousHeaders() {
         HttpHeaders headers = new HttpHeaders();
@@ -668,17 +1018,23 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * masters.id for downstream wiring.
      */
     private UUID seedMaster(String city, String avgRating) {
+        UUID cityId = cityIdByName(city);
+
         UUID ownerId = UUID.randomUUID();
         String ownerEmail = "search-owner-" + UUID.randomUUID() + "@beautica.test";
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 ownerId, ownerEmail, "$2a$04$placeholdervaluefortestonlydigest");
 
+        // Phase 10.5: the salon carries the FK locality. An employed
+        // SALON_MASTER's discovery locality resolves through this salon link
+        // at query time (COALESCE(sal.city_id, u.city_id)) — never copied onto
+        // the master/user row.
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, is_active, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId, city);
+                "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, "Salon-" + salonId, city, cityId);
 
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "search-master-" + UUID.randomUUID() + "@beautica.test";
@@ -745,18 +1101,35 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * joins {@code salons}; no master or user rows are required.
      */
     private UUID seedActiveSalon(String city, String region) {
+        UUID cityId = cityIdByName(city);
+
         UUID ownerId = UUID.randomUUID();
         String ownerEmail = "salon-owner-" + UUID.randomUUID() + "@beautica.test";
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
                 ownerId, ownerEmail, "$2a$04$placeholdervaluefortestonlydigest");
 
+        // Phase 10.5: salon discovery locality is its own city_id FK (a salon
+        // has no salon-to-salon link to resolve through).
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, region, is_active, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId, city, region);
+                "INSERT INTO salons (id, owner_id, name, city, region, city_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, "Salon-" + salonId, city, region, cityId);
         return salonId;
+    }
+
+    /**
+     * Resolves a Flyway-seeded {@code cities.id} by its canonical Ukrainian
+     * name (V53 KATOTTH seed). The taxonomy is reference data — never deleted
+     * by {@code cleanDb()} — so this lookup is stable across tests. Used to
+     * drive the Phase 10.5 FK location filter ({@code ?location.cityId=})
+     * and to stamp {@code salons.city_id} / wire the SALON_MASTER salon link.
+     */
+    private UUID cityIdByName(String nameUk) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = ? ORDER BY katotth_code LIMIT 1",
+                UUID.class, nameUk);
     }
 
     /**

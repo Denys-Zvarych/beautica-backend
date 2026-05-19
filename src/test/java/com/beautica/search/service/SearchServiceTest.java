@@ -1,7 +1,11 @@
 package com.beautica.search.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.location.DiscoveryLocationKey;
+import com.beautica.location.DiscoveryLocationResolver;
+import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
 import jakarta.persistence.EntityManager;
@@ -19,12 +23,13 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -36,25 +41,18 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Unit tests for {@link SearchService}.
+ * Unit tests for {@link SearchService} (Phase 10.5 — FK location filter).
  *
- * <p>The {@link EntityManager}, the data {@link Query} and the count {@link Query}
- * are all mocked: tests verify the SQL shape and parameter binding (the surface
+ * <p>The {@link EntityManager}, the data/count {@link Query}s and the
+ * {@link DiscoveryLocationResolver} M2 seam are all mocked: the tests verify
+ * the FK-based SQL shape, parameter binding and label stamping (the surface
  * most likely to regress under copy-paste edits) without booting Hibernate.
- * End-to-end query correctness lives in the repository / integration tests.
+ * End-to-end query correctness lives in {@code SearchIntegrationTest}.
  *
- * <p>{@code SearchService} obtains its EntityManager via {@code @PersistenceContext}
- * (field injection — Spring's documented exception to constructor injection
- * because the framework supplies a transaction-aware proxy at runtime). The
- * service is therefore instantiated manually and the field is wired with
- * {@link ReflectionTestUtils} — {@code @InjectMocks} cannot target an
- * {@code @PersistenceContext} field reliably across Mockito versions.
- *
- * <p>Caching note: this suite instantiates {@link SearchService} directly,
- * bypassing Spring's proxy. {@code @Cacheable} therefore does NOT intercept
- * calls here — every {@code searchMasters} invocation reaches the underlying
- * SQL builder. Cache behaviour is verified end-to-end in
- * {@link com.beautica.search.SearchIntegrationTest}.
+ * <p>{@code SearchService} obtains its EntityManager via
+ * {@code @PersistenceContext} (field injection — Spring's documented
+ * exception). The service is instantiated manually and the field wired with
+ * {@link ReflectionTestUtils}.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("SearchService — unit")
@@ -72,47 +70,61 @@ class SearchServiceTest {
     @Mock
     private SalonRepository salonRepository;
 
+    @Mock
+    private DiscoveryLocationResolver discoveryLocationResolver;
+
     private SearchService service;
 
-    /**
-     * Captures the SQL strings that the service hands to
-     * {@link EntityManager#createNativeQuery(String)}. The first call is the
-     * data query, the second the count query — index 0 / 1 of the captured
-     * list.
-     */
     private ArgumentCaptor<String> sqlCaptor;
 
     @BeforeEach
     void setUp() {
-        service = new SearchService(salonRepository);
+        service = new SearchService(salonRepository, discoveryLocationResolver);
         ReflectionTestUtils.setField(service, "entityManager", entityManager);
         sqlCaptor = ArgumentCaptor.forClass(String.class);
+        // The seam passes through the (cityId, districtId) pair by default;
+        // label resolution returns empty maps unless a test overrides it.
+        lenient().when(discoveryLocationResolver.resolveFilter(any(), any()))
+                .thenAnswer(inv -> {
+                    UUID c = inv.getArgument(0);
+                    UUID d = inv.getArgument(1);
+                    return (c == null && d == null) ? null : new DiscoveryLocationKey(c, d);
+                });
+        lenient().when(discoveryLocationResolver.resolveLabels(any(), any()))
+                .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
     }
 
     private void stubNativeQueries(List<Object[]> rows, long total) {
         when(entityManager.createNativeQuery(sqlCaptor.capture()))
                 .thenReturn(dataQuery, countQuery);
-        // Lenient because the parameter binding surface varies per test: when no
-        // filters are supplied the dynamic builder emits zero bound parameters
-        // beyond limit/offset, leaving these stubs unused. That is the contract
-        // we are verifying (no CAST workaround, no null binding) — strict mode
-        // would falsely flag those tests.
-        lenient().when(dataQuery.setParameter(anyString(), org.mockito.ArgumentMatchers.any())).thenReturn(dataQuery);
+        lenient().when(dataQuery.setParameter(anyString(), any())).thenReturn(dataQuery);
         lenient().when(dataQuery.setParameter(eq("limit"), anyInt())).thenReturn(dataQuery);
         lenient().when(dataQuery.setParameter(eq("offset"), anyLong())).thenReturn(dataQuery);
         when(dataQuery.getResultList()).thenReturn((List) rows);
-        lenient().when(countQuery.setParameter(anyString(), org.mockito.ArgumentMatchers.any())).thenReturn(countQuery);
+        lenient().when(countQuery.setParameter(anyString(), any())).thenReturn(countQuery);
         when(countQuery.getSingleResult()).thenReturn(total);
     }
 
+    private static final UUID CITY_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
+    private static final UUID DISTRICT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
+
     private static MasterSearchRequest emptyRequest() {
-        return new MasterSearchRequest(null, null, null, null, null, null, 0, 20);
+        return new MasterSearchRequest(null, null, null, null, null, 0, 20);
+    }
+
+    private static MasterSearchRequest cityRequest() {
+        return new MasterSearchRequest(
+                new LocationFilter(CITY_ID, null), null, null, null, null, 0, 20);
+    }
+
+    private static MasterSearchRequest districtRequest() {
+        return new MasterSearchRequest(
+                new LocationFilter(CITY_ID, DISTRICT_ID), null, null, null, null, 0, 20);
     }
 
     private static MasterSearchRequest fullRequest() {
         return new MasterSearchRequest(
-                "Київ",
-                "Kyivska",
+                new LocationFilter(CITY_ID, DISTRICT_ID),
                 "manicure",
                 new BigDecimal("100.00"),
                 new BigDecimal("500.00"),
@@ -122,111 +134,150 @@ class SearchServiceTest {
         );
     }
 
-    // ── parameter binding ────────────────────────────────────────────────────
+    // ── FK location filter — district-primary ────────────────────────────────
 
     @Test
-    @DisplayName("binds the city query parameter when a city filter is supplied")
-    void should_bindCityParam_when_cityProvided() {
+    @DisplayName("binds :districtId and uses the discovery-district expression when a district is supplied")
+    void should_bindDistrictId_when_districtProvided() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(
-                new MasterSearchRequest("Київ", null, null, null, null, null, 0, 20),
-                pageable
-        );
+        service.searchMasters(districtRequest(), PageRequest.of(0, 20));
 
-        verify(dataQuery).setParameter("city", "Київ");
-        verify(countQuery).setParameter("city", "Київ");
+        verify(dataQuery).setParameter("districtId", DISTRICT_ID);
+        verify(countQuery).setParameter("districtId", DISTRICT_ID);
+        String dataSql = sqlCaptor.getAllValues().get(0);
+        assertThat(dataSql)
+                .as("district-primary: filter on the salon-or-user discovery district")
+                .contains("COALESCE(sal.district_id, u.district_id) = :districtId")
+                .doesNotContain(":cityId");
     }
 
     @Test
-    @DisplayName("omits the city parameter entirely when no city filter is provided")
-    void should_omitCityParam_when_noCityFilter() {
+    @DisplayName("binds :cityId (city-level widen) when a city is supplied without a district")
+    void should_bindCityId_when_onlyCityProvided() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(emptyRequest(), pageable);
+        service.searchMasters(cityRequest(), PageRequest.of(0, 20));
 
-        // Dynamic-SQL build path: when the value is null we drop the predicate
-        // AND the parameter; this is exactly what restores index pushdown.
-        verify(dataQuery, never()).setParameter(eq("city"), org.mockito.ArgumentMatchers.any());
-        verify(countQuery, never()).setParameter(eq("city"), org.mockito.ArgumentMatchers.any());
+        verify(dataQuery).setParameter("cityId", CITY_ID);
+        String dataSql = sqlCaptor.getAllValues().get(0);
+        assertThat(dataSql)
+                .contains("COALESCE(sal.city_id, u.city_id) = :cityId")
+                .doesNotContain(":districtId");
+    }
+
+    @Test
+    @DisplayName("omits both location parameters entirely when no location filter is provided")
+    void should_omitLocationParams_when_noLocationFilter() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        verify(dataQuery, never()).setParameter(eq("cityId"), any());
+        verify(dataQuery, never()).setParameter(eq("districtId"), any());
         assertThat(sqlCaptor.getAllValues().get(0))
-                .as("data SQL must not reference :city when city filter is absent")
-                .doesNotContain(":city");
+                .doesNotContain(":cityId")
+                .doesNotContain(":districtId");
     }
 
     @Test
-    @DisplayName("binds every filter parameter when the full search request is provided")
-    void should_bindAllFilterParams_when_fullSearchRequest() {
+    @DisplayName("no string-equality city/region filter remains in any generated SQL (Phase 10.5 bug fixed)")
+    void should_notContainFreeTextCityRegionFilter_inAnySql() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(fullRequest(), pageable);
+        service.searchMasters(fullRequest(), PageRequest.of(0, 20));
 
-        verify(dataQuery).setParameter("city", "Київ");
-        verify(dataQuery).setParameter("region", "Kyivska");
-        verify(dataQuery).setParameter("category", "MANICURE");
-        verify(dataQuery).setParameter(eq("minRating"), org.mockito.ArgumentMatchers.any(BigDecimal.class));
-        verify(dataQuery).setParameter("minPrice", new BigDecimal("100.00"));
-        verify(dataQuery).setParameter("maxPrice", new BigDecimal("500.00"));
-        verify(dataQuery).setParameter("limit", 20);
-        verify(dataQuery).setParameter("offset", 0L);
+        for (String sql : sqlCaptor.getAllValues()) {
+            assertThat(sql)
+                    .as("the broken free-text equality filter must be gone")
+                    .doesNotContain("u.city = :city")
+                    .doesNotContain("u.region = :region");
+        }
+    }
+
+    @Test
+    @DisplayName("excludes SALON_ADMIN accounts from master search via a role predicate")
+    void should_excludeSalonAdmin_inGeneratedSql() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        for (String sql : sqlCaptor.getAllValues()) {
+            assertThat(sql)
+                    .as("SALON_ADMIN must never surface in public master discovery")
+                    .contains("u.role <> :excludedRole");
+        }
+        verify(dataQuery).setParameter("excludedRole", "SALON_ADMIN");
+    }
+
+    @Test
+    @DisplayName("always LEFT JOINs salons so an employed SALON_MASTER's locality resolves via the salon link")
+    void should_joinSalonForSalonMasterLocality_inGeneratedSql() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        for (String sql : sqlCaptor.getAllValues()) {
+            assertThat(sql)
+                    .as("salon link is resolved at query time — never denormalised onto the master")
+                    .contains("LEFT JOIN salons sal ON sal.id = m.salon_id");
+        }
+    }
+
+    // ── label resolution via the M2 seam (no N+1) ────────────────────────────
+
+    @Test
+    @DisplayName("stamps resolved cityLabel/districtLabel from the batched M2 seam onto each result")
+    void should_stampResolvedLabels_when_rowsReturned() {
+        UUID masterId = UUID.randomUUID();
+        Object[] row = new Object[]{
+                masterId, "Olena", "Kovalenko",
+                new BigDecimal("4.85"), 42, null,
+                CITY_ID, DISTRICT_ID, new BigDecimal("250.00")
+        };
+        stubNativeQueries(List.<Object[]>of(row), 1L);
+        when(discoveryLocationResolver.resolveLabels(any(), any()))
+                .thenReturn(new DiscoveryLabels(
+                        Map.of(CITY_ID, "Київ"),
+                        Map.of(DISTRICT_ID, "Голосіївський район")));
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        MasterSearchResult mapped = result.getContent().get(0);
+        assertThat(mapped.masterId()).isEqualTo(masterId);
+        assertThat(mapped.cityLabel()).isEqualTo("Київ");
+        assertThat(mapped.districtLabel()).isEqualTo("Голосіївський район");
+        assertThat(mapped.minEffectivePrice()).isEqualTo(new BigDecimal("250.00"));
+        assertThat(mapped.avgRating()).isEqualTo(4.85);
+        assertThat(mapped.reviewCount()).isEqualTo(42);
+        // Exactly one batched resolve for the whole page — never per-row (§E).
+        verify(discoveryLocationResolver, times(1)).resolveLabels(any(), any());
     }
 
     @Test
     @DisplayName("returns an empty page with totalElements 0 when no rows match")
     void should_returnEmptyPage_when_noResultsFound() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), pageable);
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
 
         assertThat(result.isEmpty()).isTrue();
         assertThat(result.getTotalElements()).isZero();
     }
 
-    @Test
-    @DisplayName("parses minEffectivePrice from the BigDecimal aggregate column on each row")
-    void should_computeEffectivePriceFromRow_when_rowContainsBigDecimal() {
-        UUID masterId = UUID.randomUUID();
-        Object[] row = new Object[]{
-                masterId,
-                "Olena",
-                "Kovalenko",
-                "Київ",
-                new BigDecimal("4.85"),
-                42,
-                "https://cdn.example/avatar.jpg",
-                new BigDecimal("250.00")
-        };
-        stubNativeQueries(List.<Object[]>of(row), 1L);
-        Pageable pageable = PageRequest.of(0, 20);
-
-        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), pageable);
-
-        assertThat(result.getContent()).hasSize(1);
-        MasterSearchResult mapped = result.getContent().get(0);
-        assertThat(mapped.minEffectivePrice()).isEqualTo(new BigDecimal("250.00"));
-        assertThat(mapped.avgRating()).isEqualTo(4.85);
-        assertThat(mapped.reviewCount()).isEqualTo(42);
-        assertThat(mapped.masterId()).isEqualTo(masterId);
-    }
-
-    // ── Phase 6.2 carry-over LOWs ──────────────────────────────────────────
+    // ── Phase 6.2 carry-over LOWs (still enforced) ───────────────────────────
 
     @Test
     @DisplayName("throws BusinessException without hitting the DB when minPrice exceeds maxPrice")
     void should_throwBusinessException_when_minPriceExceedsMaxPrice() {
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null,
+                null, null,
                 new BigDecimal("500.00"),
                 new BigDecimal("100.00"),
                 null, 0, 20
         );
-        Pageable pageable = PageRequest.of(0, 20);
 
-        assertThatThrownBy(() -> service.searchMasters(request, pageable))
+        assertThatThrownBy(() -> service.searchMasters(request, PageRequest.of(0, 20)))
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("minPrice must not exceed maxPrice");
 
@@ -237,80 +288,61 @@ class SearchServiceTest {
     @DisplayName("upper-cases category so the bound value matches the EnumType.STRING storage form")
     void should_normalizeCategoryCase_before_bindingParameter() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, "manicure", null, null, null, 0, 20
-        );
+                null, "manicure", null, null, null, 0, 20);
 
-        service.searchMasters(request, pageable);
+        service.searchMasters(request, PageRequest.of(0, 20));
 
         verify(dataQuery).setParameter("category", "MANICURE");
         verify(countQuery).setParameter("category", "MANICURE");
     }
 
     @Test
-    @DisplayName("normalises BigDecimal minRating to scale 2 before binding (consistent NUMERIC(3,2) comparison)")
-    void should_convertDoubleMinRatingToBigDecimal_before_binding() {
+    @DisplayName("normalises BigDecimal minRating to scale 2 before binding")
+    void should_convertMinRatingToScaleTwo_before_binding() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null, null, null, new BigDecimal("4.5"), 0, 20
-        );
+                null, null, null, null, new BigDecimal("4.5"), 0, 20);
 
-        service.searchMasters(request, pageable);
+        service.searchMasters(request, PageRequest.of(0, 20));
 
         ArgumentCaptor<Object> captor = ArgumentCaptor.forClass(Object.class);
         verify(dataQuery, times(1)).setParameter(eq("minRating"), captor.capture());
         Object bound = captor.getValue();
         assertThat(bound).isInstanceOf(BigDecimal.class);
-        BigDecimal scaled = (BigDecimal) bound;
-        assertThat(scaled.scale()).isEqualTo(2);
-        assertThat(scaled).isEqualTo(new BigDecimal("4.50"));
+        assertThat(((BigDecimal) bound).scale()).isEqualTo(2);
+        assertThat((BigDecimal) bound).isEqualTo(new BigDecimal("4.50"));
     }
 
-    // ── Phase 6.3 active-flag filtering ────────────────────────────────────
+    // ── Phase 6.3 active-flag filtering ──────────────────────────────────────
 
-    /**
-     * Smoke test guarding against accidental removal of the active-flag predicates
-     * from the master-search SQL. Both the data and count SQL must filter out
-     * deactivated masters and disabled user accounts so a public search cannot
-     * leak hidden profiles. Behavioural coverage (real Postgres) lives in
-     * SearchIntegrationTest.
-     */
     @Test
     @DisplayName("master-search SQL filters on m.is_active = true and u.is_active = true")
     void should_filterByIsActiveTrue_inGeneratedSql() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(emptyRequest(), pageable);
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
 
         List<String> sqls = sqlCaptor.getAllValues();
         assertThat(sqls).hasSize(2);
         for (String sql : sqls) {
             assertThat(sql)
-                    .as("generated SQL must guard public search against inactive rows")
                     .contains("m.is_active = true")
                     .contains("u.is_active = true");
         }
     }
 
-    // ── Phase 6.5 dynamic SQL — JOIN elision and count branching ───────────
+    // ── Phase 6.5 dynamic SQL — JOIN elision and count branching ─────────────
 
     @Test
     @DisplayName("omits master_services / service_definitions JOIN when no category or price filter")
     void should_omitServiceJoin_when_noCategoryOrPriceFilter() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(
-                new MasterSearchRequest("Київ", null, null, null, null, null, 0, 20),
-                pageable
-        );
+        service.searchMasters(cityRequest(), PageRequest.of(0, 20));
 
         for (String sql : sqlCaptor.getAllValues()) {
             assertThat(sql)
-                    .as("no category or price filter — service join is dead weight")
                     .doesNotContain("master_services")
                     .doesNotContain("service_definitions");
         }
@@ -320,12 +352,10 @@ class SearchServiceTest {
     @DisplayName("includes master_services / service_definitions JOIN when category filter is set")
     void should_includeServiceJoin_when_categoryFilterSet() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
         service.searchMasters(
-                new MasterSearchRequest(null, null, "MANICURE", null, null, null, 0, 20),
-                pageable
-        );
+                new MasterSearchRequest(null, "MANICURE", null, null, null, 0, 20),
+                PageRequest.of(0, 20));
 
         String dataSql = sqlCaptor.getAllValues().get(0);
         assertThat(dataSql)
@@ -338,13 +368,11 @@ class SearchServiceTest {
     @DisplayName("count query is a flat COUNT(DISTINCT m.id) when no price filter is set")
     void should_emitFlatCountQuery_when_noPriceFilter() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(emptyRequest(), pageable);
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
 
         String countSql = sqlCaptor.getAllValues().get(1);
         assertThat(countSql)
-                .as("no price filter — count must be flat, no GROUP BY / HAVING / subquery wrap")
                 .contains("COUNT(DISTINCT m.id)")
                 .doesNotContain("HAVING")
                 .doesNotContain("FROM (");
@@ -354,19 +382,16 @@ class SearchServiceTest {
     @DisplayName("count query wraps the GROUP BY + HAVING in a subquery when a price filter is set")
     void should_emitWrappedCountQuery_when_priceFilterSet() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
         service.searchMasters(
-                new MasterSearchRequest(null, null, null,
+                new MasterSearchRequest(null, null,
                         new BigDecimal("100.00"),
                         new BigDecimal("500.00"),
                         null, 0, 20),
-                pageable
-        );
+                PageRequest.of(0, 20));
 
         String countSql = sqlCaptor.getAllValues().get(1);
         assertThat(countSql)
-                .as("price filter present — count must respect HAVING via subquery wrapper")
                 .contains("SELECT COUNT(*) FROM (")
                 .contains("GROUP BY m.id")
                 .contains("HAVING")
@@ -377,24 +402,20 @@ class SearchServiceTest {
     @DisplayName("does NOT use CAST(:p AS VARCHAR) workarounds in any generated SQL")
     void should_notUseCastWorkaround_inAnyGeneratedSql() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(fullRequest(), pageable);
+        service.searchMasters(fullRequest(), PageRequest.of(0, 20));
 
         for (String sql : sqlCaptor.getAllValues()) {
-            assertThat(sql)
-                    .as("CAST workaround defeats index pushdown — must be eliminated")
-                    .doesNotContain("CAST(:");
+            assertThat(sql).doesNotContain("CAST(:");
         }
     }
 
     @Test
-    @DisplayName("ORDER BY includes m.id as the deterministic tie-breaker (matches idx_masters_active_rating)")
+    @DisplayName("ORDER BY includes m.id as the deterministic tie-breaker")
     void should_orderByRatingThenId_when_dataQueryIssued() {
         stubNativeQueries(List.of(), 0L);
-        Pageable pageable = PageRequest.of(0, 20);
 
-        service.searchMasters(emptyRequest(), pageable);
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
 
         String dataSql = sqlCaptor.getAllValues().get(0);
         assertThat(dataSql).contains("ORDER BY m.avg_rating DESC NULLS LAST, m.id");

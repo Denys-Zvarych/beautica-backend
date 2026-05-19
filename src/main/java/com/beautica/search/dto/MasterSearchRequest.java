@@ -1,5 +1,6 @@
 package com.beautica.search.dto;
 
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
@@ -26,12 +27,21 @@ import java.math.BigDecimal;
  * method validation is required because Bean Validation does not run on plain
  * {@code @RequestParam} method parameters by default.</p>
  *
+ * <p><b>Phase 10.5 breaking change:</b> the legacy free-text {@code city} /
+ * {@code region} query params are <b>removed</b> and replaced by the
+ * structured {@link LocationFilter} object ({@code location.cityId} /
+ * {@code location.districtId}). This is an intended, documented pre-launch
+ * breaking change to the search contract (there are no real clients yet); the
+ * old exact string-equality location filter was a real bug ("Київ" ≠ "Киев").
+ * The {@code @Valid} cascade lets the nested object grow additively in Part B
+ * (M3) without reshaping this request again.</p>
+ *
  * <p><b>Field-by-field rationale:</b></p>
  * <ul>
- *   <li>{@code city}, {@code region} — bounded to 100 chars to mirror the
- *       {@code users.city VARCHAR(100)} / {@code users.region VARCHAR(100)}
- *       columns added in V35. Control-character pattern blocks log injection
- *       and obviously malformed inputs.</li>
+ *   <li>{@code location} — structured FK-based locality filter; see
+ *       {@link LocationFilter}. {@code @Valid} cascades Bean Validation into
+ *       the nested record. Optional: a {@code null} location means "no
+ *       location filter".</li>
  *   <li>{@code category} — kept as a free {@code String} (max 100, mirroring
  *       {@code service_definitions.category VARCHAR(100)} from V6) rather than
  *       binding straight to the {@code ServiceCategory} enum. Enum binding
@@ -62,13 +72,8 @@ import java.math.BigDecimal;
  */
 public record MasterSearchRequest(
 
-        @Size(max = 100)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
-        String city,
-
-        @Size(max = 100)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
-        String region,
+        @Valid
+        LocationFilter location,
 
         @Size(max = 100)
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
