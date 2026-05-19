@@ -131,3 +131,383 @@ jobs:
           git reset -q --hard "$BASE_SHA"
 
           echo "All self-test scenarios passed."
+
+  check-migration-version-monotonicity:
+    name: Check Migration Version Monotonicity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # REQUIRED: full history so the three-dot merge-base diff
+          # ("$BASE_SHA...HEAD") and "git ls-tree $BASE_SHA" can resolve.
+          # Do not lower this.
+          fetch-depth: 0
+
+      - name: Enforce monotonic, non-duplicate Flyway versions
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # =========================================================
+          # SHARED PARSE+GATE LOGIC -- keep this block BYTE-IDENTICAL
+          # with the mirror in `self-test-version-monotonicity-gate`
+          # so a typo or semantic drift in one place is caught by the
+          # hermetic self-test before it can ship.
+          # =========================================================
+          #
+          # Parse a Flyway *versioned* migration filename into a
+          # normalized, zero-padded, dot-joined numeric key suitable
+          # for plain string comparison.  Flyway version grammar:
+          # leading 'V', then the version, then '__', then the
+          # description.  Within the version, '.' and '_' are
+          # interchangeable segment separators (V2_1 == V2.1) and each
+          # segment is a non-negative integer.  Every segment is
+          # zero-padded to 10 digits, so a lexical compare of two keys
+          # equals Flyway's numeric, segment-wise ordering -- this is
+          # exactly what makes V9 (...0009) sort BEFORE V10 (...0010)
+          # instead of the wrong lexical "10" < "9".  Repeatable (R__)
+          # and any non-versioned file yields an empty key so callers
+          # skip it (Flyway does not order repeatables by version).
+          parse_version_key() {
+            local name="$1"
+            local base="${name##*/}"
+            case "$base" in
+              V*__*.sql) : ;;
+              *) printf '' ; return 0 ;;
+            esac
+            local ver="${base#V}"
+            ver="${ver%%__*}"
+            case "$ver" in
+              ''|*[!0-9._]*) printf '' ; return 0 ;;
+            esac
+            local key="" seg rest="$ver"
+            rest="${rest//_/.}"
+            local IFS=.
+            for seg in $rest; do
+              [ -z "$seg" ] && seg=0
+              key="${key}.$(printf '%010d' "$((10#$seg))")"
+            done
+            printf '%s' "${key#.}"
+          }
+
+          # Run the monotonicity + duplicate gate for a merge-base SHA.
+          # Pure git + shell, NO database.  Returns 0 on pass, 1 on
+          # violation, and prints a developer-facing diagnostic naming
+          # the offending file(s) and the conflicting/blocking version.
+          run_version_gate() {
+            local base_sha="$1"
+            local added_file added_key blocking_key="" blocking_file=""
+            local violations=0 k
+
+            # Highest migration version already present at the
+            # merge-base (the state that is effectively already
+            # merged on the base branch).
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              k="$(parse_version_key "$f")"
+              [ -z "$k" ] && continue
+              if [ -z "$blocking_key" ] || [ "$k" \> "$blocking_key" ]; then
+                blocking_key="$k"
+                blocking_file="$f"
+              fi
+            done <<EOF
+          $(git ls-tree -r --name-only "$base_sha" -- "$MIGRATION_PATH" 2>/dev/null || true)
+          EOF
+
+            # Files ADDED on this branch relative to the merge-base.
+            # Use --name-only (no status column) so filenames containing
+            # whitespace are NOT truncated by an awk field split -- a
+            # migration added as 'V5__has space.sql' must still reach
+            # parse_version_key intact and be evaluated by the gate.
+            local added_list
+            added_list="$(git diff --name-only --diff-filter=A "${base_sha}...HEAD" -- "$MIGRATION_PATH")"
+
+            # (1)+(2) Monotonicity: every newly-added version must be
+            # strictly greater than the highest already-merged version.
+            while IFS= read -r added_file; do
+              [ -z "$added_file" ] && continue
+              added_key="$(parse_version_key "$added_file")"
+              [ -z "$added_key" ] && continue
+              if [ -n "$blocking_key" ] && { [ "$added_key" \< "$blocking_key" ] || [ "$added_key" = "$blocking_key" ]; }; then
+                echo "ERROR: new migration '$added_file' has a version <= the highest"
+                echo "       already-merged migration. Flyway runs with out-of-order"
+                echo "       DISABLED, so this would fail 'flyway validate' at app startup."
+                echo "       blocked by already-merged: '$blocking_file'"
+                echo "       Renumber your migration ABOVE the current highest version."
+                violations=1
+              fi
+            done <<EOF
+          $added_list
+          EOF
+
+            # (3) No duplicate versions across the full HEAD set
+            # (existing + newly added). Two files mapping to the same
+            # parsed version key collide in Flyway's version space.
+            local dup
+            dup="$(
+              git ls-tree -r --name-only HEAD -- "$MIGRATION_PATH" 2>/dev/null \
+                | while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    k="$(parse_version_key "$f")"
+                    [ -z "$k" ] && continue
+                    printf '%s\t%s\n' "$k" "$f"
+                  done \
+                | sort \
+                | awk -F'\t' '{ if ($1==prev) { print prevf; print $2 } prev=$1; prevf=$2 }' \
+                | sort -u
+            )"
+            if [ -n "$dup" ]; then
+              echo "ERROR: two Flyway migrations share the same parsed version:"
+              echo "$dup"
+              echo "       Each migration version must be unique."
+              violations=1
+            fi
+
+            return "$violations"
+          }
+          # =========================================================
+          # END SHARED PARSE+GATE LOGIC
+          # =========================================================
+
+          if run_version_gate "$BASE_SHA"; then
+            echo "Flyway migration versions are monotonic and unique. Check passed."
+            exit 0
+          fi
+
+          echo ""
+          echo "Out-of-order or duplicate Flyway migration version detected."
+          echo "Flyway in this project validates with out-of-order DISABLED;"
+          echo "an out-of-order or duplicate version passes file-immutability"
+          echo "but FAILS 'flyway validate' on the next deploy."
+          echo "Rebase onto the base branch and renumber above the highest version."
+          exit 1
+
+  self-test-version-monotonicity-gate:
+    name: Self-test Version Monotonicity Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Assert version gate fails on out-of-order / duplicate and passes on clean / new-highest
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # =========================================================
+          # SHARED PARSE+GATE LOGIC -- keep this block BYTE-IDENTICAL
+          # with the mirror in `self-test-version-monotonicity-gate`
+          # so a typo or semantic drift in one place is caught by the
+          # hermetic self-test before it can ship.
+          # =========================================================
+          #
+          # Parse a Flyway *versioned* migration filename into a
+          # normalized, zero-padded, dot-joined numeric key suitable
+          # for plain string comparison.  Flyway version grammar:
+          # leading 'V', then the version, then '__', then the
+          # description.  Within the version, '.' and '_' are
+          # interchangeable segment separators (V2_1 == V2.1) and each
+          # segment is a non-negative integer.  Every segment is
+          # zero-padded to 10 digits, so a lexical compare of two keys
+          # equals Flyway's numeric, segment-wise ordering -- this is
+          # exactly what makes V9 (...0009) sort BEFORE V10 (...0010)
+          # instead of the wrong lexical "10" < "9".  Repeatable (R__)
+          # and any non-versioned file yields an empty key so callers
+          # skip it (Flyway does not order repeatables by version).
+          parse_version_key() {
+            local name="$1"
+            local base="${name##*/}"
+            case "$base" in
+              V*__*.sql) : ;;
+              *) printf '' ; return 0 ;;
+            esac
+            local ver="${base#V}"
+            ver="${ver%%__*}"
+            case "$ver" in
+              ''|*[!0-9._]*) printf '' ; return 0 ;;
+            esac
+            local key="" seg rest="$ver"
+            rest="${rest//_/.}"
+            local IFS=.
+            for seg in $rest; do
+              [ -z "$seg" ] && seg=0
+              key="${key}.$(printf '%010d' "$((10#$seg))")"
+            done
+            printf '%s' "${key#.}"
+          }
+
+          # Run the monotonicity + duplicate gate for a merge-base SHA.
+          # Pure git + shell, NO database.  Returns 0 on pass, 1 on
+          # violation, and prints a developer-facing diagnostic naming
+          # the offending file(s) and the conflicting/blocking version.
+          run_version_gate() {
+            local base_sha="$1"
+            local added_file added_key blocking_key="" blocking_file=""
+            local violations=0 k
+
+            # Highest migration version already present at the
+            # merge-base (the state that is effectively already
+            # merged on the base branch).
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              k="$(parse_version_key "$f")"
+              [ -z "$k" ] && continue
+              if [ -z "$blocking_key" ] || [ "$k" \> "$blocking_key" ]; then
+                blocking_key="$k"
+                blocking_file="$f"
+              fi
+            done <<EOF
+          $(git ls-tree -r --name-only "$base_sha" -- "$MIGRATION_PATH" 2>/dev/null || true)
+          EOF
+
+            # Files ADDED on this branch relative to the merge-base.
+            # Use --name-only (no status column) so filenames containing
+            # whitespace are NOT truncated by an awk field split -- a
+            # migration added as 'V5__has space.sql' must still reach
+            # parse_version_key intact and be evaluated by the gate.
+            local added_list
+            added_list="$(git diff --name-only --diff-filter=A "${base_sha}...HEAD" -- "$MIGRATION_PATH")"
+
+            # (1)+(2) Monotonicity: every newly-added version must be
+            # strictly greater than the highest already-merged version.
+            while IFS= read -r added_file; do
+              [ -z "$added_file" ] && continue
+              added_key="$(parse_version_key "$added_file")"
+              [ -z "$added_key" ] && continue
+              if [ -n "$blocking_key" ] && { [ "$added_key" \< "$blocking_key" ] || [ "$added_key" = "$blocking_key" ]; }; then
+                echo "ERROR: new migration '$added_file' has a version <= the highest"
+                echo "       already-merged migration. Flyway runs with out-of-order"
+                echo "       DISABLED, so this would fail 'flyway validate' at app startup."
+                echo "       blocked by already-merged: '$blocking_file'"
+                echo "       Renumber your migration ABOVE the current highest version."
+                violations=1
+              fi
+            done <<EOF
+          $added_list
+          EOF
+
+            # (3) No duplicate versions across the full HEAD set
+            # (existing + newly added). Two files mapping to the same
+            # parsed version key collide in Flyway's version space.
+            local dup
+            dup="$(
+              git ls-tree -r --name-only HEAD -- "$MIGRATION_PATH" 2>/dev/null \
+                | while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    k="$(parse_version_key "$f")"
+                    [ -z "$k" ] && continue
+                    printf '%s\t%s\n' "$k" "$f"
+                  done \
+                | sort \
+                | awk -F'\t' '{ if ($1==prev) { print prevf; print $2 } prev=$1; prevf=$2 }' \
+                | sort -u
+            )"
+            if [ -n "$dup" ]; then
+              echo "ERROR: two Flyway migrations share the same parsed version:"
+              echo "$dup"
+              echo "       Each migration version must be unique."
+              violations=1
+            fi
+
+            return "$violations"
+          }
+          # =========================================================
+          # END SHARED PARSE+GATE LOGIC
+          # =========================================================
+
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "CI Self Test"
+
+          mkdir -p "$MIGRATION_PATH"
+          printf 'CREATE TABLE a (id int);\n' > "$MIGRATION_PATH/V1__a.sql"
+          printf 'CREATE TABLE b (id int);\n' > "$MIGRATION_PATH/V9__b.sql"
+          printf 'CREATE TABLE c (id int);\n' > "$MIGRATION_PATH/V10__c.sql"
+          git add -A
+          git commit -q -m "base: V1, V9, V10 (max merged = V10)"
+          BASE_SHA="$(git rev-parse HEAD)"
+          git switch -q -c feature
+
+          fail() { echo "SELF-TEST FAILED: $1"; exit 1; }
+
+          # --- Scenario 1: clean diff (no migration changes) -> pass ---
+          git commit -q --allow-empty -m "no migration changes"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "clean diff should pass (exit 0)"
+          echo "OK: clean diff passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 2: new HIGHEST version (V11) -> pass ---
+          printf 'CREATE TABLE d (id int);\n' > "$MIGRATION_PATH/V11__d.sql"
+          git add -A && git commit -q -m "add V11"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "new highest version should pass (exit 0)"
+          echo "OK: new highest version (V11) passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 3: new version LOWER than merged max (V5 < V10) -> fail ---
+          printf 'CREATE TABLE e (id int);\n' > "$MIGRATION_PATH/V5__e.sql"
+          git add -A && git commit -q -m "add V5 behind merged V10"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "version <= merged max should fail (exit 1)"; fi
+          echo "OK: lower version (V5 < merged V10) fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 4: new version EQUAL to merged max (V10) -> fail ---
+          printf 'CREATE TABLE f (id int);\n' > "$MIGRATION_PATH/V10__dup.sql"
+          git add -A && git commit -q -m "add V10 duplicate"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "duplicate of merged max should fail (exit 1)"; fi
+          echo "OK: duplicate version (V10 == merged V10) fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 5: numeric (not lexical) ordering V9 vs V10 ---
+          # Lexically "9" > "10"; numerically 9 < 10. A genuinely new
+          # V9 added after merged V10 must FAIL -> proves numeric compare.
+          git rm -q "$MIGRATION_PATH/V9__b.sql"
+          git commit -q -m "drop V9 so the re-add is a genuine add"
+          printf 'CREATE TABLE g (id int);\n' > "$MIGRATION_PATH/V9__g.sql"
+          git add -A && git commit -q -m "re-add V9 after merged V10 exists"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "V9 after merged V10 must fail numerically (exit 1)"; fi
+          echo "OK: numeric ordering enforced (V9 < V10, not lexical)"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 6: two NEW files above max sharing a version -> fail ---
+          printf 'x\n' > "$MIGRATION_PATH/V20__x.sql"
+          printf 'y\n' > "$MIGRATION_PATH/V20__y.sql"
+          git add -A && git commit -q -m "two new files both V20"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "two new files sharing a version should fail (exit 1)"; fi
+          echo "OK: duplicate among newly-added files fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 7: dotted/underscore version above max (V10_1) -> pass ---
+          printf 'z\n' > "$MIGRATION_PATH/V10_1__patch.sql"
+          git add -A && git commit -q -m "add V10_1 patch (> V10)"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "V10_1 (> V10) should pass (exit 0)"
+          echo "OK: dotted version V10_1 > V10 passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 8: non-versioned repeatable migration added -> pass ---
+          printf 'r\n' > "$MIGRATION_PATH/R__refresh_view.sql"
+          git add -A && git commit -q -m "add repeatable migration"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "repeatable (R__) migration should be ignored (exit 0)"
+          echo "OK: repeatable (R__) migration ignored"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 9: spaced filename out-of-order (V5 < V10) -> fail ---
+          # A filename containing a space must NOT be truncated by the
+          # added-file extraction; it must reach parse_version_key whole
+          # so an out-of-order spaced migration still FAILS the gate.
+          printf 'CREATE TABLE h (id int);\n' > "$MIGRATION_PATH/V5__has space.sql"
+          git add -A && git commit -q -m "add spaced V5 behind merged V10"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "spaced out-of-order migration must fail (exit 1)"; fi
+          echo "OK: spaced out-of-order migration (V5__has space.sql < V10) fails"
+          git reset -q --hard "$BASE_SHA"
+
+          echo "All version-monotonicity self-test scenarios passed."
