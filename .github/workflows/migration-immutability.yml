@@ -10,6 +10,7 @@ jobs:
   check-migration-immutability:
     name: Check Migration Immutability
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -25,23 +26,50 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
+
           MIGRATION_PATH="src/main/resources/db/migration"
 
-          # Collect files that are Modified (M), Deleted (D), Renamed (R),
-          # Copied (C), or Type-changed (T) relative to the PR merge-base.
-          # The three-dot form ("$BASE_SHA...HEAD") diffs against the
-          # merge-base of the two tips rather than the raw base tip, so
-          # advances on the base branch never attribute base-side mutations
-          # to this PR.  Added (A) files are intentionally excluded so
-          # brand-new migrations always pass.  Renamed migrations are caught
-          # because Flyway uses the script name as part of its checksum
-          # identity -- a rename changes that identity and will fail
-          # validation in prod.  C and T are practically unreachable for
-          # text V*.sql migrations but are included for defensive
-          # completeness (zero behaviour change for normal new-file adds).
+          # >>> SHARED-BLOCK:immutability:BEGIN
+          # =========================================================
+          # SHARED IMMUTABILITY GATE LOGIC -- keep this block
+          # BYTE-IDENTICAL with the mirror in
+          # `self-test-immutability-gate`. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift, so a typo or a dropped
+          # filter letter in one place is caught before it can ship.
+          # =========================================================
+          #
+          # Collect files that are Modified (M), Deleted (D), Renamed
+          # (R), Copied (C), or Type-changed (T) relative to the PR
+          # merge-base. The three-dot form ("$base_sha...HEAD") diffs
+          # against the merge-base of the two tips rather than the raw
+          # base tip, so advances on the base branch never attribute
+          # base-side mutations to this PR.  Added (A) files are
+          # intentionally excluded so brand-new migrations always pass.
+          # Renamed migrations are caught because Flyway uses the
+          # script name as part of its checksum identity -- a rename
+          # changes that identity and will fail validation in prod.
+          # C and T are practically unreachable for text V*.sql
+          # migrations but are included for defensive completeness
+          # (zero behaviour change for normal new-file adds).
+          run_gate() {
+            local base_sha="$1"
+            local changed
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            if [ -z "$changed" ]; then
+              return 0
+            fi
+            return 1
+          }
+          # =========================================================
+          # END SHARED IMMUTABILITY GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:immutability:END
+
           CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- "$MIGRATION_PATH")
 
-          if [ -z "$CHANGED" ]; then
+          if run_gate "$BASE_SHA"; then
             echo "No existing migration files were modified, deleted, or renamed. Check passed."
             exit 0
           fi
@@ -58,6 +86,7 @@ jobs:
   self-test-immutability-gate:
     name: Self-test Immutability Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -68,9 +97,29 @@ jobs:
 
           MIGRATION_PATH="src/main/resources/db/migration"
 
-          # Mirror of the production gate logic. Keep this byte-identical to
-          # the diff invocation in `check-migration-immutability` so a typo
-          # or a dropped filter letter in one place is caught here.
+          # >>> SHARED-BLOCK:immutability:BEGIN
+          # =========================================================
+          # SHARED IMMUTABILITY GATE LOGIC -- keep this block
+          # BYTE-IDENTICAL with the mirror in
+          # `self-test-immutability-gate`. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift, so a typo or a dropped
+          # filter letter in one place is caught before it can ship.
+          # =========================================================
+          #
+          # Collect files that are Modified (M), Deleted (D), Renamed
+          # (R), Copied (C), or Type-changed (T) relative to the PR
+          # merge-base. The three-dot form ("$base_sha...HEAD") diffs
+          # against the merge-base of the two tips rather than the raw
+          # base tip, so advances on the base branch never attribute
+          # base-side mutations to this PR.  Added (A) files are
+          # intentionally excluded so brand-new migrations always pass.
+          # Renamed migrations are caught because Flyway uses the
+          # script name as part of its checksum identity -- a rename
+          # changes that identity and will fail validation in prod.
+          # C and T are practically unreachable for text V*.sql
+          # migrations but are included for defensive completeness
+          # (zero behaviour change for normal new-file adds).
           run_gate() {
             local base_sha="$1"
             local changed
@@ -80,6 +129,10 @@ jobs:
             fi
             return 1
           }
+          # =========================================================
+          # END SHARED IMMUTABILITY GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:immutability:END
 
           WORK="$(mktemp -d)"
           cd "$WORK"
@@ -89,8 +142,9 @@ jobs:
 
           mkdir -p "$MIGRATION_PATH"
           printf 'CREATE TABLE existing (id int);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          printf 'CREATE TABLE other (id int);\n' > "$MIGRATION_PATH/V2__other.sql"
           git add -A
-          git commit -q -m "base: existing migration"
+          git commit -q -m "base: existing migrations"
           BASE_SHA="$(git rev-parse HEAD)"
           git switch -q -c feature
 
@@ -103,7 +157,7 @@ jobs:
           git reset -q --hard "$BASE_SHA"
 
           # --- Scenario 2: pure add of a new migration -> exit 0 ---
-          printf 'CREATE TABLE new_table (id int);\n' > "$MIGRATION_PATH/V2__new.sql"
+          printf 'CREATE TABLE new_table (id int);\n' > "$MIGRATION_PATH/V3__new.sql"
           git add -A && git commit -q -m "add new migration"
           run_gate "$BASE_SHA" || fail "add-only diff should pass (exit 0)"
           echo "OK: add-only diff passes"
@@ -117,17 +171,89 @@ jobs:
           git reset -q --hard "$BASE_SHA"
 
           # --- Scenario 4: DELETE an existing migration -> exit 1 ---
+          # Exercises the 'D' filter letter explicitly. Scenario 5 (a
+          # real rename) yields 'R', not 'D', so this scenario is the
+          # sole dedicated 'D' coverage and must stay.
           git rm -q "$MIGRATION_PATH/V1__existing.sql"
           git commit -q -m "delete existing migration"
           if run_gate "$BASE_SHA"; then fail "deleted migration should fail (exit 1)"; fi
           echo "OK: deleted migration fails"
           git reset -q --hard "$BASE_SHA"
 
-          # --- Scenario 5: RENAME an existing migration -> exit 1 ---
+          # --- Scenario 5: real RENAME (status 'R') of an existing
+          # migration -> exit 1 ---
+          # `git config diff.renames true` makes git emit a true 'R'
+          # status (instead of the config-less D+A pair, which would
+          # only ever exercise the 'D' path and silently leave the 'R'
+          # filter letter untested). This scenario genuinely exercises
+          # the 'R' letter in --diff-filter=MDRCT. Identical file
+          # content + a pure path change is the textbook rename git
+          # detects as R100.
+          git config diff.renames true
           git mv "$MIGRATION_PATH/V1__existing.sql" "$MIGRATION_PATH/V1__existing_renamed.sql"
           git commit -q -m "rename existing migration"
+          # Sanity: prove git actually reports an 'R' status here, so a
+          # future git/config change that downgrades it to D+A is loud.
+          git diff --name-status --diff-filter=R "$BASE_SHA...HEAD" -- "$MIGRATION_PATH" \
+            | grep -q '^R' || fail "scenario 5 expected a real 'R' status but git produced none"
           if run_gate "$BASE_SHA"; then fail "renamed migration should fail (exit 1)"; fi
-          echo "OK: renamed migration fails"
+          echo "OK: real renamed (R) migration fails"
+          git config --unset diff.renames
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 6: COPY (status 'C') of an existing migration
+          # -> exit 1 ---
+          # `git config diff.renames copies` enables copy detection.
+          # NOTE: a *pure* copy of an unmodified file is reported by
+          # `git diff` (without the expensive --find-copies-harder,
+          # which the gate deliberately does NOT pass) as a plain 'A'
+          # add -- and that is intentionally allowed: a duplicated-
+          # content file under a NEW Flyway version is a legitimate new
+          # migration; version collisions are the monotonicity job's
+          # concern, not immutability's. git only emits a real 'C'
+          # status with the default diff when the copy SOURCE is also
+          # modified. So this scenario copies an existing migration AND
+          # mutates the original in the same commit: the gate then sees
+          # both 'M' (the source mutation) and 'C100', genuinely
+          # exercising the 'C' filter letter, and must fail (exit 1).
+          git config diff.renames copies
+          cp "$MIGRATION_PATH/V1__existing.sql" "$MIGRATION_PATH/V1__existing_copy.sql"
+          printf 'CREATE TABLE existing (id int, copied text);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "copy existing migration AND modify the source"
+          # Sanity: prove git actually reports a 'C' status here using
+          # the SAME diff invocation the gate uses (no --find-copies-
+          # harder), so a future git/config change is loud.
+          git diff --name-status --diff-filter=C "$BASE_SHA...HEAD" -- "$MIGRATION_PATH" \
+            | grep -q '^C' || fail "scenario 6 expected a real 'C' status but git produced none"
+          if run_gate "$BASE_SHA"; then fail "copied migration should fail (exit 1)"; fi
+          echo "OK: copied (C) migration fails"
+          git config --unset diff.renames
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 7: TYPE-CHANGE (status 'T') of an existing
+          # migration -> exit 1 ---
+          # Replace an existing regular-file V*.sql with a symlink of
+          # the same name. git reports this as a 'T' (type changed)
+          # status. Exercises the 'T' filter letter.
+          rm "$MIGRATION_PATH/V1__existing.sql"
+          ln -s /dev/null "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "type-change existing migration to symlink"
+          # Sanity: prove git actually reports a 'T' status here.
+          git diff --name-status --diff-filter=T "$BASE_SHA...HEAD" -- "$MIGRATION_PATH" \
+            | grep -q '^T' || fail "scenario 7 expected a real 'T' status but git produced none"
+          if run_gate "$BASE_SHA"; then fail "type-changed migration should fail (exit 1)"; fi
+          echo "OK: type-changed (T) migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 8: MIXED add + modify in one commit -> exit 1 ---
+          # A single commit that adds a brand-new V*.sql AND edits an
+          # already-merged one. Proves a legitimate new migration does
+          # NOT mask a co-located mutation of an existing migration.
+          printf 'CREATE TABLE mixed_new (id int);\n' > "$MIGRATION_PATH/V4__mixed_new.sql"
+          printf 'CREATE TABLE existing (id int, mixed text);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "add new migration AND modify existing in one commit"
+          if run_gate "$BASE_SHA"; then fail "mixed add+modify should fail (exit 1)"; fi
+          echo "OK: mixed add+modify fails (new add does not mask the modify)"
           git reset -q --hard "$BASE_SHA"
 
           echo "All self-test scenarios passed."
@@ -135,6 +261,7 @@ jobs:
   check-migration-version-monotonicity:
     name: Check Migration Version Monotonicity
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -155,11 +282,14 @@ jobs:
 
           MIGRATION_PATH="src/main/resources/db/migration"
 
+          # >>> SHARED-BLOCK:monotonicity:BEGIN
           # =========================================================
           # SHARED PARSE+GATE LOGIC -- keep this block BYTE-IDENTICAL
           # with the mirror in `self-test-version-monotonicity-gate`
           # so a typo or semantic drift in one place is caught by the
-          # hermetic self-test before it can ship.
+          # hermetic self-test before it can ship. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift.
           # =========================================================
           #
           # Parse a Flyway *versioned* migration filename into a
@@ -187,12 +317,19 @@ jobs:
             case "$ver" in
               ''|*[!0-9._]*) printf '' ; return 0 ;;
             esac
-            local key="" seg rest="$ver"
+            local key="" seg pad rest="$ver"
             rest="${rest//_/.}"
             local IFS=.
             for seg in $rest; do
               [ -z "$seg" ] && seg=0
-              key="${key}.$(printf '%010d' "$((10#$seg))")"
+              # ACCEPTED LIMITATION (INFO): "10#$seg" forces base-10 so
+              # a leading-zero segment is not parsed as octal. It still
+              # overflows a 64-bit signed integer for a >=19-digit (and
+              # certainly any >=26-digit) segment. Unreachable for real
+              # Flyway versions, which are small integers -- documented,
+              # not silently relied upon.
+              printf -v pad '%010d' "$((10#$seg))"
+              key="${key}.${pad}"
             done
             printf '%s' "${key#.}"
           }
@@ -226,6 +363,11 @@ jobs:
             # whitespace are NOT truncated by an awk field split -- a
             # migration added as 'V5__has space.sql' must still reach
             # parse_version_key intact and be evaluated by the gate.
+            # ACCEPTED LIMITATION (INFO): --name-only would still split
+            # on an *embedded newline* inside a filename (the read loop
+            # is newline-delimited). Unreachable for Flyway filenames,
+            # whose grammar forbids newlines -- documented, not relied
+            # upon silently.
             local added_list
             added_list="$(git diff --name-only --diff-filter=A "${base_sha}...HEAD" -- "$MIGRATION_PATH")"
 
@@ -275,6 +417,7 @@ jobs:
           # =========================================================
           # END SHARED PARSE+GATE LOGIC
           # =========================================================
+          # >>> SHARED-BLOCK:monotonicity:END
 
           if run_version_gate "$BASE_SHA"; then
             echo "Flyway migration versions are monotonic and unique. Check passed."
@@ -292,6 +435,7 @@ jobs:
   self-test-version-monotonicity-gate:
     name: Self-test Version Monotonicity Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -302,11 +446,14 @@ jobs:
 
           MIGRATION_PATH="src/main/resources/db/migration"
 
+          # >>> SHARED-BLOCK:monotonicity:BEGIN
           # =========================================================
           # SHARED PARSE+GATE LOGIC -- keep this block BYTE-IDENTICAL
           # with the mirror in `self-test-version-monotonicity-gate`
           # so a typo or semantic drift in one place is caught by the
-          # hermetic self-test before it can ship.
+          # hermetic self-test before it can ship. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift.
           # =========================================================
           #
           # Parse a Flyway *versioned* migration filename into a
@@ -334,12 +481,19 @@ jobs:
             case "$ver" in
               ''|*[!0-9._]*) printf '' ; return 0 ;;
             esac
-            local key="" seg rest="$ver"
+            local key="" seg pad rest="$ver"
             rest="${rest//_/.}"
             local IFS=.
             for seg in $rest; do
               [ -z "$seg" ] && seg=0
-              key="${key}.$(printf '%010d' "$((10#$seg))")"
+              # ACCEPTED LIMITATION (INFO): "10#$seg" forces base-10 so
+              # a leading-zero segment is not parsed as octal. It still
+              # overflows a 64-bit signed integer for a >=19-digit (and
+              # certainly any >=26-digit) segment. Unreachable for real
+              # Flyway versions, which are small integers -- documented,
+              # not silently relied upon.
+              printf -v pad '%010d' "$((10#$seg))"
+              key="${key}.${pad}"
             done
             printf '%s' "${key#.}"
           }
@@ -373,6 +527,11 @@ jobs:
             # whitespace are NOT truncated by an awk field split -- a
             # migration added as 'V5__has space.sql' must still reach
             # parse_version_key intact and be evaluated by the gate.
+            # ACCEPTED LIMITATION (INFO): --name-only would still split
+            # on an *embedded newline* inside a filename (the read loop
+            # is newline-delimited). Unreachable for Flyway filenames,
+            # whose grammar forbids newlines -- documented, not relied
+            # upon silently.
             local added_list
             added_list="$(git diff --name-only --diff-filter=A "${base_sha}...HEAD" -- "$MIGRATION_PATH")"
 
@@ -422,6 +581,7 @@ jobs:
           # =========================================================
           # END SHARED PARSE+GATE LOGIC
           # =========================================================
+          # >>> SHARED-BLOCK:monotonicity:END
 
           WORK="$(mktemp -d)"
           cd "$WORK"
@@ -510,4 +670,128 @@ jobs:
           echo "OK: spaced out-of-order migration (V5__has space.sql < V10) fails"
           git reset -q --hard "$BASE_SHA"
 
+          # --- Scenario 10: underscore<->dot equivalence collision -> fail ---
+          # V20_1 and V20.1 normalize to the SAME parsed key (the
+          # '_'->'.' rewrite is load-bearing). Both are above merged max
+          # so monotonicity alone would pass; the duplicate-detection
+          # arm must still FAIL them as a version-space collision.
+          printf 'p\n' > "$MIGRATION_PATH/V20_1__a.sql"
+          printf 'q\n' > "$MIGRATION_PATH/V20.1__b.sql"
+          git add -A && git commit -q -m "V20_1 and V20.1 collide after normalization"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "underscore/dot equivalence collision must fail (exit 1)"; fi
+          echo "OK: V20_1 vs V20.1 normalization collision fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 11: undo migration (U*) added -> pass/ignored ---
+          # Undo migrations are not version-ordered by Flyway's forward
+          # validate path; parse_version_key only matches 'V*__*.sql',
+          # so a 'U*__*.sql' yields an empty key and is skipped. Pins
+          # the "undo not version-ordered" contract alongside R__ (8).
+          printf 'u\n' > "$MIGRATION_PATH/U10__undo_c.sql"
+          git add -A && git commit -q -m "add undo migration U10"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "undo (U*) migration should be ignored (exit 0)"
+          echo "OK: undo (U*) migration ignored"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 12: first-ever migration on an empty base -> pass ---
+          # Build a SECOND base with NO migration directory at all, then
+          # add the very first V1 migration. With no already-merged
+          # version there is no blocking_key, so the first migration
+          # must PASS.
+          EMPTY_WORK="$(mktemp -d)"
+          (
+            cd "$EMPTY_WORK"
+            git init -q
+            git config user.email "ci@example.com"
+            git config user.name "CI Self Test"
+            git commit -q --allow-empty -m "empty base: no migration dir"
+            EMPTY_BASE="$(git rev-parse HEAD)"
+            git switch -q -c feature
+            mkdir -p "$MIGRATION_PATH"
+            printf 'CREATE TABLE first (id int);\n' > "$MIGRATION_PATH/V1__first.sql"
+            git add -A && git commit -q -m "add first-ever migration V1"
+            run_version_gate "$EMPTY_BASE" >/dev/null || fail "first-ever migration on empty base should pass (exit 0)"
+          )
+          echo "OK: first-ever migration on an empty base passes"
+          rm -rf "$EMPTY_WORK"
+
+          # --- Scenario 13: new-highest + modify-existing in same PR ->
+          # version gate PASSES ---
+          # Monotonicity is ORTHOGONAL to immutability. A PR that adds a
+          # new highest version (V11) while also editing an existing
+          # migration (V1) must PASS the *version* gate -- the edit is
+          # the immutability job's concern, not this one. This pins that
+          # separation of duties so a future change does not accidentally
+          # couple the two gates.
+          printf 'CREATE TABLE k (id int);\n' > "$MIGRATION_PATH/V11__k.sql"
+          printf 'CREATE TABLE a (id int, extra text);\n' > "$MIGRATION_PATH/V1__a.sql"
+          git add -A && git commit -q -m "add new highest V11 AND modify existing V1"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "new-highest + modify-existing must PASS the version gate (orthogonal to immutability)"
+          echo "OK: new-highest + modify-existing passes the version gate (orthogonal to immutability)"
+          git reset -q --hard "$BASE_SHA"
+
           echo "All version-monotonicity self-test scenarios passed."
+
+  verify-gate-mirror-parity:
+    name: Verify Gate <-> Mirror Parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Assert every SHARED block is byte-identical across gate and mirror
+        run: |
+          set -euo pipefail
+
+          WF=".github/workflows/migration-immutability.yml"
+
+          # Extract every region delimited by the sentinel markers
+          # "# >>> SHARED-BLOCK:<id>:BEGIN" / ":END" for a given <id>.
+          # awk prints the lines strictly BETWEEN the two marker lines
+          # (markers excluded), and concatenates every occurrence of
+          # that <id> in file order. The two production/mirror copies
+          # therefore extract as one stream each pairing collapses to.
+          # We then split that stream back into the N occurrences and
+          # diff occurrence #1 vs #2. There are exactly two occurrences
+          # of each id (the production gate and its self-test mirror).
+          extract_occurrence() {
+            local id="$1" want="$2"
+            awk -v id="$id" -v want="$want" '
+              $0 ~ ("# >>> SHARED-BLOCK:" id ":BEGIN") { n++; cap=(n==want?1:0); next }
+              $0 ~ ("# >>> SHARED-BLOCK:" id ":END")   { if (n==want) exit; cap=0; next }
+              cap { print }
+            ' "$WF"
+          }
+
+          check_pair() {
+            local id="$1"
+            local a b count
+            count="$(grep -c "# >>> SHARED-BLOCK:${id}:BEGIN" "$WF")"
+            if [ "$count" -ne 2 ]; then
+              echo "PARITY FAILED: expected exactly 2 '${id}' SHARED blocks, found ${count}"
+              exit 1
+            fi
+            a="$(mktemp)"; b="$(mktemp)"
+            extract_occurrence "$id" 1 > "$a"
+            extract_occurrence "$id" 2 > "$b"
+            if [ ! -s "$a" ] || [ ! -s "$b" ]; then
+              echo "PARITY FAILED: extracted an empty '${id}' SHARED block"
+              exit 1
+            fi
+            if ! diff -u "$a" "$b"; then
+              echo "PARITY FAILED: '${id}' gate block differs from its self-test mirror."
+              echo "The SHARED block must be BYTE-IDENTICAL across the production"
+              echo "job and its hermetic mirror. Re-sync the two copies."
+              exit 1
+            fi
+            echo "OK: '${id}' SHARED block is byte-identical across gate and mirror"
+          }
+
+          check_pair immutability
+          check_pair monotonicity
+
+          echo "All SHARED gate<->mirror blocks are byte-identical."
