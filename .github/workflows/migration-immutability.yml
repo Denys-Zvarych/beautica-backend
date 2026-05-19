@@ -1,0 +1,1238 @@
+name: Migration Immutability
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+  # Defense-in-depth: re-run the gates on the merged tip of the
+  # protected branches. A bad migration that reaches dev/main via a
+  # merge-commit (or a direct push) is NOT covered by the
+  # pull_request trigger and would otherwise deploy to prod
+  # unchecked (this exact gap crash-looped Railway on a V49
+  # checksum mismatch). The base-revision resolution step below is
+  # event-aware: PR -> pull_request.base.sha; push ->
+  # github.event.before with a safe merge-base fallback.
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  check-migration-immutability:
+    name: Check Migration Immutability
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # REQUIRED: full history so the three-dot merge-base diff
+          # ("$BASE_SHA...HEAD") can resolve. Do not lower this.
+          fetch-depth: 0
+
+      # Event-aware base-revision resolution. This is the ONLY place
+      # event type is interpreted; the gate step (and its hermetic
+      # mirror) consume the resulting $BASE_SHA verbatim, so the
+      # SHARED block stays byte-identical and verify-gate-mirror-parity
+      # still passes.
+      #   pull_request -> the PR base tip (unchanged behavior).
+      #   push         -> github.event.before, the pre-push tip; the
+      #                    before...HEAD diff catches a V49-style
+      #                    mutation introduced by the merge-commit.
+      #   zero-SHA / unresolved (branch creation, first push,
+      #   force-push, shallow) -> fall back to merge-base vs
+      #   origin/main, then HEAD^, and FAIL loudly if neither
+      #   resolves (a poisoned push must never silently pass).
+      - name: Resolve base revision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:baserev:BEGIN
+          # =========================================================
+          # SHARED BASE-REVISION RESOLVER LOGIC -- keep this block
+          # BYTE-IDENTICAL with the copy in
+          # `check-migration-version-monotonicity` and the hermetic
+          # mirror in `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs all extracted copies
+          # and fails CI if they drift, so a typo in one place is
+          # caught before it can ship.
+          # =========================================================
+          #
+          # Event-aware base-revision resolution. This is the ONLY
+          # place event type is interpreted; the gate step (and its
+          # hermetic mirror) consume the resulting SHA verbatim as
+          # $BASE_SHA, so the gate SHARED blocks stay byte-identical.
+          #   pull_request -> the PR base tip (unchanged behavior).
+          #   push         -> github.event.before, the pre-push tip;
+          #                    the before...HEAD diff catches a
+          #                    V49-style mutation introduced by the
+          #                    merge-commit.
+          #   zero-SHA / unresolved (branch creation, first push,
+          #   force-push, shallow) -> fall back to merge-base vs
+          #   origin/main, then HEAD^, and FAIL loudly if neither
+          #   resolves (a poisoned push must never silently pass).
+          #
+          # Reads EVENT_NAME / PR_BASE_SHA / PUSH_BEFORE_SHA from the
+          # environment. Prints ONLY the resolved SHA on stdout (the
+          # caller is responsible for exporting it to $GITHUB_ENV, so
+          # this block is hermetic and reusable from the self-test).
+          # Diagnostics go to stderr. Exits 1 (fail-loud) if no safe
+          # base can be resolved.
+          resolve_base_revision() {
+            local zero_sha="0000000000000000000000000000000000000000"
+            local candidate
+
+            resolve_base_revision_fallback() {
+              # Prefer the merge-base against the protected mainline so
+              # only commits unique to this push/tip are evaluated.
+              if git rev-parse --verify --quiet origin/main >/dev/null; then
+                local mb
+                if mb="$(git merge-base origin/main HEAD 2>/dev/null)" && [ -n "$mb" ]; then
+                  printf '%s' "$mb"
+                  return 0
+                fi
+              fi
+              # Otherwise the immediate parent, if HEAD has one.
+              if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+                git rev-parse "HEAD^"
+                return 0
+              fi
+              return 1
+            }
+
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              candidate="${PR_BASE_SHA:-}"
+            else
+              candidate="${PUSH_BEFORE_SHA:-}"
+            fi
+
+            # Treat the zero-SHA sentinel or any non-resolvable value
+            # as unresolved and fall back; never let it silently pass.
+            if [ -z "$candidate" ] || [ "$candidate" = "$zero_sha" ] \
+               || ! git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              echo "Base revision '$candidate' for event '${EVENT_NAME:-}' is unresolved (zero-SHA, missing, or shallow). Falling back." >&2
+              if ! candidate="$(resolve_base_revision_fallback)"; then
+                echo "ERROR: could not resolve any safe base revision (no origin/main merge-base and no HEAD parent)." >&2
+                echo "Refusing to pass the migration gate without a base to diff against." >&2
+                return 1
+              fi
+              echo "Resolved fallback base revision: $candidate" >&2
+            fi
+
+            printf '%s' "$candidate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED BASE-REVISION RESOLVER LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:baserev:END
+
+          if ! BASE_SHA="$(resolve_base_revision)"; then
+            exit 1
+          fi
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "Using BASE_SHA=$BASE_SHA (event=$EVENT_NAME)"
+
+      - name: Detect modified or deleted migrations
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # >>> SHARED-BLOCK:immutability:BEGIN
+          # =========================================================
+          # SHARED IMMUTABILITY GATE LOGIC -- keep this block
+          # BYTE-IDENTICAL with the mirror in
+          # `self-test-immutability-gate`. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift, so a typo or a dropped
+          # filter letter in one place is caught before it can ship.
+          # =========================================================
+          #
+          # Collect files that are Modified (M), Deleted (D), Renamed
+          # (R), Copied (C), or Type-changed (T) relative to the PR
+          # merge-base. The three-dot form ("$base_sha...HEAD") diffs
+          # against the merge-base of the two tips rather than the raw
+          # base tip, so advances on the base branch never attribute
+          # base-side mutations to this PR.  Added (A) files are
+          # intentionally excluded so brand-new migrations always pass.
+          # Renamed migrations are caught because Flyway uses the
+          # script name as part of its checksum identity -- a rename
+          # changes that identity and will fail validation in prod.
+          # C and T are practically unreachable for text V*.sql
+          # migrations but are included for defensive completeness
+          # (zero behaviour change for normal new-file adds).
+          run_gate() {
+            local base_sha="$1"
+            local changed
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            if [ -z "$changed" ]; then
+              return 0
+            fi
+            return 1
+          }
+          # =========================================================
+          # END SHARED IMMUTABILITY GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:immutability:END
+
+          CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- "$MIGRATION_PATH")
+
+          if run_gate "$BASE_SHA"; then
+            echo "No existing migration files were modified, deleted, or renamed. Check passed."
+            exit 0
+          fi
+
+          echo "ERROR: The following already-merged Flyway migration file(s) were modified, deleted, or renamed:"
+          echo ""
+          echo "$CHANGED"
+          echo ""
+          echo "Applied/merged migrations are immutable -- never edit or rename V*.sql after it is merged."
+          echo "Add a new forward migration with the next version number instead."
+          echo "If you did NOT touch the file(s) listed above, rebase your branch onto the base branch to bring your history up to date."
+          exit 1
+
+  self-test-immutability-gate:
+    name: Self-test Immutability Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Assert gate fails on mutation and passes on clean / add-only
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # >>> SHARED-BLOCK:immutability:BEGIN
+          # =========================================================
+          # SHARED IMMUTABILITY GATE LOGIC -- keep this block
+          # BYTE-IDENTICAL with the mirror in
+          # `self-test-immutability-gate`. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift, so a typo or a dropped
+          # filter letter in one place is caught before it can ship.
+          # =========================================================
+          #
+          # Collect files that are Modified (M), Deleted (D), Renamed
+          # (R), Copied (C), or Type-changed (T) relative to the PR
+          # merge-base. The three-dot form ("$base_sha...HEAD") diffs
+          # against the merge-base of the two tips rather than the raw
+          # base tip, so advances on the base branch never attribute
+          # base-side mutations to this PR.  Added (A) files are
+          # intentionally excluded so brand-new migrations always pass.
+          # Renamed migrations are caught because Flyway uses the
+          # script name as part of its checksum identity -- a rename
+          # changes that identity and will fail validation in prod.
+          # C and T are practically unreachable for text V*.sql
+          # migrations but are included for defensive completeness
+          # (zero behaviour change for normal new-file adds).
+          run_gate() {
+            local base_sha="$1"
+            local changed
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            if [ -z "$changed" ]; then
+              return 0
+            fi
+            return 1
+          }
+          # =========================================================
+          # END SHARED IMMUTABILITY GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:immutability:END
+
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "CI Self Test"
+
+          mkdir -p "$MIGRATION_PATH"
+          printf 'CREATE TABLE existing (id int);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          printf 'CREATE TABLE other (id int);\n' > "$MIGRATION_PATH/V2__other.sql"
+          git add -A
+          git commit -q -m "base: existing migrations"
+          BASE_SHA="$(git rev-parse HEAD)"
+          git switch -q -c feature
+
+          fail() { echo "SELF-TEST FAILED: $1"; exit 1; }
+
+          # --- Scenario 1: clean diff (no migration changes) -> exit 0 ---
+          git commit -q --allow-empty -m "no migration changes"
+          run_gate "$BASE_SHA" || fail "clean diff should pass (exit 0)"
+          echo "OK: clean diff passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 2: pure add of a new migration -> exit 0 ---
+          printf 'CREATE TABLE new_table (id int);\n' > "$MIGRATION_PATH/V3__new.sql"
+          git add -A && git commit -q -m "add new migration"
+          run_gate "$BASE_SHA" || fail "add-only diff should pass (exit 0)"
+          echo "OK: add-only diff passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 3: MODIFY an existing migration -> exit 1 ---
+          printf 'CREATE TABLE existing (id int, extra text);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "modify existing migration"
+          if run_gate "$BASE_SHA"; then fail "modified migration should fail (exit 1)"; fi
+          echo "OK: modified migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 4: DELETE an existing migration -> exit 1 ---
+          # Exercises the 'D' filter letter explicitly. Scenario 5 (a
+          # real rename) yields 'R', not 'D', so this scenario is the
+          # sole dedicated 'D' coverage and must stay.
+          git rm -q "$MIGRATION_PATH/V1__existing.sql"
+          git commit -q -m "delete existing migration"
+          if run_gate "$BASE_SHA"; then fail "deleted migration should fail (exit 1)"; fi
+          echo "OK: deleted migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 5: real RENAME (status 'R') of an existing
+          # migration -> exit 1 ---
+          # `git config diff.renames true` makes git emit a true 'R'
+          # status (instead of the config-less D+A pair, which would
+          # only ever exercise the 'D' path and silently leave the 'R'
+          # filter letter untested). This scenario genuinely exercises
+          # the 'R' letter in --diff-filter=MDRCT. Identical file
+          # content + a pure path change is the textbook rename git
+          # detects as R100.
+          git config diff.renames true
+          git mv "$MIGRATION_PATH/V1__existing.sql" "$MIGRATION_PATH/V1__existing_renamed.sql"
+          git commit -q -m "rename existing migration"
+          # Sanity: prove git actually reports an 'R' status here, so a
+          # future git/config change that downgrades it to D+A is loud.
+          git diff --name-status --diff-filter=R "$BASE_SHA...HEAD" -- "$MIGRATION_PATH" \
+            | grep -q '^R' || fail "scenario 5 expected a real 'R' status but git produced none"
+          if run_gate "$BASE_SHA"; then fail "renamed migration should fail (exit 1)"; fi
+          echo "OK: real renamed (R) migration fails"
+          git config --unset diff.renames
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 6: COPY (status 'C') of an existing migration
+          # -> exit 1 ---
+          # `git config diff.renames copies` enables copy detection.
+          # NOTE: a *pure* copy of an unmodified file is reported by
+          # `git diff` (without the expensive --find-copies-harder,
+          # which the gate deliberately does NOT pass) as a plain 'A'
+          # add -- and that is intentionally allowed: a duplicated-
+          # content file under a NEW Flyway version is a legitimate new
+          # migration; version collisions are the monotonicity job's
+          # concern, not immutability's. git only emits a real 'C'
+          # status with the default diff when the copy SOURCE is also
+          # modified. So this scenario copies an existing migration AND
+          # mutates the original in the same commit: the gate then sees
+          # both 'M' (the source mutation) and 'C100', genuinely
+          # exercising the 'C' filter letter, and must fail (exit 1).
+          git config diff.renames copies
+          cp "$MIGRATION_PATH/V1__existing.sql" "$MIGRATION_PATH/V1__existing_copy.sql"
+          printf 'CREATE TABLE existing (id int, copied text);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "copy existing migration AND modify the source"
+          # Sanity: prove git actually reports a 'C' status here using
+          # the SAME diff invocation the gate uses (no --find-copies-
+          # harder), so a future git/config change is loud.
+          git diff --name-status --diff-filter=C "$BASE_SHA...HEAD" -- "$MIGRATION_PATH" \
+            | grep -q '^C' || fail "scenario 6 expected a real 'C' status but git produced none"
+          if run_gate "$BASE_SHA"; then fail "copied migration should fail (exit 1)"; fi
+          echo "OK: copied (C) migration fails"
+          git config --unset diff.renames
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 7: TYPE-CHANGE (status 'T') of an existing
+          # migration -> exit 1 ---
+          # Replace an existing regular-file V*.sql with a symlink of
+          # the same name. git reports this as a 'T' (type changed)
+          # status. Exercises the 'T' filter letter.
+          rm "$MIGRATION_PATH/V1__existing.sql"
+          ln -s /dev/null "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "type-change existing migration to symlink"
+          # Sanity: prove git actually reports a 'T' status here.
+          git diff --name-status --diff-filter=T "$BASE_SHA...HEAD" -- "$MIGRATION_PATH" \
+            | grep -q '^T' || fail "scenario 7 expected a real 'T' status but git produced none"
+          if run_gate "$BASE_SHA"; then fail "type-changed migration should fail (exit 1)"; fi
+          echo "OK: type-changed (T) migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 8: MIXED add + modify in one commit -> exit 1 ---
+          # A single commit that adds a brand-new V*.sql AND edits an
+          # already-merged one. Proves a legitimate new migration does
+          # NOT mask a co-located mutation of an existing migration.
+          printf 'CREATE TABLE mixed_new (id int);\n' > "$MIGRATION_PATH/V4__mixed_new.sql"
+          printf 'CREATE TABLE existing (id int, mixed text);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          git add -A && git commit -q -m "add new migration AND modify existing in one commit"
+          if run_gate "$BASE_SHA"; then fail "mixed add+modify should fail (exit 1)"; fi
+          echo "OK: mixed add+modify fails (new add does not mask the modify)"
+          git reset -q --hard "$BASE_SHA"
+
+          echo "All self-test scenarios passed."
+
+  check-migration-version-monotonicity:
+    name: Check Migration Version Monotonicity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # REQUIRED: full history so the three-dot merge-base diff
+          # ("$BASE_SHA...HEAD") and "git ls-tree $BASE_SHA" can resolve.
+          # Do not lower this.
+          fetch-depth: 0
+
+      # Event-aware base-revision resolution. This is the ONLY place
+      # event type is interpreted; the gate step (and its hermetic
+      # mirror) consume the resulting $BASE_SHA verbatim, so the
+      # SHARED block stays byte-identical and verify-gate-mirror-parity
+      # still passes.
+      #   pull_request -> the PR base tip (unchanged behavior).
+      #   push         -> github.event.before, the pre-push tip; the
+      #                    before...HEAD diff catches a V49-style
+      #                    mutation introduced by the merge-commit.
+      #   zero-SHA / unresolved (branch creation, first push,
+      #   force-push, shallow) -> fall back to merge-base vs
+      #   origin/main, then HEAD^, and FAIL loudly if neither
+      #   resolves (a poisoned push must never silently pass).
+      - name: Resolve base revision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:baserev:BEGIN
+          # =========================================================
+          # SHARED BASE-REVISION RESOLVER LOGIC -- keep this block
+          # BYTE-IDENTICAL with the copy in
+          # `check-migration-version-monotonicity` and the hermetic
+          # mirror in `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs all extracted copies
+          # and fails CI if they drift, so a typo in one place is
+          # caught before it can ship.
+          # =========================================================
+          #
+          # Event-aware base-revision resolution. This is the ONLY
+          # place event type is interpreted; the gate step (and its
+          # hermetic mirror) consume the resulting SHA verbatim as
+          # $BASE_SHA, so the gate SHARED blocks stay byte-identical.
+          #   pull_request -> the PR base tip (unchanged behavior).
+          #   push         -> github.event.before, the pre-push tip;
+          #                    the before...HEAD diff catches a
+          #                    V49-style mutation introduced by the
+          #                    merge-commit.
+          #   zero-SHA / unresolved (branch creation, first push,
+          #   force-push, shallow) -> fall back to merge-base vs
+          #   origin/main, then HEAD^, and FAIL loudly if neither
+          #   resolves (a poisoned push must never silently pass).
+          #
+          # Reads EVENT_NAME / PR_BASE_SHA / PUSH_BEFORE_SHA from the
+          # environment. Prints ONLY the resolved SHA on stdout (the
+          # caller is responsible for exporting it to $GITHUB_ENV, so
+          # this block is hermetic and reusable from the self-test).
+          # Diagnostics go to stderr. Exits 1 (fail-loud) if no safe
+          # base can be resolved.
+          resolve_base_revision() {
+            local zero_sha="0000000000000000000000000000000000000000"
+            local candidate
+
+            resolve_base_revision_fallback() {
+              # Prefer the merge-base against the protected mainline so
+              # only commits unique to this push/tip are evaluated.
+              if git rev-parse --verify --quiet origin/main >/dev/null; then
+                local mb
+                if mb="$(git merge-base origin/main HEAD 2>/dev/null)" && [ -n "$mb" ]; then
+                  printf '%s' "$mb"
+                  return 0
+                fi
+              fi
+              # Otherwise the immediate parent, if HEAD has one.
+              if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+                git rev-parse "HEAD^"
+                return 0
+              fi
+              return 1
+            }
+
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              candidate="${PR_BASE_SHA:-}"
+            else
+              candidate="${PUSH_BEFORE_SHA:-}"
+            fi
+
+            # Treat the zero-SHA sentinel or any non-resolvable value
+            # as unresolved and fall back; never let it silently pass.
+            if [ -z "$candidate" ] || [ "$candidate" = "$zero_sha" ] \
+               || ! git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              echo "Base revision '$candidate' for event '${EVENT_NAME:-}' is unresolved (zero-SHA, missing, or shallow). Falling back." >&2
+              if ! candidate="$(resolve_base_revision_fallback)"; then
+                echo "ERROR: could not resolve any safe base revision (no origin/main merge-base and no HEAD parent)." >&2
+                echo "Refusing to pass the migration gate without a base to diff against." >&2
+                return 1
+              fi
+              echo "Resolved fallback base revision: $candidate" >&2
+            fi
+
+            printf '%s' "$candidate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED BASE-REVISION RESOLVER LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:baserev:END
+
+          if ! BASE_SHA="$(resolve_base_revision)"; then
+            exit 1
+          fi
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "Using BASE_SHA=$BASE_SHA (event=$EVENT_NAME)"
+
+      - name: Enforce monotonic, non-duplicate Flyway versions
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # >>> SHARED-BLOCK:monotonicity:BEGIN
+          # =========================================================
+          # SHARED PARSE+GATE LOGIC -- keep this block BYTE-IDENTICAL
+          # with the mirror in `self-test-version-monotonicity-gate`
+          # so a typo or semantic drift in one place is caught by the
+          # hermetic self-test before it can ship. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift.
+          # =========================================================
+          #
+          # Parse a Flyway *versioned* migration filename into a
+          # normalized, zero-padded, dot-joined numeric key suitable
+          # for plain string comparison.  Flyway version grammar:
+          # leading 'V', then the version, then '__', then the
+          # description.  Within the version, '.' and '_' are
+          # interchangeable segment separators (V2_1 == V2.1) and each
+          # segment is a non-negative integer.  Every segment is
+          # zero-padded to 10 digits, so a lexical compare of two keys
+          # equals Flyway's numeric, segment-wise ordering -- this is
+          # exactly what makes V9 (...0009) sort BEFORE V10 (...0010)
+          # instead of the wrong lexical "10" < "9".  Repeatable (R__)
+          # and any non-versioned file yields an empty key so callers
+          # skip it (Flyway does not order repeatables by version).
+          parse_version_key() {
+            local name="$1"
+            local base="${name##*/}"
+            case "$base" in
+              V*__*.sql) : ;;
+              *) printf '' ; return 0 ;;
+            esac
+            local ver="${base#V}"
+            ver="${ver%%__*}"
+            case "$ver" in
+              ''|*[!0-9._]*) printf '' ; return 0 ;;
+            esac
+            local key="" seg pad rest="$ver"
+            rest="${rest//_/.}"
+            local IFS=.
+            for seg in $rest; do
+              [ -z "$seg" ] && seg=0
+              # ACCEPTED LIMITATION (INFO): "10#$seg" forces base-10 so
+              # a leading-zero segment is not parsed as octal. It still
+              # overflows a 64-bit signed integer for a >=19-digit (and
+              # certainly any >=26-digit) segment. Unreachable for real
+              # Flyway versions, which are small integers -- documented,
+              # not silently relied upon.
+              printf -v pad '%010d' "$((10#$seg))"
+              key="${key}.${pad}"
+            done
+            printf '%s' "${key#.}"
+          }
+
+          # Run the monotonicity + duplicate gate for a merge-base SHA.
+          # Pure git + shell, NO database.  Returns 0 on pass, 1 on
+          # violation, and prints a developer-facing diagnostic naming
+          # the offending file(s) and the conflicting/blocking version.
+          run_version_gate() {
+            local base_sha="$1"
+            local added_file added_key blocking_key="" blocking_file=""
+            local violations=0 k
+
+            # Highest migration version already present at the
+            # merge-base (the state that is effectively already
+            # merged on the base branch).
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              k="$(parse_version_key "$f")"
+              [ -z "$k" ] && continue
+              if [ -z "$blocking_key" ] || [ "$k" \> "$blocking_key" ]; then
+                blocking_key="$k"
+                blocking_file="$f"
+              fi
+            done <<EOF
+          $(git ls-tree -r --name-only "$base_sha" -- "$MIGRATION_PATH" 2>/dev/null || true)
+          EOF
+
+            # Files ADDED on this branch relative to the merge-base.
+            # Use --name-only (no status column) so filenames containing
+            # whitespace are NOT truncated by an awk field split -- a
+            # migration added as 'V5__has space.sql' must still reach
+            # parse_version_key intact and be evaluated by the gate.
+            # ACCEPTED LIMITATION (INFO): --name-only would still split
+            # on an *embedded newline* inside a filename (the read loop
+            # is newline-delimited). Unreachable for Flyway filenames,
+            # whose grammar forbids newlines -- documented, not relied
+            # upon silently.
+            local added_list
+            added_list="$(git diff --name-only --diff-filter=A "${base_sha}...HEAD" -- "$MIGRATION_PATH")"
+
+            # (1)+(2) Monotonicity: every newly-added version must be
+            # strictly greater than the highest already-merged version.
+            while IFS= read -r added_file; do
+              [ -z "$added_file" ] && continue
+              added_key="$(parse_version_key "$added_file")"
+              [ -z "$added_key" ] && continue
+              if [ -n "$blocking_key" ] && { [ "$added_key" \< "$blocking_key" ] || [ "$added_key" = "$blocking_key" ]; }; then
+                echo "ERROR: new migration '$added_file' has a version <= the highest"
+                echo "       already-merged migration. Flyway runs with out-of-order"
+                echo "       DISABLED, so this would fail 'flyway validate' at app startup."
+                echo "       blocked by already-merged: '$blocking_file'"
+                echo "       Renumber your migration ABOVE the current highest version."
+                violations=1
+              fi
+            done <<EOF
+          $added_list
+          EOF
+
+            # (3) No duplicate versions across the full HEAD set
+            # (existing + newly added). Two files mapping to the same
+            # parsed version key collide in Flyway's version space.
+            local dup
+            dup="$(
+              git ls-tree -r --name-only HEAD -- "$MIGRATION_PATH" 2>/dev/null \
+                | while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    k="$(parse_version_key "$f")"
+                    [ -z "$k" ] && continue
+                    printf '%s\t%s\n' "$k" "$f"
+                  done \
+                | sort \
+                | awk -F'\t' '{ if ($1==prev) { print prevf; print $2 } prev=$1; prevf=$2 }' \
+                | sort -u
+            )"
+            if [ -n "$dup" ]; then
+              echo "ERROR: two Flyway migrations share the same parsed version:"
+              echo "$dup"
+              echo "       Each migration version must be unique."
+              violations=1
+            fi
+
+            return "$violations"
+          }
+          # =========================================================
+          # END SHARED PARSE+GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:monotonicity:END
+
+          if run_version_gate "$BASE_SHA"; then
+            echo "Flyway migration versions are monotonic and unique. Check passed."
+            exit 0
+          fi
+
+          echo ""
+          echo "Out-of-order or duplicate Flyway migration version detected."
+          echo "Flyway in this project validates with out-of-order DISABLED;"
+          echo "an out-of-order or duplicate version passes file-immutability"
+          echo "but FAILS 'flyway validate' on the next deploy."
+          echo "Rebase onto the base branch and renumber above the highest version."
+          exit 1
+
+  self-test-version-monotonicity-gate:
+    name: Self-test Version Monotonicity Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Assert version gate fails on out-of-order / duplicate and passes on clean / new-highest
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # >>> SHARED-BLOCK:monotonicity:BEGIN
+          # =========================================================
+          # SHARED PARSE+GATE LOGIC -- keep this block BYTE-IDENTICAL
+          # with the mirror in `self-test-version-monotonicity-gate`
+          # so a typo or semantic drift in one place is caught by the
+          # hermetic self-test before it can ship. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted
+          # copies and fails CI if they drift.
+          # =========================================================
+          #
+          # Parse a Flyway *versioned* migration filename into a
+          # normalized, zero-padded, dot-joined numeric key suitable
+          # for plain string comparison.  Flyway version grammar:
+          # leading 'V', then the version, then '__', then the
+          # description.  Within the version, '.' and '_' are
+          # interchangeable segment separators (V2_1 == V2.1) and each
+          # segment is a non-negative integer.  Every segment is
+          # zero-padded to 10 digits, so a lexical compare of two keys
+          # equals Flyway's numeric, segment-wise ordering -- this is
+          # exactly what makes V9 (...0009) sort BEFORE V10 (...0010)
+          # instead of the wrong lexical "10" < "9".  Repeatable (R__)
+          # and any non-versioned file yields an empty key so callers
+          # skip it (Flyway does not order repeatables by version).
+          parse_version_key() {
+            local name="$1"
+            local base="${name##*/}"
+            case "$base" in
+              V*__*.sql) : ;;
+              *) printf '' ; return 0 ;;
+            esac
+            local ver="${base#V}"
+            ver="${ver%%__*}"
+            case "$ver" in
+              ''|*[!0-9._]*) printf '' ; return 0 ;;
+            esac
+            local key="" seg pad rest="$ver"
+            rest="${rest//_/.}"
+            local IFS=.
+            for seg in $rest; do
+              [ -z "$seg" ] && seg=0
+              # ACCEPTED LIMITATION (INFO): "10#$seg" forces base-10 so
+              # a leading-zero segment is not parsed as octal. It still
+              # overflows a 64-bit signed integer for a >=19-digit (and
+              # certainly any >=26-digit) segment. Unreachable for real
+              # Flyway versions, which are small integers -- documented,
+              # not silently relied upon.
+              printf -v pad '%010d' "$((10#$seg))"
+              key="${key}.${pad}"
+            done
+            printf '%s' "${key#.}"
+          }
+
+          # Run the monotonicity + duplicate gate for a merge-base SHA.
+          # Pure git + shell, NO database.  Returns 0 on pass, 1 on
+          # violation, and prints a developer-facing diagnostic naming
+          # the offending file(s) and the conflicting/blocking version.
+          run_version_gate() {
+            local base_sha="$1"
+            local added_file added_key blocking_key="" blocking_file=""
+            local violations=0 k
+
+            # Highest migration version already present at the
+            # merge-base (the state that is effectively already
+            # merged on the base branch).
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              k="$(parse_version_key "$f")"
+              [ -z "$k" ] && continue
+              if [ -z "$blocking_key" ] || [ "$k" \> "$blocking_key" ]; then
+                blocking_key="$k"
+                blocking_file="$f"
+              fi
+            done <<EOF
+          $(git ls-tree -r --name-only "$base_sha" -- "$MIGRATION_PATH" 2>/dev/null || true)
+          EOF
+
+            # Files ADDED on this branch relative to the merge-base.
+            # Use --name-only (no status column) so filenames containing
+            # whitespace are NOT truncated by an awk field split -- a
+            # migration added as 'V5__has space.sql' must still reach
+            # parse_version_key intact and be evaluated by the gate.
+            # ACCEPTED LIMITATION (INFO): --name-only would still split
+            # on an *embedded newline* inside a filename (the read loop
+            # is newline-delimited). Unreachable for Flyway filenames,
+            # whose grammar forbids newlines -- documented, not relied
+            # upon silently.
+            local added_list
+            added_list="$(git diff --name-only --diff-filter=A "${base_sha}...HEAD" -- "$MIGRATION_PATH")"
+
+            # (1)+(2) Monotonicity: every newly-added version must be
+            # strictly greater than the highest already-merged version.
+            while IFS= read -r added_file; do
+              [ -z "$added_file" ] && continue
+              added_key="$(parse_version_key "$added_file")"
+              [ -z "$added_key" ] && continue
+              if [ -n "$blocking_key" ] && { [ "$added_key" \< "$blocking_key" ] || [ "$added_key" = "$blocking_key" ]; }; then
+                echo "ERROR: new migration '$added_file' has a version <= the highest"
+                echo "       already-merged migration. Flyway runs with out-of-order"
+                echo "       DISABLED, so this would fail 'flyway validate' at app startup."
+                echo "       blocked by already-merged: '$blocking_file'"
+                echo "       Renumber your migration ABOVE the current highest version."
+                violations=1
+              fi
+            done <<EOF
+          $added_list
+          EOF
+
+            # (3) No duplicate versions across the full HEAD set
+            # (existing + newly added). Two files mapping to the same
+            # parsed version key collide in Flyway's version space.
+            local dup
+            dup="$(
+              git ls-tree -r --name-only HEAD -- "$MIGRATION_PATH" 2>/dev/null \
+                | while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    k="$(parse_version_key "$f")"
+                    [ -z "$k" ] && continue
+                    printf '%s\t%s\n' "$k" "$f"
+                  done \
+                | sort \
+                | awk -F'\t' '{ if ($1==prev) { print prevf; print $2 } prev=$1; prevf=$2 }' \
+                | sort -u
+            )"
+            if [ -n "$dup" ]; then
+              echo "ERROR: two Flyway migrations share the same parsed version:"
+              echo "$dup"
+              echo "       Each migration version must be unique."
+              violations=1
+            fi
+
+            return "$violations"
+          }
+          # =========================================================
+          # END SHARED PARSE+GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:monotonicity:END
+
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "CI Self Test"
+
+          mkdir -p "$MIGRATION_PATH"
+          printf 'CREATE TABLE a (id int);\n' > "$MIGRATION_PATH/V1__a.sql"
+          printf 'CREATE TABLE b (id int);\n' > "$MIGRATION_PATH/V9__b.sql"
+          printf 'CREATE TABLE c (id int);\n' > "$MIGRATION_PATH/V10__c.sql"
+          git add -A
+          git commit -q -m "base: V1, V9, V10 (max merged = V10)"
+          BASE_SHA="$(git rev-parse HEAD)"
+          git switch -q -c feature
+
+          fail() { echo "SELF-TEST FAILED: $1"; exit 1; }
+
+          # --- Scenario 1: clean diff (no migration changes) -> pass ---
+          git commit -q --allow-empty -m "no migration changes"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "clean diff should pass (exit 0)"
+          echo "OK: clean diff passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 2: new HIGHEST version (V11) -> pass ---
+          printf 'CREATE TABLE d (id int);\n' > "$MIGRATION_PATH/V11__d.sql"
+          git add -A && git commit -q -m "add V11"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "new highest version should pass (exit 0)"
+          echo "OK: new highest version (V11) passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 3: new version LOWER than merged max (V5 < V10) -> fail ---
+          printf 'CREATE TABLE e (id int);\n' > "$MIGRATION_PATH/V5__e.sql"
+          git add -A && git commit -q -m "add V5 behind merged V10"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "version <= merged max should fail (exit 1)"; fi
+          echo "OK: lower version (V5 < merged V10) fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 4: new version EQUAL to merged max (V10) -> fail ---
+          printf 'CREATE TABLE f (id int);\n' > "$MIGRATION_PATH/V10__dup.sql"
+          git add -A && git commit -q -m "add V10 duplicate"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "duplicate of merged max should fail (exit 1)"; fi
+          echo "OK: duplicate version (V10 == merged V10) fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 5: numeric (not lexical) ordering V9 vs V10 ---
+          # Lexically "9" > "10"; numerically 9 < 10. A genuinely new
+          # V9 added after merged V10 must FAIL -> proves numeric compare.
+          git rm -q "$MIGRATION_PATH/V9__b.sql"
+          git commit -q -m "drop V9 so the re-add is a genuine add"
+          printf 'CREATE TABLE g (id int);\n' > "$MIGRATION_PATH/V9__g.sql"
+          git add -A && git commit -q -m "re-add V9 after merged V10 exists"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "V9 after merged V10 must fail numerically (exit 1)"; fi
+          echo "OK: numeric ordering enforced (V9 < V10, not lexical)"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 6: two NEW files above max sharing a version -> fail ---
+          printf 'x\n' > "$MIGRATION_PATH/V20__x.sql"
+          printf 'y\n' > "$MIGRATION_PATH/V20__y.sql"
+          git add -A && git commit -q -m "two new files both V20"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "two new files sharing a version should fail (exit 1)"; fi
+          echo "OK: duplicate among newly-added files fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 7: dotted/underscore version above max (V10_1) -> pass ---
+          printf 'z\n' > "$MIGRATION_PATH/V10_1__patch.sql"
+          git add -A && git commit -q -m "add V10_1 patch (> V10)"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "V10_1 (> V10) should pass (exit 0)"
+          echo "OK: dotted version V10_1 > V10 passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 8: non-versioned repeatable migration added -> pass ---
+          printf 'r\n' > "$MIGRATION_PATH/R__refresh_view.sql"
+          git add -A && git commit -q -m "add repeatable migration"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "repeatable (R__) migration should be ignored (exit 0)"
+          echo "OK: repeatable (R__) migration ignored"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 9: spaced filename out-of-order (V5 < V10) -> fail ---
+          # A filename containing a space must NOT be truncated by the
+          # added-file extraction; it must reach parse_version_key whole
+          # so an out-of-order spaced migration still FAILS the gate.
+          printf 'CREATE TABLE h (id int);\n' > "$MIGRATION_PATH/V5__has space.sql"
+          git add -A && git commit -q -m "add spaced V5 behind merged V10"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "spaced out-of-order migration must fail (exit 1)"; fi
+          echo "OK: spaced out-of-order migration (V5__has space.sql < V10) fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 10: underscore<->dot equivalence collision -> fail ---
+          # V20_1 and V20.1 normalize to the SAME parsed key (the
+          # '_'->'.' rewrite is load-bearing). Both are above merged max
+          # so monotonicity alone would pass; the duplicate-detection
+          # arm must still FAIL them as a version-space collision.
+          printf 'p\n' > "$MIGRATION_PATH/V20_1__a.sql"
+          printf 'q\n' > "$MIGRATION_PATH/V20.1__b.sql"
+          git add -A && git commit -q -m "V20_1 and V20.1 collide after normalization"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "underscore/dot equivalence collision must fail (exit 1)"; fi
+          echo "OK: V20_1 vs V20.1 normalization collision fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 11: undo migration (U*) added -> pass/ignored ---
+          # Undo migrations are not version-ordered by Flyway's forward
+          # validate path; parse_version_key only matches 'V*__*.sql',
+          # so a 'U*__*.sql' yields an empty key and is skipped. Pins
+          # the "undo not version-ordered" contract alongside R__ (8).
+          printf 'u\n' > "$MIGRATION_PATH/U10__undo_c.sql"
+          git add -A && git commit -q -m "add undo migration U10"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "undo (U*) migration should be ignored (exit 0)"
+          echo "OK: undo (U*) migration ignored"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 12: first-ever migration on an empty base -> pass ---
+          # Build a SECOND base with NO migration directory at all, then
+          # add the very first V1 migration. With no already-merged
+          # version there is no blocking_key, so the first migration
+          # must PASS.
+          EMPTY_WORK="$(mktemp -d)"
+          (
+            cd "$EMPTY_WORK"
+            git init -q
+            git config user.email "ci@example.com"
+            git config user.name "CI Self Test"
+            git commit -q --allow-empty -m "empty base: no migration dir"
+            EMPTY_BASE="$(git rev-parse HEAD)"
+            git switch -q -c feature
+            mkdir -p "$MIGRATION_PATH"
+            printf 'CREATE TABLE first (id int);\n' > "$MIGRATION_PATH/V1__first.sql"
+            git add -A && git commit -q -m "add first-ever migration V1"
+            run_version_gate "$EMPTY_BASE" >/dev/null || fail "first-ever migration on empty base should pass (exit 0)"
+          )
+          echo "OK: first-ever migration on an empty base passes"
+          rm -rf "$EMPTY_WORK"
+
+          # --- Scenario 13: new-highest + modify-existing in same PR ->
+          # version gate PASSES ---
+          # Monotonicity is ORTHOGONAL to immutability. A PR that adds a
+          # new highest version (V11) while also editing an existing
+          # migration (V1) must PASS the *version* gate -- the edit is
+          # the immutability job's concern, not this one. This pins that
+          # separation of duties so a future change does not accidentally
+          # couple the two gates.
+          printf 'CREATE TABLE k (id int);\n' > "$MIGRATION_PATH/V11__k.sql"
+          printf 'CREATE TABLE a (id int, extra text);\n' > "$MIGRATION_PATH/V1__a.sql"
+          git add -A && git commit -q -m "add new highest V11 AND modify existing V1"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "new-highest + modify-existing must PASS the version gate (orthogonal to immutability)"
+          echo "OK: new-highest + modify-existing passes the version gate (orthogonal to immutability)"
+          git reset -q --hard "$BASE_SHA"
+
+          echo "All version-monotonicity self-test scenarios passed."
+
+  self-test-base-revision-resolution:
+    name: Self-test Base Revision Resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Assert the resolver picks the right base per event and fails loud when none resolves
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:baserev:BEGIN
+          # =========================================================
+          # SHARED BASE-REVISION RESOLVER LOGIC -- keep this block
+          # BYTE-IDENTICAL with the copy in
+          # `check-migration-version-monotonicity` and the hermetic
+          # mirror in `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs all extracted copies
+          # and fails CI if they drift, so a typo in one place is
+          # caught before it can ship.
+          # =========================================================
+          #
+          # Event-aware base-revision resolution. This is the ONLY
+          # place event type is interpreted; the gate step (and its
+          # hermetic mirror) consume the resulting SHA verbatim as
+          # $BASE_SHA, so the gate SHARED blocks stay byte-identical.
+          #   pull_request -> the PR base tip (unchanged behavior).
+          #   push         -> github.event.before, the pre-push tip;
+          #                    the before...HEAD diff catches a
+          #                    V49-style mutation introduced by the
+          #                    merge-commit.
+          #   zero-SHA / unresolved (branch creation, first push,
+          #   force-push, shallow) -> fall back to merge-base vs
+          #   origin/main, then HEAD^, and FAIL loudly if neither
+          #   resolves (a poisoned push must never silently pass).
+          #
+          # Reads EVENT_NAME / PR_BASE_SHA / PUSH_BEFORE_SHA from the
+          # environment. Prints ONLY the resolved SHA on stdout (the
+          # caller is responsible for exporting it to $GITHUB_ENV, so
+          # this block is hermetic and reusable from the self-test).
+          # Diagnostics go to stderr. Exits 1 (fail-loud) if no safe
+          # base can be resolved.
+          resolve_base_revision() {
+            local zero_sha="0000000000000000000000000000000000000000"
+            local candidate
+
+            resolve_base_revision_fallback() {
+              # Prefer the merge-base against the protected mainline so
+              # only commits unique to this push/tip are evaluated.
+              if git rev-parse --verify --quiet origin/main >/dev/null; then
+                local mb
+                if mb="$(git merge-base origin/main HEAD 2>/dev/null)" && [ -n "$mb" ]; then
+                  printf '%s' "$mb"
+                  return 0
+                fi
+              fi
+              # Otherwise the immediate parent, if HEAD has one.
+              if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+                git rev-parse "HEAD^"
+                return 0
+              fi
+              return 1
+            }
+
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              candidate="${PR_BASE_SHA:-}"
+            else
+              candidate="${PUSH_BEFORE_SHA:-}"
+            fi
+
+            # Treat the zero-SHA sentinel or any non-resolvable value
+            # as unresolved and fall back; never let it silently pass.
+            if [ -z "$candidate" ] || [ "$candidate" = "$zero_sha" ] \
+               || ! git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              echo "Base revision '$candidate' for event '${EVENT_NAME:-}' is unresolved (zero-SHA, missing, or shallow). Falling back." >&2
+              if ! candidate="$(resolve_base_revision_fallback)"; then
+                echo "ERROR: could not resolve any safe base revision (no origin/main merge-base and no HEAD parent)." >&2
+                echo "Refusing to pass the migration gate without a base to diff against." >&2
+                return 1
+              fi
+              echo "Resolved fallback base revision: $candidate" >&2
+            fi
+
+            printf '%s' "$candidate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED BASE-REVISION RESOLVER LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:baserev:END
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+
+          # Local copy of the REAL immutability gate one-liner. This is
+          # deliberately NOT wrapped in a SHARED-BLOCK:immutability
+          # sentinel: that id must keep EXACTLY two occurrences (the
+          # production gate + its dedicated mirror) so check_pair
+          # immutability stays valid. Scenario 2 still exercises the
+          # genuine `git diff --diff-filter=MDRCT base...HEAD` behavior
+          # end-to-end on a real V49 mutation -- the headline
+          # regression that crash-looped Railway.
+          run_gate() {
+            local base_sha="$1"
+            local changed
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            if [ -z "$changed" ]; then
+              return 0
+            fi
+            return 1
+          }
+
+          fail() { echo "SELF-TEST FAILED: $1"; exit 1; }
+
+          # Hermetic repo: no checkout, no network.
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "CI Self Test"
+
+          mkdir -p "$MIGRATION_PATH"
+          printf 'CREATE TABLE existing (id int);\n' > "$MIGRATION_PATH/V49__existing.sql"
+          git add -A
+          git commit -q -m "base tip (pre-push 'before')"
+          BEFORE_SHA="$(git rev-parse HEAD)"
+
+          printf 'CREATE TABLE next_table (id int);\n' > "$MIGRATION_PATH/V50__next.sql"
+          git add -A
+          git commit -q -m "advance HEAD with a clean add (acts as merge tip)"
+          HEAD_SHA="$(git rev-parse HEAD)"
+
+          # --- Scenario 1: pull_request + valid PR base -> PR_BASE_SHA ---
+          OUT="$(EVENT_NAME=pull_request PR_BASE_SHA="$BEFORE_SHA" PUSH_BEFORE_SHA="$HEAD_SHA" resolve_base_revision)"
+          [ "$OUT" = "$BEFORE_SHA" ] || fail "pull_request must resolve to PR_BASE_SHA (got '$OUT', want '$BEFORE_SHA')"
+          echo "OK: pull_request resolves to PR_BASE_SHA"
+
+          # --- Scenario 2: push + valid before -> PUSH_BEFORE_SHA, then
+          # feed it through the REAL immutability gate on a planted V49
+          # modify across before...HEAD -> MUST exit 1 (the headline
+          # regression that crash-looped Railway, now executable). ---
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$BEFORE_SHA" resolve_base_revision)"
+          [ "$OUT" = "$BEFORE_SHA" ] || fail "push must resolve to PUSH_BEFORE_SHA (got '$OUT', want '$BEFORE_SHA')"
+          # Plant a V49-style mutation on top of HEAD: the merge tip
+          # edits an already-merged migration. before...HEAD must catch it.
+          printf 'CREATE TABLE existing (id int, poisoned text);\n' > "$MIGRATION_PATH/V49__existing.sql"
+          git add -A
+          git commit -q -m "merge-commit mutates already-merged V49 (the Railway crash-loop)"
+          POISONED_HEAD="$(git rev-parse HEAD)"
+          if run_gate "$OUT"; then
+            fail "push->V49-modify across before...HEAD MUST fail the immutability gate (exit 1)"
+          fi
+          echo "OK: push resolves to PUSH_BEFORE_SHA and the V49 mutation trips the real gate (exit 1)"
+          git reset -q --hard "$HEAD_SHA"
+
+          # --- Scenario 3: push + zero-SHA before, origin/main present
+          # -> falls back to merge-base origin/main HEAD ---
+          ZERO_SHA="0000000000000000000000000000000000000000"
+          git branch -f main "$BEFORE_SHA"
+          # Simulate a remote-tracking ref the resolver looks for.
+          git update-ref refs/remotes/origin/main "$BEFORE_SHA"
+          EXPECTED_MB="$(git merge-base origin/main HEAD)"
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$ZERO_SHA" resolve_base_revision)"
+          [ "$OUT" = "$EXPECTED_MB" ] || fail "zero-SHA push with origin/main must fall back to merge-base (got '$OUT', want '$EXPECTED_MB')"
+          echo "OK: zero-SHA + origin/main falls back to merge-base origin/main HEAD"
+          git update-ref -d refs/remotes/origin/main
+          git branch -D main >/dev/null 2>&1 || true
+
+          # --- Scenario 4: zero-SHA, no origin/main, HEAD^ exists
+          # -> falls back to HEAD^ ---
+          EXPECTED_PARENT="$(git rev-parse 'HEAD^')"
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$ZERO_SHA" resolve_base_revision)"
+          [ "$OUT" = "$EXPECTED_PARENT" ] || fail "zero-SHA push with no origin/main must fall back to HEAD^ (got '$OUT', want '$EXPECTED_PARENT')"
+          echo "OK: zero-SHA + no origin/main falls back to HEAD^"
+
+          # --- Scenario 5: zero-SHA, no origin/main, no HEAD^ (root
+          # commit) -> exit 1, NO silent pass (the fail-loud invariant,
+          # the single most important assertion). ---
+          ROOT_WORK="$(mktemp -d)"
+          (
+            cd "$ROOT_WORK"
+            git init -q
+            git config user.email "ci@example.com"
+            git config user.name "CI Self Test"
+            mkdir -p "$MIGRATION_PATH"
+            printf 'CREATE TABLE only (id int);\n' > "$MIGRATION_PATH/V1__only.sql"
+            git add -A
+            git commit -q -m "root commit (no parent, no origin/main)"
+            if EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="$ZERO_SHA" resolve_base_revision >/dev/null 2>&1; then
+              fail "root commit with no base MUST fail loud (exit 1), never silently pass"
+            fi
+          )
+          echo "OK: root commit with no resolvable base fails loud (exit 1, no silent pass)"
+          rm -rf "$ROOT_WORK"
+
+          # --- Scenario 6: garbage PUSH_BEFORE_SHA that fails
+          # rev-parse --verify -> fallback path taken, NOT silent pass.
+          # HEAD^ still exists here so it must resolve to that, proving
+          # an unresolvable candidate is treated as unresolved (not
+          # passed through verbatim, which would later break the gate). ---
+          OUT="$(EVENT_NAME=push PR_BASE_SHA="" PUSH_BEFORE_SHA="not-a-real-sha-deadbeef" resolve_base_revision)"
+          [ "$OUT" = "$EXPECTED_PARENT" ] || fail "garbage PUSH_BEFORE_SHA must take the fallback path, not pass verbatim (got '$OUT', want '$EXPECTED_PARENT')"
+          echo "OK: unresolvable/garbage PUSH_BEFORE_SHA takes the fallback path (no silent pass)"
+
+          echo "All base-revision-resolution self-test scenarios passed."
+
+  verify-gate-mirror-parity:
+    name: Verify Gate <-> Mirror Parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Assert every SHARED block is byte-identical across gate and mirror
+        run: |
+          set -euo pipefail
+
+          WF=".github/workflows/migration-immutability.yml"
+
+          # Extract every region delimited by the sentinel markers
+          # "# >>> SHARED-BLOCK:<id>:BEGIN" / ":END" for a given <id>.
+          # awk prints the lines strictly BETWEEN the two marker lines
+          # (markers excluded), and concatenates every occurrence of
+          # that <id> in file order. The two production/mirror copies
+          # therefore extract as one stream each pairing collapses to.
+          # We then split that stream back into the N occurrences and
+          # diff occurrence #1 against every other occurrence. Each id
+          # declares its expected occurrence count: the single-gate ids
+          # (immutability, monotonicity) have exactly 2 (production gate
+          # + self-test mirror); baserev has 3 (the resolver is shared
+          # by BOTH gate jobs plus its self-test mirror).
+          extract_occurrence() {
+            local id="$1" want="$2"
+            awk -v id="$id" -v want="$want" '
+              $0 ~ ("# >>> SHARED-BLOCK:" id ":BEGIN") { n++; cap=(n==want?1:0); next }
+              $0 ~ ("# >>> SHARED-BLOCK:" id ":END")   { if (n==want) exit; cap=0; next }
+              cap { print }
+            ' "$WF"
+          }
+
+          check_pair() {
+            local id="$1" expected="$2"
+            local a b count i
+            count="$(grep -c "# >>> SHARED-BLOCK:${id}:BEGIN" "$WF")"
+            if [ "$count" -ne "$expected" ]; then
+              echo "PARITY FAILED: expected exactly ${expected} '${id}' SHARED blocks, found ${count}"
+              exit 1
+            fi
+            a="$(mktemp)"
+            extract_occurrence "$id" 1 > "$a"
+            if [ ! -s "$a" ]; then
+              echo "PARITY FAILED: extracted an empty '${id}' SHARED block"
+              exit 1
+            fi
+            i=2
+            while [ "$i" -le "$count" ]; do
+              b="$(mktemp)"
+              extract_occurrence "$id" "$i" > "$b"
+              if [ ! -s "$b" ]; then
+                echo "PARITY FAILED: extracted an empty '${id}' SHARED block (occurrence ${i})"
+                exit 1
+              fi
+              if ! diff -u "$a" "$b"; then
+                echo "PARITY FAILED: '${id}' SHARED block occurrence ${i} differs from occurrence 1."
+                echo "The SHARED block must be BYTE-IDENTICAL across the production"
+                echo "job(s) and its hermetic mirror. Re-sync the copies."
+                exit 1
+              fi
+              i=$((i + 1))
+            done
+            echo "OK: all ${count} '${id}' SHARED block copies are byte-identical"
+          }
+
+          check_pair immutability 2
+          check_pair monotonicity 2
+          check_pair baserev 3
+
+          echo "All SHARED gate<->mirror blocks are byte-identical."
