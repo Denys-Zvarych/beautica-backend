@@ -40,7 +40,10 @@ import java.util.UUID;
  * {@code master_services}) and applies an aggregate filter on
  * {@code MIN(COALESCE(price_override, base_price))}, which JPQL cannot express
  * cleanly while keeping the {@code GROUP BY} → {@code HAVING} pipeline visible.
- * Salon search is plain JPQL on {@link SalonRepository#findByLocation}.
+ * Salon search is plain JPQL dispatched by {@link #searchSalons} to one of
+ * three single-equality, SARGable {@link SalonRepository} methods (Phase 10.8,
+ * MEDIUM-1): {@code findActiveByDistrictId} / {@code findActiveByCityId} /
+ * {@code findByIsActiveTrue}.
  *
  * <h3>Phase 10.5 — FK-based, district-primary location filter</h3>
  * The earlier free-text {@code AND u.city = :city AND u.region = :region}
@@ -199,7 +202,7 @@ public class SearchService {
         UUID cityId = key == null ? null : key.cityId();
         UUID districtId = key == null ? null : key.districtId();
 
-        Page<Salon> page = salonRepository.findByLocation(cityId, districtId, pageable);
+        Page<Salon> page = findSalonsByLocation(cityId, districtId, pageable);
 
         List<Salon> salons = page.getContent();
         DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
@@ -207,6 +210,40 @@ public class SearchService {
                 distinct(salons, Salon::getDistrictId));
 
         return page.map(salon -> toSalonSearchResult(salon, labels));
+    }
+
+    /**
+     * Dispatches the salon-location query to a single-equality, SARGable
+     * repository method by district-primary precedence (Phase 10.8, MEDIUM-1):
+     *
+     * <ol>
+     *   <li>a resolved {@code districtId} wins →
+     *       {@link SalonRepository#findActiveByDistrictId} (index-served by
+     *       {@code idx_salons_district_id});</li>
+     *   <li>else a resolved {@code cityId} →
+     *       {@link SalonRepository#findActiveByCityId} (index-served by
+     *       {@code idx_salons_city_id});</li>
+     *   <li>else no locality filter →
+     *       {@link SalonRepository#findByIsActiveTrue}.</li>
+     * </ol>
+     *
+     * <p>This replaces the former single
+     * {@code findByLocation(cityId, districtId, …)} whose disjunctive
+     * NULL-guard OR-chain spanning {@code district_id}/{@code city_id} was
+     * non-SARGable — Postgres could not reliably index-serve it. Behaviour is
+     * unchanged (same result set, paging and ordering per branch); only the
+     * plan shape changed. The district→city→all precedence is identical to the
+     * old query's {@code :districtId IS NOT NULL … OR :districtId IS NULL …}
+     * dispatch.
+     */
+    private Page<Salon> findSalonsByLocation(UUID cityId, UUID districtId, Pageable pageable) {
+        if (districtId != null) {
+            return salonRepository.findActiveByDistrictId(districtId, pageable);
+        }
+        if (cityId != null) {
+            return salonRepository.findActiveByCityId(cityId, pageable);
+        }
+        return salonRepository.findByIsActiveTrue(pageable);
     }
 
     // ── location seam (M2) ────────────────────────────────────────────────────

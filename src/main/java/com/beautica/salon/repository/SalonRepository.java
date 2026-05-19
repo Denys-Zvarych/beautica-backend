@@ -43,40 +43,69 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     Optional<Salon> findByIdAndIsActiveTrueWithOwner(@Param("id") UUID id);
 
     /**
-     * Filter active salons by the Phase 10.5 FK location filter
-     * (district-primary) for the public salon search endpoint.
+     * Active salons in a specific discovery district (district-primary branch
+     * of the Phase 10.5 FK location filter).
+     *
+     * <p><b>Plan shape (Phase 10.8, MEDIUM-1):</b> a single-column equality on
+     * {@code district_id} under a constant {@code is_active = true}. No
+     * disjunctive NULL-guard OR-chain spanning two columns, so Postgres can
+     * index-serve it via {@code idx_salons_district_id} (V54) at any scale —
+     * the predicate is SARGable. {@link SearchService#searchSalons} dispatches
+     * here when a districtId is resolved; the caller never passes
+     * {@code null}.
      *
      * <p>Replaces the removed free-text {@code findByFilter} (exact
-     * string-equality on {@code city}/{@code region} — the Phase 10.5 bug).
-     * No non-graph/legacy variant is kept alongside (§E): the free-text form
-     * is deleted, not deprecated, because it produced silently wrong results
-     * ("Київ" ≠ "Киев").
+     * string-equality on {@code city}/{@code region} — the Phase 10.5 bug);
+     * no legacy variant is kept alongside (§E). A salon's discovery locality
+     * is its own {@code district_id} — there is no salon-to-salon link to
+     * resolve through (that resolution is the master-only
+     * {@code SALON_MASTER → salon} case). The {@code Page} return type makes
+     * Spring Data emit the matching {@code COUNT(*)} companion.
      *
-     * <p>District-primary, read side: a supplied {@code districtId} wins;
-     * otherwise {@code cityId}; both {@code null} → no location filter (all
-     * active salons). {@code (:param IS NULL OR col = :param)} keeps a single
-     * query covering every combination; the {@code Page} return type makes
-     * Spring Data emit the matching {@code COUNT(*)} companion (no HAVING, so
-     * the default count is correct).
-     *
-     * <p>Backed by {@code idx_salons_district_id} / {@code idx_salons_city_id}
-     * (V54). A salon's discovery locality is its own {@code city_id} /
-     * {@code district_id} — there is no salon-to-salon link to resolve through
-     * (that resolution is the master-only {@code SALON_MASTER → salon} case).
-     *
-     * @param cityId     resolved discovery city id, or {@code null}
-     * @param districtId resolved discovery district id, or {@code null}
+     * @param districtId resolved discovery district id (never {@code null})
      */
     @Query("""
             SELECT s FROM Salon s
             WHERE s.isActive = true
-              AND (:districtId IS NOT NULL AND s.districtId = :districtId
-                   OR :districtId IS NULL
-                      AND (:cityId IS NULL OR s.cityId = :cityId))
+              AND s.districtId = :districtId
             """)
-    Page<Salon> findByLocation(
-            @Param("cityId") UUID cityId,
+    Page<Salon> findActiveByDistrictId(
             @Param("districtId") UUID districtId,
             Pageable pageable
     );
+
+    /**
+     * Active salons in a specific discovery city (city-only branch of the
+     * Phase 10.5 FK location filter — a districted city without a resolved
+     * district widens to city level on the read side).
+     *
+     * <p><b>Plan shape (Phase 10.8, MEDIUM-1):</b> a single-column equality on
+     * {@code city_id} under a constant {@code is_active = true}, SARGable and
+     * index-served by {@code idx_salons_city_id} (V54) at any scale.
+     * {@link SearchService#searchSalons} dispatches here when no district was
+     * resolved but a cityId is present; the caller never passes {@code null}.
+     *
+     * @param cityId resolved discovery city id (never {@code null})
+     */
+    @Query("""
+            SELECT s FROM Salon s
+            WHERE s.isActive = true
+              AND s.cityId = :cityId
+            """)
+    Page<Salon> findActiveByCityId(
+            @Param("cityId") UUID cityId,
+            Pageable pageable
+    );
+
+    /**
+     * All active salons (no-locality-filter branch of the Phase 10.5 FK
+     * location filter — both cityId and districtId resolved to {@code null}).
+     *
+     * <p><b>Plan shape (Phase 10.8, MEDIUM-1):</b> a single constant predicate
+     * {@code is_active = true} with no locality column reference — no
+     * non-SARGable OR-chain. Spring Data derives the matching {@code COUNT(*)}
+     * companion. {@link SearchService#searchSalons} dispatches here only when
+     * no locality filter was supplied.
+     */
+    Page<Salon> findByIsActiveTrue(Pageable pageable);
 }

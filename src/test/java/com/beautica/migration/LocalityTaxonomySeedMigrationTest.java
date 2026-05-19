@@ -382,4 +382,65 @@ class LocalityTaxonomySeedMigrationTest extends AbstractIntegrationTest {
                     .isNotNull();
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 10.8 AC6 — seed migration runtime is acceptable on a cold start
+    // ---------------------------------------------------------------------
+
+    @Nested
+    @DisplayName("Phase 10.8 AC6 — V53 seed migration runtime")
+    class SeedMigrationRuntime {
+
+        /**
+         * Cold-start ceiling for the V53 seed. The seed is ~455 single-row
+         * {@code INSERT ... SELECT ... WHERE katotth_code = ?} statements
+         * (FK resolved by business key — the deterministic/idempotent form the
+         * V53 header mandates), all inside ONE Flyway migration transaction
+         * (one begin/commit round-trip, not 455 transactions) over ≤356-row
+         * reference tables. Testcontainers spins a cold {@code postgres:16}
+         * with no warm cache — a fair, if anything pessimistic, proxy for a
+         * cold Neon start (Neon's compute resumes warm). Flyway records the
+         * applied duration in {@code execution_time} (milliseconds); a generous
+         * 10s ceiling is a coarse regression tripwire that a pathological
+         * rewrite (e.g. a per-row correlated cross join, or accidental
+         * {@code O(n^2)} re-seed) would trip, while not flaking on CI jitter.
+         * V53 is an immutable shipped migration — Phase 10.8 only CONFIRMS its
+         * runtime (Step 4), it does not and must not rewrite it.
+         */
+        private static final int V53_RUNTIME_CEILING_MS = 10_000;
+
+        @Test
+        @DisplayName("V53 applied well within the cold-start runtime ceiling (batched in one migration tx)")
+        void should_applyWithinRuntimeCeiling_when_seedRunOnColdContainer() {
+            Integer executionTimeMs = jdbcTemplate.queryForObject(
+                    "SELECT execution_time FROM flyway_schema_history "
+                            + "WHERE version = '53'",
+                    Integer.class);
+
+            assertThat(executionTimeMs)
+                    .as("Flyway must have recorded a V53 execution_time")
+                    .isNotNull();
+            assertThat(executionTimeMs)
+                    .as("V53 (~455 single-row inserts in ONE migration tx over "
+                            + "≤356-row ref tables) must not bloat cold-start "
+                            + "migration runtime — recorded %d ms, ceiling %d ms",
+                            executionTimeMs, V53_RUNTIME_CEILING_MS)
+                    .isLessThan(V53_RUNTIME_CEILING_MS);
+        }
+
+        @Test
+        @DisplayName("V53 is a single atomic migration entry — not row-by-row reapplied (no repeat/retry rows)")
+        void should_haveExactlyOneV53HistoryRow_when_chainApplied() {
+            // A single flyway_schema_history row for V53 proves the ~455
+            // inserts ran as ONE migration unit (one tx, one round-trip to
+            // start/commit), not as fragmented re-applied chunks.
+            Integer rows = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM flyway_schema_history WHERE version = '53'",
+                    Integer.class);
+
+            assertThat(rows)
+                    .as("V53 must appear exactly once in the migration history")
+                    .isEqualTo(1);
+        }
+    }
 }
