@@ -26,6 +26,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String REFRESH_PATH = "/api/v1/auth/refresh";
     private static final String VERIFY_EMAIL_PATH = "/api/v1/auth/verify-email";
     private static final String RESEND_VERIFICATION_PATH = "/api/v1/auth/resend-verification";
+    private static final String FORGOT_PASSWORD_PATH = "/api/v1/auth/forgot-password";
+    private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
@@ -34,6 +36,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
     // so clients do not spin-retry every 60 s and waste their remaining IP quota.
     private static final int VERIFY_EMAIL_RETRY_AFTER_SECONDS = 900;
+    // forgot-password / reset-password bucket window is 60 minutes.
+    private static final int FORGOT_PASSWORD_RETRY_AFTER_SECONDS = 3600;
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -48,6 +52,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // runs after this one, so the rate limiter sees only the network identity.
     private final LoadingCache<String, Bucket> mediaUploadBuckets;
     private final LoadingCache<String, Bucket> resendVerificationBuckets;
+    // Shared bucket for forgot-password and reset-password (60-minute window).
+    // Using one bucket for both paths keeps config surface minimal and is
+    // semantically correct: a user making 3 forgot-password requests in an hour
+    // already holds a live token and has no legitimate need to hit reset-password
+    // more than 3 times against that same bucket's counter.
+    private final LoadingCache<String, Bucket> forgotPasswordBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -57,7 +67,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
             @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
             @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
-            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets) {
+            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
+            @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -66,6 +77,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.deviceTokenBuckets = deviceTokenBuckets;
         this.mediaUploadBuckets = mediaUploadBuckets;
         this.resendVerificationBuckets = resendVerificationBuckets;
+        this.forgotPasswordBuckets = forgotPasswordBuckets;
     }
 
     @Override
@@ -122,6 +134,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             retryAfterSeconds = VERIFY_EMAIL_RETRY_AFTER_SECONDS;
         } else if (RESEND_VERIFICATION_PATH.equals(path)) {
             cache = resendVerificationBuckets;
+        } else if (FORGOT_PASSWORD_PATH.equals(path) || RESET_PASSWORD_PATH.equals(path)) {
+            cache = forgotPasswordBuckets;
+            retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
         } else {
             filterChain.doFilter(request, response);
             return;
