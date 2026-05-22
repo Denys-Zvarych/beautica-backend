@@ -712,6 +712,363 @@ class AuthorizationServiceTest {
                 .doesNotThrowAnyException();
     }
 
+    // ── canManageMaster — SALON_OWNER branch (Phase 12.1) ─────────────────────
+
+    @Test
+    @DisplayName("canManageMaster — returns true when actor is the salon owner and master type is SALON_OWNER")
+    void should_returnTrue_when_salonOwnerTypeMasterAndActorOwnsSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result)
+                .as("SALON_OWNER actor must be allowed to manage a SALON_OWNER-type master in their own salon")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageMaster — returns false when actor does not own the salon of a SALON_OWNER-type master")
+    void should_returnFalse_when_differentOwnerTriesToManageSalonOwnerTypeMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID realOwnerId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        User realOwner = mock(User.class);
+        when(realOwner.getId()).thenReturn(realOwnerId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(realOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result)
+                .as("a different owner must not be allowed to manage a SALON_OWNER-type master")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("canManageMaster — returns false when SALON_OWNER-type master has a null salon reference")
+    void should_returnFalse_when_salonOwnerTypeMasterHasNullSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result)
+                .as("canManageMaster must return false when the SALON_OWNER-type master has no salon reference")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("canManageMaster — returns false when SALON_OWNER-type master has salon with null owner")
+    void should_returnFalse_when_salonOwnerTypeMasterHasNullOwnerOnSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result)
+                .as("canManageMaster must return false when the salon has a null owner reference")
+                .isFalse();
+    }
+
+    // ── canManageMasterSchedule — SALON_OWNER branch (Phase 12.1) ─────────────
+
+    @Test
+    @DisplayName("canManageMasterSchedule — returns true when actor is the salon owner and master type is SALON_OWNER")
+    void should_returnTrue_when_salonOwnerCanManageOwnTypeMasterSchedule() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageMasterSchedule(auth, masterId);
+
+        assertThat(result)
+                .as("a SALON_OWNER actor must be able to manage the schedule of their SALON_OWNER-type master")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("canManageMasterSchedule — returns false when a different owner tries to manage SALON_OWNER-type master schedule")
+    void should_returnFalse_when_differentOwnerTriesToManageSalonOwnerTypeMasterSchedule() {
+        UUID actorId = UUID.randomUUID();
+        UUID realOwnerId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        User realOwner = mock(User.class);
+        when(realOwner.getId()).thenReturn(realOwnerId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(realOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageMasterSchedule(auth, masterId);
+
+        assertThat(result)
+                .as("a different owner must not be allowed to manage a SALON_OWNER-type master schedule")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("canManageMasterSchedule — returns false when SALON_OWNER-type master has null salon")
+    void should_returnFalse_when_salonOwnerTypeMasterScheduleHasNullSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canManageMasterSchedule(auth, masterId);
+
+        assertThat(result)
+                .as("canManageMasterSchedule must return false when SALON_OWNER-type master has no salon")
+                .isFalse();
+    }
+
+    // ── enforceCanManageMaster — SALON_OWNER branch (Phase 12.1) ──────────────
+
+    @Test
+    @DisplayName("enforceCanManageMaster — does not throw when actor is the correct salon owner for a SALON_OWNER-type master")
+    void should_notThrow_when_correctSalonOwnerEnforcesOnSalonOwnerTypeMaster() {
+        UUID actorId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        authorizationService.enforceCanManageMaster(actorId, master);
+        // No exception = pass.
+    }
+
+    @Test
+    @DisplayName("enforceCanManageMaster — throws ForbiddenException when wrong actor enforces on SALON_OWNER-type master")
+    void should_throwForbidden_when_wrongActorEnforcesOnSalonOwnerTypeMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID realOwnerId = UUID.randomUUID();
+
+        User realOwner = mock(User.class);
+        when(realOwner.getId()).thenReturn(realOwnerId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(realOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageMaster(actorId, master))
+                .isInstanceOf(ForbiddenException.class)
+                .as("enforceCanManageMaster must throw ForbiddenException for wrong actor on SALON_OWNER-type master");
+    }
+
+    @Test
+    @DisplayName("enforceCanManageMaster — throws ForbiddenException when SALON_OWNER-type master has null salon")
+    void should_throwForbidden_when_salonOwnerTypeMasterHasNullSalonOnEnforce() {
+        UUID actorId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(null);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageMaster(actorId, master))
+                .isInstanceOf(ForbiddenException.class)
+                .as("null salon on SALON_OWNER-type master must result in ForbiddenException");
+    }
+
+    // ── enforceCanManageMasterSchedule — SALON_OWNER branch (Phase 12.1) ──────
+
+    @Test
+    @DisplayName("enforceCanManageMasterSchedule — does not throw when actor is the correct owner for SALON_OWNER-type master")
+    void should_notThrow_when_correctOwnerEnforcesScheduleOnSalonOwnerTypeMaster() {
+        UUID actorId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        authorizationService.enforceCanManageMasterSchedule(actorId, master);
+        // No exception = pass.
+    }
+
+    @Test
+    @DisplayName("enforceCanManageMasterSchedule — throws ForbiddenException when wrong actor enforces schedule on SALON_OWNER-type master")
+    void should_throwForbidden_when_wrongActorEnforcesScheduleOnSalonOwnerTypeMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID realOwnerId = UUID.randomUUID();
+
+        User realOwner = mock(User.class);
+        when(realOwner.getId()).thenReturn(realOwnerId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(realOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageMasterSchedule(actorId, master))
+                .isInstanceOf(ForbiddenException.class)
+                .as("wrong actor must get ForbiddenException on SALON_OWNER-type master schedule");
+    }
+
+    @Test
+    @DisplayName("enforceCanManageMasterSchedule — throws ForbiddenException when SALON_OWNER-type master has null salon")
+    void should_throwForbidden_when_salonOwnerTypeMasterHasNullSalonOnScheduleEnforce() {
+        UUID actorId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(null);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageMasterSchedule(actorId, master))
+                .isInstanceOf(ForbiddenException.class)
+                .as("null salon on SALON_OWNER-type master must yield ForbiddenException on schedule enforce");
+    }
+
+    // ── isAuthorizedToManageBooking — SALON_OWNER master type (Phase 12.1) ────
+
+    @Test
+    @DisplayName("enforceCanManageBooking — does not throw when SALON_OWNER-type master's salon owner matches actor")
+    void should_notThrow_when_enforceCanManageBookingCalledWithSalonOwnerTypeAndCorrectOwner() {
+        UUID actorId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(actorId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        authorizationService.enforceCanManageBooking(actorId, booking);
+        // No exception = pass.
+    }
+
+    @Test
+    @DisplayName("enforceCanManageBooking — throws ForbiddenException when booking master is SALON_OWNER type but actor is a different owner")
+    void should_throwForbidden_when_wrongActorTriesToManageBookingWithSalonOwnerTypeMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID realOwnerId = UUID.randomUUID();
+
+        User realOwner = mock(User.class);
+        when(realOwner.getId()).thenReturn(realOwnerId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(realOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(actorId, booking))
+                .isInstanceOf(ForbiddenException.class)
+                .as("a different owner must not be allowed to manage a booking whose master is SALON_OWNER type");
+    }
+
+    @Test
+    @DisplayName("enforceCanManageBooking — throws ForbiddenException when SALON_OWNER-type master has null salon on booking")
+    void should_throwForbidden_when_salonOwnerTypeMasterHasNullSalonOnBookingEnforce() {
+        UUID actorId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(null);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(actorId, booking))
+                .isInstanceOf(ForbiddenException.class)
+                .as("null salon on SALON_OWNER-type master must yield ForbiddenException on booking enforce");
+    }
+
     // ── enforceCanManageBooking ────────────────────────────────────────────────
 
     @Test

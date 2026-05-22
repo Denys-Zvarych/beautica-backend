@@ -47,6 +47,8 @@ public class SalonService {
             throw new ForbiddenException("Only SALON_OWNER may create a salon");
         }
 
+        boolean isFirstSalon = !salonRepository.existsByOwnerId(owner.getId());
+
         var salon = Salon.builder()
                 .owner(owner)
                 .name(request.name())
@@ -57,6 +59,7 @@ public class SalonService {
                 .phone(request.phone())
                 .instagramUrl(request.instagramUrl())
                 .isActive(true)
+                .isPrimary(isFirstSalon)
                 .build();
 
         return SalonResponse.from(salonRepository.save(salon));

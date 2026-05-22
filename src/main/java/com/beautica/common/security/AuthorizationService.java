@@ -82,6 +82,13 @@ public class AuthorizationService {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
                 return m.getUser().getId().equals(actorId);
             }
+            // SALON_OWNER-type master: authorized via primary salon ownership.
+            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            if (m.getMasterType() == MasterType.SALON_OWNER) {
+                return m.getSalon() != null
+                        && m.getSalon().getOwner() != null
+                        && m.getSalon().getOwner().getId().equals(actorId);
+            }
             return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId);
         }).orElse(false);
     }
@@ -101,6 +108,13 @@ public class AuthorizationService {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
                 return m.getUser().getId().equals(actorId);
             }
+            // SALON_OWNER-type master: authorized via primary salon ownership.
+            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            if (m.getMasterType() == MasterType.SALON_OWNER) {
+                return m.getSalon() != null
+                        && m.getSalon().getOwner() != null
+                        && m.getSalon().getOwner().getId().equals(actorId);
+            }
             return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId);
         }).orElse(false);
     }
@@ -112,18 +126,36 @@ public class AuthorizationService {
     }
 
     public void enforceCanManageMaster(UUID actorId, Master master) {
-        boolean allowed = master.getMasterType() == MasterType.INDEPENDENT_MASTER
-                ? master.getUser().getId().equals(actorId)
-                : master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
+        boolean allowed;
+        if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+            allowed = master.getUser().getId().equals(actorId);
+        } else if (master.getMasterType() == MasterType.SALON_OWNER) {
+            // SALON_OWNER-type master: authorized via primary salon ownership.
+            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            allowed = master.getSalon() != null
+                    && master.getSalon().getOwner() != null
+                    && master.getSalon().getOwner().getId().equals(actorId);
+        } else {
+            allowed = master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
+        }
         if (!allowed) {
             throw new ForbiddenException("Access denied");
         }
     }
 
     public void enforceCanManageMasterSchedule(UUID actorId, Master master) {
-        boolean allowed = master.getMasterType() == MasterType.INDEPENDENT_MASTER
-                ? master.getUser().getId().equals(actorId)
-                : master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
+        boolean allowed;
+        if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+            allowed = master.getUser().getId().equals(actorId);
+        } else if (master.getMasterType() == MasterType.SALON_OWNER) {
+            // SALON_OWNER-type master: authorized via primary salon ownership.
+            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            allowed = master.getSalon() != null
+                    && master.getSalon().getOwner() != null
+                    && master.getSalon().getOwner().getId().equals(actorId);
+        } else {
+            allowed = master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
+        }
         if (!allowed) {
             throw new ForbiddenException("Access denied");
         }
@@ -257,6 +289,13 @@ public class AuthorizationService {
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             return master.getUser().getId().equals(actorId);
+        }
+        // SALON_OWNER-type master: authorized via primary salon ownership.
+        // Explicit case prevents silent fallthrough if new MasterType values are added.
+        if (master.getMasterType() == MasterType.SALON_OWNER) {
+            return master.getSalon() != null
+                    && master.getSalon().getOwner() != null
+                    && master.getSalon().getOwner().getId().equals(actorId);
         }
         if (master.getSalon() != null) {
             return master.getSalon().getOwner() != null

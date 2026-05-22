@@ -8,6 +8,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
@@ -20,7 +21,22 @@ import lombok.Setter;
 import java.util.UUID;
 
 @Entity
-@Table(name = "salons")
+@Table(
+        name = "salons",
+        indexes = {
+                // V46: partial index — only active salons (WHERE is_active = true).
+                // Backs getOwnerSalons and salon listing queries filtered by owner.
+                // JPA @Index cannot express partial WHERE — column list only.
+                @Index(name = "idx_salons_owner_active_created", columnList = "owner_id, created_at"),
+                // V56: partial unique — one primary salon per owner (WHERE is_primary = true).
+                // DB index is partial unique; using unique=true here would generate a full unique
+                // constraint under ddl-auto=create-drop, which is wrong — omit unique=true.
+                @Index(name = "idx_salons_owner_primary", columnList = "owner_id"),
+                // V57: non-partial — backs existsByOwnerId(UUID) which must find any salon
+                // regardless of is_active or is_primary state.
+                @Index(name = "idx_salons_owner_id", columnList = "owner_id")
+        }
+)
 @Getter
 @Setter
 @NoArgsConstructor
@@ -81,4 +97,9 @@ public class Salon extends AuditableEntity {
 
     @Column(name = "is_active")
     private boolean isActive;
+
+    // True for the salon created during SALON_OWNER registration (Phase 12.1).
+    // Only one primary salon per owner — enforced by idx_salons_owner_primary (V56).
+    @Column(name = "is_primary", nullable = false)
+    private boolean isPrimary = false;
 }

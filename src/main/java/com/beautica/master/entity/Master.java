@@ -11,6 +11,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.OneToOne;
@@ -25,7 +26,20 @@ import java.math.BigDecimal;
 import java.util.UUID;
 
 @Entity
-@Table(name = "masters")
+@Table(
+        name = "masters",
+        indexes = {
+                // Backs owner-master lookup (Phase 12.2/12.4) and dashboard scope join.
+                // DB index is partial: WHERE master_type = 'SALON_OWNER' AND is_active = true (V56).
+                // JPA @Index cannot express partial WHERE — column list only.
+                @Index(name = "idx_masters_salon_owner_active", columnList = "salon_id, user_id"),
+                // V56: partial unique — one SALON_OWNER-type master row per user
+                // (WHERE master_type = 'SALON_OWNER'). DB index is partial unique; using unique=true
+                // here would generate a full unique constraint under ddl-auto=create-drop, which is
+                // wrong — omit unique=true. JPA @Index cannot express partial WHERE — column list only.
+                @Index(name = "idx_masters_user_owner_type", columnList = "user_id")
+        }
+)
 @Getter
 @Setter
 @NoArgsConstructor

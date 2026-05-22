@@ -136,8 +136,9 @@ class SalonControllerTest {
     }
 
     private SalonResponse stubSalonResponse(UUID salonId, String name) {
+        // Phase 12.1: isPrimary added as the 17th component; false is the safe default for stubs.
         return new SalonResponse(salonId, null, name, null, null, null, null,
-                null, null, null, null, null, null, null, null, true, null);
+                null, null, null, null, null, null, null, null, true, false, null);
     }
 
     // ── POST /api/v1/salons ───────────────────────────────────────────────────

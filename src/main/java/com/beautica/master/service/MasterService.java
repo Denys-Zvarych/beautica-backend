@@ -129,7 +129,7 @@ public class MasterService {
         List<WorkingHoursResponse> saved = workingHoursRepository.saveAll(toSave).stream()
                 .map(WorkingHoursResponse::from)
                 .toList();
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(masterId);
         return saved;
     }
 
@@ -159,7 +159,7 @@ public class MasterService {
             result = scheduleExceptionRepository.save(exception);
         }
 
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(masterId);
         return result;
     }
 
@@ -172,7 +172,7 @@ public class MasterService {
 
         scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
                 .ifPresent(scheduleExceptionRepository::delete);
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(masterId);
     }
 
     @Transactional
@@ -184,7 +184,7 @@ public class MasterService {
 
         master.setActive(false);
         // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
-        evictMasterCalendarAfterCommit();
+        evictMasterCalendarAfterCommit(masterId);
 
         // Capture the user UUID while the transaction is still open (user is JOIN FETCH-ed by
         // findByIdWithSalonAndOwner, so getUser() is initialized). A stale master-by-user entry
@@ -208,7 +208,16 @@ public class MasterService {
     // to repopulate the cache with stale data within the commit window.
     // Registering afterCommit() ensures the cache is cleared only after the write is durable.
     // Guard: synchronization must be active (i.e. called within a @Transactional context).
-    private void evictMasterCalendarAfterCommit() {
+    //
+    // Why cache.clear() instead of per-key eviction:
+    // The @Cacheable key is a compound SimpleKey{masterId, from, to, pageNumber, pageSize}.
+    // SimpleKey.toString() produces "[uuid, from, to, ...]" (leading bracket), so a
+    // prefix match on masterId.toString() never fires. Reconstructing every possible
+    // (from, to, page) combination for targeted eviction is not feasible. cache.clear()
+    // is safe here because it is scoped exclusively to the "master-calendar" cache — no
+    // other data lives there — and the 30-second TTL already bounds the worst-case
+    // stale window for unaffected masters.
+    private void evictMasterCalendarAfterCommit(UUID masterId) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
