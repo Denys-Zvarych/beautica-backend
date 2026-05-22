@@ -5,15 +5,19 @@ import jakarta.validation.ConstraintValidatorContext;
 
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
- * Shared implementation backing {@link StrongPassword}. Used by both the registration
- * and the password-reset DTOs so the two flows can never diverge on password strength.
+ * Shared implementation backing {@link StrongPassword}. Used by the self-registration,
+ * independent-master registration and the password-reset DTOs so those flows can never
+ * diverge on password strength.
  *
- * <p>Rules:
+ * <p>Rules (a strict superset of the mobile {@code validateNewPassword} policy):
  * <ul>
  *   <li>Length 8–128 (the historical bound; below 8 is rejected, above 128 guards the
  *       BCrypt 72-byte-relevant input and oversized payloads).</li>
+ *   <li>At least one digit {@code [0-9]} — mirrors the mobile registration validator.</li>
+ *   <li>At least one uppercase ASCII letter {@code [A-Z]} — mirrors the mobile validator.</li>
  *   <li>Case-insensitive denylist of the most trivially-guessable values (OWASP ASVS 2.1
  *       common-password rejection). Kept deliberately small and in-process — this is a
  *       last-line guard against the worst offenders, not a substitute for a breach-corpus
@@ -28,6 +32,12 @@ public class StrongPasswordValidator implements ConstraintValidator<StrongPasswo
 
     static final int MIN_LENGTH = 8;
     static final int MAX_LENGTH = 128;
+
+    /** Precompiled once — matches a string containing at least one ASCII digit. */
+    private static final Pattern HAS_DIGIT = Pattern.compile(".*[0-9].*", Pattern.DOTALL);
+
+    /** Precompiled once — matches a string containing at least one uppercase ASCII letter. */
+    private static final Pattern HAS_UPPERCASE = Pattern.compile(".*[A-Z].*", Pattern.DOTALL);
 
     /**
      * Lower-cased denylist of trivially-weak passwords. Compared case-insensitively, so
@@ -60,6 +70,9 @@ public class StrongPasswordValidator implements ConstraintValidator<StrongPasswo
             return true;
         }
         if (value.length() < MIN_LENGTH || value.length() > MAX_LENGTH) {
+            return false;
+        }
+        if (!HAS_DIGIT.matcher(value).matches() || !HAS_UPPERCASE.matcher(value).matches()) {
             return false;
         }
         return !COMMON_PASSWORDS.contains(value.toLowerCase(Locale.ROOT));
