@@ -317,7 +317,7 @@ class InviteServiceTest {
         var userId = UUID.randomUUID();
         var invite = buildInviteToken("new@example.com", Instant.now().plusSeconds(3600));
         ReflectionTestUtils.setField(invite, "salonId", salonId);
-        var request = new InviteAcceptRequest(rawToken, "password123", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Jane", "Doe", null);
         log.debug("Arrange: valid unused token for email=new@example.com salonId={}", salonId);
 
         var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
@@ -356,7 +356,7 @@ class InviteServiceTest {
     void should_throwNotFoundException_when_tokenNotFound() {
         var rawToken = "nonexistent";
         var hashedToken = "hashed-nonexistent";
-        var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
         log.debug("Arrange: no invite token found");
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
@@ -375,7 +375,7 @@ class InviteServiceTest {
         var hashedToken = "hashed-used-token";
         var invite = buildInviteToken("used@example.com", Instant.now().plusSeconds(3600));
         invite.markUsed();
-        var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
         log.debug("Arrange: invite token already marked used");
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
@@ -393,7 +393,7 @@ class InviteServiceTest {
         var rawToken = "raw-expired-token";
         var hashedToken = "hashed-expired-token";
         var invite = buildInviteToken("expired2@example.com", Instant.now().minusSeconds(1));
-        var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
         log.debug("Arrange: invite token is expired");
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
@@ -411,7 +411,7 @@ class InviteServiceTest {
         var rawToken = "raw-collision-token";
         var hashedToken = "hashed-collision-token";
         var invite = buildInviteToken("collision@example.com", Instant.now().plusSeconds(3600));
-        var request = new InviteAcceptRequest(rawToken, "password123", null, null, null);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
         log.debug("Arrange: invite token valid but email collision detected");
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);

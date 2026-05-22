@@ -54,7 +54,7 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(DashboardIntegrationTest.class);
     private static final String REVENUE_URL = "/api/v1/dashboard/revenue";
-    private static final String TEST_PASSWORD = "password123";
+    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
 

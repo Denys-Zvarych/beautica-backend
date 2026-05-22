@@ -43,7 +43,7 @@ class ReviewIntegrationTest extends AbstractIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(ReviewIntegrationTest.class);
     private static final String REVIEWS_URL   = "/api/v1/reviews";
     private static final String MASTERS_URL   = "/api/v1/masters";
-    private static final String TEST_PASSWORD = "password123";
+    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
     private static final HttpComponentsClientHttpRequestFactory HTTP_FACTORY =
             new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
 

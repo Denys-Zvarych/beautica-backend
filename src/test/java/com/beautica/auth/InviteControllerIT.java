@@ -335,7 +335,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("/auth/invite/accept is reachable without auth → not 401")
     void should_notReturn401_when_inviteAcceptCalledWithoutAuth() throws Exception {
-        var request = new InviteAcceptRequest("some-token", "password123", null, null, null);
+        var request = new InviteAcceptRequest("some-token", "Str0ngP@ss1!", null, null, null);
         log.debug("Arrange: no Authorization header — endpoint must be public");
 
         log.debug("Act: POST /auth/invite/accept without credentials — endpoint must be public");
@@ -477,14 +477,14 @@ class InviteControllerIT extends AbstractIntegrationTest {
     private String registerAndGetToken(String email, Role ignoredRole) throws Exception {
         restTemplate.postForEntity(
                 "/api/v1/auth/register",
-                new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class
         );
         // Phase 1.7: mark email as verified so login does not return 403 EMAIL_NOT_VERIFIED
         verifyEmailInDb(email);
         var loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login",
-                new LoginRequest(email, "password123"),
+                new LoginRequest(email, "Str0ngP@ss1!"),
                 String.class
         );
         var body = objectMapper.readValue(
@@ -514,7 +514,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         );
         var loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login",
-                new LoginRequest(email, "password123"),
+                new LoginRequest(email, "Str0ngP@ss1!"),
                 String.class
         );
         var body = objectMapper.readValue(
@@ -537,7 +537,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         );
         var loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login",
-                new LoginRequest(email, "password123"),
+                new LoginRequest(email, "Str0ngP@ss1!"),
                 String.class
         );
         var body = objectMapper.readValue(

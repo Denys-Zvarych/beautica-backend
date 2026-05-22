@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
+import com.beautica.auth.PasswordResetService;
 import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
@@ -73,7 +74,7 @@ public class WebMvcTestSupport {
     @SuppressWarnings("unchecked")
     public AuthRateLimitFilter authRateLimitFilter() {
         LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
-        return new AuthRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
+        return new AuthRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
             @Override
             protected void doFilterInternal(HttpServletRequest req,
                                             HttpServletResponse res,
@@ -87,5 +88,17 @@ public class WebMvcTestSupport {
                 return true;
             }
         };
+    }
+
+    /**
+     * Mock {@link PasswordResetService}: the password-reset business logic is not
+     * under test in an {@code AuthController} slice. Provided so the
+     * {@code AuthController} constructor can be satisfied without loading the real
+     * service and its persistence collaborators.
+     */
+    @Bean
+    @Primary
+    public PasswordResetService passwordResetService() {
+        return Mockito.mock(PasswordResetService.class);
     }
 }
