@@ -12,7 +12,6 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.repository.ServiceRepository;
-import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
@@ -41,14 +40,13 @@ public class AuthorizationService {
      */
     public boolean hasManagementAccess(UUID salonId, UUID actorId) {
         if (salonId == null) return false;
-        User actor = userRepository.findById(actorId)
-                .orElseThrow(() -> new NotFoundException("User not found"));
-        return switch (actor.getRole()) {
-            case SALON_OWNER -> salonRepository.existsByIdAndOwnerId(salonId, actorId);
-            // salonId is set at invite time and is not user-modifiable (UpdateProfileRequest has no salonId field).
-            case SALON_ADMIN -> salonId.equals(actor.getSalonId());
-            default -> false;
-        };
+        // Read the role from the SecurityContext (already resolved by JwtAuthenticationFilter)
+        // instead of issuing a userRepository.findById round-trip. For SALON_OWNER actors this
+        // eliminates a wasted DB call — the ownership check goes straight to the repository query.
+        // SALON_ADMIN still calls userRepository.findById inside the 3-arg overload because the
+        // admin's assigned salonId is stored on the User record and cannot be derived from the JWT.
+        Role actorRole = roleFromCurrentAuthentication();
+        return hasManagementAccess(salonId, actorId, actorRole);
     }
 
     public boolean isOwnerOf(UUID salonId, UUID actorId) {
@@ -68,7 +66,8 @@ public class AuthorizationService {
                         || a.getAuthority().equals("ROLE_SALON_ADMIN"));
         if (!mayManage) return false;
         UUID actorId = principalId(auth);
-        return hasManagementAccess(salonId, actorId);
+        Role actorRole = roleFromAuthentication(auth);
+        return hasManagementAccess(salonId, actorId, actorRole);
     }
 
     public boolean canManageMaster(Authentication auth, UUID masterId) {
@@ -78,18 +77,22 @@ public class AuthorizationService {
             return false;
         }
         UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
         return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
                 return m.getUser().getId().equals(actorId);
             }
             // SALON_OWNER-type master: authorized via primary salon ownership.
-            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
+            // (owner-operated) masters: authority derives from salon management access.
+            // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
             if (m.getMasterType() == MasterType.SALON_OWNER) {
                 return m.getSalon() != null
                         && m.getSalon().getOwner() != null
                         && m.getSalon().getOwner().getId().equals(actorId);
             }
-            return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId);
+            // Remaining types (SALON_MASTER): authorize via salon management access.
+            return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId, actorRole);
         }).orElse(false);
     }
 
@@ -104,18 +107,21 @@ public class AuthorizationService {
                         || a.getAuthority().equals("ROLE_CLIENT"));
         if (cannotManage) return false;
         UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
         return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
                 return m.getUser().getId().equals(actorId);
             }
-            // SALON_OWNER-type master: authorized via primary salon ownership.
-            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
+            // (owner-operated) masters: authority derives from salon management access.
+            // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
             if (m.getMasterType() == MasterType.SALON_OWNER) {
                 return m.getSalon() != null
                         && m.getSalon().getOwner() != null
                         && m.getSalon().getOwner().getId().equals(actorId);
             }
-            return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId);
+            // Remaining types (SALON_MASTER): authorize via salon management access.
+            return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId, actorRole);
         }).orElse(false);
     }
 
@@ -130,12 +136,14 @@ public class AuthorizationService {
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             allowed = master.getUser().getId().equals(actorId);
         } else if (master.getMasterType() == MasterType.SALON_OWNER) {
-            // SALON_OWNER-type master: authorized via primary salon ownership.
-            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
+            // (owner-operated) masters: authority derives from salon management access.
+            // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
             allowed = master.getSalon() != null
                     && master.getSalon().getOwner() != null
                     && master.getSalon().getOwner().getId().equals(actorId);
         } else {
+            // Remaining types (SALON_MASTER): authorize via salon management access.
             allowed = master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
         }
         if (!allowed) {
@@ -148,12 +156,14 @@ public class AuthorizationService {
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             allowed = master.getUser().getId().equals(actorId);
         } else if (master.getMasterType() == MasterType.SALON_OWNER) {
-            // SALON_OWNER-type master: authorized via primary salon ownership.
-            // Explicit case prevents silent fallthrough if new MasterType values are added.
+            // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
+            // (owner-operated) masters: authority derives from salon management access.
+            // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
             allowed = master.getSalon() != null
                     && master.getSalon().getOwner() != null
                     && master.getSalon().getOwner().getId().equals(actorId);
         } else {
+            // Remaining types (SALON_MASTER): authorize via salon management access.
             allowed = master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
         }
         if (!allowed) {
@@ -230,6 +240,10 @@ public class AuthorizationService {
             // Management access: SALON_OWNER whose id matches the salon owner, or INDEPENDENT_MASTER
             // whose user id matches the master's user id. Both checks use the projection fields
             // resolved in a single JOIN — no second DB round-trip on any branch.
+            //
+            // SALON_OWNER-type master booking: both the salonOwnerUserId branch AND the masterUserId
+            // branch fire for the owner (the owner is the master's user), granting full client-data
+            // visibility under the salon-owner branch. There is no contradiction — both return true.
             if (v.salonOwnerUserId() != null && v.salonOwnerUserId().equals(actorId)) {
                 return true;
             }
@@ -290,13 +304,18 @@ public class AuthorizationService {
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             return master.getUser().getId().equals(actorId);
         }
-        // SALON_OWNER-type master: authorized via primary salon ownership.
-        // Explicit case prevents silent fallthrough if new MasterType values are added.
+        // SALON_OWNER-type master booking: master.salon.owner.id == actorId grants the
+        // owner confirm/decline/complete authority over their own bookings. SALON_ADMIN
+        // still excluded (distinct userId), preserving the owner-level lifecycle boundary.
+        // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
+        // (owner-operated) masters: authority derives from salon management access.
+        // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
         if (master.getMasterType() == MasterType.SALON_OWNER) {
             return master.getSalon() != null
                     && master.getSalon().getOwner() != null
                     && master.getSalon().getOwner().getId().equals(actorId);
         }
+        // Remaining types (SALON_MASTER): owner of the master's salon has manage authority.
         if (master.getSalon() != null) {
             return master.getSalon().getOwner() != null
                     && master.getSalon().getOwner().getId().equals(actorId);
@@ -305,16 +324,50 @@ public class AuthorizationService {
     }
 
     /**
+     * Role-aware fast path for callers that have already resolved {@code actorRole}
+     * from the JWT. Avoids the {@code userRepository.findById} round-trip for
+     * {@code SALON_OWNER} actors — the ownership check goes directly to the
+     * repository query that verifies the owner relationship.
+     *
+     * <p>The {@code SALON_ADMIN} branch still calls {@code userRepository.findById}
+     * because the admin's assigned {@code salonId} is stored on the {@code User}
+     * record and cannot be derived from the JWT alone.
+     */
+    private boolean hasManagementAccess(UUID salonId, UUID actorId, Role actorRole) {
+        if (actorRole == Role.SALON_OWNER) {
+            return salonRepository.existsByIdAndOwnerId(salonId, actorId);
+        }
+        if (actorRole == Role.SALON_ADMIN) {
+            return userRepository.findById(actorId)
+                    .map(u -> salonId.equals(u.getSalonId()))
+                    .orElse(false);
+        }
+        return false;
+    }
+
+    /**
      * Extracts the {@link Role} from the supplied {@code Authentication} object.
      * The JWT filter encodes the role as a {@code GrantedAuthority} with the
      * standard {@code ROLE_} prefix.
+     *
+     * <p>Wraps {@link Role#valueOf} to prevent an unchecked
+     * {@link IllegalArgumentException} from propagating as a 500 when the token
+     * carries an unrecognised role string. Re-thrown as {@link ForbiddenException}
+     * so the global exception handler maps it to 403.
      */
     private Role roleFromAuthentication(Authentication auth) {
         if (auth == null) {
             throw new IllegalStateException("No authentication in security context");
         }
         return auth.getAuthorities().stream()
-                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
+                .map(a -> {
+                    String name = a.getAuthority().replace("ROLE_", "");
+                    try {
+                        return Role.valueOf(name);
+                    } catch (IllegalArgumentException ex) {
+                        throw new ForbiddenException("Unrecognized role in security context");
+                    }
+                })
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("No role in security context"));
     }
