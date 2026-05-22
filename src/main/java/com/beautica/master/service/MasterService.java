@@ -142,6 +142,13 @@ public class MasterService {
             }
             if (!m.isActive()) {
                 m.setActive(true); // reactivate — Hibernate dirty-check flushes on commit
+                // Replace the lazy proxies loaded by findByUserId with the already-loaded
+                // entities held by the caller. This guarantees that when getMasterDetail(Master)
+                // opens a new read-only session after this transaction commits (entity detached),
+                // master.getUser() and master.getSalon() are initialized Java references and
+                // cannot trigger LazyInitializationException (Anti-Bug §E, MEDIUM fix).
+                m.setUser(owner);
+                m.setSalon(salon);
                 // Evict stale master-by-user entry so the re-enabled master passes isActive
                 // guards for callers using the cache (LOW F4 / Anti-Bug §F rule 1).
                 final UUID ownerUserId = owner.getId();
@@ -191,6 +198,21 @@ public class MasterService {
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
+        return MasterDetailResponse.from(master, hours);
+    }
+
+    /**
+     * Entity overload — avoids a redundant {@code findByIdWithSalonAndOwner} graph-fetch when
+     * the caller already holds the {@link Master} entity in the Hibernate first-level cache
+     * (MEDIUM-2). The entity must have its {@code salon} and {@code user} associations
+     * reachable (i.e. created via {@link #createMasterForOwner(UUID, UUID)} within the same
+     * transaction, or loaded via a graph query).
+     *
+     * <p>Do NOT remove the {@link #getMasterDetail(UUID)} overload — other callers depend on it.
+     */
+    @Transactional(readOnly = true)
+    public MasterDetailResponse getMasterDetail(Master master) {
+        var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
         return MasterDetailResponse.from(master, hours);
     }
 
@@ -267,6 +289,53 @@ public class MasterService {
         scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
                 .ifPresent(scheduleExceptionRepository::delete);
         evictMasterCalendarAfterCommit(masterId);
+    }
+
+    /**
+     * Soft-deletes the {@code SALON_OWNER}-type master profile for the given actor in the
+     * given salon. Guards:
+     * <ul>
+     *   <li>The master row must exist, belong to {@code actorUserId}, have type
+     *       {@code SALON_OWNER}, and be associated with {@code salonId}.</li>
+     * </ul>
+     * Ownership is already enforced by {@code @PreAuthorize("@authz.canManageSalon(...)")}
+     * on the controller layer — this method trusts that guard and only validates
+     * that the row structure matches expectations.
+     *
+     * <p>Performance (MEDIUM-1): inlines the deactivation logic instead of delegating to
+     * {@link #deactivateMaster(UUID, UUID)} to avoid a redundant {@code findByIdWithSalonAndOwner}
+     * graph-fetch. The master loaded via {@code findByUserId} is already in the Hibernate
+     * first-level cache; Hibernate dirty-checking flushes {@code is_active = false} on commit
+     * without a separate {@code save()} call. Both cache evictions from {@code deactivateMaster}
+     * are replicated here: {@code master-calendar} (via {@link #evictMasterCalendarAfterCommit})
+     * and {@code master-by-user} (via an {@code afterCommit} synchronization).
+     */
+    @Transactional
+    public void deactivateOwnerMaster(UUID actorUserId, UUID salonId) {
+        var master = masterRepository.findByUserId(actorUserId)
+                .filter(m -> m.getMasterType() == MasterType.SALON_OWNER)
+                .filter(m -> m.getSalon() != null && m.getSalon().getId().equals(salonId))
+                .orElseThrow(() -> new NotFoundException("Owner master profile not found"));
+
+        master.setActive(false);
+        // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
+        evictMasterCalendarAfterCommit(master.getId());
+
+        // Evict stale master-by-user entry so the deactivated master fails isActive guards for
+        // callers using the cache. actorUserId is available directly without a JOIN FETCH because
+        // findByUserId already filtered on it — no lazy-load risk.
+        final UUID masterUserId = actorUserId;
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    Cache c = cacheManager.getCache("master-by-user");
+                    if (c != null) {
+                        c.evict(masterUserId);
+                    }
+                }
+            });
+        }
     }
 
     @Transactional
