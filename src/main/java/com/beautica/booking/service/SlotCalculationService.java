@@ -54,7 +54,7 @@ public class SlotCalculationService {
     }
 
     @Transactional(readOnly = true)
-    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}")
+    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}", sync = true)
     public List<AvailableSlotResponse> getAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {
         // Step 1: date range validation — cheapest guard, no DB
         LocalDate today = LocalDate.now(kyivClock);
@@ -85,6 +85,11 @@ public class SlotCalculationService {
         if (totalDuration.toMinutes() > 600) {
             throw new BusinessException("total service duration exceeds maximum allowed");
         }
+
+        // Slot calculation is master-type agnostic: working_hours, schedule_exceptions,
+        // and bookings are keyed by master_id alone. A SALON_OWNER master with working
+        // hours and an active master_services row is bookable identically to any other
+        // master type.
 
         // Step 5: check working hours for the requested day of week
         int dayOfWeek = date.getDayOfWeek().getValue(); // 1=Mon..7=Sun

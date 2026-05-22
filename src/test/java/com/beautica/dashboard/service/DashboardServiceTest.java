@@ -531,6 +531,79 @@ class DashboardServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    // ── 17. Owner-master revenue inclusion ───────────────────────────────────
+
+    @Test
+    @DisplayName("SALON_OWNER scope — owner-master's completed booking appears in revenue total and byMaster")
+    void should_includeOwnerMasterRevenue_inDashboard() {
+        // Arrange — simulate one completed booking by the owner-master.
+        // The SALON_OWNER scope binds all active salonIds; the owner-master row has
+        // salon_id = one of those salons, so it is included by the existing SQL.
+        // At the unit-test level we stub the SQL result directly.
+        UUID ownerMasterId = UUID.randomUUID();
+        UUID svcDefId      = UUID.randomUUID();
+        Object[] ownerMasterRow = buildRow(
+                LocalDate.of(2026, 5, 10),
+                ownerMasterId, "Олена Власник",
+                svcDefId,      "Стрижка",
+                1L,            new BigDecimal("500.00"));
+
+        DashboardService svc = serviceWithRows(List.<Object[]>of(ownerMasterRow));
+
+        // Act
+        RevenueResponse result = svc.getRevenueSummary(
+                UUID.randomUUID(), Role.SALON_OWNER,
+                LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31),
+                null, null, Optional.empty());
+
+        // Assert — total and byMaster contain the owner-master's booking
+        assertThat(result.totalCompletedBookings()).isEqualTo(1L);
+        assertThat(result.estimatedRevenue()).isEqualByComparingTo("500.00");
+        assertThat(result.byMaster()).hasSize(1);
+        assertThat(result.byMaster().get(0).masterId()).isEqualTo(ownerMasterId);
+        assertThat(result.byMaster().get(0).masterName()).isEqualTo("Олена Власник");
+        assertThat(result.byMaster().get(0).revenue()).isEqualByComparingTo("500.00");
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER scope — owner-master + invited master each appear once; totals = sum of both")
+    void should_notDoubleCount_withOwnerAndInvitedMaster() {
+        // Arrange — two distinct masters under the same salon: the owner-master and one invited master.
+        UUID ownerMasterId   = UUID.randomUUID();
+        UUID invitedMasterId = UUID.randomUUID();
+        UUID svcDefId        = UUID.randomUUID();
+
+        Object[] ownerRow = buildRow(
+                LocalDate.of(2026, 5, 10),
+                ownerMasterId,   "Олена Власник",
+                svcDefId,        "Стрижка",
+                1L,              new BigDecimal("300.00"));
+
+        Object[] invitedRow = buildRow(
+                LocalDate.of(2026, 5, 11),
+                invitedMasterId, "Марія Майстер",
+                svcDefId,        "Стрижка",
+                1L,              new BigDecimal("250.00"));
+
+        DashboardService svc = serviceWithRows(List.of(ownerRow, invitedRow));
+
+        // Act
+        RevenueResponse result = svc.getRevenueSummary(
+                UUID.randomUUID(), Role.SALON_OWNER,
+                LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31),
+                null, null, Optional.empty());
+
+        // Assert — two masters, each appearing exactly once; totals = sum of both
+        assertThat(result.byMaster()).hasSize(2);
+        assertThat(result.totalCompletedBookings()).isEqualTo(2L);
+        assertThat(result.estimatedRevenue()).isEqualByComparingTo("550.00");
+
+        // Each master appears exactly once in the breakdown
+        java.util.List<UUID> masterIds = result.byMaster().stream()
+                .map(RevenueByMasterDto::masterId).toList();
+        assertThat(masterIds).containsExactlyInAnyOrder(ownerMasterId, invitedMasterId);
+    }
+
     // ── test helpers ──────────────────────────────────────────────────────
 
     /** Creates a {@link DashboardService} with the given clock and shared mocks. */
