@@ -166,19 +166,15 @@ public class MasterService {
                     });
                 }
 
-                // Evict available-slots entries for the reactivated master.
+                // Evict available-slots entries for the reactivated master only (PERF-MEDIUM-3).
                 // Stale "empty" cache entries from the deactivation period must not persist
-                // for the remaining TTL window after the master is re-enabled (MEDIUM SEC finding).
-                // Key shape is {masterId, date, masterServiceId} — clear() the whole cache because
-                // per-key enumeration is not feasible (same rationale as master-calendar).
+                // for the remaining TTL window after the master is re-enabled.
+                final UUID reactivatedMasterId = m.getId();
                 if (TransactionSynchronizationManager.isSynchronizationActive()) {
                     TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                         @Override
                         public void afterCommit() {
-                            Cache c = cacheManager.getCache("available-slots");
-                            if (c != null) {
-                                c.clear();
-                            }
+                            doEvictAvailableSlotsByMaster(reactivatedMasterId);
                         }
                     });
                 }
@@ -358,20 +354,15 @@ public class MasterService {
             });
         }
 
-        // Evict available-slots entries for the deactivated master.
-        // Key shape is {masterId, date, masterServiceId} — cannot enumerate all dimensions,
-        // so clear() the whole cache (same rationale as master-calendar, see
-        // evictMasterCalendarAfterCommit). Security: a client within the 60-second TTL window
-        // would otherwise receive real slot data for a deactivated master and could submit a
-        // booking against it (MEDIUM SEC finding).
+        // Evict available-slots entries for the deactivated master only (PERF-MEDIUM-3).
+        // Security: a client within the 60-second TTL window would otherwise receive real slot
+        // data for a deactivated master and could submit a booking against it.
+        final UUID deactivatedMasterId = master.getId();
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    Cache c = cacheManager.getCache("available-slots");
-                    if (c != null) {
-                        c.clear();
-                    }
+                    doEvictAvailableSlotsByMaster(deactivatedMasterId);
                 }
             });
         }
@@ -411,14 +402,17 @@ public class MasterService {
     // Registering afterCommit() ensures the cache is cleared only after the write is durable.
     // Guard: synchronization must be active (i.e. called within a @Transactional context).
     //
-    // Why cache.clear() instead of per-key eviction:
-    // The @Cacheable key is a compound SimpleKey{masterId, from, to, pageNumber, pageSize}.
-    // SimpleKey.toString() produces "[uuid, from, to, ...]" (leading bracket), so a
-    // prefix match on masterId.toString() never fires. Reconstructing every possible
-    // (from, to, page) combination for targeted eviction is not feasible. cache.clear()
-    // is safe here because it is scoped exclusively to the "master-calendar" cache — no
-    // other data lives there — and the 30-second TTL already bounds the worst-case
-    // stale window for unaffected masters.
+    // Eviction is registered as a post-commit callback rather than via @CacheEvict.
+    // @CacheEvict fires before the transaction commits, allowing a concurrent reader
+    // to repopulate the cache with stale data within the commit window.
+    // Registering afterCommit() ensures the cache is cleared only after the write is durable.
+    // Guard: synchronization must be active (i.e. called within a @Transactional context).
+    //
+    // Per-master key eviction (PERF-MEDIUM-4): the @Cacheable key is a SimpleKey{masterId, from, to, page, size}.
+    // SimpleKey.toString() renders as "[masterId, from, to, page, size]" via Arrays.deepToString.
+    // We filter by the "[masterId," prefix to evict only affected master entries, avoiding a
+    // blanket clear() that would evict ALL masters on every single schedule change (thundering herd).
+    // Falls back to cache.clear() for non-Caffeine caches (e.g. ConcurrentMapCache in tests).
     private void evictMasterCalendarAfterCommit(UUID masterId) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
@@ -426,12 +420,54 @@ public class MasterService {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                Cache cache = cacheManager.getCache("master-calendar");
-                if (cache != null) {
-                    cache.clear();
-                }
+                doEvictMasterCalendarByMaster(masterId);
             }
         });
+    }
+
+    private void doEvictMasterCalendarByMaster(UUID masterId) {
+        Cache springCache = cacheManager.getCache("master-calendar");
+        if (springCache == null) {
+            return;
+        }
+        Object nativeCache = springCache.getNativeCache();
+        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
+            String masterIdPrefix = "[" + masterId + ",";
+            caffeineCache.asMap().keySet().removeIf(k ->
+                    k instanceof org.springframework.cache.interceptor.SimpleKey
+                            && k.toString().contains(masterIdPrefix));
+        } else {
+            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
+            springCache.clear();
+        }
+    }
+
+    /**
+     * Evicts only the {@code available-slots} entries that belong to the given master.
+     *
+     * <p>The {@code available-slots} cache key is a {@link org.springframework.cache.interceptor.SimpleKey}
+     * whose first element is the masterId UUID (see {@code SlotCalculationService}).
+     * SimpleKey.toString() renders as {@code "[masterId, date, masterServiceId]"} — we filter
+     * on the {@code "[masterId,"} prefix so we touch only the affected master's entries,
+     * avoiding a blanket clear() (Anti-Bug §F rule 6 / PERF-MEDIUM-3).</p>
+     *
+     * <p>Falls back to {@code cache.clear()} for non-Caffeine caches.</p>
+     */
+    private void doEvictAvailableSlotsByMaster(UUID masterId) {
+        Cache springCache = cacheManager.getCache("available-slots");
+        if (springCache == null) {
+            return;
+        }
+        Object nativeCache = springCache.getNativeCache();
+        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
+            String masterIdPrefix = "[" + masterId + ",";
+            caffeineCache.asMap().keySet().removeIf(k ->
+                    k instanceof org.springframework.cache.interceptor.SimpleKey
+                            && k.toString().contains(masterIdPrefix));
+        } else {
+            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
+            springCache.clear();
+        }
     }
 
     // Fix 8: use JOIN FETCH query to eliminate per-master user lazy-loads

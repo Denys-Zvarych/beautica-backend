@@ -1,6 +1,7 @@
 package com.beautica.user;
 
 import com.beautica.common.AuditableEntity;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
@@ -67,6 +68,7 @@ public class PasswordResetToken extends AuditableEntity {
         return id;
     }
 
+    @JsonIgnore
     public String getToken() {
         return token;
     }

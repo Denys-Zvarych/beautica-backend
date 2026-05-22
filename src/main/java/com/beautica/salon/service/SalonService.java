@@ -19,9 +19,7 @@ import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.annotation.Caching;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -85,9 +83,10 @@ public class SalonService {
         return SalonResponse.from(savedSalon);
     }
 
-    // Eviction is registered as a post-commit callback rather than via @CacheEvict.
+    // Eviction helpers are registered as post-commit callbacks rather than via @CacheEvict.
     // @CacheEvict fires before the transaction commits, allowing a concurrent reader
     // to repopulate the cache with stale data within the commit window (Anti-Bug §F rule 2).
+
     private void evictOwnerSalonsCacheAfterCommit(UUID ownerId) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
@@ -103,10 +102,45 @@ public class SalonService {
         });
     }
 
-    @Caching(evict = {
-            @CacheEvict(value = "ownerSalons", key = "#actorId"),
-            @CacheEvict(value = "salon-detail", key = "#salonId")
-    })
+    private void evictSalonDetailCacheAfterCommit(UUID salonId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache cache = cacheManager.getCache("salon-detail");
+                if (cache != null) {
+                    cache.evict(salonId);
+                }
+            }
+        });
+    }
+
+    /**
+     * Evicts the entire {@code search:salons} cache after commit.
+     *
+     * <p>Blanket eviction (not per-key) is intentional: search results are a filtered subset of
+     * all active salons. When a salon is deactivated the cached page may contain it, and the only
+     * safe invalidation strategy without re-querying is to drop the whole cache so the next
+     * request rebuilds it from the DB. The cache TTL is short and this path is write-rare,
+     * so thundering-herd risk is negligible (PERF-HIGH-2).</p>
+     */
+    private void evictSearchSalonsCacheAfterCommit() {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache cache = cacheManager.getCache("search:salons");
+                if (cache != null) {
+                    cache.clear();
+                }
+            }
+        });
+    }
+
     @Transactional
     public SalonResponse updateSalon(UUID actorId, UUID salonId, UpdateSalonRequest request) {
         var salon = salonRepository.findById(salonId)
@@ -140,7 +174,14 @@ public class SalonService {
             salon.setInstagramUrl(request.instagramUrl());
         }
 
-        return SalonResponse.from(salonRepository.save(salon));
+        SalonResponse result = SalonResponse.from(salonRepository.save(salon));
+
+        // Evict after commit so a concurrent reader cannot repopulate stale data within the
+        // commit window. Replaces the @CacheEvict annotations that fired pre-commit (PERF-MEDIUM-2).
+        evictOwnerSalonsCacheAfterCommit(actorId);
+        evictSalonDetailCacheAfterCommit(salonId);
+
+        return result;
     }
 
     @Transactional(readOnly = true)
@@ -176,10 +217,6 @@ public class SalonService {
                 .toList();
     }
 
-    @Caching(evict = {
-            @CacheEvict(value = "ownerSalons", key = "#ownerId"),
-            @CacheEvict(value = "salon-detail", key = "#salonId")
-    })
     @Transactional
     public void deactivateSalon(UUID ownerId, UUID salonId) {
         var caller = userRepository.findById(ownerId)
@@ -194,5 +231,12 @@ public class SalonService {
 
         salon.setActive(false);
         salonRepository.save(salon);
+
+        // Evict after commit — replaces pre-commit @CacheEvict annotations (PERF-MEDIUM-2).
+        // Also evicts search:salons because a deactivated salon must not appear in discovery
+        // results for the remaining TTL window (PERF-HIGH-2).
+        evictOwnerSalonsCacheAfterCommit(ownerId);
+        evictSalonDetailCacheAfterCommit(salonId);
+        evictSearchSalonsCacheAfterCommit();
     }
 }

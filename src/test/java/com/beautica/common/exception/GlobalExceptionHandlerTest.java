@@ -321,9 +321,8 @@ class GlobalExceptionHandlerTest {
                 .isFalse();
 
         assertThat(response.getBody().message())
-                .as("message must contain the constraint violation text")
-                .isNotBlank()
-                .contains("must not be blank");
+                .as("message must be the generic sentinel — constraint text must not be echoed to clients")
+                .isEqualTo("Validation failed — check request parameters");
     }
 
     @Test

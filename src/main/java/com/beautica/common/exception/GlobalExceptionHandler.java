@@ -96,9 +96,13 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiResponse<Void>> handleValidation(MethodArgumentNotValidException ex) {
-        String message = ex.getBindingResult().getFieldErrors().stream()
+        // Generic message — per-field messages are never echoed to prevent information
+        // disclosure about internal field names, enum constants, or DB constraints (Anti-Bug §A/§N).
+        // Debug-level log is available for server-side triage without exposing details to callers.
+        log.debug("Validation failed: {}", ex.getBindingResult().getFieldErrors().stream()
                 .map(FieldError::getDefaultMessage)
-                .collect(Collectors.joining("; "));
+                .collect(Collectors.joining("; ")));
+        String message = "Validation failed — check request parameters";
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
                 .body(ApiResponse.error(message));

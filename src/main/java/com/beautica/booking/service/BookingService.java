@@ -177,7 +177,7 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        evictRevenueDashboardAfterCommit();
+        evictRevenueDashboardAfterCommit(actorUserId);
         return BookingResponse.from(saved);
     }
 
@@ -195,7 +195,7 @@ public class BookingService {
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        evictRevenueDashboardAfterCommit();
+        evictRevenueDashboardAfterCommit(actorUserId);
         return BookingResponse.from(saved);
     }
 
@@ -380,18 +380,42 @@ public class BookingService {
         }
     }
 
-    private void evictRevenueDashboardAfterCommit() {
+    /**
+     * Evicts {@code revenue-dashboard} entries for the given actor after commit.
+     *
+     * <p>Uses per-actor prefix eviction when the underlying cache is Caffeine, avoiding
+     * a blanket {@code cache.clear()} that would evict all actors' dashboard entries on
+     * every booking status transition (Anti-Bug §F rule 6 / PERF-MEDIUM-5).</p>
+     *
+     * <p>Falls back to {@code cache.clear()} for non-Caffeine caches (e.g. tests).</p>
+     */
+    private void evictRevenueDashboardAfterCommit(UUID actorId) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    Cache cache = cacheManager.getCache("revenue-dashboard");
-                    if (cache != null) cache.clear();
+                    doEvictRevenueDashboard(actorId);
                 }
             });
         } else {
-            Cache cache = cacheManager.getCache("revenue-dashboard");
-            if (cache != null) cache.clear();
+            doEvictRevenueDashboard(actorId);
+        }
+    }
+
+    private void doEvictRevenueDashboard(UUID actorId) {
+        Cache springCache = cacheManager.getCache("revenue-dashboard");
+        if (springCache == null) {
+            return;
+        }
+        Object nativeCache = springCache.getNativeCache();
+        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
+            String actorPrefix = "[" + actorId + ",";
+            caffeineCache.asMap().keySet().removeIf(k ->
+                    k instanceof org.springframework.cache.interceptor.SimpleKey
+                            && k.toString().contains(actorPrefix));
+        } else {
+            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
+            springCache.clear();
         }
     }
 }

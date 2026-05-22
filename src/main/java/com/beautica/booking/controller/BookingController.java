@@ -12,6 +12,7 @@ import com.beautica.common.PageResponse;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
@@ -85,6 +86,10 @@ public class BookingController {
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
+        // Cap page number to prevent giant OFFSET scans (Anti-Bug §J / SEC-MEDIUM-3).
+        if (pageable.getPageNumber() > 1000) {
+            pageable = PageRequest.of(1000, pageable.getPageSize(), pageable.getSort());
+        }
         Page<BookingResponse> page = bookingService.listBookings(principalId(auth), auth, status, pageable);
         return ApiResponse.ok(PageResponse.of(
                 page.getContent(),

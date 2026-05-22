@@ -29,10 +29,8 @@ COPY --from=builder /app/build/libs/*.jar app.jar
 EXPOSE 8080
 
 ENTRYPOINT ["java", \
-  "-XX:+UseSerialGC", \
-  "-Xms128m", \
-  "-Xmx256m", \
-  "-XX:MaxMetaspaceSize=192m", \
-  "-XX:ReservedCodeCacheSize=64m", \
+  "-XX:+UseZGC", \
+  "-XX:MaxRAMPercentage=75.0", \
+  "-XX:+ExitOnOutOfMemoryError", \
   "-Djava.security.egd=file:/dev/./urandom", \
   "-jar", "app.jar"]

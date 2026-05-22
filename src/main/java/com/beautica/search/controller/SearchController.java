@@ -85,6 +85,9 @@ public class SearchController {
     ) {
         int pageNum = request.page() != null ? request.page() : 0;
         int pageSize = request.size() != null ? request.size() : 20;
+        // Defense-in-depth cap: guards against @Validated ever being removed from the class.
+        pageSize = Math.min(pageSize, 100);
+        pageNum = Math.min(pageNum, 10_000);
         Pageable pageable = PageRequest.of(pageNum, pageSize);
         Page<MasterSearchResult> result = searchService.searchMasters(request, pageable);
         return ApiResponse.ok(PageResponse.of(
@@ -111,6 +114,9 @@ public class SearchController {
     ) {
         int pageNum = request.page() != null ? request.page() : 0;
         int pageSize = request.size() != null ? request.size() : 20;
+        // Defense-in-depth cap: guards against @Validated ever being removed from the class.
+        pageSize = Math.min(pageSize, 100);
+        pageNum = Math.min(pageNum, 10_000);
         Pageable pageable = PageRequest.of(pageNum, pageSize);
         Page<SalonSearchResult> result = searchService.searchSalons(request, pageable);
         return ApiResponse.ok(PageResponse.of(

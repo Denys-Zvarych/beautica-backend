@@ -140,7 +140,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwForbidden_when_actorIsNotBookingClient")
+    @DisplayName("403 Forbidden when the actor requesting the review is not the booking's client")
     void should_throwForbidden_when_actorIsNotBookingClient() {
         UUID differentClientId = UUID.randomUUID();
 
@@ -162,7 +162,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw409_when_reviewAlreadyExistsForBooking")
+    @DisplayName("409 Conflict when a review for this booking already exists")
     void should_throw409_when_reviewAlreadyExistsForBooking() {
         User client = mock(User.class);
         when(client.getId()).thenReturn(CLIENT_ID);
@@ -186,7 +186,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw404_when_bookingNotFound")
+    @DisplayName("404 Not Found when the booking does not exist")
     void should_throw404_when_bookingNotFound() {
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, null);
 
@@ -199,7 +199,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_notCallRecalculate_when_saveThrowsDataIntegrityViolation")
+    @DisplayName("skips rating recalculation when a duplicate review triggers DataIntegrityViolation")
     void should_notCallRecalculate_when_saveThrowsDataIntegrityViolation() {
         User client = mock(User.class);
         when(client.getId()).thenReturn(CLIENT_ID);
@@ -234,7 +234,7 @@ class ReviewServiceTest {
     // cache hit/miss behaviour is covered by ReviewIntegrationTest.
 
     @Test
-    @DisplayName("should_returnPagedReviews_when_masterHasReviews")
+    @DisplayName("returns paginated reviews when the master has reviews")
     void should_returnPagedReviews_when_masterHasReviews() {
         User client = mock(User.class);
         when(client.getFirstName()).thenReturn("Anna");
@@ -268,7 +268,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnEmptyPage_when_masterHasNoReviews")
+    @DisplayName("returns an empty page when the master has no reviews")
     void should_returnEmptyPage_when_masterHasNoReviews() {
         Pageable pageable = PageRequest.of(0, 20);
         Page<UUID> emptyIdPage = Page.empty(pageable);
@@ -284,7 +284,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnEmptyPage_when_masterIdDoesNotExist")
+    @DisplayName("returns an empty page when the master ID does not exist")
     void should_returnEmptyPage_when_masterIdDoesNotExist() {
         Pageable pageable = PageRequest.of(0, 20);
         UUID nonExistentMasterId = UUID.randomUUID();
@@ -299,7 +299,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_ignoreCallerSort_when_gettingReviewsForMaster")
+    @DisplayName("ignores caller-supplied sort and always orders reviews by createdAt desc")
     void should_ignoreCallerSort_when_gettingReviewsForMaster() {
         // Arrange — caller supplies a sort that must not reach the repository
         Pageable callerPageable = PageRequest.of(0, 20, Sort.by("comment"));
@@ -322,7 +322,7 @@ class ReviewServiceTest {
     // ── getReview ─────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnReview_when_reviewIdExists")
+    @DisplayName("returns the review when the review ID exists")
     void should_returnReview_when_reviewIdExists() {
         User client = mock(User.class);
         when(client.getFirstName()).thenReturn("Ivan");
@@ -349,7 +349,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnAnonymous_when_clientHasNoName")
+    @DisplayName("returns 'Anonymous' as the display name when the client has no first or last name")
     void should_returnAnonymous_when_clientHasNoName() {
         User client = mock(User.class);
         when(client.getFirstName()).thenReturn(null);
@@ -376,7 +376,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnFirstNameOnly_when_clientHasNoLastName")
+    @DisplayName("returns first name only as display name when the client has no last name")
     void should_returnFirstNameOnly_when_clientHasNoLastName() {
         User client = mock(User.class);
         when(client.getFirstName()).thenReturn("Anna");
@@ -403,7 +403,7 @@ class ReviewServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwNotFound_when_reviewByIdNotFound")
+    @DisplayName("404 Not Found when the review ID does not exist")
     void should_throwNotFound_when_reviewByIdNotFound() {
         when(reviewRepository.findByIdWithAssociations(REVIEW_ID)).thenReturn(Optional.empty());
 
@@ -414,7 +414,7 @@ class ReviewServiceTest {
     // ── getReviewsForMaster — timing oracle (FIX 5) ──────────────────────────
 
     @Test
-    @DisplayName("should_return_empty_page_when_masterId_does_not_exist")
+    @DisplayName("returns an empty page via getReview path when the master ID does not exist")
     void should_return_empty_page_when_masterId_does_not_exist() {
         // Arrange — unknown master: repository returns empty page (no rows)
         UUID unknownMasterId = UUID.randomUUID();

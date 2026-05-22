@@ -9,7 +9,6 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
-import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -32,8 +31,6 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             WHERE m.user.id = :userId
             """)
     Optional<Master> findByUserIdWithSalon(@Param("userId") UUID userId);
-
-    List<Master> findBySalonId(UUID salonId);
 
     /** @deprecated No JOIN FETCH on user — triggers N+1. Use {@link #findBySalonIdAndIsActiveTrueWithUser} instead. */
     @Deprecated
