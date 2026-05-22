@@ -3,6 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.util.TimeSlotCalculator;
 import com.beautica.config.CacheConfig;
+import com.beautica.master.entity.Master;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -90,9 +91,11 @@ class SlotCalculationServiceCacheTest {
                 .bufferMinutesAfter(0)
                 .isActive(true)
                 .build();
+        Master activeMaster = Master.builder().isActive(true).build();
         var msa = com.beautica.service.entity.MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(sd)
+                .master(activeMaster)
                 .isActive(true)
                 .build();
         reset(masterServiceRepository);

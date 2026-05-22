@@ -10,6 +10,7 @@ import com.beautica.common.util.TimeSlotCalculator.TimeRange;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.master.entity.Master;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -52,6 +53,10 @@ class SlotCalculationServiceTest {
 
     // Fixed clock: 2026-05-07T00:00:00Z — Kyiv is UTC+3 so this is 2026-05-07T03:00 Kyiv
     private final Clock clock = Clock.fixed(Instant.parse("2026-05-07T00:00:00Z"), ZoneOffset.UTC);
+
+    // Shared active master stub — used in every builder-constructed MasterServiceAssignment
+    // to satisfy the inactive-master guard added to getAvailableSlots().
+    private static final Master ACTIVE_MASTER = Master.builder().isActive(true).build();
 
     @Mock
     private WorkingHoursRepository workingHoursRepository;
@@ -100,6 +105,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -142,6 +148,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -216,6 +223,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -283,6 +291,7 @@ class SlotCalculationServiceTest {
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
                 .durationOverrideMinutes(45)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -341,6 +350,7 @@ class SlotCalculationServiceTest {
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
                 .durationOverrideMinutes(480)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -413,6 +423,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -469,6 +480,7 @@ class SlotCalculationServiceTest {
 
         MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
         when(msa.isActive()).thenReturn(true);
+        when(msa.getMaster()).thenReturn(ACTIVE_MASTER);
         when(msa.getDurationOverrideMinutes()).thenReturn(null);
         when(msa.getServiceDefinition()).thenReturn(serviceDefinition);
 
@@ -519,6 +531,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -580,6 +593,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -611,6 +625,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -642,6 +657,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -704,6 +720,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(sd)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
         WorkingHours wh = WorkingHours.builder()
@@ -758,6 +775,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(sd)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -810,6 +828,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(sd)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 

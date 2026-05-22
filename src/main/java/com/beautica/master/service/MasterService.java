@@ -129,7 +129,9 @@ public class MasterService {
 
         // user_id is UNIQUE on masters — a user has at most one master row.
         // Decide: create new / return existing active / reactivate inactive / conflict.
-        var existing = masterRepository.findByUserId(owner.getId());
+        // findByUserIdWithSalon JOIN FETCH-es salon so that getSalon().getId() below does not
+        // fire an extra SELECT * FROM salons (MEDIUM F3).
+        var existing = masterRepository.findByUserIdWithSalon(owner.getId());
         if (existing.isPresent()) {
             Master m = existing.get();
             if (m.getMasterType() != MasterType.SALON_OWNER) {
@@ -159,6 +161,23 @@ public class MasterService {
                             Cache c = cacheManager.getCache("master-by-user");
                             if (c != null) {
                                 c.evict(ownerUserId);
+                            }
+                        }
+                    });
+                }
+
+                // Evict available-slots entries for the reactivated master.
+                // Stale "empty" cache entries from the deactivation period must not persist
+                // for the remaining TTL window after the master is re-enabled (MEDIUM SEC finding).
+                // Key shape is {masterId, date, masterServiceId} — clear() the whole cache because
+                // per-key enumeration is not feasible (same rationale as master-calendar).
+                if (TransactionSynchronizationManager.isSynchronizationActive()) {
+                    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            Cache c = cacheManager.getCache("available-slots");
+                            if (c != null) {
+                                c.clear();
                             }
                         }
                     });
@@ -312,7 +331,9 @@ public class MasterService {
      */
     @Transactional
     public void deactivateOwnerMaster(UUID actorUserId, UUID salonId) {
-        var master = masterRepository.findByUserId(actorUserId)
+        // findByUserIdWithSalon JOIN FETCH-es salon to avoid the extra SELECT * FROM salons
+        // fired when getSalon().getId() is dereferenced in the filter below (MEDIUM F2).
+        var master = masterRepository.findByUserIdWithSalon(actorUserId)
                 .filter(m -> m.getMasterType() == MasterType.SALON_OWNER)
                 .filter(m -> m.getSalon() != null && m.getSalon().getId().equals(salonId))
                 .orElseThrow(() -> new NotFoundException("Owner master profile not found"));
@@ -323,7 +344,7 @@ public class MasterService {
 
         // Evict stale master-by-user entry so the deactivated master fails isActive guards for
         // callers using the cache. actorUserId is available directly without a JOIN FETCH because
-        // findByUserId already filtered on it — no lazy-load risk.
+        // findByUserIdWithSalon already filtered on it — no lazy-load risk.
         final UUID masterUserId = actorUserId;
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -332,6 +353,24 @@ public class MasterService {
                     Cache c = cacheManager.getCache("master-by-user");
                     if (c != null) {
                         c.evict(masterUserId);
+                    }
+                }
+            });
+        }
+
+        // Evict available-slots entries for the deactivated master.
+        // Key shape is {masterId, date, masterServiceId} — cannot enumerate all dimensions,
+        // so clear() the whole cache (same rationale as master-calendar, see
+        // evictMasterCalendarAfterCommit). Security: a client within the 60-second TTL window
+        // would otherwise receive real slot data for a deactivated master and could submit a
+        // booking against it (MEDIUM SEC finding).
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    Cache c = cacheManager.getCache("available-slots");
+                    if (c != null) {
+                        c.clear();
                     }
                 }
             });

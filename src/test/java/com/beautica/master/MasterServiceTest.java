@@ -492,7 +492,9 @@ class MasterServiceTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
+        // createMasterForOwner now calls findByUserIdWithSalon to avoid a lazy SELECT on
+        // getSalon().getId() (MEDIUM F3 fix) — stub the new graph method.
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.empty());
         when(masterRepository.save(any(Master.class))).thenReturn(saved);
 
         Master result = masterService.createMasterForOwner(user, salon);
@@ -529,7 +531,8 @@ class MasterServiceTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(existing));
+        // createMasterForOwner now calls findByUserIdWithSalon (MEDIUM F3 fix).
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(existing));
 
         Master result = masterService.createMasterForOwner(user, salon);
 
@@ -561,7 +564,8 @@ class MasterServiceTest {
                 .isActive(false)
                 .build();
 
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(inactive));
+        // createMasterForOwner now calls findByUserIdWithSalon (MEDIUM F3 fix).
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(inactive));
 
         Master result = masterService.createMasterForOwner(user, salon);
 
@@ -588,7 +592,8 @@ class MasterServiceTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(independentMaster));
+        // createMasterForOwner now calls findByUserIdWithSalon (MEDIUM F3 fix).
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(independentMaster));
 
         assertThatThrownBy(() -> masterService.createMasterForOwner(user, salon))
                 .isInstanceOf(ConflictException.class);
@@ -622,7 +627,8 @@ class MasterServiceTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(ownerMasterInOtherSalon));
+        // createMasterForOwner now calls findByUserIdWithSalon (MEDIUM F3 fix).
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(ownerMasterInOtherSalon));
 
         assertThatThrownBy(() -> masterService.createMasterForOwner(user, requestedSalon))
                 .isInstanceOf(ConflictException.class);

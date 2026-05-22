@@ -17,6 +17,22 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
 
     Optional<Master> findByUserId(UUID userId);
 
+    /**
+     * Same as {@link #findByUserId} but also JOIN FETCH-es the {@code salon} association,
+     * eliminating the extra {@code SELECT * FROM salons WHERE id = ?} fired when callers
+     * dereference {@code master.getSalon().getId()} (MEDIUM F2+F3).
+     *
+     * <p>Do NOT use for {@link com.beautica.master.service.MasterService#getMasterByUserId}
+     * — that cached method never dereferences {@code salon} and must keep its existing query
+     * to avoid unnecessary join overhead.
+     */
+    @Query("""
+            SELECT m FROM Master m
+            LEFT JOIN FETCH m.salon
+            WHERE m.user.id = :userId
+            """)
+    Optional<Master> findByUserIdWithSalon(@Param("userId") UUID userId);
+
     List<Master> findBySalonId(UUID salonId);
 
     /** @deprecated No JOIN FETCH on user — triggers N+1. Use {@link #findBySalonIdAndIsActiveTrueWithUser} instead. */

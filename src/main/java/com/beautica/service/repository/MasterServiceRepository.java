@@ -23,6 +23,7 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     @Query("""
             SELECT ms FROM MasterServiceAssignment ms
             LEFT JOIN FETCH ms.serviceDefinition
+            JOIN FETCH ms.master
             WHERE ms.master.id = :masterId AND ms.id = :id
             """)
     Optional<MasterServiceAssignment> findByMasterIdAndIdWithGraph(
