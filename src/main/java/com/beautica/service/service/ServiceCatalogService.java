@@ -23,13 +23,15 @@ import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 
 import java.util.List;
@@ -48,6 +50,7 @@ public class ServiceCatalogService {
     private final EmailService emailService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
+    private final CacheManager cacheManager;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -80,12 +83,14 @@ public class ServiceCatalogService {
     }
 
     @Transactional
-    @CacheEvict(value = "masterServices", key = "#masterId")
     public MasterServiceResponse assignServiceToMaster(
             UUID salonId,
             UUID masterId,
             AssignServiceToMasterRequest request) {
 
+        // Type-agnostic: accepts SALON_MASTER, SALON_OWNER, and INDEPENDENT_MASTER rows equally.
+        // A SALON_OWNER-type master row has salon_id = the owner's salon, so the salon-membership
+        // check at line ~92 resolves true for owner-as-master without any special-casing.
         Master master = masterRepository.findById(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
 
@@ -113,11 +118,15 @@ public class ServiceCatalogService {
                 .build();
 
         MasterServiceAssignment saved = masterServiceRepository.save(assignment);
+
+        // Evict after commit so a parallel reader cannot repopulate the cache with
+        // the pre-insert DB snapshot between eviction and commit (anti-bug §F).
+        evictMasterServicesCache(List.of(masterId));
+
         return MasterServiceResponse.from(saved);
     }
 
     @Transactional
-    @CacheEvict(value = "masterServices", allEntries = true)
     public MasterServiceResponse addIndependentMasterService(
             UUID userId,
             CreateServiceDefinitionRequest request) {
@@ -152,6 +161,11 @@ public class ServiceCatalogService {
                 .build();
 
         MasterServiceAssignment savedAssignment = masterServiceRepository.save(assignment);
+
+        // Evict only this master's cache entry after commit — replacing allEntries=true
+        // to avoid cold-miss DB round-trips for all other masters (anti-bug §F).
+        evictMasterServicesCache(List.of(master.getId()));
+
         return MasterServiceResponse.from(savedAssignment);
     }
 
@@ -169,9 +183,20 @@ public class ServiceCatalogService {
     }
 
     @Transactional
-    @CacheEvict(value = "masterServices", allEntries = true)
     // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller — any future caller must enforce the same guard.
     public void deactivateServiceDefinition(UUID serviceDefId) {
+        // Step 1: identify only the masters that actually use this service definition
+        // so the afterCommit eviction targets their cache entries instead of flushing
+        // every master (replacing allEntries=true, anti-bug §F).
+        List<UUID> affectedMasterIds =
+                masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
+
+        // Step 2: register the targeted eviction to run after commit so a parallel
+        // reader cannot repopulate stale entries between eviction and commit.
+        evictMasterServicesCache(affectedMasterIds);
+
+        // Step 3: execute the update; check after registration so the callback is a
+        // no-op when the method throws (transaction rolls back, afterCommit never fires).
         int updated = serviceRepository.deactivateById(serviceDefId);
         if (updated == 0) {
             throw new NotFoundException("Service definition not found: " + serviceDefId);
@@ -224,6 +249,32 @@ public class ServiceCatalogService {
     private static String sanitizeEmailField(String value) {
         if (value == null) return "";
         return value.replaceAll("[\r\n\t]", " ").strip();
+    }
+
+    /**
+     * Evicts the given master IDs from the "masterServices" cache.
+     *
+     * <p>When a Spring transaction is active (the normal production path), the eviction is
+     * deferred to {@code afterCommit} so a concurrent reader cannot repopulate the cache
+     * with a pre-commit DB snapshot. When no transaction is active (e.g., in unit tests or
+     * programmatic non-transactional callers), the eviction runs immediately — same net
+     * effect as the former {@code @CacheEvict} annotation.
+     */
+    private void evictMasterServicesCache(List<UUID> masterIds) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            var cache = cacheManager.getCache("masterServices");
+                            if (cache != null) masterIds.forEach(cache::evict);
+                        }
+                    }
+            );
+        } else {
+            var cache = cacheManager.getCache("masterServices");
+            if (cache != null) masterIds.forEach(cache::evict);
+        }
     }
 
     private void applyServiceType(ServiceDefinition definition, CreateServiceDefinitionRequest request) {

@@ -78,4 +78,13 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     List<MasterServiceAssignment> findByMasterIdAndIsActiveTrueWithGraph(
             @Param("masterId") UUID masterId,
             Pageable pageable);
+
+    /**
+     * Returns the distinct master IDs that have at least one assignment referencing
+     * the given service definition. Used by {@link com.beautica.service.service.ServiceCatalogService}
+     * to perform targeted per-key cache eviction when a service definition is deactivated,
+     * avoiding the blanket {@code allEntries=true} thundering-herd amplifier.
+     */
+    @Query("SELECT DISTINCT a.master.id FROM MasterServiceAssignment a WHERE a.serviceDefinition.id = :serviceDefId")
+    List<UUID> findMasterIdsByServiceDefinitionId(@Param("serviceDefId") UUID serviceDefId);
 }

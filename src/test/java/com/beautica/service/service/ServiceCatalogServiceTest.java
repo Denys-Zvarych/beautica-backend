@@ -6,6 +6,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.EmailService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
@@ -18,6 +19,7 @@ import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.CatalogCategoryLookup;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -26,6 +28,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 
@@ -63,6 +66,15 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private ServiceTypeSearchService serviceTypeSearchService;
+
+    @Mock
+    private CatalogCategoryLookup catalogCategoryLookup;
+
+    @Mock
+    private EmailService emailService;
+
+    @Mock
+    private CacheManager cacheManager;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;

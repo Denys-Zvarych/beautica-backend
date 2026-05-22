@@ -41,6 +41,9 @@ public class ServiceController {
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
+    // Also authorizes a SALON_OWNER assigning services to their OWN owner-operated
+    // master row (master_type = SALON_OWNER): that row's salon_id equals #salonId, so
+    // masterBelongsToSalon resolves true. No owner-specific branch is required.
     @PostMapping("/salons/{salonId}/masters/{masterId}/services")
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> assignServiceToMaster(

@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
@@ -46,6 +47,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private EmailService emailService;
     @Mock private ServiceTypeLookup serviceTypeLookup;
     @Mock private ServiceTypeSearchService serviceTypeSearchService;
+    @Mock private CacheManager cacheManager;
 
     private ServiceCatalogService service;
 
@@ -59,7 +61,8 @@ class ServiceCatalogServiceCatalogTest {
                 catalogCategoryLookup,
                 emailService,
                 serviceTypeLookup,
-                serviceTypeSearchService
+                serviceTypeSearchService,
+                cacheManager
         );
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
