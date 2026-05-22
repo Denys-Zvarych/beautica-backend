@@ -8,8 +8,10 @@ import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.user.PasswordResetToken;
 import com.beautica.user.PasswordResetTokenRepository;
 import com.beautica.user.RefreshTokenRepository;
+import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -27,6 +29,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.mockito.Mockito;
+
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -63,6 +68,9 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
 
     @Autowired
     private RefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
+    private TokenGenerator tokenGenerator;
 
     @Autowired
     private TransactionTemplate transactionTemplate;
@@ -232,6 +240,36 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
+        assertThat(body.message()).isEqualTo("Invalid or expired reset token");
+    }
+
+    @Test
+    @DisplayName("should return 400 with generic message for an expired token (full HTTP stack)")
+    void should_return400WithGenericMessage_when_tokenExpired() throws Exception {
+        String email = "reset.expired@beautica.com";
+        log.debug("Arrange: register+verify email={} then persist a token row already expired", email);
+        registerAndVerify(email, "Password1!");
+
+        // Persist a reset-token row whose expires_at is in the past. The DB stores the
+        // SHA-256 hash; the raw token is what the client submits over HTTP.
+        String rawToken = "expired-raw-token-" + java.util.UUID.randomUUID();
+        String hashedToken = tokenGenerator.hash(rawToken);
+        transactionTemplate.executeWithoutResult(status -> {
+            User user = userRepository.findByEmail(email).orElseThrow();
+            passwordResetTokenRepository.save(new PasswordResetToken(
+                    hashedToken, user.getId(), Instant.now().minus(2, ChronoUnit.HOURS)));
+        });
+
+        log.debug("Act: POST /auth/reset-password with the expired raw token");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/reset-password",
+                new ResetPasswordRequest(rawToken, "NewPassword99!"),
+                String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        assertThat(body.success()).isFalse();
+        // Same generic message as used/unknown — the expired branch must not be distinguishable.
         assertThat(body.message()).isEqualTo("Invalid or expired reset token");
     }
 

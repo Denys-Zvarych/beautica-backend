@@ -107,10 +107,12 @@ public class PasswordResetService {
         // No exception, no log line that references the email or the outcome.
         var userOpt = userRepository.findByEmail(email);
         if (userOpt.isEmpty()) {
+            performDecoyWork();
             return;
         }
         User user = userOpt.get();
         if (!user.isActive() || !user.isEmailVerified()) {
+            performDecoyWork();
             return;
         }
 
@@ -146,6 +148,14 @@ public class PasswordResetService {
     public void resetPassword(ResetPasswordRequest request) {
         String hashedToken = tokenGenerator.hash(request.token());
 
+        // Compute the new password BCrypt hash BEFORE acquiring the row lock. BCrypt is
+        // pure CPU work (~80-150 ms) that needs no lock; running it inside the lock would
+        // lengthen the PESSIMISTIC_WRITE hold under concurrent same-token submits. This
+        // shrinks the lock window to fast DB round-trips only. Trade-off: the hash is now
+        // computed even for invalid tokens (minor wasted CPU) — acceptable, and it evens
+        // out per-request timing as an anti-oracle bonus.
+        String newPasswordHash = passwordEncoder.encode(request.newPassword());
+
         PasswordResetToken token = passwordResetTokenRepository
                 .findByTokenForUpdate(hashedToken)
                 .orElseThrow(() -> new BusinessException(HttpStatus.BAD_REQUEST, GENERIC_RESET_ERROR));
@@ -159,7 +169,7 @@ public class PasswordResetService {
         User user = userRepository.findById(token.getUserId())
                 .orElseThrow(() -> new BusinessException(HttpStatus.BAD_REQUEST, GENERIC_RESET_ERROR));
 
-        user.setPasswordHash(passwordEncoder.encode(request.newPassword()));
+        user.setPasswordHash(newPasswordHash);
         userRepository.save(user);
 
         token.markUsed();
@@ -176,6 +186,23 @@ public class PasswordResetService {
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Performs a throwaway token hash on the no-op (unknown / unverified / inactive)
+     * branch so the per-request crypto cost is symmetric with the verified-account
+     * path, which mints + hashes a real token. Without this, response latency would
+     * distinguish a real verified account (extra hash + DB save + email schedule)
+     * from a phantom, opening a timing-based enumeration side-channel.
+     *
+     * <p>Mirrors the existing unknown-email defense pattern: the HTTP body is already
+     * identical across branches; this closes the latency channel. The discarded result
+     * is intentional — the cost, not the value, is what matters. (The email-bounce
+     * channel is inherent and accepted; only the latency channel is closed here.)
+     */
+    private void performDecoyWork() {
+        String decoyToken = tokenGenerator.generateToken();
+        tokenGenerator.hash(decoyToken);
+    }
 
     /**
      * Builds the absolute reset URL that will appear in the email.

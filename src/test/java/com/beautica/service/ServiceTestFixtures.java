@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class ServiceTestFixtures {
 
-    static final String TEST_PASSWORD = "password123";
+    static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     private final TestRestTemplate restTemplate;
     private final JdbcTemplate jdbcTemplate;

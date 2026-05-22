@@ -46,7 +46,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(BookingIntegrationTest.class);
     private static final String BOOKINGS_URL = "/api/v1/bookings";
-    private static final String TEST_PASSWORD = "password123";
+    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     @Autowired
     private TestRestTemplate restTemplate;

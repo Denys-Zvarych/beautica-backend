@@ -55,7 +55,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     // rows). Resolved by its stable KATOTTH business key, never by name or a
     // hardcoded UUID (the seed assigns ids via gen_random_uuid()).
     private static final String CITY_WITH_DISTRICTS_KATOTTH = "UA12020010010037010";
-    private static final String TEST_PASSWORD = "password123";
+    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     // ── setup ─────────────────────────────────────────────────────────────────
     // JDK HttpURLConnection rejects PATCH as an invalid method. Replace the
@@ -97,7 +97,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return200WithProfile_when_validTokenProvided() throws Exception {
         log.debug("Arrange: register user and obtain access token");
         String accessToken = registerAndGetToken(
-                "getme@beautica.com", "password123", "Olena", "Koval", null);
+                "getme@beautica.com", "Str0ngP@ss1!", "Olena", "Koval", null);
 
         HttpHeaders headers = bearerHeaders(accessToken);
 
@@ -128,7 +128,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return200_when_anyAuthenticatedUserAccessesOwnProfile() throws Exception {
         log.debug("Arrange: register as CLIENT — only role auto-assigned on register");
         String accessToken = registerAndGetToken(
-                "anyrole@beautica.com", "password123", null, null, null);
+                "anyrole@beautica.com", "Str0ngP@ss1!", null, null, null);
 
         HttpHeaders headers = bearerHeaders(accessToken);
 
@@ -175,7 +175,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return200AndUpdateFields_when_patchApplied() throws Exception {
         log.debug("Arrange: register user with initial name, obtain token");
         String accessToken = registerAndGetToken(
-                "patch@beautica.com", "password123", "Stara", "Familiya", "+380671111111");
+                "patch@beautica.com", "Str0ngP@ss1!", "Stara", "Familiya", "+380671111111");
 
         var patchRequest = new UpdateProfileRequest("Nova", "Familiya", "+380672222222",
                 null, null, null, null, null);
@@ -206,7 +206,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return200AndLeaveFieldsUnchanged_when_allNullPatch() throws Exception {
         log.debug("Arrange: register user with known name, obtain token");
         String accessToken = registerAndGetToken(
-                "nullpatch@beautica.com", "password123", "Kept", "Name", "+380633333333");
+                "nullpatch@beautica.com", "Str0ngP@ss1!", "Kept", "Name", "+380633333333");
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
                 null, null, null, null, null);
@@ -238,7 +238,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return400_when_firstNameIsBlank() throws Exception {
         log.debug("Arrange: register user and obtain access token");
         String accessToken = registerAndGetToken(
-                "blank-fn@beautica.com", "password123", "Valid", "Name", null);
+                "blank-fn@beautica.com", "Str0ngP@ss1!", "Valid", "Name", null);
 
         var patchRequest = new UpdateProfileRequest("", null, null,
                 null, null, null, null, null);
@@ -261,7 +261,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return400_when_firstNameTooLong() throws Exception {
         log.debug("Arrange: register user and obtain access token");
         String accessToken = registerAndGetToken(
-                "long-fn@beautica.com", "password123", "Valid", "Name", null);
+                "long-fn@beautica.com", "Str0ngP@ss1!", "Valid", "Name", null);
 
         String tooLong = "A".repeat(101);
         var patchRequest = new UpdateProfileRequest(tooLong, null, null,
@@ -285,7 +285,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return400_when_phoneNumberInvalidFormat() throws Exception {
         log.debug("Arrange: register user and obtain access token");
         String accessToken = registerAndGetToken(
-                "bad-phone@beautica.com", "password123", "Valid", "Name", null);
+                "bad-phone@beautica.com", "Str0ngP@ss1!", "Valid", "Name", null);
 
         var patchRequest = new UpdateProfileRequest(null, null, "not-a-phone!@#",
                 null, null, null, null, null);
@@ -310,7 +310,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_registerClient_when_noLocalityProvided() {
         log.debug("Arrange: a CLIENT registration payload that carries no city/district");
         var request = new RegisterRequest(
-                "noloc-client@beautica.com", "password123",
+                "noloc-client@beautica.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Olha", "Bez", null, null);
 
         log.debug("Act: POST /api/v1/auth/register — locality is absent and must not block");
@@ -327,7 +327,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_setCityIdDiscoveryDefault_when_clientPatchesProfile() throws Exception {
         log.debug("Arrange: register a CLIENT (no locality), resolve a real seeded city id");
         String accessToken = registerAndGetToken(
-                "client-disc@beautica.com", "password123", "Dasha", "Klient", null);
+                "client-disc@beautica.com", "Str0ngP@ss1!", "Dasha", "Klient", null);
         UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
 
         // CLIENT discovery default is city-only — district is optional and NOT
@@ -458,7 +458,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_dropProviderOnlyFields_when_clientSuppliesThem() throws Exception {
         log.debug("Arrange: register a CLIENT and resolve a real seeded city id");
         String accessToken = registerAndGetToken(
-                "client-provfields@beautica.com", "password123", "Kli", "Ent", null);
+                "client-provfields@beautica.com", "Str0ngP@ss1!", "Kli", "Ent", null);
         UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
 
         // A CLIENT explicitly supplies the provider-only structured address.

@@ -60,7 +60,7 @@ class BookingConcurrencyTest {
 
     private static final Logger log = LoggerFactory.getLogger(BookingConcurrencyTest.class);
     private static final String BOOKINGS_URL = "/api/v1/bookings";
-    private static final String TEST_PASSWORD = "password123";
+    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
     private static final int THREAD_COUNT = 10;
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
 

@@ -43,6 +43,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> mediaUploadBuckets;
     @Mock private LoadingCache<String, Bucket> resendVerificationBuckets;
     @Mock private LoadingCache<String, Bucket> forgotPasswordBuckets;
+    @Mock private LoadingCache<String, Bucket> resetPasswordBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -53,7 +54,7 @@ class AuthRateLimitFilterTest {
         filter = new AuthRateLimitFilter(
                 registerBuckets, loginBuckets, refreshBuckets, verifyEmailBuckets,
                 slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, resendVerificationBuckets,
-                forgotPasswordBuckets);
+                forgotPasswordBuckets, resetPasswordBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -1030,6 +1031,124 @@ class AuthRateLimitFilterTest {
             verifyNoInteractions(registerBuckets);
             verifyNoInteractions(refreshBuckets);
             verifyNoInteractions(verifyEmailBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("POST /api/v1/auth/forgot-password")
+    class ForgotPasswordEndpoint {
+
+        @Test
+        @DisplayName("passes through when forgot-password bucket has tokens")
+        void should_passThrough_when_forgotPasswordBucketHasTokens() throws Exception {
+            log.debug("Arrange: forgotPasswordBuckets returns bucket that allows consumption");
+            when(forgotPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/auth/forgot-password");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/forgot-password when bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when forgot-password bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(forgotPasswordBuckets).get(REMOTE_ADDR);
+            // Decoupling invariant: forgot-password must NOT touch the reset-password bucket.
+            verifyNoInteractions(resetPasswordBuckets);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(verifyEmailBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 with 3600s Retry-After when forgot-password bucket is exhausted")
+        void should_return429_when_forgotPasswordBucketExhausted() throws Exception {
+            log.debug("Arrange: forgotPasswordBuckets returns bucket that denies consumption");
+            when(forgotPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/forgot-password");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/forgot-password when bucket is exhausted");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when forgot-password bucket is exhausted")
+                    .isEqualTo(429);
+            // 60-minute window — Retry-After must reflect 3600 s.
+            assertThat(response.getHeader("Retry-After")).isEqualTo("3600");
+            assertThat(response.getContentType())
+                    .as("Content-Type must be application/json on 429 forgot-password response")
+                    .startsWith("application/json");
+            assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(chain.getRequest()).isNull();
+            verifyNoInteractions(resetPasswordBuckets);
+            verifyNoInteractions(loginBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("POST /api/v1/auth/reset-password")
+    class ResetPasswordEndpoint {
+
+        @Test
+        @DisplayName("passes through when reset-password bucket has tokens")
+        void should_passThrough_when_resetPasswordBucketHasTokens() throws Exception {
+            log.debug("Arrange: resetPasswordBuckets returns bucket that allows consumption");
+            when(resetPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/auth/reset-password");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/reset-password when bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when reset-password bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(resetPasswordBuckets).get(REMOTE_ADDR);
+            // Decoupling invariant: reset-password must NOT touch the forgot-password bucket.
+            verifyNoInteractions(forgotPasswordBuckets);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(verifyEmailBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 with 3600s Retry-After when reset-password bucket is exhausted")
+        void should_return429_when_resetPasswordBucketExhausted() throws Exception {
+            log.debug("Arrange: resetPasswordBuckets returns bucket that denies consumption");
+            when(resetPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/reset-password");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/reset-password when bucket is exhausted");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when reset-password bucket is exhausted")
+                    .isEqualTo(429);
+            // 60-minute window — Retry-After must reflect 3600 s.
+            assertThat(response.getHeader("Retry-After")).isEqualTo("3600");
+            assertThat(response.getContentType())
+                    .as("Content-Type must be application/json on 429 reset-password response")
+                    .startsWith("application/json");
+            assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(chain.getRequest()).isNull();
+            verifyNoInteractions(forgotPasswordBuckets);
+            verifyNoInteractions(loginBuckets);
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.beautica.auth.dto;
 
+import com.beautica.common.validation.StrongPassword;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
@@ -12,9 +13,10 @@ import jakarta.validation.constraints.Size;
  *       {@code password_reset_tokens.token} column length. Prevents oversized raw-token
  *       inputs from bypassing validation and hitting the DB; does not reveal the stored
  *       hash length.</li>
- *   <li>{@code newPassword}: {@code @NotBlank} + {@code @Size(min = 8, max = 128)} —
- *       identical policy to {@link RegisterRequest#password()} so a password that passed
- *       registration can always be set via the reset path and vice-versa.</li>
+ *   <li>{@code newPassword}: {@code @NotBlank} + {@code @StrongPassword} — the SAME shared
+ *       policy implementation applied to {@link RegisterRequest#password()} (length 8–128 +
+ *       common-password denylist), so a password that passed registration can always be set
+ *       via the reset path and vice-versa.</li>
  * </ul>
  *
  * <p>Invalid / used / expired tokens all surface as a single generic 400 at the service
@@ -28,7 +30,7 @@ public record ResetPasswordRequest(
         String token,
 
         @NotBlank(message = "Password is required")
-        @Size(min = 8, max = 128, message = "Password must be between 8 and 128 characters")
+        @StrongPassword
         String newPassword
 
 ) {}

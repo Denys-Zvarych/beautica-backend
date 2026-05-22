@@ -60,6 +60,8 @@ app:
     cumulative-failure-threshold: 10
     lockout-duration: 15m
     stale-code-retention: 24h
+  password-reset:
+    cleanup-retention: 7d
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
     payload-key: w+ZLcc1IXPaNHEmD3o7EZu5yS+Uq97Wz61pmYe8NmIc=

@@ -96,7 +96,7 @@ class VerifyEmailConcurrencyTest {
         log.debug("Arrange: register email={} so a verification code exists", email);
         restTemplate.postForEntity(
                 "/api/v1/auth/register",
-                new RegisterRequest(email, "password123",
+                new RegisterRequest(email, "Str0ngP@ss1!",
                         SelfRegistrationRole.CLIENT, "Anna", "Test", null, null),
                 String.class);
 

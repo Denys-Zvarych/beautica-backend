@@ -51,16 +51,23 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.resend-verification-capacity:3}")
     private long resendVerificationCapacity;
 
-    // Per-IP cap for POST /api/v1/auth/forgot-password and POST /api/v1/auth/reset-password
-    // (60-minute window). Both paths share the same Caffeine bucket:
-    //   • forgot-password is the email-bomb surface — keep it low.
-    //   • reset-password uses the same family; a legitimate user needs at most a handful
-    //     of attempts per hour (typo in new password, network error), so 3 is generous.
-    // The 60-minute window matches the token TTL so a user who exhausts their budget
-    // at the start of a reset session can always retry when the token would have expired
-    // anyway. Configurable so integration tests can raise the cap.
+    // Per-IP cap for POST /api/v1/auth/forgot-password (60-minute window).
+    // forgot-password is the email-bomb surface — keep it low (3/hr). The 60-minute
+    // window matches the token TTL so a user who exhausts their budget at the start of
+    // a reset session can always retry when the token would have expired anyway.
+    // Configurable so integration tests can raise the cap.
     @Value("${app.rate-limit.forgot-password-capacity:3}")
     private long forgotPasswordCapacity;
+
+    // Per-IP cap for POST /api/v1/auth/reset-password (60-minute window).
+    // Decoupled from forgot-password so a user behind NAT who spams forgot-password
+    // does NOT block their own (or a co-located user's) reset-password submit. A
+    // legitimate user may retry a new-password typo / network error several times
+    // against one emailed token, so the cap is higher (10/hr) than the email-bomb
+    // surface. reset-password sends no email, so a higher cap carries no spam risk.
+    // Configurable so integration tests can raise the cap.
+    @Value("${app.rate-limit.reset-password-capacity:10}")
+    private long resetPasswordCapacity;
 
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
@@ -147,12 +154,15 @@ public class RateLimitConfig {
     }
 
     /**
-     * Shared bucket for {@code POST /api/v1/auth/forgot-password} and
-     * {@code POST /api/v1/auth/reset-password}.
+     * Per-IP bucket for {@code POST /api/v1/auth/forgot-password}.
      *
      * <p>Window is 60 minutes — matching the 1-hour token TTL. A user who exhausts
      * the budget at the start of a reset flow will be able to retry when the issued
      * token has expired, naturally forcing a fresh forgot-password request.
+     *
+     * <p>Kept deliberately separate from {@link #resetPasswordBuckets()} so that
+     * exhausting the email-bomb surface here cannot deplete the reset-confirm budget
+     * for a user sharing the same NAT egress IP.
      *
      * <p>{@code expireAfterAccess(65 min)} gives a 5-minute grace so the bucket entry
      * is not evicted the moment the window rolls over (avoids a false-start on the
@@ -165,6 +175,27 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofMinutes(65))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(forgotPasswordCapacity, Duration.ofMinutes(60)))
+                        .build());
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/auth/reset-password}.
+     *
+     * <p>Decoupled from {@link #forgotPasswordBuckets()} (SEC fix): coupling the two
+     * paths to one bucket meant a NAT-shared client spamming forgot-password could
+     * lock out their own reset-password submit. reset-password sends no email, so a
+     * higher cap (10/hr) carries no spam risk and tolerates legitimate new-password
+     * typo retries against a single emailed token.
+     *
+     * <p>Same 60-minute window + 5-minute eviction grace as forgot-password.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> resetPasswordBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(Duration.ofMinutes(65))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(resetPasswordCapacity, Duration.ofMinutes(60)))
                         .build());
     }
 

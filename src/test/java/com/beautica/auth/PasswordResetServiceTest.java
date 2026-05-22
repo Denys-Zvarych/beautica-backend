@@ -34,7 +34,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -119,7 +118,14 @@ class PasswordResetServiceTest {
         assertThat(saved.isUsed()).isFalse();
         assertThat(saved.getExpiresAt()).isEqualTo(FIXED_NOW.plusSeconds(3600));
 
-        verify(emailNotificationService).sendPasswordResetEmail(eq(TEST_EMAIL), contains(RAW_TOKEN));
+        // Assert the FULL emitted link shape, not just that it contains the token:
+        // rooted at FRONTEND_BASE_URL, https scheme, exact deep-link path + token query param.
+        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
+        verify(emailNotificationService).sendPasswordResetEmail(eq(TEST_EMAIL), linkCaptor.capture());
+        assertThat(linkCaptor.getValue())
+                .startsWith("https://")
+                .startsWith(FRONTEND_BASE_URL + "/reset-password?token=")
+                .endsWith(RAW_TOKEN);
     }
 
     @Test
@@ -200,6 +206,81 @@ class PasswordResetServiceTest {
     }
 
     // =========================================================================
+    // requestReset — timing-channel decoy work on no-op branches
+    //
+    // performDecoyWork() is an anti-enumeration defense: it must run on EVERY
+    // no-op branch so per-request crypto cost is symmetric with the real path.
+    // These tests pin that behaviour so the decoy cannot be silently deleted
+    // without a red test.
+    // =========================================================================
+
+    @Test
+    @DisplayName("requestReset — performs decoy crypto work on unknown-email no-op (timing defense)")
+    void should_performDecoyWork_when_emailUnknown() {
+        log.debug("Arrange: unknown email — decoy crypto must still run");
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+
+        service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
+
+        // Decoy work = generate a throwaway token then hash it.
+        verify(tokenGenerator).generateToken();
+        verify(tokenGenerator).hash(RAW_TOKEN);
+        // ...but no real token persisted and no email sent.
+        verify(passwordResetTokenRepository, never()).save(any());
+        verify(emailNotificationService, never()).sendPasswordResetEmail(anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("requestReset — performs decoy crypto work on unverified-user no-op (timing defense)")
+    void should_performDecoyWork_when_userUnverified() {
+        log.debug("Arrange: unverified user — decoy crypto must still run");
+        User user = unverifiedUser();
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+
+        service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
+
+        verify(tokenGenerator).generateToken();
+        verify(tokenGenerator).hash(RAW_TOKEN);
+        verify(passwordResetTokenRepository, never()).save(any());
+        verify(emailNotificationService, never()).sendPasswordResetEmail(anyString(), anyString());
+    }
+
+    // =========================================================================
+    // requestReset — buildResetLink scheme guard
+    // =========================================================================
+
+    @Test
+    @DisplayName("requestReset — throws IllegalState when frontendBaseUrl scheme is unsafe (SchemeGuard)")
+    void should_throwIllegalState_when_frontendBaseUrlSchemeUnsafe() {
+        log.debug("Arrange: service built with an unsafe (non-https / non-localhost) base URL");
+        PasswordResetService unsafeService = new PasswordResetService(
+                passwordResetTokenRepository,
+                userRepository,
+                refreshTokenRepository,
+                tokenGenerator,
+                passwordEncoder,
+                emailNotificationService,
+                Runnable::run,
+                Clock.fixed(FIXED_NOW, ZoneOffset.UTC),
+                "http://evil.example",
+                TOKEN_EXPIRY_HOURS
+        );
+        User user = activeVerifiedUser();
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+
+        assertThatThrownBy(() -> unsafeService.requestReset(new ForgotPasswordRequest(TEST_EMAIL)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.frontend.base-url");
+
+        // The unsafe scheme is caught before any email is dispatched.
+        verify(emailNotificationService, never()).sendPasswordResetEmail(anyString(), anyString());
+    }
+
+    // =========================================================================
     // resetPassword — happy path
     // =========================================================================
 
@@ -258,7 +339,7 @@ class PasswordResetServiceTest {
     }
 
     @Test
-    @DisplayName("resetPassword — response carries no auth tokens (no auto-login)")
+    @DisplayName("resetPassword — issues no new session and revokes existing ones (no auto-login)")
     void should_notReturnTokens_when_resetSucceeds() {
         log.debug("Arrange: valid token");
         PasswordResetToken token = validToken();
@@ -267,11 +348,15 @@ class PasswordResetServiceTest {
         when(passwordResetTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(token));
         when(userRepository.findById(USER_ID)).thenReturn(Optional.of(user));
 
-        // Void return — confirm no auth-token issuance wiring exists (no AuthResponseBuilder call).
+        // resetPassword returns void — there is no AuthResponse to inspect. The
+        // observable "no auto-login" guarantee is that the flow REVOKES sessions
+        // (global logout) and never persists a NEW refresh token for the user.
         service.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "NewValidPass1!"));
 
-        // If auto-login were attempted it would NPE (AuthResponseBuilder is not injected/mocked).
-        // The test passing confirms no such call is made.
+        // Existing sessions are revoked — the user is logged out, not logged in.
+        verify(refreshTokenRepository).deleteByUserId(USER_ID);
+        // No new session token is minted as a side-effect of the reset (no auto-login).
+        verify(refreshTokenRepository, never()).save(any());
     }
 
     // =========================================================================

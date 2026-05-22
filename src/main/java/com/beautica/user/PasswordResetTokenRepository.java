@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -55,4 +56,21 @@ public interface PasswordResetTokenRepository extends JpaRepository<PasswordRese
     @Modifying
     @Query("UPDATE PasswordResetToken t SET t.isUsed = true WHERE t.userId = :userId AND t.isUsed = false")
     void markAllUsedByUserId(@Param("userId") UUID userId);
+
+    /**
+     * Bounded hard-delete of stale reset tokens whose TTL elapsed before {@code cutoff}.
+     *
+     * <p>Backs {@link com.beautica.auth.PasswordResetTokenCleanupJob}: without it the
+     * {@code password_reset_tokens} side table grows unbounded (one row per forgot-password
+     * request, never reclaimed). A token expired beyond the retention window is dead weight —
+     * it can no longer be redeemed (TTL + single-use are both enforced at confirm time), so a
+     * physical {@code DELETE} is safe. Single statement, no per-row materialisation; rides the
+     * {@code expires_at} scan.
+     *
+     * @param cutoff delete tokens with {@code expires_at < cutoff}
+     * @return number of rows removed
+     */
+    @Modifying
+    @Query("DELETE FROM PasswordResetToken t WHERE t.expiresAt < :cutoff")
+    int deleteByExpiresAtBefore(@Param("cutoff") Instant cutoff);
 }

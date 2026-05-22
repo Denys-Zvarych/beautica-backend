@@ -60,7 +60,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
     @DisplayName("should return 200 with RegistrationResponse when registering with valid data")
     void should_return201_when_registerWithValidData() throws Exception {
         var request = new RegisterRequest(
-                "register@beautica.com", "password123",
+                "register@beautica.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
         log.debug("Arrange: register request for email={}", request.email());
 
@@ -84,7 +84,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
     void should_return409_when_registerWithDuplicateEmail() throws Exception {
         log.debug("Arrange: registering email={} twice", "duplicate@beautica.com");
         var request = new RegisterRequest(
-                "duplicate@beautica.com", "password123",
+                "duplicate@beautica.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, null, null, null, null);
 
         restTemplate.postForEntity("/api/v1/auth/register", request, String.class);
