@@ -1,6 +1,10 @@
 package com.beautica.master;
 
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.auth.Role;
+import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ConflictException;
+import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
@@ -459,6 +463,260 @@ class MasterServiceTest {
 
         assertThatThrownBy(() -> masterService.getMasterByUserId(userId))
                 .isInstanceOf(NotFoundException.class);
+    }
+
+    // ── createMasterForOwner (entity overload) ────────────────────────────────
+    // Tests target the entity overload directly — no repo mocking required for
+    // user/salon loading since both are passed in already (Findings 3 + 4 fix).
+
+    @Test
+    @DisplayName("should_createOwnerMaster_when_ownerHasNoExistingMasterRow")
+    void should_createOwnerMaster_when_ownerHasNoExistingMasterRow() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(user);
+
+        Master saved = Master.builder()
+                .user(user)
+                .salon(salon)
+                .masterType(MasterType.SALON_OWNER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
+        when(masterRepository.save(any(Master.class))).thenReturn(saved);
+
+        Master result = masterService.createMasterForOwner(user, salon);
+
+        assertThat(result.getMasterType()).isEqualTo(MasterType.SALON_OWNER);
+        assertThat(result.isActive()).isTrue();
+        assertThat(result.getAvgRating()).isEqualByComparingTo(BigDecimal.ZERO);
+        verify(masterRepository).save(any(Master.class));
+        verify(userRepository, never()).findById(any());
+        verify(salonRepository, never()).findById(any());
+    }
+
+    @Test
+    @DisplayName("should_returnExistingActiveRow_idempotent")
+    void should_returnExistingActiveRow_idempotent() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(user);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master existing = Master.builder()
+                .user(user)
+                .salon(salon)
+                .masterType(MasterType.SALON_OWNER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(existing));
+
+        Master result = masterService.createMasterForOwner(user, salon);
+
+        assertThat(result).isSameAs(existing);
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_reactivate_when_existingOwnerMasterIsInactive")
+    void should_reactivate_when_existingOwnerMasterIsInactive() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(user);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master inactive = Master.builder()
+                .user(user)
+                .salon(salon)
+                .masterType(MasterType.SALON_OWNER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(false)
+                .build();
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(inactive));
+
+        Master result = masterService.createMasterForOwner(user, salon);
+
+        assertThat(result.isActive()).isTrue();
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwConflict_when_userHasIndependentMasterRow")
+    void should_throwConflict_when_userHasIndependentMasterRow() {
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(user);
+
+        Master independentMaster = Master.builder()
+                .user(user)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(true)
+                .build();
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(independentMaster));
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(user, salon))
+                .isInstanceOf(ConflictException.class);
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwConflict_when_ownerMasterExistsInDifferentSalon")
+    void should_throwConflict_when_ownerMasterExistsInDifferentSalon() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID otherSalonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon requestedSalon = mock(Salon.class);
+        when(requestedSalon.isActive()).thenReturn(true);
+        when(requestedSalon.getOwner()).thenReturn(user);
+        when(requestedSalon.getId()).thenReturn(salonId);
+
+        Salon otherSalon = mock(Salon.class);
+        when(otherSalon.getId()).thenReturn(otherSalonId);
+
+        Master ownerMasterInOtherSalon = Master.builder()
+                .user(user)
+                .salon(otherSalon)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(true)
+                .build();
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(ownerMasterInOtherSalon));
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(user, requestedSalon))
+                .isInstanceOf(ConflictException.class);
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwForbidden_when_actorRoleIsNotSalonOwner")
+    void should_throwForbidden_when_actorRoleIsNotSalonOwner() {
+        User client = mock(User.class);
+        when(client.getRole()).thenReturn(Role.CLIENT);
+
+        Salon salon = mock(Salon.class);
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(client, salon))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(salonRepository, never()).findById(any());
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwForbidden_when_actorDoesNotOwnSalon")
+    void should_throwForbidden_when_actorDoesNotOwnSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID realOwnerId = UUID.randomUUID();
+
+        User actor = mock(User.class);
+        when(actor.getRole()).thenReturn(Role.SALON_OWNER);
+        when(actor.getId()).thenReturn(actorId);
+
+        User realOwner = mock(User.class);
+        when(realOwner.getId()).thenReturn(realOwnerId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(realOwner);
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(actor, salon))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwBusiness_when_salonIsInactive")
+    void should_throwBusiness_when_salonIsInactive() {
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+
+        Salon inactiveSalon = mock(Salon.class);
+        when(inactiveSalon.isActive()).thenReturn(false);
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(user, inactiveSalon))
+                .isInstanceOf(BusinessException.class);
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    // ── createMasterForOwner (UUID overload) — delegates to entity overload ──
+
+    @Test
+    @DisplayName("should_throwNotFound_when_salonMissing")
+    void should_throwNotFound_when_salonMissing() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        // UUID overload loads user then salon — role is not checked until inside the entity
+        // overload, but we never reach it because salonRepository returns empty first.
+        User user = mock(User.class);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(userId, salonId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_userMissing")
+    void should_throwNotFound_when_userMissing() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(userRepository.findById(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(userId, salonId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(salonRepository, never()).findById(any());
+        verify(masterRepository, never()).save(any());
     }
 
     // ── getMastersByPage ───────────────────────────────────────────────────────

@@ -3,7 +3,11 @@ package com.beautica.master.service;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.auth.Role;
 import com.beautica.common.TimeZones;
+import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ConflictException;
+import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
@@ -17,7 +21,9 @@ import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.Cache;
@@ -88,6 +94,94 @@ public class MasterService {
                 .build();
 
         return masterRepository.save(master);
+    }
+
+    /**
+     * Creates (or reactivates) a {@code SALON_OWNER}-type master row for the given owner
+     * inside their primary salon. Called automatically from {@code SalonService.createSalon}
+     * on first-salon creation (entity overload), and from the manual re-enable endpoint
+     * (Phase 12.4, UUID overload).
+     *
+     * <ul>
+     *   <li>Idempotent: returns the existing active row if already present.</li>
+     *   <li>Reactivates: flips {@code is_active = true} if the row exists but was disabled.</li>
+     *   <li>Throws {@link ConflictException} if the owner already has a master row of a different
+     *       type, or a {@code SALON_OWNER} row already exists in a different salon.</li>
+     * </ul>
+     *
+     * <p>Entity overload — accepts already-loaded entities to avoid redundant DB round-trips
+     * when called from {@code SalonService.createSalon} where both are already in memory
+     * (Findings 3 and 4).
+     */
+    @Transactional
+    public Master createMasterForOwner(User owner, Salon salon) {
+        if (owner.getRole() != Role.SALON_OWNER) {
+            throw new ForbiddenException("Only a SALON_OWNER may operate as a master");
+        }
+
+        if (!salon.isActive()) {
+            throw new BusinessException("Salon is not active");
+        }
+
+        if (salon.getOwner() == null || !salon.getOwner().getId().equals(owner.getId())) {
+            throw new ForbiddenException("Salon is not owned by the actor");
+        }
+
+        // user_id is UNIQUE on masters — a user has at most one master row.
+        // Decide: create new / return existing active / reactivate inactive / conflict.
+        var existing = masterRepository.findByUserId(owner.getId());
+        if (existing.isPresent()) {
+            Master m = existing.get();
+            if (m.getMasterType() != MasterType.SALON_OWNER) {
+                throw new ConflictException(
+                        "User already holds a master profile of a different type");
+            }
+            if (m.getSalon() == null || !m.getSalon().getId().equals(salon.getId())) {
+                throw new ConflictException(
+                        "Owner master profile already exists in a different salon");
+            }
+            if (!m.isActive()) {
+                m.setActive(true); // reactivate — Hibernate dirty-check flushes on commit
+                // Evict stale master-by-user entry so the re-enabled master passes isActive
+                // guards for callers using the cache (LOW F4 / Anti-Bug §F rule 1).
+                final UUID ownerUserId = owner.getId();
+                if (TransactionSynchronizationManager.isSynchronizationActive()) {
+                    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            Cache c = cacheManager.getCache("master-by-user");
+                            if (c != null) {
+                                c.evict(ownerUserId);
+                            }
+                        }
+                    });
+                }
+            }
+            return m; // idempotent
+        }
+
+        var master = Master.builder()
+                .user(owner)
+                .salon(salon)
+                .masterType(MasterType.SALON_OWNER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        return masterRepository.save(master);
+    }
+
+    /**
+     * UUID-based overload retained for Phase 12.4 standalone re-enable endpoint.
+     * Loads both entities then delegates to the entity overload to avoid code duplication.
+     */
+    @Transactional
+    public Master createMasterForOwner(UUID actorUserId, UUID salonId) {
+        var user = userRepository.findById(actorUserId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+        var salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found"));
+        return createMasterForOwner(user, salon);
     }
 
     // Fix 6: use findByIdWithSalonAndOwner to eliminate 2-4 lazy SELECTs per request

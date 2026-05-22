@@ -4,7 +4,10 @@ import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.entity.Salon;
@@ -19,6 +22,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.Optional;
@@ -27,6 +31,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -57,6 +62,12 @@ class SalonServicePrimaryTest {
 
     @Mock
     private LocalityWriteValidator localityWriteValidator;
+
+    @Mock
+    private MasterService masterService;
+
+    @Mock
+    private CacheManager cacheManager;
 
     @InjectMocks
     private SalonService salonService;
@@ -204,6 +215,56 @@ class SalonServicePrimaryTest {
         assertThat(response.isPrimary())
                 .as("SalonResponse.isPrimary must be false when owner already has a salon")
                 .isFalse();
+    }
+
+    // ── auto-create master on first salon (Phase 12.2) ───────────────────────
+
+    @Test
+    @DisplayName("createSalon — sets isPrimary=true AND calls masterService.createMasterForOwner(User,Salon) when first salon")
+    void should_setPrimary_andAutoCreateMaster_when_firstSalon() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildOwner(ownerId);
+        var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null);
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
+            Salon s = inv.getArgument(0);
+            ReflectionTestUtils.setField(s, "id", UUID.randomUUID());
+            return s;
+        });
+        // Entity overload — SalonService now passes the already-loaded owner and savedSalon.
+        when(masterService.createMasterForOwner(any(User.class), any(Salon.class)))
+                .thenReturn(mock(Master.class));
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.isPrimary()).isTrue();
+
+        ArgumentCaptor<Salon> salonCaptor = ArgumentCaptor.forClass(Salon.class);
+        verify(masterService).createMasterForOwner(any(User.class), salonCaptor.capture());
+        assertThat(salonCaptor.getValue()).isNotNull();
+        assertThat(salonCaptor.getValue().isPrimary())
+                .as("the saved salon passed to masterService must already be marked isPrimary")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("createSalon — sets isPrimary=false AND does NOT call masterService.createMasterForOwner when additional salon")
+    void should_notSetPrimary_andNotCreateMaster_when_additionalSalon() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildOwner(ownerId);
+        var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null);
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.isPrimary()).isFalse();
+        // Entity overload must never be called for subsequent salons.
+        verify(masterService, never()).createMasterForOwner(any(User.class), any(Salon.class));
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

@@ -226,10 +226,10 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("Should return 409 when BusinessException with CONFLICT status is thrown")
+    @DisplayName("Should return 409 with generic message and NOT echo internal message when CONFLICT BusinessException")
     void should_return409_when_conflictExceptionThrown() {
-        // Arrange
-        var ex = new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        // Arrange — internal message must NOT appear in the response body (Finding 1 fix)
+        var ex = new BusinessException(HttpStatus.CONFLICT, "User already holds a master profile of a different type");
 
         // Act
         ResponseEntity<ApiResponse<Void>> response = handler.handleBusiness(ex);
@@ -242,6 +242,60 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody().success())
                 .as("success must be false")
                 .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("response must use the generic conflict message — never echo internal state")
+                .isEqualTo("Request could not be completed due to a conflict");
+
+        assertThat(response.getBody().message())
+                .as("internal master-type detail must not reach the caller")
+                .doesNotContain("master profile");
+    }
+
+    @Test
+    @DisplayName("Should return 400 with generic message and NOT echo internal message when BAD_REQUEST BusinessException")
+    void should_return400_with_genericMessage_when_badRequestBusinessException() {
+        // Arrange
+        var ex = new BusinessException(HttpStatus.BAD_REQUEST, "Salon is not active");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleBusiness(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 400")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThat(response.getBody().message())
+                .as("message must be the generic 'Invalid request' string")
+                .isEqualTo("Invalid request");
+
+        assertThat(response.getBody().message())
+                .as("internal salon-state detail must not reach the caller")
+                .doesNotContain("Salon is not active");
+    }
+
+    @Test
+    @DisplayName("handleBusiness — internal message is emitted at DEBUG level for server-side triage")
+    void should_emitDebugLog_when_businessExceptionThrown() {
+        // Arrange
+        String internalMessage = "Owner master profile already exists in a different salon";
+        var ex = new ConflictException(internalMessage);
+        listAppender.list.clear();
+
+        // Act
+        handler.handleBusiness(ex);
+
+        // Assert — exactly one DEBUG event containing the internal message
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleBusiness must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must contain the original internal message")
+                .contains(internalMessage);
     }
 
     @Test

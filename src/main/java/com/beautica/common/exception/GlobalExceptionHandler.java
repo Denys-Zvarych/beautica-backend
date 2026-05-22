@@ -40,9 +40,15 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
+        log.debug("Business exception: {}", ex.getMessage());
+        String clientMessage = switch (ex.getStatus()) {
+            case CONFLICT -> "Request could not be completed due to a conflict";
+            case BAD_REQUEST -> "Invalid request";
+            default -> "Request could not be completed";
+        };
         return ResponseEntity
                 .status(ex.getStatus())
-                .body(ApiResponse.error(ex.getMessage()));
+                .body(ApiResponse.error(clientMessage));
     }
 
     @ExceptionHandler(ResendThrottledException.class)

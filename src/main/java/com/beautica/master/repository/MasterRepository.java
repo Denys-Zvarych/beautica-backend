@@ -1,6 +1,7 @@
 package com.beautica.master.repository;
 
 import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -29,6 +30,14 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Page<Master> findBySalonIdAndIsActiveTrueWithUser(@Param("salonId") UUID salonId, Pageable pageable);
 
     boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
+
+    /**
+     * Returns {@code true} iff the given user has an active master row of the given type in the
+     * given salon. Used by the owner-as-master authorization fast-path (Phase 12.3) and by
+     * {@code MasterService.createMasterForOwner} to perform the idempotent active-row check.
+     */
+    boolean existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue(
+            UUID userId, UUID salonId, MasterType masterType);
 
     boolean existsByIdAndSalonId(UUID id, UUID salonId);
 

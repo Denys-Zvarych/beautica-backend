@@ -9,6 +9,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -16,6 +17,8 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.Caching;
@@ -23,6 +26,8 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.List;
 import java.util.UUID;
@@ -36,9 +41,10 @@ public class SalonService {
     private final InviteService inviteService;
     private final MasterRepository masterRepository;
     private final LocalityWriteValidator localityWriteValidator;
+    private final MasterService masterService;
+    private final CacheManager cacheManager;
 
     @Transactional
-    @CacheEvict(value = "ownerSalons", key = "#ownerId")
     public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
         var owner = userRepository.findById(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
@@ -62,7 +68,39 @@ public class SalonService {
                 .isPrimary(isFirstSalon)
                 .build();
 
-        return SalonResponse.from(salonRepository.save(salon));
+        Salon savedSalon = salonRepository.save(salon);
+
+        // Evict ownerSalons cache after commit so a concurrent reader cannot repopulate
+        // with stale data inside the commit window (Anti-Bug Playbook §F rule 2).
+        evictOwnerSalonsCacheAfterCommit(ownerId);
+
+        // Auto-create the owner's SALON_OWNER-type master profile on first-salon creation.
+        // Passes already-loaded entities to avoid redundant DB round-trips (Finding 3/4).
+        // Runs inside the same @Transactional boundary: if master creation fails, the
+        // salon row is rolled back too (atomicity per Phase 12.2 architecture decision).
+        if (isFirstSalon) {
+            masterService.createMasterForOwner(owner, savedSalon);
+        }
+
+        return SalonResponse.from(savedSalon);
+    }
+
+    // Eviction is registered as a post-commit callback rather than via @CacheEvict.
+    // @CacheEvict fires before the transaction commits, allowing a concurrent reader
+    // to repopulate the cache with stale data within the commit window (Anti-Bug §F rule 2).
+    private void evictOwnerSalonsCacheAfterCommit(UUID ownerId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache cache = cacheManager.getCache("ownerSalons");
+                if (cache != null) {
+                    cache.evict(ownerId);
+                }
+            }
+        });
     }
 
     @Caching(evict = {

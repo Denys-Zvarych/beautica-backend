@@ -10,6 +10,7 @@ import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -60,6 +61,9 @@ class SalonServiceTest {
 
     @Mock
     private com.beautica.location.LocalityWriteValidator localityWriteValidator;
+
+    @Mock
+    private MasterService masterService;
 
     @InjectMocks
     private SalonService salonService;
