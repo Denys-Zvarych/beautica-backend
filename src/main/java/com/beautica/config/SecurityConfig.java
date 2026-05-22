@@ -59,7 +59,19 @@ public class SecurityConfig {
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint(unauthorizedEntryPoint()))
                 .authorizeHttpRequests(auth -> {
-                    auth.requestMatchers("/api/v1/auth/register", "/api/v1/auth/register/independent-master", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/invite/accept", "/api/v1/auth/verify-email", "/api/v1/auth/resend-verification").permitAll();
+                    auth.requestMatchers(
+                            "/api/v1/auth/register",
+                            "/api/v1/auth/register/independent-master",
+                            "/api/v1/auth/login",
+                            "/api/v1/auth/refresh",
+                            "/api/v1/auth/invite/accept",
+                            "/api/v1/auth/verify-email",
+                            "/api/v1/auth/resend-verification",
+                            // Phase 11.2 / 11.3 — password-reset flow is unauthenticated by design.
+                            // The caller holds no JWT (that is why they are resetting the password).
+                            "/api/v1/auth/forgot-password",
+                            "/api/v1/auth/reset-password"
+                    ).permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll();
                     if (isDevProfile) {
                         auth.requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll();

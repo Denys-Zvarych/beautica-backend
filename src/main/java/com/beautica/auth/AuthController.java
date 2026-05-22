@@ -1,6 +1,7 @@
 package com.beautica.auth;
 
 import com.beautica.auth.dto.AuthResponse;
+import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.InvitePreviewResponse;
@@ -11,6 +12,7 @@ import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.ResendVerificationRequest;
+import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.ApiResponse;
 import jakarta.validation.Valid;
@@ -38,10 +40,14 @@ public class AuthController {
 
     private final AuthService authService;
     private final InviteService inviteService;
+    private final PasswordResetService passwordResetService;
 
-    public AuthController(AuthService authService, InviteService inviteService) {
+    public AuthController(AuthService authService,
+                          InviteService inviteService,
+                          PasswordResetService passwordResetService) {
         this.authService = authService;
         this.inviteService = inviteService;
+        this.passwordResetService = passwordResetService;
     }
 
     @PostMapping("/register")
@@ -87,6 +93,44 @@ public class AuthController {
     public ResponseEntity<ApiResponse<RegistrationResponse>> resendVerification(
             @Valid @RequestBody ResendVerificationRequest request) {
         return ResponseEntity.ok(ApiResponse.ok(authService.resendVerification(request)));
+    }
+
+    /**
+     * Initiates a password reset for the given email address.
+     *
+     * <p>Always returns a generic 200 regardless of whether the email is known, verified, or
+     * active — enumeration protection is the primary goal. The only observable difference
+     * between a real user and a phantom address is whether a reset email arrives in the inbox.
+     *
+     * <p>Rate-limited per IP via the {@code forgotPasswordBuckets} bucket (3 requests/hour
+     * by default). A 429 with {@code Retry-After: 3600} is returned when exhausted.
+     */
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ApiResponse<Void>> forgotPassword(
+            @Valid @RequestBody ForgotPasswordRequest request) {
+        passwordResetService.requestReset(request);
+        return ResponseEntity.ok(ApiResponse.ok(null,
+                "If an account exists for that email, a reset link has been sent."));
+    }
+
+    /**
+     * Completes a password reset using the raw token from the emailed link.
+     *
+     * <p>On success the user's password is updated and all existing sessions are terminated.
+     * No auth tokens are returned — the client must route to the login screen.
+     *
+     * <p>Invalid, used, and expired tokens all produce the same generic 400 (no oracle).
+     * Bean-validation failures (blank token, short password) return the standard 400
+     * validation envelope from {@code GlobalExceptionHandler}.
+     *
+     * <p>Rate-limited via the shared {@code forgotPasswordBuckets} bucket. 429 with
+     * {@code Retry-After: 3600} when exhausted.
+     */
+    @PostMapping("/reset-password")
+    public ResponseEntity<ApiResponse<Void>> resetPassword(
+            @Valid @RequestBody ResetPasswordRequest request) {
+        passwordResetService.resetPassword(request);
+        return ResponseEntity.ok(ApiResponse.ok(null, "Password has been reset. Please sign in."));
     }
 
     @PostMapping("/logout")

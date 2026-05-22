@@ -5,6 +5,8 @@ import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.support.SlowTestExtension;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
+import org.apache.hc.core5.util.TimeValue;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -67,6 +69,10 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
+        // Phase 11.1: password_reset_tokens has FK to users (ON DELETE CASCADE) but we
+        // delete it explicitly before users to stay consistent with FK ordering and make
+        // the cleanup intent clear. Must precede the users DELETE.
+        jdbcTemplate.execute("DELETE FROM password_reset_tokens");
         jdbcTemplate.execute("DELETE FROM device_tokens");
         jdbcTemplate.execute("DELETE FROM users");
 
@@ -77,8 +83,16 @@ public abstract class AbstractIntegrationTest {
 
         // Reset to a fresh Apache HttpClient after every test so context-sharing
         // classes never inherit a stale/closed connection pool from a previous test.
-        baseRestTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        // Finite response timeout (10 s) + zero retries: a rate-limit 429 that resets
+        // the socket will fail fast instead of hanging the suite for 27 minutes.
+        var httpClient = HttpClients.custom()
+                .setRetryStrategy(new DefaultHttpRequestRetryStrategy(0, TimeValue.ZERO_MILLISECONDS))
+                .build();
+        var factory = new HttpComponentsClientHttpRequestFactory(httpClient);
+        factory.setConnectionRequestTimeout(10_000);
+        factory.setConnectTimeout(10_000);
+        factory.setReadTimeout(10_000);
+        baseRestTemplate.getRestTemplate().setRequestFactory(factory);
     }
 
     private static final PostgreSQLContainer<?> POSTGRES =

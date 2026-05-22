@@ -42,7 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ServicesIntegrationTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(ServicesIntegrationTest.class);
-    private static final String TEST_PASSWORD = "password123";
+    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     @Autowired
     private TestRestTemplate restTemplate;

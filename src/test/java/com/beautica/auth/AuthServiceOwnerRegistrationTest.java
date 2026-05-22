@@ -83,7 +83,7 @@ class AuthServiceOwnerRegistrationTest {
     @DisplayName("register — throws BusinessException when SALON_OWNER omits businessName")
     void should_requireBusinessName_when_registeringAsSalonOwner() {
         var request = new RegisterRequest(
-                "owner@beautica.test", "password123",
+                "owner@beautica.test", "Str0ngP@ss1!",
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, null);
 
         when(userRepository.existsByEmail("owner@beautica.test")).thenReturn(false);
@@ -103,7 +103,7 @@ class AuthServiceOwnerRegistrationTest {
     @DisplayName("register — accepts null firstName and lastName when SALON_OWNER provides businessName")
     void should_allowNullFirstAndLastName_when_registeringAsSalonOwner() {
         var request = new RegisterRequest(
-                "owner@beautica.test", "password123",
+                "owner@beautica.test", "Str0ngP@ss1!",
                 SelfRegistrationRole.SALON_OWNER, null, null, null, "Beauty Studio");
 
         when(userRepository.existsByEmail("owner@beautica.test")).thenReturn(false);
@@ -130,7 +130,7 @@ class AuthServiceOwnerRegistrationTest {
     @DisplayName("register — throws BusinessException when SALON_OWNER provides whitespace-only businessName")
     void should_rejectEmptyBusinessName_when_registeringAsSalonOwner() {
         var request = new RegisterRequest(
-                "owner@beautica.test", "password123",
+                "owner@beautica.test", "Str0ngP@ss1!",
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "   ");
 
         when(userRepository.existsByEmail("owner@beautica.test")).thenReturn(false);
@@ -150,7 +150,7 @@ class AuthServiceOwnerRegistrationTest {
     @DisplayName("register — persists businessName on User entity when SALON_OWNER registers")
     void should_storeBusinessName_on_createdUser() {
         var request = new RegisterRequest(
-                "owner@beautica.test", "password123",
+                "owner@beautica.test", "Str0ngP@ss1!",
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "Lviv Beauty Hub");
 
         when(userRepository.existsByEmail("owner@beautica.test")).thenReturn(false);

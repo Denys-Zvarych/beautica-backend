@@ -32,7 +32,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 abstract class AbstractMediaIntegrationTest extends AbstractIntegrationTest {
 
-    static final String TEST_PASSWORD = "password123";
+    static final String TEST_PASSWORD = "Str0ngP@ss1!";
     static final byte[] JPEG_HEADER = new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00};
 
     /**

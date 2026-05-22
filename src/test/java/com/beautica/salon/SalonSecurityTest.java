@@ -40,7 +40,7 @@ class SalonSecurityTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(SalonSecurityTest.class);
     private static final String SALONS_URL = "/api/v1/salons";
-    private static final String TEST_PASSWORD = "password123";
+    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     @Autowired
     private TestRestTemplate restTemplate;

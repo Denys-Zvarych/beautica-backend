@@ -32,6 +32,8 @@ app:
     media-upload-capacity: 100000
     verify-email-capacity: 100000
     resend-verification-capacity: 100000
+    forgot-password-capacity: 100000
+    reset-password-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.
@@ -58,6 +60,8 @@ app:
     cumulative-failure-threshold: 10
     lockout-duration: 15m
     stale-code-retention: 24h
+  password-reset:
+    cleanup-retention: 7d
   outbox:
     # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
     payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=

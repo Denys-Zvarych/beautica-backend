@@ -89,7 +89,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
      */
     private String registerAndCaptureCode(String email) throws Exception {
         var request = new RegisterRequest(
-                email, "password123",
+                email, "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
 
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -112,7 +112,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
     void should_returnRegistrationResponse_when_clientRegisters() throws Exception {
         var email = "reg.lifecycle@beautica.test";
         var request = new RegisterRequest(
-                email, "password123",
+                email, "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
         log.debug("Arrange: CLIENT register request for email={}", email);
 
@@ -169,7 +169,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
 
         log.debug("Act: POST /api/v1/auth/register for email={}", email);
         var request = new RegisterRequest(
-                email, "password123",
+                email, "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
         restTemplate.postForEntity("/api/v1/auth/register", request, String.class);
 
@@ -329,14 +329,14 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         var email = "unverified.login@beautica.test";
         log.debug("Arrange: register email={} without verifying", email);
         var request = new RegisterRequest(
-                email, "password123",
+                email, "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
         restTemplate.postForEntity("/api/v1/auth/register", request, String.class);
 
         log.debug("Act: POST /api/v1/auth/login with correct password but unverified email");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/login",
-                new LoginRequest(email, "password123"),
+                new LoginRequest(email, "Str0ngP@ss1!"),
                 String.class);
 
         log.debug("Assert: 403, data.code=EMAIL_NOT_VERIFIED, data.email matches");
@@ -372,7 +372,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         log.debug("Act: POST /api/v1/auth/login after verification");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/login",
-                new LoginRequest(email, "password123"),
+                new LoginRequest(email, "Str0ngP@ss1!"),
                 String.class);
 
         log.debug("Assert: 200, accessToken not blank, email matches");

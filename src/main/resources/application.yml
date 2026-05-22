@@ -143,6 +143,11 @@ app:
     lockout-duration: 15m
     # Abandoned unverified OTP rows older than this are nulled by the daily sweep.
     stale-code-retention: 24h
+  password-reset:
+    # Reset tokens expired longer than this are hard-deleted by the daily sweep
+    # (PasswordResetTokenCleanupJob) — keeps password_reset_tokens from growing
+    # unbounded. A few days of buffer past the 1 h TTL for support/forensic lookup.
+    cleanup-retention: 7d
   rate-limit:
     # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
     # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.
@@ -150,6 +155,14 @@ app:
     # POST/DELETE /api/v1/media/* — 10/min per IP; balances upload retries
     # (after a 400 on wrong MIME / oversize) with abuse prevention.
     media-upload-capacity: 10
+    # POST /api/v1/auth/forgot-password — 3/hr per IP (60-min window).
+    # Email-bomb surface; kept low. Decoupled from reset-password so a NAT-shared
+    # client spamming forgot-password cannot lock out their own reset-confirm.
+    forgot-password-capacity: 3
+    # POST /api/v1/auth/reset-password — 10/hr per IP (60-min window).
+    # Sends no email; higher cap tolerates legitimate new-password typo retries
+    # against a single emailed token.
+    reset-password-capacity: 10
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32

@@ -118,7 +118,7 @@ class AuthServiceTest {
     @DisplayName("register — returns RegistrationResponse without tokens when CLIENT registers")
     void should_returnRegistrationResponse_when_clientRegisters() {
         var request = new RegisterRequest(
-                "new@example.com", "password123",
+                "new@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "John", "Doe", null, null);
         log.debug("Arrange: seeding register request for email={}", request.email());
 
@@ -146,7 +146,7 @@ class AuthServiceTest {
     @DisplayName("register returns RegistrationResponse (200) when email is already registered — enumeration suppressed")
     void should_return200WithRegistrationResponse_when_emailAlreadyRegistered() {
         var request = new RegisterRequest(
-                "taken@example.com", "password123",
+                "taken@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, null, null, null, null);
         log.debug("Arrange: existing email={} already registered", request.email());
 
@@ -166,7 +166,7 @@ class AuthServiceTest {
     @DisplayName("registerIndependentMaster — returns RegistrationResponse without tokens")
     void should_returnRegistrationResponseWithoutTokens_when_independentMasterRegisters() {
         var request = new RegisterIndependentMasterRequest(
-                "master@example.com", "password123",
+                "master@example.com", "Str0ngP@ss1!",
                 "Oksana", "Kovalenko", "+380671234567");
         log.debug("Arrange: seeding independent master request for email={}", request.email());
 
@@ -194,7 +194,7 @@ class AuthServiceTest {
     @DisplayName("registerIndependentMaster returns RegistrationResponse (200) when email already registered — enumeration suppressed")
     void should_return200WithRegistrationResponse_when_independentMasterEmailAlreadyRegistered() {
         var request = new RegisterIndependentMasterRequest(
-                "taken@example.com", "password123",
+                "taken@example.com", "Str0ngP@ss1!",
                 null, null, null);
         log.debug("Arrange: email={} already exists", request.email());
 
@@ -380,7 +380,7 @@ class AuthServiceTest {
     @DisplayName("register stores businessName when SALON_OWNER registers with valid businessName")
     void should_storeBusinessName_when_salonOwnerRegisters() {
         var request = new RegisterRequest(
-                "owner@example.com", "password123",
+                "owner@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "Beauty Studio Lviv");
         log.debug("Arrange: SALON_OWNER request with businessName={}", request.businessName());
 
@@ -405,7 +405,7 @@ class AuthServiceTest {
     @DisplayName("register throws BusinessException when SALON_OWNER registers without businessName")
     void should_throwBusinessException_when_salonOwnerRegistersWithoutBusinessName() {
         var request = new RegisterRequest(
-                "owner@example.com", "password123",
+                "owner@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, null);
         log.debug("Arrange: SALON_OWNER request with null businessName");
 
@@ -423,7 +423,7 @@ class AuthServiceTest {
     @DisplayName("register throws BusinessException when SALON_OWNER registers with blank businessName")
     void should_throwBusinessException_when_salonOwnerRegistersWithBlankBusinessName() {
         var request = new RegisterRequest(
-                "owner@example.com", "password123",
+                "owner@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.SALON_OWNER, "Olena", "Koval", null, "   ");
         log.debug("Arrange: SALON_OWNER request with whitespace-only businessName");
 
@@ -441,7 +441,7 @@ class AuthServiceTest {
     @DisplayName("register does not require businessName when CLIENT registers")
     void should_notRequireBusinessName_when_clientRegisters() {
         var request = new RegisterRequest(
-                "client@example.com", "password123",
+                "client@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Ivan", "Petrenko", null, null);
         log.debug("Arrange: CLIENT request without businessName");
 
@@ -468,7 +468,7 @@ class AuthServiceTest {
         boolean isSalonOwner = role == SelfRegistrationRole.SALON_OWNER;
         String businessName = isSalonOwner ? "Test Salon" : null;
         var request = new RegisterRequest(
-                "valid@example.com", "password123",
+                "valid@example.com", "Str0ngP@ss1!",
                 role, "Test", "User", null, businessName);
         log.debug("Arrange: registering with permitted role={}", role);
 
@@ -495,7 +495,7 @@ class AuthServiceTest {
     @DisplayName("register — persists OTP hash and expiry on the single save call")
     void should_persistCodeAndExpiry_when_clientRegisters() {
         var request = new RegisterRequest(
-                "otp@example.com", "password123",
+                "otp@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Anna", "Koval", null, null);
 
         when(userRepository.existsByEmail("otp@example.com")).thenReturn(false);
@@ -528,7 +528,7 @@ class AuthServiceTest {
     @DisplayName("register — sendVerificationEmail NOT called synchronously (dispatched via afterCommit)")
     void should_notCallSendVerificationEmailSynchronously_when_clientRegisters() {
         var request = new RegisterRequest(
-                "verify@example.com", "password123",
+                "verify@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Daria", "Melnyk", null, null);
 
         when(userRepository.existsByEmail("verify@example.com")).thenReturn(false);
@@ -551,7 +551,7 @@ class AuthServiceTest {
     @DisplayName("register — response is RegistrationResponse (no accessToken / refreshToken) when CLIENT registers")
     void should_returnRegistrationResponseWithoutTokens_when_clientRegisters() {
         var request = new RegisterRequest(
-                "notoken@example.com", "password123",
+                "notoken@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, "Maksym", "Bondar", null, null);
 
         when(userRepository.existsByEmail("notoken@example.com")).thenReturn(false);
@@ -576,7 +576,7 @@ class AuthServiceTest {
     @DisplayName("registerIndependentMaster — master profile created and response defers token issuance")
     void should_deferTokenIssuance_when_independentMasterRegisters() {
         var request = new RegisterIndependentMasterRequest(
-                "imdefer@example.com", "password123",
+                "imdefer@example.com", "Str0ngP@ss1!",
                 "Sofiia", "Hrytsenko", "+380501112233");
 
         when(userRepository.existsByEmail("imdefer@example.com")).thenReturn(false);

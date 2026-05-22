@@ -58,7 +58,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
 
         // Register (now returns RegistrationResponse — no tokens, no userId)
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
 
         // Force email verification so login succeeds (phase 1.7 will add the gate, not yet active)
@@ -66,7 +66,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
 
         // Login to get userId (phase 1.7 not yet active — login does not check emailVerified yet)
         var loginResp = restTemplate.postForEntity("/api/v1/auth/login",
-                new LoginRequest(email, "password123"), String.class);
+                new LoginRequest(email, "Str0ngP@ss1!"), String.class);
         var loginBody = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         var userId = loginBody.data().userId();
 
@@ -97,11 +97,11 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         log.debug("Arrange: register CLIENT email={}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null),
                 String.class);
         jdbcTemplate.update("UPDATE users SET email_verified = TRUE WHERE email = ?", email);
         var loginResp = restTemplate.postForEntity("/api/v1/auth/login",
-                new LoginRequest(email, "password123"), String.class);
+                new LoginRequest(email, "Str0ngP@ss1!"), String.class);
         var auth = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         String clientToken = auth.data().accessToken();
 
@@ -131,7 +131,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         String requestBody = String.format(
-                "{\"email\":\"%s\",\"password\":\"password123\",\"role\":\"SALON_OWNER\"}", email);
+                "{\"email\":\"%s\",\"password\":\"Str0ngP@ss1!\",\"role\":\"SALON_OWNER\"}", email);
 
         log.debug("Act: POST /auth/register with SALON_OWNER role and absent businessName field");
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -154,12 +154,12 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         log.debug("Arrange: register email={}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, "password123", SelfRegistrationRole.CLIENT, null, null, null, null), String.class);
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null), String.class);
         jdbcTemplate.update("UPDATE users SET email_verified = TRUE WHERE email = ?", email);
 
         log.debug("Arrange: login to obtain tokens");
         ResponseEntity<String> loginResp = restTemplate.postForEntity("/api/v1/auth/login",
-                new LoginRequest(email, "password123"), String.class);
+                new LoginRequest(email, "Str0ngP@ss1!"), String.class);
         var loginBody = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         String accessToken = loginBody.data().accessToken();
         String refreshToken = loginBody.data().refreshToken();
@@ -195,7 +195,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         // INVALID_ENUM_VALUE is not a member of SelfRegistrationRole — Jackson raises
         // InvalidFormatException, which the handler must sanitise before responding.
         String requestBody = String.format(
-                "{\"email\":\"%s\",\"password\":\"password123\",\"role\":\"INVALID_ENUM_VALUE\"}", email);
+                "{\"email\":\"%s\",\"password\":\"Str0ngP@ss1!\",\"role\":\"INVALID_ENUM_VALUE\"}", email);
 
         log.debug("Act: POST /api/v1/auth/register with unrecognised enum value");
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -257,7 +257,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         // Use byte[] so RestTemplate's ByteArrayHttpMessageConverter is selected instead of
         // StringHttpMessageConverter, which would silently inject Content-Type: text/plain.
         HttpHeaders headers = new HttpHeaders();
-        byte[] rawBody = "{\"email\":\"no-content-type@beautica.test\",\"password\":\"password123\",\"role\":\"CLIENT\"}"
+        byte[] rawBody = "{\"email\":\"no-content-type@beautica.test\",\"password\":\"Str0ngP@ss1!\",\"role\":\"CLIENT\"}"
                 .getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
         log.debug("Act: POST /api/v1/auth/register with a body but without Content-Type header");
@@ -309,7 +309,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         // SALON_ADMIN is not a member of SelfRegistrationRole — Jackson cannot
         // deserialise this value and Spring will return 400 before reaching the service.
         String requestBody = String.format(
-                "{\"email\":\"%s\",\"password\":\"password123\",\"role\":\"SALON_ADMIN\"}", email);
+                "{\"email\":\"%s\",\"password\":\"Str0ngP@ss1!\",\"role\":\"SALON_ADMIN\"}", email);
 
         log.debug("Act: POST /auth/register with role=SALON_ADMIN which is not self-registrable");
         ResponseEntity<String> resp = restTemplate.exchange(

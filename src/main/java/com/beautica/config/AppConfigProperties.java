@@ -9,7 +9,8 @@ import org.springframework.context.annotation.Configuration;
         JwtConfig.class,
         OutboxCipherProperties.class,
         OtpPepperConfig.class,
-        VerificationPolicyConfig.class
+        VerificationPolicyConfig.class,
+        PasswordResetPolicyConfig.class
 })
 public class AppConfigProperties {
 }

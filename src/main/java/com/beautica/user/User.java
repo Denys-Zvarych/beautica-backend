@@ -183,6 +183,19 @@ public class User extends AuditableEntity {
         return passwordHash;
     }
 
+    /**
+     * Replaces the stored password hash after a successful password-reset flow.
+     *
+     * <p>Callers MUST supply a BCrypt-encoded value — never a plaintext password.
+     * This mutator is intentionally narrow: it exists solely for
+     * {@code PasswordResetService.resetPassword} and must not be called from
+     * any other write path (use {@link User#User(String, String, Role, String, String, String)}
+     * constructor-based init for new users).
+     */
+    public void setPasswordHash(String passwordHash) {
+        this.passwordHash = passwordHash;
+    }
+
     public Role getRole() {
         return role;
     }

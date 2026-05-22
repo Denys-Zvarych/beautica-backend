@@ -1,5 +1,6 @@
 package com.beautica.auth.dto;
 
+import com.beautica.common.validation.StrongPassword;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
@@ -11,8 +12,10 @@ public record RegisterIndependentMasterRequest(
         @Size(max = 255, message = "Email must not exceed 255 characters")
         String email,
 
+        // Shared @StrongPassword policy — same implementation as RegisterRequest /
+        // ResetPasswordRequest so no self-registration path diverges on strength.
         @NotBlank(message = "Password is required")
-        @Size(min = 8, max = 128, message = "Password must be between 8 and 128 characters")
+        @StrongPassword
         String password,
 
         @Size(max = 100, message = "First name must not exceed 100 characters")

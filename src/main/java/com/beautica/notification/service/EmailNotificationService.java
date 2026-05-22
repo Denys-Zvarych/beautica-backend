@@ -87,6 +87,46 @@ public class EmailNotificationService {
         send(to, "Бронювання відхилено", "email/booking-declined", ctx);
     }
 
+    /**
+     * Sends a password-reset link email.
+     *
+     * <p>Delivery failures are non-fatal and are swallowed after logging (template + exception
+     * class only — {@code to} is PII and is never logged). The caller dispatches this method
+     * via {@code emailExecutor} in an {@code afterCommit} synchronization so the email is
+     * never sent if the DB transaction rolls back.
+     *
+     * @param to       recipient address — never logged
+     * @param resetUrl absolute https URL containing the raw reset token as a query param;
+     *                 must pass {@link com.beautica.common.util.SchemeGuard#isAllowedScheme}
+     * @throws IllegalArgumentException if {@code resetUrl} fails the scheme guard (caller bug)
+     */
+    public void sendPasswordResetEmail(String to, String resetUrl) {
+        if (!SchemeGuard.isAllowedScheme(resetUrl)) {
+            throw new IllegalArgumentException(
+                    "resetUrl must use https:// scheme or http://localhost — got an unsafe scheme");
+        }
+        try {
+            var message = mailSender.createMimeMessage();
+            var helper = new MimeMessageHelper(message, true, "UTF-8");
+            helper.setFrom(fromAddress);
+            helper.setTo(to);
+            helper.setSubject("Скидання паролю Beautica");
+
+            var ctx = new Context();
+            ctx.setVariable("resetUrl", resetUrl);
+            String html = templateEngine.process("email/reset-password", ctx);
+            helper.setText(html, true);
+
+            helper.addInline("beauticaLogo", LOGO);
+
+            mailSender.send(message);
+        } catch (MessagingException | MailException e) {
+            // Non-fatal: delivery failure is acceptable; the user can request a new link.
+            // 'to' is PII — never log it. Log template + exception type only.
+            log.error("sendPasswordResetEmail failed: template=email/reset-password exception={}", e.getClass().getSimpleName());
+        }
+    }
+
     public void sendVerificationEmail(String to, String rawOtp) {
         try {
             var message = mailSender.createMimeMessage();
