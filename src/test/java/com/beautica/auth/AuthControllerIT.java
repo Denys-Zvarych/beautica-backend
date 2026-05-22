@@ -104,10 +104,28 @@ class AuthControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("should return 400 when register password is length-valid but has no uppercase (@StrongPassword)")
+    void should_return400_when_registerPasswordHasNoUppercase() {
+        var request = new RegisterRequest(
+                "no.uppercase@beautica.com", "str0ngp@ss1",
+                SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
+        log.debug("Arrange: register request with length-valid but no-uppercase password for email={}",
+                request.email());
+
+        log.debug("Act: POST /auth/register with no-uppercase password");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/register", request, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status for register with no-uppercase password, email=%s", request.email())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
     @DisplayName("should return 200 with access and refresh tokens when login credentials are valid")
     void should_return200WithTokenPair_when_loginWithValidCredentials() throws Exception {
         var email = "login.valid@beautica.com";
-        var password = "mypassword1";
+        var password = "Mypassword1";
         log.debug("Arrange: pre-registering email={} with known password", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
@@ -159,7 +177,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
     @DisplayName("should return 200 with a new rotated token pair when refresh token is valid")
     void should_return200WithNewTokenPair_when_refreshWithValidToken() throws Exception {
         var email = "refresh.user@beautica.com";
-        var password = "refreshpass1";
+        var password = "Refreshpass1";
         log.debug("Arrange: user {} registered and logged in", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
@@ -198,7 +216,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
     @DisplayName("should return 204 when logout is called with a valid Bearer JWT")
     void should_return204_when_logoutWithValidJwt() throws Exception {
         var email = "logout.user@beautica.com";
-        var password = "logoutpass1";
+        var password = "Logoutpass1";
         log.debug("Arrange: obtained access token for {}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
@@ -249,7 +267,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
     @DisplayName("should return 401 when old refresh token is replayed after rotation")
     void should_return401_when_oldRefreshTokenReplayedAfterRotation() throws Exception {
         var email = "replay.user@beautica.com";
-        var password = "replaypass1";
+        var password = "Replaypass1";
         log.debug("Arrange: register user email={}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",

@@ -13,9 +13,11 @@ class StrongPasswordValidatorTest {
     @Test
     @DisplayName("accepts a strong password within the length bound")
     void should_accept_when_passwordIsStrong() {
-        boolean valid = validator.isValid("Str0ngP@ss1!", null);
+        String input = "Str0ngP@ss1!";
 
-        assertThat(valid).isTrue();
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isTrue();
     }
 
     @Test
@@ -23,48 +25,116 @@ class StrongPasswordValidatorTest {
     void should_accept_when_valueIsNull() {
         boolean valid = validator.isValid(null, null);
 
-        assertThat(valid).isTrue();
+        assertThat(valid).as("password=%s", (Object) null).isTrue();
     }
 
     @Test
     @DisplayName("accepts blank so @NotBlank owns the required message")
     void should_accept_when_valueIsBlank() {
-        boolean valid = validator.isValid("   ", null);
+        String input = "   ";
 
-        assertThat(valid).isTrue();
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isTrue();
+    }
+
+    @Test
+    @DisplayName("accepts a password of exactly the minimum length (length is the sole passing dimension)")
+    void should_accept_when_passwordExactly8Chars() {
+        String input = "Abcdef1g";
+
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isTrue();
+    }
+
+    @Test
+    @DisplayName("rejects a password one char below the minimum length (length is the sole failing dimension)")
+    void should_reject_when_passwordExactly7Chars() {
+        String input = "Abcde1f";
+
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isFalse();
+    }
+
+    @Test
+    @DisplayName("accepts a password of exactly the maximum length (length is the sole passing dimension)")
+    void should_accept_when_passwordExactly128Chars() {
+        String input = "A1" + "a".repeat(StrongPasswordValidator.MAX_LENGTH - 2);
+
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password.length=%d", input.length()).isTrue();
+    }
+
+    @Test
+    @DisplayName("rejects a password one char above the maximum length (length is the sole failing dimension)")
+    void should_reject_when_passwordExactly129Chars() {
+        String input = "A1" + "a".repeat(StrongPasswordValidator.MAX_LENGTH - 1);
+
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password.length=%d", input.length()).isFalse();
     }
 
     @Test
     @DisplayName("rejects a password shorter than the minimum length")
     void should_reject_when_passwordTooShort() {
-        boolean valid = validator.isValid("short1!", null);
+        String input = "short1!";
 
-        assertThat(valid).isFalse();
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isFalse();
     }
 
     @Test
-    @DisplayName("rejects a password longer than the maximum length")
+    @DisplayName("rejects a password longer than the maximum length (length-only failure: has digit + uppercase)")
     void should_reject_when_passwordTooLong() {
-        String tooLong = "A".repeat(StrongPasswordValidator.MAX_LENGTH + 1);
+        String tooLong = "A1" + "a".repeat(StrongPasswordValidator.MAX_LENGTH);
 
         boolean valid = validator.isValid(tooLong, null);
 
-        assertThat(valid).isFalse();
+        assertThat(valid).as("password.length=%d", tooLong.length()).isFalse();
+    }
+
+    @Test
+    @DisplayName("rejects a password with no digit")
+    void should_reject_when_passwordHasNoDigit() {
+        String input = "Strongpass!";
+
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isFalse();
+    }
+
+    @Test
+    @DisplayName("rejects a password with no uppercase letter")
+    void should_reject_when_passwordHasNoUppercase() {
+        String input = "str0ngp@ss1";
+
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isFalse();
     }
 
     @Test
     @DisplayName("rejects a denylisted common password")
     void should_reject_when_passwordIsCommon() {
-        boolean valid = validator.isValid("password123", null);
+        String input = "password123";
 
-        assertThat(valid).isFalse();
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isFalse();
     }
 
     @Test
     @DisplayName("rejects a denylisted common password case-insensitively")
     void should_reject_when_commonPasswordDiffersOnlyInCase() {
-        boolean valid = validator.isValid("PassWord123", null);
+        String input = "PassWord123";
 
-        assertThat(valid).isFalse();
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isFalse();
     }
 }

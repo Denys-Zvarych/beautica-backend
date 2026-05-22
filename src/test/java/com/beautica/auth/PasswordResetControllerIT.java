@@ -285,6 +285,30 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("should return 400 when new password is length-valid but has no uppercase (@StrongPassword)")
+    void should_return400_when_newPasswordHasNoUppercase() throws Exception {
+        String email = "reset.nouppercase@beautica.com";
+        log.debug("Arrange: register, verify, issue a real reset token for email={}", email);
+        registerAndVerify(email, "OldPassword1!");
+
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+        restTemplate.postForEntity("/api/v1/auth/forgot-password",
+                new ForgotPasswordRequest(email), String.class);
+        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
+        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
+
+        log.debug("Act: POST /auth/reset-password with valid token but no-uppercase new password");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/reset-password",
+                new ResetPasswordRequest(rawToken, "str0ngp@ss1"),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status for reset-confirm with no-uppercase new password")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
     @DisplayName("should return 400 when token field is blank (bean validation)")
     void should_return400_when_tokenIsBlank() {
         ResponseEntity<String> response = restTemplate.postForEntity(
