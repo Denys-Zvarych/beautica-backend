@@ -251,7 +251,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
     // ── Phase 7.7 — portfolio cache hit + post-write eviction ─────────────────
 
     @Test
-    @DisplayName("GET /salons/{id}/portfolio twice — repository is hit twice (paginated path is not cached)")
+    @DisplayName("GET /salons/{id}/portfolio twice — repository is hit once — second request is a cache hit (PERF-M3)")
     void should_returnPortfolio_when_calledTwiceInSuccession() throws Exception {
         // Arrange
         String ownerEmail = "media-it-cache-hit-" + System.nanoTime() + "@beautica.test";
@@ -277,13 +277,14 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 "/api/v1/salons/" + salonId + "/portfolio", HttpMethod.GET,
                 new HttpEntity<>(new HttpHeaders()), String.class);
 
-        // Assert — both succeed, repository is hit TWICE (once per call).
-        // The controller dispatches to the paginated overload getPortfolio(EntityType, UUID, Pageable)
-        // which calls findByEntityTypeAndEntityId(EntityType, UUID, Pageable). The paginated path
-        // is intentionally not cached (cache-key explosion per page/size), so both GETs reach the repo.
+        // Assert — both succeed, repository is hit exactly ONCE across the two requests.
+        // PERF-M3: the paginated portfolio overload getPortfolio(EntityType, UUID, PageRequest)
+        // is now cached with a stable key (entityType + entityId). The controller always passes
+        // the fixed PORTFOLIO_PAGE constant, so the key is stable per entity and the second GET
+        // is served from the Caffeine cache without touching the repository.
         assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
-        verify(mediaRepository, times(2))
+        verify(mediaRepository, times(1))
                 .findByEntityTypeAndEntityId(eq(EntityType.SALON), eq(salonId), any(Pageable.class));
     }
 

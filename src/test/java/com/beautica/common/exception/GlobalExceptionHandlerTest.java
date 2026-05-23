@@ -7,6 +7,9 @@ import ch.qos.logback.core.read.ListAppender;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.ConstraintViolationException;
+import jakarta.validation.Path;
 import jakarta.validation.constraints.NotNull;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +23,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -411,6 +415,97 @@ class GlobalExceptionHandlerTest {
         assertThat(markerLogged)
                 .as("a non-PII exception marker should still be logged at DEBUG")
                 .isTrue();
+    }
+
+    @Test
+    @DisplayName("should return 400 with generic message when ConstraintViolationException is thrown")
+    void should_return400_withGenericMessage_when_constraintViolationExceptionThrown() {
+        // Arrange — construct a ConstraintViolationException with a real ConstraintViolation
+        // whose property path is "size" and whose message discloses bound limits ("size must be
+        // between 1 and 200").  Neither the path name nor the bound values may reach the client
+        // (Anti-Bug §A/§N).
+        ConstraintViolation<?> violation = mock(ConstraintViolation.class);
+        Path path = mock(Path.class);
+        when(path.toString()).thenReturn("size");
+        when(violation.getPropertyPath()).thenReturn(path);
+        when(violation.getMessage()).thenReturn("size must be between 1 and 200");
+
+        ConstraintViolationException ex =
+                new ConstraintViolationException(java.util.Set.of(violation));
+
+        listAppender.list.clear();
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleConstraintViolation(ex);
+
+        // Assert — HTTP contract
+        assertThat(response.getStatusCode())
+                .as("status must be 400")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("message must be the generic sentinel — no constraint detail leaked to client")
+                .isEqualTo("Validation failed — check request parameters");
+
+        // Assert — no detail leak in the response body
+        assertThat(response.getBody().message())
+                .as("message must NOT contain the field name 'size'")
+                .doesNotContain("size");
+
+        assertThat(response.getBody().message())
+                .as("message must NOT contain the bound value '200'")
+                .doesNotContain("200");
+
+        // Assert — DEBUG log contains the detail so ops can triage without client exposure
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleConstraintViolation must emit at least one DEBUG log for server-side triage")
+                .isNotEmpty();
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must contain the constraint violation detail for ops visibility")
+                .contains("size must be between 1 and 200");
+    }
+
+    @Test
+    @DisplayName("should return 400 with generic message when MissingServletRequestParameterException is thrown")
+    void should_return400_withGenericMessage_when_missingServletRequestParameterExceptionThrown() {
+        // Arrange — simulates a caller omitting the required ?page= query parameter.
+        // The parameter name ("page") and type ("Integer") must NOT appear in the response
+        // body — they disclose internal controller parameter names on permitAll endpoints
+        // (Anti-Bug §I/§N).
+        MissingServletRequestParameterException ex =
+                new MissingServletRequestParameterException("page", "Integer");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMissingParam(ex);
+
+        // Assert — HTTP contract
+        assertThat(response.getStatusCode())
+                .as("status must be 400")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("message must be the generic sentinel")
+                .isEqualTo("A required query parameter is missing");
+
+        // Assert — no detail leak in the response body
+        assertThat(response.getBody().message())
+                .as("message must NOT contain the parameter name 'page'")
+                .doesNotContain("page");
+
+        assertThat(response.getBody().message())
+                .as("message must NOT contain the parameter type 'Integer'")
+                .doesNotContain("Integer");
     }
 
     /**

@@ -21,6 +21,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.springframework.lang.Nullable;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -71,4 +72,19 @@ public class Master extends AuditableEntity {
 
     @Column(name = "is_active")
     private boolean isActive;
+
+    /**
+     * Pre-computed minimum effective price for this master — the lowest of
+     * {@code MIN(COALESCE(ms.price_override, sd.base_price))} across all
+     * active service assignments. {@code null} means the master has no active
+     * services.
+     *
+     * <p>Maintained by {@link com.beautica.service.service.ServiceCatalogService}
+     * whenever a master service assignment is created, removed, or when a service
+     * definition is deactivated. Read by the search query (PERF-M2, V58) to avoid
+     * the per-request aggregate join.
+     */
+    @Nullable
+    @Column(name = "min_effective_price", precision = 10, scale = 2)
+    private BigDecimal minEffectivePrice;
 }

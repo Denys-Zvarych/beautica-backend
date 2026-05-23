@@ -27,8 +27,11 @@ import org.springframework.transaction.support.AbstractPlatformTransactionManage
 import org.springframework.transaction.support.DefaultTransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.LocalDate;
 import java.util.Optional;
 import java.util.UUID;
+
+import org.springframework.cache.interceptor.SimpleKey;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -171,8 +174,11 @@ class OwnerMasterCacheTest {
         Cache calendarCache = cacheManager.getCache("master-calendar");
         assertThat(calendarCache).isNotNull();
 
-        calendarCache.put("sentinel-key", "sentinel-value");
-        assertThat(calendarCache.get("sentinel-key"))
+        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
+        // A plain String sentinel is not a SimpleKey and would survive the removeIf predicate.
+        SimpleKey calendarKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        calendarCache.put(calendarKey, "sentinel-value");
+        assertThat(calendarCache.get(calendarKey))
                 .as("sentinel must be in master-calendar cache before deactivation")
                 .isNotNull();
 
@@ -185,7 +191,7 @@ class OwnerMasterCacheTest {
         });
 
         // Assert
-        assertThat(calendarCache.get("sentinel-key"))
+        assertThat(calendarCache.get(calendarKey))
                 .as("master-calendar cache must be fully cleared after deactivateOwnerMaster commits")
                 .isNull();
     }
@@ -200,7 +206,9 @@ class OwnerMasterCacheTest {
         assertThat(calendarCache).isNotNull();
 
         masterByUserCache.put(ACTOR_USER_ID, "cached-master");
-        calendarCache.put("any-calendar-key", "calendar-data");
+        // PERF-MEDIUM-4: use a SimpleKey sentinel so the removeIf predicate recognises it.
+        SimpleKey calendarKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        calendarCache.put(calendarKey, "calendar-data");
 
         stubOwnerMasterForDeactivation();
 
@@ -214,7 +222,7 @@ class OwnerMasterCacheTest {
         assertThat(masterByUserCache.get(ACTOR_USER_ID))
                 .as("master-by-user entry must be evicted after deactivateOwnerMaster")
                 .isNull();
-        assertThat(calendarCache.get("any-calendar-key"))
+        assertThat(calendarCache.get(calendarKey))
                 .as("master-calendar must be cleared after deactivateOwnerMaster")
                 .isNull();
     }
@@ -228,8 +236,11 @@ class OwnerMasterCacheTest {
         Cache availableSlotsCache = cacheManager.getCache("available-slots");
         assertThat(availableSlotsCache).isNotNull();
 
-        availableSlotsCache.put("sentinel-slots-key", "sentinel-slots-value");
-        assertThat(availableSlotsCache.get("sentinel-slots-key"))
+        // PERF-MEDIUM-3: available-slots eviction filters by SimpleKey whose toString() starts
+        // with "[masterId," — the key shape is SimpleKey[masterId, date, masterServiceId].
+        SimpleKey slotKey = new SimpleKey(MASTER_ID, LocalDate.now(), UUID.randomUUID());
+        availableSlotsCache.put(slotKey, "sentinel-slots-value");
+        assertThat(availableSlotsCache.get(slotKey))
                 .as("sentinel must be present in available-slots cache before deactivation")
                 .isNotNull();
 
@@ -242,7 +253,7 @@ class OwnerMasterCacheTest {
         });
 
         // Assert
-        assertThat(availableSlotsCache.get("sentinel-slots-key"))
+        assertThat(availableSlotsCache.get(slotKey))
                 .as("available-slots cache must be fully cleared after deactivateOwnerMaster commits")
                 .isNull();
     }

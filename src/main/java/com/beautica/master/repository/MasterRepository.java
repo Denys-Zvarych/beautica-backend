@@ -5,6 +5,7 @@ import com.beautica.master.entity.MasterType;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -73,4 +74,31 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             WHERE m.id = :masterId
             """)
     Optional<Master> findByIdWithSalonAndOwner(@Param("masterId") UUID masterId);
+
+    /**
+     * Re-computes and persists {@code masters.min_effective_price} for a single
+     * master as a single UPDATE — eliminates the load/mutate/save round-trip.
+     *
+     * <p>The subquery mirrors {@code MIN(COALESCE(ms.price_override, sd.base_price))}
+     * across active {@code master_services} rows with an active
+     * {@code service_definitions} row. The result is {@code null} when the master
+     * has no active services (semantically: no bookable price to display).
+     *
+     * <p>Must be called inside an existing {@code @Transactional} context — callers
+     * in {@link com.beautica.service.service.ServiceCatalogService} satisfy this.
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("""
+            UPDATE Master m
+            SET m.minEffectivePrice = (
+                SELECT MIN(COALESCE(ms.priceOverride, sd.basePrice))
+                FROM MasterServiceAssignment ms
+                JOIN ServiceDefinition sd ON ms.serviceDefinition.id = sd.id
+                WHERE ms.master.id = :masterId
+                  AND ms.isActive = true
+                  AND sd.isActive = true
+            )
+            WHERE m.id = :masterId
+            """)
+    void refreshMinEffectivePrice(@Param("masterId") UUID masterId);
 }

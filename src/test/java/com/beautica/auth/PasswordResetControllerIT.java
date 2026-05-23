@@ -226,7 +226,7 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
 
         assertThat(secondResp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         var body = objectMapper.readValue(secondResp.getBody(), new TypeReference<ApiResponse<Void>>() {});
-        assertThat(body.message()).isEqualTo("Invalid or expired reset token");
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test
@@ -240,7 +240,7 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).isEqualTo("Invalid or expired reset token");
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test
@@ -270,7 +270,8 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
         // Same generic message as used/unknown — the expired branch must not be distinguishable.
-        assertThat(body.message()).isEqualTo("Invalid or expired reset token");
+        // GlobalExceptionHandler.handleBusiness maps BAD_REQUEST BusinessException to "Invalid request".
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test

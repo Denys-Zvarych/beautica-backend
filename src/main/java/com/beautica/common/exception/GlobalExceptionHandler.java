@@ -110,18 +110,12 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ConstraintViolationException.class)
     public ResponseEntity<ApiResponse<Void>> handleConstraintViolation(ConstraintViolationException ex) {
-        String message = ex.getConstraintViolations().stream()
-                .map(v -> {
-                    String propertyPath = v.getPropertyPath().toString();
-                    String leafName = propertyPath.contains(".")
-                            ? propertyPath.substring(propertyPath.lastIndexOf('.') + 1)
-                            : propertyPath;
-                    return leafName + ": " + v.getMessage();
-                })
-                .collect(Collectors.joining(", "));
+        // Detail logged at DEBUG only — field names and bound values are internal API surface
+        // that would aid DoS/enumeration attacks if echoed to unauthenticated callers (Anti-Bug §A/§N).
+        log.debug("Constraint violation: {}", ex.getMessage());
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
-                .body(ApiResponse.error(message));
+                .body(ApiResponse.error("Validation failed — check request parameters"));
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)
@@ -162,9 +156,11 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(MissingServletRequestParameterException.class)
     public ResponseEntity<ApiResponse<Void>> handleMissingParam(
             MissingServletRequestParameterException ex) {
+        // Parameter name is not echoed — it discloses internal controller parameter names
+        // on permitAll endpoints (Anti-Bug §I/§N).
         return ResponseEntity
                 .badRequest()
-                .body(ApiResponse.error(ex.getParameterName() + " parameter is required"));
+                .body(ApiResponse.error("A required query parameter is missing"));
     }
 
     @ExceptionHandler(HttpMediaTypeNotSupportedException.class)

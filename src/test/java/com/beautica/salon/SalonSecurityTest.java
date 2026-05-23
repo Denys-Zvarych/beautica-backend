@@ -63,6 +63,12 @@ class SalonSecurityTest extends AbstractIntegrationTest {
     @AfterEach
     void cleanUp() {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
+        // masters FK-references users via masters_user_id_fkey; must be deleted
+        // before users to avoid DataIntegrityViolationException (RC3).
+        // createSalon now auto-creates a SALON_OWNER master on first-salon creation
+        // (Phase 12.2), so every owner created in this test class has a master row.
+        jdbcTemplate.execute("DELETE FROM master_services");
+        jdbcTemplate.execute("DELETE FROM masters");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
         jdbcTemplate.execute("DELETE FROM users");

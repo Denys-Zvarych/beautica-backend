@@ -119,6 +119,10 @@ public class ServiceCatalogService {
 
         MasterServiceAssignment saved = masterServiceRepository.save(assignment);
 
+        // PERF-M2: keep the pre-computed min_effective_price in sync so the
+        // search index reflects the new assignment immediately on next cache miss.
+        masterRepository.refreshMinEffectivePrice(masterId);
+
         // Evict after commit so a parallel reader cannot repopulate the cache with
         // the pre-insert DB snapshot between eviction and commit (anti-bug §F).
         evictMasterServicesCache(List.of(masterId));
@@ -162,6 +166,10 @@ public class ServiceCatalogService {
 
         MasterServiceAssignment savedAssignment = masterServiceRepository.save(assignment);
 
+        // PERF-M2: keep the pre-computed min_effective_price in sync for the
+        // independent master's own search entry.
+        masterRepository.refreshMinEffectivePrice(master.getId());
+
         // Evict only this master's cache entry after commit — replacing allEntries=true
         // to avoid cold-miss DB round-trips for all other masters (anti-bug §F).
         evictMasterServicesCache(List.of(master.getId()));
@@ -201,6 +209,11 @@ public class ServiceCatalogService {
         if (updated == 0) {
             throw new NotFoundException("Service definition not found: " + serviceDefId);
         }
+
+        // PERF-M2: refresh the pre-computed min_effective_price for every master
+        // that had this service definition assigned. The affectedMasterIds list was
+        // collected before the deactivation so it correctly captures all impacted rows.
+        affectedMasterIds.forEach(masterRepository::refreshMinEffectivePrice);
     }
 
     @Transactional(readOnly = true)

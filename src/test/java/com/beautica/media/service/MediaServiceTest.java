@@ -32,7 +32,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
-import org.springframework.cache.interceptor.SimpleKey;
+// SimpleKey import removed — cache keys are now plain Strings (portfolioCacheKey contract)
 import org.springframework.http.HttpStatus;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.transaction.TransactionStatus;
@@ -491,10 +491,11 @@ class MediaServiceTest {
         service.uploadPortfolioPhoto(actorId, Role.SALON_OWNER, jpegFile());
 
         // Eviction must happen AFTER the write tx — InOrder over (txWrite, cache) proves it.
+        // Cache key is a plain String: entityType.name() + '_' + entityId (portfolioCacheKey contract).
         InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
         order.verify(txWrite).execute(any());
         order.verify(cacheManager).getCache("portfolio");
-        order.verify(portfolioCache).evictIfPresent(new SimpleKey(EntityType.SALON, salonId));
+        order.verify(portfolioCache).evictIfPresent(EntityType.SALON.name() + "_" + salonId);
     }
 
     @Test
@@ -517,10 +518,11 @@ class MediaServiceTest {
         service.deletePortfolioPhoto(actorId, mediaId);
 
         // Eviction must happen AFTER the write tx — InOrder over (txWrite, cache) proves it.
+        // Cache key is a plain String: entityType.name() + '_' + entityId (portfolioCacheKey contract).
         InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
         order.verify(txWrite).execute(any());
         order.verify(cacheManager).getCache("portfolio");
-        order.verify(portfolioCache).evictIfPresent(new SimpleKey(EntityType.MASTER, masterEntityId));
+        order.verify(portfolioCache).evictIfPresent(EntityType.MASTER.name() + "_" + masterEntityId);
     }
 
     @Test
@@ -616,6 +618,9 @@ class MediaServiceTest {
 
         assertThat(result).isEmpty();
         verifyNoMoreInteractions(mediaRepo);
+        // LOW-2: Non-paginated overload is intentionally uncached (PERF-M3 security fix) to prevent
+        // List<MediaFileResponse> vs Page<MediaFileResponse> cache-slot collision.
+        verify(cacheManager, never()).getCache(anyString());
     }
 
     @Test
@@ -658,6 +663,9 @@ class MediaServiceTest {
         verify(mockA, never()).getUploader();
         verify(mockB, never()).getUploader();
         verify(mockC, never()).getUploader();
+        // LOW-2: Non-paginated overload is intentionally uncached (PERF-M3 security fix) to prevent
+        // List<MediaFileResponse> vs Page<MediaFileResponse> cache-slot collision.
+        verify(cacheManager, never()).getCache(anyString());
     }
 
     // ---------------------------------------------------- QA MEDIUM #4 — upload rollback
@@ -794,8 +802,9 @@ class MediaServiceTest {
         InOrder order = inOrder(txWrite, portfolioCache);
         order.verify(txWrite).execute(any());
         // Exactly 2 eviction calls — duplicate (SALON, salonA) collapsed by Set.
-        verify(portfolioCache, times(1)).evictIfPresent(new SimpleKey(EntityType.SALON, salonA));
-        verify(portfolioCache, times(1)).evictIfPresent(new SimpleKey(EntityType.MASTER, masterB));
+        // Cache keys are plain Strings: entityType.name() + '_' + entityId (portfolioCacheKey contract).
+        verify(portfolioCache, times(1)).evictIfPresent(EntityType.SALON.name() + "_" + salonA);
+        verify(portfolioCache, times(1)).evictIfPresent(EntityType.MASTER.name() + "_" + masterB);
         verify(portfolioCache, times(2)).evictIfPresent(any());
     }
 

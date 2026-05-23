@@ -144,7 +144,9 @@ class AuthSecurityTest extends AbstractIntegrationTest {
 
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).containsIgnoringCase("businessName");
+        // GlobalExceptionHandler.handleBusiness maps BAD_REQUEST to "Invalid request";
+        // field-level details are suppressed to prevent information disclosure (§A/§N).
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test
