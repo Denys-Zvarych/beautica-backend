@@ -37,7 +37,7 @@ spring:
 
 app:
   jwt:
-    secret: REPLACE_ME__run__openssl_rand_-base64_48      # placeholder — never commit a real value here
+    secret: ${JWT_SECRET}
     access-token-expiration: 900000
     refresh-token-expiration: 604800000
   cloudflare-r2:
@@ -64,7 +64,7 @@ app:
     cleanup-retention: 7d
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
-    payload-key: REPLACE_ME__run__openssl_rand_-base64_32
+    payload-key: ${OUTBOX_PAYLOAD_KEY}
 
 springdoc:
   api-docs:
