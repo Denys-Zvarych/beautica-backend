@@ -13,5 +13,9 @@ public record JwtConfig(
             throw new IllegalStateException(
                     "app.jwt.secret must be at least 32 characters — refusing to start with a weak JWT secret");
         }
+        if (secret.startsWith("REPLACE_ME")) {
+            throw new IllegalStateException(
+                    "JWT secret must be replaced — current value is a placeholder");
+        }
     }
 }

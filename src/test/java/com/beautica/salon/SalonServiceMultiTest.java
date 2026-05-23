@@ -2,7 +2,9 @@ package com.beautica.salon;
 
 import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.entity.Salon;
@@ -17,6 +19,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Instant;
@@ -46,6 +49,15 @@ class SalonServiceMultiTest {
 
     @Mock
     private MasterRepository masterRepository;
+
+    @Mock
+    private LocalityWriteValidator localityWriteValidator;
+
+    @Mock
+    private MasterService masterService;
+
+    @Mock
+    private CacheManager cacheManager;
 
     @InjectMocks
     private SalonService salonService;

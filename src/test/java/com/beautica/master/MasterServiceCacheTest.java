@@ -38,6 +38,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import org.springframework.cache.interceptor.SimpleKey;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -103,8 +105,11 @@ class MasterServiceCacheTest {
     void should_evictMasterCalendarCache_when_upsertWorkingHours() {
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
+        // A plain String sentinel is not a SimpleKey, so the removeIf predicate would not touch it.
+        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(cacheKey, "value");
+        assertThat(cache.get(cacheKey)).isNotNull();
 
         Master master = mock(Master.class);
         when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
@@ -124,7 +129,7 @@ class MasterServiceCacheTest {
             return null;
         });
 
-        assertThat(cache.get("sentinel"))
+        assertThat(cache.get(cacheKey))
                 .as("master-calendar cache must be evicted after upsertWorkingHours commits")
                 .isNull();
     }
@@ -134,8 +139,10 @@ class MasterServiceCacheTest {
     void should_evictMasterCalendarCache_when_addScheduleException() {
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
+        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(cacheKey, "value");
+        assertThat(cache.get(cacheKey)).isNotNull();
 
         Master master = mock(Master.class);
         when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
@@ -155,7 +162,7 @@ class MasterServiceCacheTest {
             return null;
         });
 
-        assertThat(cache.get("sentinel"))
+        assertThat(cache.get(cacheKey))
                 .as("master-calendar cache must be evicted after addScheduleException commits")
                 .isNull();
     }
@@ -165,8 +172,10 @@ class MasterServiceCacheTest {
     void should_evictMasterCalendarCache_when_removeScheduleException() {
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
+        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(cacheKey, "value");
+        assertThat(cache.get(cacheKey)).isNotNull();
 
         Master master = mock(Master.class);
         when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
@@ -181,7 +190,7 @@ class MasterServiceCacheTest {
             return null;
         });
 
-        assertThat(cache.get("sentinel"))
+        assertThat(cache.get(cacheKey))
                 .as("master-calendar cache must be evicted after removeScheduleException commits")
                 .isNull();
     }
@@ -191,8 +200,10 @@ class MasterServiceCacheTest {
     void should_evictMasterCalendarCache_when_deactivateMaster() {
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
+        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(cacheKey, "value");
+        assertThat(cache.get(cacheKey)).isNotNull();
 
         User user = mock(User.class);
         when(user.getId()).thenReturn(UUID.randomUUID());
@@ -208,7 +219,7 @@ class MasterServiceCacheTest {
             return null;
         });
 
-        assertThat(cache.get("sentinel"))
+        assertThat(cache.get(cacheKey))
                 .as("master-calendar cache must be evicted after deactivateMaster commits")
                 .isNull();
     }

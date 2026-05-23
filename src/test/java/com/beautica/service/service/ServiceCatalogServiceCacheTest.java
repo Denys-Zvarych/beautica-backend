@@ -83,6 +83,8 @@ class ServiceCatalogServiceCacheTest {
 
         when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
                 .thenReturn(List.of());
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
+                .thenReturn(List.of(masterId));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         // Populate cache

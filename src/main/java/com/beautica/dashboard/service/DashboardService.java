@@ -264,6 +264,9 @@ public class DashboardService {
                     // cannot distinguish "resource absent" from "access denied" via 404 vs 403.
                     throw new ForbiddenException("Access denied");
                 }
+                // Owner-operated masters (master_type = SALON_OWNER) belong to this salon list and
+                // are counted here exactly like invited masters. They appear in the by-master
+                // revenue breakdown under the owner's own name — no special-casing needed.
                 yield new ActorScope(salonIds, null);
             }
             case INDEPENDENT_MASTER -> {

@@ -303,7 +303,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).containsIgnoringCase("expired");
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test
@@ -329,7 +329,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).containsIgnoringCase("already been used");
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test
@@ -409,7 +409,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).containsIgnoringCase("expired");
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test
@@ -433,7 +433,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).containsIgnoringCase("Invalid or expired");
+        assertThat(body.message()).isEqualTo("Invalid request");
     }
 
     @Test

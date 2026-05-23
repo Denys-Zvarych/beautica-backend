@@ -272,7 +272,7 @@ class SearchControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.message").value(containsString("minPrice must not exceed maxPrice")));
+                .andExpect(jsonPath("$.message").value("Invalid request"));
     }
 
     // ── GET /api/v1/search/salons ───────────────────────────────────────────────────

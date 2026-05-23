@@ -35,13 +35,12 @@ import java.util.UUID;
 /**
  * Read-only search service for master and salon discovery.
  *
- * <p>Master search uses native SQL because the projection joins three tables
- * ({@code masters}, {@code users}, {@code service_definitions} via
- * {@code master_services}) and applies an aggregate filter on
- * {@code MIN(COALESCE(price_override, base_price))}, which JPQL cannot express
- * cleanly while keeping the {@code GROUP BY} → {@code HAVING} pipeline visible.
- * Salon search is plain JPQL dispatched by {@link #searchSalons} to one of
- * three single-equality, SARGable {@link SalonRepository} methods (Phase 10.8,
+ * <p>Master search uses native SQL because the projection joins several tables
+ * ({@code masters}, {@code users}, optionally {@code master_services} /
+ * {@code service_definitions}) and requires a {@code COUNT(*) OVER()} window
+ * function to eliminate the second count round-trip (PERF-M1). Salon search is
+ * plain JPQL dispatched by {@link #searchSalons} to one of three
+ * single-equality, SARGable {@link SalonRepository} methods (Phase 10.8,
  * MEDIUM-1): {@code findActiveByDistrictId} / {@code findActiveByCityId} /
  * {@code findByIsActiveTrue}.
  *
@@ -91,18 +90,25 @@ import java.util.UUID;
  *       {@code idx_users_district_id} / {@code idx_users_city_id} indexes
  *       (V54).</li>
  *   <li><b>JOIN avoidance</b>. The {@code master_services} /
- *       {@code service_definitions} LEFT JOINs are only useful when the caller
- *       filters by price or category. For the common "all masters in district
- *       X" query, building without those joins shaves a two-table fan-out from
- *       every row.</li>
+ *       {@code service_definitions} LEFT JOINs are only emitted when the
+ *       caller filters by category. Price filtering uses the pre-computed
+ *       {@code m.min_effective_price} column (PERF-M2, V58), so the common
+ *       "all masters in district X with min price Y" query avoids the
+ *       two-table fan-out entirely.</li>
  * </ol>
  *
- * <h3>Why pagination needs a HAVING-aware count</h3>
- * The price filter is applied in {@code HAVING}, not {@code WHERE}, because the
- * effective price is an aggregate. A naive {@code SELECT COUNT(DISTINCT m.id)}
- * without {@code HAVING} would over-count, producing phantom pages. The count
- * query therefore wraps the same {@code GROUP BY ... HAVING ...} in a subquery
- * — but only when a price filter is actually present.
+ * <h3>Single-query pagination (PERF-M1)</h3>
+ * The data SELECT includes {@code COUNT(*) OVER() AS total_count} as the last
+ * column (index 9). After {@code getResultList()}, {@code total_count} is read
+ * from {@code row[9]} of the first result row — eliminating the second
+ * {@code SELECT COUNT(*)} query that fired on every cache miss.
+ *
+ * <h3>Pre-computed min price (PERF-M2)</h3>
+ * {@code masters.min_effective_price} (V58) is updated by
+ * {@link com.beautica.service.service.ServiceCatalogService} whenever a master
+ * service assignment is created, removed, or when a service definition is
+ * deactivated. Price filtering is therefore a simple {@code WHERE} predicate
+ * rather than a {@code GROUP BY … HAVING MIN(COALESCE(…))} aggregate.
  */
 @Service
 @RequiredArgsConstructor
@@ -110,6 +116,9 @@ public class SearchService {
 
     /** Scale of {@code masters.avg_rating} (NUMERIC(3,2)) — matches column precision. */
     private static final int RATING_SCALE = 2;
+
+    /** Scale of {@code masters.min_effective_price} (NUMERIC(10,2)) — matches column precision. */
+    private static final int PRICE_SCALE = 2;
 
     /** Role value (stored via {@code EnumType.STRING}) excluded from master discovery. */
     private static final String ROLE_SALON_ADMIN = "SALON_ADMIN";
@@ -159,23 +168,26 @@ public class SearchService {
 
         MasterSearchFilters filters = normalize(request);
 
-        SqlAndParams dataSql = buildMasterSearchSql(filters, pageable, false);
+        // PERF-M1: single query — COUNT(*) OVER() is column index 9.
+        // No separate count round-trip on cache miss.
+        SqlAndParams dataSql = buildMasterSearchSql(filters, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
         bind(dataQuery, dataSql.params());
 
         @SuppressWarnings("unchecked")
         List<Object[]> rawRows = dataQuery.getResultList();
 
+        if (rawRows.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+
+        long total = ((Number) rawRows.get(0)[9]).longValue();
+
         DiscoveryLabels labels = resolveLabelsForRows(rawRows, 6, 7);
         List<MasterSearchResult> results = new ArrayList<>(rawRows.size());
         for (Object[] row : rawRows) {
             results.add(mapMasterRow(row, labels));
         }
-
-        SqlAndParams countSql = buildMasterSearchSql(filters, pageable, true);
-        Query countQuery = entityManager.createNativeQuery(countSql.sql());
-        bind(countQuery, countSql.params());
-        long total = ((Number) countQuery.getSingleResult()).longValue();
 
         return new PageImpl<>(results, pageable, total);
     }
@@ -278,8 +290,14 @@ public class SearchService {
             return minPrice != null || maxPrice != null;
         }
 
+        /**
+         * The {@code master_services} / {@code service_definitions} fan-out join is
+         * only needed when filtering by category. Price filtering is now a simple
+         * {@code WHERE m.min_effective_price} predicate on the pre-computed column
+         * (PERF-M2, V58) — no join required.
+         */
         boolean needsServiceJoin() {
-            return hasPriceFilter() || category != null;
+            return category != null;
         }
 
         boolean hasDistrictFilter() {
@@ -301,66 +319,71 @@ public class SearchService {
                 key == null ? null : key.districtId(),
                 normalizeCategory(request.category()),
                 normalizeRating(request.minRating()),
-                request.minPrice(),
-                request.maxPrice()
+                normalizePrice(request.minPrice()),
+                normalizePrice(request.maxPrice())
         );
     }
 
-    private static SqlAndParams buildMasterSearchSql(
-            MasterSearchFilters filters,
-            Pageable pageable,
-            boolean isCountQuery
-    ) {
+    /**
+     * Builds the single data+count SQL for master search (PERF-M1).
+     *
+     * <p>The SELECT includes {@code COUNT(*) OVER() AS total_count} as the last
+     * column (index 9) so the caller can read the full result-set size from the
+     * first row without issuing a second query.
+     *
+     * <p>Price filtering is a {@code WHERE m.min_effective_price} predicate on the
+     * pre-computed column (PERF-M2, V58) — no {@code GROUP BY / HAVING} needed
+     * for price. A {@code GROUP BY} is still emitted when the category filter
+     * triggers the {@code master_services} fan-out join.
+     */
+    private static SqlAndParams buildMasterSearchSql(MasterSearchFilters filters, Pageable pageable) {
         boolean needsServiceJoin = filters.needsServiceJoin();
-        boolean hasPriceFilter = filters.hasPriceFilter();
-        boolean wrapSubquery = isCountQuery && hasPriceFilter;
 
         StringBuilder sb = new StringBuilder();
         Map<String, Object> params = new LinkedHashMap<>();
 
-        if (wrapSubquery) {
-            sb.append("SELECT COUNT(*) FROM (SELECT m.id ");
-            appendFromClause(sb, needsServiceJoin);
-        } else if (isCountQuery) {
-            sb.append("SELECT COUNT(DISTINCT m.id) ");
-            appendFromClause(sb, needsServiceJoin);
-        } else {
-            appendDataSelect(sb, needsServiceJoin);
-            appendFromClause(sb, needsServiceJoin);
-        }
-
+        appendDataSelect(sb, needsServiceJoin);
+        appendFromClause(sb, needsServiceJoin);
         appendWhereClause(sb, filters, params);
 
-        boolean needsGroupBy =
-                (!isCountQuery && needsServiceJoin)
-                        || (wrapSubquery && needsServiceJoin);
-        if (needsGroupBy) {
-            if (isCountQuery) {
-                sb.append("GROUP BY m.id ");
-            } else {
-                sb.append("GROUP BY m.id, u.first_name, u.last_name, ")
-                        .append(DISCOVERY_CITY_EXPR).append(", ")
-                        .append(DISCOVERY_DISTRICT_EXPR).append(", ")
-                        .append("m.avg_rating, m.review_count ");
-            }
+        if (needsServiceJoin) {
+            sb.append("GROUP BY m.id, u.first_name, u.last_name, ")
+                    .append(DISCOVERY_CITY_EXPR).append(", ")
+                    .append(DISCOVERY_DISTRICT_EXPR).append(", ")
+                    .append("m.avg_rating, m.review_count, m.min_effective_price ");
         }
 
-        appendHavingClause(sb, filters, params, needsServiceJoin);
-
-        if (wrapSubquery) {
-            sb.append(") AS filtered");
-        }
-
-        if (!isCountQuery) {
-            sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id ");
-            sb.append("LIMIT :limit OFFSET :offset");
-            params.put("limit", pageable.getPageSize());
-            params.put("offset", pageable.getOffset());
-        }
+        sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id ");
+        sb.append("LIMIT :limit OFFSET :offset");
+        params.put("limit", pageable.getPageSize());
+        params.put("offset", pageable.getOffset());
 
         return new SqlAndParams(sb.toString(), params);
     }
 
+    /**
+     * Builds the SELECT clause for the master data query.
+     *
+     * <p>Column layout (stable — index-matched in {@link #mapMasterRow}):
+     * <ol start="0">
+     *   <li>master_id</li>
+     *   <li>first_name</li>
+     *   <li>last_name</li>
+     *   <li>avg_rating</li>
+     *   <li>review_count</li>
+     *   <li>avatar_url</li>
+     *   <li>discovery_city_id</li>
+     *   <li>discovery_district_id</li>
+     *   <li>min_effective_price (pre-computed column, PERF-M2 / V58)</li>
+     *   <li>total_count (window function COUNT(*) OVER(), PERF-M1)</li>
+     * </ol>
+     *
+     * <p>When the category filter triggers the service join, a surrounding
+     * {@code GROUP BY} is applied — but {@code min_effective_price} is a plain
+     * column, not an aggregate, so the GROUP BY simply adds it to the list.
+     * {@code COUNT(*) OVER()} is evaluated over the grouped result set,
+     * which is correct: it counts distinct master rows, not raw join rows.
+     */
     private static void appendDataSelect(StringBuilder sb, boolean needsServiceJoin) {
         sb.append("SELECT m.id AS master_id, ")
                 .append("u.first_name AS first_name, u.last_name AS last_name, ")
@@ -373,12 +396,14 @@ public class SearchService {
                 // for SALON_MASTER, else the user's own). Labels are resolved
                 // through the M2 seam; columns 6/7 carry the ids only.
                 .append(DISCOVERY_CITY_EXPR).append(" AS discovery_city_id, ")
-                .append(DISCOVERY_DISTRICT_EXPR).append(" AS discovery_district_id, ");
-        if (needsServiceJoin) {
-            sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) AS min_effective_price ");
-        } else {
-            sb.append("CAST(NULL AS NUMERIC) AS min_effective_price ");
-        }
+                .append(DISCOVERY_DISTRICT_EXPR).append(" AS discovery_district_id, ")
+                // PERF-M2: pre-computed column from V58 — avoids the per-request
+                // MIN(COALESCE(ms.price_override, sd.base_price)) aggregate.
+                .append("m.min_effective_price AS min_effective_price, ")
+                // PERF-M1: window function replaces the second COUNT(*) query.
+                // Postgres evaluates COUNT(*) OVER() after GROUP BY (if any),
+                // so it counts master rows, not raw join rows.
+                .append("COUNT(*) OVER() AS total_count ");
     }
 
     /**
@@ -398,10 +423,19 @@ public class SearchService {
     }
 
     /**
-     * District-primary FK location filter + {@code SALON_ADMIN} exclusion.
-     * The exclusion sits on the {@code users} join (the role lives there) so
-     * an admin account never surfaces in public master discovery regardless
-     * of any future data shape.
+     * District-primary FK location filter, {@code SALON_ADMIN} exclusion, and
+     * price/rating predicates.
+     *
+     * <p>Price filtering (PERF-M2): the former {@code HAVING MIN(COALESCE(…))}
+     * aggregate filter is replaced by a plain {@code WHERE m.min_effective_price}
+     * predicate on the pre-computed column (V58). This predicate is pushed into
+     * the WHERE clause so Postgres can use the partial index
+     * {@code idx_masters_min_effective_price} and avoids the GROUP BY / HAVING
+     * pipeline for the common price-only filter.
+     *
+     * <p>The exclusion sits on the {@code users} join (the role lives there) so
+     * an admin account never surfaces in public master discovery regardless of
+     * any future data shape.
      */
     private static void appendWhereClause(
             StringBuilder sb,
@@ -427,29 +461,15 @@ public class SearchService {
             sb.append("AND m.avg_rating >= :minRating ");
             params.put("minRating", filters.minRating());
         }
-    }
-
-    private static void appendHavingClause(
-            StringBuilder sb,
-            MasterSearchFilters filters,
-            Map<String, Object> params,
-            boolean needsServiceJoin
-    ) {
-        if (!filters.hasPriceFilter() || !needsServiceJoin) {
-            return;
-        }
-        sb.append("HAVING ");
-        boolean first = true;
+        // PERF-M2: price predicates on the pre-computed column — plain WHERE,
+        // no GROUP BY / HAVING needed. NULL min_effective_price means no active
+        // services; such masters are excluded by the range predicate naturally.
         if (filters.minPrice() != null) {
-            sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) >= :minPrice ");
+            sb.append("AND m.min_effective_price >= :minPrice ");
             params.put("minPrice", filters.minPrice());
-            first = false;
         }
         if (filters.maxPrice() != null) {
-            if (!first) {
-                sb.append("AND ");
-            }
-            sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) <= :maxPrice ");
+            sb.append("AND m.min_effective_price <= :maxPrice ");
             params.put("maxPrice", filters.maxPrice());
         }
     }
@@ -486,6 +506,23 @@ public class SearchService {
             return null;
         }
         return minRating.setScale(RATING_SCALE, java.math.RoundingMode.HALF_UP);
+    }
+
+    /**
+     * Normalises a price {@code BigDecimal} to scale 2, matching
+     * {@code masters.min_effective_price} (NUMERIC(10,2)).
+     *
+     * <p>Without normalisation, semantically equal values such as {@code 1.0}
+     * and {@code 1.00} produce distinct cache keys via their default
+     * {@code toString()} representation, causing unnecessary cache misses
+     * (LOW cache-key normalisation finding). The SQL parameter binding is
+     * unaffected — JDBC coerces the scale when the native query executes.
+     */
+    private static BigDecimal normalizePrice(BigDecimal val) {
+        if (val == null) {
+            return null;
+        }
+        return val.setScale(PRICE_SCALE, java.math.RoundingMode.HALF_UP);
     }
 
     // ── label resolution (M2 seam, batched — §E no N+1) ───────────────────────
@@ -531,11 +568,14 @@ public class SearchService {
      * Maps a raw native-query row to {@link MasterSearchResult}, stamping the
      * resolved locality labels from the batched M2-seam result.
      *
-     * <p>Stable 8-column projection: {@code [master_id, first_name, last_name,
-     * avg_rating, review_count, avatar_url, discovery_city_id,
-     * discovery_district_id, min_effective_price]}. The internal city/district
-     * UUIDs are consumed here for label resolution and are NOT placed on the
-     * public DTO (§I).
+     * <p>10-column projection (indices 0–9):
+     * {@code [master_id, first_name, last_name, avg_rating, review_count,
+     * avatar_url, discovery_city_id, discovery_district_id,
+     * min_effective_price, total_count]}.
+     * The internal city/district UUIDs (6, 7) are consumed here for label
+     * resolution and are NOT placed on the public DTO (§I).
+     * {@code total_count} (9) is read by the caller before this method is
+     * invoked and is not mapped to the DTO.
      */
     private static MasterSearchResult mapMasterRow(Object[] row, DiscoveryLabels labels) {
         UUID masterId = (UUID) row[0];

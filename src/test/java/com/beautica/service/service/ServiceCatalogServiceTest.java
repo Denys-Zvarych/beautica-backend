@@ -6,6 +6,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.EmailService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
@@ -18,6 +19,7 @@ import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.CatalogCategoryLookup;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -26,6 +28,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 
@@ -63,6 +66,15 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private ServiceTypeSearchService serviceTypeSearchService;
+
+    @Mock
+    private CatalogCategoryLookup catalogCategoryLookup;
+
+    @Mock
+    private EmailService emailService;
+
+    @Mock
+    private CacheManager cacheManager;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
@@ -184,6 +196,8 @@ class ServiceCatalogServiceTest {
                 .as("isActive on response must be true as returned by the saved assignment")
                 .isTrue();
         verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
+        // MEDIUM-1: service must refresh the pre-computed min_effective_price index after saving the assignment.
+        verify(masterRepository).refreshMinEffectivePrice(masterId);
     }
 
     @Test
@@ -324,6 +338,8 @@ class ServiceCatalogServiceTest {
                 .isTrue();
         verify(serviceRepository).save(any(ServiceDefinition.class));
         verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
+        // MEDIUM-2: service must refresh the pre-computed min_effective_price index for the independent master.
+        verify(masterRepository).refreshMinEffectivePrice(masterId);
     }
 
     @Test
@@ -405,12 +421,21 @@ class ServiceCatalogServiceTest {
     @DisplayName("deactivates ServiceDefinition when service definition exists")
     void should_deactivateServiceDefinition_when_serviceDefinitionExists() {
         UUID serviceDefId = UUID.randomUUID();
+        UUID masterA = UUID.randomUUID();
+        UUID masterB = UUID.randomUUID();
 
+        // MEDIUM-3: the service loads affected master IDs before the bulk UPDATE so it can
+        // refresh their min_effective_price after deactivation — stub must be present.
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
+                .thenReturn(List.of(masterA, masterB));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(serviceDefId);
 
         verify(serviceRepository).deactivateById(serviceDefId);
+        // MEDIUM-3: refreshMinEffectivePrice must be called for every affected master.
+        verify(masterRepository).refreshMinEffectivePrice(masterA);
+        verify(masterRepository).refreshMinEffectivePrice(masterB);
     }
 
     @Test

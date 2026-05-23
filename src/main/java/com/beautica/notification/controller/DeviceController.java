@@ -10,6 +10,7 @@ import com.beautica.user.UserRepository;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.transaction.annotation.Transactional;
@@ -30,6 +31,7 @@ public class DeviceController {
     private final UserRepository userRepository;
 
     @PostMapping("/token")
+    @PreAuthorize("isAuthenticated()")
     @Transactional
     public ResponseEntity<Void> registerToken(
             @Valid @RequestBody RegisterDeviceTokenRequest request,
@@ -58,6 +60,7 @@ public class DeviceController {
     }
 
     @DeleteMapping("/token")
+    @PreAuthorize("isAuthenticated()")
     public ResponseEntity<Void> unregisterToken(
             @Valid @RequestBody UnregisterDeviceTokenRequest request,
             Authentication authentication

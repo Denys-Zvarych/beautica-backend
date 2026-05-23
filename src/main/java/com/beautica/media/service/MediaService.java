@@ -21,7 +21,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.interceptor.SimpleKey;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -31,7 +30,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.PageRequest;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -298,15 +297,28 @@ public class MediaService {
     private record DeleteTarget(String r2Key, EntityType entityType, UUID entityId) {}
 
     /**
-     * Public unauthenticated read path. Annotated with {@link Cacheable} on the
-     * {@code portfolio} cache. With no explicit {@code key}, Spring's
-     * {@code SimpleKeyGenerator} builds a {@link SimpleKey} from the method's
-     * two arguments — {@code SimpleKey(entityType, entityId)} — which the
-     * programmatic eviction sites construct identically. (A SpEL
-     * {@code key = "{#entityType, #entityId}"} would produce a {@code List}
-     * instead, breaking the eviction match.)
+     * Key builder shared by {@link Cacheable} SpEL expressions and the programmatic
+     * {@link #evictPortfolioCache} helper. Using a plain {@code String} key avoids the
+     * {@link SimpleKey} vs {@code List} mismatch that arises when mixing annotation-based
+     * and programmatic cache access (Anti-Bug Playbook §F).
      */
-    @Cacheable(value = PORTFOLIO_CACHE, sync = true)
+    static String portfolioCacheKey(EntityType entityType, UUID entityId) {
+        return entityType.name() + '_' + entityId;
+    }
+
+    /**
+     * Non-paginated portfolio listing — kept for internal callers and tests.
+     *
+     * <p><b>Not cached.</b> The paginated overload
+     * {@link #getPortfolio(EntityType, UUID, PageRequest)} owns the
+     * {@code portfolio} cache slot for {@code (entityType, entityId)}. Caching
+     * this overload with the same key caused a {@code ClassCastException} when
+     * Caffeine returned a cached {@code List} to a caller expecting
+     * {@code Page<MediaFileResponse>} (MEDIUM cache-key collision fix,
+     * Anti-Bug Playbook §F). Internal callers that do not need pagination bear
+     * the cost of an uncached read; the paginated controller path is the hot
+     * public code path and remains cached.
+     */
     @Transactional(readOnly = true)
     public List<MediaFileResponse> getPortfolio(EntityType entityType, UUID entityId) {
         // No need to touch getUploader() — MediaFileResponse.from does not access it,
@@ -317,16 +329,28 @@ public class MediaService {
     }
 
     /**
-     * Paginated portfolio listing for the public GET portfolio controller endpoints.
+     * Paginated portfolio listing for the public GET portfolio controller endpoints
+     * (PERF-M3).
      *
-     * <p>This overload is intentionally NOT annotated with {@link Cacheable} — each
-     * distinct (page, size, sort) tuple would produce a separate Caffeine entry,
-     * creating unbounded heap growth proportional to the number of unique query
-     * combinations. The 5-min TTL on the non-paginated {@link #getPortfolio(EntityType, UUID)}
-     * variant is sufficient for the internal cached path (Anti-Bug Playbook § F rule 6).
+     * <p><b>This is the sole cached overload.</b> The non-paginated sibling
+     * {@link #getPortfolio(EntityType, UUID)} is intentionally uncached to
+     * prevent a {@code ClassCastException} from the shared cache key
+     * {@code (entityType, entityId)}: Caffeine stores the first result and
+     * returns it verbatim on the next hit, so a cached {@code List} returned to
+     * a {@code Page}-expecting caller caused a 500 (MEDIUM fix, §F).
+     *
+     * <p>The controller always passes a fixed {@link PageRequest} (50 items,
+     * sorted by {@code createdAt} DESC), ensuring the key is stable per entity
+     * and avoids unbounded per-page cache entries. {@code sync = true} prevents
+     * a thundering herd on popular public keys (Anti-Bug Playbook §F rule 7).
+     * The inline SpEL string expression avoids the CGLIB-proxy visibility issue
+     * that arises when referencing a non-public static method via
+     * {@code T(ClassName).method()} (Anti-Bug §F).
      */
+    @Cacheable(value = PORTFOLIO_CACHE, sync = true,
+               key = "#entityType.name() + '_' + #entityId")
     @Transactional(readOnly = true)
-    public Page<MediaFileResponse> getPortfolio(EntityType entityType, UUID entityId, Pageable pageable) {
+    public Page<MediaFileResponse> getPortfolio(EntityType entityType, UUID entityId, PageRequest pageable) {
         return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId, pageable)
                 .map(MediaFileResponse::from);
     }
@@ -335,13 +359,17 @@ public class MediaService {
      * Narrow eviction of a single {@code portfolio} cache entry. Called from the
      * write paths AFTER {@link TransactionTemplate#execute} has returned (and the
      * transaction has therefore committed), so a parallel reader cannot repopulate
-     * stale data between the commit and the eviction. The {@link SimpleKey}
-     * mirrors Spring's materialisation of {@code @Cacheable(key = "{...}")}.
+     * stale data between the commit and the eviction.
+     *
+     * <p>Uses the same String key as the {@link Cacheable} annotation on
+     * {@link #getPortfolio(EntityType, UUID, PageRequest)} — the sole cached
+     * read path since the non-paginated overload was decached to fix the
+     * MEDIUM cache-key collision (§F).
      */
     private void evictPortfolioCache(EntityType entityType, UUID entityId) {
         Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
         if (cache != null) {
-            cache.evictIfPresent(new SimpleKey(entityType, entityId));
+            cache.evictIfPresent(portfolioCacheKey(entityType, entityId));
         }
     }
 
@@ -388,14 +416,14 @@ public class MediaService {
         // Step 4 — Phase 7.8/7.9: evict every distinct (entityType, entityId) portfolio
         // cache entry AFTER the write tx commits. Without this, a future user-deletion
         // flow would leave deleted portfolio entries readable from the cache for up to
-        // the 5-min TTL.
-        Set<SimpleKey> distinctKeys = new HashSet<>();
+        // the 5-min TTL. Uses the same String key as evictPortfolioCache (PERF-M3).
+        Set<String> distinctKeys = new HashSet<>();
         for (MediaFile row : rows) {
-            distinctKeys.add(new SimpleKey(row.getEntityType(), row.getEntityId()));
+            distinctKeys.add(portfolioCacheKey(row.getEntityType(), row.getEntityId()));
         }
         Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
         if (cache != null) {
-            for (SimpleKey key : distinctKeys) {
+            for (String key : distinctKeys) {
                 cache.evictIfPresent(key);
             }
         }

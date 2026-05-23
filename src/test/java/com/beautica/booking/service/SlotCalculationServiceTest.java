@@ -10,6 +10,7 @@ import com.beautica.common.util.TimeSlotCalculator.TimeRange;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.master.entity.Master;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -52,6 +53,10 @@ class SlotCalculationServiceTest {
 
     // Fixed clock: 2026-05-07T00:00:00Z — Kyiv is UTC+3 so this is 2026-05-07T03:00 Kyiv
     private final Clock clock = Clock.fixed(Instant.parse("2026-05-07T00:00:00Z"), ZoneOffset.UTC);
+
+    // Shared active master stub — used in every builder-constructed MasterServiceAssignment
+    // to satisfy the inactive-master guard added to getAvailableSlots().
+    private static final Master ACTIVE_MASTER = Master.builder().isActive(true).build();
 
     @Mock
     private WorkingHoursRepository workingHoursRepository;
@@ -100,6 +105,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -142,6 +148,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -216,6 +223,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -283,6 +291,7 @@ class SlotCalculationServiceTest {
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
                 .durationOverrideMinutes(45)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -341,6 +350,7 @@ class SlotCalculationServiceTest {
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
                 .durationOverrideMinutes(480)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -413,6 +423,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -469,6 +480,7 @@ class SlotCalculationServiceTest {
 
         MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
         when(msa.isActive()).thenReturn(true);
+        when(msa.getMaster()).thenReturn(ACTIVE_MASTER);
         when(msa.getDurationOverrideMinutes()).thenReturn(null);
         when(msa.getServiceDefinition()).thenReturn(serviceDefinition);
 
@@ -519,6 +531,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -580,6 +593,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -611,6 +625,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -642,6 +657,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(serviceDefinition)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
 
@@ -704,6 +720,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .serviceDefinition(sd)
+                .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
         WorkingHours wh = WorkingHours.builder()
@@ -736,5 +753,105 @@ class SlotCalculationServiceTest {
         OffsetDateTime expectedEnd = date.plusDays(1).atStartOfDay(kyiv).toOffsetDateTime();
         assertThat(startCaptor.getValue()).isEqualTo(expectedStart);
         assertThat(endCaptor.getValue()).isEqualTo(expectedEnd);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER master — getAvailableSlots returns slots from working hours when no exception")
+    void should_returnSlots_forOwnerMaster() {
+        // Arrange — the service is master-type agnostic; an owner-master with Mon–Fri hours
+        // behaves identically to any other master type in slot calculation.
+        UUID masterId        = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date       = LocalDate.of(2026, 5, 7); // Thursday — working day
+        int dayOfWeek        = date.getDayOfWeek().getValue();
+
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .master(ACTIVE_MASTER)
+                .isActive(true)
+                .build();
+
+        WorkingHours wh = WorkingHours.builder()
+                .id(UUID.randomUUID())
+                .dayOfWeek(dayOfWeek)
+                .startTime(java.time.LocalTime.of(9, 0))
+                .endTime(java.time.LocalTime.of(17, 0))
+                .isActive(true)
+                .build();
+
+        java.time.OffsetDateTime slotStart = date.atTime(java.time.LocalTime.of(9, 0))
+                .atZone(java.time.ZoneId.of("Europe/Kyiv")).toOffsetDateTime();
+        java.time.OffsetDateTime slotEnd   = slotStart.plusMinutes(60);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
+                .thenReturn(Optional.of(wh));
+        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of(new TimeRange(slotStart.toInstant(), slotEnd.toInstant())));
+
+        // Act
+        List<AvailableSlotResponse> slots = slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+
+        // Assert — slots returned; calculator was invoked (master-type-agnostic path taken)
+        assertThat(slots).hasSize(1);
+        verify(timeSlotCalculator).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER master — schedule exception on target date returns empty slot list")
+    void should_returnEmpty_forOwnerMaster_when_scheduleExceptionOnDate() {
+        UUID masterId        = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date       = LocalDate.of(2026, 5, 7);
+        int dayOfWeek        = date.getDayOfWeek().getValue();
+
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .master(ACTIVE_MASTER)
+                .isActive(true)
+                .build();
+
+        WorkingHours wh = WorkingHours.builder()
+                .id(UUID.randomUUID())
+                .dayOfWeek(dayOfWeek)
+                .startTime(java.time.LocalTime.of(9, 0))
+                .endTime(java.time.LocalTime.of(17, 0))
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
+                .thenReturn(Optional.of(wh));
+        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
+                .thenReturn(Optional.of(new com.beautica.master.entity.ScheduleException()));
+
+        // Act
+        List<AvailableSlotResponse> slots = slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+
+        // Assert — exception date → empty; calculator not called
+        assertThat(slots).isEmpty();
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
     }
 }

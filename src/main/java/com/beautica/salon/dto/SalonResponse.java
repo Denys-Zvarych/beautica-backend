@@ -35,6 +35,9 @@ public record SalonResponse(
         String instagramUrl,
         String avatarUrl,
         boolean isActive,
+        // Phase 12.1: isPrimary surfaces the DB-level one-primary-per-owner invariant
+        // so callers can determine whether the salon created during registration is primary.
+        boolean isPrimary,
         Instant createdAt
 ) {
     public static SalonResponse from(Salon salon) {
@@ -55,6 +58,7 @@ public record SalonResponse(
                 salon.getInstagramUrl(),
                 salon.getAvatarUrl(),
                 salon.isActive(),
+                salon.isPrimary(),
                 salon.getCreatedAt()
         );
     }

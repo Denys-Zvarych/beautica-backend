@@ -39,7 +39,6 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Pageable;
 
 import java.time.Instant;
 import java.util.List;
@@ -326,28 +325,29 @@ class MediaControllerTest {
     }
 
     @Test
-    @DisplayName("GET /salons/{id}/portfolio — size=101 is capped to 100 by spring.data.web.pageable.max-page-size")
-    void should_capPageSize_when_callerRequestsMoreThanMaxPageSize() throws Exception {
+    @DisplayName("GET /salons/{id}/portfolio — controller always passes fixed PageRequest(0, 50, DESC createdAt) (PERF-M3)")
+    void should_useFixedPageRequest_when_callerGetsPortfolio() throws Exception {
         var salonId = UUID.randomUUID();
-        // Service stub accepts any Pageable — the assertion is on the Pageable argument
-        // captured by Mockito, which proves the framework capped the caller-supplied size.
-        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        // PERF-M3: the controller no longer accepts a caller-supplied Pageable.
+        // It always passes MediaController.PORTFOLIO_PAGE — PageRequest.of(0, 50, DESC createdAt).
+        // Capture the PageRequest to verify the controller enforces the fixed size.
+        ArgumentCaptor<PageRequest> pageableCaptor = ArgumentCaptor.forClass(PageRequest.class);
         when(mediaService.getPortfolio(eq(EntityType.SALON), eq(salonId), pageableCaptor.capture()))
                 .thenReturn(Page.empty());
 
-        log.debug("Act: GET /api/v1/salons/{}/portfolio?size=101 — framework must cap to 100", salonId);
+        log.debug("Act: GET /api/v1/salons/{}/portfolio — controller must pass fixed PageRequest", salonId);
         mockMvc.perform(get("/api/v1/salons/" + salonId + "/portfolio")
-                        .param("size", "101")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk());
 
-        // Assert — Spring Data Web capped the effective page size at the max-page-size=100 ceiling
-        // configured in application.yml. If the property were absent or misconfigured in the test
-        // profile the captor would see size=101 and this assertion fails, exposing the regression.
-        Pageable captured = pageableCaptor.getValue();
+        // Assert — controller always passes a fixed 50-item PageRequest regardless of query params.
+        PageRequest captured = pageableCaptor.getValue();
         assertThat(captured.getPageSize())
-                .as("max-page-size=100 from application.yml must cap caller-supplied size=101 to 100")
-                .isLessThanOrEqualTo(100);
+                .as("PERF-M3: fixed PORTFOLIO_PAGE size must be 50")
+                .isEqualTo(50);
+        assertThat(captured.getPageNumber())
+                .as("PERF-M3: fixed PORTFOLIO_PAGE must be page 0")
+                .isEqualTo(0);
     }
 
     // ── INDEPENDENT_MASTER role coverage ──────────────────────────────────────

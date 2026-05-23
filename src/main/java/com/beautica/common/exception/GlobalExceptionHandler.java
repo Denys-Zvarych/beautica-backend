@@ -40,9 +40,15 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
+        log.debug("Business exception: {}", ex.getMessage());
+        String clientMessage = switch (ex.getStatus()) {
+            case CONFLICT -> "Request could not be completed due to a conflict";
+            case BAD_REQUEST -> "Invalid request";
+            default -> "Request could not be completed";
+        };
         return ResponseEntity
                 .status(ex.getStatus())
-                .body(ApiResponse.error(ex.getMessage()));
+                .body(ApiResponse.error(clientMessage));
     }
 
     @ExceptionHandler(ResendThrottledException.class)
@@ -90,9 +96,13 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiResponse<Void>> handleValidation(MethodArgumentNotValidException ex) {
-        String message = ex.getBindingResult().getFieldErrors().stream()
+        // Generic message — per-field messages are never echoed to prevent information
+        // disclosure about internal field names, enum constants, or DB constraints (Anti-Bug §A/§N).
+        // Debug-level log is available for server-side triage without exposing details to callers.
+        log.debug("Validation failed: {}", ex.getBindingResult().getFieldErrors().stream()
                 .map(FieldError::getDefaultMessage)
-                .collect(Collectors.joining("; "));
+                .collect(Collectors.joining("; ")));
+        String message = "Validation failed — check request parameters";
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
                 .body(ApiResponse.error(message));
@@ -100,18 +110,12 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ConstraintViolationException.class)
     public ResponseEntity<ApiResponse<Void>> handleConstraintViolation(ConstraintViolationException ex) {
-        String message = ex.getConstraintViolations().stream()
-                .map(v -> {
-                    String propertyPath = v.getPropertyPath().toString();
-                    String leafName = propertyPath.contains(".")
-                            ? propertyPath.substring(propertyPath.lastIndexOf('.') + 1)
-                            : propertyPath;
-                    return leafName + ": " + v.getMessage();
-                })
-                .collect(Collectors.joining(", "));
+        // Detail logged at DEBUG only — field names and bound values are internal API surface
+        // that would aid DoS/enumeration attacks if echoed to unauthenticated callers (Anti-Bug §A/§N).
+        log.debug("Constraint violation: {}", ex.getMessage());
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
-                .body(ApiResponse.error(message));
+                .body(ApiResponse.error("Validation failed — check request parameters"));
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)
@@ -152,9 +156,11 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(MissingServletRequestParameterException.class)
     public ResponseEntity<ApiResponse<Void>> handleMissingParam(
             MissingServletRequestParameterException ex) {
+        // Parameter name is not echoed — it discloses internal controller parameter names
+        // on permitAll endpoints (Anti-Bug §I/§N).
         return ResponseEntity
                 .badRequest()
-                .body(ApiResponse.error(ex.getParameterName() + " parameter is required"));
+                .body(ApiResponse.error("A required query parameter is missing"));
     }
 
     @ExceptionHandler(HttpMediaTypeNotSupportedException.class)

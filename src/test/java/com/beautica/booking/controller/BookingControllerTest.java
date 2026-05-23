@@ -875,4 +875,37 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
     }
 
+    // ── QA-MEDIUM-1: enum validation — ?status param ─────────────────────────
+
+    @Test
+    @DisplayName("GET /me — 400 when ?status contains an unrecognised enum value")
+    void should_return400_when_statusParamIsInvalidEnum() throws Exception {
+        var clientId = UUID.randomUUID();
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me")
+                        .param("status", "GARBAGE")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── QA-MEDIUM-2: enum validation — decline cancellationReason ────────────
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/decline — 400 when cancellationReason is an unknown enum value")
+    void should_return400_when_declineHasInvalidCancellationReasonEnum() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = "{\"cancellationReason\":\"INVALID_REASON\"}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
 }

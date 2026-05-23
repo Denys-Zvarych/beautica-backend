@@ -54,7 +54,7 @@ public class SlotCalculationService {
     }
 
     @Transactional(readOnly = true)
-    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}")
+    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}", sync = true)
     public List<AvailableSlotResponse> getAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {
         // Step 1: date range validation — cheapest guard, no DB
         LocalDate today = LocalDate.now(kyivClock);
@@ -74,6 +74,13 @@ public class SlotCalculationService {
             throw new BusinessException("master service is inactive");
         }
 
+        // Guard: master must be active to expose any bookable slots.
+        // deactivateOwnerMaster (and the general deactivateMaster) sets masters.is_active = false
+        // but leaves master_services rows intact — check the master entity itself here.
+        if (!msa.getMaster().isActive()) {
+            return List.of();
+        }
+
         // Step 3: compute effective duration (override takes precedence over base)
         int durationMinutes = msa.getDurationOverrideMinutes() != null
                 ? msa.getDurationOverrideMinutes()
@@ -85,6 +92,12 @@ public class SlotCalculationService {
         if (totalDuration.toMinutes() > 600) {
             throw new BusinessException("total service duration exceeds maximum allowed");
         }
+
+        // Slot calculation is master-type agnostic: working_hours, schedule_exceptions,
+        // and bookings are keyed by master_id alone. A SALON_OWNER master with working
+        // hours and an active master_services row is bookable identically to any other
+        // master type. Master liveness (masters.is_active) is checked above before
+        // reaching this point — do not remove that guard.
 
         // Step 5: check working hours for the requested day of week
         int dayOfWeek = date.getDayOfWeek().getValue(); // 1=Mon..7=Sun

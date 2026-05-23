@@ -37,6 +37,13 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
 
     boolean existsByIdAndOwnerId(UUID id, UUID ownerId);
 
+    // True iff the given owner already has at least one salon (primary or not).
+    // Used in SalonService.createSalon to decide is_primary = true/false.
+    boolean existsByOwnerId(UUID ownerId);
+
+    // Returns the owner's primary salon, if one exists.
+    Optional<Salon> findByOwnerIdAndIsPrimaryTrue(UUID ownerId);
+
     Optional<Salon> findByIdAndOwnerId(UUID id, UUID ownerId);
 
     @Query("SELECT s FROM Salon s JOIN FETCH s.owner WHERE s.id = :id AND s.isActive = true")

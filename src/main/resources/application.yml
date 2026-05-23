@@ -48,10 +48,10 @@ spring:
 
   servlet:
     multipart:
-      # Image uploads are bounded at 10 MB; oversized requests are rejected by the container
-      # before reaching the controller layer, so MediaService never sees an unbounded stream.
-      max-file-size: 10MB
-      max-request-size: 10MB
+      # Image uploads are bounded at 5 MB — aligned with MediaService.MAX_FILE_BYTES (5 MB).
+      # Oversized requests are rejected at the Tomcat layer before reaching the controller.
+      max-file-size: 5MB
+      max-request-size: 5MB
       # Explicit temp directory avoids platform-specific default locations on non-Railway hosts.
       location: ${java.io.tmpdir}/beautica-uploads
 
@@ -77,9 +77,9 @@ server:
   # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
   # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
   tomcat:
-    # Swallow up to 10 MB of an oversized request body so Tomcat returns a clean 413
+    # Swallow up to 5 MB of an oversized request body so Tomcat returns a clean 413
     # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.
-    max-swallow-size: 10MB
+    max-swallow-size: 5MB
 
 management:
   endpoints:

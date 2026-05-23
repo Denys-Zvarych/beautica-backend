@@ -250,6 +250,33 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("SALON_OWNER master — booking creation proceeds identically to INDEPENDENT_MASTER")
+    void should_bookOwnerMaster_when_clientBooksAvailableSlot() {
+        // Arrange — build an SALON_OWNER-type master (same as INDEPENDENT_MASTER from BookingService's perspective)
+        Master ownerMaster = buildMaster(masterId, MasterType.SALON_OWNER);
+        MasterServiceAssignment ownerMsa = buildMsa(masterServiceId, ownerMaster, serviceDef, null, null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(ownerMaster));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(ownerMsa));
+        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+
+        Booking saved = buildBooking(bookingId, client, ownerMaster, ownerMsa, BookingStatus.PENDING);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+
+        // Act
+        BookingResponse result = bookingService.createBooking(clientId, null, validRequest());
+
+        // Assert — booking created; master_id is the owner-master's ID
+        ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
+        verify(bookingRepository).saveAndFlush(captor.capture());
+        assertThat(captor.getValue().getMaster().getMasterType()).isEqualTo(MasterType.SALON_OWNER);
+        assertThat(captor.getValue().getStatus()).isEqualTo(BookingStatus.PENDING);
+        assertThat(result).isNotNull();
+        verify(slotCalculationService).evictAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId));
+    }
+
+    @Test
     @DisplayName("existing booking is returned without saving when idempotency key already exists")
     void should_returnExistingBooking_when_idempotencyKeyMatches() {
         String key = "unique-key-123";

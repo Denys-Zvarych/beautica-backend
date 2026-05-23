@@ -68,8 +68,8 @@ class SearchServiceTest {
     @Mock
     private Query dataQuery;
 
-    @Mock
-    private Query countQuery;
+    // countQuery mock removed — PERF-M1 replaced the two-query pattern with a single
+    // native query that embeds COUNT(*) OVER() as row[9] of every result row.
 
     @Mock
     private SalonRepository salonRepository;
@@ -99,14 +99,20 @@ class SearchServiceTest {
     }
 
     private void stubNativeQueries(List<Object[]> rows, long total) {
-        when(entityManager.createNativeQuery(sqlCaptor.capture()))
-                .thenReturn(dataQuery, countQuery);
+        // PERF-M1: a single native query replaces the old data+count two-query pattern.
+        // COUNT(*) OVER() total is embedded as row[9] of every result row.
+        List<Object[]> rowsWithCount = rows.stream()
+                .map(row -> {
+                    Object[] extended = java.util.Arrays.copyOf(row, 10);
+                    extended[9] = total;
+                    return extended;
+                })
+                .toList();
+        when(entityManager.createNativeQuery(sqlCaptor.capture())).thenReturn(dataQuery);
         lenient().when(dataQuery.setParameter(anyString(), any())).thenReturn(dataQuery);
         lenient().when(dataQuery.setParameter(eq("limit"), anyInt())).thenReturn(dataQuery);
         lenient().when(dataQuery.setParameter(eq("offset"), anyLong())).thenReturn(dataQuery);
-        when(dataQuery.getResultList()).thenReturn((List) rows);
-        lenient().when(countQuery.setParameter(anyString(), any())).thenReturn(countQuery);
-        when(countQuery.getSingleResult()).thenReturn(total);
+        when(dataQuery.getResultList()).thenReturn((List) rowsWithCount);
     }
 
     private static final UUID CITY_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
@@ -148,7 +154,7 @@ class SearchServiceTest {
         service.searchMasters(districtRequest(), PageRequest.of(0, 20));
 
         verify(dataQuery).setParameter("districtId", DISTRICT_ID);
-        verify(countQuery).setParameter("districtId", DISTRICT_ID);
+        // countQuery removed — PERF-M1: single query with COUNT(*) OVER(), no separate count query.
         String dataSql = sqlCaptor.getAllValues().get(0);
         assertThat(dataSql)
                 .as("district-primary: filter on the salon-or-user discovery district")
@@ -377,7 +383,7 @@ class SearchServiceTest {
         service.searchMasters(request, PageRequest.of(0, 20));
 
         verify(dataQuery).setParameter("category", "MANICURE");
-        verify(countQuery).setParameter("category", "MANICURE");
+        // countQuery removed — PERF-M1: single query with COUNT(*) OVER(), no separate count query.
     }
 
     @Test
@@ -397,6 +403,35 @@ class SearchServiceTest {
         assertThat((BigDecimal) bound).isEqualTo(new BigDecimal("4.50"));
     }
 
+    @Test
+    @DisplayName("normalises BigDecimal minPrice and maxPrice to scale 2 before binding (cache-key stability)")
+    void should_normalizeMinPriceAndMaxPrice_to_scale2_before_binding() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, null,
+                new BigDecimal("1.0"),      // scale 1 — must become 1.00
+                new BigDecimal("500"),       // scale 0 — must become 500.00
+                null, 0, 20);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        ArgumentCaptor<Object> minCaptor = ArgumentCaptor.forClass(Object.class);
+        ArgumentCaptor<Object> maxCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(dataQuery).setParameter(eq("minPrice"), minCaptor.capture());
+        verify(dataQuery).setParameter(eq("maxPrice"), maxCaptor.capture());
+
+        assertThat(((BigDecimal) minCaptor.getValue()).scale())
+                .as("minPrice must be normalised to scale 2 for cache-key stability")
+                .isEqualTo(2);
+        assertThat((BigDecimal) minCaptor.getValue())
+                .isEqualByComparingTo(new BigDecimal("1.00"));
+        assertThat(((BigDecimal) maxCaptor.getValue()).scale())
+                .as("maxPrice must be normalised to scale 2 for cache-key stability")
+                .isEqualTo(2);
+        assertThat((BigDecimal) maxCaptor.getValue())
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
     // ── Phase 6.3 active-flag filtering ──────────────────────────────────────
 
     @Test
@@ -406,13 +441,12 @@ class SearchServiceTest {
 
         service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
 
+        // PERF-M1: single query (window function replaces separate count query).
         List<String> sqls = sqlCaptor.getAllValues();
-        assertThat(sqls).hasSize(2);
-        for (String sql : sqls) {
-            assertThat(sql)
-                    .contains("m.is_active = true")
-                    .contains("u.is_active = true");
-        }
+        assertThat(sqls).hasSize(1);
+        assertThat(sqls.get(0))
+                .contains("m.is_active = true")
+                .contains("u.is_active = true");
     }
 
     // ── Phase 6.5 dynamic SQL — JOIN elision and count branching ─────────────
@@ -448,37 +482,33 @@ class SearchServiceTest {
     }
 
     @Test
-    @DisplayName("count query is a flat COUNT(DISTINCT m.id) when no price filter is set")
-    void should_emitFlatCountQuery_when_noPriceFilter() {
+    @DisplayName("issues exactly one native query per call (PERF-M1: COUNT(*) OVER() window function)")
+    void should_issueExactlyOneNativeQuery_when_searchPerformed() {
         stubNativeQueries(List.of(), 0L);
 
         service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
 
-        String countSql = sqlCaptor.getAllValues().get(1);
-        assertThat(countSql)
-                .contains("COUNT(DISTINCT m.id)")
-                .doesNotContain("HAVING")
-                .doesNotContain("FROM (");
+        verify(entityManager, times(1)).createNativeQuery(anyString());
     }
 
     @Test
-    @DisplayName("count query wraps the GROUP BY + HAVING in a subquery when a price filter is set")
-    void should_emitWrappedCountQuery_when_priceFilterSet() {
-        stubNativeQueries(List.of(), 0L);
+    @DisplayName("total count is read from COUNT(*) OVER() in row[9], not a separate query (PERF-M1)")
+    void should_readTotalFromWindowFunction_when_rowsReturned() {
+        Object[] row = new Object[]{
+                UUID.randomUUID(), "Anna", "Koval",
+                new BigDecimal("4.20"), 5, null,
+                CITY_ID, null, new BigDecimal("350.00")
+        };
+        stubNativeQueries(List.<Object[]>of(row), 7L);  // total=7, embedded as row[9] by stubNativeQueries
 
-        service.searchMasters(
-                new MasterSearchRequest(null, null,
-                        new BigDecimal("100.00"),
-                        new BigDecimal("500.00"),
-                        null, 0, 20),
-                PageRequest.of(0, 20));
+        // Use pageSize=5 so Spring Data's PageImpl last-page adjustment doesn't fire.
+        // PageImpl adjusts total when offset+pageSize > total (last-page heuristic):
+        //   PageRequest.of(0,20) → 0+20=20 > 7 → total becomes offset+content.size()=1 ✗
+        //   PageRequest.of(0, 5) → 0+ 5= 5 ≤ 7 → total stays 7 ✓
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 5));
 
-        String countSql = sqlCaptor.getAllValues().get(1);
-        assertThat(countSql)
-                .contains("SELECT COUNT(*) FROM (")
-                .contains("GROUP BY m.id")
-                .contains("HAVING")
-                .endsWith(") AS filtered");
+        assertThat(result.getTotalElements()).isEqualTo(7L);
+        verify(entityManager, times(1)).createNativeQuery(anyString());
     }
 
     @Test

@@ -318,9 +318,13 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
         assertThat(rows.size()).isEqualTo(1);
         assertThat(rows.get(0).path("masterId").asText()).isEqualTo(masterId.toString());
-        assertThat(rows.get(0).path("minEffectivePrice").isNull())
-                .as("JOIN is elided when no category/price filter — minEffectivePrice column projects NULL")
-                .isTrue();
+        // PERF-M2: min_effective_price is a pre-computed column always projected from masters.
+        // The seeder's UPDATE refreshes it to 250.00, so the value is non-null even when the
+        // service-join is elided (no category/price filter). The old "JOIN elided → NULL"
+        // behaviour no longer applies since the column is always SELECTed from the masters row.
+        assertThat(new BigDecimal(rows.get(0).path("minEffectivePrice").asText()))
+                .as("min_effective_price is pre-computed and always projected — seedServiceWithCategory sets 250.00")
+                .isEqualByComparingTo(new BigDecimal("250.00"));
     }
 
     @Test
@@ -1133,7 +1137,16 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Seeds a service definition + master_services row.
+     * Seeds a service definition + master_services row, then refreshes
+     * {@code masters.min_effective_price} so that PERF-M2 price-filter tests
+     * see the pre-computed column value instead of NULL.
+     *
+     * <p>The UPDATE mirrors {@code MasterRepository.refreshMinEffectivePrice()}:
+     * it recomputes the MIN(COALESCE(price_override, base_price)) over all
+     * <em>active</em> master_services + service_definitions rows and writes it
+     * back to the masters row. Without this, the directly-seeded test data
+     * leaves {@code min_effective_price = NULL}, causing every price-filter
+     * integration test to return 0 results.
      *
      * @param defActive   {@code service_definitions.is_active}
      * @param msActive    {@code master_services.is_active}
@@ -1152,5 +1165,16 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, ?, NOW(), NOW())",
                 msId, masterId, serviceDefId, msActive);
+
+        // PERF-M2: keep min_effective_price in sync — mirrors MasterRepository.refreshMinEffectivePrice()
+        // so search price filters work on directly-seeded test data.
+        jdbcTemplate.update(
+                "UPDATE masters SET min_effective_price = (" +
+                "  SELECT MIN(COALESCE(ms2.price_override, sd2.base_price))" +
+                "  FROM master_services ms2" +
+                "  JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id" +
+                "  WHERE ms2.master_id = ? AND ms2.is_active = true AND sd2.is_active = true" +
+                ") WHERE id = ?",
+                masterId, masterId);
     }
 }

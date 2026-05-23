@@ -2,6 +2,7 @@ package com.beautica.auth.dto;
 
 import com.beautica.auth.Role;
 import jakarta.annotation.Nullable;
+import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -22,5 +23,10 @@ public record InviteRequest(
 ) {
     public Role effectiveRole() {
         return role != null ? role : Role.SALON_MASTER;
+    }
+
+    @AssertTrue(message = "Role must be SALON_MASTER or SALON_ADMIN")
+    public boolean isRoleAllowed() {
+        return role == null || role == Role.SALON_MASTER || role == Role.SALON_ADMIN;
     }
 }
