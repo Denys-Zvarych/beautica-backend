@@ -30,6 +30,7 @@ import java.util.Properties;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -522,6 +523,188 @@ class EmailNotificationServiceTest {
         MimeMultipart related = (MimeMultipart) outer.getBodyPart(0).getContent();
         String body = (String) related.getBodyPart(0).getContent();
         assertThat(body).contains("src=\"cid:beauticaLogo\"");
+    }
+
+    // -------------------------------------------------------------------------
+    // sendPasswordResetEmail
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — calls mailSender.send and uses email/reset-password template")
+    void should_callMailSenderSend_when_sendPasswordResetEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+
+        verify(templateEngine).process(templateCaptor.capture(), any(IContext.class));
+        verify(mailSender).send(realMessage);
+        assertThat(templateCaptor.getValue())
+                .as("template name must be email/reset-password")
+                .isEqualTo("email/reset-password");
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — subject is Ukrainian 'Скидання паролю Beautica'")
+    void should_setUkrainianSubject_when_sendPasswordResetEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+
+        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+
+        assertThat(realMessage.getSubject())
+                .as("subject must be the Ukrainian reset-password heading")
+                .isEqualTo("Скидання паролю Beautica");
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — From header contains configured noreply address")
+    void should_setFromAddress_when_sendPasswordResetEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+
+        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+
+        assertThat(realMessage.getFrom())
+                .as("From: must be set")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getFrom()[0].toString())
+                .as("From: must contain the noreply address")
+                .contains(FROM_ADDRESS);
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — To header contains the recipient address")
+    void should_setToRecipient_when_sendPasswordResetEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+
+        service.sendPasswordResetEmail("reset-user@example.com", "https://beautica.app/reset?token=tok");
+
+        assertThat(realMessage.getRecipients(jakarta.mail.Message.RecipientType.TO))
+                .as("To: must contain exactly the recipient passed in")
+                .isNotNull()
+                .hasSize(1);
+        assertThat(realMessage.getRecipients(jakarta.mail.Message.RecipientType.TO)[0].toString())
+                .as("To: must contain the target address")
+                .contains("reset-user@example.com");
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — passes resetUrl to Thymeleaf context variable 'resetUrl'")
+    void should_passResetUrlToContext_when_sendPasswordResetEmailCalled() throws Exception {
+        String expectedUrl = "https://beautica.app/reset?token=securetoken42";
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendPasswordResetEmail("user@example.com", expectedUrl);
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("resetUrl"))
+                .as("context variable 'resetUrl' must equal the URL passed in")
+                .isEqualTo(expectedUrl);
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — MimeMessage is multipart/related with inline image/png CID beauticaLogo")
+    void should_attachLogoAsCid_when_sendPasswordResetEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+
+        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+
+        realMessage.saveChanges();
+        Object content = realMessage.getContent();
+        assertThat(content)
+                .as("MimeMessageHelper(multipart=true) must produce a MimeMultipart body")
+                .isInstanceOf(MimeMultipart.class);
+        MimeMultipart outer = (MimeMultipart) content;
+        MimeMultipart related = (MimeMultipart) outer.getBodyPart(0).getContent();
+
+        boolean foundLogoPart = false;
+        for (int i = 0; i < related.getCount(); i++) {
+            BodyPart part = related.getBodyPart(i);
+            String[] contentIds = part.getHeader("Content-ID");
+            String contentType = part.getContentType();
+            if (contentIds != null && contentType != null
+                    && contentType.startsWith("image/png")
+                    && java.util.Arrays.stream(contentIds)
+                            .anyMatch(id -> id.contains("beauticaLogo"))) {
+                foundLogoPart = true;
+                break;
+            }
+        }
+        assertThat(foundLogoPart)
+                .as("Expected inline image/png with Content-ID beauticaLogo in multipart/related")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — does not throw when mailSender.send throws MailSendException")
+    void should_notThrow_when_mailSenderThrowsMailException_in_sendPasswordResetEmail() {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+        doThrow(new MailSendException("SMTP unavailable")).when(mailSender).send(any(MimeMessage.class));
+
+        assertThatCode(() ->
+                service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok")
+        ).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — does not throw when MimeMessage.setSubject throws MessagingException")
+    void should_notThrow_when_messagingExceptionIn_sendPasswordResetEmail() throws MessagingException {
+        MimeMessage mockMessage = mock(MimeMessage.class);
+        doThrow(new MessagingException("simulated header failure"))
+                .when(mockMessage).setSubject(anyString(), anyString());
+        when(mailSender.createMimeMessage()).thenReturn(mockMessage);
+
+        assertThatCode(() ->
+                service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok")
+        ).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — throws IllegalArgumentException when resetUrl uses ftp:// scheme")
+    void should_throwIllegalArgument_when_resetUrlHasFtpScheme() {
+        assertThatThrownBy(() ->
+                service.sendPasswordResetEmail("user@example.com", "ftp://evil.com/reset?token=x")
+        )
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unsafe scheme");
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — throws IllegalArgumentException when resetUrl uses http:// with non-localhost host")
+    void should_throwIllegalArgument_when_resetUrlIsHttpNonLocalhost() {
+        assertThatThrownBy(() ->
+                service.sendPasswordResetEmail("user@example.com", "http://attacker.com/reset?token=x")
+        )
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unsafe scheme");
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetEmail — does not throw when resetUrl is http://localhost (SchemeGuard allows localhost)")
+    void should_notThrow_when_resetUrlIsLocalhostHttp() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+
+        assertThatCode(() ->
+                service.sendPasswordResetEmail("dev@localhost", "http://localhost/reset?token=localdev")
+        ).doesNotThrowAnyException();
     }
 
     // -------------------------------------------------------------------------
