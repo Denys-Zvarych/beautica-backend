@@ -169,11 +169,12 @@ public class EmailNotificationService {
         try {
             String html = templateEngine.process(template, ctx);
             MimeMessage message = mailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(message, "UTF-8");
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
             helper.setFrom(fromAddress);
             helper.setTo(to);
             helper.setSubject(subject);
             helper.setText(html, true);
+            helper.addInline("beauticaLogo", LOGO);
             mailSender.send(message);
         } catch (MessagingException | MailException ex) {
             // Deliberate swallow: delivery failures must not crash the outbox drain loop.

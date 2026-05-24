@@ -37,7 +37,7 @@ class StaleVerificationCleanupJobTest {
     @DisplayName("should_passClockDerivedCutoff_when_sweepRuns")
     void should_passClockDerivedCutoff_when_sweepRuns() {
         Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
-        var policy = new VerificationPolicyConfig(10, Duration.ofMinutes(15), RETENTION);
+        var policy = new VerificationPolicyConfig(10, Duration.ofMinutes(15), RETENTION, Duration.ofSeconds(60));
         var job = new StaleVerificationCleanupJob(userRepository, policy, clock);
         when(userRepository.nullifyStaleVerificationCodes(FIXED_NOW.minus(RETENTION)))
                 .thenReturn(7);
@@ -56,7 +56,7 @@ class StaleVerificationCleanupJobTest {
     @DisplayName("should_notFail_when_noStaleRows")
     void should_notFail_when_noStaleRows() {
         Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
-        var policy = new VerificationPolicyConfig(10, Duration.ofMinutes(15), RETENTION);
+        var policy = new VerificationPolicyConfig(10, Duration.ofMinutes(15), RETENTION, Duration.ofSeconds(60));
         var job = new StaleVerificationCleanupJob(userRepository, policy, clock);
         when(userRepository.nullifyStaleVerificationCodes(FIXED_NOW.minus(RETENTION)))
                 .thenReturn(0);

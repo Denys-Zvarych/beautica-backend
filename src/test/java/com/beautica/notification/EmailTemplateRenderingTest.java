@@ -125,4 +125,138 @@ class EmailTemplateRenderingTest {
         assertThat(html).contains("href=\"" + inviteUrl + "\"");
         assertThat(html).contains("Glamour Studio");
     }
+
+    // ── reset-password template ───────────────────────────────────────────────
+
+    @Test
+    @DisplayName("reset-password — @{${resetUrl}} renders as literal https:// href, not raw Thymeleaf syntax")
+    void should_renderResetUrlAsHttpsHref_when_resetPasswordTemplateProcessed() {
+        var resetUrl = "https://beautica.app/reset?token=securetoken99";
+        var ctx = new Context();
+        ctx.setVariable("resetUrl", resetUrl);
+
+        String html = templateEngine.process("email/reset-password", ctx);
+
+        assertThat(html)
+                .as("rendered href must equal the https:// reset URL")
+                .contains("href=\"" + resetUrl + "\"");
+    }
+
+    @Test
+    @DisplayName("reset-password — rendered HTML contains no raw Thymeleaf syntax (no ${ or th:)")
+    void should_notContainRawThymeleafSyntax_when_resetPasswordTemplateProcessed() {
+        var ctx = new Context();
+        ctx.setVariable("resetUrl", "https://beautica.app/reset?token=tok");
+
+        String html = templateEngine.process("email/reset-password", ctx);
+
+        assertThat(html)
+                .as("rendered template must not contain unresolved Thymeleaf expression '\\${'")
+                .doesNotContain("${");
+        assertThat(html)
+                .as("rendered template must not contain unresolved Thymeleaf attribute like 'th:text' or 'th:href'")
+                .doesNotContainPattern("th:[a-z]");
+    }
+
+    @Test
+    @DisplayName("reset-password — renders validity note mentioning 1 година")
+    void should_renderValidityNote_when_resetPasswordTemplateProcessed() {
+        var ctx = new Context();
+        ctx.setVariable("resetUrl", "https://beautica.app/reset?token=tok");
+
+        String html = templateEngine.process("email/reset-password", ctx);
+
+        assertThat(html)
+                .as("reset-password template must mention the 1-hour link expiry")
+                .contains("1 години");
+    }
+
+    // ── verify-email template ─────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("verify-email — th:text='\\${code}' renders the actual OTP code, not the static placeholder")
+    void should_renderOtpCode_when_verifyEmailTemplateProcessed() {
+        var ctx = new Context();
+        ctx.setVariable("code", "836274");
+
+        String html = templateEngine.process("email/verify-email", ctx);
+
+        assertThat(html)
+                .as("rendered OTP must contain the value passed as 'code'")
+                .contains("836274");
+        assertThat(html)
+                .as("rendered OTP must NOT contain the static placeholder '000000'")
+                .doesNotContain("000000");
+    }
+
+    @Test
+    @DisplayName("verify-email — rendered HTML contains no raw Thymeleaf syntax (no ${ or th:)")
+    void should_notContainRawThymeleafSyntax_when_verifyEmailTemplateProcessed() {
+        var ctx = new Context();
+        ctx.setVariable("code", "112233");
+
+        String html = templateEngine.process("email/verify-email", ctx);
+
+        assertThat(html)
+                .as("rendered template must not contain unresolved Thymeleaf expression '\\${'")
+                .doesNotContain("${");
+        assertThat(html)
+                .as("rendered template must not contain unresolved Thymeleaf attribute like 'th:text' or 'th:href'")
+                .doesNotContainPattern("th:[a-z]");
+    }
+
+    @Test
+    @DisplayName("verify-email — renders 15-minute validity note")
+    void should_renderValidityNote_when_verifyEmailTemplateProcessed() {
+        var ctx = new Context();
+        ctx.setVariable("code", "000111");
+
+        String html = templateEngine.process("email/verify-email", ctx);
+
+        assertThat(html)
+                .as("verify-email template must mention the 15-minute OTP expiry")
+                .contains("15 хвилин");
+    }
+
+    // ── invite (owner invite) template ────────────────────────────────────────
+
+    @Test
+    @DisplayName("invite — @{${inviteLink}} renders https:// href and salonName and expiresHours")
+    void should_renderInviteLinkAndSalonName_when_inviteTemplateProcessed() {
+        var inviteLink = "https://beautica.app/invite/accept?token=xyz-owner-invite";
+        var ctx = new Context();
+        ctx.setVariable("inviteLink", inviteLink);
+        ctx.setVariable("salonName", "Stella Beauty");
+        ctx.setVariable("expiresHours", 48L);
+
+        String html = templateEngine.process("email/invite", ctx);
+
+        assertThat(html)
+                .as("rendered href must equal the https:// invite link")
+                .contains("href=\"" + inviteLink + "\"");
+        assertThat(html)
+                .as("rendered body must contain the salon name")
+                .contains("Stella Beauty");
+        assertThat(html)
+                .as("rendered body must contain the expiry hours value")
+                .contains("48");
+    }
+
+    @Test
+    @DisplayName("invite — rendered HTML contains no raw Thymeleaf syntax (no ${ or th:)")
+    void should_notContainRawThymeleafSyntax_when_inviteTemplateProcessed() {
+        var ctx = new Context();
+        ctx.setVariable("inviteLink", "https://beautica.app/invite/accept?token=tok");
+        ctx.setVariable("salonName", "Test Salon");
+        ctx.setVariable("expiresHours", 72L);
+
+        String html = templateEngine.process("email/invite", ctx);
+
+        assertThat(html)
+                .as("rendered template must not contain unresolved Thymeleaf expression '\\${'")
+                .doesNotContain("${");
+        assertThat(html)
+                .as("rendered template must not contain unresolved Thymeleaf attribute like 'th:text' or 'th:href'")
+                .doesNotContainPattern("th:[a-z]");
+    }
 }

@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshTokenRepository;
@@ -20,6 +21,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 import java.time.Clock;
+import java.time.Duration;
 
 import java.util.UUID;
 
@@ -61,6 +63,8 @@ class AuthServiceOwnerRegistrationTest {
     void setUp() {
         PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(4);
         TaskExecutor syncExecutor = Runnable::run;
+        var verificationPolicyConfig = new VerificationPolicyConfig(
+                10, Duration.ofMinutes(15), Duration.ofHours(24), Duration.ofSeconds(60));
         authService = new AuthService(
                 userRepository,
                 refreshTokenRepository,
@@ -71,7 +75,8 @@ class AuthServiceOwnerRegistrationTest {
                 Clock.systemUTC(),
                 emailNotificationService,
                 syncExecutor,
-                emailVerificationProcessor
+                emailVerificationProcessor,
+                verificationPolicyConfig
         );
     }
 

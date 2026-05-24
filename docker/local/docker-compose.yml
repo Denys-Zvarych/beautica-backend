@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: beautica
       POSTGRES_PASSWORD: beautica
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - beautica-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -28,7 +28,7 @@ services:
     volumes:
       - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
     ports:
-      - "5050:80"
+      - "127.0.0.1:5050:80"
     depends_on:
       - postgres
     networks:
@@ -38,8 +38,8 @@ services:
     image: axllent/mailpit
     container_name: beautica-mailpit
     ports:
-      - "1025:1025"
-      - "8025:8025"
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
     networks:
       - beautica-net
 

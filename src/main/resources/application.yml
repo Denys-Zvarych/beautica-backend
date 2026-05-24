@@ -143,6 +143,9 @@ app:
     lockout-duration: 15m
     # Abandoned unverified OTP rows older than this are nulled by the daily sweep.
     stale-code-retention: 24h
+    # Minimum time between two consecutive OTP resend requests for the same account.
+    # Overridden to 10s in the local profile so developers don't wait 60s during testing.
+    resend-cooldown: 60s
   password-reset:
     # Reset tokens expired longer than this are hard-deleted by the daily sweep
     # (PasswordResetTokenCleanupJob) — keeps password_reset_tokens from growing

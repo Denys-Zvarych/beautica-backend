@@ -63,7 +63,7 @@ class EmailVerificationProcessorTest {
     void setUp() {
         Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         var policy = new VerificationPolicyConfig(
-                CUMULATIVE_THRESHOLD, LOCKOUT, Duration.ofHours(24));
+                CUMULATIVE_THRESHOLD, LOCKOUT, Duration.ofHours(24), Duration.ofSeconds(60));
         processor = new EmailVerificationProcessor(userRepository, tokenGenerator, clock, policy);
     }
 

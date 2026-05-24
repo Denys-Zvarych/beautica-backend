@@ -13,6 +13,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
+import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshTokenRepository;
@@ -38,7 +39,6 @@ import java.util.UUID;
 public class AuthService {
 
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
-    private static final Duration RESEND_COOLDOWN = Duration.ofSeconds(60);
 
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
@@ -50,6 +50,7 @@ public class AuthService {
     private final EmailNotificationService emailNotificationService;
     private final TaskExecutor emailExecutor;
     private final EmailVerificationProcessor emailVerificationProcessor;
+    private final VerificationPolicyConfig verificationPolicyConfig;
 
     public AuthService(
             UserRepository userRepository,
@@ -61,7 +62,8 @@ public class AuthService {
             Clock clock,
             EmailNotificationService emailNotificationService,
             @Qualifier("emailExecutor") TaskExecutor emailExecutor,
-            EmailVerificationProcessor emailVerificationProcessor
+            EmailVerificationProcessor emailVerificationProcessor,
+            VerificationPolicyConfig verificationPolicyConfig
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -73,6 +75,7 @@ public class AuthService {
         this.emailNotificationService = emailNotificationService;
         this.emailExecutor = emailExecutor;
         this.emailVerificationProcessor = emailVerificationProcessor;
+        this.verificationPolicyConfig = verificationPolicyConfig;
     }
 
     @Transactional
@@ -245,12 +248,6 @@ public class AuthService {
      * compare so it is time-equivalent to a wrong-code attempt on a real user.
      */
     public AuthResponse verifyEmail(VerifyEmailRequest request) {
-        // The locked critical section runs in EmailVerificationProcessor's
-        // @Transactional proxy. Token issuance happens AFTER that transaction
-        // commits and the PESSIMISTIC_WRITE lock is released — so concurrent
-        // verifies are no longer serialised across JWT signing + the
-        // refresh-token INSERT (a separate bean is required because a this.-call
-        // to a @Transactional method bypasses the proxy — Anti-Bug §F3).
         UUID verifiedUserId = emailVerificationProcessor.verifyAndReturnUserId(request);
         User user = userRepository.findById(verifiedUserId)
                 .orElseThrow(() -> new VerificationException(VerificationException.Code.INVALID_CODE));
@@ -304,7 +301,7 @@ public class AuthService {
         // Throttle check: derive issuedAt from expiresAt - OTP_TTL.
         if (user.getVerificationCodeExpiresAt() != null) {
             Instant issuedAt = user.getVerificationCodeExpiresAt().minus(OTP_TTL);
-            Instant nextAllowed = issuedAt.plus(RESEND_COOLDOWN);
+            Instant nextAllowed = issuedAt.plus(verificationPolicyConfig.resendCooldown());
             if (clock.instant().isBefore(nextAllowed)) {
                 long retryAfter = Duration.between(clock.instant(), nextAllowed).getSeconds() + 1;
                 throw new ResendThrottledException(retryAfter);
