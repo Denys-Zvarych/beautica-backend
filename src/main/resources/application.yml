@@ -89,6 +89,12 @@ management:
   endpoint:
     health:
       show-details: never
+  health:
+    # Mail health disabled: SMTP (Brevo) failures are non-fatal.
+    # The email service degrades gracefully (silent log on MailException).
+    # Fix BREVO_SMTP_KEY / BREVO_SMTP_LOGIN in Railway env vars separately.
+    mail:
+      enabled: false
 
 logging:
   level:
