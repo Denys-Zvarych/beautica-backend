@@ -71,7 +71,7 @@ class SalonServiceMultiTest {
     void should_createSecondSalon_when_ownerAlreadyHasOne() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.test", Role.SALON_OWNER);
-        var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null);
+        var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null, null, null, null, null, null);
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
@@ -136,7 +136,7 @@ class SalonServiceMultiTest {
     void should_notSetSalonIdOnOwner_when_salonCreated() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.test", Role.SALON_OWNER);
-        var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null);
+        var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "My Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));

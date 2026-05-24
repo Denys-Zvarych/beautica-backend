@@ -73,7 +73,7 @@ class SalonServiceTest {
     void should_createSalon_when_ownerAlreadyHasOneSalon() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
-        var request = new CreateSalonRequest("Second Salon", null, "Kyiv", null, null, null, null);
+        var request = new CreateSalonRequest("Second Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
@@ -110,7 +110,7 @@ class SalonServiceTest {
     void should_throwForbidden_when_userIsNotSalonOwner() {
         UUID userId = UUID.randomUUID();
         User client = buildUser(userId, "client@beautica.com", Role.CLIENT);
-        var request = new CreateSalonRequest("My Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("My Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(client));
 

@@ -169,7 +169,7 @@ class SalonSecurityTest extends AbstractIntegrationTest {
     }
 
     private UUID createSalon(String ownerToken, String salonName) throws Exception {
-        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null);
+        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, null, null, null, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(ownerToken)),

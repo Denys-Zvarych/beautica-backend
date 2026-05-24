@@ -79,7 +79,7 @@ class SalonServicePrimaryTest {
     void should_setPrimaryTrue_when_ownerHasNoPriorSalons() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildOwner(ownerId);
-        var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
@@ -101,7 +101,7 @@ class SalonServicePrimaryTest {
     void should_setPrimaryFalse_when_ownerAlreadyHasAtLeastOneSalon() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildOwner(ownerId);
-        var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
@@ -123,7 +123,7 @@ class SalonServicePrimaryTest {
     void should_callExistsByOwnerId_when_decidingPrimaryStatus() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildOwner(ownerId);
-        var request = new CreateSalonRequest("Any Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Any Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
@@ -141,7 +141,7 @@ class SalonServicePrimaryTest {
     void should_throwForbidden_before_existsByOwnerIdCheck_when_callerIsClient() {
         UUID userId = UUID.randomUUID();
         User client = buildUser(userId, Role.CLIENT);
-        var request = new CreateSalonRequest("Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(client));
 
@@ -178,7 +178,7 @@ class SalonServicePrimaryTest {
     void should_returnSalonResponseWithIsPrimaryTrue_when_firstSalon() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildOwner(ownerId);
-        var request = new CreateSalonRequest("Primary Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Primary Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
@@ -200,7 +200,7 @@ class SalonServicePrimaryTest {
     void should_returnSalonResponseWithIsPrimaryFalse_when_subsequentSalon() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildOwner(ownerId);
-        var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
@@ -224,7 +224,7 @@ class SalonServicePrimaryTest {
     void should_setPrimary_andAutoCreateMaster_when_firstSalon() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildOwner(ownerId);
-        var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
@@ -254,7 +254,7 @@ class SalonServicePrimaryTest {
     void should_notSetPrimary_andNotCreateMaster_when_additionalSalon() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildOwner(ownerId);
-        var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);

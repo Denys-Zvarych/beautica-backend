@@ -67,7 +67,7 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
         // Arrange
         UUID ownerId = persistOwner("owner-first@beautica.test");
         var request = new CreateSalonRequest(
-                "Velvet Studio", null, "Kyiv", null, null, null, null);
+                "Velvet Studio", null, "Kyiv", null, null, null, null, null, null, null, null, null);
 
         // Act
         var salonResponse = salonService.createSalon(ownerId, request);
@@ -107,9 +107,9 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
         // Arrange
         UUID ownerId = persistOwner("owner-second@beautica.test");
         var firstRequest = new CreateSalonRequest(
-                "First Studio", null, "Kyiv", null, null, null, null);
+                "First Studio", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         var secondRequest = new CreateSalonRequest(
-                "Second Studio", null, "Lviv", null, null, null, null);
+                "Second Studio", null, "Lviv", null, null, null, null, null, null, null, null, null);
 
         // Act — create first salon (triggers auto-master)
         salonService.createSalon(ownerId, firstRequest);
