@@ -60,6 +60,7 @@ app:
     cumulative-failure-threshold: 10
     lockout-duration: 15m
     stale-code-retention: 24h
+    resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between resend attempts
   password-reset:
     cleanup-retention: 7d
   outbox:

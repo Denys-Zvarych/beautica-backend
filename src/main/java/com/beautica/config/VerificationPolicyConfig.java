@@ -13,12 +13,17 @@ import java.time.Duration;
  * an attacker cannot loop resend→guess indefinitely against the 1,000,000-value
  * space). {@code staleCodeRetention} is the age after which an abandoned,
  * unverified OTP row is nulled by the scheduled sweep.
+ *
+ * <p>{@code resendCooldown} is the minimum time that must elapse between two
+ * consecutive OTP resend requests for the same account. Production default is
+ * 60 s; the local profile overrides to 10 s so developers don't have to wait.
  */
 @ConfigurationProperties(prefix = "app.verification")
 public record VerificationPolicyConfig(
         int cumulativeFailureThreshold,
         Duration lockoutDuration,
-        Duration staleCodeRetention
+        Duration staleCodeRetention,
+        Duration resendCooldown
 ) {
 
     public VerificationPolicyConfig {
@@ -33,6 +38,10 @@ public record VerificationPolicyConfig(
         if (staleCodeRetention == null || staleCodeRetention.isNegative() || staleCodeRetention.isZero()) {
             throw new IllegalStateException(
                     "app.verification.stale-code-retention must be a positive duration");
+        }
+        if (resendCooldown == null || resendCooldown.isNegative() || resendCooldown.isZero()) {
+            throw new IllegalStateException(
+                    "app.verification.resend-cooldown must be a positive duration");
         }
     }
 }

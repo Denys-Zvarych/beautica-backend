@@ -17,7 +17,8 @@ class VerificationPolicyConfigTest {
     @Test
     @DisplayName("should_throw_when_thresholdBelowOne")
     void should_throw_when_thresholdBelowOne() {
-        assertThatThrownBy(() -> new VerificationPolicyConfig(0, Duration.ofMinutes(15), Duration.ofHours(24)))
+        assertThatThrownBy(() -> new VerificationPolicyConfig(
+                0, Duration.ofMinutes(15), Duration.ofHours(24), Duration.ofSeconds(60)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("cumulative-failure-threshold");
     }
@@ -25,7 +26,8 @@ class VerificationPolicyConfigTest {
     @Test
     @DisplayName("should_throw_when_lockoutDurationNotPositive")
     void should_throw_when_lockoutDurationNotPositive() {
-        assertThatThrownBy(() -> new VerificationPolicyConfig(10, Duration.ZERO, Duration.ofHours(24)))
+        assertThatThrownBy(() -> new VerificationPolicyConfig(
+                10, Duration.ZERO, Duration.ofHours(24), Duration.ofSeconds(60)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("lockout-duration");
     }
@@ -33,15 +35,26 @@ class VerificationPolicyConfigTest {
     @Test
     @DisplayName("should_throw_when_staleRetentionNotPositive")
     void should_throw_when_staleRetentionNotPositive() {
-        assertThatThrownBy(() -> new VerificationPolicyConfig(10, Duration.ofMinutes(15), Duration.ofSeconds(-1)))
+        assertThatThrownBy(() -> new VerificationPolicyConfig(
+                10, Duration.ofMinutes(15), Duration.ofSeconds(-1), Duration.ofSeconds(60)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("stale-code-retention");
     }
 
     @Test
+    @DisplayName("should_throw_when_resendCooldownNotPositive")
+    void should_throw_when_resendCooldownNotPositive() {
+        assertThatThrownBy(() -> new VerificationPolicyConfig(
+                10, Duration.ofMinutes(15), Duration.ofHours(24), Duration.ZERO))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("resend-cooldown");
+    }
+
+    @Test
     @DisplayName("should_accept_when_allValuesValid")
     void should_accept_when_allValuesValid() {
-        assertThatCode(() -> new VerificationPolicyConfig(10, Duration.ofMinutes(15), Duration.ofHours(24)))
+        assertThatCode(() -> new VerificationPolicyConfig(
+                10, Duration.ofMinutes(15), Duration.ofHours(24), Duration.ofSeconds(60)))
                 .doesNotThrowAnyException();
     }
 }

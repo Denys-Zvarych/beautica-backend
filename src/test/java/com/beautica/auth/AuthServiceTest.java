@@ -13,6 +13,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
+import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshToken;
@@ -91,6 +92,10 @@ class AuthServiceTest {
     // Mirrors AuthService.OTP_TTL — used to construct expiresAt in stubs.
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
 
+    // Resend cooldown used for unit-test VerificationPolicyConfig instances.
+    // Tests that need the cooldown elapsed use deltas > 60 s; tests within cooldown use < 60 s.
+    private static final Duration RESEND_COOLDOWN = Duration.ofSeconds(60);
+
     private static final String TEST_EMAIL = "test@example.com";
 
     @BeforeEach
@@ -100,6 +105,14 @@ class AuthServiceTest {
         // verify(emailNotificationService) assertions remain deterministic without CountDownLatch.
         TaskExecutor syncExecutor = Runnable::run;
         lenient().when(clock.instant()).thenReturn(FIXED_NOW);
+        // VerificationPolicyConfig with production-equivalent values for all fields.
+        // resendCooldown matches RESEND_COOLDOWN constant above so time-delta stubs stay consistent.
+        var verificationPolicyConfig = new VerificationPolicyConfig(
+                10,
+                Duration.ofMinutes(15),
+                Duration.ofHours(24),
+                RESEND_COOLDOWN
+        );
         authService = new AuthService(
                 userRepository,
                 refreshTokenRepository,
@@ -110,7 +123,8 @@ class AuthServiceTest {
                 clock,
                 emailNotificationService,
                 syncExecutor,
-                emailVerificationProcessor
+                emailVerificationProcessor,
+                verificationPolicyConfig
         );
     }
 
@@ -669,6 +683,25 @@ class AuthServiceTest {
                 .isInstanceOf(VerificationException.class)
                 .extracting(ex -> ((VerificationException) ex).getCode())
                 .isEqualTo(VerificationException.Code.INVALID_CODE);
+    }
+
+    @Test
+    @DisplayName("verifyEmail — second call on already-verified account propagates INVALID_CODE (no auth bypass)")
+    void should_throwInvalidCode_when_verifyEmail_calledAgain_onAlreadyVerifiedAccount() {
+        // Already-verified user — processor will throw INVALID_CODE via the anti-enumeration path
+        var email = "already-verified@example.com";
+        log.debug("Arrange: processor rejects the re-verify attempt with INVALID_CODE for email={}", email);
+        when(emailVerificationProcessor.verifyAndReturnUserId(any()))
+                .thenThrow(new VerificationException(VerificationException.Code.INVALID_CODE));
+
+        log.debug("Act: verifyEmail with any code — must propagate INVALID_CODE, never issue tokens");
+        assertThatThrownBy(() -> authService.verifyEmail(new VerifyEmailRequest(email, "any-code-irrelevant")))
+                .isInstanceOf(VerificationException.class)
+                .extracting(ex -> ((VerificationException) ex).getCode())
+                .isEqualTo(VerificationException.Code.INVALID_CODE);
+
+        verify(refreshTokenRepository, never()).save(any());
+        verify(authResponseBuilder, never()).buildAuthResponse(any());
     }
 
     // ─── resendVerification ───────────────────────────────────────────────────
