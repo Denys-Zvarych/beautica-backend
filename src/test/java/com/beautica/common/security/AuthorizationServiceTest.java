@@ -119,10 +119,9 @@ class AuthorizationServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
 
-        User actor = mock(User.class);
-        when(actor.getSalonId()).thenReturn(salonId);
-
-        when(userRepository.findById(actorId)).thenReturn(Optional.of(actor));
+        // Fix MEDIUM-7: AuthorizationService now calls findSalonIdById (projection) instead of
+        // findById (full entity) so only the salonId column is fetched.
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
 
@@ -138,10 +137,9 @@ class AuthorizationServiceTest {
         UUID salonId = UUID.randomUUID();
         UUID otherSalonId = UUID.randomUUID();
 
-        User actor = mock(User.class);
-        when(actor.getSalonId()).thenReturn(otherSalonId);
-
-        when(userRepository.findById(actorId)).thenReturn(Optional.of(actor));
+        // Fix MEDIUM-7: AuthorizationService now calls findSalonIdById (projection) instead of
+        // findById (full entity) so only the salonId column is fetched.
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(otherSalonId));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
 
@@ -370,11 +368,12 @@ class AuthorizationServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
 
-        User admin = mock(User.class);
-        when(admin.getSalonId()).thenReturn(null);
-        when(userRepository.findById(actorId)).thenReturn(Optional.of(admin));
+        // Fix MEDIUM-7: AuthorizationService now calls findSalonIdById (projection) instead of
+        // findById (full entity). When the SALON_ADMIN's salonId is null the projection returns
+        // Optional.empty() — map(salonId::equals) short-circuits to false.
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.empty());
 
-        // SALON_ADMIN role is read from SecurityContext; the userRepository.findById call
+        // SALON_ADMIN role is read from SecurityContext; the userRepository.findSalonIdById call
         // still fires for SALON_ADMIN because the assigned salonId lives on the User record.
         SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_ADMIN"));
 

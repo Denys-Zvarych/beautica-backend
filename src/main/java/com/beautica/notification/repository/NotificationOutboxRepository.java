@@ -11,6 +11,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.validation.annotation.Validated;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -64,4 +65,21 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * @return number of rows with that status
      */
     long countByStatus(OutboxStatus status);
+
+    /**
+     * Deletes terminal rows (SENT or DEAD) whose {@code updated_at} is before the
+     * given cutoff. Called by the daily TTL purge job in
+     * {@link com.beautica.notification.service.NotificationOutboxDrainWorker#purgeStaleOutboxRows()}.
+     *
+     * <p>The partial index {@code idx_outbox_terminal_updated} (V59) covers
+     * {@code (updated_at) WHERE status IN ('SENT','DEAD')} — this delete uses that
+     * index and avoids a sequential scan on a large table.
+     *
+     * <p>Spring Data derives this as a {@code DELETE FROM notification_outbox WHERE
+     * status IN (?) AND updated_at < ?} — no custom {@code @Query} needed.
+     *
+     * <p>Fix MEDIUM-8 PERF.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    void deleteByStatusInAndUpdatedAtBefore(List<OutboxStatus> statuses, Instant cutoff);
 }

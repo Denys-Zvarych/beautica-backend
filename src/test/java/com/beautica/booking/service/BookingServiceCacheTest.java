@@ -13,6 +13,7 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -105,6 +106,7 @@ class BookingServiceCacheTest {
     @MockBean MasterRepository masterRepository;
     @MockBean MasterServiceRepository masterServiceRepository;
     @MockBean UserRepository userRepository;
+    @MockBean SalonRepository salonRepository;
     @MockBean AuthorizationService authz;
     @MockBean NotificationOutboxService outboxService;
     @MockBean SlotCalculationService slotCalculationService;

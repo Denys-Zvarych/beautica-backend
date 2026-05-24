@@ -128,6 +128,52 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("status") BookingStatus status,
             Pageable pageable);
 
+    // ── SALON_OWNER multi-salon queries (Fix HIGH-1) ───────────────────────────
+    //
+    // The previous approach resolved salonId via userRepository.findSalonIdById which only
+    // returns a value for invited roles (SALON_ADMIN, SALON_MASTER). For SALON_OWNER the
+    // relationship is stored on Salon.owner_id, not User.salonId — always returning empty.
+    // These methods accept a pre-resolved list of salonIds (from SalonRepository
+    // .findIdsByOwnerIdAndIsActiveTrue) and join through master → salon, covering all active
+    // salons owned by the actor in a single query.
+
+    @Query(value = """
+            SELECT b.id FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            WHERE s.id IN :salonIds
+            ORDER BY b.startsAt DESC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            WHERE s.id IN :salonIds
+            """)
+    Page<UUID> findIdsBySalonIds(
+            @Param("salonIds") List<UUID> salonIds,
+            Pageable pageable);
+
+    @Query(value = """
+            SELECT b.id FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            WHERE s.id IN :salonIds
+            AND b.status = :status
+            ORDER BY b.startsAt DESC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            JOIN b.master m
+            JOIN m.salon s
+            WHERE s.id IN :salonIds
+            AND b.status = :status
+            """)
+    Page<UUID> findIdsBySalonIdsAndStatus(
+            @Param("salonIds") List<UUID> salonIds,
+            @Param("status") BookingStatus status,
+            Pageable pageable);
+
     @Query(value = """
             SELECT b.id FROM Booking b
             WHERE b.master.id = :masterId

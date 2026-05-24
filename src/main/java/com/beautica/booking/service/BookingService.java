@@ -18,6 +18,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -58,6 +59,7 @@ public class BookingService {
     private final MasterRepository masterRepository;
     private final MasterServiceRepository masterServiceRepository;
     private final UserRepository userRepository;
+    private final SalonRepository salonRepository;
     private final AuthorizationService authz;
     private final NotificationOutboxService outboxService;
     private final SlotCalculationService slotCalculationService;
@@ -108,11 +110,18 @@ public class BookingService {
                         : bookingRepository.findIdsByMasterIdAndStatus(master.getId(), status, pageable);
             }
             case SALON_OWNER -> {
-                UUID salonId = userRepository.findSalonIdById(actorUserId)
-                        .orElseThrow(() -> new BusinessException("Salon owner has no associated salon"));
+                // Fix HIGH-1: salonId is on Salon.owner_id, NOT on User.salonId.
+                // userRepository.findSalonIdById always returned empty for SALON_OWNER,
+                // causing a guaranteed BusinessException (500). Resolved via SalonRepository
+                // which joins on the owner FK. An owner with no active salons gets an empty page
+                // rather than a 500 — consistent with the no-results case on other roles.
+                List<UUID> salonIds = salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorUserId);
+                if (salonIds.isEmpty()) {
+                    yield Page.empty(pageable);
+                }
                 yield status == null
-                        ? bookingRepository.findIdsBySalonIdAndOwnerId(salonId, actorUserId, pageable)
-                        : bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(salonId, actorUserId, status, pageable);
+                        ? bookingRepository.findIdsBySalonIds(salonIds, pageable)
+                        : bookingRepository.findIdsBySalonIdsAndStatus(salonIds, status, pageable);
             }
             // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings.
             // If this restriction is ever relaxed, add a SALON_ADMIN branch scoped to their salon.

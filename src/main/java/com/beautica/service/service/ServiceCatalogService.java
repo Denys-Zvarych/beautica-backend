@@ -203,6 +203,14 @@ public class ServiceCatalogService {
         // reader cannot repopulate stale entries between eviction and commit.
         evictMasterServicesCache(affectedMasterIds);
 
+        // Fix MEDIUM-9 PERF: deactivating a service definition also invalidates
+        // available-slots cache entries for affected masters. Clients may otherwise see
+        // stale slot data for the inactive service until the cache TTL expires.
+        // Date-specific eviction is not feasible here (no date context at deactivation
+        // time), so we evict all available-slots cache keys whose first element is a
+        // matching masterId using the Caffeine prefix scan pattern (anti-bug §F rule 6).
+        evictAvailableSlotsCache(affectedMasterIds);
+
         // Step 3: execute the update; check after registration so the callback is a
         // no-op when the method throws (transaction rolls back, afterCommit never fires).
         int updated = serviceRepository.deactivateById(serviceDefId);
@@ -210,10 +218,11 @@ public class ServiceCatalogService {
             throw new NotFoundException("Service definition not found: " + serviceDefId);
         }
 
-        // PERF-M2: refresh the pre-computed min_effective_price for every master
-        // that had this service definition assigned. The affectedMasterIds list was
-        // collected before the deactivation so it correctly captures all impacted rows.
-        affectedMasterIds.forEach(masterRepository::refreshMinEffectivePrice);
+        // Fix MEDIUM-6 PERF: replace N individual UPDATE round-trips with a single bulk
+        // statement — 50 masters = 1 query instead of 50.
+        if (!affectedMasterIds.isEmpty()) {
+            masterRepository.refreshMinEffectivePriceForAll(affectedMasterIds);
+        }
     }
 
     @Transactional(readOnly = true)
@@ -262,6 +271,56 @@ public class ServiceCatalogService {
     private static String sanitizeEmailField(String value) {
         if (value == null) return "";
         return value.replaceAll("[\r\n\t]", " ").strip();
+    }
+
+    /**
+     * Evicts all {@code available-slots} cache entries whose key prefix matches any
+     * of the given master IDs.
+     *
+     * <p>The {@code available-slots} cache key is a SpEL array
+     * {@code {masterId, date, masterServiceId}}. Spring renders it as a
+     * {@code SimpleKey} whose {@code toString()} starts with {@code "[masterId,"}.
+     * Because deactivation has no date/service context, we remove all date × service
+     * combinations for the affected masters in one sweep.
+     *
+     * <p>When a Spring transaction is active, the eviction is deferred to
+     * {@code afterCommit} (anti-bug §F rule 2).
+     *
+     * <p>Fix MEDIUM-9.
+     */
+    private void evictAvailableSlotsCache(List<UUID> masterIds) {
+        if (masterIds.isEmpty()) return;
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            doEvictAvailableSlots(masterIds);
+                        }
+                    }
+            );
+        } else {
+            doEvictAvailableSlots(masterIds);
+        }
+    }
+
+    private void doEvictAvailableSlots(List<UUID> masterIds) {
+        var cache = cacheManager.getCache("available-slots");
+        if (cache == null) return;
+        Object nativeCache = cache.getNativeCache();
+        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
+            // SimpleKey.toString() renders as "SimpleKey [elem0, elem1, ...]" via Arrays.deepToString.
+            // The first element is the masterId UUID string — detect it by substring presence.
+            for (UUID masterId : masterIds) {
+                String prefix = "[" + masterId + ",";
+                caffeineCache.asMap().keySet().removeIf(k ->
+                        k instanceof org.springframework.cache.interceptor.SimpleKey
+                                && k.toString().contains(prefix));
+            }
+        } else {
+            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
+            cache.clear();
+        }
     }
 
     /**

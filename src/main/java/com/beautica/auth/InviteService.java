@@ -91,8 +91,23 @@ public class InviteService {
             throw new ForbiddenException("Only SALON_OWNER may invite a SALON_ADMIN");
         }
 
-        Salon salon = salonRepository.findByIdAndOwnerId(request.salonId(), callerId)
-                .orElseThrow(() -> new ForbiddenException("You do not own the specified salon"));
+        // Fix MEDIUM-2: SALON_ADMIN is assigned to a salon but is NOT its owner, so
+        // findByIdAndOwnerId always returns empty for them — the invite feature was dead
+        // for SALON_ADMIN callers. Use a role-based branch: SALON_OWNER verifies ownership
+        // via the owner FK; SALON_ADMIN verifies their assigned salonId matches the request.
+        Salon salon;
+        if (caller.getRole() == Role.SALON_OWNER) {
+            salon = salonRepository.findByIdAndOwnerId(request.salonId(), callerId)
+                    .orElseThrow(() -> new ForbiddenException("You do not own the specified salon"));
+        } else if (caller.getRole() == Role.SALON_ADMIN) {
+            if (!request.salonId().equals(caller.getSalonId())) {
+                throw new ForbiddenException("SALON_ADMIN may only invite to their own assigned salon");
+            }
+            salon = salonRepository.findById(request.salonId())
+                    .orElseThrow(() -> new NotFoundException("Salon not found"));
+        } else {
+            throw new ForbiddenException("Role " + caller.getRole() + " cannot send invites");
+        }
 
         if (targetRole == Role.SALON_ADMIN) {
             if (userRepository.existsBySalonIdAndRole(request.salonId(), Role.SALON_ADMIN)) {

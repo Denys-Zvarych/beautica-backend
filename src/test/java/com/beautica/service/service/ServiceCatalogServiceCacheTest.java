@@ -20,14 +20,18 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.interceptor.SimpleKey;
 
 import org.springframework.data.domain.Pageable;
+
+import java.time.LocalDate;
 
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.times;
@@ -59,6 +63,7 @@ class ServiceCatalogServiceCacheTest {
         cacheManager.getCache("service-types").clear();
         cacheManager.getCache("service-type-search").clear();
         cacheManager.getCache("service-categories").clear();
+        cacheManager.getCache("available-slots").clear();
     }
 
     @Test
@@ -222,5 +227,33 @@ class ServiceCatalogServiceCacheTest {
         serviceCatalogService.getCategories();
 
         verify(catalogCategoryRepository, times(1)).findAllByOrderBySortOrderAsc();
+    }
+
+    @Test
+    @DisplayName("deactivateServiceDefinition evicts available-slots cache entries for affected masters")
+    void should_evictAvailableSlotsCache_when_deactivateServiceDefinitionCalled() {
+        // Arrange — pre-populate an available-slots entry whose key contains the affected
+        // master UUID as the first element. The production eviction scans Caffeine's
+        // asMap() for SimpleKey entries whose toString() contains "[<masterId>,".
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID someServiceId = UUID.randomUUID();
+        LocalDate someDate = LocalDate.of(2026, 6, 1);
+
+        // Simulate a slot-cache entry placed by SlotCalculationService's @Cacheable method.
+        // Key shape: SimpleKey[masterId, date, serviceId] as Spring would produce it.
+        var slotsCache = cacheManager.getCache("available-slots");
+        var cacheKey = new SimpleKey(masterId, someDate, someServiceId);
+        slotsCache.put(cacheKey, List.of("09:00", "10:00"));
+
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
+                .thenReturn(List.of(masterId));
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        // Act — no active Spring transaction here; eviction runs immediately in the else-branch.
+        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+
+        // Assert — the cache entry for the affected master must be gone.
+        assertThat(slotsCache.get(cacheKey)).isNull();
     }
 }

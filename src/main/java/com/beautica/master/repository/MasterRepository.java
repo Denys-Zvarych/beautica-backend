@@ -10,6 +10,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -101,4 +102,30 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             WHERE m.id = :masterId
             """)
     void refreshMinEffectivePrice(@Param("masterId") UUID masterId);
+
+    /**
+     * Bulk variant of {@link #refreshMinEffectivePrice} — collapses N individual UPDATE
+     * round-trips into a single statement (Fix MEDIUM-6 PERF).
+     *
+     * <p>Replaces the {@code affectedMasterIds.forEach(masterRepository::refreshMinEffectivePrice)}
+     * loop in {@code ServiceCatalogService.deactivateServiceDefinition}.
+     *
+     * <p>Must be called inside an existing {@code @Transactional} context.
+     * {@code clearAutomatically = true} ensures the first-level cache is invalidated
+     * after the bulk UPDATE so subsequent reads see the refreshed price.
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("""
+            UPDATE Master m
+            SET m.minEffectivePrice = (
+                SELECT MIN(COALESCE(ms.priceOverride, sd.basePrice))
+                FROM MasterServiceAssignment ms
+                JOIN ServiceDefinition sd ON ms.serviceDefinition.id = sd.id
+                WHERE ms.master.id = m.id
+                  AND ms.isActive = true
+                  AND sd.isActive = true
+            )
+            WHERE m.id IN :masterIds
+            """)
+    void refreshMinEffectivePriceForAll(@Param("masterIds") List<UUID> masterIds);
 }
