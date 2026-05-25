@@ -14,7 +14,6 @@ import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
-import com.beautica.config.SecurityPolicyConfig;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -53,7 +52,6 @@ public class AuthService {
     private final TaskExecutor emailExecutor;
     private final EmailVerificationProcessor emailVerificationProcessor;
     private final VerificationPolicyConfig verificationPolicyConfig;
-    private final SecurityPolicyConfig securityPolicyConfig;
 
     public AuthService(
             UserRepository userRepository,
@@ -66,8 +64,7 @@ public class AuthService {
             EmailNotificationService emailNotificationService,
             @Qualifier("emailExecutor") TaskExecutor emailExecutor,
             EmailVerificationProcessor emailVerificationProcessor,
-            VerificationPolicyConfig verificationPolicyConfig,
-            SecurityPolicyConfig securityPolicyConfig
+            VerificationPolicyConfig verificationPolicyConfig
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -80,23 +77,20 @@ public class AuthService {
         this.emailExecutor = emailExecutor;
         this.emailVerificationProcessor = emailVerificationProcessor;
         this.verificationPolicyConfig = verificationPolicyConfig;
-        this.securityPolicyConfig = securityPolicyConfig;
     }
 
     @Transactional
     public RegistrationResponse register(RegisterRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // Return the same 200 response for already-registered emails to prevent
-        // enumeration attacks — callers cannot distinguish new from existing registrations.
-        // The local-dev profile opts in to an honest 409 via
-        // app.security.disclose-duplicate-registration so developers stop hitting the
-        // "we sent a code, but it never comes" footgun. Prod default stays silent-200.
+        // Honest 409 on duplicate email. The prior anti-enumeration silent-200 was
+        // dropped — it created an undebuggable "we sent a code, but it never comes"
+        // footgun for any caller who hit a duplicate (the OTP path was bypassed but
+        // the response was indistinguishable from a fresh signup). The 409 path is
+        // rate-limited per-IP via AuthRateLimitFilter, so the enumeration surface
+        // is bounded; the trade-off is intentional.
         if (userRepository.existsByEmail(email)) {
-            if (securityPolicyConfig.discloseDuplicateRegistration()) {
-                throw new EmailAlreadyRegisteredException();
-            }
-            return RegistrationResponse.of(email);
+            throw new EmailAlreadyRegisteredException();
         }
 
         if (request.role() == SelfRegistrationRole.SALON_OWNER) {
@@ -135,16 +129,9 @@ public class AuthService {
     public RegistrationResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // Return the same 200 response for already-registered emails to prevent
-        // enumeration attacks — callers cannot distinguish new from existing registrations.
-        // The local-dev profile opts in to an honest 409 via
-        // app.security.disclose-duplicate-registration so developers stop hitting the
-        // "we sent a code, but it never comes" footgun. Prod default stays silent-200.
+        // Honest 409 on duplicate email. See register() for the rationale.
         if (userRepository.existsByEmail(email)) {
-            if (securityPolicyConfig.discloseDuplicateRegistration()) {
-                throw new EmailAlreadyRegisteredException();
-            }
-            return RegistrationResponse.of(email);
+            throw new EmailAlreadyRegisteredException();
         }
 
         String rawOtp = tokenGenerator.generateOtp();

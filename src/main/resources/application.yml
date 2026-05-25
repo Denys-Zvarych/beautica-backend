@@ -141,11 +141,6 @@ app:
     # JWT_SECRET. Generate: openssl rand -base64 32. Empty default forces every
     # profile to supply a value or fail fast at startup (>= 32 chars required).
     otp-pepper: ${APP_OTP_PEPPER:}
-    # Anti-enumeration default — duplicate-email registrations return the generic
-    # 200 RegistrationResponse so attackers cannot distinguish new from existing
-    # accounts. The local profile flips this to true so developers stop hitting
-    # the "we sent a code, but it never comes" trap. Profile-driven, not env-driven.
-    disclose-duplicate-registration: false
   verification:
     # Resend-surviving cumulative brute-force bound: after this many lifetime
     # failed verifies (NOT reset by resend) the account is locked for

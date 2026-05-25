@@ -3,7 +3,6 @@ package com.beautica.auth;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.config.SecurityPolicyConfig;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -77,10 +76,7 @@ class AuthServiceOwnerRegistrationTest {
                 emailNotificationService,
                 syncExecutor,
                 emailVerificationProcessor,
-                verificationPolicyConfig,
-                // Anti-enumeration silent-200 (prod default) — this test class exercises
-                // the new-email registration paths, not the duplicate-email branch.
-                new SecurityPolicyConfig(false)
+                verificationPolicyConfig
         );
     }
 

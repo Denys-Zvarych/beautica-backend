@@ -6,6 +6,7 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -123,7 +124,7 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("returns 200 with success=true for duplicate email (anti-enumeration — Phase 1.3)")
+    @DisplayName("returns 409 with EMAIL_ALREADY_REGISTERED code when email is already registered as a CLIENT")
     void should_return409_when_emailAlreadyRegisteredAsClient() {
         var clientRequest = new RegisterRequest(
                 registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, TEST_PHONE, null);
@@ -131,20 +132,21 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
         log.debug("Arrange: register email={} as CLIENT first", registeredEmail);
         postClient(clientRequest);
 
-        log.debug("Act: register same email={} as INDEPENDENT_MASTER when already a CLIENT — anti-enumeration must return 200", registeredEmail);
+        log.debug("Act: register same email={} as INDEPENDENT_MASTER — must surface as 409", registeredEmail);
         var masterRequest = new RegisterIndependentMasterRequest(
                 registeredEmail, TEST_PASSWORD, TEST_FIRST, TEST_LAST, TEST_PHONE);
-        var response = postIndependentMaster(masterRequest);
+        var response = postIndependentMasterRaw(masterRequest);
 
-        // Phase 1.3: duplicate-email registration silently returns 200 to prevent email enumeration.
+        // Honest 409 — the prior anti-enumeration silent-200 branch was dropped.
         assertThat(response.getStatusCode())
-                .as("anti-enumeration: duplicate email must return 200, not 409")
-                .isEqualTo(HttpStatus.OK);
+                .as("duplicate email across roles must surface as 409 Conflict")
+                .isEqualTo(HttpStatus.CONFLICT);
 
-        var body = response.getBody();
-        assertThat(body).isNotNull();
-        assertThat(body.success()).isTrue();
-        assertThat(body.data().email()).isEqualTo(registeredEmail);
+        assertThat(response.getBody())
+                .as("409 response body must be present")
+                .isNotNull()
+                .as("response body must include the stable EMAIL_ALREADY_REGISTERED error code")
+                .contains(EmailAlreadyRegisteredException.ERROR_CODE);
     }
 
     @Test
@@ -197,6 +199,23 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
                 HttpMethod.POST,
                 new HttpEntity<>(request),
                 new ParameterizedTypeReference<>() {}
+        );
+    }
+
+    /**
+     * Raw-String variant used by the duplicate-email test. The 409 path returns
+     * {@code ApiResponse<EmailAlreadyRegisteredResponse>}, which would coerce
+     * into a {@code RegistrationResponse} with null fields under the parameterized
+     * helper. Asserting on the raw body lets the test pin the
+     * {@code EMAIL_ALREADY_REGISTERED} error-code constant directly.
+     */
+    private ResponseEntity<String> postIndependentMasterRaw(
+            RegisterIndependentMasterRequest request) {
+        return restTemplate.exchange(
+                REGISTER_URL,
+                HttpMethod.POST,
+                new HttpEntity<>(request),
+                String.class
         );
     }
 

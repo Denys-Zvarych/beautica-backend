@@ -14,7 +14,6 @@ import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
-import com.beautica.config.SecurityPolicyConfig;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -116,20 +115,7 @@ class AuthServiceTest {
                 Duration.ofHours(24),
                 RESEND_COOLDOWN
         );
-        // Default to prod-equivalent anti-enumeration posture (silent-200 on duplicate email).
-        // Individual tests can rebuild authService via authServiceWith(...) when they need
-        // the local-dev profile's honest-409 disclosure path.
-        authService = buildAuthService(new SecurityPolicyConfig(false));
-    }
-
-    /**
-     * Builds an {@link AuthService} wired to the existing collaborator mocks and the
-     * given {@link SecurityPolicyConfig}. Used by tests that need to flip the
-     * {@code disclose-duplicate-registration} toggle without duplicating the entire
-     * setUp block.
-     */
-    private AuthService buildAuthService(SecurityPolicyConfig securityPolicyConfig) {
-        return new AuthService(
+        authService = new AuthService(
                 userRepository,
                 refreshTokenRepository,
                 passwordEncoder,
@@ -140,8 +126,7 @@ class AuthServiceTest {
                 emailNotificationService,
                 syncExecutor,
                 emailVerificationProcessor,
-                verificationPolicyConfig,
-                securityPolicyConfig
+                verificationPolicyConfig
         );
     }
 
@@ -174,38 +159,16 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("register returns RegistrationResponse (200) when email is already registered — enumeration suppressed")
-    void should_return200WithRegistrationResponse_when_emailAlreadyRegistered() {
+    @DisplayName("register — throws EmailAlreadyRegisteredException (409) when email is already registered")
+    void register_existingEmail_throwsConflict() {
         var request = new RegisterRequest(
                 "taken@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, null, null, null, null);
-        log.debug("Arrange: existing email={} already registered", request.email());
+        log.debug("Arrange: existing email={}", request.email());
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: register with already-registered email — expects silent 200 RegistrationResponse, no exception");
-        var response = authService.register(request);
-
-        assertThat(response).isInstanceOf(RegistrationResponse.class);
-        assertThat(response.email()).isEqualTo("taken@example.com");
-        // No new user persisted and no OTP email sent for duplicate registration
-        verify(userRepository, never()).save(any());
-        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
-    }
-
-    @Test
-    @DisplayName("register — throws EmailAlreadyRegisteredException (409) when disclose toggle is on")
-    void register_existingEmail_disclosureEnabled_throwsConflict() {
-        // Local-dev profile: disclose-duplicate-registration=true → honest 409
-        authService = buildAuthService(new SecurityPolicyConfig(true));
-        var request = new RegisterRequest(
-                "taken@example.com", "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, null, null, null, null);
-        log.debug("Arrange: disclose toggle ON, existing email={}", request.email());
-
-        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
-
-        log.debug("Act: register with already-registered email under disclose=true — expects EmailAlreadyRegisteredException");
+        log.debug("Act: register with already-registered email — expects EmailAlreadyRegisteredException");
         assertThatThrownBy(() -> authService.register(request))
                 .isInstanceOf(EmailAlreadyRegisteredException.class)
                 .extracting(ex -> ((EmailAlreadyRegisteredException) ex).getStatus())
@@ -218,73 +181,22 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("register — returns silent 200 RegistrationResponse when disclose toggle is off (prod default)")
-    void register_existingEmail_disclosureDisabled_returnsSilentSuccess() {
-        // Prod / default: disclose-duplicate-registration=false → silent 200 (anti-enumeration)
-        // authService is already built with disclose=false in setUp(), but we rebuild
-        // explicitly here so the contract is obvious at the test site.
-        authService = buildAuthService(new SecurityPolicyConfig(false));
-        var request = new RegisterRequest(
-                "taken@example.com", "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, null, null, null, null);
-        log.debug("Arrange: disclose toggle OFF, existing email={}", request.email());
-
-        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
-
-        log.debug("Act: register with already-registered email under disclose=false — expects silent 200");
-        var response = authService.register(request);
-
-        assertThat(response).isInstanceOf(RegistrationResponse.class);
-        assertThat(response.email()).isEqualTo("taken@example.com");
-        // No persistence, no email dispatch, no OTP generation on the silent-200 path.
-        verify(userRepository, never()).save(any());
-        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
-        verify(tokenGenerator, never()).generateOtp();
-    }
-
-    @Test
-    @DisplayName("registerIndependentMaster — throws EmailAlreadyRegisteredException (409) when disclose toggle is on")
-    void registerIndependentMaster_existingEmail_disclosureEnabled_throwsConflict() {
-        // Local-dev profile: disclose-duplicate-registration=true → honest 409
-        authService = buildAuthService(new SecurityPolicyConfig(true));
+    @DisplayName("registerIndependentMaster — throws EmailAlreadyRegisteredException (409) when email is already registered")
+    void registerIndependentMaster_existingEmail_throwsConflict() {
         var request = new RegisterIndependentMasterRequest(
                 "taken@example.com", "Str0ngP@ss1!",
                 "Oksana", "Kovalenko", "+380671234567");
-        log.debug("Arrange: disclose toggle ON, existing master email={}", request.email());
+        log.debug("Arrange: existing master email={}", request.email());
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: registerIndependentMaster with already-registered email under disclose=true — expects 409");
+        log.debug("Act: registerIndependentMaster with already-registered email — expects 409");
         assertThatThrownBy(() -> authService.registerIndependentMaster(request))
                 .isInstanceOf(EmailAlreadyRegisteredException.class)
                 .extracting(ex -> ((EmailAlreadyRegisteredException) ex).getStatus())
                 .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
 
         // No persistence, no master created, no OTP, no email dispatch on the 409 path.
-        verify(userRepository, never()).save(any());
-        verify(masterService, never()).createMasterForIndependentUser(any());
-        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
-        verify(tokenGenerator, never()).generateOtp();
-    }
-
-    @Test
-    @DisplayName("registerIndependentMaster — returns silent 200 when disclose toggle is off (prod default)")
-    void registerIndependentMaster_existingEmail_disclosureDisabled_returnsSilentSuccess() {
-        // Prod / default: disclose-duplicate-registration=false → silent 200 (anti-enumeration)
-        authService = buildAuthService(new SecurityPolicyConfig(false));
-        var request = new RegisterIndependentMasterRequest(
-                "taken@example.com", "Str0ngP@ss1!",
-                "Oksana", "Kovalenko", "+380671234567");
-        log.debug("Arrange: disclose toggle OFF, existing master email={}", request.email());
-
-        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
-
-        log.debug("Act: registerIndependentMaster with already-registered email under disclose=false — expects silent 200");
-        var response = authService.registerIndependentMaster(request);
-
-        assertThat(response).isInstanceOf(RegistrationResponse.class);
-        assertThat(response.email()).isEqualTo("taken@example.com");
-        // No persistence, no master created, no OTP, no email dispatch on the silent-200 path.
         verify(userRepository, never()).save(any());
         verify(masterService, never()).createMasterForIndependentUser(any());
         verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
@@ -317,27 +229,6 @@ class AuthServiceTest {
         // In unit tests no active transaction exists, so scheduleVerificationEmail falls
         // through to the direct call path. In production (real transaction) it fires afterCommit.
         verify(emailNotificationService).sendVerificationEmail("master@example.com", "654321");
-    }
-
-    @Test
-    @DisplayName("registerIndependentMaster returns RegistrationResponse (200) when email already registered — enumeration suppressed")
-    void should_return200WithRegistrationResponse_when_independentMasterEmailAlreadyRegistered() {
-        var request = new RegisterIndependentMasterRequest(
-                "taken@example.com", "Str0ngP@ss1!",
-                null, null, null);
-        log.debug("Arrange: email={} already exists", request.email());
-
-        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
-
-        log.debug("Act: register independent master with already-registered email — expects silent 200 RegistrationResponse");
-        var response = authService.registerIndependentMaster(request);
-
-        assertThat(response).isInstanceOf(RegistrationResponse.class);
-        assertThat(response.email()).isEqualTo("taken@example.com");
-        // No new user persisted, no master created, no OTP email sent for duplicate registration
-        verify(userRepository, never()).save(any());
-        verify(masterService, never()).createMasterForIndependentUser(any());
-        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }
 
     @Test

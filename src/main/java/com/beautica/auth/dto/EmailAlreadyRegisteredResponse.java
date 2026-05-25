@@ -2,8 +2,7 @@ package com.beautica.auth.dto;
 
 /**
  * Response body for the 409 returned when registration is attempted with an
- * already-registered email AND the
- * {@code app.security.disclose-duplicate-registration} toggle is on (local-dev only).
+ * already-registered email.
  *
  * <p>The {@code code} field carries the stable error code
  * {@code EMAIL_ALREADY_REGISTERED}; the client maps it to a localised user-facing

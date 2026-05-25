@@ -4,6 +4,7 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
 import com.beautica.AbstractIntegrationTest;
@@ -183,22 +184,23 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
     class DuplicateEmail {
 
         @Test
-        @DisplayName("returns 200 with RegistrationResponse for duplicate email (anti-enumeration)")
+        @DisplayName("returns 409 with EMAIL_ALREADY_REGISTERED code for duplicate email")
         void should_return409_when_emailIsAlreadyRegistered() {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
-            log.debug("Act: register email={} a second time — anti-enumeration returns same 200", registeredEmail);
-            var secondResponse = post(validRequest);
+            log.debug("Act: register email={} a second time — must surface as 409 Conflict", registeredEmail);
+            var secondResponse = postRaw(validRequest);
 
             assertThat(secondResponse.getStatusCode())
-                    .as("anti-enumeration: status for second registration attempt with same email=%s", registeredEmail)
-                    .isEqualTo(HttpStatus.OK);
+                    .as("duplicate registration must surface as 409, email=%s", registeredEmail)
+                    .isEqualTo(HttpStatus.CONFLICT);
 
-            var body = secondResponse.getBody();
-            assertThat(body).isNotNull();
-            assertThat(body.success()).isTrue();
-            assertThat(body.data().email()).isEqualTo(registeredEmail);
+            assertThat(secondResponse.getBody())
+                    .as("409 response body must be present")
+                    .isNotNull()
+                    .as("response body must include the stable EMAIL_ALREADY_REGISTERED error code")
+                    .contains(EmailAlreadyRegisteredException.ERROR_CODE);
         }
 
         @Test
@@ -211,7 +213,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
             log.debug("Arrange: user count after first registration = {}", countAfterFirst);
 
             log.debug("Act: attempt to register email={} a second time and verify no duplicate row is created", registeredEmail);
-            post(validRequest);
+            postRaw(validRequest);
 
             assertThat(userRepository.count())
                     .as("user count must not increase after rejected duplicate registration")
@@ -219,17 +221,20 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("returns same RegistrationResponse shape on duplicate email (no tokens ever issued)")
+        @DisplayName("does not issue tokens on the 409 duplicate-email path")
         void should_notReturnTokens_when_duplicateEmailRejected() {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
-            log.debug("Act: POST with already-registered email={} — same response shape returned", registeredEmail);
-            var response = post(validRequest);
+            log.debug("Act: POST with already-registered email={} — must reject without issuing tokens", registeredEmail);
+            var response = postRaw(validRequest);
 
-            var body = response.getBody();
-            assertThat(body).isNotNull();
-            assertThat(body.data().email()).isEqualTo(registeredEmail);
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+            // Refresh-token table must remain empty — tokens are issued only after verifyEmail,
+            // and a duplicate-email registration never reaches that path.
+            assertThat(refreshTokenRepository.count())
+                    .as("no refresh token must be persisted by a rejected duplicate registration")
+                    .isZero();
         }
     }
 
@@ -331,6 +336,22 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
                 HttpMethod.POST,
                 new HttpEntity<>(request),
                 new ParameterizedTypeReference<>() {}
+        );
+    }
+
+    /**
+     * Raw-String variant used by the duplicate-email tests. The 409 path returns
+     * {@code ApiResponse<EmailAlreadyRegisteredResponse>}, which would deserialize
+     * into a {@code RegistrationResponse} with null fields under the parameterized
+     * helper. Asserting on the raw body avoids that coercion and lets the test
+     * pin the {@code EMAIL_ALREADY_REGISTERED} error-code constant directly.
+     */
+    private ResponseEntity<String> postRaw(RegisterRequest request) {
+        return restTemplate.exchange(
+                REGISTER_URL,
+                HttpMethod.POST,
+                new HttpEntity<>(request),
+                String.class
         );
     }
 }

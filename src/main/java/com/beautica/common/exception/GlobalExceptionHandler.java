@@ -40,11 +40,13 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Profile-gated honest 409 for duplicate-email registration.
+     * Honest 409 for duplicate-email registration.
      *
-     * <p>Only thrown under {@code app.security.disclose-duplicate-registration=true}
-     * (local-dev profile). In prod / default the silent-200 anti-enumeration branch
-     * in {@code AuthService} runs instead and this handler is never invoked.
+     * <p>{@code AuthService} throws {@link EmailAlreadyRegisteredException} on every
+     * duplicate-email registration in every profile. The previous anti-enumeration
+     * silent-200 branch was removed because it created an undebuggable "we sent a
+     * code, but it never comes" footgun; the per-IP rate limit on {@code /auth/*}
+     * bounds the enumeration surface.
      *
      * <p>Must be declared BEFORE / alongside {@link #handleBusiness} so the structured
      * {@link EmailAlreadyRegisteredResponse} body (with the {@code EMAIL_ALREADY_REGISTERED}

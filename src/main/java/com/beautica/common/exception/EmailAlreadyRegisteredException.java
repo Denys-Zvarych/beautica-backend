@@ -4,17 +4,15 @@ import org.springframework.http.HttpStatus;
 
 /**
  * Thrown by {@code AuthService} when a registration request targets an email that
- * already exists in the {@code users} table AND the
- * {@code app.security.disclose-duplicate-registration} toggle is on.
+ * already exists in the {@code users} table.
  *
- * <p>The toggle is {@code false} in every profile that is not explicitly opted in
- * (prod / default), so production callers still receive the silent-200
- * anti-enumeration response described in {@code AuthService#register}. Under the
- * local-dev profile the toggle is {@code true} and this exception surfaces as a
- * {@code 409 Conflict} with the error code {@code EMAIL_ALREADY_REGISTERED},
- * which the developer-facing client uses to route to a "this email is already
- * registered — sign in instead" prompt without leaving the developer guessing
- * why the verification email never arrived.
+ * <p>Surfaces as a {@code 409 Conflict} with the error code
+ * {@code EMAIL_ALREADY_REGISTERED}, which the client uses to route to a
+ * "this email is already registered — sign in instead" prompt. This is the only
+ * duplicate-email path; the previous anti-enumeration silent-200 branch was
+ * removed because it produced an undebuggable "we sent a code, but it never
+ * comes" footgun. The enumeration surface is bounded by the per-IP rate limit
+ * on {@code /auth/*}.
  *
  * <p>Stack-trace capture is suppressed — like {@link EmailNotVerifiedException},
  * this is a flow-control exception translated directly to an HTTP response. The
