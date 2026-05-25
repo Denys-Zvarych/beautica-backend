@@ -10,9 +10,11 @@ import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
+import com.beautica.config.SecurityPolicyConfig;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -51,6 +53,7 @@ public class AuthService {
     private final TaskExecutor emailExecutor;
     private final EmailVerificationProcessor emailVerificationProcessor;
     private final VerificationPolicyConfig verificationPolicyConfig;
+    private final SecurityPolicyConfig securityPolicyConfig;
 
     public AuthService(
             UserRepository userRepository,
@@ -63,7 +66,8 @@ public class AuthService {
             EmailNotificationService emailNotificationService,
             @Qualifier("emailExecutor") TaskExecutor emailExecutor,
             EmailVerificationProcessor emailVerificationProcessor,
-            VerificationPolicyConfig verificationPolicyConfig
+            VerificationPolicyConfig verificationPolicyConfig,
+            SecurityPolicyConfig securityPolicyConfig
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -76,6 +80,7 @@ public class AuthService {
         this.emailExecutor = emailExecutor;
         this.emailVerificationProcessor = emailVerificationProcessor;
         this.verificationPolicyConfig = verificationPolicyConfig;
+        this.securityPolicyConfig = securityPolicyConfig;
     }
 
     @Transactional
@@ -84,7 +89,13 @@ public class AuthService {
 
         // Return the same 200 response for already-registered emails to prevent
         // enumeration attacks — callers cannot distinguish new from existing registrations.
+        // The local-dev profile opts in to an honest 409 via
+        // app.security.disclose-duplicate-registration so developers stop hitting the
+        // "we sent a code, but it never comes" footgun. Prod default stays silent-200.
         if (userRepository.existsByEmail(email)) {
+            if (securityPolicyConfig.discloseDuplicateRegistration()) {
+                throw new EmailAlreadyRegisteredException();
+            }
             return RegistrationResponse.of(email);
         }
 
@@ -126,7 +137,13 @@ public class AuthService {
 
         // Return the same 200 response for already-registered emails to prevent
         // enumeration attacks — callers cannot distinguish new from existing registrations.
+        // The local-dev profile opts in to an honest 409 via
+        // app.security.disclose-duplicate-registration so developers stop hitting the
+        // "we sent a code, but it never comes" footgun. Prod default stays silent-200.
         if (userRepository.existsByEmail(email)) {
+            if (securityPolicyConfig.discloseDuplicateRegistration()) {
+                throw new EmailAlreadyRegisteredException();
+            }
             return RegistrationResponse.of(email);
         }
 

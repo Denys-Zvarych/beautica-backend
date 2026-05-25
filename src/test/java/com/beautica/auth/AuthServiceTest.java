@@ -10,9 +10,11 @@ import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
+import com.beautica.config.SecurityPolicyConfig;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -85,6 +87,10 @@ class AuthServiceTest {
 
     private PasswordEncoder passwordEncoder;
     private AuthService authService;
+    // Inline synchronous TaskExecutor: runs the Runnable on the calling thread so
+    // verify(emailNotificationService) assertions remain deterministic without CountDownLatch.
+    private final TaskExecutor syncExecutor = (Runnable r) -> r.run();
+    private VerificationPolicyConfig verificationPolicyConfig;
 
     // Fixed reference instant used as "now" across all time-sensitive tests.
     private static final Instant FIXED_NOW = Instant.parse("2025-06-01T12:00:00Z");
@@ -101,19 +107,29 @@ class AuthServiceTest {
     @BeforeEach
     void setUp() {
         passwordEncoder = new BCryptPasswordEncoder(4);
-        // Inline synchronous TaskExecutor: runs the Runnable on the calling thread so
-        // verify(emailNotificationService) assertions remain deterministic without CountDownLatch.
-        TaskExecutor syncExecutor = Runnable::run;
         lenient().when(clock.instant()).thenReturn(FIXED_NOW);
         // VerificationPolicyConfig with production-equivalent values for all fields.
         // resendCooldown matches RESEND_COOLDOWN constant above so time-delta stubs stay consistent.
-        var verificationPolicyConfig = new VerificationPolicyConfig(
+        verificationPolicyConfig = new VerificationPolicyConfig(
                 10,
                 Duration.ofMinutes(15),
                 Duration.ofHours(24),
                 RESEND_COOLDOWN
         );
-        authService = new AuthService(
+        // Default to prod-equivalent anti-enumeration posture (silent-200 on duplicate email).
+        // Individual tests can rebuild authService via authServiceWith(...) when they need
+        // the local-dev profile's honest-409 disclosure path.
+        authService = buildAuthService(new SecurityPolicyConfig(false));
+    }
+
+    /**
+     * Builds an {@link AuthService} wired to the existing collaborator mocks and the
+     * given {@link SecurityPolicyConfig}. Used by tests that need to flip the
+     * {@code disclose-duplicate-registration} toggle without duplicating the entire
+     * setUp block.
+     */
+    private AuthService buildAuthService(SecurityPolicyConfig securityPolicyConfig) {
+        return new AuthService(
                 userRepository,
                 refreshTokenRepository,
                 passwordEncoder,
@@ -124,7 +140,8 @@ class AuthServiceTest {
                 emailNotificationService,
                 syncExecutor,
                 emailVerificationProcessor,
-                verificationPolicyConfig
+                verificationPolicyConfig,
+                securityPolicyConfig
         );
     }
 
@@ -174,6 +191,104 @@ class AuthServiceTest {
         // No new user persisted and no OTP email sent for duplicate registration
         verify(userRepository, never()).save(any());
         verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+    }
+
+    @Test
+    @DisplayName("register — throws EmailAlreadyRegisteredException (409) when disclose toggle is on")
+    void register_existingEmail_disclosureEnabled_throwsConflict() {
+        // Local-dev profile: disclose-duplicate-registration=true → honest 409
+        authService = buildAuthService(new SecurityPolicyConfig(true));
+        var request = new RegisterRequest(
+                "taken@example.com", "Str0ngP@ss1!",
+                SelfRegistrationRole.CLIENT, null, null, null, null);
+        log.debug("Arrange: disclose toggle ON, existing email={}", request.email());
+
+        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
+
+        log.debug("Act: register with already-registered email under disclose=true — expects EmailAlreadyRegisteredException");
+        assertThatThrownBy(() -> authService.register(request))
+                .isInstanceOf(EmailAlreadyRegisteredException.class)
+                .extracting(ex -> ((EmailAlreadyRegisteredException) ex).getStatus())
+                .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+
+        // No persistence, no email dispatch, no master profile creation on the 409 path.
+        verify(userRepository, never()).save(any());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+        verify(tokenGenerator, never()).generateOtp();
+    }
+
+    @Test
+    @DisplayName("register — returns silent 200 RegistrationResponse when disclose toggle is off (prod default)")
+    void register_existingEmail_disclosureDisabled_returnsSilentSuccess() {
+        // Prod / default: disclose-duplicate-registration=false → silent 200 (anti-enumeration)
+        // authService is already built with disclose=false in setUp(), but we rebuild
+        // explicitly here so the contract is obvious at the test site.
+        authService = buildAuthService(new SecurityPolicyConfig(false));
+        var request = new RegisterRequest(
+                "taken@example.com", "Str0ngP@ss1!",
+                SelfRegistrationRole.CLIENT, null, null, null, null);
+        log.debug("Arrange: disclose toggle OFF, existing email={}", request.email());
+
+        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
+
+        log.debug("Act: register with already-registered email under disclose=false — expects silent 200");
+        var response = authService.register(request);
+
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("taken@example.com");
+        // No persistence, no email dispatch, no OTP generation on the silent-200 path.
+        verify(userRepository, never()).save(any());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+        verify(tokenGenerator, never()).generateOtp();
+    }
+
+    @Test
+    @DisplayName("registerIndependentMaster — throws EmailAlreadyRegisteredException (409) when disclose toggle is on")
+    void registerIndependentMaster_existingEmail_disclosureEnabled_throwsConflict() {
+        // Local-dev profile: disclose-duplicate-registration=true → honest 409
+        authService = buildAuthService(new SecurityPolicyConfig(true));
+        var request = new RegisterIndependentMasterRequest(
+                "taken@example.com", "Str0ngP@ss1!",
+                "Oksana", "Kovalenko", "+380671234567");
+        log.debug("Arrange: disclose toggle ON, existing master email={}", request.email());
+
+        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
+
+        log.debug("Act: registerIndependentMaster with already-registered email under disclose=true — expects 409");
+        assertThatThrownBy(() -> authService.registerIndependentMaster(request))
+                .isInstanceOf(EmailAlreadyRegisteredException.class)
+                .extracting(ex -> ((EmailAlreadyRegisteredException) ex).getStatus())
+                .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+
+        // No persistence, no master created, no OTP, no email dispatch on the 409 path.
+        verify(userRepository, never()).save(any());
+        verify(masterService, never()).createMasterForIndependentUser(any());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+        verify(tokenGenerator, never()).generateOtp();
+    }
+
+    @Test
+    @DisplayName("registerIndependentMaster — returns silent 200 when disclose toggle is off (prod default)")
+    void registerIndependentMaster_existingEmail_disclosureDisabled_returnsSilentSuccess() {
+        // Prod / default: disclose-duplicate-registration=false → silent 200 (anti-enumeration)
+        authService = buildAuthService(new SecurityPolicyConfig(false));
+        var request = new RegisterIndependentMasterRequest(
+                "taken@example.com", "Str0ngP@ss1!",
+                "Oksana", "Kovalenko", "+380671234567");
+        log.debug("Arrange: disclose toggle OFF, existing master email={}", request.email());
+
+        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
+
+        log.debug("Act: registerIndependentMaster with already-registered email under disclose=false — expects silent 200");
+        var response = authService.registerIndependentMaster(request);
+
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("taken@example.com");
+        // No persistence, no master created, no OTP, no email dispatch on the silent-200 path.
+        verify(userRepository, never()).save(any());
+        verify(masterService, never()).createMasterForIndependentUser(any());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+        verify(tokenGenerator, never()).generateOtp();
     }
 
     @Test
