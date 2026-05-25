@@ -8,6 +8,8 @@ import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
 import com.beautica.AbstractIntegrationTest;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -43,6 +45,9 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired
     private TransactionTemplate transactionTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     // ── test-local state ───────────────────────────────────────────────────────
     // Tracks every email registered during a test so @AfterEach can remove it.
@@ -185,7 +190,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
 
         @Test
         @DisplayName("returns 409 with EMAIL_ALREADY_REGISTERED code for duplicate email")
-        void should_return409_when_emailIsAlreadyRegistered() {
+        void should_return409_when_emailIsAlreadyRegistered() throws Exception {
             log.debug("Arrange: register email={} for the first time", registeredEmail);
             post(validRequest);
 
@@ -196,11 +201,24 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
                     .as("duplicate registration must surface as 409, email=%s", registeredEmail)
                     .isEqualTo(HttpStatus.CONFLICT);
 
-            assertThat(secondResponse.getBody())
-                    .as("409 response body must be present")
-                    .isNotNull()
-                    .as("response body must include the stable EMAIL_ALREADY_REGISTERED error code")
-                    .contains(EmailAlreadyRegisteredException.ERROR_CODE);
+            // Parse via ObjectMapper so a body-shape regression fails fast rather than
+            // passing a loose substring assertion that a malformed JSON body could satisfy.
+            String rawBody = secondResponse.getBody();
+            assertThat(rawBody).as("409 response body must be present").isNotNull();
+
+            JsonNode body = objectMapper.readTree(rawBody);
+
+            assertThat(body.path("success").asBoolean())
+                    .as("success must be false on the 409 duplicate-email path")
+                    .isFalse();
+
+            assertThat(body.path("data").path("code").asText())
+                    .as("data.code must be the stable EMAIL_ALREADY_REGISTERED constant")
+                    .isEqualTo(EmailAlreadyRegisteredException.ERROR_CODE);
+
+            assertThat(body.path("message").asText())
+                    .as("message must be the stable wire-contract string")
+                    .isEqualTo("Email already registered");
         }
 
         @Test
