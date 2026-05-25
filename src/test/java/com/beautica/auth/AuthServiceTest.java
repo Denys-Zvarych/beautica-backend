@@ -10,6 +10,7 @@ import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
@@ -85,6 +86,10 @@ class AuthServiceTest {
 
     private PasswordEncoder passwordEncoder;
     private AuthService authService;
+    // Inline synchronous TaskExecutor: runs the Runnable on the calling thread so
+    // verify(emailNotificationService) assertions remain deterministic without CountDownLatch.
+    private final TaskExecutor syncExecutor = (Runnable r) -> r.run();
+    private VerificationPolicyConfig verificationPolicyConfig;
 
     // Fixed reference instant used as "now" across all time-sensitive tests.
     private static final Instant FIXED_NOW = Instant.parse("2025-06-01T12:00:00Z");
@@ -101,13 +106,10 @@ class AuthServiceTest {
     @BeforeEach
     void setUp() {
         passwordEncoder = new BCryptPasswordEncoder(4);
-        // Inline synchronous TaskExecutor: runs the Runnable on the calling thread so
-        // verify(emailNotificationService) assertions remain deterministic without CountDownLatch.
-        TaskExecutor syncExecutor = Runnable::run;
         lenient().when(clock.instant()).thenReturn(FIXED_NOW);
         // VerificationPolicyConfig with production-equivalent values for all fields.
         // resendCooldown matches RESEND_COOLDOWN constant above so time-delta stubs stay consistent.
-        var verificationPolicyConfig = new VerificationPolicyConfig(
+        verificationPolicyConfig = new VerificationPolicyConfig(
                 10,
                 Duration.ofMinutes(15),
                 Duration.ofHours(24),
@@ -157,23 +159,48 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("register returns RegistrationResponse (200) when email is already registered — enumeration suppressed")
-    void should_return200WithRegistrationResponse_when_emailAlreadyRegistered() {
+    @DisplayName("register — throws EmailAlreadyRegisteredException (409) when email is already registered")
+    void register_existingEmail_throwsConflict() {
         var request = new RegisterRequest(
                 "taken@example.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, null, null, null, null);
-        log.debug("Arrange: existing email={} already registered", request.email());
+        log.debug("Arrange: existing email={}", request.email());
 
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
-        log.debug("Act: register with already-registered email — expects silent 200 RegistrationResponse, no exception");
-        var response = authService.register(request);
+        log.debug("Act: register with already-registered email — expects EmailAlreadyRegisteredException");
+        assertThatThrownBy(() -> authService.register(request))
+                .isInstanceOf(EmailAlreadyRegisteredException.class)
+                .extracting(ex -> ((EmailAlreadyRegisteredException) ex).getStatus())
+                .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
 
-        assertThat(response).isInstanceOf(RegistrationResponse.class);
-        assertThat(response.email()).isEqualTo("taken@example.com");
-        // No new user persisted and no OTP email sent for duplicate registration
+        // No persistence, no email dispatch, no master profile creation on the 409 path.
         verify(userRepository, never()).save(any());
         verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+        verify(tokenGenerator, never()).generateOtp();
+    }
+
+    @Test
+    @DisplayName("registerIndependentMaster — throws EmailAlreadyRegisteredException (409) when email is already registered")
+    void registerIndependentMaster_existingEmail_throwsConflict() {
+        var request = new RegisterIndependentMasterRequest(
+                "taken@example.com", "Str0ngP@ss1!",
+                "Oksana", "Kovalenko", "+380671234567");
+        log.debug("Arrange: existing master email={}", request.email());
+
+        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
+
+        log.debug("Act: registerIndependentMaster with already-registered email — expects 409");
+        assertThatThrownBy(() -> authService.registerIndependentMaster(request))
+                .isInstanceOf(EmailAlreadyRegisteredException.class)
+                .extracting(ex -> ((EmailAlreadyRegisteredException) ex).getStatus())
+                .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+
+        // No persistence, no master created, no OTP, no email dispatch on the 409 path.
+        verify(userRepository, never()).save(any());
+        verify(masterService, never()).createMasterForIndependentUser(any());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+        verify(tokenGenerator, never()).generateOtp();
     }
 
     @Test
@@ -202,27 +229,6 @@ class AuthServiceTest {
         // In unit tests no active transaction exists, so scheduleVerificationEmail falls
         // through to the direct call path. In production (real transaction) it fires afterCommit.
         verify(emailNotificationService).sendVerificationEmail("master@example.com", "654321");
-    }
-
-    @Test
-    @DisplayName("registerIndependentMaster returns RegistrationResponse (200) when email already registered — enumeration suppressed")
-    void should_return200WithRegistrationResponse_when_independentMasterEmailAlreadyRegistered() {
-        var request = new RegisterIndependentMasterRequest(
-                "taken@example.com", "Str0ngP@ss1!",
-                null, null, null);
-        log.debug("Arrange: email={} already exists", request.email());
-
-        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
-
-        log.debug("Act: register independent master with already-registered email — expects silent 200 RegistrationResponse");
-        var response = authService.registerIndependentMaster(request);
-
-        assertThat(response).isInstanceOf(RegistrationResponse.class);
-        assertThat(response.email()).isEqualTo("taken@example.com");
-        // No new user persisted, no master created, no OTP email sent for duplicate registration
-        verify(userRepository, never()).save(any());
-        verify(masterService, never()).createMasterForIndependentUser(any());
-        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }
 
     @Test

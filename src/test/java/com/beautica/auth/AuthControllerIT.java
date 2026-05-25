@@ -8,9 +8,11 @@ import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.user.UserRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -80,27 +82,54 @@ class AuthControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should return 200 with RegistrationResponse for duplicate email (anti-enumeration)")
+    @DisplayName("should return 409 with EMAIL_ALREADY_REGISTERED code when registering with duplicate email")
     void should_return409_when_registerWithDuplicateEmail() throws Exception {
+        // Arrange — first registration seeds the email, second hits the duplicate branch.
         log.debug("Arrange: registering email={} twice", "duplicate@beautica.com");
         var request = new RegisterRequest(
                 "duplicate@beautica.com", "Str0ngP@ss1!",
                 SelfRegistrationRole.CLIENT, null, null, null, null);
 
-        restTemplate.postForEntity("/api/v1/auth/register", request, String.class);
+        ResponseEntity<String> firstResponse = restTemplate.postForEntity(
+                "/api/v1/auth/register", request, String.class);
+        assertThat(firstResponse.getStatusCode())
+                .as("seed registration must succeed with 200 OK")
+                .isEqualTo(HttpStatus.OK);
 
+        // Act — second POST with the same email triggers the duplicate branch.
         log.debug("Act: POST /auth/register with already-registered duplicate@beautica.com");
         ResponseEntity<String> secondResponse = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
 
+        // Assert — HTTP status is 409 Conflict (the silent-200 anti-enumeration branch
+        // was removed; the honest 409 is now the only duplicate-email path).
         assertThat(secondResponse.getStatusCode())
-                .as("anti-enumeration: same 200 returned for duplicate email")
-                .isEqualTo(HttpStatus.OK);
+                .as("duplicate registration must surface as 409 Conflict")
+                .isEqualTo(HttpStatus.CONFLICT);
 
-        var apiResponse = objectMapper.readValue(
-                secondResponse.getBody(), new TypeReference<ApiResponse<RegistrationResponse>>() {});
-        assertThat(apiResponse.success()).isTrue();
-        assertThat(apiResponse.data().email()).isEqualTo("duplicate@beautica.com");
+        // Assert — body matches the wire contract, parsed via ObjectMapper so a
+        // malformed JSON change fails fast instead of passing a substring assertion.
+        JsonNode body = objectMapper.readTree(secondResponse.getBody());
+
+        assertThat(body.path("success").isBoolean())
+                .as("body must contain a boolean 'success' field")
+                .isTrue();
+        assertThat(body.path("success").asBoolean())
+                .as("success must be false on the 409 path")
+                .isFalse();
+
+        assertThat(body.path("data").isObject())
+                .as("body must contain a structured 'data' object")
+                .isTrue();
+        // Reference the constant — a rename of EmailAlreadyRegisteredException.ERROR_CODE
+        // must fail this test, not silently break the mobile client's routing logic.
+        assertThat(body.path("data").path("code").asText())
+                .as("data.code must equal the EMAIL_ALREADY_REGISTERED constant")
+                .isEqualTo(EmailAlreadyRegisteredException.ERROR_CODE);
+
+        assertThat(body.path("message").asText())
+                .as("message must be the stable wire-contract string")
+                .isEqualTo("Email already registered");
     }
 
     @Test

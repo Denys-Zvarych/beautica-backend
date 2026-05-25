@@ -10,6 +10,7 @@ import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
@@ -82,10 +83,14 @@ public class AuthService {
     public RegistrationResponse register(RegisterRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // Return the same 200 response for already-registered emails to prevent
-        // enumeration attacks — callers cannot distinguish new from existing registrations.
+        // Honest 409 on duplicate email. The prior anti-enumeration silent-200 was
+        // dropped — it created an undebuggable "we sent a code, but it never comes"
+        // footgun for any caller who hit a duplicate (the OTP path was bypassed but
+        // the response was indistinguishable from a fresh signup). The 409 path is
+        // rate-limited per-IP via AuthRateLimitFilter, so the enumeration surface
+        // is bounded; the trade-off is intentional.
         if (userRepository.existsByEmail(email)) {
-            return RegistrationResponse.of(email);
+            throw new EmailAlreadyRegisteredException();
         }
 
         if (request.role() == SelfRegistrationRole.SALON_OWNER) {
@@ -124,10 +129,9 @@ public class AuthService {
     public RegistrationResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // Return the same 200 response for already-registered emails to prevent
-        // enumeration attacks — callers cannot distinguish new from existing registrations.
+        // Honest 409 on duplicate email. See register() for the rationale.
         if (userRepository.existsByEmail(email)) {
-            return RegistrationResponse.of(email);
+            throw new EmailAlreadyRegisteredException();
         }
 
         String rawOtp = tokenGenerator.generateOtp();

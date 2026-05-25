@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.beautica.auth.dto.EmailAlreadyRegisteredResponse;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
@@ -415,6 +416,73 @@ class GlobalExceptionHandlerTest {
         assertThat(markerLogged)
                 .as("a non-PII exception marker should still be logged at DEBUG")
                 .isTrue();
+    }
+
+    @Test
+    @DisplayName("Should return 409 with EMAIL_ALREADY_REGISTERED code when EmailAlreadyRegisteredException is thrown")
+    void should_return409WithEmailAlreadyRegisteredCode_when_emailAlreadyRegisteredExceptionThrown() {
+        // Arrange — the toggle-on branch of AuthService.register throws this exception.
+        // The handler must emit the structured EmailAlreadyRegisteredResponse body
+        // (with the EMAIL_ALREADY_REGISTERED code) instead of letting handleBusiness
+        // catch it and return the generic "Request could not be completed due to a conflict".
+        var ex = new EmailAlreadyRegisteredException();
+
+        // Act
+        ResponseEntity<ApiResponse<EmailAlreadyRegisteredResponse>> response =
+                handler.handleEmailAlreadyRegistered(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("duplicate-email disclosure must map to 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        // Reference the constant — a rename of EmailAlreadyRegisteredException.ERROR_CODE
+        // must fail this test, not silently break the mobile client's routing logic.
+        assertThat(response.getBody().data().code())
+                .as("code must be the stable EMAIL_ALREADY_REGISTERED constant")
+                .isEqualTo(EmailAlreadyRegisteredException.ERROR_CODE);
+
+        assertThat(response.getBody().message())
+                .as("message must be the stable wire-contract string the mobile client may surface")
+                .isEqualTo("Email already registered");
+    }
+
+    @Test
+    @DisplayName("handleEmailAlreadyRegistered — emits DEBUG log marker without leaking email PII")
+    void should_emitDebugLog_when_emailAlreadyRegisteredExceptionThrown() {
+        // Arrange — the exception itself carries no email field, but this test guards
+        // against future changes that add a payload field (mirrors the PII regression
+        // suite for EmailNotVerifiedException).
+        var ex = new EmailAlreadyRegisteredException();
+        listAppender.list.clear();
+
+        // Act
+        handler.handleEmailAlreadyRegistered(ex);
+
+        // Assert — exactly one DEBUG event was emitted carrying the non-PII class marker
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleEmailAlreadyRegistered must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must contain the non-PII exception class marker")
+                .contains("EmailAlreadyRegisteredException");
+
+        // No log event at any level may contain something that looks like an email
+        // address. The exception is email-less today, but this assertion guards a
+        // future maintainer who adds an email payload field from leaking PII (§I).
+        boolean emailShapedLogged = listAppender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(m -> m.matches(".*\\S+@\\S+.*"));
+        assertThat(emailShapedLogged)
+                .as("no log event may contain an email-shaped substring — PII at any level")
+                .isFalse();
     }
 
     @Test

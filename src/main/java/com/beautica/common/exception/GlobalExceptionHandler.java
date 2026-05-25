@@ -1,5 +1,6 @@
 package com.beautica.common.exception;
 
+import com.beautica.auth.dto.EmailAlreadyRegisteredResponse;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
@@ -36,6 +37,30 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
                 .body(new ApiResponse<>(false, new VerificationErrorResponse(ex.getCode().name()), "Verification failed"));
+    }
+
+    /**
+     * Honest 409 for duplicate-email registration.
+     *
+     * <p>{@code AuthService} throws {@link EmailAlreadyRegisteredException} on every
+     * duplicate-email registration in every profile. The previous anti-enumeration
+     * silent-200 branch was removed because it created an undebuggable "we sent a
+     * code, but it never comes" footgun; the per-IP rate limit on {@code /auth/*}
+     * bounds the enumeration surface.
+     *
+     * <p>Must be declared BEFORE / alongside {@link #handleBusiness} so the structured
+     * {@link EmailAlreadyRegisteredResponse} body (with the {@code EMAIL_ALREADY_REGISTERED}
+     * code) is emitted instead of the generic conflict message.
+     */
+    @ExceptionHandler(EmailAlreadyRegisteredException.class)
+    public ResponseEntity<ApiResponse<EmailAlreadyRegisteredResponse>> handleEmailAlreadyRegistered(
+            EmailAlreadyRegisteredException ex) {
+        log.debug("Registration rejected — {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        new EmailAlreadyRegisteredResponse(EmailAlreadyRegisteredException.ERROR_CODE),
+                        "Email already registered"));
     }
 
     @ExceptionHandler(BusinessException.class)
