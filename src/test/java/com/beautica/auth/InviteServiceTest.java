@@ -935,6 +935,77 @@ class InviteServiceTest {
         assertThat(linkCaptor.getValue()).startsWith("http://localhost:3000/invite/accept?token=");
     }
 
+    // ── Finding 2: SALON_ADMIN can invite masters ─────────────────────────────
+
+    @Test
+    @DisplayName("SALON_ADMIN can invite a SALON_MASTER to their own assigned salon")
+    void should_allow_salonAdmin_to_invite_master() {
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var request = new InviteRequest("newmaster@example.com", salonId, null);
+
+        // SALON_ADMIN caller — salonId is the assigned salon
+        var adminCaller = new User("admin@beautica.test", "hash", Role.SALON_ADMIN, null, null, null, salonId);
+        ReflectionTestUtils.setField(adminCaller, "id", callerId);
+
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
+
+        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(userRepository.existsByEmail("newmaster@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
+        // SALON_ADMIN branch: salonRepository.findById is called (not findByIdAndOwnerId)
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("newmaster@example.com"))
+                .thenReturn(Optional.empty());
+        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        var response = inviteService.sendInvite(request, callerId);
+
+        assertThat(response.invitedEmail()).isEqualTo("newmaster@example.com");
+        verify(salonRepository).findById(salonId);
+        verify(inviteTokenRepository).save(any(InviteToken.class));
+    }
+
+    @Test
+    @DisplayName("SALON_ADMIN is rejected with ForbiddenException when inviting to a foreign salon")
+    void should_reject_salonAdmin_inviting_to_foreign_salon() {
+        var assignedSalonId = UUID.randomUUID();
+        var foreignSalonId  = UUID.randomUUID();
+        var callerId        = UUID.randomUUID();
+        // Request targets a salon the admin is NOT assigned to
+        var request = new InviteRequest("master@example.com", foreignSalonId, null);
+
+        var adminCaller = new User("admin@beautica.test", "hash", Role.SALON_ADMIN, null, null, null, assignedSalonId);
+        ReflectionTestUtils.setField(adminCaller, "id", callerId);
+
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
+
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("SALON_ADMIN may only invite to their own assigned salon");
+
+        verify(inviteTokenRepository, never()).save(any());
+    }
+
+    // ── Finding 3: weak password rejected on invite accept ───────────────────
+
+    @Test
+    @DisplayName("InviteAcceptRequest @StrongPassword rejects a weak password that only satisfies @Size(min=12)")
+    void should_reject_weakPassword_on_inviteAccept() {
+        // @StrongPassword requires uppercase + digit + special char; "aaaaaaaaaaaa" only passes @Size(min=12).
+        // Validate directly using Jakarta Validation to confirm the annotation is in place.
+        var request = new InviteAcceptRequest("valid-token", "aaaaaaaaaaaa", "First", "Last", null);
+
+        var validator = jakarta.validation.Validation.buildDefaultValidatorFactory().getValidator();
+        var violations = validator.validate(request);
+
+        assertThat(violations)
+                .as("@StrongPassword should reject 'aaaaaaaaaaaa' (no uppercase/digit/special)")
+                .anyMatch(v -> v.getPropertyPath().toString().equals("password"));
+    }
+
     private InviteToken buildInviteToken(String email, Instant expiresAt) {
         return new InviteToken(UUID.randomUUID().toString(), email, UUID.randomUUID(), Role.SALON_MASTER, expiresAt);
     }

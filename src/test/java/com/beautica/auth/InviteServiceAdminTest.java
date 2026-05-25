@@ -240,6 +240,45 @@ class InviteServiceAdminTest {
         verify(inviteTokenRepository, never()).save(any());
     }
 
+    // ── sendInvite — SALON_ADMIN master invite success path ───────────────────
+
+    @Test
+    @DisplayName("sendInvite saves token with SALON_MASTER role and uses findById (not findByIdAndOwnerId) when SALON_ADMIN invites their own salon")
+    void should_sendMasterInvite_when_salonAdminInvitesOwnSalon() {
+        // Arrange
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var adminCaller = buildSalonAdmin(callerId, salonId);
+        var request = new InviteRequest("master@example.com", salonId, Role.SALON_MASTER);
+
+        var salonStub = mock(com.beautica.salon.entity.Salon.class);
+        when(salonStub.getName()).thenReturn("Salon A");
+
+        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
+        // SALON_ADMIN branch calls findById, NOT findByIdAndOwnerId
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
+        when(inviteTokenRepository.findByEmailAndIsUsedFalse("master@example.com"))
+                .thenReturn(Optional.empty());
+        when(tokenGenerator.generateToken()).thenReturn("raw-master-tok");
+
+        ArgumentCaptor<com.beautica.user.InviteToken> tokenCaptor =
+                ArgumentCaptor.forClass(com.beautica.user.InviteToken.class);
+        when(inviteTokenRepository.save(tokenCaptor.capture())).thenAnswer(inv -> inv.getArgument(0));
+
+        // Act
+        inviteService.sendInvite(request, callerId);
+
+        // Assert — token was saved with SALON_MASTER role
+        assertThat(tokenCaptor.getValue().getRole())
+                .as("token role must be SALON_MASTER when SALON_ADMIN invites a master")
+                .isEqualTo(Role.SALON_MASTER);
+
+        // Assert — the ownership path used by SALON_ADMIN is findById, not findByIdAndOwnerId
+        verify(salonRepository).findById(salonId);
+        verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
+    }
+
     // ── sendInvite — invalid role guard ───────────────────────────────────────
 
     @Test
@@ -273,14 +312,14 @@ class InviteServiceAdminTest {
 
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-        // Salon B exists but the combined id+ownerId query returns empty because admin is not the owner.
-        when(salonRepository.findByIdAndOwnerId(targetSalonId, callerId)).thenReturn(Optional.empty());
 
+        // Fix 2: SALON_ADMIN branch now detects cross-salon attempts via salonId equality
+        // before reaching the salonRepository.findByIdAndOwnerId path, so the message is
+        // the SALON_ADMIN-specific one (not the SALON_OWNER "own the specified salon" message).
         assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
                 .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("own the specified salon");
+                .hasMessageContaining("SALON_ADMIN may only invite to their own assigned salon");
 
-        verify(salonRepository).findByIdAndOwnerId(targetSalonId, callerId);
         verify(inviteTokenRepository, never()).save(any());
     }
 

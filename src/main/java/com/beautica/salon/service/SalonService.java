@@ -53,6 +53,12 @@ public class SalonService {
 
         boolean isFirstSalon = !salonRepository.existsByOwnerId(owner.getId());
 
+        // Phase 10.3: validate locality when cityId is provided (nullable on creation —
+        // the mobile flow always sends it, but the field is optional for backwards compat).
+        if (request.cityId() != null) {
+            localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+        }
+
         var salon = Salon.builder()
                 .owner(owner)
                 .name(request.name())
@@ -60,6 +66,11 @@ public class SalonService {
                 .city(request.city())
                 .region(request.region())
                 .address(request.address())
+                .cityId(request.cityId())
+                .districtId(request.districtId())
+                .street(request.street())
+                .buildingNo(request.buildingNo())
+                .locationNote(request.locationNote())
                 .phone(request.phone())
                 .instagramUrl(request.instagramUrl())
                 .isActive(true)

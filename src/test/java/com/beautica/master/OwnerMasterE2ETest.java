@@ -123,7 +123,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         log.debug("Step 1 complete — owner={}, client={}", ownerEmail, clientEmail);
 
         // ── Step 2: create salon ──────────────────────────────────────────────
-        var createSalonReq = new CreateSalonRequest("E2E Owner Studio", null, "Kyiv", null, null, null, null);
+        var createSalonReq = new CreateSalonRequest("E2E Owner Studio", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         ResponseEntity<String> salonResp = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(createSalonReq, bearerHeaders(ownerToken)),

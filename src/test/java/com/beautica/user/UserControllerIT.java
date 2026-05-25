@@ -454,42 +454,41 @@ class UserControllerIT extends AbstractIntegrationTest {
     // ── Phase 10.7 — write-path security properties (AC 2/3) ─────────────────
 
     @Test
-    @DisplayName("PATCH /me (CLIENT) — provider-only fields supplied are silently dropped, never persisted (AC 2)")
-    void should_dropProviderOnlyFields_when_clientSuppliesThem() throws Exception {
+    @DisplayName("PATCH /me (CLIENT) — all 5 locality fields (city/district/street/buildingNo/locationNote) are persisted (AC 2)")
+    void should_persistAllLocalityFields_when_clientSuppliesThem() throws Exception {
         log.debug("Arrange: register a CLIENT and resolve a real seeded city id");
         String accessToken = registerAndGetToken(
                 "client-provfields@beautica.com", "Str0ngP@ss1!", "Kli", "Ent", null);
         UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
 
-        // A CLIENT explicitly supplies the provider-only structured address.
-        // The per-role write routing must NOT persist street/buildingNo/
-        // locationNote for a CLIENT (they are a physical-address concept that
-        // only providers own); only the discovery-default city_id is kept.
+        // Since fix(user): persist all 5 locality fields for CLIENT, CLIENTs
+        // may now write street/buildingNo/locationNote in addition to the
+        // discovery fields city_id/district_id. All 5 fields must round-trip.
         var patchRequest = new UpdateProfileRequest(null, null, null,
                 cityId, null, "Provider Street", "42", "Hidden entrance");
 
-        log.debug("Act: PATCH /api/v1/users/me as CLIENT supplying provider-only address fields");
+        log.debug("Act: PATCH /api/v1/users/me as CLIENT supplying all locality fields");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, bearerHeaders(accessToken)),
                 String.class);
 
         assertThat(response.getStatusCode())
-                .as("CLIENT save must still succeed — extra fields are dropped, not an error")
+                .as("CLIENT save with all locality fields must succeed")
                 .isEqualTo(HttpStatus.OK);
 
         var apiResponse = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
         assertThat(apiResponse.data().cityId()).isEqualTo(cityId);
         assertThat(apiResponse.data().street())
-                .as("CLIENT must NOT be able to write the provider-only street field")
-                .isNull();
+                .as("CLIENT can write and retrieve the street field")
+                .isEqualTo("Provider Street");
         assertThat(apiResponse.data().buildingNo())
-                .as("CLIENT must NOT be able to write the provider-only building_no field")
-                .isNull();
+                .as("CLIENT can write and retrieve the building_no field")
+                .isEqualTo("42");
         assertThat(apiResponse.data().locationNote())
-                .as("CLIENT must NOT be able to write the provider-only location_note field")
-                .isNull();
+                .as("CLIENT can write and retrieve the location_note field")
+                .isEqualTo("Hidden entrance");
     }
 
     @Test

@@ -22,6 +22,7 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -75,6 +76,8 @@ class BookingServiceTest {
     @Mock
     private UserRepository userRepository;
     @Mock
+    private SalonRepository salonRepository;
+    @Mock
     private AuthorizationService authz;
     @Mock
     private NotificationOutboxService outboxService;
@@ -108,6 +111,7 @@ class BookingServiceTest {
                 masterRepository,
                 masterServiceRepository,
                 userRepository,
+                salonRepository,
                 authz,
                 outboxService,
                 slotCalculationService,
@@ -830,21 +834,18 @@ class BookingServiceTest {
     void should_returnFilteredBookings_when_salonOwnerListsWithStatus() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        User salonOwner = new User(
-                "owner@example.com", "hash", Role.SALON_OWNER, "Owner", "User", "+380501111113", salonId);
-        setField(salonOwner, "id", actorId);
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-        when(bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(salonId, actorId, BookingStatus.PENDING, pageable))
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.PENDING, pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result =
                 bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.PENDING, pageable);
 
         assertThat(result.getTotalElements()).isZero();
-        verify(bookingRepository).findIdsBySalonIdAndOwnerIdAndStatus(salonId, actorId, BookingStatus.PENDING, pageable);
-        verify(bookingRepository, never()).findIdsBySalonIdAndOwnerId(any(), any(), any());
+        verify(bookingRepository).findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.PENDING, pageable);
+        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
     }
 
     @Test
@@ -852,21 +853,18 @@ class BookingServiceTest {
     void should_returnAllBookings_when_salonOwnerListsWithoutStatus() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        User salonOwner = new User(
-                "owner2@example.com", "hash", Role.SALON_OWNER, "Owner", "Two", "+380501111114", salonId);
-        setField(salonOwner, "id", actorId);
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-        when(bookingRepository.findIdsBySalonIdAndOwnerId(salonId, actorId, pageable))
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
                 .thenReturn(Page.empty());
 
         Page<BookingResponse> result =
                 bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsBySalonIdAndOwnerId(salonId, actorId, pageable);
-        verify(bookingRepository, never()).findIdsBySalonIdAndOwnerIdAndStatus(any(), any(), any(), any());
+        verify(bookingRepository).findIdsBySalonIds(List.of(salonId), pageable);
+        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
     }
 
     @Test
@@ -874,14 +872,11 @@ class BookingServiceTest {
     void should_returnMappedBookings_when_salonOwnerListsWithNonEmptyPage() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        User salonOwner = new User(
-                "owner3@example.com", "hash", Role.SALON_OWNER, "Owner", "Three", "+380501111115", salonId);
-        setField(salonOwner, "id", actorId);
         Pageable pageable = Pageable.unpaged();
         Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
 
-        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-        when(bookingRepository.findIdsBySalonIdAndOwnerId(salonId, actorId, pageable))
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
@@ -894,17 +889,61 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("BusinessException is thrown when a salon owner's account has no salon ID linked")
-    void should_throwBusinessException_when_salonOwnerHasNoSalonId() {
+    @DisplayName("empty page is returned when a salon owner has no active salons")
+    void should_returnEmptyPage_when_salonOwnerHasNoActiveSalons() {
         UUID actorId = UUID.randomUUID();
-        User salonOwner = buildUser(actorId, Role.SALON_OWNER);
-        // salonId is null — buildUser does not set it
         Pageable pageable = Pageable.unpaged();
 
-        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.empty());
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
 
-        assertThatThrownBy(() -> bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable))
-                .isInstanceOf(BusinessException.class);
+        Page<BookingResponse> result =
+                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+
+        assertThat(result).isEmpty();
+        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
+        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
+    }
+
+    // ── Finding 1: new SALON_OWNER multi-salon tests ───────────────────────────
+
+    @Test
+    @DisplayName("salon owner with multiple salons receives bookings from all owned salons")
+    void should_returnOwnerBookings_across_all_owned_salons() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId1 = UUID.randomUUID();
+        UUID salonId2 = UUID.randomUUID();
+        List<UUID> salonIds = List.of(salonId1, salonId2);
+        Pageable pageable = Pageable.unpaged();
+        Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(salonIds);
+        when(bookingRepository.findIdsBySalonIds(salonIds, pageable))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
+                .thenReturn(List.of(existingBooking));
+
+        Page<BookingResponse> result =
+                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        verify(salonRepository).findIdsByOwnerIdAndIsActiveTrue(actorId);
+        verify(bookingRepository).findIdsBySalonIds(salonIds, pageable);
+    }
+
+    @Test
+    @DisplayName("empty page is returned immediately when owner has no active salons")
+    void should_returnEmpty_when_ownerHasNoSalons() {
+        UUID actorId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
+
+        Page<BookingResponse> result =
+                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+
+        assertThat(result).isEmpty();
+        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
+        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
     }
 
     @Test

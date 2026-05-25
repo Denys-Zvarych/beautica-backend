@@ -53,8 +53,11 @@ public class UserService {
      *   <li><b>CLIENT</b> — optional discovery-filter default; only
      *       referential integrity is checked, and only when supplied. Absence
      *       never blocks the save (OTP registration is unaffected — it does
-     *       not call this path at all). The structured street/building/note
-     *       fields are not a client concern and are ignored.</li>
+     *       not call this path at all). All five locality fields
+     *       ({@code cityId}, {@code districtId}, {@code street},
+     *       {@code buildingNo}, {@code locationNote}) are persisted when
+     *       present so clients can pre-fill their preferred location for
+     *       appointment booking.</li>
      *   <li><b>SALON_OWNER / SALON_MASTER / SALON_ADMIN</b> — no personal
      *       locality write path. Owner locality lives on the salon
      *       ({@code SalonService}); SALON_MASTER discovery resolves via the
@@ -68,13 +71,16 @@ public class UserService {
             localityWriteValidator.validateProviderLocality(request.toLocalityInput());
             user.setCityId(request.cityId());
             user.setDistrictId(request.districtId());
-            user.setStreet(request.street());
-            user.setBuildingNo(request.buildingNo());
-            user.setLocationNote(request.locationNote());
+            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
+            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
+            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
         } else if (role == Role.CLIENT) {
             localityWriteValidator.validateClientLocality(request.toLocalityInput());
             user.setCityId(request.cityId());
             user.setDistrictId(request.districtId());
+            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
+            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
+            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
         }
         // SALON_OWNER / SALON_MASTER / SALON_ADMIN: no personal locality write.
     }

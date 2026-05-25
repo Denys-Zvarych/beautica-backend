@@ -148,7 +148,7 @@ class SalonControllerTest {
     void should_return201_when_validSalonCreation() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
-        var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null);
+        var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         var stubResponse = stubSalonResponse(salonId, "My Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
@@ -169,7 +169,7 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 403 when CLIENT token is used")
     void should_return403_when_clientTokenUsedToCreateSalon() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Forbidden Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Forbidden Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         log.debug("Act: POST {} as CLIENT — must be rejected with 403", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -183,7 +183,7 @@ class SalonControllerTest {
     @Test
     @DisplayName("POST /api/v1/salons — 401 when no Authorization header")
     void should_return401_when_noTokenOnCreateSalon() throws Exception {
-        var request = new CreateSalonRequest("Anon Salon", null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Anon Salon", null, null, null, null, null, null, null, null, null, null, null);
 
         log.debug("Act: POST {} without credentials — unauthenticated request must be rejected", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -404,7 +404,7 @@ class SalonControllerTest {
     void should_return201_when_salonOwnerCreatesSecondSalon() throws Exception {
         var userId = UUID.randomUUID();
         var secondSalonId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null);
+        var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null, null, null, null, null, null);
         var stubResponse = stubSalonResponse(secondSalonId, "Second Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
@@ -426,7 +426,7 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses javascript: scheme")
     void should_return400_when_instagramUrlUsesJavascriptScheme() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Insta Salon JS", null, "Kyiv", null, null, null, "javascript:alert(1)");
+        var request = new CreateSalonRequest("Insta Salon JS", null, "Kyiv", null, null, null, "javascript:alert(1)", null, null, null, null, null);
 
         log.debug("Act: POST {} with instagramUrl='javascript:alert(1)' — must be rejected with 400", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -441,7 +441,7 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses http: instead of https:")
     void should_return400_when_instagramUrlUsesHttpScheme() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Insta Salon HTTP", null, "Kyiv", null, null, null, "http://instagram.com/testuser");
+        var request = new CreateSalonRequest("Insta Salon HTTP", null, "Kyiv", null, null, null, "http://instagram.com/testuser", null, null, null, null, null);
 
         log.debug("Act: POST {} with instagramUrl='http://instagram.com/testuser' — must be rejected with 400", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)

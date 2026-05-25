@@ -153,28 +153,103 @@ class UserServiceTest {
         assertThat(user.getCityId()).isEqualTo(cityId);
         assertThat(user.getDistrictId()).isEqualTo(districtId);
         assertThat(user.getStreet()).isEqualTo("Lesi Ukrainky");
+        assertThat(user.getBuildingNo()).isEqualTo("7");
+        assertThat(user.getLocationNote()).isEqualTo("Blue door");
     }
 
     @Test
-    @DisplayName("updateProfile (CLIENT) validates client locality and writes only city_id/district_id")
-    void should_writeClientLocality_when_client() {
+    @DisplayName("updateProfile (CLIENT) persists all five locality fields")
+    void should_writeAllClientLocalityFields_when_client() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
         User user = buildUser(userId, "c@example.com", Role.CLIENT, "Cli", "Ent", "+380501111111");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         when(userRepository.save(user)).thenReturn(user);
 
-        // street is supplied but a CLIENT must not have it persisted (discovery default only).
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, "Ignored St", "99", "ignored");
+                cityId, districtId, "Shevchenka", "12A", "ring twice");
 
         userService.updateProfile(userId, request);
 
-        verify(localityWriteValidator).validateClientLocality(new LocalityWriteInput(cityId, null));
+        verify(localityWriteValidator).validateClientLocality(new LocalityWriteInput(cityId, districtId));
         verify(localityWriteValidator, never()).validateProviderLocality(any());
         assertThat(user.getCityId()).isEqualTo(cityId);
-        assertThat(user.getStreet()).isNull();
+        assertThat(user.getDistrictId()).isEqualTo(districtId);
+        assertThat(user.getStreet()).isEqualTo("Shevchenka");
+        assertThat(user.getBuildingNo()).isEqualTo("12A");
+        assertThat(user.getLocationNote()).isEqualTo("ring twice");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) with null cityId clears cityId/districtId but retains pre-existing street fields")
+    void should_clearAllLocalityFields_when_clientSendsNullCityId() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "c3@example.com", Role.CLIENT, "Null", "City", "+380501111111");
+        // Pre-populate locality so we can confirm referential IDs are cleared while
+        // free-text fields (street/buildingNo/locationNote) are retained via the null-guard.
+        user.setCityId(UUID.randomUUID());
+        user.setDistrictId(UUID.randomUUID());
+        user.setStreet("Old Street");
+        user.setBuildingNo("1");
+        user.setLocationNote("old note");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        verify(localityWriteValidator).validateClientLocality(new LocalityWriteInput(null, null));
+        assertThat(user.getCityId()).isNull();
+        assertThat(user.getDistrictId()).isNull();
+        // street/buildingNo/locationNote are null in the request — null-guard skips them → retained.
+        assertThat(user.getStreet()).isEqualTo("Old Street");
+        assertThat(user.getBuildingNo()).isEqualTo("1");
+        assertThat(user.getLocationNote()).isEqualTo("old note");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) does not overwrite street when street is omitted from the PATCH")
+    void should_notOverwriteStreet_when_clientOmitsStreetInPatch() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "c4@example.com", Role.CLIENT, "Oksana", "P", "+380671234567");
+        user.setStreet("вул. Науки");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        // PATCH sends only cityId — street, buildingNo, locationNote all null.
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getStreet()).isEqualTo("вул. Науки");
+    }
+
+    @Test
+    @DisplayName("updateProfile (INDEPENDENT_MASTER) does not overwrite buildingNo when buildingNo is omitted from the PATCH")
+    void should_notOverwriteBuildingNo_when_independentMasterOmitsBuildingNoInPatch() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "im3@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
+        user.setBuildingNo("5B");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        // PATCH sends cityId and street but omits buildingNo — null-guard must retain the pre-existing value.
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, null, "Lesi Ukrainky", null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getBuildingNo()).isEqualTo("5B");
     }
 
     @Test

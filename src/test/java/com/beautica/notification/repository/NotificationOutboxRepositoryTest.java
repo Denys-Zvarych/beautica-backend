@@ -263,6 +263,78 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         assertThat(repo.countByStatus(OutboxStatus.DEAD)).isEqualTo(1L);
     }
 
+    // ── Purge query ───────────────────────────────────────────────────────────
+
+    /**
+     * Verifies {@link NotificationOutboxRepository#deleteByStatusInAndUpdatedAtBefore}:
+     * <ul>
+     *   <li>Deletes SENT rows whose {@code updated_at} is before the cutoff.</li>
+     *   <li>Deletes DEAD rows whose {@code updated_at} is before the cutoff.</li>
+     *   <li>Preserves a recent SENT row whose {@code updated_at} is after the cutoff.</li>
+     *   <li>Preserves a PENDING row regardless of age (status not in the delete set).</li>
+     * </ul>
+     *
+     * <p>The {@code insertOutboxRow} helper sets {@code updated_at} equal to the supplied
+     * {@code createdAt} timestamp via raw JDBC. Because
+     * {@link NotificationOutboxRepository#deleteByStatusInAndUpdatedAtBefore} is annotated
+     * with {@code @Transactional(propagation = REQUIRES_NEW)}, it opens a new database
+     * transaction that must be able to read the test rows. The {@code @DataJpaTest}
+     * default outer transaction would keep the JDBC inserts uncommitted, making them
+     * invisible to the {@code REQUIRES_NEW} inner transaction. Therefore this test
+     * suspends the outer transaction with
+     * {@code @Transactional(propagation = NOT_SUPPORTED)} so that all JDBC inserts are
+     * auto-committed before the purge call. Post-purge verification uses
+     * {@link JdbcTemplate} (which does not require an active transaction) rather than
+     * {@link TestEntityManager}.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @DisplayName("should_deleteSentAndDeadRowsOlderThanCutoff_andPreservePendingRows")
+    void should_deleteSentAndDeadRowsOlderThanCutoff_andPreservePendingRows() {
+        // Arrange
+        Instant cutoff = Instant.now().minus(java.time.Duration.ofDays(30));
+        Instant old    = cutoff.minusSeconds(3600);   // 1 hour before cutoff — must be deleted
+        Instant recent = cutoff.plusSeconds(3600);    // 1 hour after cutoff  — must survive
+
+        UUID oldSentId    = UUID.randomUUID();
+        UUID oldDeadId    = UUID.randomUUID();
+        UUID recentSentId = UUID.randomUUID();
+        UUID oldPendingId = UUID.randomUUID();
+
+        insertOutboxRow(oldSentId,    OutboxEventType.NEW_BOOKING,      "SENT",    old);
+        insertOutboxRow(oldDeadId,    OutboxEventType.STATUS_CHANGED,   "DEAD",    old);
+        insertOutboxRow(recentSentId, OutboxEventType.NEW_BOOKING,      "SENT",    recent);
+        insertOutboxRow(oldPendingId, OutboxEventType.CLIENT_CANCELLED, "PENDING", old);
+
+        // Act — REQUIRES_NEW inner transaction; rows are now auto-committed so they are visible.
+        repo.deleteByStatusInAndUpdatedAtBefore(List.of(OutboxStatus.SENT, OutboxStatus.DEAD), cutoff);
+
+        // Assert — verify via JDBC so no transaction boundary issues with the persistence context.
+        assertThat(rowExists(oldSentId))
+                .as("old SENT row must be deleted by the purge query")
+                .isFalse();
+        assertThat(rowExists(oldDeadId))
+                .as("old DEAD row must be deleted by the purge query")
+                .isFalse();
+        assertThat(rowExists(recentSentId))
+                .as("recent SENT row must survive (updated_at is after the cutoff)")
+                .isTrue();
+        assertThat(rowExists(oldPendingId))
+                .as("old PENDING row must survive (status not in the delete set)")
+                .isTrue();
+
+        // Cleanup — NOT_SUPPORTED means no rollback; we must delete manually.
+        jdbcTemplate.update("DELETE FROM notification_outbox WHERE id IN (?, ?, ?, ?)",
+                recentSentId, oldPendingId, oldSentId, oldDeadId);
+    }
+
+    private boolean rowExists(UUID id) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM notification_outbox WHERE id = ?",
+                Integer.class, id);
+        return count != null && count > 0;
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /**

@@ -8,13 +8,17 @@ import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -31,6 +35,20 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+/**
+ * Unit tests for {@link NotificationOutboxDrainWorker}.
+ *
+ * <p><strong>Coverage note — {@code dispatchAll()} propagation contract:</strong>
+ * The {@code dispatchAll()} method is annotated with
+ * {@code @Transactional(propagation = Propagation.NOT_SUPPORTED)} so that SMTP
+ * delivery runs outside any active database transaction. This propagation
+ * behaviour cannot be exercised by a plain Mockito unit test because there is no
+ * Spring transaction infrastructure present. It is verified end-to-end by the
+ * Spring context integration test
+ * {@code NotificationOutboxIntegrationTest#drain_to_SENT}, which loads the full
+ * application context with a real PostgreSQL container and asserts that SMTP
+ * dispatch occurs without a surrounding DB transaction.
+ */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("NotificationOutboxDrainWorker — unit")
 class NotificationOutboxDrainWorkerTest {
@@ -55,6 +73,14 @@ class NotificationOutboxDrainWorkerTest {
 
     // Shared real mapper — avoids repeated construction overhead across tests that need real JSON.
     private static final ObjectMapper REAL_MAPPER = new ObjectMapper();
+
+    @BeforeEach
+    void wireself() {
+        // The `self` field is a @Lazy @Autowired self-proxy reference used so drain() calls
+        // the phase methods through the Spring AOP proxy. In unit tests there is no proxy,
+        // so we point `self` directly at the worker instance so drain() operates correctly.
+        ReflectionTestUtils.setField(worker, "self", worker);
+    }
 
     // ── Helper ────────────────────────────────────────────────────────────────
 
@@ -114,6 +140,7 @@ class NotificationOutboxDrainWorkerTest {
         // Arrange — use a real ObjectMapper so JSON deserialisation is actually exercised.
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
                 outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+        ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
         String sealed = "v1:STUB-SEALED";
@@ -148,6 +175,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_dead_letter_when_cipherOpenThrows() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
                 outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+        ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
         String payload = REAL_MAPPER.writeValueAsString(Map.of(
@@ -183,6 +211,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_dead_letter_when_inviteUrlSealedMissing() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
                 outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+        ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
         // Older-schema row: email + salonName only, no inviteUrlSealed key.
@@ -422,6 +451,54 @@ class NotificationOutboxDrainWorkerTest {
                 .doesNotContain("secret");
     }
 
+    // ── Test D: purgeStaleOutboxRows deletes SENT and DEAD, not PENDING ─────────
+
+    @Test
+    @DisplayName("deleteByStatusInAndUpdatedAtBefore is called with SENT and DEAD statuses and a 30-day cutoff")
+    void should_callDeleteWithCorrectStatusesAndCutoff_when_purgeStaleOutboxRowsCalled() {
+        // Arrange
+        ArgumentCaptor<List<OutboxStatus>> statusCaptor =
+                ArgumentCaptor.forClass((Class) List.class);
+        ArgumentCaptor<Instant> cutoffCaptor = ArgumentCaptor.forClass(Instant.class);
+
+        // Act
+        worker.purgeStaleOutboxRows();
+
+        // Assert — statuses and cutoff
+        verify(outboxRepository).deleteByStatusInAndUpdatedAtBefore(
+                statusCaptor.capture(), cutoffCaptor.capture());
+
+        assertThat(statusCaptor.getValue())
+                .as("purge status list must include SENT")
+                .contains(OutboxStatus.SENT)
+                .as("purge status list must include DEAD")
+                .contains(OutboxStatus.DEAD);
+
+        Instant expectedCutoff = Instant.now().minus(java.time.Duration.ofDays(30));
+        assertThat(cutoffCaptor.getValue())
+                .as("cutoff must be within 5 seconds of 30 days ago")
+                .isBetween(expectedCutoff.minusSeconds(5), expectedCutoff.plusSeconds(5));
+    }
+
+    @Test
+    @DisplayName("deleteByStatusInAndUpdatedAtBefore is never called with PENDING in the status list")
+    void should_notIncludePendingInPurge_when_purgeStaleOutboxRowsCalled() {
+        // Arrange
+        ArgumentCaptor<List<OutboxStatus>> statusCaptor =
+                ArgumentCaptor.forClass((Class) List.class);
+
+        // Act
+        worker.purgeStaleOutboxRows();
+
+        // Assert — PENDING must never appear in the delete predicate
+        verify(outboxRepository).deleteByStatusInAndUpdatedAtBefore(
+                statusCaptor.capture(), any(Instant.class));
+
+        assertThat(statusCaptor.getValue())
+                .as("PENDING rows must never be purged by the TTL job")
+                .doesNotContain(OutboxStatus.PENDING);
+    }
+
     // ── Test C: malformed INVITE JSON payload → dead-letter ───────────────────
 
     @Test
@@ -429,6 +506,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_setStatusToPending_when_invitePayloadIsInvalidJson() {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
                 outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+        ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, "NOT_JSON", aggregateId);

@@ -338,8 +338,11 @@ public class AuthorizationService {
             return salonRepository.existsByIdAndOwnerId(salonId, actorId);
         }
         if (actorRole == Role.SALON_ADMIN) {
-            return userRepository.findById(actorId)
-                    .map(u -> salonId.equals(u.getSalonId()))
+            // Fix MEDIUM-7 PERF: the previous findById loaded the full User entity
+            // (including passwordHash) just to read salonId. findSalonIdById uses a
+            // SELECT projection that fetches only the salonId column — one column vs all.
+            return userRepository.findSalonIdById(actorId)
+                    .map(salonId::equals)
                     .orElse(false);
         }
         return false;

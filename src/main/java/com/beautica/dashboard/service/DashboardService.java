@@ -308,6 +308,13 @@ public class DashboardService {
         q.setParameter("salonIds",       salonIdArray);
         q.setParameter("actorMasterId",  scope.actorMasterId() != null ? scope.actorMasterId().toString() : null);
 
+        // Fix HIGH-5 — Safety cap: prevents OOM on large date ranges (e.g. 365 days × many
+        // masters × many service types). Aggregate row count is bounded by
+        // (days × masters × service types); 10,000 rows covers ~27 years of a 1-master,
+        // 1-service salon or ~1 year of a 28-master, 1-service salon.
+        // This is defence-in-depth — the 365-day range cap above is the primary guard.
+        q.setMaxResults(10_000);
+
         List<Object[]> resultRows = q.getResultList();
         List<RawRow>   rows       = new ArrayList<>(resultRows.size());
         for (Object[] r : resultRows) {

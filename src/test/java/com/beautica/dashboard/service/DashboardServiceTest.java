@@ -604,6 +604,29 @@ class DashboardServiceTest {
         assertThat(masterIds).containsExactlyInAnyOrder(ownerMasterId, invitedMasterId);
     }
 
+    // ── 18. OOM safety cap (Fix HIGH-5) ──────────────────────────────────────
+
+    @Test
+    @DisplayName("executeQuery — calls setMaxResults(10000) to prevent OOM on large date ranges")
+    void should_capResultsAt10000_when_executingRevenueQuery() {
+        // Arrange
+        DashboardService svc = newService(Clock.fixed(FIXED_INSTANT, UTC));
+
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        stubEmptyQuery(em, query);
+
+        LocalDate from = LocalDate.of(2026, 4, 1);
+        LocalDate to   = LocalDate.of(2026, 5, 1);
+
+        // Act
+        svc.getRevenueSummary(actorId, Role.SALON_OWNER, from, to, null, null, Optional.empty());
+
+        // Assert — setMaxResults must have been called with exactly 10,000
+        verify(query).setMaxResults(10_000);
+    }
+
     // ── test helpers ──────────────────────────────────────────────────────
 
     /** Creates a {@link DashboardService} with the given clock and shared mocks. */
@@ -630,15 +653,17 @@ class DashboardServiceTest {
 
         when(localEm.createNativeQuery(anyString())).thenReturn(localQuery);
         when(localQuery.setParameter(anyString(), any())).thenReturn(localQuery);
+        when(localQuery.setMaxResults(org.mockito.ArgumentMatchers.anyInt())).thenReturn(localQuery);
         when(localQuery.getResultList()).thenReturn((List) rows);
 
         return new DashboardService(localEm, localMaster, localSalon, localMsr, fixedClock);
     }
 
-    /** Stubs em → query → empty result list. */
+    /** Stubs em → query → empty result list. Also stubs setMaxResults so Mockito does not complain. */
     private void stubEmptyQuery(EntityManager localEm, Query localQuery) {
         when(localEm.createNativeQuery(anyString())).thenReturn(localQuery);
         when(localQuery.setParameter(anyString(), any())).thenReturn(localQuery);
+        when(localQuery.setMaxResults(org.mockito.ArgumentMatchers.anyInt())).thenReturn(localQuery);
         when(localQuery.getResultList()).thenReturn(List.of());
     }
 

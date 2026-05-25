@@ -242,7 +242,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         createdSalonIds.add(salonId);
         saveValidInviteToken(masterEmail, salonId, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", null);
 
         log.debug("Act: POST /auth/invite/accept with valid token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -268,7 +268,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("Token not found → 404")
     void should_return404_when_tokenNotFound() throws Exception {
-        var request = new InviteAcceptRequest("nonexistent-token-xyz", "password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest("nonexistent-token-xyz", "Password12345", "Jane", "Doe", null);
         log.debug("Arrange: no matching token in DB");
 
         log.debug("Act: POST /auth/invite/accept with a token that does not exist in the DB");
@@ -290,7 +290,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String rawToken = UUID.randomUUID().toString();
         saveExpiredInviteToken(masterEmail, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", null);
 
         log.debug("Act: POST /auth/invite/accept with an expired token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -316,7 +316,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String rawToken = UUID.randomUUID().toString();
         saveUsedInviteToken(masterEmail, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", null);
 
         log.debug("Act: POST /auth/invite/accept with a token already marked used for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(

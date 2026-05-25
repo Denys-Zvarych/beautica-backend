@@ -433,9 +433,10 @@ class ServiceCatalogServiceTest {
         serviceCatalogService.deactivateServiceDefinition(serviceDefId);
 
         verify(serviceRepository).deactivateById(serviceDefId);
-        // MEDIUM-3: refreshMinEffectivePrice must be called for every affected master.
-        verify(masterRepository).refreshMinEffectivePrice(masterA);
-        verify(masterRepository).refreshMinEffectivePrice(masterB);
+        // Fix MEDIUM-6: refreshMinEffectivePriceForAll collapses N round-trips into one bulk UPDATE.
+        verify(masterRepository).refreshMinEffectivePriceForAll(List.of(masterA, masterB));
+        // Single-ID variant must NOT be called — verifies the loop was replaced.
+        verify(masterRepository, never()).refreshMinEffectivePrice(any());
     }
 
     @Test
