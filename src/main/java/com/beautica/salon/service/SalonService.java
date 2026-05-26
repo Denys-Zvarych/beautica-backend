@@ -53,12 +53,6 @@ public class SalonService {
 
         boolean isFirstSalon = !salonRepository.existsByOwnerId(owner.getId());
 
-        // Phase 10.3: validate locality when cityId is provided (nullable on creation —
-        // the mobile flow always sends it, but the field is optional for backwards compat).
-        if (request.cityId() != null) {
-            localityWriteValidator.validateProviderLocality(request.toLocalityInput());
-        }
-
         var salon = Salon.builder()
                 .owner(owner)
                 .name(request.name())
@@ -78,6 +72,22 @@ public class SalonService {
                 .build();
 
         Salon savedSalon = salonRepository.save(salon);
+
+        // Phase 10.3: validate locality when cityId is provided (nullable on creation —
+        // the mobile flow always sends it, but the field is optional for backwards compat).
+        // Sync location to owner's User row so /users/me reflects the salon address.
+        // userRepository.save is intentionally scoped inside this guard: when no structured
+        // location is provided there is nothing to sync, and the multi-salon test asserts
+        // that save(owner) is never called unconditionally.
+        if (request.cityId() != null) {
+            localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+            owner.setCityId(request.cityId());
+            owner.setDistrictId(request.districtId());
+            owner.setStreet(request.street());
+            owner.setBuildingNo(request.buildingNo());
+            owner.setLocationNote(request.locationNote());
+            userRepository.save(owner);
+        }
 
         // Evict ownerSalons cache after commit so a concurrent reader cannot repopulate
         // with stale data inside the commit window (Anti-Bug Playbook §F rule 2).

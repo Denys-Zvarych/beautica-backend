@@ -25,6 +25,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
@@ -65,6 +66,11 @@ class SalonServiceTest {
     @Mock
     private MasterService masterService;
 
+    @Mock
+    // CacheManager: post-commit eviction uses TransactionSynchronizationManager,
+    // which is inactive under MockitoExtension — tested via integration test.
+    private CacheManager cacheManager;
+
     @InjectMocks
     private SalonService salonService;
 
@@ -77,6 +83,7 @@ class SalonServiceTest {
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         SalonResponse response = salonService.createSalon(ownerId, request);
@@ -84,6 +91,48 @@ class SalonServiceTest {
         assertThat(response.name()).isEqualTo("Second Salon");
         assertThat(response.ownerId()).isEqualTo(ownerId);
         verify(salonRepository).save(any(Salon.class));
+        // cityId is null in the request above — the locality sync guard must not fire
+        verify(userRepository, never()).save(any(User.class));
+        // second-salon path must NOT trigger master auto-creation
+        verify(masterService, never()).createMasterForOwner(any(User.class), any(Salon.class));
+    }
+
+    @Test
+    @DisplayName("createSalon — syncs locality fields to owner and saves owner when cityId is provided")
+    void should_syncLocationToOwner_when_createSalonWithCityId() {
+        // Arrange
+        UUID ownerId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        // Field order: name, description, city, region, address, phone, instagramUrl,
+        //              cityId, districtId, street, buildingNo, locationNote
+        var request = new CreateSalonRequest(
+                "Geo Salon", null, null, null, null, null, null,
+                cityId, districtId, "Shevchenka St", "5A", "2nd floor"
+        );
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "Geo Salon");
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+        when(userRepository.save(owner)).thenReturn(owner);
+
+        // Act
+        salonService.createSalon(ownerId, request);
+
+        // Assert — locality fields mirrored onto the owner entity
+        assertThat(owner.getCityId()).isEqualTo(cityId);
+        assertThat(owner.getStreet()).isEqualTo("Shevchenka St");
+        assertThat(owner.getBuildingNo()).isEqualTo("5A");
+        assertThat(owner.getLocationNote()).isEqualTo("2nd floor");
+        assertThat(owner.getDistrictId()).isEqualTo(districtId);
+        // userRepository.save must be called exactly once (inside the cityId guard)
+        verify(userRepository).save(owner);
+        // Locality validation must have been invoked
+        verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
+        // first-salon path (existsByOwnerId=false) must trigger master auto-creation
+        verify(masterService).createMasterForOwner(owner, savedSalon);
     }
 
     @Test
@@ -204,6 +253,30 @@ class SalonServiceTest {
     }
 
     @Test
+    @DisplayName("createSalon — propagates BusinessException from localityWriteValidator and does not save owner")
+    void should_throwBusinessException_when_localityValidatorRejectsOnCreateSalon() {
+        // Arrange
+        UUID ownerId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        // Non-null cityId ensures the locality-sync guard is entered and the validator is called.
+        var request = new CreateSalonRequest(
+                "Bad Geo Salon", null, null, null, null, null, null,
+                cityId, null, null, null, null
+        );
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
+                .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
+
+        // Act + Assert
+        assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+
+        verify(userRepository, never()).save(any(User.class));
+    }
+
+    @Test
     @DisplayName("deactivateSalon — sets isActive to false and saves when owner requests")
     void should_deactivateSalon_when_ownerRequests() {
         UUID ownerId = UUID.randomUUID();
@@ -272,6 +345,19 @@ class SalonServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — throws NotFoundException when user not found")
+    void should_throwNotFoundException_when_deactivateSalonAndUserNotFound() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(userRepository.findById(ownerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> salonService.deactivateSalon(ownerId, salonId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
     }
 
     @Test
