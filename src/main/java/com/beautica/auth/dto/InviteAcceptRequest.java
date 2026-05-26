@@ -30,6 +30,7 @@ public record InviteAcceptRequest(
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Last name must not contain control characters")
         String lastName,
 
+        @NotBlank(message = "Phone number is required")
         @Size(max = 20)
         @Pattern(regexp = "^[+\\d\\s\\-()]*$", message = "Phone number contains invalid characters")
         String phoneNumber

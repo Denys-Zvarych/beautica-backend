@@ -215,6 +215,7 @@ class AuthControllerRegisterTest {
                                   "role": "SALON_OWNER",
                                   "firstName": "Олена",
                                   "lastName": "Коваль",
+                                  "phoneNumber": "+380501234567",
                                   "businessName": "Salon Ніжність"
                                 }
                                 """))
@@ -264,6 +265,57 @@ class AuthControllerRegisterTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
 
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
+    // ── QA: RegisterRequest.phoneNumber @NotBlank guard ──────────────────────
+
+    @Test
+    @DisplayName("400 Bad Request when phoneNumber is blank (empty string)")
+    void should_return400_when_phoneNumberIsBlank() throws Exception {
+        log.debug("Arrange: no mock needed — blank phoneNumber fails @NotBlank before service is reached");
+
+        log.debug("Act: POST {} with blank phoneNumber", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "new@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Taras",
+                                  "lastName": "Shevchenko",
+                                  "phoneNumber": ""
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        log.debug("Assert: service must NOT be invoked when Bean Validation fails");
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
+    @Test
+    @DisplayName("400 Bad Request when phoneNumber is null (omitted)")
+    void should_return400_when_phoneNumberIsNull() throws Exception {
+        log.debug("Arrange: no mock needed — null phoneNumber fails @NotBlank before service is reached");
+
+        log.debug("Act: POST {} with phoneNumber omitted", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "new@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Taras",
+                                  "lastName": "Shevchenko"
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        log.debug("Assert: service must NOT be invoked when Bean Validation fails");
         verify(authService, never()).register(any(RegisterRequest.class));
     }
 }

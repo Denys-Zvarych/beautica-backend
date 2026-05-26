@@ -169,7 +169,7 @@ class PasswordResetConcurrencyTest {
         restTemplate.postForEntity(
                 "/api/v1/auth/register",
                 new RegisterRequest(email, "Password1!",
-                        SelfRegistrationRole.CLIENT, "Anna", "Test", null, null),
+                        SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null),
                 String.class);
         jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
     }

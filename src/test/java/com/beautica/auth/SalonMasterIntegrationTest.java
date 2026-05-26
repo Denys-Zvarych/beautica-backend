@@ -123,7 +123,7 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
         saveValidInviteToken(masterEmail, salonId, rawToken);
 
         // Act: master accepts the invite
-        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Oksana", "Kovalenko", null);
+        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Oksana", "Kovalenko", "+380501234567");
         log.debug("Act: POST /auth/invite/accept");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
@@ -175,7 +175,7 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
                 .when(masterService).createMasterFromInvite(any(UUID.class), any(UUID.class));
 
         // Act: attempt invite accept — expect 500 due to uncaught RuntimeException
-        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Fail", "Master", null);
+        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Fail", "Master", "+380501234567");
         log.debug("Act: POST /auth/invite/accept with failing masterService");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);

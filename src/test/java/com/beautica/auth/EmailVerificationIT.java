@@ -90,7 +90,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
     private String registerAndCaptureCode(String email) throws Exception {
         var request = new RegisterRequest(
                 email, "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
+                SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null);
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
@@ -113,7 +113,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         var email = "reg.lifecycle@beautica.test";
         var request = new RegisterRequest(
                 email, "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
+                SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null);
         log.debug("Arrange: CLIENT register request for email={}", email);
 
         log.debug("Act: POST /api/v1/auth/register");
@@ -170,7 +170,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         log.debug("Act: POST /api/v1/auth/register for email={}", email);
         var request = new RegisterRequest(
                 email, "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
+                SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null);
         restTemplate.postForEntity("/api/v1/auth/register", request, String.class);
 
         log.debug("Assert: sendVerificationEmail called once with a 6-digit code");
@@ -330,7 +330,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         log.debug("Arrange: register email={} without verifying", email);
         var request = new RegisterRequest(
                 email, "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, "Anna", "Test", null, null);
+                SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null);
         restTemplate.postForEntity("/api/v1/auth/register", request, String.class);
 
         log.debug("Act: POST /api/v1/auth/login with correct password but unverified email");

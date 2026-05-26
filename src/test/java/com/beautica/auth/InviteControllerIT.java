@@ -242,7 +242,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         createdSalonIds.add(salonId);
         saveValidInviteToken(masterEmail, salonId, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", "+380501234567");
 
         log.debug("Act: POST /auth/invite/accept with valid token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -268,7 +268,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("Token not found → 404")
     void should_return404_when_tokenNotFound() throws Exception {
-        var request = new InviteAcceptRequest("nonexistent-token-xyz", "Password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest("nonexistent-token-xyz", "Password12345", "Jane", "Doe", "+380501234567");
         log.debug("Arrange: no matching token in DB");
 
         log.debug("Act: POST /auth/invite/accept with a token that does not exist in the DB");
@@ -290,7 +290,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String rawToken = UUID.randomUUID().toString();
         saveExpiredInviteToken(masterEmail, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", "+380501234567");
 
         log.debug("Act: POST /auth/invite/accept with an expired token for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -316,7 +316,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String rawToken = UUID.randomUUID().toString();
         saveUsedInviteToken(masterEmail, rawToken);
 
-        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", null);
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", "+380501234567");
 
         log.debug("Act: POST /auth/invite/accept with a token already marked used for email={}", masterEmail);
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -455,6 +455,55 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 .isNotEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
+    @Test
+    @DisplayName("invite/accept with blank phoneNumber → 400")
+    void should_return400_when_inviteAccept_has_blank_phoneNumber() throws Exception {
+        // Arrange: a valid token is not needed — Bean Validation fires before service logic
+        log.debug("Arrange: request with empty phoneNumber — validation must reject before reaching service");
+        var request = new InviteAcceptRequest("any-token", "Password12345", "Jane", "Doe", "");
+
+        // Act
+        log.debug("Act: POST /auth/invite/accept with blank phoneNumber");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept", request, String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when phoneNumber is blank")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("invite/accept omitting phoneNumber → 400")
+    void should_return400_when_inviteAccept_omits_phoneNumber() throws Exception {
+        // Arrange: send raw JSON without phoneNumber field — Jackson sets it to null, @NotBlank rejects null
+        log.debug("Arrange: request body without phoneNumber field — @NotBlank must reject null");
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String json = """
+                {
+                  "token": "any-token",
+                  "password": "Password12345",
+                  "firstName": "Jane",
+                  "lastName": "Doe"
+                }
+                """;
+
+        // Act
+        log.debug("Act: POST /auth/invite/accept with phoneNumber field absent from JSON body");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/auth/invite/accept",
+                HttpMethod.POST,
+                new HttpEntity<>(json, headers),
+                String.class
+        );
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 400 when phoneNumber is absent from the request body")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String uniqueEmail(String prefix) {
@@ -477,7 +526,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
     private String registerAndGetToken(String email, Role ignoredRole) throws Exception {
         restTemplate.postForEntity(
                 "/api/v1/auth/register",
-                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, "Test", "User", null, null),
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
                 String.class
         );
         // Phase 1.7: mark email as verified so login does not return 403 EMAIL_NOT_VERIFIED

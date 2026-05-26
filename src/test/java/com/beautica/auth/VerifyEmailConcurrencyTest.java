@@ -97,7 +97,7 @@ class VerifyEmailConcurrencyTest {
         restTemplate.postForEntity(
                 "/api/v1/auth/register",
                 new RegisterRequest(email, "Str0ngP@ss1!",
-                        SelfRegistrationRole.CLIENT, "Anna", "Test", null, null),
+                        SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null),
                 String.class);
 
         // Two threads, released simultaneously, both submit a wrong code.
