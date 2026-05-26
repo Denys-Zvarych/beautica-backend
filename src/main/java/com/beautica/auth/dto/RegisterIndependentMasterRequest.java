@@ -18,10 +18,14 @@ public record RegisterIndependentMasterRequest(
         @StrongPassword
         String password,
 
+        @NotBlank(message = "First name is required")
         @Size(max = 100, message = "First name must not exceed 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "First name must not contain control characters")
         String firstName,
 
+        @NotBlank(message = "Last name is required")
         @Size(max = 100, message = "Last name must not exceed 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Last name must not contain control characters")
         String lastName,
 
         @Size(max = 20, message = "Phone number must not exceed 20 characters")
