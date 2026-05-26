@@ -557,4 +557,53 @@ class ServiceControllerTest {
                         .with(csrf()))
                 .andExpect(status().isForbidden());
     }
+
+    // ── QA-MEDIUM: CreateServiceDefinitionRequest @Pattern — control-char guard
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when service name contains a control character (NUL byte)")
+    void should_return400_when_serviceNameContainsControlCharacter() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        // NUL byte in name — @Pattern(^[^\p{Cntrl}]*$) must reject before the service is reached
+        var body = "{\"name\":\"Manicure\\u0000\""
+                + ",\"baseDurationMinutes\":60,\"basePrice\":\"350.00\",\"bufferMinutesAfter\":0}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with name containing NUL byte — must return 400", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .addServiceToSalon(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when service description contains a control character (tab injection)")
+    void should_return400_when_serviceDescriptionContainsControlCharacter() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        // Tab character in description — @Pattern(^[^\p{Cntrl}]*$) must reject
+        var body = "{\"name\":\"Manicure\""
+                + ",\"description\":\"Good desc\\tbad\""
+                + ",\"baseDurationMinutes\":60,\"basePrice\":\"350.00\",\"bufferMinutesAfter\":0}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with description containing tab — must return 400", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .addServiceToSalon(any(), any());
+    }
 }

@@ -318,12 +318,15 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("returns 200 when optional fields firstName, lastName, phoneNumber are absent")
-        void should_return201_when_optionalFieldsAreNull() {
-            // firstName, lastName, phoneNumber are optional in RegisterRequest — null is valid
-            var minimalRequest = new RegisterRequest(registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT, null, null, null, null);
+        @DisplayName("returns 200 when optional fields phoneNumber and businessName are absent")
+        void should_return200_when_optionalPhoneAndBusinessNameAreNull() {
+            // phoneNumber and businessName are optional; firstName and lastName are required (@NotBlank).
+            // This test verifies that omitting the truly-optional fields does not cause a 400.
+            var minimalRequest = new RegisterRequest(
+                    registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT,
+                    TEST_FIRST, TEST_LAST, null, null);
 
-            log.debug("Act: POST {} with only required fields", REGISTER_URL);
+            log.debug("Act: POST {} with required fields only (no phoneNumber, no businessName)", REGISTER_URL);
             var response = post(minimalRequest);
 
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);

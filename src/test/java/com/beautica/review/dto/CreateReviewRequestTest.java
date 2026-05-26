@@ -161,4 +161,37 @@ class CreateReviewRequestTest {
         assertThat(violations).isNotEmpty();
         assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
     }
+
+    // ── QA-MEDIUM: @Pattern control-char ban — embedded NUL/newline ───────────
+
+    @Test
+    @DisplayName("rejects comment when comment contains an embedded NUL byte in position 2 (\\p{Cntrl} ban)")
+    void should_rejectComment_when_commentContainsEmbeddedControlCharacter() {
+        // "x" passes the leading-char check; NUL at position 1 must be caught by
+        // the second character class [^\p{Cntrl}]{0,1999} in the @Pattern.
+        var comment = "x" + "\u0000" + "rest of comment";
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, comment);
+
+        Set<ConstraintViolation<CreateReviewRequest>> violations = validator.validate(request);
+
+        assertThat(violations)
+                .as("comment with embedded NUL byte must fail @Pattern validation")
+                .isNotEmpty();
+        assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
+    }
+
+    @Test
+    @DisplayName("rejects comment when comment contains a leading control character (NUL in position 0)")
+    void should_rejectComment_when_commentStartsWithControlCharacter() {
+        // NUL byte at position 0 — fails both the leading-char class and the \p{Cntrl} ban
+        var comment = "\u0000" + "starts with null";
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, comment);
+
+        Set<ConstraintViolation<CreateReviewRequest>> violations = validator.validate(request);
+
+        assertThat(violations)
+                .as("comment starting with NUL byte must fail @Pattern validation")
+                .isNotEmpty();
+        assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
+    }
 }

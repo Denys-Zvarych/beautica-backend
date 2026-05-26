@@ -37,6 +37,7 @@ public record RegisterRequest(
         String phoneNumber,
 
         @Size(max = 255, message = "Business name must not exceed 255 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Business name must not contain control characters")
         String businessName
 ) {
 }

@@ -477,7 +477,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
     private String registerAndGetToken(String email, Role ignoredRole) throws Exception {
         restTemplate.postForEntity(
                 "/api/v1/auth/register",
-                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, "Test", "User", null, null),
                 String.class
         );
         // Phase 1.7: mark email as verified so login does not return 403 EMAIL_NOT_VERIFIED

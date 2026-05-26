@@ -88,7 +88,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         log.debug("Arrange: registering email={} twice", "duplicate@beautica.com");
         var request = new RegisterRequest(
                 "duplicate@beautica.com", "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, null, null, null, null);
+                SelfRegistrationRole.CLIENT, "Test", "User", null, null);
 
         ResponseEntity<String> firstResponse = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
@@ -158,7 +158,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         log.debug("Arrange: pre-registering email={} with known password", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", null, null),
                 String.class);
         verifyEmailInDb(email);
 
@@ -210,7 +210,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         log.debug("Arrange: user {} registered and logged in", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", null, null),
                 String.class);
         verifyEmailInDb(email);
 
@@ -249,7 +249,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         log.debug("Arrange: obtained access token for {}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", null, null),
                 String.class);
         verifyEmailInDb(email);
 
@@ -300,7 +300,7 @@ class AuthControllerIT extends AbstractIntegrationTest {
         log.debug("Arrange: register user email={}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", null, null),
                 String.class);
         verifyEmailInDb(email);
 
