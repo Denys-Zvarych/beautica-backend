@@ -10,12 +10,14 @@ import java.util.UUID;
 public record SuggestServiceTypeRequest(
         @NotBlank
         @Size(max = 255)
-        @Pattern(regexp = "^[^\\r\\n\\t]*$", message = "Name must not contain newline or tab characters")
+        // Full control-char ban (§D) — the prior narrow pattern only rejected \r\n\t
+        // but allowed NUL (0x00) and other control bytes that produce a DB 500.
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
         String name,
 
         @NotNull UUID categoryId,
 
         @Size(max = 1000)
-        @Pattern(regexp = "^[^\\r\\n\\t]*$", message = "Description must not contain newline or tab characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
         String description
 ) {}

@@ -30,13 +30,23 @@ import java.util.UUID;
  * rather than a {@code DataIntegrityViolationException} 500 (§A).
  */
 public record UpdateSalonRequest(
-        @Size(max = 255) String name,
-        @Size(max = 2000) String description,
+        @Size(max = 255)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String name,
+        @Size(max = 2000)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String description,
 
         // ---- Legacy free-text locality (deprecated; no longer persisted) ----
-        @Size(max = 100) String city,
-        @Size(max = 100) String region,
-        @Size(max = 500) String address,
+        @Size(max = 100)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String city,
+        @Size(max = 100)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String region,
+        @Size(max = 500)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String address,
 
         // ---- Phase 10.6 taxonomy locality + light structured address -------
         // Control-char @Pattern alongside @Size (MasterSearchRequest.q

@@ -378,7 +378,7 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     private void registerAndVerify(String email, String password) {
         restTemplate.postForEntity(
                 "/api/v1/auth/register",
-                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", null, null),
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
                 String.class);
         transactionTemplate.executeWithoutResult(status ->
                 userRepository.findByEmail(email).ifPresent(u -> {

@@ -1,6 +1,7 @@
 package com.beautica.notification.dto;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 /**
@@ -10,5 +11,9 @@ public record UnregisterDeviceTokenRequest(
 
         @NotBlank
         @Size(max = 500)
+        @Pattern(
+                regexp = "^[A-Za-z0-9\\-_:]+$",
+                message = "Device token must contain only alphanumeric characters, hyphens, underscores, or colons"
+        )
         String token
 ) {}

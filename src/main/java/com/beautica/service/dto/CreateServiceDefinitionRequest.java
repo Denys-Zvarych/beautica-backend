@@ -9,6 +9,7 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.Size;
 
@@ -16,8 +17,13 @@ import java.math.BigDecimal;
 import java.util.UUID;
 
 public record CreateServiceDefinitionRequest(
-        @NotBlank @Size(max = 100) String name,
-        @Size(max = 2000) String description,
+        @NotBlank
+        @Size(max = 100)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
+        String name,
+        @Size(max = 2000)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
+        String description,
         ServiceCategory category,
         @NotNull @Positive @Max(480) int baseDurationMinutes,
         @NotNull(message = "Base price is required") @DecimalMin("0.00") @DecimalMax("99999999.99") @Digits(integer = 8, fraction = 2) BigDecimal basePrice,

@@ -875,6 +875,52 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
     }
 
+    // ── QA-CRITICAL: clientComment @Pattern — control-char guard ─────────────
+
+    @Test
+    @DisplayName("POST / — 400 when clientComment contains a control character (NUL byte)")
+    void should_return400_when_clientCommentContainsControlCharacter() throws Exception {
+        var clientId = UUID.randomUUID();
+        //   is the NUL control character — matches \p{Cntrl} and must be rejected by @Pattern
+        var body = "{\"masterId\":\"" + UUID.randomUUID()
+                + "\",\"masterServiceId\":\"" + UUID.randomUUID()
+                + "\",\"startsAt\":\"2027-01-01T10:00:00+02:00\""
+                + ",\"clientComment\":\"valid prefix\\u0000embedded null\"}";
+
+        mockMvc.perform(post(BOOKINGS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never()).createBooking(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("POST / — 201 when clientComment contains only printable Ukrainian text")
+    void should_return201_when_clientCommentIsPrintableUkrainianText() throws Exception {
+        var clientId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        // Ukrainian printable text — all chars are outside \p{Cntrl}, so @Pattern must pass
+        var body = "{\"masterId\":\"" + masterId
+                + "\",\"masterServiceId\":\"" + serviceId
+                + "\",\"startsAt\":\"2027-01-01T10:00:00+02:00\""
+                + ",\"clientComment\":\"Будь ласка, тихіше\"}";
+        when(bookingService.createBooking(eq(clientId), any(), any()))
+                .thenReturn(stubResponse(bookingId, clientId, masterId, serviceId));
+
+        mockMvc.perform(post(BOOKINGS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated());
+    }
+
     // ── QA-MEDIUM-1: enum validation — ?status param ─────────────────────────
 
     @Test
@@ -906,6 +952,72 @@ class BookingControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── QA-HIGH: CancelBookingRequest.comment @Pattern — control-char guard ───
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/cancel — 400 when comment contains a control character (NUL byte)")
+    void should_return400_when_cancelCommentContainsControlCharacter() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        // NUL byte in comment — @Pattern(^[^\p{Cntrl}]*$) must reject before service is reached
+        var body = "{\"cancellationReason\":\"CLIENT_CANCELLED\""
+                + ",\"comment\":\"valid prefix\\u0000embedded null\"}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/cancel")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never()).cancelBooking(any(), any(), any());
+    }
+
+    // ── QA-HIGH: StatusUpdateRequest.comment @Pattern — decline control-char guard
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/decline — 400 when comment contains a control character (newline injection)")
+    void should_return400_when_declineCommentContainsControlCharacter() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        // Newline in comment — matches \p{Cntrl}, must be rejected at the controller boundary
+        var body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\""
+                + ",\"comment\":\"legit comment\\nX-Injected: header\"}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never()).declineBooking(any(), any(), any());
+    }
+
+    // ── QA-HIGH: StatusUpdateRequest.comment @Pattern — not-complete control-char guard
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/not-complete — 400 when comment contains a control character (tab injection)")
+    void should_return400_when_notCompleteCommentContainsControlCharacter() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        // Tab character — matches \p{Cntrl}, must be rejected before the service is reached
+        var body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\""
+                + ",\"comment\":\"no-show note\\ttab-injected\"}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never()).notCompleteBooking(any(), any(), any());
     }
 
 }

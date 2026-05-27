@@ -329,4 +329,42 @@ class DeviceControllerTest {
 
         verify(deviceTokenRepository, never()).deleteByUserIdAndToken(any(UUID.class), anyString());
     }
+
+    @Test
+    @DisplayName("POST /devices/token — 400 when token contains a control character (newline injection attempt)")
+    void should_return400_when_deviceTokenContainsControlCharacter() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // Arrange: token contains a newline — matches the @Pattern rejection path, not the @Size path
+        String body = "{\"token\":\"abc\\nX-Header: injected\",\"platform\":\"ANDROID\"}";
+
+        log.debug("Act: POST /api/v1/devices/token with newline-containing token — must return 400");
+        mockMvc.perform(post("/api/v1/devices/token")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        verify(deviceTokenRepository, never()).save(any(DeviceToken.class));
+    }
+
+    @Test
+    @DisplayName("DELETE /devices/token — 400 when token contains whitespace (fails @Pattern)")
+    void should_return400_when_unregisterTokenContainsWhitespace() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // Arrange: token contains an embedded space — whitespace is outside [A-Za-z0-9\-_:]
+        String body = "{\"token\":\"abc def\"}";
+
+        log.debug("Act: DELETE /api/v1/devices/token with space-containing token — must return 400");
+        mockMvc.perform(delete("/api/v1/devices/token")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        verify(deviceTokenRepository, never()).deleteByUserIdAndToken(any(UUID.class), anyString());
+    }
 }

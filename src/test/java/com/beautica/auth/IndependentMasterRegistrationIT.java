@@ -192,6 +192,36 @@ class IndependentMasterRegistrationIT extends AbstractIntegrationTest {
         assertThat(response.getBody().success()).isFalse();
     }
 
+    // ── QA: RegisterIndependentMasterRequest.phoneNumber @NotBlank guard ─────
+
+    @Test
+    @DisplayName("returns 400 when phoneNumber is blank (empty string)")
+    void should_return400_when_phoneNumberIsBlank() {
+        registeredEmail = null;
+        var request = new RegisterIndependentMasterRequest(
+                "im-blank-phone@beautica.test", TEST_PASSWORD, TEST_FIRST, TEST_LAST, "");
+
+        log.debug("Act: POST {} with blank phoneNumber", REGISTER_URL);
+        var response = postIndependentMaster(request);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody().success()).isFalse();
+    }
+
+    @Test
+    @DisplayName("returns 400 when phoneNumber is null (omitted)")
+    void should_return400_when_phoneNumberIsNull() {
+        registeredEmail = null;
+        var request = new RegisterIndependentMasterRequest(
+                "im-null-phone@beautica.test", TEST_PASSWORD, TEST_FIRST, TEST_LAST, null);
+
+        log.debug("Act: POST {} with null phoneNumber", REGISTER_URL);
+        var response = postIndependentMaster(request);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody().success()).isFalse();
+    }
+
     private ResponseEntity<ApiResponse<RegistrationResponse>> postIndependentMaster(
             RegisterIndependentMasterRequest request) {
         return restTemplate.exchange(

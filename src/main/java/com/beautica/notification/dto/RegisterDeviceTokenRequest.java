@@ -15,6 +15,10 @@ public record RegisterDeviceTokenRequest(
 
         @NotBlank
         @Size(max = 500)
+        @Pattern(
+                regexp = "^[A-Za-z0-9\\-_:]+$",
+                message = "Device token must contain only alphanumeric characters, hyphens, underscores, or colons"
+        )
         String token,
 
         @NotBlank

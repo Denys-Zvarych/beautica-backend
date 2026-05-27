@@ -267,7 +267,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
             // Email is blank — @NotBlank fires before the service is ever called,
             // so no user is created and @AfterEach will find nothing to clean up.
             registeredEmail = null;
-            var request = new RegisterRequest("", TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
+            var request = new RegisterRequest("", TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, TEST_PHONE, null);
 
             log.debug("Act: POST {} with blank email", REGISTER_URL);
             var response = post(request);
@@ -280,7 +280,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         @DisplayName("returns 400 when email format is invalid")
         void should_return400_when_emailFormatIsInvalid() {
             registeredEmail = null;
-            var request = new RegisterRequest("not-an-email", TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
+            var request = new RegisterRequest("not-an-email", TEST_PASSWORD, SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, TEST_PHONE, null);
 
             log.debug("Act: POST {} with malformed email", REGISTER_URL);
             var response = post(request);
@@ -294,7 +294,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         void should_return400_when_passwordTooShort() {
             registeredEmail = null;
             var request = new RegisterRequest(
-                    "valid@beautica.test", "short", SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
+                    "valid@beautica.test", "short", SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, TEST_PHONE, null);
 
             log.debug("Act: POST {} with password shorter than 8 chars", REGISTER_URL);
             var response = post(request);
@@ -308,7 +308,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         void should_return400_when_passwordIsBlank() {
             registeredEmail = null;
             var request = new RegisterRequest(
-                    "valid2@beautica.test", "", SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, null, null);
+                    "valid2@beautica.test", "", SelfRegistrationRole.CLIENT, TEST_FIRST, TEST_LAST, TEST_PHONE, null);
 
             log.debug("Act: POST {} with blank password", REGISTER_URL);
             var response = post(request);
@@ -318,12 +318,15 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("returns 200 when optional fields firstName, lastName, phoneNumber are absent")
-        void should_return201_when_optionalFieldsAreNull() {
-            // firstName, lastName, phoneNumber are optional in RegisterRequest — null is valid
-            var minimalRequest = new RegisterRequest(registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT, null, null, null, null);
+        @DisplayName("returns 200 when optional field businessName is absent")
+        void should_return200_when_businessNameIsAbsent() {
+            // businessName is optional for CLIENT (it applies to SALON_OWNER only).
+            // phoneNumber is required for CLIENT — include it so validation passes.
+            var minimalRequest = new RegisterRequest(
+                    registeredEmail, TEST_PASSWORD, SelfRegistrationRole.CLIENT,
+                    TEST_FIRST, TEST_LAST, TEST_PHONE, null);
 
-            log.debug("Act: POST {} with only required fields", REGISTER_URL);
+            log.debug("Act: POST {} with CLIENT required fields + no businessName", REGISTER_URL);
             var response = post(minimalRequest);
 
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -336,7 +339,7 @@ class AuthIntegrationTest extends AbstractIntegrationTest {
             registeredEmail = null;
             var oversizedFirstName = "A".repeat(101);
             var request = new RegisterRequest(
-                    "oversize@beautica.test", TEST_PASSWORD, SelfRegistrationRole.CLIENT, oversizedFirstName, TEST_LAST, null, null);
+                    "oversize@beautica.test", TEST_PASSWORD, SelfRegistrationRole.CLIENT, oversizedFirstName, TEST_LAST, TEST_PHONE, null);
 
             log.debug("Act: POST {} with firstName of {} chars", REGISTER_URL, oversizedFirstName.length());
             var response = post(request);

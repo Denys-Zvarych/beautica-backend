@@ -311,7 +311,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         log.debug("Arrange: a CLIENT registration payload that carries no city/district");
         var request = new RegisterRequest(
                 "noloc-client@beautica.com", "Str0ngP@ss1!",
-                SelfRegistrationRole.CLIENT, "Olha", "Bez", null, null);
+                SelfRegistrationRole.CLIENT, "Olha", "Bez", "+380501234567", null);
 
         log.debug("Act: POST /api/v1/auth/register — locality is absent and must not block");
         ResponseEntity<String> response = restTemplate.postForEntity(
@@ -674,7 +674,10 @@ class UserControllerIT extends AbstractIntegrationTest {
     private String registerAndGetToken(
             String email, String password,
             String firstName, String lastName, String phoneNumber) throws Exception {
-        var request = new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, firstName, lastName, phoneNumber, null);
+        var phone = phoneNumber != null ? phoneNumber : "+380501234567";
+        var first = firstName != null ? firstName : "Test";
+        var last  = lastName  != null ? lastName  : "User";
+        var request = new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, first, last, phone, null);
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);

@@ -29,11 +29,21 @@ import java.util.UUID;
  * 500 (§A).
  */
 public record CreateSalonRequest(
-        @NotBlank @Size(max = 255) String name,
-        @Size(max = 2000) String description,
-        @Size(max = 100) String city,
-        @Size(max = 100) String region,
-        @Size(max = 500) String address,
+        @NotBlank @Size(max = 255)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String name,
+        @Size(max = 2000)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String description,
+        @Size(max = 100)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String city,
+        @Size(max = 100)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String region,
+        @Size(max = 500)
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        String address,
         @Pattern(regexp = "^[+\\d\\s\\-()/]*$", message = "Invalid phone format")
         @Size(max = 20) String phone,
         @Pattern(regexp = "^$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",

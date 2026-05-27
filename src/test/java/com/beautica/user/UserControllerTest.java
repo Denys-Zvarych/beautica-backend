@@ -211,6 +211,26 @@ class UserControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /me — 400 when firstName contains a control character (NUL byte)")
+    void should_return400_when_firstNameContainsControlCharacter() throws Exception {
+        var userId = UUID.randomUUID();
+        // Embedded NUL in firstName — @Pattern(^[^\p{Cntrl}]*$) on UpdateProfileRequest
+        // must reject at the controller boundary before UserService is reached.
+        var body = "{\"firstName\":\"Oksana\\u0000\",\"lastName\":\"Kovalenko\"}";
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(userService, org.mockito.Mockito.never())
+                .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
+    }
+
+    @Test
     @DisplayName("PATCH /me with no JWT → 401")
     void should_return401_when_patchProfileWithoutJwt() throws Exception {
         var body = new UpdateProfileRequest("Jane", "Doe", null,

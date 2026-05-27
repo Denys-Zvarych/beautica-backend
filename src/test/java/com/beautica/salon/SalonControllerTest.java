@@ -494,6 +494,199 @@ class SalonControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    // ── QA-MEDIUM: control-char @Pattern guard — POST create ─────────────────
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when name contains a control character")
+    void should_return400_when_salonNameContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"My Salon\t\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when description contains a control character")
+    void should_return400_when_salonDescriptionContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Name\",\"description\":\"Good desc bad\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when city contains a control character")
+    void should_return400_when_legacyCityContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Name\",\"city\":\"Kyivwest\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when region contains a control character")
+    void should_return400_when_legacyRegionContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Name\",\"region\":\"Kyivregion\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when address contains a control character")
+    void should_return400_when_legacyAddressContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Name\",\"address\":\"Street 1floor 2\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── QA-MEDIUM: control-char @Pattern guard — PATCH update ────────────────
+
+    @Test
+    @DisplayName("PATCH /api/v1/salons/{id} — 400 when name contains a control character")
+    void should_return400_when_update_salonNameContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        mockMvc.perform(patch(SALONS_URL + "/" + salonId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Bad\tName\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("PATCH /api/v1/salons/{id} — 400 when description contains a control character")
+    void should_return400_when_update_salonDescriptionContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        mockMvc.perform(patch(SALONS_URL + "/" + salonId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"description\":\"Bad desc\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("PATCH /api/v1/salons/{id} — 400 when city contains a control character")
+    void should_return400_when_update_legacyCityContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        mockMvc.perform(patch(SALONS_URL + "/" + salonId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"city\":\"Kyivbad\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("PATCH /api/v1/salons/{id} — 400 when region contains a control character")
+    void should_return400_when_update_legacyRegionContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        mockMvc.perform(patch(SALONS_URL + "/" + salonId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"region\":\"Kyivoblast\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("PATCH /api/v1/salons/{id} — 400 when address contains a control character")
+    void should_return400_when_update_legacyAddressContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        mockMvc.perform(patch(SALONS_URL + "/" + salonId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"address\":\"Streetbad\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── QA-MEDIUM: Phase 10.3 structured-address fields — control-char guard ────
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when street contains a control character")
+    void should_return400_when_salonStreetContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        // Newline in street — @Pattern(^[^\p{Cntrl}]*$) must reject before service is reached
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"street\":\"Khreshchatyk 1\\nbad\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when buildingNo contains a control character")
+    void should_return400_when_salonBuildingNoContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        // NUL byte in buildingNo — @Pattern(^[^\p{Cntrl}]*$) must reject
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"buildingNo\":\"12\\u0000A\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when locationNote contains a control character")
+    void should_return400_when_salonLocationNoteContainsControlCharacters() throws Exception {
+        var userId = UUID.randomUUID();
+        // Tab character in locationNote — @Pattern(^[^\p{Cntrl}]*$) must reject
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"locationNote\":\"near the park\\tbad\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /**

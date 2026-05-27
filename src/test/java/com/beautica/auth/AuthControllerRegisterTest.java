@@ -1,6 +1,7 @@
 package com.beautica.auth;
 
 import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.config.WebMvcTestSupport;
@@ -168,6 +169,86 @@ class AuthControllerRegisterTest {
         verify(authService, never()).register(any(RegisterRequest.class));
     }
 
+    // ── QA-CRITICAL: businessName @Pattern — control-char guard ──────────────
+
+    @Test
+    @DisplayName("400 Bad Request when businessName contains a control character (NUL byte)")
+    void should_return400_when_businessNameContainsControlCharacter() throws Exception {
+        log.debug("Arrange: no mock needed — control char in businessName fails @Pattern before service is reached");
+
+        //   is the NUL control character; it matches \\p{Cntrl} and must be rejected.
+        log.debug("Act: POST {} with businessName containing embedded NUL byte", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "owner-ctrl@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "SALON_OWNER",
+                                  "firstName": "Olena",
+                                  "lastName": "Kovalchuk",
+                                  "businessName": "Valid Salon\\u0000"
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        log.debug("Assert: service must NOT be invoked when Bean Validation fails");
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
+    @Test
+    @DisplayName("200 OK when businessName contains only printable Ukrainian text")
+    void should_return200_when_businessNameIsPrintableUkrainianText() throws Exception {
+        log.debug("Arrange: stub authService to return a minimal RegistrationResponse");
+        when(authService.register(any(RegisterRequest.class)))
+                .thenReturn(RegistrationResponse.of("owner-ua@beautica.test"));
+
+        // Ukrainian text is entirely outside \\p{Cntrl} — @Pattern must pass.
+        log.debug("Act: POST {} with businessName containing valid Ukrainian text", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "owner-ua@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "SALON_OWNER",
+                                  "firstName": "Олена",
+                                  "lastName": "Коваль",
+                                  "phoneNumber": "+380501234567",
+                                  "businessName": "Salon Ніжність"
+                                }
+                                """))
+                .andExpect(status().isOk());
+    }
+
+    // ── QA-MEDIUM: RegisterRequest.firstName @Pattern — control-char guard ──────
+
+    @Test
+    @DisplayName("400 Bad Request when firstName contains a control character (NUL byte)")
+    void should_return400_when_firstNameContainsControlCharacter() throws Exception {
+        log.debug("Arrange: no mock needed — control char in firstName fails @Pattern before service is reached");
+
+        // NUL byte in firstName — @Pattern(^[^\p{Cntrl}]*$) must reject at the controller boundary
+        log.debug("Act: POST {} with firstName containing embedded NUL byte", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "ctrl-first@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Taras\\u0000",
+                                  "lastName": "Shevchenko"
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        log.debug("Assert: service must NOT be invoked when Bean Validation fails");
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
     @Test
     @DisplayName("400 Bad Request when password does not meet @StrongPassword policy")
     void should_return400_when_passwordIsWeak() throws Exception {
@@ -184,6 +265,57 @@ class AuthControllerRegisterTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
 
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
+    // ── QA: RegisterRequest.phoneNumber @NotBlank guard ──────────────────────
+
+    @Test
+    @DisplayName("400 Bad Request when phoneNumber is blank (empty string)")
+    void should_return400_when_phoneNumberIsBlank() throws Exception {
+        log.debug("Arrange: no mock needed — blank phoneNumber fails @NotBlank before service is reached");
+
+        log.debug("Act: POST {} with blank phoneNumber", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "new@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Taras",
+                                  "lastName": "Shevchenko",
+                                  "phoneNumber": ""
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        log.debug("Assert: service must NOT be invoked when Bean Validation fails");
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
+    @Test
+    @DisplayName("400 Bad Request when phoneNumber is null (omitted)")
+    void should_return400_when_phoneNumberIsNull() throws Exception {
+        log.debug("Arrange: no mock needed — null phoneNumber fails @NotBlank before service is reached");
+
+        log.debug("Act: POST {} with phoneNumber omitted", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "new@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Taras",
+                                  "lastName": "Shevchenko"
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        log.debug("Assert: service must NOT be invoked when Bean Validation fails");
         verify(authService, never()).register(any(RegisterRequest.class));
     }
 }

@@ -58,7 +58,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
 
         // Register (now returns RegistrationResponse — no tokens, no userId)
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
                 String.class);
 
         // Force email verification so login succeeds (phase 1.7 will add the gate, not yet active)
@@ -97,7 +97,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         log.debug("Arrange: register CLIENT email={}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null),
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
                 String.class);
         jdbcTemplate.update("UPDATE users SET email_verified = TRUE WHERE email = ?", email);
         var loginResp = restTemplate.postForEntity("/api/v1/auth/login",
@@ -130,8 +130,12 @@ class AuthSecurityTest extends AbstractIntegrationTest {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        // firstName, lastName, and phoneNumber are required (@NotBlank); include them so the 400
+        // is triggered specifically by the absent businessName, not by missing name/phone fields.
         String requestBody = String.format(
-                "{\"email\":\"%s\",\"password\":\"Str0ngP@ss1!\",\"role\":\"SALON_OWNER\"}", email);
+                "{\"email\":\"%s\",\"password\":\"Str0ngP@ss1!\",\"role\":\"SALON_OWNER\","
+                        + "\"firstName\":\"Olena\",\"lastName\":\"Kovalchuk\","
+                        + "\"phoneNumber\":\"+380501234567\"}", email);
 
         log.debug("Act: POST /auth/register with SALON_OWNER role and absent businessName field");
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -156,7 +160,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         log.debug("Arrange: register email={}", email);
 
         restTemplate.postForEntity("/api/v1/auth/register",
-                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, null, null, null, null), String.class);
+                new RegisterRequest(email, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null), String.class);
         jdbcTemplate.update("UPDATE users SET email_verified = TRUE WHERE email = ?", email);
 
         log.debug("Arrange: login to obtain tokens");
