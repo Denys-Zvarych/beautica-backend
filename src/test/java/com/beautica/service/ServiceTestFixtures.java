@@ -102,7 +102,7 @@ class ServiceTestFixtures {
     }
 
     String createIndependentMasterAndGetToken(String email) throws Exception {
-        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", null);
+        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", "+380501234567");
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register/independent-master", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);

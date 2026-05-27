@@ -222,7 +222,7 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
     }
 
     private String registerClientAndGetToken(String email) throws Exception {
-        var request = new RegisterRequest(email, TEST_PASSWORD, SelfRegistrationRole.CLIENT, "Test", "User", null, null);
+        var request = new RegisterRequest(email, TEST_PASSWORD, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null);
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
