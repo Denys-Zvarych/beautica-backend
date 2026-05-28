@@ -51,6 +51,13 @@ public class MasterController {
     private final MasterService masterService;
     private final SlotCalculationService slotCalculationService;
 
+    @GetMapping("/me")
+    @PreAuthorize("hasAnyRole('SALON_MASTER', 'INDEPENDENT_MASTER')")
+    public ApiResponse<MasterDetailResponse> getMyProfile(Authentication authentication) {
+        UUID userId = extractUserId(authentication);
+        return ApiResponse.ok(masterService.getMyMasterDetail(userId));
+    }
+
     @GetMapping("/{masterId}")
     public ApiResponse<MasterDetailResponse> getMasterDetail(@PathVariable UUID masterId) {
         return ApiResponse.ok(masterService.getMasterDetail(masterId));

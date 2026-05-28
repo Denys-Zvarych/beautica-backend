@@ -170,6 +170,91 @@ class MasterControllerTest {
                 .andExpect(status().isNotFound());
     }
 
+    // ── GET /me — self-profile ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /me — 200 with master profile when authenticated INDEPENDENT_MASTER")
+    void should_return200WithProfile_when_independentMasterRequestsOwnProfile() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        // Controller now delegates to a single getMyMasterDetail(UUID) call — stub that method only.
+        when(masterService.getMyMasterDetail(userId)).thenReturn(stubMasterDetail(masterId, userId));
+
+        log.debug("Act: GET {}/me as INDEPENDENT_MASTER — must return 200 with own profile", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.masterId").value(masterId.toString()))
+                .andExpect(jsonPath("$.data.firstName").value("Oksana"));
+    }
+
+    @Test
+    @DisplayName("GET /me — 401 when unauthenticated request")
+    void should_return401_when_unauthenticatedRequestsMyProfile() throws Exception {
+        log.debug("Act: GET {}/me without credentials — must be rejected with 401", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET /me — 403 when CLIENT requests own profile (role not permitted)")
+    void should_return403_when_clientRequestsOwnProfile() throws Exception {
+        var clientId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me as CLIENT — must be denied with 403", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("GET /me — 403 when SALON_OWNER requests own profile (role not permitted)")
+    void should_return403_when_salonOwnerRequestsOwnProfile() throws Exception {
+        var ownerId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/me as SALON_OWNER — must be denied with 403", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("GET /me — 200 when SALON_MASTER requests own profile")
+    void should_return200_when_salonMasterRequestsOwnProfile() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(masterService.getMyMasterDetail(userId)).thenReturn(stubMasterDetail(masterId, userId));
+
+        log.debug("Act: GET {}/me as SALON_MASTER — must return 200 with profile", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(userId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.masterId").value(masterId.toString()));
+    }
+
+    @Test
+    @DisplayName("GET /me — 404 when master record does not exist for authenticated user")
+    void should_return404_when_masterRecordDoesNotExist() throws Exception {
+        var userId = UUID.randomUUID();
+
+        when(masterService.getMyMasterDetail(userId))
+                .thenThrow(new NotFoundException("Master not found"));
+
+        log.debug("Act: GET {}/me as INDEPENDENT_MASTER with no master record — must return 404", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(userId, "imaster@beautica.test", Role.INDEPENDENT_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
     // ── GET /by-salon/{salonId} — protected ──────────────────────────────────
 
     @Test
