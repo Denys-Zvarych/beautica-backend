@@ -81,6 +81,18 @@ class AsyncConfigSecurityContextPropagationTest {
         assertExecutorPropagatesSecurityContext("pushExecutor", pushExecutor);
     }
 
+    @Test
+    @DisplayName("emailExecutor propagates context classloader to async task thread")
+    void should_propagateContextClassLoader_when_taskSubmittedThroughEmailExecutor() throws Exception {
+        assertExecutorPropagatesContextClassLoader("emailExecutor", emailExecutor);
+    }
+
+    @Test
+    @DisplayName("pushExecutor propagates context classloader to async task thread")
+    void should_propagateContextClassLoader_when_taskSubmittedThroughPushExecutor() throws Exception {
+        assertExecutorPropagatesContextClassLoader("pushExecutor", pushExecutor);
+    }
+
     /**
      * Submits a context-capturing task through {@code executor} and asserts that the worker
      * thread sees the {@link Authentication} pre-set on the calling thread.
@@ -114,5 +126,45 @@ class AsyncConfigSecurityContextPropagationTest {
                 .isNotNull()
                 .extracting(Authentication::getName)
                 .isEqualTo(TEST_PRINCIPAL);
+    }
+
+    /**
+     * Submits a context-capturing task through {@code executor} and asserts that the worker
+     * thread sees the same context classloader that was active on the calling thread.
+     *
+     * <p>The TaskDecorator in AsyncConfig preserves the webapp classloader across thread
+     * boundaries so that ServiceLoader (jakarta.mail.util.StreamProvider, FCM SDK, APNs
+     * provider) resolves META-INF/services/ entries from the application classpath rather
+     * than the system classloader. Without this guard, a "simplification" refactor that
+     * removes the TaskDecorator would silently break ServiceLoader-based downstream libs.
+     *
+     * <p>The {@link CountDownLatch} 5-second timeout fails fast on broken propagation.
+     *
+     * @param name     human-readable executor name (used in failure diagnostics via {@code .as(...)})
+     * @param executor the executor under test
+     */
+    private void assertExecutorPropagatesContextClassLoader(String name, TaskExecutor executor)
+            throws InterruptedException {
+        // Arrange — capture the calling thread's context classloader (the webapp classloader).
+        ClassLoader expectedClassLoader = Thread.currentThread().getContextClassLoader();
+        assertThat(expectedClassLoader)
+                .as("setup error: calling thread must have a non-null context classloader")
+                .isNotNull();
+
+        // Act — submit a task that captures classloader from the worker thread.
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<ClassLoader> capturedRef = new AtomicReference<>();
+        executor.execute(() -> {
+            capturedRef.set(Thread.currentThread().getContextClassLoader());
+            done.countDown();
+        });
+
+        // Assert — task completed within timeout AND the worker thread observed the same classloader.
+        assertThat(done.await(PROPAGATION_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .as("executor %s task did not complete within %ds", name, PROPAGATION_TIMEOUT_SECONDS)
+                .isTrue();
+        assertThat(capturedRef.get())
+                .as("executor %s did not propagate context classloader to worker thread", name)
+                .isSameAs(expectedClassLoader);
     }
 }
