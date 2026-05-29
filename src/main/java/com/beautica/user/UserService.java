@@ -3,6 +3,7 @@ package com.beautica.user;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
@@ -54,24 +55,80 @@ public class UserService {
 
         applyLocality(user, request);
 
-        User saved = userRepository.save(user);
+        // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
+        evictUserCachesAfterCommit(userId);
 
-        // Evict the master-detail-by-user cache after the write is durable so that
-        // a parallel reader cannot repopulate stale address data mid-transaction.
-        final UUID evictUserId = userId;
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    Cache c = cacheManager.getCache("master-detail-by-user");
-                    if (c != null) {
-                        c.evict(evictUserId);
-                    }
-                }
-            });
+        return UserProfileResponse.from(user);
+    }
+
+    /**
+     * Updates the independent master's public profile fields: phone number, bio,
+     * and Instagram handle.
+     *
+     * <p>This method is intentionally separate from {@link #updateProfile} so that
+     * the locality and profile-text write paths remain independently testable and
+     * maintainable. The two paths cover disjoint columns on {@code users}:
+     * locality columns (cityId, districtId, street, …) vs. profile columns
+     * (phoneNumber, bio, instagram).
+     *
+     * <p>Evicts {@code master-detail-by-user} and {@code master-by-user} after
+     * commit so that a parallel reader cannot repopulate either cache with stale
+     * bio/instagram/phone data mid-transaction (§F — cache eviction must run
+     * afterCommit; both caches hold user fields).
+     *
+     * @param userId  the authenticated user's UUID
+     * @param request validated request body carrying phone, bio, instagram
+     * @return updated profile visible to the caller
+     */
+    @Transactional
+    public UserProfileResponse updateMasterProfile(UUID userId, MasterProfileUpdateRequest request) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+
+        Optional.ofNullable(request.phoneNumber()).ifPresent(user::setPhoneNumber);
+        if (request.bio() != null) {
+            user.setBio(request.bio());
+        }
+        if (request.instagram() != null) {
+            user.setInstagram(request.instagram());
         }
 
-        return UserProfileResponse.from(saved);
+        // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
+        evictUserCachesAfterCommit(userId);
+
+        return UserProfileResponse.from(user);
+    }
+
+    /**
+     * Registers a post-commit callback that evicts both user-keyed caches.
+     *
+     * <p>Eviction runs {@code afterCommit} so a parallel reader cannot repopulate
+     * stale data inside the write transaction's commit window (§F cache eviction
+     * correctness rule). Both caches are evicted together:
+     * <ul>
+     *   <li>{@code master-detail-by-user} — DTO cache for {@code GET /masters/me}</li>
+     *   <li>{@code master-by-user} — entity cache used by calendar and slot endpoints</li>
+     * </ul>
+     * This method is a no-op when called outside a transaction (guard on
+     * {@link TransactionSynchronizationManager#isSynchronizationActive()}).
+     */
+    private void evictUserCachesAfterCommit(UUID userId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache detail = cacheManager.getCache("master-detail-by-user");
+                if (detail != null) {
+                    detail.evict(userId);
+                }
+                Cache byUser = cacheManager.getCache("master-by-user");
+                if (byUser != null) {
+                    byUser.evict(userId);
+                }
+            }
+        });
     }
 
     /**

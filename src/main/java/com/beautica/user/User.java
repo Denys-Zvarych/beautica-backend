@@ -118,6 +118,12 @@ public class User extends AuditableEntity {
     @Column(name = "verification_locked_until")
     private Instant verificationLockedUntil;
 
+    @Column(name = "bio", columnDefinition = "TEXT")
+    private String bio;
+
+    @Column(name = "instagram", length = 100)
+    private String instagram;
+
     @Column(name = "business_name", length = 255)
     private String businessName;
 
@@ -368,5 +374,21 @@ public class User extends AuditableEntity {
 
     public void setAvatarUrl(String avatarUrl) {
         this.avatarUrl = avatarUrl;
+    }
+
+    public String getBio() {
+        return bio;
+    }
+
+    public void setBio(String bio) {
+        this.bio = bio;
+    }
+
+    public String getInstagram() {
+        return instagram;
+    }
+
+    public void setInstagram(String instagram) {
+        this.instagram = instagram;
     }
 }

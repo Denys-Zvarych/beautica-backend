@@ -23,6 +23,8 @@ public record UserProfileResponse(
         String street,
         String buildingNo,
         String locationNote,
+        String bio,
+        String instagram,
         boolean isActive,
         boolean emailVerified,
         UUID salonId
@@ -41,6 +43,8 @@ public record UserProfileResponse(
                 user.getStreet(),
                 user.getBuildingNo(),
                 user.getLocationNote(),
+                user.getBio(),
+                user.getInstagram(),
                 user.isActive(),
                 user.isEmailVerified(),
                 user.getSalonId()

@@ -8,6 +8,7 @@ import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
+import com.beautica.master.dto.MasterProfileUpdateRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -92,7 +93,6 @@ class UserServiceTest {
         User user = buildUser(userId, "bob@example.com", Role.INDEPENDENT_MASTER, "Bob", "Old", "+380631111111");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         UpdateProfileRequest request = new UpdateProfileRequest("Robert", "New", null,
                 null, null, null, null, null);
@@ -102,7 +102,7 @@ class UserServiceTest {
         assertThat(response.firstName()).isEqualTo("Robert");
         assertThat(response.lastName()).isEqualTo("New");
         assertThat(response.phoneNumber()).isEqualTo("+380631111111");
-        verify(userRepository).save(user);
+        verify(userRepository, never()).save(any());
     }
 
     @Test
@@ -112,7 +112,6 @@ class UserServiceTest {
         User user = buildUser(userId, "carol@example.com", Role.SALON_OWNER, "Carol", "Jones", "+380661234567");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, null,
                 null, null, null, null, null);
@@ -122,7 +121,7 @@ class UserServiceTest {
         assertThat(response.firstName()).isEqualTo("Carol");
         assertThat(response.lastName()).isEqualTo("Jones");
         assertThat(response.phoneNumber()).isEqualTo("+380661234567");
-        verify(userRepository).save(user);
+        verify(userRepository, never()).save(any());
     }
 
     @Test
@@ -133,7 +132,6 @@ class UserServiceTest {
                 "Ivan", "Kovalenko", "+380631111111");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, "+380991234567",
                 null, null, null, null, null);
@@ -141,7 +139,7 @@ class UserServiceTest {
         UserProfileResponse response = userService.updateProfile(userId, request);
 
         assertThat(response.phoneNumber()).isEqualTo("+380991234567");
-        verify(userRepository).save(user);
+        verify(userRepository, never()).save(any());
     }
 
     @Test
@@ -160,7 +158,6 @@ class UserServiceTest {
         when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest(null, null, null,
                 cityId, districtId, "Lesi Ukrainky", "7", "Blue door");
@@ -193,7 +190,6 @@ class UserServiceTest {
         when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest(null, null, null,
                 cityId, districtId, "Shevchenka", "12A", "ring twice");
@@ -224,7 +220,6 @@ class UserServiceTest {
         when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest(null, null, null,
                 cityId, null, "вул. Дерибасівська", "5", "yellow building");
@@ -250,7 +245,6 @@ class UserServiceTest {
         user.setLocationNote("old note");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest(null, null, null,
                 null, null, null, null, null);
@@ -276,7 +270,6 @@ class UserServiceTest {
 
         when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         // PATCH sends only cityId — street, buildingNo, locationNote all null.
         var request = new UpdateProfileRequest(null, null, null,
@@ -297,7 +290,6 @@ class UserServiceTest {
 
         when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         // PATCH sends cityId and street but omits buildingNo — null-guard must retain the pre-existing value.
         var request = new UpdateProfileRequest(null, null, null,
@@ -315,7 +307,6 @@ class UserServiceTest {
         User user = buildUser(userId, "sm@example.com", Role.SALON_MASTER, "Sal", "M", "+380501111111");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest("Sal", null, null,
                 UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
@@ -334,7 +325,6 @@ class UserServiceTest {
         User user = buildUser(userId, "c2@example.com", Role.CLIENT, "No", "Loc", "+380501111111");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest("No", "Loc", null,
                 null, null, null, null, null);
@@ -342,7 +332,7 @@ class UserServiceTest {
         userService.updateProfile(userId, request);
 
         verify(localityWriteValidator).validateClientLocality(new LocalityWriteInput(null, null));
-        verify(userRepository).save(user);
+        verify(userRepository, never()).save(any());
     }
 
     @Test
@@ -358,7 +348,6 @@ class UserServiceTest {
         when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest(null, null, null,
                 cityId, null, null, null, null);
@@ -382,7 +371,6 @@ class UserServiceTest {
 
         when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest(null, null, null,
                 cityId, null, null, null, null);
@@ -404,7 +392,6 @@ class UserServiceTest {
         User user = buildUser(userId, "owner@example.com", Role.SALON_OWNER, "Own", "Er", "+380501111111");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest("Own", null, null,
                 UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
@@ -426,7 +413,6 @@ class UserServiceTest {
         User user = buildUser(userId, "admin@example.com", Role.SALON_ADMIN, "Adm", "In", "+380501111111");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(userRepository.save(user)).thenReturn(user);
 
         var request = new UpdateProfileRequest("Adm", null, null,
                 UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
@@ -440,6 +426,98 @@ class UserServiceTest {
         assertThat(user.getCity()).isNull();
         assertThat(user.getRegion()).isNull();
     }
+
+    // ── updateMasterProfile ───────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("updateMasterProfile sets phone, bio, and instagram from request")
+    void should_updatePhoneAndBioAndInstagram_when_updateMasterProfileCalled() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master@example.com", Role.INDEPENDENT_MASTER,
+                "Olena", "Koval", "+380630000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        MasterProfileUpdateRequest request =
+                new MasterProfileUpdateRequest("+380671112233", "bio text", "@instagram");
+
+        UserProfileResponse response = userService.updateMasterProfile(userId, request);
+
+        assertThat(user.getPhoneNumber()).isEqualTo("+380671112233");
+        assertThat(user.getBio()).isEqualTo("bio text");
+        assertThat(user.getInstagram()).isEqualTo("@instagram");
+        assertThat(response.phoneNumber()).isEqualTo("+380671112233");
+        assertThat(response.bio()).isEqualTo("bio text");
+        assertThat(response.instagram()).isEqualTo("@instagram");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile throws NotFoundException when user does not exist")
+    void should_throwNotFoundException_when_userNotFoundInUpdateMasterProfile() {
+        UUID userId = UUID.randomUUID();
+
+        when(userRepository.findById(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> userService.updateMasterProfile(
+                userId, new MasterProfileUpdateRequest("+380671112233", null, null)))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("User not found");
+
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite bio when bio is null in request")
+    void should_notOverwriteBio_when_bioIsNullInRequest() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master2@example.com", Role.INDEPENDENT_MASTER,
+                "Iryna", "M", "+380671111111");
+        user.setBio("existing bio");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest("+380671111111", null, null));
+
+        assertThat(user.getBio()).isEqualTo("existing bio");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite instagram when instagram is null in request")
+    void should_notOverwriteInstagram_when_instagramIsNullInRequest() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master3@example.com", Role.INDEPENDENT_MASTER,
+                "Vira", "K", "+380671111111");
+        user.setInstagram("@old_handle");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest("+380671111111", null, null));
+
+        assertThat(user.getInstagram()).isEqualTo("@old_handle");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile updates only phone when bio and instagram are null in request")
+    void should_updateOnlyPhone_when_bioAndInstagramAreNull() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master4@example.com", Role.INDEPENDENT_MASTER,
+                "Natalia", "P", "+380670000000");
+        user.setBio("original bio");
+        user.setInstagram("@original");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest("+380679999999", null, null));
+
+        assertThat(user.getPhoneNumber()).isEqualTo("+380679999999");
+        assertThat(user.getBio()).isEqualTo("original bio");
+        assertThat(user.getInstagram()).isEqualTo("@original");
+    }
+
+    // ── updateProfile — propagate from validator ──────────────────────────────
 
     @Test
     @DisplayName("updateProfile propagates BusinessException from the locality validator and does not save")

@@ -18,6 +18,7 @@ public record MasterDetailResponse(
         String buildingNo,
         String locationNote,
         String bio,
+        String instagram,
         String avatarUrl,
         BigDecimal avgRating,
         int reviewCount,
@@ -34,7 +35,8 @@ public record MasterDetailResponse(
                 master.getUser().getStreet(),
                 master.getUser().getBuildingNo(),
                 master.getUser().getLocationNote(),
-                null, // TODO: bio — no backing column yet (masters.bio / users.bio not in schema)
+                master.getUser().getBio(),
+                master.getUser().getInstagram(),
                 master.getUser().getAvatarUrl(),
                 master.getAvgRating(),
                 master.getReviewCount(),

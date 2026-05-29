@@ -171,15 +171,17 @@ class IndependentMasterControllerTest {
                 "INDEPENDENT_MASTER",
                 "Олена",
                 "Коваль",
-                null,
+                null,         // phoneNumber
                 cityId,
-                null,
+                null,         // districtId
                 "вулиця Хрещатик, 1",
-                null,
-                null,
-                true,
-                true,
-                null
+                null,         // buildingNo
+                null,         // locationNote
+                null,         // bio
+                null,         // instagram
+                true,         // isActive
+                true,         // emailVerified
+                null          // salonId
         );
     }
 

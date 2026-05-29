@@ -71,7 +71,8 @@ public class MasterController {
         MasterDetailResponse publicDetail = new MasterDetailResponse(
                 detail.masterId(), detail.firstName(), detail.lastName(), detail.city(),
                 null, null, null, // street, buildingNo, locationNote — masked for public access
-                detail.bio(), detail.avatarUrl(), detail.avgRating(), detail.reviewCount(),
+                detail.bio(), detail.instagram(),
+                detail.avatarUrl(), detail.avgRating(), detail.reviewCount(),
                 detail.masterType(), detail.salon(), detail.workingHours()
         );
         return ApiResponse.ok(publicDetail);
