@@ -7,8 +7,12 @@ import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.Optional;
 import java.util.UUID;
@@ -20,13 +24,16 @@ public class UserService {
     private final UserRepository userRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final CityRepository cityRepository;
+    private final CacheManager cacheManager;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
-                       CityRepository cityRepository) {
+                       CityRepository cityRepository,
+                       CacheManager cacheManager) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
         this.cityRepository = cityRepository;
+        this.cacheManager = cacheManager;
     }
 
     @Transactional(readOnly = true)
@@ -48,6 +55,22 @@ public class UserService {
         applyLocality(user, request);
 
         User saved = userRepository.save(user);
+
+        // Evict the master-detail-by-user cache after the write is durable so that
+        // a parallel reader cannot repopulate stale address data mid-transaction.
+        final UUID evictUserId = userId;
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    Cache c = cacheManager.getCache("master-detail-by-user");
+                    if (c != null) {
+                        c.evict(evictUserId);
+                    }
+                }
+            });
+        }
+
         return UserProfileResponse.from(saved);
     }
 
@@ -59,13 +82,11 @@ public class UserService {
      *       most-specific-node rule is enforced (city mandatory, district
      *       mandatory iff the city has urban districts).</li>
      *   <li><b>CLIENT</b> — optional discovery-filter default; only
-     *       referential integrity is checked, and only when supplied. Absence
-     *       never blocks the save (OTP registration is unaffected — it does
-     *       not call this path at all). All five locality fields
-     *       ({@code cityId}, {@code districtId}, {@code street},
-     *       {@code buildingNo}, {@code locationNote}) are persisted when
-     *       present so clients can pre-fill their preferred location for
-     *       appointment booking.</li>
+     *       {@code cityId} and {@code districtId} are consumed for discovery
+     *       filtering. {@code street}, {@code buildingNo}, and
+     *       {@code locationNote} are intentionally NOT persisted for clients:
+     *       storing home addresses for clients is unnecessary PII and could
+     *       be inadvertently exposed (security finding 3).</li>
      *   <li><b>SALON_OWNER / SALON_MASTER / SALON_ADMIN</b> — no personal
      *       locality write path. Owner locality lives on the salon
      *       ({@code SalonService}); SALON_MASTER discovery resolves via the
@@ -87,9 +108,8 @@ public class UserService {
             localityWriteValidator.validateClientLocality(request.toLocalityInput());
             user.setCityId(request.cityId());
             user.setDistrictId(request.districtId());
-            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
-            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
-            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
+            // street, buildingNo, locationNote are NOT written for CLIENT role:
+            // home addresses are unnecessary PII for clients and must not be stored.
             writeCityDisplayStrings(user, request.cityId());
         }
         // SALON_OWNER / SALON_MASTER / SALON_ADMIN: no personal locality write.

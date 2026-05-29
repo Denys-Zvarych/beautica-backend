@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.Optional;
@@ -41,11 +42,14 @@ class UserServiceTest {
     @Mock
     private CityRepository cityRepository;
 
+    @Mock
+    private CacheManager cacheManager;
+
     private UserService userService;
 
     @BeforeEach
     void setUp() {
-        userService = new UserService(userRepository, localityWriteValidator, cityRepository);
+        userService = new UserService(userRepository, localityWriteValidator, cityRepository, cacheManager);
     }
 
     @Test
@@ -174,8 +178,8 @@ class UserServiceTest {
     }
 
     @Test
-    @DisplayName("updateProfile (CLIENT) persists all five locality fields")
-    void should_writeAllClientLocalityFields_when_client() {
+    @DisplayName("updateProfile (CLIENT) persists cityId and districtId but NOT street/buildingNo/locationNote")
+    void should_writeOnlyReferentialLocality_when_client() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
@@ -200,11 +204,37 @@ class UserServiceTest {
         verify(localityWriteValidator, never()).validateProviderLocality(any());
         assertThat(user.getCityId()).isEqualTo(cityId);
         assertThat(user.getDistrictId()).isEqualTo(districtId);
-        assertThat(user.getStreet()).isEqualTo("Shevchenka");
-        assertThat(user.getBuildingNo()).isEqualTo("12A");
-        assertThat(user.getLocationNote()).isEqualTo("ring twice");
+        // Home address fields must NOT be written for CLIENT — unnecessary PII (security finding 3).
+        assertThat(user.getStreet()).isNull();
+        assertThat(user.getBuildingNo()).isNull();
+        assertThat(user.getLocationNote()).isNull();
         assertThat(user.getCity()).isEqualTo("Київ");
         assertThat(user.getRegion()).isEqualTo("Київська область");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) does not persist street, buildingNo, locationNote even when all three are supplied")
+    void should_not_persist_street_buildingNo_locationNote_when_CLIENT_calls_updateProfile() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "c6@example.com", Role.CLIENT, "Test", "Client", "+380501111111");
+
+        City mockCity = mock(City.class);
+        when(mockCity.getNameUk()).thenReturn("Одеса");
+        when(mockCity.getOblast()).thenReturn(null);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, null, "вул. Дерибасівська", "5", "yellow building");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getStreet()).isNull();
+        assertThat(user.getBuildingNo()).isNull();
+        assertThat(user.getLocationNote()).isNull();
     }
 
     @Test
