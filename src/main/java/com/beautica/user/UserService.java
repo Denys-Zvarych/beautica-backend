@@ -3,6 +3,8 @@ package com.beautica.user;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.master.dto.MasterProfileUpdateRequest;
+import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
@@ -54,24 +56,100 @@ public class UserService {
 
         applyLocality(user, request);
 
-        User saved = userRepository.save(user);
+        // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
+        evictUserCachesAfterCommit(userId, user.getRole());
 
-        // Evict the master-detail-by-user cache after the write is durable so that
-        // a parallel reader cannot repopulate stale address data mid-transaction.
-        final UUID evictUserId = userId;
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    Cache c = cacheManager.getCache("master-detail-by-user");
-                    if (c != null) {
-                        c.evict(evictUserId);
-                    }
-                }
-            });
+        return UserProfileResponse.from(user);
+    }
+
+    /**
+     * Updates the independent master's public profile fields: phone number, bio,
+     * and Instagram handle.
+     *
+     * <p>This method is intentionally separate from {@link #updateProfile} so that
+     * the locality and profile-text write paths remain independently testable and
+     * maintainable. The two paths cover disjoint columns on {@code users}:
+     * locality columns (cityId, districtId, street, …) vs. profile columns
+     * (phoneNumber, bio, instagram).
+     *
+     * <p>Evicts {@code master-detail-by-user} and {@code master-by-user} after
+     * commit so that a parallel reader cannot repopulate either cache with stale
+     * bio/instagram/phone data mid-transaction (§F — cache eviction must run
+     * afterCommit; both caches hold user fields).
+     *
+     * @param userId  the authenticated user's UUID
+     * @param request validated request body carrying phone, bio, instagram
+     * @return updated profile visible to the caller
+     */
+    @Transactional
+    public MasterPublicProfileResponse updateMasterProfile(UUID userId, MasterProfileUpdateRequest request) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+
+        Optional.ofNullable(request.phoneNumber()).ifPresent(user::setPhoneNumber);
+        if (request.bio() != null) {
+            user.setBio(request.bio());
+        }
+        if (request.instagram() != null) {
+            user.setInstagram(request.instagram());
         }
 
-        return UserProfileResponse.from(saved);
+        // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
+        evictUserCachesAfterCommit(userId, Role.INDEPENDENT_MASTER);
+
+        return new MasterPublicProfileResponse(
+                user.getPhoneNumber(),
+                user.getBio(),
+                user.getInstagram()
+        );
+    }
+
+    /**
+     * Registers a post-commit callback that evicts user-keyed caches and, for
+     * {@code INDEPENDENT_MASTER} writes, also clears the discovery cache.
+     *
+     * <p>Eviction runs {@code afterCommit} so a parallel reader cannot repopulate
+     * stale data inside the write transaction's commit window (§F cache eviction
+     * correctness rule). Caches evicted:
+     * <ul>
+     *   <li>{@code master-detail-by-user} — DTO cache for {@code GET /masters/me}</li>
+     *   <li>{@code master-by-user} — entity cache used by calendar and slot endpoints</li>
+     *   <li>{@code search:masters} — discovery cache; cleared only when the writing user
+     *       is an {@code INDEPENDENT_MASTER}, since locality or profile changes affect
+     *       search results. Salon-bound roles route discovery through the salon record.</li>
+     * </ul>
+     * This method is a no-op when called outside a transaction (guard on
+     * {@link TransactionSynchronizationManager#isSynchronizationActive()}).
+     *
+     * @param userId the authenticated user's UUID (used as the per-user eviction key)
+     * @param role   the role of the writing user, used to gate {@code search:masters} eviction
+     */
+    private void evictUserCachesAfterCommit(UUID userId, Role role) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache detail = cacheManager.getCache("master-detail-by-user");
+                if (detail != null) {
+                    detail.evict(userId);
+                }
+                Cache byUser = cacheManager.getCache("master-by-user");
+                if (byUser != null) {
+                    byUser.evict(userId);
+                }
+                // Search results reflect INDEPENDENT_MASTER locality and profile fields
+                // directly. Clear the entire search:masters cache so the next discovery
+                // request re-queries the DB rather than serving stale data.
+                if (role == Role.INDEPENDENT_MASTER) {
+                    Cache search = cacheManager.getCache("search:masters");
+                    if (search != null) {
+                        search.clear();
+                    }
+                }
+            }
+        });
     }
 
     /**
@@ -98,22 +176,28 @@ public class UserService {
         Role role = user.getRole();
         if (role == Role.INDEPENDENT_MASTER) {
             localityWriteValidator.validateProviderLocality(request.toLocalityInput());
-            user.setCityId(request.cityId());
-            user.setDistrictId(request.districtId());
-            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
-            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
-            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
-            writeCityDisplayStrings(user, request.cityId());
+            writeLocalityFields(user, request);
         } else if (role == Role.CLIENT) {
             localityWriteValidator.validateClientLocality(request.toLocalityInput());
-            user.setCityId(request.cityId());
-            user.setDistrictId(request.districtId());
-            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
-            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
-            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
-            writeCityDisplayStrings(user, request.cityId());
+            writeLocalityFields(user, request);
         }
         // SALON_OWNER / SALON_MASTER / SALON_ADMIN: no personal locality write.
+    }
+
+    /**
+     * Writes the 5 locality columns and denormalizes the city display strings.
+     *
+     * <p>Extracted from the two branches of {@link #applyLocality} (INDEPENDENT_MASTER
+     * and CLIENT) to eliminate duplication. A future 6th locality column must be added
+     * here only — callers are unchanged.
+     */
+    private void writeLocalityFields(User user, UpdateProfileRequest request) {
+        user.setCityId(request.cityId());
+        user.setDistrictId(request.districtId());
+        Optional.ofNullable(request.street()).ifPresent(user::setStreet);
+        Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
+        Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
+        writeCityDisplayStrings(user, request.cityId());
     }
 
     /**

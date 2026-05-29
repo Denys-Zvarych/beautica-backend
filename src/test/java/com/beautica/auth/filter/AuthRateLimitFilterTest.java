@@ -41,6 +41,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> slotsBuckets;
     @Mock private LoadingCache<String, Bucket> deviceTokenBuckets;
     @Mock private LoadingCache<String, Bucket> mediaUploadBuckets;
+    @Mock private LoadingCache<String, Bucket> profileUpdateBuckets;
     @Mock private LoadingCache<String, Bucket> resendVerificationBuckets;
     @Mock private LoadingCache<String, Bucket> forgotPasswordBuckets;
     @Mock private LoadingCache<String, Bucket> resetPasswordBuckets;
@@ -53,8 +54,8 @@ class AuthRateLimitFilterTest {
     void setUp() {
         filter = new AuthRateLimitFilter(
                 registerBuckets, loginBuckets, refreshBuckets, verifyEmailBuckets,
-                slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, resendVerificationBuckets,
-                forgotPasswordBuckets, resetPasswordBuckets);
+                slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, profileUpdateBuckets,
+                resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -1149,6 +1150,65 @@ class AuthRateLimitFilterTest {
             assertThat(chain.getRequest()).isNull();
             verifyNoInteractions(forgotPasswordBuckets);
             verifyNoInteractions(loginBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("PATCH /api/v1/masters/me/profile")
+    class MastersMeProfileEndpoint {
+
+        @Test
+        @DisplayName("returns 429 when SALON_MASTER exceeds rate limit on /api/v1/masters/me/profile")
+        void should_return429_when_salonMasterExceedsRateLimitOnMastersMeProfile() throws Exception {
+            log.debug("Arrange: profileUpdateBuckets returns bucket that allows 10 then denies the 11th");
+            when(profileUpdateBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1))
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(false);
+
+            MockHttpServletResponse lastResponse = null;
+            MockFilterChain         lastChain    = null;
+
+            log.debug("Act: send 11 PATCH requests to /api/v1/masters/me/profile from SALON_MASTER IP");
+            for (int i = 0; i < 11; i++) {
+                var request = new MockHttpServletRequest("PATCH", "/api/v1/masters/me/profile");
+                request.setRemoteAddr(REMOTE_ADDR);
+                request.addHeader("Authorization", "Bearer mock-salon-master-token");
+                lastResponse = new MockHttpServletResponse();
+                lastChain    = new MockFilterChain();
+                doFilter(request, lastResponse, lastChain);
+
+                if (i < 10) {
+                    assertThat(lastResponse.getStatus())
+                            .as("request %d must not be 429 — bucket not yet exhausted", i + 1)
+                            .isNotEqualTo(429);
+                }
+            }
+
+            assertThat(lastResponse.getStatus())
+                    .as("11th request must be 429 — profileUpdateBuckets exhausted for /api/v1/masters/me/profile")
+                    .isEqualTo(429);
+            assertThat(lastResponse.getHeader("Retry-After")).isEqualTo("60");
+            assertThat(lastResponse.getContentType())
+                    .as("Content-Type must be application/json on 429 response")
+                    .startsWith("application/json");
+            assertThat(lastResponse.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(lastChain.getRequest())
+                    .as("filter chain must not be forwarded on the throttled request")
+                    .isNull();
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(registerBuckets);
+            verifyNoInteractions(refreshBuckets);
         }
     }
 }

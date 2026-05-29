@@ -14,6 +14,7 @@ import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.MasterType;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.master.service.MasterService;
+import com.beautica.user.UserService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
@@ -126,6 +127,9 @@ class MasterControllerTest {
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
+    @MockBean
+    private UserService userService;
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static RequestPostProcessor authenticatedAs(UUID userId, String email, Role role) {
@@ -138,7 +142,7 @@ class MasterControllerTest {
     private MasterDetailResponse stubMasterDetail(UUID masterId, UUID userId) {
         return new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", null, null, null, null,
-                null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
+                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
     }
 
     // ── GET /{masterId} — public ───────────────────────────────────────────────
@@ -178,7 +182,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
+                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
         log.debug("Act: GET {}/{} without credentials — address fields must be masked", MASTERS_URL, masterId);
@@ -201,7 +205,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
+                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
         when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
 
         mockMvc.perform(get(MASTERS_URL + "/me")

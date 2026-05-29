@@ -32,6 +32,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
+    private static final String PROFILE_UPDATE_PATH = "/api/v1/independent-masters/me/profile";
+    private static final String USER_ME_PATH = "/api/v1/users/me";
+    private static final String IM_LOCALITY_PATH = "/api/v1/independent-masters/me";
+    private static final String MASTERS_ME_PROFILE_PATH = "/api/v1/masters/me/profile";
     private static final int RETRY_AFTER_SECONDS = 60;
     // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
     // so clients do not spin-retry every 60 s and waste their remaining IP quota.
@@ -51,6 +55,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Same IP-keyed rationale applies to media uploads — JwtAuthenticationFilter
     // runs after this one, so the rate limiter sees only the network identity.
     private final LoadingCache<String, Bucket> mediaUploadBuckets;
+    // Per-IP bucket for PATCH /api/v1/independent-masters/me/profile — prevents
+    // unbounded DB writes and cache churn from a token-holding client (10/min).
+    private final LoadingCache<String, Bucket> profileUpdateBuckets;
     private final LoadingCache<String, Bucket> resendVerificationBuckets;
     // Separate per-IP buckets for forgot-password and reset-password (each 60-minute
     // window). Decoupled (SEC fix): a NAT-shared client spamming forgot-password must
@@ -67,6 +74,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
             @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
             @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
+            @Qualifier("profileUpdateBuckets") LoadingCache<String, Bucket> profileUpdateBuckets,
             @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
             @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
             @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets) {
@@ -77,6 +85,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.slotsBuckets = slotsBuckets;
         this.deviceTokenBuckets = deviceTokenBuckets;
         this.mediaUploadBuckets = mediaUploadBuckets;
+        this.profileUpdateBuckets = profileUpdateBuckets;
         this.resendVerificationBuckets = resendVerificationBuckets;
         this.forgotPasswordBuckets = forgotPasswordBuckets;
         this.resetPasswordBuckets = resetPasswordBuckets;
@@ -113,6 +122,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(SLOTS_PATH_PREFIX)
                 && path.endsWith(SLOTS_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, slotsBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Profile-update rate-limit: PATCH /me endpoints — checked before the POST-only
+        // guard so PATCH is covered. Cap: 10 requests/min per IP (shared profileUpdateBuckets).
+        // JWT is not yet parsed at this point; rate limiting is IP-keyed for consistency
+        // with all other buckets in this filter (see comment on deviceTokenBuckets field).
+        // Covers three paths:
+        //   - /api/v1/independent-masters/me/profile (bio, phone, instagram)
+        //   - /api/v1/users/me                       (first/last name, phone, locality — all roles)
+        //   - /api/v1/independent-masters/me          (locality-only — INDEPENDENT_MASTER)
+        if (HttpMethod.PATCH.matches(method)
+                && (PROFILE_UPDATE_PATH.equals(path)
+                        || USER_ME_PATH.equals(path)
+                        || IM_LOCALITY_PATH.equals(path)
+                        || MASTERS_ME_PROFILE_PATH.equals(path))) {
+            applyRateLimit(request, response, filterChain, profileUpdateBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 

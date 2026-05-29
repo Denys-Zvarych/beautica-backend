@@ -113,7 +113,8 @@ class UserControllerTest {
         var profile = new UserProfileResponse(
                 userId, "jane@example.com", "CLIENT",
                 "Jane", "Doe", "+380671234567",
-                null, null, null, null, null,
+                null, null, null, null, null, // cityId, districtId, street, buildingNo, locationNote
+                null, null,                   // bio, instagram
                 true, false, null
         );
         when(userService.getProfile(userId)).thenReturn(profile);
@@ -147,7 +148,8 @@ class UserControllerTest {
         var updated = new UserProfileResponse(
                 userId, "jane@example.com", "CLIENT",
                 "Oksana", "Kovalenko", null,
-                null, null, null, null, null,
+                null, null, null, null, null, // cityId, districtId, street, buildingNo, locationNote
+                null, null,                   // bio, instagram
                 true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))

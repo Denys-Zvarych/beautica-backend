@@ -3,6 +3,8 @@ package com.beautica.master.controller;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.dto.IndependentMasterUpdateRequest;
+import com.beautica.master.dto.MasterProfileUpdateRequest;
+import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.user.UpdateProfileRequest;
 import com.beautica.user.UserProfileResponse;
 import com.beautica.user.UserService;
@@ -69,6 +71,32 @@ public class IndependentMasterController {
                         request.locationNote()
                 )
         );
+        return ResponseEntity.ok(ApiResponse.ok(updated));
+    }
+
+    /**
+     * Updates the authenticated independent master's public profile fields.
+     *
+     * <p>Distinct from {@code PATCH /me} (locality-only). This endpoint covers
+     * the three human-readable profile fields displayed on the master detail screen:
+     * phone number, bio, and Instagram handle.
+     *
+     * <p>Role gate: {@code INDEPENDENT_MASTER} only — same as {@code PATCH /me}.
+     * No further ownership check is needed; the authenticated user ID is resolved
+     * from the JWT ({@link #extractUserId}) and the service writes only that row.
+     *
+     * @param request        validated profile update body
+     * @param authentication Spring Security context — carries the user UUID
+     * @return updated user profile wrapped in {@link ApiResponse}
+     */
+    @PatchMapping("/me/profile")
+    @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
+    public ResponseEntity<ApiResponse<MasterPublicProfileResponse>> updateProfile(
+            @Valid @RequestBody MasterProfileUpdateRequest request,
+            Authentication authentication
+    ) {
+        UUID userId = extractUserId(authentication);
+        MasterPublicProfileResponse updated = userService.updateMasterProfile(userId, request);
         return ResponseEntity.ok(ApiResponse.ok(updated));
     }
 
