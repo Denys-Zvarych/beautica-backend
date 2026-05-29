@@ -14,6 +14,7 @@ import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.MasterType;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.master.service.MasterService;
+import com.beautica.user.UserService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
@@ -125,6 +126,9 @@ class MasterControllerTest {
 
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
+
+    @MockBean
+    private UserService userService;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
