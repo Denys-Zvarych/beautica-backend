@@ -9,12 +9,15 @@ import com.beautica.common.PageResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.dto.MasterDetailResponse;
+import com.beautica.master.dto.MasterProfileUpdateRequest;
+import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.service.MasterService;
+import com.beautica.user.UserService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
@@ -50,6 +53,7 @@ public class MasterController {
 
     private final MasterService masterService;
     private final SlotCalculationService slotCalculationService;
+    private final UserService userService;
 
     @GetMapping("/me")
     @PreAuthorize("hasAnyRole('SALON_MASTER', 'INDEPENDENT_MASTER')")
@@ -183,6 +187,34 @@ public class MasterController {
     ) {
         List<AvailableSlotResponse> slots = slotCalculationService.getAvailableSlots(masterId, date, serviceId);
         return ApiResponse.ok(new AvailableSlotsResponse(date, slots));
+    }
+
+    /**
+     * Updates the authenticated salon master's public profile fields.
+     *
+     * <p>Mirrors the {@code PATCH /api/v1/independent-masters/me/profile} endpoint
+     * that serves {@code INDEPENDENT_MASTER}. {@code SALON_MASTER} has no other
+     * self-service route to update bio, phone, or Instagram handle.
+     *
+     * <p>Delegates to {@link UserService#updateMasterProfile} — the same service
+     * method used by the independent master path. The service has no internal role
+     * assertion blocking {@code SALON_MASTER}, and sharing the implementation is
+     * intentional: the DB columns written ({@code phone_number}, {@code bio},
+     * {@code instagram}) are role-agnostic.
+     *
+     * @param request        validated profile update body (phone required; bio, instagram optional)
+     * @param authentication Spring Security context — carries the user UUID
+     * @return updated public-profile fields wrapped in {@link ApiResponse}
+     */
+    @PatchMapping("/me/profile")
+    @PreAuthorize("hasRole('SALON_MASTER')")
+    public ResponseEntity<ApiResponse<MasterPublicProfileResponse>> updateMyProfile(
+            @Valid @RequestBody MasterProfileUpdateRequest request,
+            Authentication authentication
+    ) {
+        UUID userId = extractUserId(authentication);
+        MasterPublicProfileResponse updated = userService.updateMasterProfile(userId, request);
+        return ResponseEntity.ok(ApiResponse.ok(updated));
     }
 
     private UUID extractUserId(Authentication authentication) {

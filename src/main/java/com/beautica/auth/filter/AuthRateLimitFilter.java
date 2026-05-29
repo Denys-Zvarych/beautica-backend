@@ -33,6 +33,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
     private static final String PROFILE_UPDATE_PATH = "/api/v1/independent-masters/me/profile";
+    private static final String USER_ME_PATH = "/api/v1/users/me";
+    private static final String IM_LOCALITY_PATH = "/api/v1/independent-masters/me";
+    private static final String MASTERS_ME_PROFILE_PATH = "/api/v1/masters/me/profile";
     private static final int RETRY_AFTER_SECONDS = 60;
     // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
     // so clients do not spin-retry every 60 s and waste their remaining IP quota.
@@ -122,11 +125,19 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        // Profile-update rate-limit: PATCH /api/v1/independent-masters/me/profile — checked
-        // before the POST-only guard so PATCH is covered. Cap: 10 requests/min per IP.
+        // Profile-update rate-limit: PATCH /me endpoints — checked before the POST-only
+        // guard so PATCH is covered. Cap: 10 requests/min per IP (shared profileUpdateBuckets).
         // JWT is not yet parsed at this point; rate limiting is IP-keyed for consistency
         // with all other buckets in this filter (see comment on deviceTokenBuckets field).
-        if (HttpMethod.PATCH.matches(method) && PROFILE_UPDATE_PATH.equals(path)) {
+        // Covers three paths:
+        //   - /api/v1/independent-masters/me/profile (bio, phone, instagram)
+        //   - /api/v1/users/me                       (first/last name, phone, locality — all roles)
+        //   - /api/v1/independent-masters/me          (locality-only — INDEPENDENT_MASTER)
+        if (HttpMethod.PATCH.matches(method)
+                && (PROFILE_UPDATE_PATH.equals(path)
+                        || USER_ME_PATH.equals(path)
+                        || IM_LOCALITY_PATH.equals(path)
+                        || MASTERS_ME_PROFILE_PATH.equals(path))) {
             applyRateLimit(request, response, filterChain, profileUpdateBuckets, RETRY_AFTER_SECONDS);
             return;
         }

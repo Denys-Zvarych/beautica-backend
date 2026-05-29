@@ -57,7 +57,7 @@ public class UserService {
         applyLocality(user, request);
 
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
-        evictUserCachesAfterCommit(userId);
+        evictUserCachesAfterCommit(userId, user.getRole());
 
         return UserProfileResponse.from(user);
     }
@@ -95,7 +95,7 @@ public class UserService {
         }
 
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
-        evictUserCachesAfterCommit(userId);
+        evictUserCachesAfterCommit(userId, Role.INDEPENDENT_MASTER);
 
         return new MasterPublicProfileResponse(
                 user.getPhoneNumber(),
@@ -105,19 +105,26 @@ public class UserService {
     }
 
     /**
-     * Registers a post-commit callback that evicts both user-keyed caches.
+     * Registers a post-commit callback that evicts user-keyed caches and, for
+     * {@code INDEPENDENT_MASTER} writes, also clears the discovery cache.
      *
      * <p>Eviction runs {@code afterCommit} so a parallel reader cannot repopulate
      * stale data inside the write transaction's commit window (§F cache eviction
-     * correctness rule). Both caches are evicted together:
+     * correctness rule). Caches evicted:
      * <ul>
      *   <li>{@code master-detail-by-user} — DTO cache for {@code GET /masters/me}</li>
      *   <li>{@code master-by-user} — entity cache used by calendar and slot endpoints</li>
+     *   <li>{@code search:masters} — discovery cache; cleared only when the writing user
+     *       is an {@code INDEPENDENT_MASTER}, since locality or profile changes affect
+     *       search results. Salon-bound roles route discovery through the salon record.</li>
      * </ul>
      * This method is a no-op when called outside a transaction (guard on
      * {@link TransactionSynchronizationManager#isSynchronizationActive()}).
+     *
+     * @param userId the authenticated user's UUID (used as the per-user eviction key)
+     * @param role   the role of the writing user, used to gate {@code search:masters} eviction
      */
-    private void evictUserCachesAfterCommit(UUID userId) {
+    private void evictUserCachesAfterCommit(UUID userId, Role role) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
@@ -131,6 +138,15 @@ public class UserService {
                 Cache byUser = cacheManager.getCache("master-by-user");
                 if (byUser != null) {
                     byUser.evict(userId);
+                }
+                // Search results reflect INDEPENDENT_MASTER locality and profile fields
+                // directly. Clear the entire search:masters cache so the next discovery
+                // request re-queries the DB rather than serving stale data.
+                if (role == Role.INDEPENDENT_MASTER) {
+                    Cache search = cacheManager.getCache("search:masters");
+                    if (search != null) {
+                        search.clear();
+                    }
                 }
             }
         });
@@ -160,22 +176,28 @@ public class UserService {
         Role role = user.getRole();
         if (role == Role.INDEPENDENT_MASTER) {
             localityWriteValidator.validateProviderLocality(request.toLocalityInput());
-            user.setCityId(request.cityId());
-            user.setDistrictId(request.districtId());
-            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
-            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
-            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
-            writeCityDisplayStrings(user, request.cityId());
+            writeLocalityFields(user, request);
         } else if (role == Role.CLIENT) {
             localityWriteValidator.validateClientLocality(request.toLocalityInput());
-            user.setCityId(request.cityId());
-            user.setDistrictId(request.districtId());
-            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
-            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
-            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
-            writeCityDisplayStrings(user, request.cityId());
+            writeLocalityFields(user, request);
         }
         // SALON_OWNER / SALON_MASTER / SALON_ADMIN: no personal locality write.
+    }
+
+    /**
+     * Writes the 5 locality columns and denormalizes the city display strings.
+     *
+     * <p>Extracted from the two branches of {@link #applyLocality} (INDEPENDENT_MASTER
+     * and CLIENT) to eliminate duplication. A future 6th locality column must be added
+     * here only — callers are unchanged.
+     */
+    private void writeLocalityFields(User user, UpdateProfileRequest request) {
+        user.setCityId(request.cityId());
+        user.setDistrictId(request.districtId());
+        Optional.ofNullable(request.street()).ifPresent(user::setStreet);
+        Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
+        Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
+        writeCityDisplayStrings(user, request.cityId());
     }
 
     /**
