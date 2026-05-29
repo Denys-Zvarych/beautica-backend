@@ -3,22 +3,30 @@ package com.beautica.user;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.entity.City;
+import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityRepository;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Optional;
 import java.util.UUID;
 
+@Slf4j
 @Service
 public class UserService {
 
     private final UserRepository userRepository;
     private final LocalityWriteValidator localityWriteValidator;
+    private final CityRepository cityRepository;
 
     public UserService(UserRepository userRepository,
-                       LocalityWriteValidator localityWriteValidator) {
+                       LocalityWriteValidator localityWriteValidator,
+                       CityRepository cityRepository) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
+        this.cityRepository = cityRepository;
     }
 
     @Transactional(readOnly = true)
@@ -74,6 +82,7 @@ public class UserService {
             Optional.ofNullable(request.street()).ifPresent(user::setStreet);
             Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
             Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
+            writeCityDisplayStrings(user, request.cityId());
         } else if (role == Role.CLIENT) {
             localityWriteValidator.validateClientLocality(request.toLocalityInput());
             user.setCityId(request.cityId());
@@ -81,7 +90,43 @@ public class UserService {
             Optional.ofNullable(request.street()).ifPresent(user::setStreet);
             Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
             Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
+            writeCityDisplayStrings(user, request.cityId());
         }
         // SALON_OWNER / SALON_MASTER / SALON_ADMIN: no personal locality write.
+    }
+
+    /**
+     * Denormalizes the human-readable city and region (oblast) display strings
+     * into {@code users.city} and {@code users.region} so that read paths
+     * (e.g. {@link com.beautica.master.dto.MasterDetailResponse}) can surface
+     * them without a JOIN to the taxonomy tables.
+     *
+     * <p>Called only when {@code cityId} is non-null. If the city row is not
+     * found (e.g. stale/invalid UUID slipped past validation), a WARN is logged
+     * and both columns are left unchanged — the caller's transaction continues
+     * normally.</p>
+     *
+     * <p>The {@link com.beautica.location.entity.City#getOblast()} association is
+     * {@code FetchType.LAZY}; it is safe to traverse here because this method is
+     * always called within an active {@code @Transactional} context.</p>
+     */
+    private void writeCityDisplayStrings(User user, UUID cityId) {
+        if (cityId == null) {
+            return;
+        }
+        Optional<City> cityOpt = cityRepository.findByIdWithOblast(cityId);
+        if (cityOpt.isEmpty()) {
+            log.warn("applyLocality: city not found for id={}, skipping city/region denorm", cityId);
+            return;
+        }
+        City city = cityOpt.get();
+        Oblast oblast = city.getOblast();
+        if (oblast == null) {
+            log.warn("applyLocality: city {} has no oblast association, skipping region denorm", cityId);
+            user.setCity(city.getNameUk());
+            return;
+        }
+        user.setCity(city.getNameUk());
+        user.setRegion(oblast.getNameUk());
     }
 }

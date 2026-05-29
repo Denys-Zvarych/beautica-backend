@@ -5,6 +5,9 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteInput;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.entity.City;
+import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -20,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -34,11 +38,14 @@ class UserServiceTest {
     @Mock
     private LocalityWriteValidator localityWriteValidator;
 
+    @Mock
+    private CityRepository cityRepository;
+
     private UserService userService;
 
     @BeforeEach
     void setUp() {
-        userService = new UserService(userRepository, localityWriteValidator);
+        userService = new UserService(userRepository, localityWriteValidator, cityRepository);
     }
 
     @Test
@@ -141,6 +148,13 @@ class UserServiceTest {
         UUID districtId = UUID.randomUUID();
         User user = buildUser(userId, "im@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
 
+        City mockCity = mock(City.class);
+        Oblast mockOblast = mock(Oblast.class);
+        when(mockOblast.getNameUk()).thenReturn("Київська область");
+        when(mockCity.getNameUk()).thenReturn("Київ");
+        when(mockCity.getOblast()).thenReturn(mockOblast);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         when(userRepository.save(user)).thenReturn(user);
 
@@ -155,6 +169,8 @@ class UserServiceTest {
         assertThat(user.getStreet()).isEqualTo("Lesi Ukrainky");
         assertThat(user.getBuildingNo()).isEqualTo("7");
         assertThat(user.getLocationNote()).isEqualTo("Blue door");
+        assertThat(user.getCity()).isEqualTo("Київ");
+        assertThat(user.getRegion()).isEqualTo("Київська область");
     }
 
     @Test
@@ -164,6 +180,13 @@ class UserServiceTest {
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
         User user = buildUser(userId, "c@example.com", Role.CLIENT, "Cli", "Ent", "+380501111111");
+
+        City mockCity = mock(City.class);
+        Oblast mockOblast = mock(Oblast.class);
+        when(mockOblast.getNameUk()).thenReturn("Київська область");
+        when(mockCity.getNameUk()).thenReturn("Київ");
+        when(mockCity.getOblast()).thenReturn(mockOblast);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         when(userRepository.save(user)).thenReturn(user);
@@ -180,6 +203,8 @@ class UserServiceTest {
         assertThat(user.getStreet()).isEqualTo("Shevchenka");
         assertThat(user.getBuildingNo()).isEqualTo("12A");
         assertThat(user.getLocationNote()).isEqualTo("ring twice");
+        assertThat(user.getCity()).isEqualTo("Київ");
+        assertThat(user.getRegion()).isEqualTo("Київська область");
     }
 
     @Test
@@ -220,6 +245,7 @@ class UserServiceTest {
         User user = buildUser(userId, "c4@example.com", Role.CLIENT, "Oksana", "P", "+380671234567");
         user.setStreet("вул. Науки");
 
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         when(userRepository.save(user)).thenReturn(user);
 
@@ -240,6 +266,7 @@ class UserServiceTest {
         User user = buildUser(userId, "im3@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
         user.setBuildingNo("5B");
 
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         when(userRepository.save(user)).thenReturn(user);
 
@@ -287,6 +314,80 @@ class UserServiceTest {
 
         verify(localityWriteValidator).validateClientLocality(new LocalityWriteInput(null, null));
         verify(userRepository).save(user);
+    }
+
+    @Test
+    @DisplayName("writeCityDisplayStrings — sets city name but leaves region null when city has no oblast association")
+    void should_setOnlyCityName_when_oblastAssociationIsNull() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "im4@example.com", Role.INDEPENDENT_MASTER, "Vira", "K", "+380631111111");
+
+        City mockCity = mock(City.class);
+        when(mockCity.getNameUk()).thenReturn("Харків");
+        when(mockCity.getOblast()).thenReturn(null);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCity())
+                .as("city display string must be set even when oblast is absent")
+                .isEqualTo("Харків");
+        assertThat(user.getRegion())
+                .as("region must remain null when the city has no oblast association")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("writeCityDisplayStrings — leaves city and region null when city is not found in the repository")
+    void should_leaveCityAndRegionNull_when_cityNotFoundInRepository() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "c5@example.com", Role.CLIENT, "Empty", "City", "+380501111111");
+
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCity())
+                .as("city display string must remain null when cityRepository returns empty")
+                .isNull();
+        assertThat(user.getRegion())
+                .as("region display string must remain null when cityRepository returns empty")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile (SALON_OWNER) writes no personal locality and never calls the validator")
+    void should_notWriteLocality_when_salonOwner() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "owner@example.com", Role.SALON_OWNER, "Own", "Er", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        var request = new UpdateProfileRequest("Own", null, null,
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+
+        userService.updateProfile(userId, request);
+
+        verify(localityWriteValidator, never()).validateProviderLocality(any());
+        verify(localityWriteValidator, never()).validateClientLocality(any());
+        verify(cityRepository, never()).findByIdWithOblast(any());
+        assertThat(user.getCityId()).isNull();
+        assertThat(user.getCity()).isNull();
+        assertThat(user.getRegion()).isNull();
     }
 
     @Test
