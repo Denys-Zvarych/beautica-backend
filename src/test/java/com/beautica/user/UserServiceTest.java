@@ -178,8 +178,8 @@ class UserServiceTest {
     }
 
     @Test
-    @DisplayName("updateProfile (CLIENT) persists cityId and districtId but NOT street/buildingNo/locationNote")
-    void should_writeOnlyReferentialLocality_when_client() {
+    @DisplayName("updateProfile (CLIENT) persists all 5 locality fields including street/buildingNo/locationNote")
+    void should_writeAllLocalityFields_when_client() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
@@ -204,17 +204,16 @@ class UserServiceTest {
         verify(localityWriteValidator, never()).validateProviderLocality(any());
         assertThat(user.getCityId()).isEqualTo(cityId);
         assertThat(user.getDistrictId()).isEqualTo(districtId);
-        // Home address fields must NOT be written for CLIENT — unnecessary PII (security finding 3).
-        assertThat(user.getStreet()).isNull();
-        assertThat(user.getBuildingNo()).isNull();
-        assertThat(user.getLocationNote()).isNull();
+        assertThat(user.getStreet()).isEqualTo("Shevchenka");
+        assertThat(user.getBuildingNo()).isEqualTo("12A");
+        assertThat(user.getLocationNote()).isEqualTo("ring twice");
         assertThat(user.getCity()).isEqualTo("Київ");
         assertThat(user.getRegion()).isEqualTo("Київська область");
     }
 
     @Test
-    @DisplayName("updateProfile (CLIENT) does not persist street, buildingNo, locationNote even when all three are supplied")
-    void should_not_persist_street_buildingNo_locationNote_when_CLIENT_calls_updateProfile() {
+    @DisplayName("updateProfile (CLIENT) persists street, buildingNo, locationNote when all three are supplied")
+    void should_persist_street_buildingNo_locationNote_when_CLIENT_calls_updateProfile() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
         User user = buildUser(userId, "c6@example.com", Role.CLIENT, "Test", "Client", "+380501111111");
@@ -232,9 +231,9 @@ class UserServiceTest {
 
         userService.updateProfile(userId, request);
 
-        assertThat(user.getStreet()).isNull();
-        assertThat(user.getBuildingNo()).isNull();
-        assertThat(user.getLocationNote()).isNull();
+        assertThat(user.getStreet()).isEqualTo("вул. Дерибасівська");
+        assertThat(user.getBuildingNo()).isEqualTo("5");
+        assertThat(user.getLocationNote()).isEqualTo("yellow building");
     }
 
     @Test

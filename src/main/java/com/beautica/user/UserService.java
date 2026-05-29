@@ -75,18 +75,18 @@ public class UserService {
     }
 
     /**
-     * Routes the locality fields per the locked Phase 10.6 per-role matrix.
+     * Routes the locality fields per the Phase 10.6 per-role matrix.
      *
      * <ul>
      *   <li><b>INDEPENDENT_MASTER</b> — full personal address; the
      *       most-specific-node rule is enforced (city mandatory, district
      *       mandatory iff the city has urban districts).</li>
-     *   <li><b>CLIENT</b> — optional discovery-filter default; only
-     *       {@code cityId} and {@code districtId} are consumed for discovery
-     *       filtering. {@code street}, {@code buildingNo}, and
-     *       {@code locationNote} are intentionally NOT persisted for clients:
-     *       storing home addresses for clients is unnecessary PII and could
-     *       be inadvertently exposed (security finding 3).</li>
+     *   <li><b>CLIENT</b> — all 5 locality fields ({@code cityId},
+     *       {@code districtId}, {@code street}, {@code buildingNo},
+     *       {@code locationNote}) are persisted. City and district serve as
+     *       the discovery-filter default; the structured address fields allow
+     *       clients to record a service-delivery address (e.g. for
+     *       at-home appointments).</li>
      *   <li><b>SALON_OWNER / SALON_MASTER / SALON_ADMIN</b> — no personal
      *       locality write path. Owner locality lives on the salon
      *       ({@code SalonService}); SALON_MASTER discovery resolves via the
@@ -108,8 +108,9 @@ public class UserService {
             localityWriteValidator.validateClientLocality(request.toLocalityInput());
             user.setCityId(request.cityId());
             user.setDistrictId(request.districtId());
-            // street, buildingNo, locationNote are NOT written for CLIENT role:
-            // home addresses are unnecessary PII for clients and must not be stored.
+            Optional.ofNullable(request.street()).ifPresent(user::setStreet);
+            Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
+            Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
             writeCityDisplayStrings(user, request.cityId());
         }
         // SALON_OWNER / SALON_MASTER / SALON_ADMIN: no personal locality write.
