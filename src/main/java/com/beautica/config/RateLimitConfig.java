@@ -69,6 +69,12 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.reset-password-capacity:10}")
     private long resetPasswordCapacity;
 
+    // Per-IP cap for PATCH /api/v1/independent-masters/me/profile (60-second window).
+    // 10/min prevents unbounded DB writes and cache churn from a token-holding client
+    // while remaining generous enough for a legitimate profile-edit retry.
+    @Value("${app.rate-limit.profile-update-capacity:10}")
+    private long profileUpdateCapacity;
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
         return Caffeine.newBuilder()
@@ -175,6 +181,29 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofMinutes(65))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(forgotPasswordCapacity, Duration.ofMinutes(60)))
+                        .build());
+    }
+
+    /**
+     * Per-IP bucket for {@code PATCH /api/v1/independent-masters/me/profile}.
+     *
+     * <p>Cap: 10 requests per 60-second window per source IP. An authenticated
+     * user with a valid JWT can send at most 10 profile-update writes per minute;
+     * beyond that the bucket returns 429. This prevents sustained cache churn
+     * ({@code master-detail-by-user} / {@code master-by-user} evictions) and
+     * unbounded DB dirty-checking flushes without impacting legitimate usage.
+     *
+     * <p>IP-keyed (not user-keyed) for consistency with existing buckets: JWT
+     * parsing happens in {@link com.beautica.auth.JwtAuthenticationFilter} which
+     * runs after this filter, so the principal is not yet available here.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> profileUpdateBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(Duration.ofHours(1))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(profileUpdateCapacity, Duration.ofMinutes(1)))
                         .build());
     }
 

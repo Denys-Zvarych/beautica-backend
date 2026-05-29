@@ -6,7 +6,7 @@ import com.beautica.auth.Role;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.master.controller.IndependentMasterController;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
-import com.beautica.user.UserProfileResponse;
+import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.user.UserService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
@@ -129,26 +129,16 @@ class IndependentMasterProfileUpdateTest {
         return objectMapper.writeValueAsString(body);
     }
 
-    /** Builds a stub response that mirrors what the service would return. */
-    private UserProfileResponse stubProfile(UUID userId, String phone, String bio, String instagram) {
-        return new UserProfileResponse(
-                userId,
-                "master@beautica.test",
-                "INDEPENDENT_MASTER",
-                "Олена",
-                "Коваль",
-                phone,
-                null,        // cityId
-                null,        // districtId
-                null,        // street
-                null,        // buildingNo
-                null,        // locationNote
-                bio,         // bio
-                instagram,   // instagram
-                true,        // isActive
-                true,        // emailVerified
-                null         // salonId
-        );
+    /**
+     * Builds a stub response that mirrors what the service would return.
+     *
+     * <p>Returns {@link MasterPublicProfileResponse} — the slim 3-field DTO — rather
+     * than the full {@link com.beautica.user.UserProfileResponse}. The controller
+     * wraps whatever the service returns in {@code ApiResponse.ok(...)}, so the
+     * JSON fields under {@code $.data} must match the slim DTO shape.
+     */
+    private MasterPublicProfileResponse stubProfile(String phone, String bio, String instagram) {
+        return new MasterPublicProfileResponse(phone, bio, instagram);
     }
 
     // ── PATCH /me/profile — happy path ────────────────────────────────────────
@@ -162,7 +152,7 @@ class IndependentMasterProfileUpdateTest {
         var instagram = "@my_master_handle";
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(stubProfile(userId, phone, bio, instagram));
+                .thenReturn(stubProfile(phone, bio, instagram));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -171,7 +161,6 @@ class IndependentMasterProfileUpdateTest {
                         .content(validRequestBody(phone, bio, instagram)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.id").value(userId.toString()))
                 .andExpect(jsonPath("$.data.phoneNumber").value(phone))
                 .andExpect(jsonPath("$.data.bio").value(bio))
                 .andExpect(jsonPath("$.data.instagram").value(instagram));
@@ -184,7 +173,7 @@ class IndependentMasterProfileUpdateTest {
         var phone = "+380501112233";
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(stubProfile(userId, phone, null, null));
+                .thenReturn(stubProfile(phone, null, null));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -391,7 +380,7 @@ class IndependentMasterProfileUpdateTest {
         var instagram = "@myhandle";
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(stubProfile(userId, "+380671234567", null, instagram));
+                .thenReturn(stubProfile("+380671234567", null, instagram));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -410,7 +399,7 @@ class IndependentMasterProfileUpdateTest {
         var instagram = "https://instagram.com/myhandle";
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(stubProfile(userId, "+380671234567", null, instagram));
+                .thenReturn(stubProfile("+380671234567", null, instagram));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -470,7 +459,7 @@ class IndependentMasterProfileUpdateTest {
         var instagram = "myhandle";
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(stubProfile(userId, "+380671234567", null, instagram));
+                .thenReturn(stubProfile("+380671234567", null, instagram));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -498,5 +487,92 @@ class IndependentMasterProfileUpdateTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    // ── Fix 4 — QA CRITICAL: instagram empty string ───────────────────────────
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 when instagram is empty string (Fix 1: ^$| arm removed)")
+    void should_return400_when_instagramIsEmptyString() throws Exception {
+        var userId = UUID.randomUUID();
+        // After Fix 1 the ^$| arm is removed from the instagram @Pattern. An empty string
+        // no longer satisfies any branch of the regex and must produce a 400.
+        // Previously "" passed through to the service and silently overwrote an existing
+        // handle with "", which is semantically invalid and data-corrupting.
+        var body = objectMapper.writeValueAsString(java.util.Map.of(
+                "phoneNumber", "+380671234567",
+                "instagram", ""));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    // ── Fix 5 — QA MEDIUM: phone max-boundary ────────────────────────────────
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 when phoneNumber is exactly 20 characters (max boundary)")
+    void should_return200_when_phoneNumberIsExactly20Characters() throws Exception {
+        var userId = UUID.randomUUID();
+        // "+" + 19 digits = 20 chars total — exactly at the @Size(max = 20) and @Pattern ceiling.
+        var phone = "+" + "1".repeat(19);
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(stubProfile(phone, null, null));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validRequestBody(phone, null, null)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.phoneNumber").value(phone));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 when phoneNumber exceeds 20 characters (max boundary + 1)")
+    void should_return400_when_phoneNumberExceeds20Characters() throws Exception {
+        var userId = UUID.randomUUID();
+        // "+" + 20 digits = 21 chars total — one over the @Size(max = 20) cap.
+        var phone = "+" + "1".repeat(20);
+        var body = objectMapper.writeValueAsString(java.util.Map.of("phoneNumber", phone));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    // ── Fix 6 — QA MEDIUM: bio exact-boundary ────────────────────────────────
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 when bio is exactly 2000 characters (max boundary)")
+    void should_return200_when_bioIsExactly2000Characters() throws Exception {
+        var userId = UUID.randomUUID();
+        // 2000 Cyrillic chars — exactly at the @Size(max = 2000) ceiling. The @Pattern
+        // ^[^\p{Cntrl}]*$ permits Cyrillic letters; this must pass and reach the service.
+        String bio = "А".repeat(2000);
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(stubProfile("+380671234567", bio, null));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validRequestBody("+380671234567", bio, null)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.bio").value(bio));
     }
 }

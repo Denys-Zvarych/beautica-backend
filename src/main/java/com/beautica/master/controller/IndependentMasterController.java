@@ -4,6 +4,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.dto.IndependentMasterUpdateRequest;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
+import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.user.UpdateProfileRequest;
 import com.beautica.user.UserProfileResponse;
 import com.beautica.user.UserService;
@@ -90,12 +91,12 @@ public class IndependentMasterController {
      */
     @PatchMapping("/me/profile")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
-    public ResponseEntity<ApiResponse<UserProfileResponse>> updateProfile(
+    public ResponseEntity<ApiResponse<MasterPublicProfileResponse>> updateProfile(
             @Valid @RequestBody MasterProfileUpdateRequest request,
             Authentication authentication
     ) {
         UUID userId = extractUserId(authentication);
-        UserProfileResponse updated = userService.updateMasterProfile(userId, request);
+        MasterPublicProfileResponse updated = userService.updateMasterProfile(userId, request);
         return ResponseEntity.ok(ApiResponse.ok(updated));
     }
 

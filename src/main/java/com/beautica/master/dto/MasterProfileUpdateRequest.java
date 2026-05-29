@@ -41,7 +41,7 @@ public record MasterProfileUpdateRequest(
 
         @Size(max = 100, message = "Instagram handle must not exceed 100 characters")
         @Pattern(
-                regexp = "^$|^@?[A-Za-z0-9._]{1,30}$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
+                regexp = "^@?[A-Za-z0-9._]{1,30}$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
                 message = "Instagram must be a handle (e.g. @username) or a full instagram.com URL"
         )
         String instagram

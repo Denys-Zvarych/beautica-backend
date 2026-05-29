@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
+import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
@@ -81,7 +82,7 @@ public class UserService {
      * @return updated profile visible to the caller
      */
     @Transactional
-    public UserProfileResponse updateMasterProfile(UUID userId, MasterProfileUpdateRequest request) {
+    public MasterPublicProfileResponse updateMasterProfile(UUID userId, MasterProfileUpdateRequest request) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
 
@@ -96,7 +97,11 @@ public class UserService {
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
         evictUserCachesAfterCommit(userId);
 
-        return UserProfileResponse.from(user);
+        return new MasterPublicProfileResponse(
+                user.getPhoneNumber(),
+                user.getBio(),
+                user.getInstagram()
+        );
     }
 
     /**

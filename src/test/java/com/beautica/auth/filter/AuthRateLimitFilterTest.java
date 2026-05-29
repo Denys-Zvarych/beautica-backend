@@ -41,6 +41,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> slotsBuckets;
     @Mock private LoadingCache<String, Bucket> deviceTokenBuckets;
     @Mock private LoadingCache<String, Bucket> mediaUploadBuckets;
+    @Mock private LoadingCache<String, Bucket> profileUpdateBuckets;
     @Mock private LoadingCache<String, Bucket> resendVerificationBuckets;
     @Mock private LoadingCache<String, Bucket> forgotPasswordBuckets;
     @Mock private LoadingCache<String, Bucket> resetPasswordBuckets;
@@ -53,8 +54,8 @@ class AuthRateLimitFilterTest {
     void setUp() {
         filter = new AuthRateLimitFilter(
                 registerBuckets, loginBuckets, refreshBuckets, verifyEmailBuckets,
-                slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, resendVerificationBuckets,
-                forgotPasswordBuckets, resetPasswordBuckets);
+                slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, profileUpdateBuckets,
+                resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

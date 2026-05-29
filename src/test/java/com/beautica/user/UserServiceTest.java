@@ -9,7 +9,9 @@ import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
+import com.beautica.master.dto.MasterPublicProfileResponse;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -441,7 +443,7 @@ class UserServiceTest {
         MasterProfileUpdateRequest request =
                 new MasterProfileUpdateRequest("+380671112233", "bio text", "@instagram");
 
-        UserProfileResponse response = userService.updateMasterProfile(userId, request);
+        MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
 
         assertThat(user.getPhoneNumber()).isEqualTo("+380671112233");
         assertThat(user.getBio()).isEqualTo("bio text");
@@ -536,6 +538,35 @@ class UserServiceTest {
                 .isInstanceOf(BusinessException.class);
 
         verify(userRepository, never()).save(any());
+    }
+
+    // ── Cache eviction — requires Spring context ──────────────────────────────
+
+    /**
+     * Documents why cache-eviction correctness cannot be verified under
+     * {@link org.junit.jupiter.api.extension.ExtendWith} (MockitoExtension) alone.
+     *
+     * <p>{@link UserService#evictUserCachesAfterCommit} registers a callback via
+     * {@link TransactionSynchronizationManager#registerSynchronization}, which is a
+     * no-op when no transaction synchronisation is active. Under
+     * {@code MockitoExtension} there is no active transaction, so the callback is
+     * never registered and the {@link org.springframework.cache.CacheManager} mock
+     * is never invoked — asserting on it would give a false-negative (always passes,
+     * even if the eviction logic is broken).
+     *
+     * <p>The correct coverage level for this behaviour is a Spring slice or full
+     * integration test where a real {@link org.springframework.transaction.PlatformTransactionManager}
+     * and a {@link org.springframework.cache.CacheManager} bean are in scope, so that
+     * the {@code afterCommit} callback actually fires and cache eviction can be
+     * observed on the real cache.
+     */
+    @Test
+    @Disabled("Requires Spring context — cache eviction is tested via integration test")
+    void should_evictBothCaches_afterCommit_onProfileUpdate() {
+        // Not implemented at unit-test level. See Javadoc above for the full rationale.
+        // Coverage lives in the @SpringBootTest integration test for UserService /
+        // IndependentMasterController where the TransactionSynchronizationManager
+        // callback fires after the real commit boundary.
     }
 
     private User buildUser(UUID id, String email, Role role,
