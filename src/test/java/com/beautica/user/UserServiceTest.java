@@ -391,6 +391,28 @@ class UserServiceTest {
     }
 
     @Test
+    @DisplayName("updateProfile (SALON_ADMIN) writes no personal locality and never calls the validator or city repository")
+    void should_notWriteLocality_when_salonAdmin() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "admin@example.com", Role.SALON_ADMIN, "Adm", "In", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepository.save(user)).thenReturn(user);
+
+        var request = new UpdateProfileRequest("Adm", null, null,
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+
+        userService.updateProfile(userId, request);
+
+        verify(localityWriteValidator, never()).validateProviderLocality(any());
+        verify(localityWriteValidator, never()).validateClientLocality(any());
+        verify(cityRepository, never()).findByIdWithOblast(any());
+        assertThat(user.getCityId()).isNull();
+        assertThat(user.getCity()).isNull();
+        assertThat(user.getRegion()).isNull();
+    }
+
+    @Test
     @DisplayName("updateProfile propagates BusinessException from the locality validator and does not save")
     void should_propagate_when_validatorRejects() {
         UUID userId = UUID.randomUUID();
