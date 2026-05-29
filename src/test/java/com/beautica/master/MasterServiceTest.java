@@ -446,7 +446,7 @@ class MasterServiceTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByUserIdWithUserAndSalon(userId)).thenReturn(Optional.of(master));
 
         Master result = masterService.getMasterByUserId(userId);
 
@@ -459,7 +459,7 @@ class MasterServiceTest {
     void should_throwNotFound_when_getMasterByUserIdAndNoMasterRecord() {
         UUID userId = UUID.randomUUID();
 
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
+        when(masterRepository.findByUserIdWithUserAndSalon(userId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.getMasterByUserId(userId))
                 .isInstanceOf(NotFoundException.class);

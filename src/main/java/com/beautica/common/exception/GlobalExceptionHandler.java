@@ -24,6 +24,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.stream.Collectors;
 
@@ -241,6 +242,21 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         new EmailNotVerifiedResponse("EMAIL_NOT_VERIFIED", ex.getEmail()),
                         "Email not verified"));
+    }
+
+    /**
+     * Handles Spring MVC 6.x {@link NoResourceFoundException}, thrown when a request
+     * targets a static resource path that does not exist (e.g. {@code /swagger-ui/index.html}
+     * in production where Swagger is disabled). Without this handler the generic
+     * {@link #handleGeneric} catch-all fires, logging at ERROR and returning HTTP 500.
+     * The correct status is 404 and the log noise belongs at DEBUG.
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleNoResourceFound(NoResourceFoundException ex) {
+        log.debug("Static resource not found: {}", ex.getResourcePath());
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error("Resource not found"));
     }
 
     @ExceptionHandler(Exception.class)

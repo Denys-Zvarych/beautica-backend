@@ -40,6 +40,22 @@ public interface CityRepository extends JpaRepository<City, UUID> {
     Optional<City> findByKatotthCode(String katotthCode);
 
     /**
+     * Fetches a city together with its parent {@link com.beautica.location.entity.Oblast}
+     * in a single round-trip via {@code JOIN FETCH}.
+     *
+     * <p>Use this instead of the plain {@link #findById(Object)} whenever the
+     * caller needs to read {@code city.getOblast()} — the plain finder leaves
+     * the {@code LAZY} association un-initialised, causing either a secondary
+     * SELECT (N+1) inside an active transaction or a
+     * {@code LazyInitializationException} outside one.
+     *
+     * @param id surrogate PK of the city
+     * @return the city with its oblast hydrated, or empty when not found
+     */
+    @Query("SELECT c FROM City c JOIN FETCH c.oblast WHERE c.id = :id")
+    Optional<City> findByIdWithOblast(@Param("id") UUID id);
+
+    /**
      * Batch-resolves city {@code name_uk} labels for a set of city ids in a
      * single {@code IN (...)} query.
      *

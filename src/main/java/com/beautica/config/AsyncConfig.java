@@ -32,6 +32,21 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(20);
+        // Propagate the webapp classloader into email-* threads so that
+        // ServiceLoader (jakarta.mail.util.StreamProvider) resolves META-INF/services/
+        // entries from the application classpath rather than the system classloader.
+        executor.setTaskDecorator(runnable -> {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            return () -> {
+                ClassLoader prev = Thread.currentThread().getContextClassLoader();
+                Thread.currentThread().setContextClassLoader(cl);
+                try {
+                    runnable.run();
+                } finally {
+                    Thread.currentThread().setContextClassLoader(prev);
+                }
+            };
+        });
         executor.initialize();
         return new DelegatingSecurityContextTaskExecutor(executor);
     }
@@ -48,6 +63,20 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);
+        // Same classloader propagation as emailExecutor — future ServiceLoader-based libs
+        // (FCM SDK, APNs provider) need the webapp classloader on push-* threads.
+        executor.setTaskDecorator(runnable -> {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            return () -> {
+                ClassLoader prev = Thread.currentThread().getContextClassLoader();
+                Thread.currentThread().setContextClassLoader(cl);
+                try {
+                    runnable.run();
+                } finally {
+                    Thread.currentThread().setContextClassLoader(prev);
+                }
+            };
+        });
         executor.initialize();
         return new DelegatingSecurityContextTaskExecutor(executor);
     }

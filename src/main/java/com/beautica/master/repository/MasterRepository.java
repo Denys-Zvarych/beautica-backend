@@ -34,6 +34,24 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             """)
     Optional<Master> findByUserIdWithSalon(@Param("userId") UUID userId);
 
+    /**
+     * Fetches the master together with both its {@code user} and {@code salon} associations
+     * in a single query. Used by
+     * {@link com.beautica.master.service.MasterService#getMyMasterDetail(java.util.UUID)}
+     * so the cached result is a fully-initialized DTO rather than a detached JPA entity
+     * with unresolvable lazy proxies (CRITICAL Anti-Bug §E).
+     *
+     * <p>Prefer this over the bare {@link #findByUserId} wherever the caller needs to
+     * dereference either {@code master.getUser()} or {@code master.getSalon()}.
+     */
+    @Query("""
+            SELECT m FROM Master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon
+            WHERE m.user.id = :userId
+            """)
+    Optional<Master> findByUserIdWithUserAndSalon(@Param("userId") UUID userId);
+
     /** @deprecated No JOIN FETCH on user — triggers N+1. Use {@link #findBySalonIdAndIsActiveTrueWithUser} instead. */
     @Deprecated
     Page<Master> findBySalonIdAndIsActiveTrue(UUID salonId, Pageable pageable);

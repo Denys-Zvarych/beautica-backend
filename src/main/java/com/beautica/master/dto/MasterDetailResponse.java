@@ -14,6 +14,9 @@ public record MasterDetailResponse(
         String firstName,
         String lastName,
         String city,
+        String street,
+        String buildingNo,
+        String locationNote,
         String bio,
         String avatarUrl,
         BigDecimal avgRating,
@@ -27,9 +30,12 @@ public record MasterDetailResponse(
                 master.getId(),
                 master.getUser().getFirstName(),
                 master.getUser().getLastName(),
-                null, // TODO: map from user.city once Phase 2-B adds it to User
-                null, // TODO: map from user.bio once Phase 2-B adds it to User
-                null, // TODO: map from user.avatarUrl once Phase 2-B adds it to User
+                master.getUser().getCity(),
+                master.getUser().getStreet(),
+                master.getUser().getBuildingNo(),
+                master.getUser().getLocationNote(),
+                null, // TODO: bio — no backing column yet (masters.bio / users.bio not in schema)
+                master.getUser().getAvatarUrl(),
                 master.getAvgRating(),
                 master.getReviewCount(),
                 master.getMasterType(),

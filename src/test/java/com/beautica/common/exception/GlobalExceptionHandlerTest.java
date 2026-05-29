@@ -576,6 +576,55 @@ class GlobalExceptionHandlerTest {
                 .doesNotContain("Integer");
     }
 
+    @Test
+    @DisplayName("handleNoResourceFound — returns 404 with generic message when static resource is not found")
+    void should_return404_when_noResourceFoundException() {
+        // Arrange — Spring MVC 6.x throws this when a static resource path does not exist
+        // (e.g. /swagger-ui/index.html when Swagger is disabled in production).
+        // The exception should NOT be logged at ERROR; DEBUG is sufficient.
+        var ex = new org.springframework.web.servlet.resource.NoResourceFoundException(
+                org.springframework.http.HttpMethod.GET,
+                "/swagger-ui/index.html");
+
+        listAppender.list.clear();
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleNoResourceFound(ex);
+
+        // Assert — HTTP contract
+        assertThat(response.getStatusCode())
+                .as("status must be 404 for a missing static resource")
+                .isEqualTo(HttpStatus.NOT_FOUND);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("message must be the generic safe string")
+                .isEqualTo("Resource not found");
+
+        // Assert — logging contract: DEBUG level (not ERROR)
+        List<ILoggingEvent> allEvents = listAppender.list;
+        List<ILoggingEvent> errorEvents = allEvents.stream()
+                .filter(e -> e.getLevel() == Level.ERROR)
+                .toList();
+        assertThat(errorEvents)
+                .as("handleNoResourceFound must NOT emit any ERROR logs")
+                .isEmpty();
+
+        List<ILoggingEvent> debugEvents = allEvents.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleNoResourceFound must emit exactly one DEBUG log")
+                .hasSize(1);
+
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must reference the resource path")
+                .contains("/swagger-ui/index.html");
+    }
+
     /**
      * Dummy target method whose sole purpose is to supply a MethodParameter
      * for constructing MethodArgumentNotValidException in tests.

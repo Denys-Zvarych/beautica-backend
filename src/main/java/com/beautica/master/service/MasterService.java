@@ -477,10 +477,33 @@ public class MasterService {
                 .map(MasterSummaryResponse::from);
     }
 
-    @Cacheable(value = "master-by-user", key = "#userId")
+    /**
+     * Returns the fully-mapped {@link MasterDetailResponse} for the authenticated master
+     * identified by {@code userId}.
+     *
+     * <p>Combines the cache, the JOIN FETCH query, and the DTO mapping in a single
+     * {@code @Transactional(readOnly = true)} boundary so all three happen inside one
+     * database session (MEDIUM — two-transaction fix). The cached value is a DTO, never
+     * a detached JPA entity, which eliminates {@code LazyInitializationException} on cache
+     * hits (CRITICAL §E). {@code sync = true} prevents the thundering-herd on TTL expiry
+     * by allowing only one thread to populate the cache entry (HIGH §F-7).
+     *
+     * <p>Callers in {@link com.beautica.master.controller.MasterController#getMyProfile}
+     * must use this method. {@link #getMasterByUserId} is retained for other callers
+     * (e.g. calendar endpoint) that only need the {@link Master} entity.
+     */
+    @Cacheable(value = "master-detail-by-user", key = "#userId", sync = true)
+    @Transactional(readOnly = true)
+    public MasterDetailResponse getMyMasterDetail(UUID userId) {
+        Master master = masterRepository.findByUserIdWithUserAndSalon(userId)
+                .orElseThrow(() -> new NotFoundException("Master not found"));
+        return getMasterDetail(master);
+    }
+
+    @Cacheable(value = "master-by-user", key = "#userId", sync = true)
     @Transactional(readOnly = true)
     public Master getMasterByUserId(UUID userId) {
-        return masterRepository.findByUserId(userId)
+        return masterRepository.findByUserIdWithUserAndSalon(userId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
     }
 
