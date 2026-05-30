@@ -441,7 +441,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         MasterProfileUpdateRequest request =
-                new MasterProfileUpdateRequest("+380671112233", "bio text", "@instagram");
+                new MasterProfileUpdateRequest(null, null, "+380671112233", "bio text", "@instagram");
 
         MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
 
@@ -461,7 +461,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> userService.updateMasterProfile(
-                userId, new MasterProfileUpdateRequest("+380671112233", null, null)))
+                userId, new MasterProfileUpdateRequest(null, null, "+380671112233", null, null)))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessage("User not found");
 
@@ -479,7 +479,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest("+380671111111", null, null));
+                new MasterProfileUpdateRequest(null, null, "+380671111111", null, null));
 
         assertThat(user.getBio()).isEqualTo("existing bio");
     }
@@ -495,7 +495,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest("+380671111111", null, null));
+                new MasterProfileUpdateRequest(null, null, "+380671111111", null, null));
 
         assertThat(user.getInstagram()).isEqualTo("@old_handle");
     }
@@ -512,11 +512,106 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest("+380679999999", null, null));
+                new MasterProfileUpdateRequest(null, null, "+380679999999", null, null));
 
         assertThat(user.getPhoneNumber()).isEqualTo("+380679999999");
         assertThat(user.getBio()).isEqualTo("original bio");
         assertThat(user.getInstagram()).isEqualTo("@original");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile updates firstName and lastName when provided")
+    void should_updateFirstNameAndLastName_when_provided() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master5@example.com", Role.INDEPENDENT_MASTER,
+                "Старе", "Ім'я", "+380670000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        MasterProfileUpdateRequest request =
+                new MasterProfileUpdateRequest("Нова", "Назва", null, null, null);
+
+        MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
+
+        assertThat(user.getFirstName()).isEqualTo("Нова");
+        assertThat(user.getLastName()).isEqualTo("Назва");
+        assertThat(response.firstName()).isEqualTo("Нова");
+        assertThat(response.lastName()).isEqualTo("Назва");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite firstName when firstName is null")
+    void should_notOverwriteFirstName_when_firstNameIsNullInRequest() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master6@example.com", Role.INDEPENDENT_MASTER,
+                "Існуюче", "Ім'я", "+380670000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, null, null, null, null));
+
+        assertThat(user.getFirstName()).isEqualTo("Існуюче");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite firstName when firstName is blank")
+    void should_notOverwriteFirstName_when_firstNameIsBlankInRequest() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master7@example.com", Role.INDEPENDENT_MASTER,
+                "Існуюче", "Ім'я", "+380670000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest("   ", null, null, null, null));
+
+        assertThat(user.getFirstName()).isEqualTo("Існуюче");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite lastName when lastName is null")
+    void should_notOverwriteLastName_when_lastNameIsNullInRequest() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master8@example.com", Role.INDEPENDENT_MASTER,
+                "Існуюче", "Прізвище", "+380670000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, null, null, null, null));
+
+        assertThat(user.getLastName()).isEqualTo("Прізвище");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite lastName when lastName is blank")
+    void should_notOverwriteLastName_when_lastNameIsBlankInRequest() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master9@example.com", Role.INDEPENDENT_MASTER,
+                "Існуюче", "Прізвище", "+380670000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, "   ", null, null, null));
+
+        assertThat(user.getLastName()).isEqualTo("Прізвище");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite phoneNumber when phoneNumber is null")
+    void should_notOverwritePhone_when_phoneIsNullInRequest() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "master10@example.com", Role.INDEPENDENT_MASTER,
+                "Іван", "Коваль", "+380670000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, null, null, null, null));
+
+        assertThat(user.getPhoneNumber()).isEqualTo("+380670000000");
     }
 
     // ── updateProfile — propagate from validator ──────────────────────────────

@@ -1,30 +1,51 @@
 package com.beautica.master.dto;
 
-import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 /**
  * Request body for {@code PATCH /api/v1/independent-masters/me/profile}.
  *
- * <p>Covers the three editable public-profile fields: phone number, bio, and
- * Instagram handle.
+ * <p>All fields are optional (nullable). The service applies a null-and-blank
+ * guard before writing: a null value leaves the stored value unchanged; a
+ * non-null non-blank value overwrites it. This allows the mobile edit-profile
+ * screen to send only the fields it wishes to change.
  *
  * <h2>Validation notes (§A)</h2>
  * <ul>
- *   <li>{@code phoneNumber} is {@code @NotBlank}: phone was collected at
- *       registration and must not be cleared via this endpoint.</li>
- *   <li>{@code bio} and {@code instagram} are optional (null-safe in the service),
- *       but when supplied they are capped by {@code @Size} and guarded by a
+ *   <li>{@code firstName} and {@code lastName} are optional free-text. When
+ *       supplied, they are capped at 100 characters and may not contain control
+ *       characters (§A — every supplied string field needs {@code @Size} + a
  *       control-character {@code @Pattern} so that malformed payloads produce a
- *       clean 400 rather than a {@code DataIntegrityViolationException} 500.</li>
+ *       clean 400 rather than a {@code DataIntegrityViolationException} 500).</li>
+ *   <li>{@code phoneNumber} is optional on this edit endpoint: the phone number
+ *       was collected at registration and may already be stored. Removing
+ *       {@code @NotBlank} allows the caller to omit it and leave the stored value
+ *       intact. The {@code @Pattern} still enforces format when a value is
+ *       provided (Bean Validation skips null, so the pattern fires only for
+ *       non-null values).</li>
+ *   <li>{@code bio} and {@code instagram} retain the same optional semantics as
+ *       before.</li>
  *   <li>{@code @Size(max = N)} values match {@code @Column(length = N)} / TEXT
  *       on the entity exactly — the DB column is never the backstop.</li>
  * </ul>
  */
 public record MasterProfileUpdateRequest(
 
-        @NotBlank(message = "Phone number is required")
+        @Size(max = 100, message = "First name must not exceed 100 characters")
+        @Pattern(
+                regexp = "^[^\\p{Cntrl}]*$",
+                message = "First name must not contain control characters"
+        )
+        String firstName,
+
+        @Size(max = 100, message = "Last name must not exceed 100 characters")
+        @Pattern(
+                regexp = "^[^\\p{Cntrl}]*$",
+                message = "Last name must not contain control characters"
+        )
+        String lastName,
+
         @Size(max = 20, message = "Phone number must not exceed 20 characters")
         @Pattern(
                 regexp = "^\\+?[0-9][0-9\\s\\-()]{6,19}$",

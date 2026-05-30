@@ -138,7 +138,16 @@ class IndependentMasterProfileUpdateTest {
      * JSON fields under {@code $.data} must match the slim DTO shape.
      */
     private MasterPublicProfileResponse stubProfile(String phone, String bio, String instagram) {
-        return new MasterPublicProfileResponse(phone, bio, instagram);
+        return new MasterPublicProfileResponse(null, null, phone, bio, instagram);
+    }
+
+    /**
+     * Overload that also populates firstName and lastName — used by tests that assert
+     * name fields are echoed in the response body.
+     */
+    private MasterPublicProfileResponse stubProfile(String firstName, String lastName,
+            String phone, String bio, String instagram) {
+        return new MasterPublicProfileResponse(firstName, lastName, phone, bio, instagram);
     }
 
     // ── PATCH /me/profile — happy path ────────────────────────────────────────
@@ -269,20 +278,23 @@ class IndependentMasterProfileUpdateTest {
     }
 
     @Test
-    @DisplayName("PATCH /me/profile — 400 when phoneNumber is absent from the request body")
-    void should_return400_when_phoneNumberIsMissing() throws Exception {
+    @DisplayName("PATCH /me/profile — 200 when phoneNumber is absent from the request body (phoneNumber is now optional)")
+    void should_return200_when_phoneNumberIsAbsent() throws Exception {
         var userId = UUID.randomUUID();
-        // Omit phoneNumber entirely — @NotBlank rejects null/absent values.
+        // phoneNumber is optional — omitting it must not produce a validation error.
+        // The service leaves the stored phone unchanged when the field is null.
         var body = objectMapper.writeValueAsString(java.util.Map.of("bio", "Some bio text"));
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(new MasterPublicProfileResponse(null, null, "+380670000000", "Some bio text", null));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.message").isNotEmpty());
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
     }
 
     @Test
@@ -551,6 +563,35 @@ class IndependentMasterProfileUpdateTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    // ── Fix 5 — QA MEDIUM: firstName and lastName echoed in response ─────────
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 with firstName and lastName echoed when update includes name fields")
+    void should_return200WithFirstNameAndLastName_when_updateIncludesNameFields() throws Exception {
+        var userId = UUID.randomUUID();
+        var firstName = "Нова";
+        var lastName = "Назва";
+        var phone = "+380671234567";
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("firstName", firstName);
+        body.put("lastName", lastName);
+        body.put("phoneNumber", phone);
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(stubProfile(firstName, lastName, phone, null, null));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.firstName").value(firstName))
+                .andExpect(jsonPath("$.data.lastName").value(lastName));
     }
 
     // ── Fix 6 — QA MEDIUM: bio exact-boundary ────────────────────────────────
