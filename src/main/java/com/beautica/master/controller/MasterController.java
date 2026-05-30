@@ -69,17 +69,7 @@ public class MasterController {
      */
     @GetMapping("/{masterId}")
     public ApiResponse<MasterDetailResponse> getMasterDetail(@PathVariable UUID masterId) {
-        MasterDetailResponse detail = masterService.getMasterDetail(masterId);
-        // Mask home-address triple on the public (unauthenticated) endpoint.
-        // Full address is only returned on the authenticated GET /me endpoint.
-        MasterDetailResponse publicDetail = new MasterDetailResponse(
-                detail.masterId(), detail.firstName(), detail.lastName(), detail.city(),
-                null, null, null, // street, buildingNo, locationNote — masked for public access
-                detail.bio(), detail.instagram(),
-                detail.avatarUrl(), detail.avgRating(), detail.reviewCount(),
-                detail.masterType(), detail.salon(), detail.workingHours()
-        );
-        return ApiResponse.ok(publicDetail);
+        return ApiResponse.ok(MasterDetailResponse.fromPublic(masterService.getMasterDetail(masterId)));
     }
 
     @GetMapping("/by-salon/{salonId}")

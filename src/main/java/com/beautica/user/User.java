@@ -214,6 +214,7 @@ public class User extends AuditableEntity {
         return lastName;
     }
 
+    @JsonIgnore
     public String getPhoneNumber() {
         return phoneNumber;
     }
