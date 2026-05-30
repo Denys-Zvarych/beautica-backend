@@ -141,7 +141,7 @@ class MasterControllerTest {
 
     private MasterDetailResponse stubMasterDetail(UUID masterId, UUID userId) {
         return new MasterDetailResponse(
-                masterId, "Oksana", "Kovalenko", null, null, null, null,
+                masterId, "Oksana", "Kovalenko", null, null, null, null, null,
                 null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
     }
 
@@ -175,20 +175,21 @@ class MasterControllerTest {
     }
 
     @Test
-    @DisplayName("GET /{masterId} — address fields are null when caller is unauthenticated")
+    @DisplayName("GET /{masterId} — phoneNumber, street, buildingNo, locationNote are masked when caller is unauthenticated")
     void should_not_expose_address_fields_when_caller_is_unauthenticated() throws Exception {
         var masterId = UUID.randomUUID();
-        // Stub with non-null address fields to prove the controller masks them.
+        // Stub with non-null PII fields to prove the controller masks them.
         MasterDetailResponse fullDetail = new MasterDetailResponse(
-                masterId, "Oksana", "Kovalenko", "Київ",
+                masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
                 null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
-        log.debug("Act: GET {}/{} without credentials — address fields must be masked", MASTERS_URL, masterId);
+        log.debug("Act: GET {}/{} without credentials — PII fields must be masked", MASTERS_URL, masterId);
         mockMvc.perform(get(MASTERS_URL + "/" + masterId)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phoneNumber").doesNotExist())
                 .andExpect(jsonPath("$.data.street").doesNotExist())
                 .andExpect(jsonPath("$.data.buildingNo").doesNotExist())
                 .andExpect(jsonPath("$.data.locationNote").doesNotExist());
@@ -197,13 +198,13 @@ class MasterControllerTest {
     // ── GET /me — self-profile ────────────────────────────────────────────────
 
     @Test
-    @DisplayName("GET /me — address fields are present when authenticated INDEPENDENT_MASTER calls own profile")
+    @DisplayName("GET /me — phoneNumber, street, buildingNo, locationNote are present when authenticated INDEPENDENT_MASTER calls own profile")
     void should_expose_address_fields_when_authenticatedMasterCallsGetMe() throws Exception {
         var userId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
-        // Stub with non-null address fields — the /me handler must return them unmasked.
+        // Stub with non-null PII fields — the /me handler must return them unmasked.
         MasterDetailResponse fullDetail = new MasterDetailResponse(
-                masterId, "Oksana", "Kovalenko", "Київ",
+                masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
                 null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
         when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
@@ -212,6 +213,7 @@ class MasterControllerTest {
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phoneNumber").value("+380671234567"))
                 .andExpect(jsonPath("$.data.street").value("вул. Хрещатик"))
                 .andExpect(jsonPath("$.data.buildingNo").value("1A"))
                 .andExpect(jsonPath("$.data.locationNote").value("green door"));

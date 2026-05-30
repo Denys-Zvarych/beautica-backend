@@ -13,6 +13,7 @@ public record MasterDetailResponse(
         UUID masterId,
         String firstName,
         String lastName,
+        String phoneNumber,
         String city,
         String street,
         String buildingNo,
@@ -31,6 +32,7 @@ public record MasterDetailResponse(
                 master.getId(),
                 master.getUser().getFirstName(),
                 master.getUser().getLastName(),
+                master.getUser().getPhoneNumber(),
                 master.getUser().getCity(),
                 master.getUser().getStreet(),
                 master.getUser().getBuildingNo(),
@@ -43,6 +45,23 @@ public record MasterDetailResponse(
                 master.getMasterType(),
                 master.getSalon() != null ? PublicSalonResponse.from(master.getSalon()) : null,
                 hours.stream().map(WorkingHoursResponse::from).toList()
+        );
+    }
+
+    /**
+     * Returns a copy of {@code full} with PII fields masked for unauthenticated callers.
+     * Masked: phoneNumber, street, buildingNo, locationNote.
+     * Retained: city (non-precise locality), all other public fields.
+     */
+    public static MasterDetailResponse fromPublic(MasterDetailResponse full) {
+        return new MasterDetailResponse(
+                full.masterId(), full.firstName(), full.lastName(),
+                null,             // phoneNumber — masked for public access
+                full.city(),
+                null, null, null, // street, buildingNo, locationNote — masked for public access
+                full.bio(), full.instagram(),
+                full.avatarUrl(), full.avgRating(), full.reviewCount(),
+                full.masterType(), full.salon(), full.workingHours()
         );
     }
 }
