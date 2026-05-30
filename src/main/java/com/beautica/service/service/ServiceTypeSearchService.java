@@ -46,7 +46,7 @@ class ServiceTypeSearchService {
      * @param q          search term (caller must ensure length >= 3, stripped, lowercased)
      * @param categoryId optional category filter; {@code null} searches across all categories
      */
-    @Cacheable(value = "service-type-search", key = "#q + ':' + #categoryId")
+    @Cacheable(value = "service-type-search", key = "{#q, #categoryId}")
     @Transactional(readOnly = true)
     List<ServiceTypeResponse> searchByName(String q, @Nullable UUID categoryId) {
         List<ServiceType> types = categoryId != null

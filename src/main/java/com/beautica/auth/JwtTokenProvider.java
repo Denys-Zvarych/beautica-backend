@@ -86,7 +86,7 @@ public class JwtTokenProvider {
         try {
             return UUID.fromString(subject);
         } catch (IllegalArgumentException ex) {
-            throw new MalformedJwtException(String.format("Invalid subject claim, expected UUID: %s", subject));
+            throw new MalformedJwtException("Invalid subject claim: not a valid UUID");
         }
     }
 
@@ -110,7 +110,7 @@ public class JwtTokenProvider {
         try {
             return Role.valueOf(roleStr);
         } catch (IllegalArgumentException ex) {
-            throw new MalformedJwtException(String.format("Unknown role claim: %s", roleStr));
+            throw new MalformedJwtException("Unknown role claim");
         }
     }
 

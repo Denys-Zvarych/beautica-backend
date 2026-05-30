@@ -228,4 +228,53 @@ class SalonMasterProfileUpdateTest {
                         .content(validRequestBody("+380671234567", null, null)))
                 .andExpect(status().isForbidden());
     }
+
+    // ── PATCH /me/profile — 400 validation failures ───────────────────────────
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 when bio exceeds 2000 characters")
+    void should_return400_when_bioExceeds2000Characters() throws Exception {
+        var userId = UUID.randomUUID();
+        String tooLongBio = "А".repeat(2001);
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validRequestBody("+380671234567", tooLongBio, null)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 when instagram contains javascript: scheme")
+    void should_return400_when_instagramContainsJavascriptScheme() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validRequestBody("+380671234567", null, "javascript:alert(1)")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 when phoneNumber is blank")
+    void should_return400_when_phoneNumberIsBlank() throws Exception {
+        var userId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(java.util.Map.of("phoneNumber", "   "));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "smaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").isNotEmpty());
+    }
 }

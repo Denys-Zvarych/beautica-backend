@@ -178,7 +178,7 @@ class JwtTokenProviderTest {
         assertThatThrownBy(() -> jwtTokenProvider.getUserIdFromToken(claims))
                 .as("getUserIdFromToken must throw MalformedJwtException, not IllegalArgumentException, when sub is not a UUID")
                 .isInstanceOf(MalformedJwtException.class)
-                .hasMessageContaining("Invalid subject claim, expected UUID");
+                .hasMessageContaining("Invalid subject claim: not a valid UUID");
     }
 
     @Test
