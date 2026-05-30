@@ -52,7 +52,9 @@ public class UserService {
 
         Optional.ofNullable(request.firstName()).ifPresent(user::setFirstName);
         Optional.ofNullable(request.lastName()).ifPresent(user::setLastName);
-        Optional.ofNullable(request.phoneNumber()).ifPresent(user::setPhoneNumber);
+        Optional.ofNullable(request.phoneNumber())
+                .filter(s -> !s.isBlank())
+                .ifPresent(user::setPhoneNumber);
 
         applyLocality(user, request);
 
@@ -63,30 +65,41 @@ public class UserService {
     }
 
     /**
-     * Updates the independent master's public profile fields: phone number, bio,
-     * and Instagram handle.
+     * Updates the independent master's public profile fields: first name, last name,
+     * phone number, bio, and Instagram handle.
      *
      * <p>This method is intentionally separate from {@link #updateProfile} so that
      * the locality and profile-text write paths remain independently testable and
      * maintainable. The two paths cover disjoint columns on {@code users}:
      * locality columns (cityId, districtId, street, …) vs. profile columns
-     * (phoneNumber, bio, instagram).
+     * (firstName, lastName, phoneNumber, bio, instagram).
+     *
+     * <p>All fields are optional. A null value leaves the stored value unchanged.
+     * For {@code firstName} and {@code lastName} a blank string is also treated as
+     * "no change" — an empty name must not overwrite a previously stored value.
      *
      * <p>Evicts {@code master-detail-by-user} and {@code master-by-user} after
      * commit so that a parallel reader cannot repopulate either cache with stale
-     * bio/instagram/phone data mid-transaction (§F — cache eviction must run
-     * afterCommit; both caches hold user fields).
+     * data mid-transaction (§F — cache eviction must run afterCommit).
      *
      * @param userId  the authenticated user's UUID
-     * @param request validated request body carrying phone, bio, instagram
-     * @return updated profile visible to the caller
+     * @param request validated request body; all fields nullable
+     * @return updated profile echoing the fields this endpoint can modify
      */
     @Transactional
     public MasterPublicProfileResponse updateMasterProfile(UUID userId, MasterProfileUpdateRequest request) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
 
-        Optional.ofNullable(request.phoneNumber()).ifPresent(user::setPhoneNumber);
+        Optional.ofNullable(request.firstName())
+                .filter(s -> !s.isBlank())
+                .ifPresent(user::setFirstName);
+        Optional.ofNullable(request.lastName())
+                .filter(s -> !s.isBlank())
+                .ifPresent(user::setLastName);
+        Optional.ofNullable(request.phoneNumber())
+                .filter(s -> !s.isBlank())
+                .ifPresent(user::setPhoneNumber);
         if (request.bio() != null) {
             user.setBio(request.bio());
         }
@@ -95,9 +108,11 @@ public class UserService {
         }
 
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
-        evictUserCachesAfterCommit(userId, Role.INDEPENDENT_MASTER);
+        evictUserCachesAfterCommit(userId, user.getRole());
 
         return new MasterPublicProfileResponse(
+                user.getFirstName(),
+                user.getLastName(),
                 user.getPhoneNumber(),
                 user.getBio(),
                 user.getInstagram()

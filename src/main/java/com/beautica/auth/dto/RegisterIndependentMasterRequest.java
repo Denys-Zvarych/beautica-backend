@@ -30,7 +30,7 @@ public record RegisterIndependentMasterRequest(
 
         @NotBlank(message = "Phone number is required")
         @Size(max = 20, message = "Phone number must not exceed 20 characters")
-        @Pattern(regexp = "^[+\\d\\s\\-()]*$", message = "Phone number contains invalid characters")
+        @Pattern(regexp = "^\\+?[0-9][0-9\\s\\-()]{6,19}$", message = "Phone number contains invalid characters")
         String phoneNumber
 ) {
 }
