@@ -34,6 +34,7 @@ EXPOSE 8080
 # SerialGC + explicit heap cap is the only proven-stable config on 512 MB.
 ENTRYPOINT ["java", \
   "-XX:+UseSerialGC", \
+  "-XX:+ExitOnOutOfMemoryError", \
   "-Xms128m", \
   "-Xmx256m", \
   "-XX:MaxMetaspaceSize=192m", \

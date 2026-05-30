@@ -2,6 +2,7 @@ package com.beautica.user;
 
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteInput;
 import com.beautica.location.LocalityWriteValidator;
@@ -451,6 +452,21 @@ class UserServiceTest {
         assertThat(response.phoneNumber()).isEqualTo("+380671112233");
         assertThat(response.bio()).isEqualTo("bio text");
         assertThat(response.instagram()).isEqualTo("@instagram");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile throws ForbiddenException when user role is CLIENT")
+    void should_throwForbiddenException_when_clientRoleCallsUpdateMasterProfile() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "client@example.com", Role.CLIENT, "Test", "User", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> userService.updateMasterProfile(
+                userId, new MasterProfileUpdateRequest(null, null, "+380671112233", null, null)))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(userRepository, never()).save(any());
     }
 
     @Test

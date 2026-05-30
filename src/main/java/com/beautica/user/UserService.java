@@ -1,6 +1,7 @@
 package com.beautica.user;
 
 import com.beautica.auth.Role;
+import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
@@ -59,7 +60,8 @@ public class UserService {
         applyLocality(user, request);
 
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
-        evictUserCachesAfterCommit(userId, user.getRole());
+        // Locality changes (cityId, districtId) are search filter keys — always clear search cache.
+        evictUserCachesAfterCommit(userId, user.getRole(), true);
 
         return UserProfileResponse.from(user);
     }
@@ -91,6 +93,11 @@ public class UserService {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
 
+        Role role = user.getRole();
+        if (role != Role.INDEPENDENT_MASTER && role != Role.SALON_MASTER) {
+            throw new ForbiddenException("Profile update not permitted for role: " + role);
+        }
+
         Optional.ofNullable(request.firstName())
                 .filter(s -> !s.isBlank())
                 .ifPresent(user::setFirstName);
@@ -108,7 +115,11 @@ public class UserService {
         }
 
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
-        evictUserCachesAfterCommit(userId, user.getRole());
+        // firstName/lastName appear in search result display values — changing them makes cached
+        // search:masters pages stale. bio/phone/instagram are not search filter keys, so they
+        // do not require a full cache clear.
+        boolean searchAffected = request.firstName() != null || request.lastName() != null;
+        evictUserCachesAfterCommit(userId, user.getRole(), searchAffected);
 
         return new MasterPublicProfileResponse(
                 user.getFirstName(),
@@ -136,10 +147,13 @@ public class UserService {
      * This method is a no-op when called outside a transaction (guard on
      * {@link TransactionSynchronizationManager#isSynchronizationActive()}).
      *
-     * @param userId the authenticated user's UUID (used as the per-user eviction key)
-     * @param role   the role of the writing user, used to gate {@code search:masters} eviction
+     * @param userId          the authenticated user's UUID (used as the per-user eviction key)
+     * @param role            the role of the writing user, used to gate {@code search:masters} eviction
+     * @param searchAffected  when {@code true} the search:masters cache is cleared; callers pass
+     *                        {@code false} when only bio/phone/instagram changed so that a single
+     *                        profile write does not evict every cached search page
      */
-    private void evictUserCachesAfterCommit(UUID userId, Role role) {
+    private void evictUserCachesAfterCommit(UUID userId, Role role, boolean searchAffected) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
@@ -157,7 +171,7 @@ public class UserService {
                 // Search results reflect INDEPENDENT_MASTER locality and profile fields
                 // directly. Clear the entire search:masters cache so the next discovery
                 // request re-queries the DB rather than serving stale data.
-                if (role == Role.INDEPENDENT_MASTER) {
+                if (searchAffected && role == Role.INDEPENDENT_MASTER) {
                     Cache search = cacheManager.getCache("search:masters");
                     if (search != null) {
                         search.clear();
