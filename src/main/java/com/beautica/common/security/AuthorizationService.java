@@ -192,10 +192,18 @@ public class AuthorizationService {
      *
      * Returns false — causing 403 — when the service definition does not exist.
      *
+     * Role fast-path: CLIENT, SALON_MASTER, and SALON_ADMIN can never own a ServiceDefinition,
+     * so they are rejected immediately without any DB round-trip (timing-oracle MEDIUM-1).
+     * Only SALON_OWNER and INDEPENDENT_MASTER proceed to the ownership query.
+     *
      * A single JPQL projection query resolves the owner's user UUID directly,
      * eliminating the two-query chain used previously.
      */
     public boolean canManageServiceDefinition(Authentication auth, UUID serviceDefId) {
+        boolean mayManage = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_OWNER")
+                        || a.getAuthority().equals("ROLE_INDEPENDENT_MASTER"));
+        if (!mayManage) return false;  // CLIENT / SALON_MASTER / SALON_ADMIN → 403, no DB hit
         UUID actorId = principalId(auth);
         return serviceRepository.findOwnerUserId(serviceDefId)
                 .map(ownerUserId -> ownerUserId.equals(actorId))

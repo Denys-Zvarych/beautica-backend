@@ -15,6 +15,7 @@ import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
+import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
@@ -222,6 +223,88 @@ public class ServiceCatalogService {
         // statement — 50 masters = 1 query instead of 50.
         if (!affectedMasterIds.isEmpty()) {
             masterRepository.refreshMinEffectivePriceForAll(affectedMasterIds);
+        }
+    }
+
+    /**
+     * Applies a partial update to a {@link ServiceDefinition}.
+     *
+     * <p>Only non-null fields in the request are written; null fields are treated as
+     * "no change". Ownership is verified by the {@code @PreAuthorize} guard on the
+     * controller — callers must enforce the same guard.
+     *
+     * <p>After the update commits, the {@code masterServices} cache entries for all
+     * masters using this definition are evicted (anti-bug §F afterCommit pattern)
+     * so that the next read reflects the new data.
+     */
+    @Transactional
+    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller.
+    public ServiceDefinitionResponse updateServiceDefinition(UUID serviceDefId,
+            UpdateServiceDefinitionRequest request) {
+
+        ServiceDefinition definition = serviceRepository.findByIdWithServiceType(serviceDefId)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
+
+        applyPatchFields(definition, request);
+
+        ServiceDefinition saved = serviceRepository.save(definition);
+
+        List<UUID> affectedMasterIds =
+                masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
+        evictMasterServicesCache(affectedMasterIds);
+
+        return ServiceDefinitionResponse.from(saved);
+    }
+
+    /**
+     * Sets or replaces the photo URL for a {@link ServiceDefinition}.
+     *
+     * <p>Ownership is verified by the {@code @PreAuthorize} guard on the controller.
+     * After the update commits, the {@code masterServices} cache entries for all
+     * masters using this definition are evicted (anti-bug §F).
+     */
+    @Transactional
+    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller.
+    public ServiceDefinitionResponse updateServicePhoto(UUID serviceDefId, String photoUrl) {
+        ServiceDefinition definition = serviceRepository.findByIdWithServiceType(serviceDefId)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
+
+        definition.setPhotoUrl(photoUrl);
+
+        ServiceDefinition saved = serviceRepository.save(definition);
+
+        List<UUID> affectedMasterIds =
+                masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
+        evictMasterServicesCache(affectedMasterIds);
+
+        return ServiceDefinitionResponse.from(saved);
+    }
+
+    /**
+     * Applies PATCH-semantics: only non-null fields in {@code request} are written
+     * to {@code definition}. Null fields are ignored — the entity retains its
+     * existing value for those attributes.
+     */
+    private void applyPatchFields(ServiceDefinition definition,
+            UpdateServiceDefinitionRequest request) {
+
+        if (request.name() != null) {
+            definition.setName(request.name());
+        }
+        if (request.description() != null) {
+            definition.setDescription(request.description());
+        }
+        if (request.category() != null) {
+            definition.setCategory(request.category());
+        }
+        if (request.baseDurationMinutes() != null) {
+            definition.setBaseDurationMinutes(request.baseDurationMinutes());
+        }
+        if (request.basePrice() != null) {
+            definition.setBasePrice(request.basePrice());
+        }
+        if (request.bufferMinutesAfter() != null) {
+            definition.setBufferMinutesAfter(request.bufferMinutesAfter());
         }
     }
 

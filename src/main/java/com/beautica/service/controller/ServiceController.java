@@ -6,6 +6,8 @@ import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.UpdateServiceDefinitionRequest;
+import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -15,6 +17,7 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -88,6 +91,46 @@ public class ServiceController {
     ) {
         serviceCatalogService.deactivateServiceDefinition(serviceDefId);
         return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * Partially updates a service definition.
+     *
+     * <p>Only non-null fields in the request body are applied; omitted fields retain
+     * their current values (PATCH semantics).
+     *
+     * <p>Authorization uses the same {@code canManageServiceDefinition} SpEL expression
+     * as DELETE: a single DB lookup resolves the owner user UUID and compares it to the
+     * authenticated principal. No redundant role guard is added at the controller level
+     * because ownership implies the required role (anti-bug §D).
+     */
+    @PatchMapping("/services/{serviceDefId}")
+    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
+    public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> updateServiceDefinition(
+            @PathVariable UUID serviceDefId,
+            @Valid @RequestBody UpdateServiceDefinitionRequest request
+    ) {
+        ServiceDefinitionResponse response =
+                serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    /**
+     * Sets or replaces the photo URL for a service definition.
+     *
+     * <p>Accepts a presigned Cloudflare R2 URL or any direct HTTPS URL. Validation
+     * enforces {@code https://} scheme and a 2048-character length cap at the DTO
+     * boundary (anti-bug §A URL-field rule).
+     */
+    @PatchMapping("/services/{serviceDefId}/photo")
+    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
+    public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> updateServicePhoto(
+            @PathVariable UUID serviceDefId,
+            @Valid @RequestBody UpdateServicePhotoRequest request
+    ) {
+        ServiceDefinitionResponse response =
+                serviceCatalogService.updateServicePhoto(serviceDefId, request.photoUrl());
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     private UUID extractUserId(Authentication authentication) {
