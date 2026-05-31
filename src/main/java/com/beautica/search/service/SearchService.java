@@ -173,6 +173,12 @@ public class SearchService {
         SqlAndParams dataSql = buildMasterSearchSql(filters, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
         bind(dataQuery, dataSql.params());
+        // JPA-portable pagination: setMaxResults/setFirstResult let Hibernate
+        // apply LIMIT/OFFSET at the JDBC layer, independent of SQL dialect.
+        // Previously bound via :limit/:offset named params — non-standard and
+        // Hibernate-only. (LOW portability fix — backlog.md §PERF)
+        dataQuery.setMaxResults(pageable.getPageSize());
+        dataQuery.setFirstResult((int) pageable.getOffset());
 
         @SuppressWarnings("unchecked")
         List<Object[]> rawRows = dataQuery.getResultList();
@@ -353,10 +359,7 @@ public class SearchService {
                     .append("m.avg_rating, m.review_count, m.min_effective_price ");
         }
 
-        sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id ");
-        sb.append("LIMIT :limit OFFSET :offset");
-        params.put("limit", pageable.getPageSize());
-        params.put("offset", pageable.getOffset());
+        sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id");
 
         return new SqlAndParams(sb.toString(), params);
     }

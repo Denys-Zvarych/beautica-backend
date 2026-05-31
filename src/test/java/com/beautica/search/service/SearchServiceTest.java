@@ -35,7 +35,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
@@ -110,8 +109,10 @@ class SearchServiceTest {
                 .toList();
         when(entityManager.createNativeQuery(sqlCaptor.capture())).thenReturn(dataQuery);
         lenient().when(dataQuery.setParameter(anyString(), any())).thenReturn(dataQuery);
-        lenient().when(dataQuery.setParameter(eq("limit"), anyInt())).thenReturn(dataQuery);
-        lenient().when(dataQuery.setParameter(eq("offset"), anyLong())).thenReturn(dataQuery);
+        // Portable pagination API — setMaxResults/setFirstResult replace the old
+        // :limit/:offset named-parameter binding (LOW portability fix).
+        lenient().when(dataQuery.setMaxResults(anyInt())).thenReturn(dataQuery);
+        lenient().when(dataQuery.setFirstResult(anyInt())).thenReturn(dataQuery);
         when(dataQuery.getResultList()).thenReturn((List) rowsWithCount);
     }
 
@@ -509,6 +510,28 @@ class SearchServiceTest {
 
         assertThat(result.getTotalElements()).isEqualTo(7L);
         verify(entityManager, times(1)).createNativeQuery(anyString());
+    }
+
+    // ── LOW portability fix — JPA-portable pagination (setMaxResults/setFirstResult) ──
+
+    @Test
+    @DisplayName("uses setMaxResults/setFirstResult for pagination, not :limit/:offset named params (portable API)")
+    void should_usePortablePaginationApi_not_namedParams() {
+        stubNativeQueries(List.of(), 0L);
+        Pageable page = PageRequest.of(2, 15);
+
+        service.searchMasters(emptyRequest(), page);
+
+        // The SQL must not carry :limit or :offset — Hibernate applies pagination
+        // at the JDBC layer via setMaxResults/setFirstResult instead.
+        String dataSql = sqlCaptor.getAllValues().get(0);
+        assertThat(dataSql)
+                .as("SQL must not contain :limit or :offset named params — portable API is used")
+                .doesNotContain(":limit")
+                .doesNotContain(":offset");
+        // Verify the JPA-portable API is actually invoked with correct values.
+        verify(dataQuery).setMaxResults(15);
+        verify(dataQuery).setFirstResult(30); // offset = page * size = 2 * 15
     }
 
     @Test
