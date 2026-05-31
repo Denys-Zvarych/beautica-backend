@@ -18,6 +18,7 @@ import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -70,6 +71,19 @@ public class InviteService {
         this.frontendBaseUrl = frontendBaseUrl;
         this.tokenExpirationHours = tokenExpirationHours;
         this.clock = clock;
+    }
+
+    /**
+     * Validates {@code app.frontend.base-url} at application startup.
+     * A misconfigured HTTP (non-localhost) URL will cause context startup failure
+     * rather than surfacing silently on the first invite dispatch.
+     */
+    @PostConstruct
+    void validateConfig() {
+        if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
+            throw new IllegalStateException(
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+        }
     }
 
     @Transactional
