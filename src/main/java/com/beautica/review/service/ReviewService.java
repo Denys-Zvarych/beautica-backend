@@ -76,6 +76,8 @@ public class ReviewService {
         return ReviewResponse.from(saved);
     }
 
+    private static final int MAX_PAGE_NUMBER = 10_000;
+
     // String key with typed delimiters to support prefix-based eviction in ReviewEventListener.
     // sync=true prevents cache stampede when 5-min TTL expires on a popular master page.
     @Cacheable(
@@ -84,6 +86,10 @@ public class ReviewService {
             sync = true)
     @Transactional(readOnly = true)
     public Page<ReviewResponse> getReviewsForMaster(UUID masterId, Pageable pageable) {
+        if (pageable.getPageNumber() > MAX_PAGE_NUMBER) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Page number must not exceed " + MAX_PAGE_NUMBER);
+        }
         // Strip caller-supplied sort: the JPQL query has ORDER BY r.createdAt DESC hardcoded.
         // A caller-supplied sort field can trigger PropertyReferenceException, leaking entity property names.
         Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
