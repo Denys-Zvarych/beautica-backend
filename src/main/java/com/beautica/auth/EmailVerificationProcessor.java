@@ -88,7 +88,16 @@ public class EmailVerificationProcessor {
 
         // Cumulative lock check first. While locked, reject with the generic
         // INVALID_CODE — no distinct status/body/code that would leak lock state.
+        //
+        // Timing-oracle defense: perform the same hashOtp + isEqual work that
+        // an unlocked wrong-code attempt would do so that a locked account does
+        // not respond measurably faster.  The decoy result is never compared
+        // against any real hash — it is discarded immediately.
         if (isLocked(user)) {
+            String decoyIncoming = tokenGenerator.hashOtp(DECOY_OTP);
+            MessageDigest.isEqual(
+                    decoyIncoming.getBytes(StandardCharsets.UTF_8),
+                    DECOY_HASH.getBytes(StandardCharsets.UTF_8));
             throw new VerificationException(VerificationException.Code.INVALID_CODE);
         }
 
