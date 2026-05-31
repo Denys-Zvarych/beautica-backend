@@ -77,7 +77,8 @@ public record MasterSearchRequest(
         LocationFilter location,
 
         @Size(max = 100)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+                 message = "must not contain control characters or HTML special characters")
         String category,
 
         @DecimalMin("0")

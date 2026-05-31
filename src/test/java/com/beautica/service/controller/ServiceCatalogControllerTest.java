@@ -467,4 +467,41 @@ class ServiceCatalogControllerTest {
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data[0].nameUk").value("Гель-лак"));
     }
+
+    @Test
+    @DisplayName("GET /service-types?q=<script>alert(1)</script> — 400 when q contains HTML tag characters")
+    void should_return400_when_qContainsScriptTag() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?q=<script>... — angle brackets must be rejected by @Pattern");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "<script>alert(1)</script>")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=\\\"alert\\\" — 400 when q contains double-quote characters")
+    void should_return400_when_qContainsDoubleQuote() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?q=\"alert\" — double-quote must be rejected by @Pattern");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "\"alert\"")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=<Cyrillic+spaces> — 200 when q contains only valid Cyrillic and spaces")
+    void should_return200_when_qContainsValidCyrillicAndSpaces() throws Exception {
+        var result = List.of(
+                new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish"));
+        when(serviceCatalogService.searchServiceTypes(isNull(), eq("Корекція брів"))).thenReturn(result);
+        log.debug("Act: GET /api/v1/service-types?q=Корекція брів — valid Cyrillic + space must be accepted");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "Корекція брів")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
 }
