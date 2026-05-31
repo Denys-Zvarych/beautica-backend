@@ -10,6 +10,7 @@ import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -66,14 +67,17 @@ public class CityDistrict {
      * used as the idempotent seed key.
      */
     @Column(name = "katotth_code", nullable = false, unique = true, length = 20)
+    @Size(max = 20)
     private String katotthCode;
 
     /** Canonical Ukrainian district name (e.g. "Голосіївський район"). */
     @Column(name = "name_uk", nullable = false, length = 255)
+    @Size(max = 255)
     private String nameUk;
 
     /** Official English transliteration (e.g. "Holosiivskyi district"). */
     @Column(name = "name_en", nullable = false, length = 255)
+    @Size(max = 255)
     private String nameEn;
 
     /**
