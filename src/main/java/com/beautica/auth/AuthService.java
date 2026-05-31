@@ -29,15 +29,21 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.RejectedExecutionException;
 
 
 @Service
 public class AuthService {
+
+    private static final Logger log = LoggerFactory.getLogger(AuthService.class);
 
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
 
@@ -169,15 +175,44 @@ public class AuthService {
                     new TransactionSynchronization() {
                         @Override
                         public void afterCommit() {
-                            emailExecutor.execute(() ->
-                                    emailNotificationService.sendVerificationEmail(email, rawOtp));
+                            submitVerificationEmail(email, rawOtp);
                         }
                     }
             );
         } else {
+            submitVerificationEmail(email, rawOtp);
+        }
+    }
+
+    /**
+     * Submits the verification email task to the executor. Catches
+     * {@link RejectedExecutionException} (queue saturation under AbortPolicy) and
+     * logs an error using only the userId — never the OTP or email address — so
+     * operators can investigate without PII appearing in logs.
+     * The user will be unable to log in until they trigger a resend after the
+     * 60-second cooldown expires.
+     */
+    private void submitVerificationEmail(String email, String rawOtp) {
+        try {
             emailExecutor.execute(() ->
                     emailNotificationService.sendVerificationEmail(email, rawOtp));
+        } catch (RejectedExecutionException e) {
+            log.error("Verification email task rejected — executor queue saturated; " +
+                      "user with email={} will be unable to log in until resend cooldown expires",
+                      maskEmail(email));
         }
+    }
+
+    /**
+     * Masks an email address for log output, retaining only the first character
+     * and the domain to allow correlation while minimising PII exposure.
+     * Example: {@code john.doe@example.com} → {@code j***@example.com}
+     */
+    private static String maskEmail(String email) {
+        if (email == null) return "<null>";
+        int at = email.indexOf('@');
+        if (at <= 0) return "***";
+        return email.charAt(0) + "***" + email.substring(at);
     }
 
     @Transactional

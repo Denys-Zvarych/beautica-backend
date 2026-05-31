@@ -1,5 +1,8 @@
 package com.beautica.auth;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RefreshRequest;
@@ -21,6 +24,7 @@ import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -40,8 +44,10 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.RejectedExecutionException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -91,6 +97,9 @@ class AuthServiceTest {
     private final TaskExecutor syncExecutor = (Runnable r) -> r.run();
     private VerificationPolicyConfig verificationPolicyConfig;
 
+    // ── Logback ListAppender — attached to AuthService logger for log-capture tests ──
+    private ListAppender<ILoggingEvent> logAppender;
+
     // Fixed reference instant used as "now" across all time-sensitive tests.
     private static final Instant FIXED_NOW = Instant.parse("2025-06-01T12:00:00Z");
 
@@ -105,6 +114,12 @@ class AuthServiceTest {
 
     @BeforeEach
     void setUp() {
+        ch.qos.logback.classic.Logger authServiceLogger =
+                (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(AuthService.class);
+        logAppender = new ListAppender<>();
+        logAppender.start();
+        authServiceLogger.addAppender(logAppender);
+
         passwordEncoder = new BCryptPasswordEncoder(4);
         lenient().when(clock.instant()).thenReturn(FIXED_NOW);
         // VerificationPolicyConfig with production-equivalent values for all fields.
@@ -128,6 +143,14 @@ class AuthServiceTest {
                 emailVerificationProcessor,
                 verificationPolicyConfig
         );
+    }
+
+    @AfterEach
+    void detachLogAppender() {
+        ch.qos.logback.classic.Logger authServiceLogger =
+                (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(AuthService.class);
+        authServiceLogger.detachAppender(logAppender);
+        logAppender.stop();
     }
 
     @Test
@@ -953,6 +976,103 @@ class AuthServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED));
+    }
+
+    // ─── scheduleVerificationEmail — RejectedExecutionException handling ─────
+
+    @Test
+    @DisplayName("scheduleVerificationEmail — does not propagate RejectedExecutionException when executor queue is saturated")
+    void should_notPropagateException_when_executorRejectsVerificationEmailTask() {
+        // Arrange — wire an AuthService instance whose executor always rejects submissions
+        TaskExecutor rejectingExecutor = task -> {
+            throw new RejectedExecutionException("Queue saturated — test-induced rejection");
+        };
+        AuthService serviceWithRejectingExecutor = new AuthService(
+                userRepository,
+                refreshTokenRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                clock,
+                emailNotificationService,
+                rejectingExecutor,
+                emailVerificationProcessor,
+                verificationPolicyConfig
+        );
+
+        when(userRepository.existsByEmail("reject@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(tokenGenerator.generateOtp()).thenReturn("111222");
+        when(tokenGenerator.hashOtp("111222")).thenReturn("a".repeat(64));
+
+        var request = new RegisterRequest(
+                "reject@example.com", "Str0ngP@ss1!",
+                SelfRegistrationRole.CLIENT, "Test", "User", null, null);
+
+        // Act — must not throw
+        var response = serviceWithRejectingExecutor.register(request);
+
+        // Assert — registration completes successfully
+        assertThat(response).isInstanceOf(RegistrationResponse.class);
+        assertThat(response.email()).isEqualTo("reject@example.com");
+    }
+
+    @Test
+    @DisplayName("scheduleVerificationEmail — logs an ERROR when executor rejects the email task")
+    void should_logError_when_executorRejectsVerificationEmailTask() {
+        // Arrange — wire an AuthService instance whose executor always rejects submissions
+        TaskExecutor rejectingExecutor = task -> {
+            throw new RejectedExecutionException("Queue saturated — test-induced rejection");
+        };
+        AuthService serviceWithRejectingExecutor = new AuthService(
+                userRepository,
+                refreshTokenRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                clock,
+                emailNotificationService,
+                rejectingExecutor,
+                emailVerificationProcessor,
+                verificationPolicyConfig
+        );
+
+        when(userRepository.existsByEmail("logreject@example.com")).thenReturn(false);
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
+            var u = (User) inv.getArgument(0);
+            ReflectionTestUtils.setField(u, "id", UUID.randomUUID());
+            return u;
+        });
+        when(tokenGenerator.generateOtp()).thenReturn("333444");
+        when(tokenGenerator.hashOtp("333444")).thenReturn("b".repeat(64));
+
+        var request = new RegisterRequest(
+                "logreject@example.com", "Str0ngP@ss1!",
+                SelfRegistrationRole.CLIENT, "Log", "Test", null, null);
+
+        // Act
+        serviceWithRejectingExecutor.register(request);
+
+        // Assert — exactly one ERROR-level log event mentioning queue saturation, no raw email
+        List<ILoggingEvent> errors = logAppender.list.stream()
+                .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.ERROR)
+                .toList();
+        assertThat(errors)
+                .as("exactly one ERROR must be logged on executor rejection")
+                .hasSize(1);
+        String formattedMessage = errors.get(0).getFormattedMessage();
+        assertThat(formattedMessage)
+                .as("log message must mention queue saturation")
+                .containsIgnoringCase("queue saturated");
+        assertThat(formattedMessage)
+                .as("log message must not contain the raw email address (PII)")
+                .doesNotContain("logreject@example.com");
     }
 
     // ─── helpers ──────────────────────────────────────────────────────────────
