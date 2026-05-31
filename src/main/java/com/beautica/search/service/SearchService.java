@@ -480,6 +480,15 @@ public class SearchService {
 
     // ── parameter normalisation ───────────────────────────────────────────────
 
+    /**
+     * Belt-and-suspenders: {@link com.beautica.search.dto.MasterSearchRequest#isPriceRangeValid()}
+     * {@code @AssertTrue} already validates this at binding time (before the
+     * {@code @Cacheable} proxy fires), so this guard is only reached on a cache
+     * miss via an uncached code path. It remains here so that if
+     * {@code @Validated} is ever dropped from {@link com.beautica.search.controller.SearchController},
+     * the service still rejects invalid ranges rather than silently building a
+     * nonsensical SQL predicate.
+     */
     private static void validatePriceRange(BigDecimal minPrice, BigDecimal maxPrice) {
         if (minPrice != null && maxPrice != null && minPrice.compareTo(maxPrice) > 0) {
             throw new BusinessException("minPrice must not exceed maxPrice");

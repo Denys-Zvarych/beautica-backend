@@ -1,6 +1,7 @@
 package com.beautica.search.dto;
 
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
@@ -100,4 +101,28 @@ public record MasterSearchRequest(
         @Max(100)
         Integer size
 ) {
+
+    /**
+     * Cross-field price-range guard evaluated at Spring MVC argument-resolution
+     * time — <b>before</b> any {@code @Cacheable} proxy intercepts the service
+     * call. This prevents a cached 200 response from a prior valid request being
+     * served back for a semantically invalid range (e.g. {@code minPrice=999,
+     * maxPrice=1}) on a cached page.
+     *
+     * <p>Returns {@code true} (valid) when either price bound is absent — the
+     * individual per-field constraints ({@code @DecimalMin}) already handle
+     * negative values; a null on either side simply means "no lower/upper bound"
+     * and is not a cross-field violation.</p>
+     *
+     * <p><b>Method name contract:</b> Jakarta Validation requires the method
+     * targeted by {@link AssertTrue} to start with {@code is} so it is
+     * recognised as a getter-style accessor on the record.</p>
+     */
+    @AssertTrue(message = "minPrice must be less than or equal to maxPrice")
+    public boolean isPriceRangeValid() {
+        if (minPrice == null || maxPrice == null) {
+            return true;
+        }
+        return minPrice.compareTo(maxPrice) <= 0;
+    }
 }
