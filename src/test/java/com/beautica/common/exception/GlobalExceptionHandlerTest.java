@@ -331,7 +331,7 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("Should return 400 when MissingServletRequestPartException is thrown")
+    @DisplayName("Should return 400 with static message when MissingServletRequestPartException is thrown")
     void should_return400_when_missingRequestPart() {
         // Arrange — multipart endpoint called without the required 'file' part
         var ex = new MissingServletRequestPartException("file");
@@ -349,8 +349,24 @@ class GlobalExceptionHandlerTest {
                 .isFalse();
 
         assertThat(response.getBody().message())
-                .as("message must reference the missing part name")
-                .contains("file");
+                .as("message must be the static string — part name must not be interpolated")
+                .isEqualTo("Required file part is missing");
+    }
+
+    @Test
+    @DisplayName("Should not echo attacker-controlled part name in response")
+    void should_notEchoPartName_when_partNameIsAttackerControlled() {
+        // Arrange — simulate an attacker-supplied part name that should never reach the response
+        var ex = new MissingServletRequestPartException("<script>alert(1)</script>");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMissingPart(ex);
+
+        // Assert — the attacker string must not appear anywhere in the message
+        assertThat(response.getBody().message())
+                .as("attacker-controlled part name must not be echoed in the response body")
+                .doesNotContain("<script>")
+                .isEqualTo("Required file part is missing");
     }
 
     @Test

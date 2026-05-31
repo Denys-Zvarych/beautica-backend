@@ -204,9 +204,13 @@ public class GlobalExceptionHandler {
      */
     @ExceptionHandler(MissingServletRequestPartException.class)
     public ResponseEntity<ApiResponse<Void>> handleMissingPart(MissingServletRequestPartException ex) {
+        // Static message — part name comes from server-side annotations today, but could be
+        // attacker-influenced in future endpoints. The client only needs to know to send
+        // multipart/form-data with a 'file' field; the part name adds no diagnostic value (§I).
+        log.debug("Missing request part: {}", ex.getRequestPartName());
         return ResponseEntity
                 .badRequest()
-                .body(ApiResponse.error("Required part '" + ex.getRequestPartName() + "' is missing"));
+                .body(ApiResponse.error("Required file part is missing"));
     }
 
     /**
