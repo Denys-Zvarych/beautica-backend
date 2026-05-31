@@ -4,8 +4,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.location.DiscoveryLocationKey;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
-import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.repository.SalonSearchProjection;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
@@ -38,6 +38,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -284,66 +285,113 @@ class SearchServiceTest {
         return new SalonSearchRequest(filter, 0, 20);
     }
 
-    private static Page<Salon> oneSalonPage() {
-        Salon salon = Salon.builder()
-                .name("Test Salon")
-                .cityId(CITY_ID)
-                .districtId(DISTRICT_ID)
-                .isActive(true)
-                .build();
-        ReflectionTestUtils.setField(salon, "id", UUID.randomUUID());
-        return new PageImpl<>(List.of(salon), PageRequest.of(0, 20), 1);
+    /**
+     * Builds a stub {@link SalonSearchProjection} using Mockito's interface-mock capability.
+     * This is the correct approach since the service now requests a projection
+     * rather than full entity hydration (LOW PERF fix — no Salon entity loading).
+     */
+    private static SalonSearchProjection stubProjection(UUID id, String name, UUID cityId, UUID districtId) {
+        SalonSearchProjection proj = mock(SalonSearchProjection.class);
+        when(proj.getId()).thenReturn(id);
+        when(proj.getName()).thenReturn(name);
+        when(proj.getCityId()).thenReturn(cityId);
+        when(proj.getDistrictId()).thenReturn(districtId);
+        when(proj.getAvatarUrl()).thenReturn(null);
+        return proj;
+    }
+
+    private static Page<SalonSearchProjection> oneSalonProjectionPage() {
+        SalonSearchProjection proj = stubProjection(UUID.randomUUID(), "Test Salon", CITY_ID, DISTRICT_ID);
+        return new PageImpl<>(List.of(proj), PageRequest.of(0, 20), 1);
     }
 
     @Test
-    @DisplayName("salon search dispatches to findActiveByDistrictId when a district is resolved (district-primary)")
+    @DisplayName("salon search dispatches to findActiveByDistrictIdAsProjection when a district is resolved (district-primary — projection path, LOW PERF fix)")
     void should_dispatchToDistrictRepoMethod_when_districtResolved() {
-        when(salonRepository.findActiveByDistrictId(eq(DISTRICT_ID), any(Pageable.class)))
-                .thenReturn(oneSalonPage());
+        // Build the stub page BEFORE the when(...) call — stubProjection calls
+        // when(mock.getX()) internally, which Mockito would misread as an
+        // unfinished stub if nested inside when(salonRepository...).
+        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        when(salonRepository.findActiveByDistrictIdAsProjection(eq(DISTRICT_ID), any(Pageable.class)))
+                .thenReturn(stubPage);
 
         service.searchSalons(salonRequest(CITY_ID, DISTRICT_ID), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findActiveByDistrictId(eq(DISTRICT_ID), any(Pageable.class));
+        verify(salonRepository, times(1)).findActiveByDistrictIdAsProjection(eq(DISTRICT_ID), any(Pageable.class));
+        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any());
+        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any());
+        // Must NOT touch the full-entity variants — they hydrate unnecessary columns.
+        verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
     }
 
     @Test
-    @DisplayName("salon search dispatches to findActiveByCityId when only a city is resolved")
+    @DisplayName("salon search dispatches to findActiveByCityIdAsProjection when only a city is resolved (projection path, LOW PERF fix)")
     void should_dispatchToCityRepoMethod_when_onlyCityResolved() {
-        when(salonRepository.findActiveByCityId(eq(CITY_ID), any(Pageable.class)))
-                .thenReturn(oneSalonPage());
+        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        when(salonRepository.findActiveByCityIdAsProjection(eq(CITY_ID), any(Pageable.class)))
+                .thenReturn(stubPage);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findActiveByCityId(eq(CITY_ID), any(Pageable.class));
+        verify(salonRepository, times(1)).findActiveByCityIdAsProjection(eq(CITY_ID), any(Pageable.class));
+        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any());
+        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
+        verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
     }
 
     @Test
-    @DisplayName("salon search dispatches to findByIsActiveTrue when no locality filter is supplied")
+    @DisplayName("salon search dispatches to findByIsActiveTrueAsProjection when no locality filter is supplied (projection path, LOW PERF fix)")
     void should_dispatchToActiveOnlyRepoMethod_when_noLocalityFilter() {
-        when(salonRepository.findByIsActiveTrue(any(Pageable.class)))
-                .thenReturn(oneSalonPage());
+        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        when(salonRepository.findByIsActiveTrueAsProjection(any(Pageable.class)))
+                .thenReturn(stubPage);
 
         service.searchSalons(salonRequest(null, null), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findByIsActiveTrue(any(Pageable.class));
+        verify(salonRepository, times(1)).findByIsActiveTrueAsProjection(any(Pageable.class));
+        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any());
+        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
+        verify(salonRepository, never()).findByIsActiveTrue(any());
+    }
+
+    @Test
+    @DisplayName("salon search maps projection fields to SalonSearchResult correctly, stamping resolved labels (LOW PERF fix verification)")
+    void should_mapProjectionToSalonSearchResult_with_resolvedLabels() {
+        UUID salonId = UUID.randomUUID();
+        SalonSearchProjection proj = stubProjection(salonId, "Glow Studio", CITY_ID, DISTRICT_ID);
+        when(proj.getAvatarUrl()).thenReturn("https://cdn.example.com/avatar.jpg");
+
+        when(salonRepository.findActiveByCityIdAsProjection(eq(CITY_ID), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(proj), PageRequest.of(0, 20), 1));
+        when(discoveryLocationResolver.resolveLabels(any(), any()))
+                .thenReturn(new DiscoveryLabels(
+                        Map.of(CITY_ID, "Київ"),
+                        Map.of(DISTRICT_ID, "Шевченківський район")));
+
+        Page<SalonSearchResult> result = service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
+
+        assertThat(result.getContent()).hasSize(1);
+        SalonSearchResult mapped = result.getContent().get(0);
+        assertThat(mapped.salonId()).isEqualTo(salonId);
+        assertThat(mapped.name()).isEqualTo("Glow Studio");
+        assertThat(mapped.cityLabel()).isEqualTo("Київ");
+        assertThat(mapped.districtLabel()).isEqualTo("Шевченківський район");
+        assertThat(mapped.avatarUrl()).isEqualTo("https://cdn.example.com/avatar.jpg");
     }
 
     @Test
     @DisplayName("salon search resolves locality labels exactly ONCE per page, never one call per row (§E, N+1 contract — MEDIUM-4)")
     void should_resolveSalonLabelsOncePerPage_when_pageHasManyRows() {
-        Salon a = Salon.builder().name("A").cityId(CITY_ID).districtId(DISTRICT_ID).isActive(true).build();
-        Salon b = Salon.builder().name("B").cityId(CITY_ID).districtId(DISTRICT_ID).isActive(true).build();
-        Salon c = Salon.builder().name("C").cityId(CITY_ID).districtId(DISTRICT_ID).isActive(true).build();
-        ReflectionTestUtils.setField(a, "id", UUID.randomUUID());
-        ReflectionTestUtils.setField(b, "id", UUID.randomUUID());
-        ReflectionTestUtils.setField(c, "id", UUID.randomUUID());
-        when(salonRepository.findActiveByCityId(eq(CITY_ID), any(Pageable.class)))
+        SalonSearchProjection a = stubProjection(UUID.randomUUID(), "A", CITY_ID, DISTRICT_ID);
+        SalonSearchProjection b = stubProjection(UUID.randomUUID(), "B", CITY_ID, DISTRICT_ID);
+        SalonSearchProjection c = stubProjection(UUID.randomUUID(), "C", CITY_ID, DISTRICT_ID);
+        when(salonRepository.findActiveByCityIdAsProjection(eq(CITY_ID), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(a, b, c), PageRequest.of(0, 20), 3));
 
         Page<SalonSearchResult> page =

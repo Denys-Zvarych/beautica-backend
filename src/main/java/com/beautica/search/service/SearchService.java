@@ -4,8 +4,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.location.DiscoveryLocationKey;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
-import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.repository.SalonSearchProjection;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
@@ -201,8 +201,10 @@ public class SearchService {
     /**
      * Discover salons matching the optional FK location filter
      * (district-primary). Delegates filtering to the repository's JPQL query
-     * and maps each entity to a public-facing DTO with resolved locality
-     * labels so the JPA entity never escapes the service layer.
+     * and maps each projection to a public-facing DTO with resolved locality
+     * labels. The JPA entity is never loaded — only the five columns needed by
+     * {@link SalonSearchResult} are fetched (LOW PERF fix: was "Loads Salon
+     * entity then maps via Page#map").
      *
      * <p><b>Caching</b>: same trade-off as {@link #searchMasters} — first 5
      * pages, 60-second TTL, FK-pair key.
@@ -220,48 +222,43 @@ public class SearchService {
         UUID cityId = key == null ? null : key.cityId();
         UUID districtId = key == null ? null : key.districtId();
 
-        Page<Salon> page = findSalonsByLocation(cityId, districtId, pageable);
+        Page<SalonSearchProjection> page = findSalonsByLocation(cityId, districtId, pageable);
 
-        List<Salon> salons = page.getContent();
+        List<SalonSearchProjection> projections = page.getContent();
         DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
-                distinct(salons, Salon::getCityId),
-                distinct(salons, Salon::getDistrictId));
+                distinct(projections, SalonSearchProjection::getCityId),
+                distinct(projections, SalonSearchProjection::getDistrictId));
 
-        return page.map(salon -> toSalonSearchResult(salon, labels));
+        return page.map(proj -> toSalonSearchResult(proj, labels));
     }
 
     /**
      * Dispatches the salon-location query to a single-equality, SARGable
-     * repository method by district-primary precedence (Phase 10.8, MEDIUM-1):
+     * <em>projection</em> repository method by district-primary precedence
+     * (Phase 10.8, MEDIUM-1). Returns {@link SalonSearchProjection} pages —
+     * only the five columns needed for the search response are fetched:
+     * {@code id}, {@code name}, {@code city_id}, {@code district_id},
+     * {@code avatar_url}.
      *
      * <ol>
      *   <li>a resolved {@code districtId} wins →
-     *       {@link SalonRepository#findActiveByDistrictId} (index-served by
+     *       {@link SalonRepository#findActiveByDistrictIdAsProjection} (index-served by
      *       {@code idx_salons_district_id});</li>
      *   <li>else a resolved {@code cityId} →
-     *       {@link SalonRepository#findActiveByCityId} (index-served by
+     *       {@link SalonRepository#findActiveByCityIdAsProjection} (index-served by
      *       {@code idx_salons_city_id});</li>
      *   <li>else no locality filter →
-     *       {@link SalonRepository#findByIsActiveTrue}.</li>
+     *       {@link SalonRepository#findByIsActiveTrueAsProjection}.</li>
      * </ol>
-     *
-     * <p>This replaces the former single
-     * {@code findByLocation(cityId, districtId, …)} whose disjunctive
-     * NULL-guard OR-chain spanning {@code district_id}/{@code city_id} was
-     * non-SARGable — Postgres could not reliably index-serve it. Behaviour is
-     * unchanged (same result set, paging and ordering per branch); only the
-     * plan shape changed. The district→city→all precedence is identical to the
-     * old query's {@code :districtId IS NOT NULL … OR :districtId IS NULL …}
-     * dispatch.
      */
-    private Page<Salon> findSalonsByLocation(UUID cityId, UUID districtId, Pageable pageable) {
+    private Page<SalonSearchProjection> findSalonsByLocation(UUID cityId, UUID districtId, Pageable pageable) {
         if (districtId != null) {
-            return salonRepository.findActiveByDistrictId(districtId, pageable);
+            return salonRepository.findActiveByDistrictIdAsProjection(districtId, pageable);
         }
         if (cityId != null) {
-            return salonRepository.findActiveByCityId(cityId, pageable);
+            return salonRepository.findActiveByCityIdAsProjection(cityId, pageable);
         }
-        return salonRepository.findByIsActiveTrue(pageable);
+        return salonRepository.findByIsActiveTrueAsProjection(pageable);
     }
 
     // ── location seam (M2) ────────────────────────────────────────────────────
@@ -613,13 +610,13 @@ public class SearchService {
         );
     }
 
-    private static SalonSearchResult toSalonSearchResult(Salon salon, DiscoveryLabels labels) {
+    private static SalonSearchResult toSalonSearchResult(SalonSearchProjection proj, DiscoveryLabels labels) {
         return new SalonSearchResult(
-                salon.getId(),
-                salon.getName(),
-                labels.cityLabel(salon.getCityId()),
-                labels.districtLabel(salon.getDistrictId()),
-                salon.getAvatarUrl()
+                proj.getId(),
+                proj.getName(),
+                labels.cityLabel(proj.getCityId()),
+                labels.districtLabel(proj.getDistrictId()),
+                proj.getAvatarUrl()
         );
     }
 }

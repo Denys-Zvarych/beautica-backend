@@ -69,6 +69,13 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * {@code SALON_MASTER → salon} case). The {@code Page} return type makes
      * Spring Data emit the matching {@code COUNT(*)} companion.
      *
+     * <p><b>§E — search path MUST use the projection overload.</b>
+     * {@link SearchService} must call
+     * {@link #findActiveByDistrictIdAsProjection(UUID, Pageable)} so only the
+     * five columns needed by {@link SalonSearchProjection} are fetched.
+     * This full-entity overload remains for non-search callers that genuinely
+     * need the full {@code Salon} graph.
+     *
      * @param districtId resolved discovery district id (never {@code null})
      */
     @Query("""
@@ -77,6 +84,34 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
               AND s.districtId = :districtId
             """)
     Page<Salon> findActiveByDistrictId(
+            @Param("districtId") UUID districtId,
+            Pageable pageable
+    );
+
+    /**
+     * Projection overload of {@link #findActiveByDistrictId}: fetches only the
+     * five columns needed for salon discovery
+     * ({@code id, name, city_id, district_id, avatar_url}) — no full entity
+     * hydration, no lazy proxy for the {@code owner} association.
+     *
+     * <p>Used exclusively by {@link SearchService#findSalonsByLocation} to
+     * eliminate the LOW PERF finding ("Loads Salon entity then maps via
+     * Page#map"). Hibernate translates the {@link SalonSearchProjection}
+     * return type into a narrow {@code SELECT} containing only those columns.
+     *
+     * @param districtId resolved discovery district id (never {@code null})
+     */
+    @Query("""
+            SELECT s.id AS id,
+                   s.name AS name,
+                   s.cityId AS cityId,
+                   s.districtId AS districtId,
+                   s.avatarUrl AS avatarUrl
+            FROM Salon s
+            WHERE s.isActive = true
+              AND s.districtId = :districtId
+            """)
+    Page<SalonSearchProjection> findActiveByDistrictIdAsProjection(
             @Param("districtId") UUID districtId,
             Pageable pageable
     );
@@ -92,6 +127,11 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * {@link SearchService#searchSalons} dispatches here when no district was
      * resolved but a cityId is present; the caller never passes {@code null}.
      *
+     * <p><b>§E — search path MUST use the projection overload.</b>
+     * {@link SearchService} must call
+     * {@link #findActiveByCityIdAsProjection(UUID, Pageable)}.
+     * This full-entity overload remains for non-search callers.
+     *
      * @param cityId resolved discovery city id (never {@code null})
      */
     @Query("""
@@ -105,6 +145,30 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     );
 
     /**
+     * Projection overload of {@link #findActiveByCityId}: fetches only the
+     * five columns needed for salon discovery
+     * ({@code id, name, city_id, district_id, avatar_url}).
+     *
+     * <p>Used exclusively by {@link SearchService#findSalonsByLocation}.
+     *
+     * @param cityId resolved discovery city id (never {@code null})
+     */
+    @Query("""
+            SELECT s.id AS id,
+                   s.name AS name,
+                   s.cityId AS cityId,
+                   s.districtId AS districtId,
+                   s.avatarUrl AS avatarUrl
+            FROM Salon s
+            WHERE s.isActive = true
+              AND s.cityId = :cityId
+            """)
+    Page<SalonSearchProjection> findActiveByCityIdAsProjection(
+            @Param("cityId") UUID cityId,
+            Pageable pageable
+    );
+
+    /**
      * All active salons (no-locality-filter branch of the Phase 10.5 FK
      * location filter — both cityId and districtId resolved to {@code null}).
      *
@@ -113,6 +177,29 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * non-SARGable OR-chain. Spring Data derives the matching {@code COUNT(*)}
      * companion. {@link SearchService#searchSalons} dispatches here only when
      * no locality filter was supplied.
+     *
+     * <p><b>§E — search path MUST use the projection overload.</b>
+     * {@link SearchService} must call
+     * {@link #findByIsActiveTrueAsProjection(Pageable)}.
+     * This full-entity overload remains for non-search callers.
      */
     Page<Salon> findByIsActiveTrue(Pageable pageable);
+
+    /**
+     * Projection overload of {@link #findByIsActiveTrue}: fetches only the
+     * five columns needed for salon discovery
+     * ({@code id, name, city_id, district_id, avatar_url}).
+     *
+     * <p>Used exclusively by {@link SearchService#findSalonsByLocation}.
+     */
+    @Query("""
+            SELECT s.id AS id,
+                   s.name AS name,
+                   s.cityId AS cityId,
+                   s.districtId AS districtId,
+                   s.avatarUrl AS avatarUrl
+            FROM Salon s
+            WHERE s.isActive = true
+            """)
+    Page<SalonSearchProjection> findByIsActiveTrueAsProjection(Pageable pageable);
 }
