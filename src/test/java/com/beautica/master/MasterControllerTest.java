@@ -142,7 +142,8 @@ class MasterControllerTest {
     private MasterDetailResponse stubMasterDetail(UUID masterId, UUID userId) {
         return new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", null, null, null, null, null,
-                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
+                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                null, null, null);
     }
 
     // ── GET /{masterId} — public ───────────────────────────────────────────────
@@ -175,24 +176,34 @@ class MasterControllerTest {
     }
 
     @Test
-    @DisplayName("GET /{masterId} — phoneNumber, street, buildingNo, locationNote are masked when caller is unauthenticated")
+    @DisplayName("GET /{masterId} — phoneNumber, street, buildingNo, locationNote, cityId, oblastId, districtId are masked when caller is unauthenticated")
     void should_not_expose_address_fields_when_caller_is_unauthenticated() throws Exception {
         var masterId = UUID.randomUUID();
-        // Stub with non-null PII fields to prove the controller masks them.
+        var cityUuid = UUID.randomUUID();
+        var oblastUuid = UUID.randomUUID();
+        var districtUuid = UUID.randomUUID();
+        // Stub with non-null PII and locality ID fields to prove the controller masks them.
+        // Locality IDs are set to non-null values so the test proves masking removes them,
+        // not merely that they were already absent (HIGH-3).
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
+                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                cityUuid, oblastUuid, districtUuid);
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
-        log.debug("Act: GET {}/{} without credentials — PII fields must be masked", MASTERS_URL, masterId);
+        log.debug("Act: GET {}/{} without credentials — PII and locality ID fields must be masked", MASTERS_URL, masterId);
         mockMvc.perform(get(MASTERS_URL + "/" + masterId)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.phoneNumber").doesNotExist())
                 .andExpect(jsonPath("$.data.street").doesNotExist())
                 .andExpect(jsonPath("$.data.buildingNo").doesNotExist())
-                .andExpect(jsonPath("$.data.locationNote").doesNotExist());
+                .andExpect(jsonPath("$.data.locationNote").doesNotExist())
+                // HIGH-3: locality cascade IDs must also be masked for unauthenticated callers
+                .andExpect(jsonPath("$.data.cityId").doesNotExist())
+                .andExpect(jsonPath("$.data.oblastId").doesNotExist())
+                .andExpect(jsonPath("$.data.districtId").doesNotExist());
     }
 
     // ── GET /me — self-profile ────────────────────────────────────────────────
@@ -206,7 +217,8 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of());
+                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                null, null, null);
         when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
 
         mockMvc.perform(get(MASTERS_URL + "/me")
@@ -217,6 +229,29 @@ class MasterControllerTest {
                 .andExpect(jsonPath("$.data.street").value("вул. Хрещатик"))
                 .andExpect(jsonPath("$.data.buildingNo").value("1A"))
                 .andExpect(jsonPath("$.data.locationNote").value("green door"));
+    }
+
+    @Test
+    @DisplayName("GET /me — cityId and oblastId are present when authenticated master calls own profile (HIGH-3)")
+    void should_expose_locality_ids_when_authenticatedMasterCallsGetMe() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var cityUuid = UUID.randomUUID();
+        var oblastUuid = UUID.randomUUID();
+        // Stub with non-null locality IDs — the /me handler must return them unmasked.
+        MasterDetailResponse fullDetail = new MasterDetailResponse(
+                masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
+                "вул. Хрещатик", "1A", "green door",
+                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                cityUuid, oblastUuid, null);
+        when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
+
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.cityId").value(cityUuid.toString()))
+                .andExpect(jsonPath("$.data.oblastId").value(oblastUuid.toString()));
     }
 
     @Test

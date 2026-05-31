@@ -25,6 +25,7 @@ public class CacheConfig {
      *   available-slots     — slot availability per master/date/service — 60 sec TTL, max 500 entries
      *   master-calendar     — paginated booking calendar per master/date range — 30 sec TTL, max 500 entries
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
+     *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
      *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
      *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
@@ -90,6 +91,18 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
+        // Public GET /masters/{masterId} — 5 min TTL (shorter than master-detail-by-user
+        // since discovery pages cache across many callers; 1000 entries covers active masters
+        // at current scale). sync=true is specified on the @Cacheable annotation.
+        // Explicit per-key eviction runs afterCommit in MasterService.deactivateMaster,
+        // deactivateOwnerMaster, and the reactivation branch of createMasterForOwner.
+        // Profile-text writes (bio/phone/locality via UserService) rely solely on this TTL
+        // because UserService holds only userId, not masterId — documented trade-off.
+        manager.registerCustomCache("master-detail",
+                Caffeine.newBuilder()
+                        .maximumSize(1000)
+                        .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
         manager.registerCustomCache("master-detail-by-user",
                 Caffeine.newBuilder()
