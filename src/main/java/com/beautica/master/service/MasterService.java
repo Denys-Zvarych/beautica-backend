@@ -495,7 +495,7 @@ public class MasterService {
     @Cacheable(value = "master-detail-by-user", key = "#userId", sync = true)
     @Transactional(readOnly = true)
     public MasterDetailResponse getMyMasterDetail(UUID userId) {
-        Master master = masterRepository.findByUserIdWithUserAndSalon(userId)
+        Master master = masterRepository.findActiveByUserIdWithUserAndSalon(userId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
         return getMasterDetail(master);
     }
@@ -503,7 +503,7 @@ public class MasterService {
     @Cacheable(value = "master-by-user", key = "#userId", sync = true)
     @Transactional(readOnly = true)
     public Master getMasterByUserId(UUID userId) {
-        return masterRepository.findByUserIdWithUserAndSalon(userId)
+        return masterRepository.findActiveByUserIdWithUserAndSalon(userId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
     }
 

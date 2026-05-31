@@ -40,6 +40,13 @@ import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.domain.Sort.Direction;
+
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -806,6 +813,46 @@ class MediaServiceTest {
         verify(portfolioCache, times(1)).evictIfPresent(EntityType.SALON.name() + "_" + salonA);
         verify(portfolioCache, times(1)).evictIfPresent(EntityType.MASTER.name() + "_" + masterB);
         verify(portfolioCache, times(2)).evictIfPresent(any());
+    }
+
+    // ------------------------------------------------ paginated getPortfolio — sort override
+
+    @Test
+    @DisplayName("enforces createdAt DESC sort regardless of the PageRequest sort supplied by the caller")
+    void should_enforceCreatedAtDescSort_when_callerSuppliesArbitrarySort() {
+        UUID entityId = UUID.randomUUID();
+        // Caller-supplied sort that is deliberately different from the expected createdAt DESC.
+        PageRequest callerPageRequest = PageRequest.of(0, 10, Sort.by(Direction.ASC, "r2Key"));
+        when(mediaRepo.findByEntityTypeAndEntityId(eq(EntityType.MASTER), eq(entityId), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        service.getPortfolio(EntityType.MASTER, entityId, callerPageRequest);
+
+        // Capture the Pageable that actually reached the repository and verify the sort
+        // was overridden to createdAt DESC — never the caller-supplied r2Key ASC.
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        verify(mediaRepo).findByEntityTypeAndEntityId(eq(EntityType.MASTER), eq(entityId), pageableCaptor.capture());
+        Sort capturedSort = pageableCaptor.getValue().getSort();
+        assertThat(capturedSort.getOrderFor("createdAt")).isNotNull();
+        assertThat(capturedSort.getOrderFor("createdAt").getDirection()).isEqualTo(Direction.DESC);
+        assertThat(capturedSort.getOrderFor("r2Key")).isNull();
+    }
+
+    @Test
+    @DisplayName("preserves caller page number and page size while overriding the sort")
+    void should_preservePageNumberAndSize_when_overridingSort() {
+        UUID entityId = UUID.randomUUID();
+        PageRequest callerPageRequest = PageRequest.of(2, 25, Sort.by(Direction.ASC, "r2Key"));
+        when(mediaRepo.findByEntityTypeAndEntityId(eq(EntityType.SALON), eq(entityId), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        service.getPortfolio(EntityType.SALON, entityId, callerPageRequest);
+
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        verify(mediaRepo).findByEntityTypeAndEntityId(eq(EntityType.SALON), eq(entityId), pageableCaptor.capture());
+        Pageable captured = pageableCaptor.getValue();
+        assertThat(captured.getPageNumber()).isEqualTo(2);
+        assertThat(captured.getPageSize()).isEqualTo(25);
     }
 
     // ------------------------------------------------------------------ helpers

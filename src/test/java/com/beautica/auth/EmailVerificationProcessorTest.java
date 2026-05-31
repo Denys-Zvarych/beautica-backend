@@ -293,12 +293,19 @@ class EmailVerificationProcessorTest {
         user.setVerificationCodeExpiresAt(FIXED_NOW.plusSeconds(900));
         user.setVerificationLockedUntil(FIXED_NOW.plusSeconds(60)); // still locked
         when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
+        // Timing-equalization decoy: locked branch must call hashOtp("000000") so
+        // its CPU work is equivalent to the unlocked wrong-code path.
+        when(tokenGenerator.hashOtp("000000")).thenReturn("0".repeat(64));
 
         assertThatThrownBy(() -> processor.verifyAndReturnUserId(new VerifyEmailRequest(email, "123456")))
                 .isInstanceOf(VerificationException.class)
                 .extracting(ex -> ((VerificationException) ex).getCode())
                 // Identical generic INVALID_CODE — no distinct "locked" code/status.
                 .isEqualTo(VerificationException.Code.INVALID_CODE);
+
+        // Structural timing-equivalence guard: the decoy hashOtp call ran on the
+        // locked branch, proving timing equalization with the unlocked wrong-code path.
+        org.mockito.Mockito.verify(tokenGenerator).hashOtp("000000");
     }
 
     @Test

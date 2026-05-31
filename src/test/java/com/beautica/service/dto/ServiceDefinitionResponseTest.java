@@ -50,6 +50,9 @@ class ServiceDefinitionResponseTest {
         assertThat(response.serviceTypeNameUk())
                 .as("serviceTypeNameUk must be null when no ServiceType is linked")
                 .isNull();
+        assertThat(response.photoUrl())
+                .as("photoUrl must be null when no photo has been set")
+                .isNull();
     }
 
     @Test

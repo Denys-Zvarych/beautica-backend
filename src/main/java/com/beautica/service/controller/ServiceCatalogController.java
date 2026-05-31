@@ -42,7 +42,11 @@ public class ServiceCatalogController {
     @GetMapping("/service-types")
     public ApiResponse<List<ServiceTypeResponse>> getServiceTypes(
             @RequestParam(required = false) UUID categoryId,
-            @RequestParam(required = false) @Size(min = 3, max = 100) @Pattern(regexp = "^[^\\p{Cntrl}]+$") String q) {
+            @RequestParam(required = false)
+            @Size(min = 3, max = 100)
+            @Pattern(regexp = "^[^\\p{Cntrl}<>\"']+$",
+                     message = "Search query must not contain control characters or HTML special characters")
+            String q) {
         return ApiResponse.ok(serviceCatalogService.searchServiceTypes(categoryId, q));
     }
 

@@ -208,26 +208,35 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("handleForbidden — internal message is emitted at DEBUG level so ops can triage without client exposure")
+    @DisplayName("handleForbidden — emits static DEBUG marker without leaking ex.getMessage() PII")
     void should_emitDebugLog_when_forbiddenExceptionThrown() {
-        // Arrange — internal message that must appear in the server log but NOT in the response body
-        String internalMessage = "Master 550e8400-e29b-41d4-a716-446655440000 does not own salon abc";
-        var ex = new ForbiddenException(internalMessage);
+        // Arrange — the message intentionally contains PII-like content to verify it is NEVER logged.
+        // Anti-Bug Playbook § I: a future dev may write new ForbiddenException("Master " + uuid + "...")
+        // so the log line must use the static class name, not ex.getMessage().
+        String piiMessage = "Master 550e8400-e29b-41d4-a716-446655440000 does not own salon abc";
+        var ex = new ForbiddenException(piiMessage);
         listAppender.list.clear();
 
         // Act
         handler.handleForbidden(ex);
 
-        // Assert — exactly one DEBUG event was emitted containing the internal message
+        // Assert — exactly one DEBUG event was emitted
         List<ILoggingEvent> debugEvents = listAppender.list.stream()
                 .filter(e -> e.getLevel() == Level.DEBUG)
                 .toList();
         assertThat(debugEvents)
                 .as("handleForbidden must emit exactly one DEBUG log for server-side triage")
                 .hasSize(1);
-        assertThat(debugEvents.get(0).getFormattedMessage())
-                .as("DEBUG log must contain the original internal message for ops visibility")
-                .contains(internalMessage);
+
+        String logLine = debugEvents.get(0).getFormattedMessage();
+        // Static marker — class name only, never the message content
+        assertThat(logLine)
+                .as("DEBUG log must contain the static class-name marker")
+                .contains("ForbiddenException");
+        // PII guard — message text must not appear in the log (Anti-Bug § I)
+        assertThat(logLine)
+                .as("DEBUG log must NOT echo ex.getMessage() which may carry PII")
+                .doesNotContain(piiMessage);
     }
 
     @Test
@@ -331,7 +340,7 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("Should return 400 when MissingServletRequestPartException is thrown")
+    @DisplayName("Should return 400 with static message when MissingServletRequestPartException is thrown")
     void should_return400_when_missingRequestPart() {
         // Arrange — multipart endpoint called without the required 'file' part
         var ex = new MissingServletRequestPartException("file");
@@ -349,8 +358,24 @@ class GlobalExceptionHandlerTest {
                 .isFalse();
 
         assertThat(response.getBody().message())
-                .as("message must reference the missing part name")
-                .contains("file");
+                .as("message must be the static string — part name must not be interpolated")
+                .isEqualTo("Required file part is missing");
+    }
+
+    @Test
+    @DisplayName("Should not echo attacker-controlled part name in response")
+    void should_notEchoPartName_when_partNameIsAttackerControlled() {
+        // Arrange — simulate an attacker-supplied part name that should never reach the response
+        var ex = new MissingServletRequestPartException("<script>alert(1)</script>");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMissingPart(ex);
+
+        // Assert — the attacker string must not appear anywhere in the message
+        assertThat(response.getBody().message())
+                .as("attacker-controlled part name must not be echoed in the response body")
+                .doesNotContain("<script>")
+                .isEqualTo("Required file part is missing");
     }
 
     @Test

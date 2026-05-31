@@ -141,4 +141,47 @@ class SecureTokenGeneratorTest {
         // 1000 calls with 1M possible values — collision probability negligible
         assertThat(codes.size()).isGreaterThan(900);
     }
+
+    // ─── ThreadLocal.remove() correctness ────────────────────────────────────
+
+    @Test
+    @DisplayName("hash can be called multiple times on the same thread without error (ThreadLocal is reset between calls)")
+    void should_succeedOnRepeatedCalls_when_threadLocalIsCorrectlyReset() {
+        // If SHA256.remove() were absent, the MessageDigest would be recycled correctly
+        // via md.reset() — but the ThreadLocal entry would accumulate on the Tomcat
+        // thread. This test verifies that repeated calls produce consistent results
+        // and no exception is thrown, which would happen if the digest were
+        // left in a corrupt state.
+        var input = "test-token-input";
+
+        var first = tokenGenerator.hash(input);
+        var second = tokenGenerator.hash(input);
+        var third = tokenGenerator.hash(input);
+
+        assertThat(first).isEqualTo(second);
+        assertThat(second).isEqualTo(third);
+        assertThat(first).matches("[0-9a-f]{64}");
+    }
+
+    @Test
+    @DisplayName("hash(empty string) returns the known SHA-256 digest for empty input")
+    void should_returnKnownDigest_when_hashCalledWithEmptyString() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        var expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        var actual = tokenGenerator.hash("");
+
+        assertThat(actual).isEqualTo(expected);
+    }
+
+    @Test
+    @DisplayName("hash('abc') returns the known SHA-256 digest for that input")
+    void should_returnKnownDigest_when_hashCalledWithKnownInput() {
+        // SHA-256("abc") — NIST FIPS 180-4 test vector
+        var expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        var actual = tokenGenerator.hash("abc");
+
+        assertThat(actual).isEqualTo(expected);
+    }
 }

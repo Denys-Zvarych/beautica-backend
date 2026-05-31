@@ -748,6 +748,94 @@ class InviteServiceTest {
         inOrder.verify(outboxService).enqueueInvite(any(), anyString(), anyString(), anyString());
     }
 
+    // ── @PostConstruct startup validation ────────────────────────────────────
+
+    @Test
+    @DisplayName("validateConfig throws IllegalStateException at startup when frontendBaseUrl is plain HTTP")
+    void should_throwIllegalState_when_validateConfig_withPlainHttp() {
+        var service = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                outboxService,
+                "http://example.com",
+                48L,
+                Clock.systemUTC()
+        );
+
+        assertThatThrownBy(service::validateConfig)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must use HTTPS scheme");
+    }
+
+    @Test
+    @DisplayName("validateConfig throws IllegalStateException at startup when frontendBaseUrl is null")
+    void should_throwIllegalState_when_validateConfig_withNull() {
+        var service = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                outboxService,
+                null,
+                48L,
+                Clock.systemUTC()
+        );
+
+        assertThatThrownBy(service::validateConfig)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must use HTTPS scheme");
+    }
+
+    @Test
+    @DisplayName("validateConfig passes silently when frontendBaseUrl is HTTPS")
+    void should_notThrow_when_validateConfig_withHttps() {
+        var service = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                outboxService,
+                "https://beautica.app",
+                48L,
+                Clock.systemUTC()
+        );
+
+        // Must not throw
+        service.validateConfig();
+    }
+
+    @Test
+    @DisplayName("validateConfig passes silently when frontendBaseUrl is http://localhost with port")
+    void should_notThrow_when_validateConfig_withLocalhostPort() {
+        var service = new InviteService(
+                inviteTokenRepository,
+                userRepository,
+                salonRepository,
+                passwordEncoder,
+                tokenGenerator,
+                masterService,
+                authResponseBuilder,
+                outboxService,
+                "http://localhost:3000",
+                48L,
+                Clock.systemUTC()
+        );
+
+        // Must not throw — localhost dev URLs are allowed
+        service.validateConfig();
+    }
+
     // ── Phase 5.9 — buildInviteLink HTTPS scheme guard ───────────────────────
 
     @Test

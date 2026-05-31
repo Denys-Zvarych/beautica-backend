@@ -446,7 +446,7 @@ class MasterServiceTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByUserIdWithUserAndSalon(userId)).thenReturn(Optional.of(master));
+        when(masterRepository.findActiveByUserIdWithUserAndSalon(userId)).thenReturn(Optional.of(master));
 
         Master result = masterService.getMasterByUserId(userId);
 
@@ -459,9 +459,35 @@ class MasterServiceTest {
     void should_throwNotFound_when_getMasterByUserIdAndNoMasterRecord() {
         UUID userId = UUID.randomUUID();
 
-        when(masterRepository.findByUserIdWithUserAndSalon(userId)).thenReturn(Optional.empty());
+        when(masterRepository.findActiveByUserIdWithUserAndSalon(userId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.getMasterByUserId(userId))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_getMasterByUserId_andMasterIsDeactivated")
+    void should_throwNotFound_when_getMasterByUserId_andMasterIsDeactivated() {
+        UUID userId = UUID.randomUUID();
+
+        // findActiveByUserIdWithUserAndSalon filters isActive=true at the DB level —
+        // a deactivated master returns empty, which must surface as 404.
+        when(masterRepository.findActiveByUserIdWithUserAndSalon(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.getMasterByUserId(userId))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_getMyMasterDetail_andMasterIsDeactivated")
+    void should_throwNotFound_when_getMyMasterDetail_andMasterIsDeactivated() {
+        UUID userId = UUID.randomUUID();
+
+        // DB-level isActive=true filter: deactivated master returns empty Optional,
+        // preventing a master with a valid JWT from accessing GET /masters/me.
+        when(masterRepository.findActiveByUserIdWithUserAndSalon(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.getMyMasterDetail(userId))
                 .isInstanceOf(NotFoundException.class);
     }
 

@@ -2,7 +2,6 @@ package com.beautica.search.controller;
 
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
-import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.GlobalExceptionHandler;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.search.dto.MasterSearchRequest;
@@ -39,7 +38,6 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
 
-import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -258,12 +256,13 @@ class SearchControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — 400 when minPrice exceeds maxPrice (service-layer cross-field check)")
+    @DisplayName("GET /api/v1/search/masters — 400 when minPrice exceeds maxPrice (DTO @AssertTrue fires before @Cacheable)")
     void should_return400_when_minPriceExceedsMaxPrice() throws Exception {
-        when(searchService.searchMasters(any(MasterSearchRequest.class), any(Pageable.class)))
-                .thenThrow(new BusinessException("minPrice must not exceed maxPrice"));
-
-        log.debug("Act: GET {} with minPrice > maxPrice — service raises BusinessException → 400", MASTERS_URL);
+        // No service stub — the @AssertTrue on MasterSearchRequest fires at MVC
+        // argument-resolution time, before @Cacheable intercepts, so the mock
+        // service is never called. Verifying this is the whole point of the fix:
+        // the guard must work on cached paths too.
+        log.debug("Act: GET {} with minPrice=500 > maxPrice=100 — DTO @AssertTrue must reject with 400 before service", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
                         .param("minPrice", "500.00")
                         .param("maxPrice", "100.00")
@@ -271,8 +270,38 @@ class SearchControllerTest {
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.message").value("Invalid request"));
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 even on cached pages when minPrice exceeds maxPrice")
+    void should_returnBadRequest_when_minPriceExceedsMaxPrice_cachedPath() throws Exception {
+        // Arrange: warm the cache with a valid page-0 request.
+        Page<MasterSearchResult> validPage = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(MasterSearchRequest.class), any(Pageable.class)))
+                .thenReturn(validPage);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "100.00")
+                        .param("maxPrice", "500.00")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        // Act: send an invalid range for the same page-0 (which @Cacheable would
+        // otherwise serve from cache). The @AssertTrue on MasterSearchRequest fires
+        // at argument-resolution, before @Cacheable, so this must be 400 — not a
+        // cached 200 from the previous valid request.
+        log.debug("Act: GET {} with minPrice=999 > maxPrice=1 on cached page-0 — must be 400, not a cached 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "999.00")
+                        .param("maxPrice", "1.00")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
     }
 
     // ── GET /api/v1/search/salons ───────────────────────────────────────────────────

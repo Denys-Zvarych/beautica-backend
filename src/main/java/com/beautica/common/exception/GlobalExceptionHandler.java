@@ -96,9 +96,10 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ForbiddenException.class)
     public ResponseEntity<ApiResponse<Void>> handleForbidden(ForbiddenException ex) {
-        // Log the original message at DEBUG for server-side triage — never echoed to the
-        // client because it may contain internal UUIDs or data model details (Anti-Bug § I).
-        log.debug("Forbidden: {}", ex.getMessage());
+        // Log the exception type only — never ex.getMessage() which may carry internal UUIDs
+        // or user data if a future dev writes new ForbiddenException("Master " + userId + " ...").
+        // getSimpleName() is always the constant "ForbiddenException"; no PII risk (Anti-Bug § I).
+        log.debug("Forbidden access denied [{}]", ex.getClass().getSimpleName());
         return ResponseEntity
                 .status(HttpStatus.FORBIDDEN)
                 .body(ApiResponse.error("Access denied"));
@@ -204,9 +205,13 @@ public class GlobalExceptionHandler {
      */
     @ExceptionHandler(MissingServletRequestPartException.class)
     public ResponseEntity<ApiResponse<Void>> handleMissingPart(MissingServletRequestPartException ex) {
+        // Static message — part name comes from server-side annotations today, but could be
+        // attacker-influenced in future endpoints. The client only needs to know to send
+        // multipart/form-data with a 'file' field; the part name adds no diagnostic value (§I).
+        log.debug("Missing request part: {}", ex.getRequestPartName());
         return ResponseEntity
                 .badRequest()
-                .body(ApiResponse.error("Required part '" + ex.getRequestPartName() + "' is missing"));
+                .body(ApiResponse.error("Required file part is missing"));
     }
 
     /**

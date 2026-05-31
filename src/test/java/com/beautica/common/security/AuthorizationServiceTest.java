@@ -472,6 +472,42 @@ class AuthorizationServiceTest {
         verify(masterRepository, never()).findById(any());
     }
 
+    @Test
+    @DisplayName("canManageServiceDefinition returns false without DB hit when actor has ROLE_CLIENT (MEDIUM-1 role fast-path)")
+    void should_returnFalse_withoutDbHit_when_clientCallsCanManageServiceDefinition() {
+        UUID serviceDefId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_CLIENT");
+
+        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
+
+        assertThat(result).isFalse();
+        verify(serviceRepository, never()).findOwnerUserId(any());
+    }
+
+    @Test
+    @DisplayName("canManageServiceDefinition returns false without DB hit when actor has ROLE_SALON_MASTER (MEDIUM-1 role fast-path)")
+    void should_returnFalse_withoutDbHit_when_salonMasterCallsCanManageServiceDefinition() {
+        UUID serviceDefId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
+
+        assertThat(result).isFalse();
+        verify(serviceRepository, never()).findOwnerUserId(any());
+    }
+
+    @Test
+    @DisplayName("canManageServiceDefinition returns false without DB hit when actor has ROLE_SALON_ADMIN (MEDIUM-1 role fast-path)")
+    void should_returnFalse_withoutDbHit_when_salonAdminCallsCanManageServiceDefinition() {
+        UUID serviceDefId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_ADMIN");
+
+        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
+
+        assertThat(result).isFalse();
+        verify(serviceRepository, never()).findOwnerUserId(any());
+    }
+
     // ── canManageBooking ───────────────────────────────────────────────────────
 
     @Test

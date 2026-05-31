@@ -708,6 +708,81 @@ class EmailNotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // CRLF-strip (header injection defence)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("should strip CRLF from To address in sendPasswordResetEmail before setTo is called")
+    void should_stripCrlf_when_sendPasswordResetEmailCalledWithInjectedNewline() throws Exception {
+        // Use an address that is valid after CRLF stripping so MimeMessageHelper.setTo() succeeds
+        // and we can assert the header was populated without the injected control characters.
+        // "user@example.com\r\n" → stripped → "user@example.com" (valid RFC 5321 address).
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+
+        service.sendPasswordResetEmail(
+                "user@example.com\r\n",
+                "https://beautica.app/reset?token=tok");
+
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
+                .as("To header must be set (CRLF stripped, address remains valid)")
+                .isNotNull()
+                .hasSize(1);
+        String toHeader = realMessage.getRecipients(Message.RecipientType.TO)[0].toString();
+        assertThat(toHeader).doesNotContain("\r");
+        assertThat(toHeader).doesNotContain("\n");
+        assertThat(toHeader).contains("user@example.com");
+    }
+
+    @Test
+    @DisplayName("should strip CRLF from To address in sendVerificationEmail before setTo is called")
+    void should_stripCrlf_when_sendVerificationEmailCalledWithInjectedNewline() throws Exception {
+        // Use an address that is valid after CRLF stripping so MimeMessageHelper.setTo() succeeds.
+        // "user@example.com\r\n" → stripped → "user@example.com" (valid RFC 5321 address).
+        MimeMessage realMessage = new MimeMessage(Session.getDefaultInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>verify</html>");
+
+        service.sendVerificationEmail(
+                "user@example.com\r\n",
+                "123456");
+
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
+                .as("To header must be set (CRLF stripped, address remains valid)")
+                .isNotNull()
+                .hasSize(1);
+        String toHeader = realMessage.getRecipients(Message.RecipientType.TO)[0].toString();
+        assertThat(toHeader).doesNotContain("\r");
+        assertThat(toHeader).doesNotContain("\n");
+        assertThat(toHeader).contains("user@example.com");
+    }
+
+    @Test
+    @DisplayName("should strip CRLF from To address in send() helper before setTo is called (via sendInviteEmail)")
+    void should_stripCrlf_when_sendHelperCalledWithInjectedNewline() throws Exception {
+        // Use an address that is valid after newline stripping so MimeMessageHelper.setTo() succeeds.
+        // "master@example.com\n" → stripped → "master@example.com" (valid RFC 5321 address).
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
+
+        service.sendInviteEmail(
+                "master@example.com\n",
+                "https://beautica.app/invite/token",
+                "Salon Aurora");
+
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
+                .as("To header must be set (newline stripped, address remains valid)")
+                .isNotNull()
+                .hasSize(1);
+        String toHeader = realMessage.getRecipients(Message.RecipientType.TO)[0].toString();
+        assertThat(toHeader).doesNotContain("\r");
+        assertThat(toHeader).doesNotContain("\n");
+        assertThat(toHeader).contains("master@example.com");
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 

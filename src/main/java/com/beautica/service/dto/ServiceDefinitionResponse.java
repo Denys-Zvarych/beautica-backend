@@ -16,7 +16,8 @@ public record ServiceDefinitionResponse(
         int bufferMinutesAfter,
         boolean isActive,
         UUID serviceTypeId,
-        String serviceTypeNameUk
+        String serviceTypeNameUk,
+        String photoUrl
 ) {
     public static ServiceDefinitionResponse from(ServiceDefinition sd) {
         return new ServiceDefinitionResponse(
@@ -29,7 +30,8 @@ public record ServiceDefinitionResponse(
                 sd.getBufferMinutesAfter(),
                 sd.isActive(),
                 sd.getServiceType() != null ? sd.getServiceType().getId() : null,
-                sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null
+                sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null,
+                sd.getPhotoUrl()
         );
     }
 }

@@ -83,6 +83,14 @@ public class ServiceDefinition extends AuditableEntity {
     @Column(name = "is_active", nullable = false)
     private boolean isActive;
 
+    /**
+     * Optional URL pointing to the service photo (presigned R2 URL or direct HTTPS URL).
+     * Nullable — services without a photo return {@code null} in the response DTO.
+     * The DB column carries a CHECK (photo_url LIKE 'https://%') constraint (V62 migration).
+     */
+    @Column(name = "photo_url", length = 2048)
+    private String photoUrl;
+
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "service_type_id")
     private ServiceType serviceType;

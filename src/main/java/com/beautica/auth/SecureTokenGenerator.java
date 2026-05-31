@@ -66,8 +66,15 @@ public class SecureTokenGenerator implements TokenGenerator {
     public String hash(String rawToken) {
         MessageDigest md = SHA256.get();
         md.reset();
-        byte[] digest = md.digest(rawToken.getBytes(StandardCharsets.UTF_8));
-        return HexFormat.of().formatHex(digest);
+        try {
+            byte[] digest = md.digest(rawToken.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } finally {
+            // Remove the ThreadLocal entry after each use so the MessageDigest instance
+            // is not retained on Tomcat worker threads between requests, preventing a
+            // bounded heap leak proportional to the thread-pool size.
+            SHA256.remove();
+        }
     }
 
     @Override

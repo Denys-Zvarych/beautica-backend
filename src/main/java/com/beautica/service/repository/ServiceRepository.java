@@ -38,6 +38,21 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             """)
     Optional<UUID> findOwnerUserId(@Param("serviceDefId") UUID serviceDefId);
 
+    /**
+     * Loads a ServiceDefinition together with its serviceType in a single JOIN FETCH
+     * query so that callers that need both (e.g. PATCH endpoints that return
+     * ServiceDefinitionResponse) do not trigger a second SELECT for the lazy association.
+     *
+     * Prefer this over {@code findById} in any write method whose response DTO accesses
+     * serviceType fields.
+     */
+    @Query("""
+            SELECT sd FROM ServiceDefinition sd
+            LEFT JOIN FETCH sd.serviceType
+            WHERE sd.id = :id
+            """)
+    Optional<ServiceDefinition> findByIdWithServiceType(@Param("id") UUID id);
+
     @Modifying
     @Query("UPDATE ServiceDefinition sd SET sd.isActive = false WHERE sd.id = :id")
     int deactivateById(@Param("id") UUID id);

@@ -43,7 +43,13 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      *
      * <p>Prefer this over the bare {@link #findByUserId} wherever the caller needs to
      * dereference either {@code master.getUser()} or {@code master.getSalon()}.
+     *
+     * @deprecated Use {@link #findActiveByUserIdWithUserAndSalon} for authenticated
+     *     self-service endpoints — deactivated masters must not access their own profile.
+     *     This variant (no {@code isActive} filter) is retained for internal callers
+     *     (e.g. admin paths) that explicitly need to resolve any master regardless of status.
      */
+    @Deprecated
     @Query("""
             SELECT m FROM Master m
             LEFT JOIN FETCH m.user
@@ -51,6 +57,25 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             WHERE m.user.id = :userId
             """)
     Optional<Master> findByUserIdWithUserAndSalon(@Param("userId") UUID userId);
+
+    /**
+     * Fetches the <em>active</em> master together with both its {@code user} and {@code salon}
+     * associations in a single query. Filters {@code isActive = true} at the DB level so a
+     * deactivated master with a still-valid JWT cannot call {@code GET /masters/me} or any
+     * other self-service endpoint backed by this finder (Anti-Bug §E, backlog LOW master/service).
+     *
+     * <p>Use this method for all authenticated self-service reads
+     * ({@link com.beautica.master.service.MasterService#getMyMasterDetail} and
+     * {@link com.beautica.master.service.MasterService#getMasterByUserId}).
+     */
+    @Query("""
+            SELECT m FROM Master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon
+            WHERE m.user.id = :userId
+              AND m.isActive = true
+            """)
+    Optional<Master> findActiveByUserIdWithUserAndSalon(@Param("userId") UUID userId);
 
     /** @deprecated No JOIN FETCH on user — triggers N+1. Use {@link #findBySalonIdAndIsActiveTrueWithUser} instead. */
     @Deprecated

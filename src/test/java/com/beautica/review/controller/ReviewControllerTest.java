@@ -300,6 +300,20 @@ class ReviewControllerTest {
                 .andExpect(jsonPath("$.data.totalElements").value(0));
     }
 
+    @Test
+    @DisplayName("GET /masters/{masterId}/reviews — 400 when page number exceeds 10000")
+    void should_return400_when_pageNumberExceedsMaximum() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(reviewService.getReviewsForMaster(any(), any()))
+                .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST,
+                        "Page number must not exceed 10000"));
+
+        mockMvc.perform(get(MASTERS_REVIEWS_URL, masterId)
+                        .param("page", "2147483647")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
     // ── GET /reviews/{reviewId} ───────────────────────────────────────────────
 
     @Test
