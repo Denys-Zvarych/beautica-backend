@@ -109,7 +109,7 @@ public class EmailNotificationService {
             var message = mailSender.createMimeMessage();
             var helper = new MimeMessageHelper(message, true, "UTF-8");
             helper.setFrom(fromAddress);
-            helper.setTo(to);
+            helper.setTo(to.replaceAll("[\r\n]", ""));
             helper.setSubject("Скидання паролю Beautica");
 
             var ctx = new Context();
@@ -132,7 +132,7 @@ public class EmailNotificationService {
             var message = mailSender.createMimeMessage();
             var helper = new MimeMessageHelper(message, true, "UTF-8");
             helper.setFrom(fromAddress);
-            helper.setTo(to);
+            helper.setTo(to.replaceAll("[\r\n]", ""));
             helper.setSubject("Код підтвердження Beautica");
 
             // Render template — code is ONLY passed as a context variable, never logged
@@ -171,7 +171,7 @@ public class EmailNotificationService {
             MimeMessage message = mailSender.createMimeMessage();
             MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
             helper.setFrom(fromAddress);
-            helper.setTo(to);
+            helper.setTo(to.replaceAll("[\r\n]", ""));
             helper.setSubject(subject);
             helper.setText(html, true);
             helper.addInline("beauticaLogo", LOGO);

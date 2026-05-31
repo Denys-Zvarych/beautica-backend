@@ -96,9 +96,10 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ForbiddenException.class)
     public ResponseEntity<ApiResponse<Void>> handleForbidden(ForbiddenException ex) {
-        // Log the original message at DEBUG for server-side triage — never echoed to the
-        // client because it may contain internal UUIDs or data model details (Anti-Bug § I).
-        log.debug("Forbidden: {}", ex.getMessage());
+        // Log the exception type only — never ex.getMessage() which may carry internal UUIDs
+        // or user data if a future dev writes new ForbiddenException("Master " + userId + " ...").
+        // getSimpleName() is always the constant "ForbiddenException"; no PII risk (Anti-Bug § I).
+        log.debug("Forbidden access denied [{}]", ex.getClass().getSimpleName());
         return ResponseEntity
                 .status(HttpStatus.FORBIDDEN)
                 .body(ApiResponse.error("Access denied"));
