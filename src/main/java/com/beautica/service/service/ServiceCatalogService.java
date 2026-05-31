@@ -62,7 +62,7 @@ public class ServiceCatalogService {
             CreateServiceDefinitionRequest request) {
 
         if (!salonRepository.existsById(salonId)) {
-            throw new NotFoundException("Salon not found: " + salonId);
+            throw new NotFoundException("Salon not found");
         }
 
         ServiceDefinition definition = ServiceDefinition.builder()

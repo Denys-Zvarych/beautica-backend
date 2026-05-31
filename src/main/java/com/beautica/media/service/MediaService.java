@@ -31,6 +31,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -347,11 +348,23 @@ public class MediaService {
      * that arises when referencing a non-public static method via
      * {@code T(ClassName).method()} (Anti-Bug §F).
      */
+    /** Fixed sort applied regardless of the caller-supplied {@link PageRequest} sort. */
+    private static final Sort PORTFOLIO_SORT = Sort.by(Sort.Direction.DESC, "createdAt");
+
     @Cacheable(value = PORTFOLIO_CACHE, sync = true,
                key = "#entityType.name() + '_' + #entityId")
     @Transactional(readOnly = true)
     public Page<MediaFileResponse> getPortfolio(EntityType entityType, UUID entityId, PageRequest pageable) {
-        return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId, pageable)
+        // Strip any caller-supplied sort and enforce createdAt DESC. The controller always
+        // passes PORTFOLIO_PAGE (fixed sort), but this guard prevents a future call site
+        // or test from accidentally injecting a different sort order, which would both
+        // corrupt the deterministic cache key and allow arbitrary column enumeration.
+        PageRequest sortedPageable = PageRequest.of(
+                pageable.getPageNumber(),
+                pageable.getPageSize(),
+                PORTFOLIO_SORT
+        );
+        return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId, sortedPageable)
                 .map(MediaFileResponse::from);
     }
 
