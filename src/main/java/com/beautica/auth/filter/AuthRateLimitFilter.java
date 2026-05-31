@@ -194,6 +194,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else {
             response.setStatus(429);
             response.setContentType("application/json");
+            response.setHeader("X-Content-Type-Options", "nosniff");
             response.setHeader("Retry-After", String.valueOf(retryAfterSeconds));
             response.setContentLength(TOO_MANY_REQUESTS_BODY.length);
             response.getOutputStream().write(TOO_MANY_REQUESTS_BODY);

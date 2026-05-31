@@ -1155,6 +1155,173 @@ class AuthRateLimitFilterTest {
 
     // ==========================================================================
     @Nested
+    @DisplayName("Security headers on 429 responses")
+    class SecurityHeadersOn429 {
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 login response")
+        void should_setXContentTypeOptionsNosniff_when_loginBucketExhausted() throws Exception {
+            when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/login");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when login bucket is exhausted")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 refresh response")
+        void should_setXContentTypeOptionsNosniff_when_refreshBucketExhausted() throws Exception {
+            when(refreshBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/refresh");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when refresh bucket is exhausted")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 register response")
+        void should_setXContentTypeOptionsNosniff_when_registerBucketExhausted() throws Exception {
+            when(registerBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/register");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when register bucket is exhausted")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 verify-email response (15-min window)")
+        void should_setXContentTypeOptionsNosniff_when_verifyEmailBucketExhausted() throws Exception {
+            when(verifyEmailBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/verify-email");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when verifyEmail bucket is exhausted")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 forgot-password response (60-min window)")
+        void should_setXContentTypeOptionsNosniff_when_forgotPasswordBucketExhausted() throws Exception {
+            when(forgotPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/forgot-password");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when forgotPassword bucket is exhausted")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 media-upload response (DELETE path)")
+        void should_setXContentTypeOptionsNosniff_when_mediaUploadBucketExhausted() throws Exception {
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = deleteRequest("/api/v1/media/portfolio/" + java.util.UUID.randomUUID());
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when mediaUpload bucket is exhausted on DELETE")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 device-token response (DELETE path)")
+        void should_setXContentTypeOptionsNosniff_when_deviceTokenBucketExhausted() throws Exception {
+            when(deviceTokenBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = deleteRequest("/api/v1/devices/token");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when deviceToken bucket is exhausted on DELETE")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+
+        @Test
+        @DisplayName("X-Content-Type-Options: nosniff is present on 429 profile-update response (PATCH path)")
+        void should_setXContentTypeOptionsNosniff_when_profileUpdateBucketExhausted() throws Exception {
+            when(profileUpdateBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var req = new MockHttpServletRequest("PATCH", "/api/v1/users/me");
+            req.setRemoteAddr(REMOTE_ADDR);
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(req, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when profileUpdate bucket is exhausted on PATCH")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("X-Content-Type-Options"))
+                    .as("X-Content-Type-Options must be nosniff on every 429 response from the filter")
+                    .isEqualTo("nosniff");
+        }
+    }
+
+    // ==========================================================================
+    @Nested
     @DisplayName("PATCH /api/v1/masters/me/profile")
     class MastersMeProfileEndpoint {
 
