@@ -21,7 +21,6 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
-import org.springframework.context.annotation.Primary;
 import org.springframework.http.MediaType;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -52,7 +51,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @WebMvcTest(InternalCategoryController.class)
 @TestPropertySource(properties = {
         "app.frontend.base-url=http://localhost:3000",
-        "app.internal-api-key=test-internal-api-key"
+        "app.internal-api-key=test-internal-api-key",
+        "spring.main.allow-bean-definition-overriding=true"
 })
 @Import(InternalApiKeyFilterTest.TestConfig.class)
 @DisplayName("InternalApiKeyFilter — @WebMvcTest slice")
@@ -89,8 +89,7 @@ class InternalApiKeyFilterTest {
          * auth goes via the InternalApiKeyFilter instead.
          */
         @Bean
-        @Primary
-        JwtAuthenticationFilter passThruJwtFilter(JwtTokenProvider jwtTokenProvider) {
+        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
             return new JwtAuthenticationFilter(jwtTokenProvider) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
@@ -106,9 +105,8 @@ class InternalApiKeyFilterTest {
          * Pass-through AuthRateLimitFilter.
          */
         @Bean
-        @Primary
         @SuppressWarnings("unchecked")
-        AuthRateLimitFilter passThruRateLimitFilter() {
+        AuthRateLimitFilter authRateLimitFilter() {
             LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
             return new AuthRateLimitFilter(
                     dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
@@ -158,6 +156,7 @@ class InternalApiKeyFilterTest {
     @DisplayName("returns 401 when X-Internal-Key header is missing")
     void should_return401_when_headerMissing() throws Exception {
         mockMvc.perform(get("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.success").value(false))
@@ -168,6 +167,7 @@ class InternalApiKeyFilterTest {
     @DisplayName("returns 401 when X-Internal-Key header has the wrong value")
     void should_return401_when_headerValueIsWrong() throws Exception {
         mockMvc.perform(get("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", WRONG_KEY)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isUnauthorized())
@@ -182,6 +182,7 @@ class InternalApiKeyFilterTest {
                 .thenReturn(List.of(new PlatformCategoryUsageResponse("MANICURE", true, 5L)));
 
         mockMvc.perform(get("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", VALID_KEY)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())

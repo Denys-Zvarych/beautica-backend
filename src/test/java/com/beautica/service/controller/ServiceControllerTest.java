@@ -138,7 +138,7 @@ class ServiceControllerTest {
         var salonId = UUID.randomUUID();
         var serviceId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Classic Manicure", "Basic nail care", null, 60, new BigDecimal("350.00"), 10, null);
+                "Classic Manicure", "Basic nail care", "MANICURE", 60, new BigDecimal("350.00"), 10, null);
         var stub = stubServiceDefResponse(serviceId, "Classic Manicure");
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
@@ -170,7 +170,7 @@ class ServiceControllerTest {
                         .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Hair Cut\",\"baseDurationMinutes\":30,\"basePrice\":\"50.00\",\"bufferMinutesAfter\":0}"))
+                        .content("{\"name\":\"Hair Cut\",\"category\":\"MANICURE\",\"baseDurationMinutes\":30,\"basePrice\":\"50.00\",\"bufferMinutesAfter\":0}"))
                 .andExpect(status().isForbidden());
     }
 
@@ -183,7 +183,7 @@ class ServiceControllerTest {
         when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(false);
 
         var request = new CreateServiceDefinitionRequest(
-                "Hijack Service", null, null, 30, new BigDecimal("100.00"), 0, null);
+                "Hijack Service", null, "MANICURE", 30, new BigDecimal("100.00"), 0, null);
 
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — cross-owner must be denied", salonAId);
         mockMvc.perform(post("/api/v1/salons/" + salonAId + "/services")
@@ -316,7 +316,7 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Lash Extensions", "Volume set", null, 120, new BigDecimal("900.00"), 15, null);
+                "Lash Extensions", "Volume set", "MANICURE", 120, new BigDecimal("900.00"), 15, null);
         var stub = stubMasterServiceResponse(UUID.randomUUID(), masterId, "Lash Extensions");
 
         when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
@@ -338,7 +338,7 @@ class ServiceControllerTest {
     void should_return403_when_clientAddsIndependentMasterService() throws Exception {
         var userId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Sneaky Service", null, null, 30, new BigDecimal("100.00"), 0, null);
+                "Sneaky Service", null, "MANICURE", 30, new BigDecimal("100.00"), 0, null);
 
         log.debug("Act: POST /api/v1/independent-masters/me/services as CLIENT — must be denied");
         mockMvc.perform(post("/api/v1/independent-masters/me/services")

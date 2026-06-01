@@ -1,6 +1,7 @@
 package com.beautica.master;
 
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.config.CacheConfig;
 import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
@@ -84,6 +85,7 @@ class MasterServiceCacheTest {
     @MockBean WorkingHoursRepository workingHoursRepository;
     @MockBean ScheduleExceptionRepository scheduleExceptionRepository;
     @MockBean BookingRepository bookingRepository;
+    @MockBean CityRepository cityRepository;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

@@ -25,7 +25,6 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
-import org.springframework.context.annotation.Primary;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -55,7 +54,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @WebMvcTest(InternalCategoryController.class)
 @TestPropertySource(properties = {
         "app.frontend.base-url=http://localhost:3000",
-        "app.internal-api-key=test-internal-api-key"
+        "app.internal-api-key=test-internal-api-key",
+        "spring.main.allow-bean-definition-overriding=true"
 })
 @Import(InternalCategoryControllerTest.TestConfig.class)
 @DisplayName("InternalCategoryController — @WebMvcTest slice")
@@ -84,8 +84,7 @@ class InternalCategoryControllerTest {
         }
 
         @Bean
-        @Primary
-        JwtAuthenticationFilter passThruJwtFilter(JwtTokenProvider jwtTokenProvider) {
+        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
             return new JwtAuthenticationFilter(jwtTokenProvider) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
@@ -98,9 +97,8 @@ class InternalCategoryControllerTest {
         }
 
         @Bean
-        @Primary
         @SuppressWarnings("unchecked")
-        AuthRateLimitFilter passThruRateLimitFilter() {
+        AuthRateLimitFilter authRateLimitFilter() {
             LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
             return new AuthRateLimitFilter(
                     dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
@@ -159,6 +157,7 @@ class InternalCategoryControllerTest {
         ));
 
         mockMvc.perform(get("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", VALID_KEY)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
@@ -173,6 +172,7 @@ class InternalCategoryControllerTest {
     @DisplayName("GET without key returns 401")
     void should_return401_when_getWithoutKey() throws Exception {
         mockMvc.perform(get("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isUnauthorized());
     }
@@ -186,6 +186,7 @@ class InternalCategoryControllerTest {
         when(internalCategoryService.create(any(CreatePlatformCategoryRequest.class))).thenReturn(created);
 
         mockMvc.perform(post("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", VALID_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"NAIL_ART\"}"))
@@ -202,6 +203,7 @@ class InternalCategoryControllerTest {
                 .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Category already exists: MANICURE"));
 
         mockMvc.perform(post("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", VALID_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"MANICURE\"}"))
@@ -214,6 +216,7 @@ class InternalCategoryControllerTest {
     void should_return400_when_validKeyButInvalidNameFormat() throws Exception {
         // "nail art" contains a space — violates ^[A-Z][A-Z0-9_]*$ pattern
         mockMvc.perform(post("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", VALID_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"nail art\"}"))
@@ -224,6 +227,7 @@ class InternalCategoryControllerTest {
     @DisplayName("POST with valid key but lowercase name returns 400")
     void should_return400_when_validKeyButLowercaseName() throws Exception {
         mockMvc.perform(post("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", VALID_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"manicure\"}"))
@@ -234,6 +238,7 @@ class InternalCategoryControllerTest {
     @DisplayName("POST without key returns 401")
     void should_return401_when_postWithoutKey() throws Exception {
         mockMvc.perform(post("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"NAIL_ART\"}"))
                 .andExpect(status().isUnauthorized());
@@ -243,6 +248,7 @@ class InternalCategoryControllerTest {
     @DisplayName("POST with valid key but blank name returns 400")
     void should_return400_when_blankName() throws Exception {
         mockMvc.perform(post("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", VALID_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"\"}"))
@@ -253,6 +259,7 @@ class InternalCategoryControllerTest {
     @DisplayName("POST with wrong key returns 401")
     void should_return401_when_wrongKey() throws Exception {
         mockMvc.perform(post("/api/v1/internal/service-categories")
+                        .servletPath("/api/v1/internal/service-categories")
                         .header("X-Internal-Key", "wrong-key")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"NAIL_ART\"}"))
