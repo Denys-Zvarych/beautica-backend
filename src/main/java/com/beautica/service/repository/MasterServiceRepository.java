@@ -68,12 +68,26 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             @Param("serviceDefId") UUID serviceDefId,
             @Param("masterId") UUID masterId);
 
+    /**
+     * Returns a master's active service assignments whose linked service definition is
+     * <em>also</em> active.
+     *
+     * <p>The {@code sd.isActive = true} predicate is essential: soft-deleting a service
+     * (DELETE → {@code deactivateServiceDefinition}) sets the {@link ServiceDefinition}'s
+     * {@code isActive=false} but leaves the {@link MasterServiceAssignment} row active.
+     * Without this predicate, a deactivated definition would keep appearing in the
+     * master's list and in the public client browse. Filtering on both flags makes a
+     * soft-deleted definition disappear from every consumer of this query while
+     * preserving booking history (the assignment row itself is untouched).
+     */
     @Query("""
             SELECT msa FROM MasterServiceAssignment msa
             JOIN FETCH msa.serviceDefinition sd
             LEFT JOIN FETCH sd.serviceType
             JOIN FETCH msa.master
-            WHERE msa.master.id = :masterId AND msa.isActive = true
+            WHERE msa.master.id = :masterId
+              AND msa.isActive = true
+              AND sd.isActive = true
             ORDER BY msa.id
             """)
     List<MasterServiceAssignment> findByMasterIdAndIsActiveTrueWithGraph(
