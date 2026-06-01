@@ -3,7 +3,6 @@ package com.beautica.service.dto;
 import com.beautica.master.entity.Master;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -73,7 +72,7 @@ class MasterServiceResponseTest {
                 .ownerId(UUID.randomUUID())
                 .name("Manicure Classic")
                 .description("Classic manicure service")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(BASE_DURATION)
                 .basePrice(BASE_PRICE)
                 .bufferMinutesAfter(10)
@@ -142,7 +141,7 @@ class MasterServiceResponseTest {
                 .ownerId(UUID.randomUUID())
                 .name("Manicure Classic")
                 .description("Classic manicure service")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(BASE_DURATION)
                 .basePrice(BASE_PRICE)
                 .bufferMinutesAfter(10)

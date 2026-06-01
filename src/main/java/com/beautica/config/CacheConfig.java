@@ -18,6 +18,9 @@ public class CacheConfig {
      *
      * Cache inventory:
      *   service-categories  — catalog categories, rarely change — 60 min TTL, max 200 entries
+     *   approved-categories — APPROVED+active platform categories for the mobile picker
+     *                         (GET /service-categories/approved); single global 'all' key —
+     *                         60 min TTL, max 4 entries; evicted on approve/reject
      *   service-types       — service types per category — 60 min TTL, max 500 entries
      *   service-type-by-id  — single service type by ID — 60 min TTL, max 500 entries
      *   ownerSalons         — salon list per owner, high-frequency read — 5 min TTL, max 1000 entries
@@ -55,6 +58,16 @@ public class CacheConfig {
         manager.registerCustomCache("service-categories",
                 Caffeine.newBuilder()
                         .maximumSize(200)
+                        .expireAfterWrite(60, TimeUnit.MINUTES)
+                        .build());
+        // Global APPROVED+active category list for the authenticated mobile picker.
+        // A single 'all' key (the list is platform-wide, not per-user), so a tiny
+        // maximumSize. Evicted by CategoryRequestService.approve/reject, which change
+        // APPROVED/active membership; submitRequest only inserts PENDING rows (not in
+        // this list) so it needs no eviction.
+        manager.registerCustomCache("approved-categories",
+                Caffeine.newBuilder()
+                        .maximumSize(4)
                         .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
         manager.registerCustomCache("service-types",

@@ -173,7 +173,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
 
         // ── Step 5: create a service definition ───────────────────────────────
         var createSvcReq = new CreateServiceDefinitionRequest(
-                "E2E Hair Treatment", null, null, 60, new BigDecimal("450.00"), 0, null);
+                "E2E Hair Treatment", null, "HAIRCUT", 60, new BigDecimal("450.00"), 0, null);
         ResponseEntity<String> svcResp = restTemplate.exchange(
                 SALONS_URL + "/" + salonId + "/services", HttpMethod.POST,
                 new HttpEntity<>(createSvcReq, bearerHeaders(ownerToken)),

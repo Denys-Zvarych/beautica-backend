@@ -49,8 +49,6 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
-import com.beautica.service.entity.ServiceCategory;
-
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;

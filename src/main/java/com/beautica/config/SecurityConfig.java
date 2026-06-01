@@ -34,6 +34,7 @@ public class SecurityConfig {
 
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
+    private final InternalApiKeyFilter internalApiKeyFilter;
     private final Environment environment;
 
     @Value("${app.frontend.base-url}")
@@ -41,9 +42,11 @@ public class SecurityConfig {
 
     public SecurityConfig(JwtAuthenticationFilter jwtAuthenticationFilter,
                           AuthRateLimitFilter authRateLimitFilter,
+                          InternalApiKeyFilter internalApiKeyFilter,
                           Environment environment) {
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
         this.authRateLimitFilter = authRateLimitFilter;
+        this.internalApiKeyFilter = internalApiKeyFilter;
         this.environment = environment;
     }
 
@@ -86,6 +89,16 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
+                    // Self-service category approval pages — token-authenticated
+                    // (the unguessable single-use token IS the credential), so the
+                    // routes are permitAll at the Spring Security layer. The GET
+                    // review page performs NO state change; only the POST
+                    // approve/reject mutate. POST /requests (provider role-gated)
+                    // and GET /approved (any authenticated user) are NOT listed
+                    // here and fall through to anyRequest().authenticated().
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review").permitAll();
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/approve").permitAll();
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/reject").permitAll();
                     // Phase 10.4 KATOTTH locality reference reads — DELIBERATE
                     // public allow-list (not incidental). These three GETs
                     // expose only non-sensitive reference data (oblast/city/
@@ -115,10 +128,15 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/search/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
+                    // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),
+                    // not by JWT. Spring Security must not reject these as unauthenticated; the filter handles
+                    // all access control. See InternalApiKeyFilter for the key-comparison logic.
+                    auth.requestMatchers("/api/v1/internal/**").permitAll();
                     auth.anyRequest().authenticated();
                 })
                 .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
-                .addFilterBefore(authRateLimitFilter, JwtAuthenticationFilter.class);
+                .addFilterBefore(authRateLimitFilter, JwtAuthenticationFilter.class)
+                .addFilterBefore(internalApiKeyFilter, UsernamePasswordAuthenticationFilter.class);
 
         return authorizeConfig.build();
     }

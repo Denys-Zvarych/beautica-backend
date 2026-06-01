@@ -10,7 +10,9 @@ import org.springframework.context.annotation.Configuration;
         OutboxCipherProperties.class,
         OtpPepperConfig.class,
         VerificationPolicyConfig.class,
-        PasswordResetPolicyConfig.class
+        PasswordResetPolicyConfig.class,
+        InternalApiKeyProperties.class,
+        PublicBaseUrlProperties.class
 })
 public class AppConfigProperties {
 }

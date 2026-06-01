@@ -1,6 +1,5 @@
 package com.beautica.service.dto;
 
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 
 import java.math.BigDecimal;
@@ -10,7 +9,7 @@ public record ServiceDefinitionResponse(
         UUID id,
         String name,
         String description,
-        ServiceCategory category,
+        String category,
         int baseDurationMinutes,
         BigDecimal basePrice,
         int bufferMinutesAfter,

@@ -21,6 +21,7 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
@@ -48,6 +49,7 @@ public class ServiceCatalogService {
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
     private final CatalogCategoryLookup catalogCategoryLookup;
+    private final PlatformCategoryRepository platformCategoryRepository;
     private final EmailService emailService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
@@ -64,6 +66,8 @@ public class ServiceCatalogService {
         if (!salonRepository.existsById(salonId)) {
             throw new NotFoundException("Salon not found");
         }
+
+        validateCategoryActive(request.category());
 
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.SALON)
@@ -142,6 +146,8 @@ public class ServiceCatalogService {
         if (master.getMasterType() != MasterType.INDEPENDENT_MASTER) {
             throw new ForbiddenException("Only independent masters can add their own services");
         }
+
+        validateCategoryActive(request.category());
 
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
@@ -295,6 +301,7 @@ public class ServiceCatalogService {
             definition.setDescription(request.description());
         }
         if (request.category() != null) {
+            validateCategoryActive(request.category());
             definition.setCategory(request.category());
         }
         if (request.baseDurationMinutes() != null) {
@@ -429,6 +436,27 @@ public class ServiceCatalogService {
         } else {
             var cache = cacheManager.getCache("masterServices");
             if (cache != null) masterIds.forEach(cache::evict);
+        }
+    }
+
+    /**
+     * Validates that the given category name exists in {@code platform_categories}
+     * with {@code active = true}.
+     *
+     * <p>The check is intentionally a plain {@code SELECT EXISTS} via the repository —
+     * no JOIN FETCH needed as we only validate presence. The result is not cached here
+     * because the write path is infrequent and caching an existence check would require
+     * a corresponding eviction on every {@code platform_categories} mutation.
+     *
+     * @throws BusinessException (400) if the category is unknown or inactive
+     */
+    private void validateCategoryActive(String category) {
+        if (category == null) return;
+        // A category is selectable only when it is APPROVED *and* active. PENDING
+        // self-service requests and REJECTED rows must never pass this gate.
+        if (!platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                category, com.beautica.service.entity.PlatformCategoryStatus.APPROVED)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
         }
     }
 

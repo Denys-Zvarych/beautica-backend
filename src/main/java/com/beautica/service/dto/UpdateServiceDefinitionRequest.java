@@ -1,6 +1,5 @@
 package com.beautica.service.dto;
 
-import com.beautica.service.entity.ServiceCategory;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
@@ -40,9 +39,16 @@ public record UpdateServiceDefinitionRequest(
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
         String description,
 
-        // ServiceCategory is an enum; Jackson deserialises it; GlobalExceptionHandler
-        // translates HttpMessageNotReadableException to a generic 400 (anti-bug §A).
-        ServiceCategory category,
+        /**
+         * Category name (PATCH — optional). When non-null, the service layer validates
+         * that this name exists in {@code platform_categories} with {@code active = true}.
+         * Format mirrors the create-request constraint: uppercase letters, digits,
+         * underscores, starting with an uppercase letter.
+         */
+        @Size(max = 100, message = "Category must be at most 100 characters")
+        @Pattern(regexp = "^[A-Z][A-Z0-9_]*$",
+                 message = "Category must contain only uppercase letters, digits, or underscores, and start with a letter")
+        String category,
 
         @Min(value = 1, message = "Duration must be at least 1 minute")
         @Max(value = 480, message = "Duration must be at most 480 minutes")

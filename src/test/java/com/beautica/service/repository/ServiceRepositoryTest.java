@@ -4,7 +4,6 @@ import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.OwnerType;
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,7 +59,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Gel Manicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("550.00"))
                 .isActive(true)
@@ -71,7 +70,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Classic Pedicure")
-                .category(ServiceCategory.PEDICURE)
+                .category("PEDICURE")
                 .baseDurationMinutes(75)
                 .basePrice(new BigDecimal("400.00"))
                 .isActive(false)
@@ -94,7 +93,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Eyebrow Shaping")
-                .category(ServiceCategory.BROWS)
+                .category("BROWS")
                 .baseDurationMinutes(30)
                 .basePrice(new BigDecimal("200.00"))
                 .isActive(true)
@@ -116,7 +115,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonOwnerId)
                 .name("Gel Manicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("550.00"))
                 .isActive(true)
@@ -127,7 +126,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(salonOwnerId)
                 .name("Eyelash Extensions")
-                .category(ServiceCategory.EYELASH)
+                .category("EYELASH")
                 .baseDurationMinutes(120)
                 .basePrice(new BigDecimal("900.00"))
                 .isActive(true)

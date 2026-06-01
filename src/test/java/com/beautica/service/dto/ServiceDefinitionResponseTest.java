@@ -1,7 +1,6 @@
 package com.beautica.service.dto;
 
 import com.beautica.service.entity.OwnerType;
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import org.junit.jupiter.api.DisplayName;
@@ -27,7 +26,7 @@ class ServiceDefinitionResponseTest {
                 .ownerId(UUID.randomUUID())
                 .name("Test")
                 .description("Desc")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("50.00"))
                 .bufferMinutesAfter(10)
@@ -39,7 +38,7 @@ class ServiceDefinitionResponseTest {
         assertThat(response.id()).isEqualTo(id);
         assertThat(response.name()).isEqualTo("Test");
         assertThat(response.description()).isEqualTo("Desc");
-        assertThat(response.category()).isEqualTo(ServiceCategory.MANICURE);
+        assertThat(response.category()).isEqualTo("MANICURE");
         assertThat(response.baseDurationMinutes()).isEqualTo(60);
         assertThat(response.basePrice()).isEqualByComparingTo(new BigDecimal("50.00"));
         assertThat(response.bufferMinutesAfter()).isEqualTo(10);

@@ -88,7 +88,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         var createRequest = new CreateServiceDefinitionRequest(
                 "Shellac Manicure",
                 "Long-lasting shellac",
-                null,
+                "MANICURE",
                 75,
                 new BigDecimal("600.00"),
                 10,
@@ -149,7 +149,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         UUID masterId = fixtures.createSalonMaster(salonId);
 
         var createRequest = new CreateServiceDefinitionRequest(
-                "Pedicure", null, null, 90, new BigDecimal("450.00"), 15, null);
+                "Pedicure", null, "PEDICURE", 90, new BigDecimal("450.00"), 15, null);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, createRequest);
 
         var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);

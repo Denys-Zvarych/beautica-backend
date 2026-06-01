@@ -4,6 +4,7 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.PasswordResetService;
 import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
 import jakarta.servlet.FilterChain;
@@ -74,7 +75,7 @@ public class WebMvcTestSupport {
     @SuppressWarnings("unchecked")
     public AuthRateLimitFilter authRateLimitFilter() {
         LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
-        return new AuthRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
+        return new AuthRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
             @Override
             protected void doFilterInternal(HttpServletRequest req,
                                             HttpServletResponse res,
@@ -100,5 +101,46 @@ public class WebMvcTestSupport {
     @Primary
     public PasswordResetService passwordResetService() {
         return Mockito.mock(PasswordResetService.class);
+    }
+
+    /**
+     * {@code InternalApiKeyProperties} is a {@code @ConfigurationProperties} bean
+     * that {@code @WebMvcTest} does not auto-bind, yet the auto-detected
+     * {@link InternalApiKeyFilter} {@code @Component} requires it. Provide a fixed
+     * test value so every slice that imports this support config loads without
+     * standing up the full {@code app.internal-api-key} property binding.
+     */
+    @Bean
+    @Primary
+    public InternalApiKeyProperties internalApiKeyProperties() {
+        InternalApiKeyProperties props = new InternalApiKeyProperties();
+        props.setInternalApiKey("test-internal-api-key");
+        return props;
+    }
+
+    /**
+     * Pass-through {@link InternalApiKeyFilter}: internal-key enforcement is not
+     * under test in the general controller slices, but the bean must exist because
+     * Spring auto-detects the {@code @Component} filter. {@link #shouldNotFilter}
+     * short-circuits it entirely.
+     */
+    @Bean
+    @Primary
+    public InternalApiKeyFilter internalApiKeyFilter(InternalApiKeyProperties props,
+                                                     ObjectMapper objectMapper) {
+        return new InternalApiKeyFilter(props, objectMapper) {
+            @Override
+            protected void doFilterInternal(HttpServletRequest req,
+                                            HttpServletResponse res,
+                                            FilterChain chain)
+                    throws ServletException, IOException {
+                chain.doFilter(req, res);
+            }
+
+            @Override
+            public boolean shouldNotFilter(HttpServletRequest request) {
+                return true;
+            }
+        };
     }
 }

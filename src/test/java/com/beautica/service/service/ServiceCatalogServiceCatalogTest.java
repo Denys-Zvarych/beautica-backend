@@ -9,6 +9,7 @@ import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -44,6 +45,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private SalonRepository salonRepository;
     @Mock private MasterRepository masterRepository;
     @Mock private CatalogCategoryLookup catalogCategoryLookup;
+    @Mock private PlatformCategoryRepository platformCategoryRepository;
     @Mock private EmailService emailService;
     @Mock private ServiceTypeLookup serviceTypeLookup;
     @Mock private ServiceTypeSearchService serviceTypeSearchService;
@@ -59,6 +61,7 @@ class ServiceCatalogServiceCatalogTest {
                 salonRepository,
                 masterRepository,
                 catalogCategoryLookup,
+                platformCategoryRepository,
                 emailService,
                 serviceTypeLookup,
                 serviceTypeSearchService,
