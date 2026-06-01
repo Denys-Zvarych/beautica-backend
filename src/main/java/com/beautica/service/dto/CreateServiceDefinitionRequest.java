@@ -1,5 +1,8 @@
 package com.beautica.service.dto;
 
+import com.beautica.service.entity.PriceType;
+import com.beautica.service.validation.PricedRequest;
+import com.beautica.service.validation.ServicePriceValid;
 import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
@@ -18,6 +21,16 @@ import java.util.UUID;
 /**
  * Request DTO for creating a new {@link com.beautica.service.entity.ServiceDefinition}.
  *
+ * <h2>Pricing fields</h2>
+ * Exactly one pricing mode must be supplied:
+ * <ul>
+ *   <li><b>FIXED</b>: set {@code priceType = FIXED} and {@code price}. Leave {@code priceMin}
+ *       and {@code priceMax} null.</li>
+ *   <li><b>RANGE</b>: set {@code priceType = RANGE}, {@code priceMin}, and {@code priceMax}.
+ *       Leave {@code price} null. {@code priceMax} must be strictly greater than
+ *       {@code priceMin}.</li>
+ * </ul>
+ *
  * <h2>Category validation</h2>
  * The {@code category} field is a {@code String} (not the {@link com.beautica.service.entity.ServiceCategory}
  * enum) so that dynamically-added platform categories created via
@@ -26,6 +39,7 @@ import java.util.UUID;
  * ({@code ^[A-Z][A-Z0-9_]*$}). A second validation pass at the service layer
  * checks that the name exists in {@code platform_categories} with {@code active = true}.
  */
+@ServicePriceValid
 public record CreateServiceDefinitionRequest(
         @NotBlank
         @Size(max = 100)
@@ -49,13 +63,40 @@ public record CreateServiceDefinitionRequest(
 
         @NotNull @Positive @Max(480) int baseDurationMinutes,
 
-        @NotNull(message = "Base price is required")
-        @DecimalMin("0.00") @DecimalMax("99999999.99")
-        @Digits(integer = 8, fraction = 2)
-        BigDecimal basePrice,
-
         @Min(0) @Max(120) int bufferMinutesAfter,
 
+        /** Pricing mode — required. Must be consistent with the price fields below. */
+        @NotNull
+        PriceType priceType,
+
+        /**
+         * FIXED-mode amount. Required when {@code priceType = FIXED}; must be null for RANGE.
+         * Validated by {@link com.beautica.service.validation.ServicePriceValidator}.
+         */
+        @DecimalMin(value = "0.01", inclusive = true)
+        @DecimalMax(value = "99999999.99")
+        @Digits(integer = 8, fraction = 2)
+        BigDecimal price,
+
+        /**
+         * RANGE floor. Required when {@code priceType = RANGE}; must be null for FIXED.
+         * Validated by {@link com.beautica.service.validation.ServicePriceValidator}.
+         */
+        @DecimalMin(value = "0.01", inclusive = true)
+        @DecimalMax(value = "99999999.99")
+        @Digits(integer = 8, fraction = 2)
+        BigDecimal priceMin,
+
+        /**
+         * RANGE ceiling. Required when {@code priceType = RANGE}; must be null for FIXED.
+         * Must be strictly greater than {@code priceMin}.
+         * Validated by {@link com.beautica.service.validation.ServicePriceValidator}.
+         */
+        @DecimalMin(value = "0.01", inclusive = true)
+        @DecimalMax(value = "99999999.99")
+        @Digits(integer = 8, fraction = 2)
+        BigDecimal priceMax,
+
         @Nullable UUID serviceTypeId
-) {
+) implements PricedRequest {
 }

@@ -1,36 +1,61 @@
 package com.beautica.service.dto;
 
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.util.PriceDisplayFormatter;
 
 import java.math.BigDecimal;
 import java.util.UUID;
 
+/**
+ * Response DTO for a {@link ServiceDefinition}.
+ *
+ * <h2>Pricing fields</h2>
+ * <ul>
+ *   <li>{@code priceType} — the pricing mode ({@code FIXED} or {@code RANGE}).</li>
+ *   <li>{@code priceMin} — the canonical floor ({@code base_price}) for both modes.</li>
+ *   <li>{@code priceMax} — the ceiling for RANGE; {@code null} for FIXED.</li>
+ *   <li>{@code priceDisplay} — pre-formatted display string, e.g. {@code "500 грн"} or
+ *       {@code "від 500 до 800 грн"}. {@code null} when {@code priceMin} is {@code null}.</li>
+ * </ul>
+ */
 public record ServiceDefinitionResponse(
         UUID id,
         String name,
         String description,
         String category,
         int baseDurationMinutes,
-        BigDecimal basePrice,
         int bufferMinutesAfter,
         boolean isActive,
         UUID serviceTypeId,
         String serviceTypeNameUk,
-        String photoUrl
+        String photoUrl,
+        PriceType priceType,
+        BigDecimal priceMin,
+        BigDecimal priceMax,
+        String priceDisplay
 ) {
     public static ServiceDefinitionResponse from(ServiceDefinition sd) {
+        String priceDisplay = null;
+        if (sd.getPriceType() != null && sd.getBasePrice() != null) {
+            priceDisplay = PriceDisplayFormatter.format(sd.getPriceType(), sd.getBasePrice(), sd.getPriceMax());
+        }
+
         return new ServiceDefinitionResponse(
                 sd.getId(),
                 sd.getName(),
                 sd.getDescription(),
                 sd.getCategory(),
                 sd.getBaseDurationMinutes(),
-                sd.getBasePrice(),
                 sd.getBufferMinutesAfter(),
                 sd.isActive(),
                 sd.getServiceType() != null ? sd.getServiceType().getId() : null,
                 sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null,
-                sd.getPhotoUrl()
+                sd.getPhotoUrl(),
+                sd.getPriceType(),
+                sd.getBasePrice(),
+                sd.getPriceMax(),
+                priceDisplay
         );
     }
 }

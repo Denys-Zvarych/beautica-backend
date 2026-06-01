@@ -8,6 +8,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.ServiceCatalogService;
@@ -121,12 +122,15 @@ class ServiceControllerTest {
     }
 
     private ServiceDefinitionResponse stubServiceDefResponse(UUID id, String name) {
-        return new ServiceDefinitionResponse(id, name, null, null, 60, new BigDecimal("350.00"), 10, true, null, null, null);
+        return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
     }
 
     private MasterServiceResponse stubMasterServiceResponse(UUID id, UUID masterId, String name) {
-        return new MasterServiceResponse(id, masterId, stubServiceDefResponse(UUID.randomUUID(), name),
-                null, null, new BigDecimal("350.00"), 60, true);
+        var sdResponse = stubServiceDefResponse(UUID.randomUUID(), name);
+        return new MasterServiceResponse(id, masterId, sdResponse,
+                null, null, new BigDecimal("350.00"), 60, true,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
     }
 
     // ── POST /api/v1/salons/{salonId}/services ─────────────────────────────────
@@ -138,7 +142,8 @@ class ServiceControllerTest {
         var salonId = UUID.randomUUID();
         var serviceId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Classic Manicure", "Basic nail care", "MANICURE", 60, new BigDecimal("350.00"), 10, null);
+                "Classic Manicure", "Basic nail care", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
         var stub = stubServiceDefResponse(serviceId, "Classic Manicure");
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
@@ -170,7 +175,7 @@ class ServiceControllerTest {
                         .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Hair Cut\",\"category\":\"MANICURE\",\"baseDurationMinutes\":30,\"basePrice\":\"50.00\",\"bufferMinutesAfter\":0}"))
+                        .content("{\"name\":\"Hair Cut\",\"category\":\"MANICURE\",\"baseDurationMinutes\":30,\"priceType\":\"FIXED\",\"price\":50.00,\"bufferMinutesAfter\":0}"))
                 .andExpect(status().isForbidden());
     }
 
@@ -183,7 +188,8 @@ class ServiceControllerTest {
         when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(false);
 
         var request = new CreateServiceDefinitionRequest(
-                "Hijack Service", null, "MANICURE", 30, new BigDecimal("100.00"), 0, null);
+                "Hijack Service", null, "MANICURE", 30, 0,
+                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
 
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — cross-owner must be denied", salonAId);
         mockMvc.perform(post("/api/v1/salons/" + salonAId + "/services")
@@ -316,7 +322,8 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Lash Extensions", "Volume set", "MANICURE", 120, new BigDecimal("900.00"), 15, null);
+                "Lash Extensions", "Volume set", "MANICURE", 120, 15,
+                PriceType.FIXED, new BigDecimal("900.00"), null, null, null);
         var stub = stubMasterServiceResponse(UUID.randomUUID(), masterId, "Lash Extensions");
 
         when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
@@ -338,7 +345,8 @@ class ServiceControllerTest {
     void should_return403_when_clientAddsIndependentMasterService() throws Exception {
         var userId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Sneaky Service", null, "MANICURE", 30, new BigDecimal("100.00"), 0, null);
+                "Sneaky Service", null, "MANICURE", 30, 0,
+                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
 
         log.debug("Act: POST /api/v1/independent-masters/me/services as CLIENT — must be denied");
         mockMvc.perform(post("/api/v1/independent-masters/me/services")
@@ -404,15 +412,15 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("POST /salons/{id}/services — 400 when basePrice exceeds DecimalMax(99999999.99)")
+    @DisplayName("POST /salons/{id}/services — 400 when price exceeds DecimalMax(99999999.99)")
     void should_return400_when_basePriceExceedsDecimalMax() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
 
-        String invalidBody = "{\"name\":\"Expensive Service\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"basePrice\":100000000.00}";
+        String invalidBody = "{\"name\":\"Expensive Service\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"priceType\":\"FIXED\",\"price\":100000000.00}";
 
-        log.debug("Act: POST /api/v1/salons/{}/services with basePrice=100000000.00 — must return 400", salonId);
+        log.debug("Act: POST /api/v1/salons/{}/services with price=100000000.00 — must return 400", salonId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
@@ -422,21 +430,104 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("POST /salons/{id}/services — 400 when basePrice has 3 decimal places (violates @Digits(fraction=2))")
+    @DisplayName("POST /salons/{id}/services — 400 when price has 3 decimal places (violates @Digits(fraction=2))")
     void should_return400_when_basePriceHasThreeDecimalPlaces() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
 
-        String invalidBody = "{\"name\":\"Fraction Service\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"basePrice\":123.456}";
+        String invalidBody = "{\"name\":\"Fraction Service\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"priceType\":\"FIXED\",\"price\":123.456}";
 
-        log.debug("Act: POST /api/v1/salons/{}/services with basePrice=123.456 — must return 400", salonId);
+        log.debug("Act: POST /api/v1/salons/{}/services with price=123.456 — must return 400", salonId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(invalidBody))
                 .andExpect(status().isBadRequest());
+    }
+
+    // ── MEDIUM-2: RANGE pricing HTTP contract ─────────────────────────────────
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 201 when owner creates a RANGE service and response carries RANGE fields")
+    void should_return201AndRangeResponse_when_ownerCreatesRangeService() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+
+        // Stub: service layer returns a RANGE ServiceDefinitionResponse
+        var rangeStub = new ServiceDefinitionResponse(
+                serviceId, "Range Manicure", null, "MANICURE", 60, 0, true,
+                null, null, null,
+                PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"),
+                "від 500 до 800 грн");
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
+                .thenReturn(rangeStub);
+
+        // RANGE request: priceType=RANGE, priceMin=500, priceMax=800; no price field
+        String body = "{\"name\":\"Range Manicure\",\"category\":\"MANICURE\","
+                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
+                + "\"priceType\":\"RANGE\",\"priceMin\":500.00,\"priceMax\":800.00}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with RANGE pricing — must return 201 with RANGE fields", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.priceType").value("RANGE"))
+                .andExpect(jsonPath("$.data.priceDisplay").value("від 500 до 800 грн"));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when RANGE priceMax is less than priceMin")
+    void should_return400_when_rangeMaxLessThanMin() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        // priceMax (500) < priceMin (800) — ServicePriceValidator must reject this
+        String invalidBody = "{\"name\":\"Bad Range\",\"category\":\"MANICURE\","
+                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
+                + "\"priceType\":\"RANGE\",\"priceMin\":800.00,\"priceMax\":500.00}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with priceMax < priceMin — must return 400", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalidBody))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when RANGE request also contains fixed price field")
+    void should_return400_when_rangeWithPriceAlsoSet() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        // RANGE + price set simultaneously — ServicePriceValidator must reject spurious price field
+        String invalidBody = "{\"name\":\"Ambiguous Service\",\"category\":\"MANICURE\","
+                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
+                + "\"priceType\":\"RANGE\",\"priceMin\":500.00,\"priceMax\":800.00,\"price\":350.00}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with RANGE + price both set — must return 400", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalidBody))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
     }
 
     @Test
@@ -571,7 +662,7 @@ class ServiceControllerTest {
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         // NUL byte in name — @Pattern(^[^\p{Cntrl}]*$) must reject before the service is reached
         var body = "{\"name\":\"Manicure\\u0000\""
-                + ",\"baseDurationMinutes\":60,\"basePrice\":\"350.00\",\"bufferMinutesAfter\":0}";
+                + ",\"baseDurationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"bufferMinutesAfter\":0}";
 
         log.debug("Act: POST /api/v1/salons/{}/services with name containing NUL byte — must return 400", salonId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
@@ -595,7 +686,7 @@ class ServiceControllerTest {
         // Tab character in description — @Pattern(^[^\p{Cntrl}]*$) must reject
         var body = "{\"name\":\"Manicure\""
                 + ",\"description\":\"Good desc\\tbad\""
-                + ",\"baseDurationMinutes\":60,\"basePrice\":\"350.00\",\"bufferMinutesAfter\":0}";
+                + ",\"baseDurationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"bufferMinutesAfter\":0}";
 
         log.debug("Act: POST /api/v1/salons/{}/services with description containing tab — must return 400", salonId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
@@ -618,7 +709,7 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         var request = new UpdateServiceDefinitionRequest(
-                "Updated Manicure", null, null, null, new BigDecimal("400.00"), null);
+                "Updated Manicure", null, null, null, null, PriceType.FIXED, new BigDecimal("400.00"), null, null);
         var stub = stubServiceDefResponse(serviceDefId, "Updated Manicure");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
@@ -643,7 +734,7 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         // Only baseDurationMinutes is set — all other fields null (PATCH semantics)
-        var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null);
+        var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null, null, null, null);
         var stub = stubServiceDefResponse(serviceDefId, "Manicure");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
@@ -727,19 +818,19 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("PATCH /services/{id} — 400 when basePrice has 3 decimal places")
+    @DisplayName("PATCH /services/{id} — 400 when price has 3 decimal places")
     void should_return400_when_patchPriceHasThreeDecimalPlaces() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
 
-        log.debug("Act: PATCH /api/v1/services/{} with basePrice=123.456 — must return 400", serviceDefId);
+        log.debug("Act: PATCH /api/v1/services/{} with price=123.456 — must return 400", serviceDefId);
         mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"basePrice\":123.456}"))
+                        .content("{\"priceType\":\"FIXED\",\"price\":123.456}"))
                 .andExpect(status().isBadRequest());
     }
 
@@ -752,8 +843,8 @@ class ServiceControllerTest {
         var serviceDefId = UUID.randomUUID();
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
         var stub = new ServiceDefinitionResponse(
-                serviceDefId, "Manicure", null, null, 60, new BigDecimal("350.00"),
-                10, true, null, null, photoUrl);
+                serviceDefId, "Manicure", null, null, 60, 10, true, null, null, photoUrl,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
         when(serviceCatalogService.updateServicePhoto(eq(serviceDefId), eq(photoUrl)))

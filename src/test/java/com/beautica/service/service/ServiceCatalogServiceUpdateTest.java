@@ -8,6 +8,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
@@ -92,7 +93,9 @@ class ServiceCatalogServiceUpdateTest {
                 .description("Original desc")
                 .category("MANICURE")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("350.00"))
+                .priceMax(null)
                 .bufferMinutesAfter(10)
                 .isActive(true)
                 .build();
@@ -116,14 +119,15 @@ class ServiceCatalogServiceUpdateTest {
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
+        // PATCH: switch to FIXED 400.00 (name + price block together)
         var request = new UpdateServiceDefinitionRequest(
-                "New Manicure", null, null, null, new BigDecimal("400.00"), null);
+                "New Manicure", null, null, null, null, PriceType.FIXED, new BigDecimal("400.00"), null, null);
 
         ServiceDefinitionResponse result = serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
         assertThat(result).isNotNull();
         assertThat(result.name()).isEqualTo("New Manicure");
-        assertThat(result.basePrice()).isEqualByComparingTo("400.00");
+        assertThat(result.priceMin()).isEqualByComparingTo("400.00");
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(captor.capture());
@@ -146,8 +150,8 @@ class ServiceCatalogServiceUpdateTest {
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
-        // Only baseDurationMinutes is non-null — all other fields must remain unchanged
-        var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null);
+        // Only baseDurationMinutes is non-null — all other fields must remain unchanged (price block absent)
+        var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null, null, null, null);
 
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
@@ -187,7 +191,7 @@ class ServiceCatalogServiceUpdateTest {
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
-        var request = new UpdateServiceDefinitionRequest(null, null, "HAIRCUT", null, null, null);
+        var request = new UpdateServiceDefinitionRequest(null, null, "HAIRCUT", null, null, null, null, null, null);
 
         ServiceDefinitionResponse result = serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
@@ -214,7 +218,7 @@ class ServiceCatalogServiceUpdateTest {
         var mockCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
         when(cacheManager.getCache("masterServices")).thenReturn(mockCache);
 
-        var request = new UpdateServiceDefinitionRequest("New Name", null, null, null, null, null);
+        var request = new UpdateServiceDefinitionRequest("New Name", null, null, null, null, null, null, null, null);
 
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
@@ -236,7 +240,7 @@ class ServiceCatalogServiceUpdateTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "NAIL_ART", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(false);
 
-        var request = new UpdateServiceDefinitionRequest(null, null, "NAIL_ART", null, null, null);
+        var request = new UpdateServiceDefinitionRequest(null, null, "NAIL_ART", null, null, null, null, null, null);
 
         assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
@@ -257,7 +261,7 @@ class ServiceCatalogServiceUpdateTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "RETIRED", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(false);
 
-        var request = new UpdateServiceDefinitionRequest(null, null, "RETIRED", null, null, null);
+        var request = new UpdateServiceDefinitionRequest(null, null, "RETIRED", null, null, null, null, null, null);
 
         assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
@@ -277,7 +281,7 @@ class ServiceCatalogServiceUpdateTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "DOES_NOT_EXIST", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(false);
 
-        var request = new UpdateServiceDefinitionRequest(null, null, "DOES_NOT_EXIST", null, null, null);
+        var request = new UpdateServiceDefinitionRequest(null, null, "DOES_NOT_EXIST", null, null, null, null, null, null);
 
         assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
@@ -296,7 +300,7 @@ class ServiceCatalogServiceUpdateTest {
 
         when(serviceRepository.findByIdWithServiceType(nonExistentId)).thenReturn(Optional.empty());
 
-        var request = new UpdateServiceDefinitionRequest("X", null, null, null, null, null);
+        var request = new UpdateServiceDefinitionRequest("X", null, null, null, null, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.updateServiceDefinition(nonExistentId, request))

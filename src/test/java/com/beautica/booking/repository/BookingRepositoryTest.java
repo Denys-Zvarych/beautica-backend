@@ -9,6 +9,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -77,6 +78,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .name("Manicure")
                 .category("MANICURE")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("450.00"))
                 .isActive(true)
                 .build();
@@ -389,6 +391,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .name("Pedicure")
                 .category("MANICURE")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("350.00"))
                 .isActive(true)
                 .build();
@@ -485,6 +488,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .name("Eyebrows")
                 .category("MANICURE")
                 .baseDurationMinutes(45)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
                 .isActive(true)
                 .build();
@@ -568,6 +572,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .name("Happy Manicure")
                 .category("MANICURE")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("500.00"))
                 .isActive(true)
                 .build();
@@ -660,6 +665,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .name("Status Pedicure")
                 .category("MANICURE")
                 .baseDurationMinutes(45)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("400.00"))
                 .isActive(true)
                 .build();

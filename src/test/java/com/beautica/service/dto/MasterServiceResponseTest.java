@@ -3,6 +3,7 @@ package com.beautica.service.dto;
 import com.beautica.master.entity.Master;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -74,7 +75,9 @@ class MasterServiceResponseTest {
                 .description("Classic manicure service")
                 .category("MANICURE")
                 .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
                 .basePrice(BASE_PRICE)
+                .priceMax(null)
                 .bufferMinutesAfter(10)
                 .isActive(true)
                 .build();
@@ -111,7 +114,9 @@ class MasterServiceResponseTest {
                 .ownerId(UUID.randomUUID())
                 .name("Manicure Classic")
                 .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
                 .basePrice(null)
+                .priceMax(null)
                 .isActive(true)
                 .build();
 
@@ -132,6 +137,55 @@ class MasterServiceResponseTest {
         assertThat(response.effectivePrice()).isNull();
     }
 
+    // ── HIGH-2: RANGE pricing fields surfaced through MasterServiceResponse ──────
+
+    @Test
+    @DisplayName("RANGE priceType, priceMin, priceMax and priceDisplay are surfaced when MSA has a RANGE ServiceDefinition")
+    void should_surfaceRangePriceFields_when_msaHasRangeServiceDefinition() {
+        var rangeServiceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Range Manicure")
+                .description("Flexible pricing manicure")
+                .category("MANICURE")
+                .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.RANGE)
+                .basePrice(new BigDecimal("600.00"))
+                .priceMax(new BigDecimal("1200.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        var master = Master.builder()
+                .id(UUID.randomUUID())
+                .build();
+
+        var msa = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(rangeServiceDefinition)
+                .priceOverride(null)
+                .durationOverrideMinutes(null)
+                .isActive(true)
+                .build();
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.priceType())
+                .as("priceType must be RANGE for a RANGE service definition")
+                .isEqualTo(PriceType.RANGE);
+        assertThat(response.priceMin())
+                .as("priceMin must equal base_price (600) — the RANGE floor")
+                .isEqualByComparingTo(new BigDecimal("600.00"));
+        assertThat(response.priceMax())
+                .as("priceMax must equal price_max (1200) — the RANGE ceiling")
+                .isEqualByComparingTo(new BigDecimal("1200.00"));
+        assertThat(response.priceDisplay())
+                .as("priceDisplay must use PriceDisplayFormatter RANGE format — whole hryvnia, no .00")
+                .isEqualTo("від 600 до 1200 грн");
+    }
+
     // --- helpers ---
 
     private MasterServiceAssignment buildAssignment(BigDecimal priceOverride, Integer durationOverride) {
@@ -143,7 +197,9 @@ class MasterServiceResponseTest {
                 .description("Classic manicure service")
                 .category("MANICURE")
                 .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
                 .basePrice(BASE_PRICE)
+                .priceMax(null)
                 .bufferMinutesAfter(10)
                 .isActive(true)
                 .build();

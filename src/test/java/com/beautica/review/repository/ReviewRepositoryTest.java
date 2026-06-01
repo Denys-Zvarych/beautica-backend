@@ -11,6 +11,7 @@ import com.beautica.review.entity.Review;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -85,6 +86,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
                 .name("Manicure")
                 .category("MANICURE")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("450.00"))
                 .isActive(true)
                 .build();
@@ -189,6 +191,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
                 .name("Pedicure")
                 .category("MANICURE")
                 .baseDurationMinutes(45)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
                 .isActive(true)
                 .build();

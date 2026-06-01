@@ -6,8 +6,9 @@ import com.beautica.notification.EmailService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.CatalogCategory;
-import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
+import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -125,6 +126,8 @@ class ServiceCatalogServiceCacheTest {
                 .ownerId(salonId1)
                 .name("Manicure")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("350.00"))
                 .bufferMinutesAfter(10)
                 .isActive(true)
                 .build();
@@ -135,12 +138,15 @@ class ServiceCatalogServiceCacheTest {
                 .ownerId(salonId2)
                 .name("Manicure")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("350.00"))
                 .bufferMinutesAfter(10)
                 .isActive(true)
                 .build();
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, serviceTypeId);
+                "Manicure", "Classic manicure", null, 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
 
         when(serviceTypeRepository.findById(serviceTypeId)).thenReturn(Optional.of(serviceType));
         when(salonRepository.existsById(salonId1)).thenReturn(true);
