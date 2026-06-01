@@ -9,7 +9,6 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -76,7 +75,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Manicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("450.00"))
                 .isActive(true)
@@ -388,7 +387,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salon.getId())
                 .name("Pedicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("350.00"))
                 .isActive(true)
@@ -484,7 +483,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salon.getId())
                 .name("Eyebrows")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(45)
                 .basePrice(new BigDecimal("300.00"))
                 .isActive(true)
@@ -567,7 +566,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salon.getId())
                 .name("Happy Manicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("500.00"))
                 .isActive(true)
@@ -659,7 +658,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.SALON)
                 .ownerId(salon.getId())
                 .name("Status Pedicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(45)
                 .basePrice(new BigDecimal("400.00"))
                 .isActive(true)

@@ -9,6 +9,9 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.location.entity.City;
+import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
@@ -58,6 +61,7 @@ public class MasterService {
     private final ScheduleExceptionRepository scheduleExceptionRepository;
     private final BookingRepository bookingRepository;
     private final CacheManager cacheManager;
+    private final CityRepository cityRepository;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -178,6 +182,20 @@ public class MasterService {
                         }
                     });
                 }
+
+                // Evict the public master-detail cache so the re-enabled master's updated
+                // is_active state is reflected immediately on GET /api/v1/masters/{masterId}.
+                if (TransactionSynchronizationManager.isSynchronizationActive()) {
+                    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            Cache detail = cacheManager.getCache("master-detail");
+                            if (detail != null) {
+                                detail.evict(reactivatedMasterId);
+                            }
+                        }
+                    });
+                }
             }
             return m; // idempotent
         }
@@ -206,14 +224,36 @@ public class MasterService {
         return createMasterForOwner(user, salon);
     }
 
+    /**
+     * Returns the publicly-visible {@link MasterDetailResponse} for the given master.
+     *
+     * <p>Cached under {@code master-detail} with a 5-minute TTL so the
+     * {@code findByIdWithSalonAndOwner} JOIN FETCH and the follow-up
+     * {@code findByMasterIdAndIsActiveTrue} query do not fire on every unauthenticated
+     * {@code GET /api/v1/masters/{masterId}} request. {@code sync = true} prevents the
+     * thundering-herd on TTL expiry (Anti-Bug §F-7 / HIGH §F rule 7).
+     *
+     * <p>Eviction: explicit per-key eviction runs after commit in
+     * {@link #deactivateMaster}, {@link #deactivateOwnerMaster}, and the reactivation
+     * branch of {@link #createMasterForOwner}. Profile-text write paths (bio, phone,
+     * instagram, locality) do not evict {@code master-detail} because those callers
+     * ({@link com.beautica.user.UserService}) hold only the {@code userId}, not the
+     * {@code masterId} key. The 5-minute TTL bounds the staleness window for those
+     * writes — an acceptable trade-off for a public discovery view.
+     *
+     * <p>Do NOT remove the entity overload {@link #getMasterDetail(Master)} — it is
+     * used by internal callers that already hold a loaded entity.
+     */
     // Fix 6: use findByIdWithSalonAndOwner to eliminate 2-4 lazy SELECTs per request
+    @Cacheable(value = "master-detail", key = "#masterId", sync = true)
     @Transactional(readOnly = true)
     public MasterDetailResponse getMasterDetail(UUID masterId) {
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
-        return MasterDetailResponse.from(master, hours);
+        UUID oblastId = resolveOblastId(master.getUser().getCityId());
+        return MasterDetailResponse.from(master, hours, oblastId);
     }
 
     /**
@@ -228,7 +268,8 @@ public class MasterService {
     @Transactional(readOnly = true)
     public MasterDetailResponse getMasterDetail(Master master) {
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
-        return MasterDetailResponse.from(master, hours);
+        UUID oblastId = resolveOblastId(master.getUser().getCityId());
+        return MasterDetailResponse.from(master, hours, oblastId);
     }
 
     // Fix 3 + Fix 7: use shared authorizationService, batch-load all days, saveAll
@@ -342,6 +383,7 @@ public class MasterService {
         // callers using the cache. actorUserId is available directly without a JOIN FETCH because
         // findByUserIdWithSalon already filtered on it — no lazy-load risk.
         final UUID masterUserId = actorUserId;
+        final UUID deactivatedOwnerMasterId = master.getId();
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
@@ -349,6 +391,12 @@ public class MasterService {
                     Cache c = cacheManager.getCache("master-by-user");
                     if (c != null) {
                         c.evict(masterUserId);
+                    }
+                    // Evict the public master-detail cache so deactivated owners are no longer
+                    // served from cache on GET /api/v1/masters/{masterId}.
+                    Cache detail = cacheManager.getCache("master-detail");
+                    if (detail != null) {
+                        detail.evict(deactivatedOwnerMasterId);
                     }
                 }
             });
@@ -391,9 +439,37 @@ public class MasterService {
                     if (c != null) {
                         c.evict(masterUserId);
                     }
+                    // Evict the public master-detail cache so deactivated masters are no longer
+                    // served from cache on GET /api/v1/masters/{masterId}.
+                    Cache detail = cacheManager.getCache("master-detail");
+                    if (detail != null) {
+                        detail.evict(masterId);
+                    }
                 }
             });
         }
+    }
+
+    /**
+     * Resolves the {@code oblastId} for the given city in a single JOIN FETCH round-trip.
+     *
+     * <p>Uses {@link CityRepository#findByIdWithOblast} so the {@code LAZY} oblast
+     * association is initialised within the active transaction — no secondary SELECT
+     * and no LazyInitializationException (Anti-Bug §E).
+     *
+     * @param cityId raw city FK from {@code users.city_id}; {@code null} when the user
+     *               has no location set
+     * @return the PK of the parent {@link com.beautica.location.entity.Oblast},
+     *         or {@code null} when {@code cityId} is {@code null} or the city row is missing
+     */
+    private UUID resolveOblastId(UUID cityId) {
+        if (cityId == null) {
+            return null;
+        }
+        return cityRepository.findByIdWithOblast(cityId)
+                .map(City::getOblast)
+                .map(Oblast::getId)
+                .orElse(null);
     }
 
     // Eviction is registered as a post-commit callback rather than via @CacheEvict.
@@ -497,7 +573,9 @@ public class MasterService {
     public MasterDetailResponse getMyMasterDetail(UUID userId) {
         Master master = masterRepository.findActiveByUserIdWithUserAndSalon(userId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-        return getMasterDetail(master);
+        var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
+        UUID oblastId = resolveOblastId(master.getUser().getCityId());
+        return MasterDetailResponse.from(master, hours, oblastId);
     }
 
     @Cacheable(value = "master-by-user", key = "#userId", sync = true)

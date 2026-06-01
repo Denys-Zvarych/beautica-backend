@@ -136,6 +136,10 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
+  # Externally-reachable base URL of THIS backend. Used to build the admin
+  # category-approval link in the notification email. Distinct from
+  # app.frontend.base-url (the app origin) — the approval page is served here.
+  public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
   security:
     # Keyed HMAC-SHA256 pepper for the 6-digit verification OTP. Distinct from
     # JWT_SECRET. Generate: openssl rand -base64 32. Empty default forces every
@@ -177,3 +181,4 @@ app:
     # Generate with: openssl rand -base64 32
     # Empty default forces every profile (incl. test) to provide a value or fail fast at startup.
     payload-key: ${OUTBOX_PAYLOAD_KEY:}
+  internal-api-key: ${INTERNAL_API_KEY:changeme-dev-only}

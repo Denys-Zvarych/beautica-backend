@@ -7,7 +7,6 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.user.User;
@@ -64,7 +63,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Gel Manicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("450.00"))
                 .isActive(true)
@@ -81,7 +80,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Classic Manicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(45)
                 .basePrice(new BigDecimal("300.00"))
                 .isActive(true)
@@ -104,7 +103,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Pedicure")
-                .category(ServiceCategory.PEDICURE)
+                .category("PEDICURE")
                 .baseDurationMinutes(90)
                 .basePrice(new BigDecimal("500.00"))
                 .isActive(true)
@@ -128,6 +127,50 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
         assertThat(results).hasSize(2);
         assertThat(results).extracting(a -> a.getServiceDefinition().getId())
                 .containsExactlyInAnyOrder(serviceDefinition.getId(), secondService.getId());
+    }
+
+    @Test
+    @DisplayName("should_excludeService_when_serviceDefinitionIsSoftDeleted")
+    void should_excludeService_when_serviceDefinitionIsSoftDeleted() {
+        // Arrange — two active assignments; one definition is soft-deleted (isActive=false)
+        // while its assignment row stays active, reproducing the soft-delete bug.
+        ServiceDefinition deactivatedDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(master.getId())
+                .name("Classic Manicure")
+                .category("MANICURE")
+                .baseDurationMinutes(45)
+                .basePrice(new BigDecimal("300.00"))
+                .isActive(false)
+                .build();
+        em.persist(deactivatedDef);
+
+        MasterServiceAssignment activeAssignment = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignmentOnDeactivatedDef = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(deactivatedDef)
+                .isActive(true)
+                .build();
+
+        em.persist(activeAssignment);
+        em.persist(assignmentOnDeactivatedDef);
+        em.flush();
+        em.clear();
+
+        // Act
+        List<MasterServiceAssignment> results =
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
+
+        // Assert — only the active-definition row is returned; the soft-deleted one is hidden
+        assertThat(results).hasSize(1);
+        assertThat(results).extracting(a -> a.getServiceDefinition().getId())
+                .containsExactly(serviceDefinition.getId())
+                .doesNotContain(deactivatedDef.getId());
     }
 
     @Test

@@ -1,5 +1,6 @@
 package com.beautica.service.service;
 
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
@@ -7,9 +8,9 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.OwnerType;
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -65,6 +66,9 @@ class ServiceCatalogServiceUpdateTest {
     private CatalogCategoryLookup catalogCategoryLookup;
 
     @Mock
+    private PlatformCategoryRepository platformCategoryRepository;
+
+    @Mock
     private EmailService emailService;
 
     @Mock
@@ -86,7 +90,7 @@ class ServiceCatalogServiceUpdateTest {
                 .ownerId(ownerId)
                 .name("Original Name")
                 .description("Original desc")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("350.00"))
                 .bufferMinutesAfter(10)
@@ -161,35 +165,37 @@ class ServiceCatalogServiceUpdateTest {
         assertThat(submitted.getDescription())
                 .as("description must be unchanged").isEqualTo("Original desc");
         assertThat(submitted.getCategory())
-                .as("category must be unchanged").isEqualTo(ServiceCategory.MANICURE);
+                .as("category must be unchanged").isEqualTo("MANICURE");
         assertThat(submitted.getBufferMinutesAfter())
                 .as("buffer must be unchanged").isEqualTo(10);
     }
 
     @Test
-    @DisplayName("updates category when a new ServiceCategory is provided")
+    @DisplayName("updates category when a new active category string is provided")
     void should_updateCategory_when_categoryProvided() {
         UUID serviceDefId = UUID.randomUUID();
         UUID ownerId = UUID.randomUUID();
         ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
 
         ServiceDefinition saved = buildDefinition(serviceDefId, ownerId);
-        saved.setCategory(ServiceCategory.HAIRCUT);
+        saved.setCategory("HAIRCUT");
 
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "HAIRCUT", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
-        var request = new UpdateServiceDefinitionRequest(null, null, ServiceCategory.HAIRCUT, null, null, null);
+        var request = new UpdateServiceDefinitionRequest(null, null, "HAIRCUT", null, null, null);
 
         ServiceDefinitionResponse result = serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
-        assertThat(result.category()).isEqualTo(ServiceCategory.HAIRCUT);
+        assertThat(result.category()).isEqualTo("HAIRCUT");
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(captor.capture());
-        assertThat(captor.getValue().getCategory()).isEqualTo(ServiceCategory.HAIRCUT);
+        assertThat(captor.getValue().getCategory()).isEqualTo("HAIRCUT");
     }
 
     @Test
@@ -214,6 +220,71 @@ class ServiceCatalogServiceUpdateTest {
 
         // findMasterIdsByServiceDefinitionId must be called to identify affected masters
         verify(masterServiceRepository).findMasterIdsByServiceDefinitionId(serviceDefId);
+    }
+
+    // ── validateCategoryActive — catalog-poisoning gate (negative branches) ───
+
+    @Test
+    @DisplayName("rejects a PENDING category on update — a self-service request must not be selectable")
+    void should_throwBusinessException_when_categoryIsPending() {
+        UUID serviceDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, UUID.randomUUID());
+
+        // A PENDING row is APPROVED=false in the predicate, so the exact-case APPROVED
+        // existence check returns false — same wire as an unknown name.
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "NAIL_ART", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(false);
+
+        var request = new UpdateServiceDefinitionRequest(null, null, "NAIL_ART", null, null, null);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Unknown category")
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("rejects an APPROVED-but-inactive category on update — deactivated categories are not selectable")
+    void should_throwBusinessException_when_categoryApprovedButInactive() {
+        UUID serviceDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, UUID.randomUUID());
+
+        // active=false means the active-true-and-APPROVED predicate is false.
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "RETIRED", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(false);
+
+        var request = new UpdateServiceDefinitionRequest(null, null, "RETIRED", null, null, null);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Unknown category")
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("rejects an unknown category name on update")
+    void should_throwBusinessException_when_categoryUnknown() {
+        UUID serviceDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, UUID.randomUUID());
+
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "DOES_NOT_EXIST", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(false);
+
+        var request = new UpdateServiceDefinitionRequest(null, null, "DOES_NOT_EXIST", null, null, null);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Unknown category")
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verify(serviceRepository, never()).save(any());
     }
 
     // ── updateServiceDefinition — error cases ─────────────────────────────────

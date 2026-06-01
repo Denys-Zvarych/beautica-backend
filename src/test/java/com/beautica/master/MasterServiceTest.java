@@ -6,6 +6,9 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.location.entity.City;
+import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
@@ -30,11 +33,14 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -50,6 +56,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -63,6 +70,10 @@ class MasterServiceTest {
     @Mock private ScheduleExceptionRepository scheduleExceptionRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private CacheManager cacheManager;
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
+    // getCityId() returns a non-null value.
+    @Mock private CityRepository cityRepository;
 
     @InjectMocks
     private MasterService masterService;
@@ -207,6 +218,153 @@ class MasterServiceTest {
         assertThat(response.masterId()).isEqualTo(masterId);
         assertThat(response.workingHours()).hasSize(1);
         assertThat(response.workingHours().get(0).dayOfWeek()).isEqualTo(1);
+        // HIGH-2: cityId must be null when user.getCityId() returns null (fast-path)
+        assertThat(response.cityId()).isNull();
+        // CRITICAL: cityRepository must never be called when cityId is null
+        verifyNoInteractions(cityRepository);
+    }
+
+    // ── resolveOblastId paths ─────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_returnOblastId_when_cityIdIsPresent")
+    void should_returnOblastId_when_cityIdIsPresent() {
+        UUID masterId = UUID.randomUUID();
+        UUID cityUuid = UUID.randomUUID();
+        UUID oblastUuid = UUID.randomUUID();
+
+        Oblast oblast = mock(Oblast.class);
+        when(oblast.getId()).thenReturn(oblastUuid);
+
+        City city = mock(City.class);
+        when(city.getOblast()).thenReturn(oblast);
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(cityUuid);
+        when(user.getDistrictId()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(master.getSalon()).thenReturn(null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.of(city));
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.cityId()).isEqualTo(cityUuid);
+        assertThat(response.oblastId()).isEqualTo(oblastUuid);
+        verify(cityRepository).findByIdWithOblast(cityUuid);
+    }
+
+    @Test
+    @DisplayName("should_returnNullOblastId_when_cityIdIsNull")
+    void should_returnNullOblastId_when_cityIdIsNull() {
+        UUID masterId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(master.getSalon()).thenReturn(null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.cityId()).isNull();
+        assertThat(response.oblastId()).isNull();
+        verify(cityRepository, never()).findByIdWithOblast(any());
+    }
+
+    @Test
+    @DisplayName("should_returnNullOblastId_when_cityIdPresentButCityRowMissing")
+    void should_returnNullOblastId_when_cityIdPresentButCityRowMissing() {
+        UUID masterId = UUID.randomUUID();
+        UUID cityUuid = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(cityUuid);
+        when(user.getDistrictId()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(master.getSalon()).thenReturn(null);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.empty());
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.oblastId()).isNull();
+        verify(cityRepository).findByIdWithOblast(cityUuid);
+    }
+
+    // ── deactivateMaster — cache eviction ─────────────────────────────────────
+
+    @Test
+    @DisplayName("should_evictMasterDetailCache_when_deactivateMasterCalled")
+    void should_evictMasterDetailCache_when_deactivateMasterCalled() {
+        UUID ownerId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(userId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "user", user);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        // Stub both caches so the afterCommit eviction path does not NPE.
+        Cache masterDetailCache = mock(Cache.class);
+        Cache masterByUserCache = mock(Cache.class);
+        when(cacheManager.getCache("master-detail")).thenReturn(masterDetailCache);
+        when(cacheManager.getCache("master-by-user")).thenReturn(masterByUserCache);
+        // master-calendar is also evicted by deactivateMaster via evictMasterCalendarAfterCommit.
+        Cache masterCalendarCache = mock(Cache.class);
+        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCache);
+
+        // deactivateMaster guards eviction registration with isSynchronizationActive().
+        // Manually initialise Spring transaction synchronization so the guard passes in this
+        // non-transactional unit test, then capture and replay afterCommit().
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            masterService.deactivateMaster(ownerId, masterId);
+
+            // Capture all registered synchronizations and invoke afterCommit() on each.
+            List<TransactionSynchronization> syncs =
+                    TransactionSynchronizationManager.getSynchronizations();
+            assertThat(syncs).isNotEmpty();
+            syncs.forEach(TransactionSynchronization::afterCommit);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        // The master-detail cache must have been asked to evict the deactivated master's key.
+        verify(masterDetailCache).evict(masterId);
+        // The master-by-user cache must also have been evicted for the user.
+        verify(masterByUserCache).evict(userId);
     }
 
     // ── upsertWorkingHours ─────────────────────────────────────────────────────

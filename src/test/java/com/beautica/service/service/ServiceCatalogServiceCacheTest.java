@@ -11,6 +11,7 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -51,6 +52,7 @@ class ServiceCatalogServiceCacheTest {
     @MockBean MasterRepository masterRepository;
     @MockBean ServiceTypeRepository serviceTypeRepository;
     @MockBean CatalogCategoryRepository catalogCategoryRepository;
+    @MockBean PlatformCategoryRepository platformCategoryRepository;
     @MockBean EmailService emailService;
 
     @Autowired ServiceCatalogService serviceCatalogService;

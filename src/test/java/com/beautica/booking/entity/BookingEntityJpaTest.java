@@ -8,7 +8,6 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
-import com.beautica.service.entity.ServiceCategory;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import jakarta.persistence.PersistenceException;
@@ -75,7 +74,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
                 .name("Gel Manicure")
-                .category(ServiceCategory.MANICURE)
+                .category("MANICURE")
                 .baseDurationMinutes(60)
                 .basePrice(new BigDecimal("450.00"))
                 .isActive(true)

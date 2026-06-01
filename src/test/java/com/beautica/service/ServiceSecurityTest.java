@@ -87,7 +87,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 "sec-owner-b-add-" + System.nanoTime() + "@beautica.test");
 
         var request = new CreateServiceDefinitionRequest(
-                "IDOR Service", null, null, 30, new BigDecimal("100.00"), 0, null);
+                "IDOR Service", null, "MANICURE", 30, new BigDecimal("100.00"), 0, null);
 
         // Act
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — IDOR must be blocked", salonAId);

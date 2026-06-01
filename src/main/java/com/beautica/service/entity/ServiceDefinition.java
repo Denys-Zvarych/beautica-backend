@@ -61,9 +61,13 @@ public class ServiceDefinition extends AuditableEntity {
     @Column(columnDefinition = "TEXT")
     private String description;
 
-    @Enumerated(EnumType.STRING)
+    /**
+     * Category name string — validated against {@code platform_categories.name} at the
+     * service layer. No DB FK is declared (see class Javadoc on PlatformCategory).
+     * Stores values like {@code "MANICURE"}, {@code "NAIL_ART"}, etc.
+     */
     @Column(length = 100)
-    private ServiceCategory category;
+    private String category;
 
     @Column(name = "base_duration_minutes", nullable = false)
     private int baseDurationMinutes;

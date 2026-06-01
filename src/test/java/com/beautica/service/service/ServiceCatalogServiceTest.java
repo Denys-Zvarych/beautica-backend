@@ -18,6 +18,7 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.service.CatalogCategoryLookup;
 import com.beautica.user.User;
@@ -69,6 +70,9 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private CatalogCategoryLookup catalogCategoryLookup;
+
+    @Mock
+    private PlatformCategoryRepository platformCategoryRepository;
 
     @Mock
     private EmailService emailService;

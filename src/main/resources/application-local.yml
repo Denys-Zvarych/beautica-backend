@@ -53,6 +53,7 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:dev-admin@localhost}
+  public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
   security:
     # Local dev only — never use in prod. Generate prod value: openssl rand -base64 32
     otp-pepper: local-dev-otp-pepper-not-for-prod-min32chars

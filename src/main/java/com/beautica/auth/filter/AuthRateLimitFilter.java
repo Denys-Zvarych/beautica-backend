@@ -36,7 +36,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String USER_ME_PATH = "/api/v1/users/me";
     private static final String IM_LOCALITY_PATH = "/api/v1/independent-masters/me";
     private static final String MASTERS_ME_PROFILE_PATH = "/api/v1/masters/me/profile";
+    private static final String CATEGORY_REQUEST_PATH = "/api/v1/service-categories/requests";
     private static final int RETRY_AFTER_SECONDS = 60;
+    // category-request bucket window is 60 minutes — Retry-After reflects the window.
+    private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
     // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
     // so clients do not spin-retry every 60 s and waste their remaining IP quota.
     private static final int VERIFY_EMAIL_RETRY_AFTER_SECONDS = 900;
@@ -65,6 +68,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // (low cap); reset-password sends no email (higher cap, tolerant of typo retries).
     private final LoadingCache<String, Bucket> forgotPasswordBuckets;
     private final LoadingCache<String, Bucket> resetPasswordBuckets;
+    // Per-IP bucket for POST /api/v1/service-categories/requests — every successful
+    // request emails the admin, so this is an inbox-flood surface (5/hr).
+    private final LoadingCache<String, Bucket> categoryRequestBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -77,7 +83,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("profileUpdateBuckets") LoadingCache<String, Bucket> profileUpdateBuckets,
             @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
             @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
-            @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets) {
+            @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
+            @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -89,6 +96,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.resendVerificationBuckets = resendVerificationBuckets;
         this.forgotPasswordBuckets = forgotPasswordBuckets;
         this.resetPasswordBuckets = resetPasswordBuckets;
+        this.categoryRequestBuckets = categoryRequestBuckets;
     }
 
     @Override
@@ -168,6 +176,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (RESET_PASSWORD_PATH.equals(path)) {
             cache = resetPasswordBuckets;
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
+        } else if (CATEGORY_REQUEST_PATH.equals(path)) {
+            cache = categoryRequestBuckets;
+            retryAfterSeconds = CATEGORY_REQUEST_RETRY_AFTER_SECONDS;
         } else {
             filterChain.doFilter(request, response);
             return;

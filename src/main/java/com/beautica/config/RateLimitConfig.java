@@ -75,6 +75,17 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.profile-update-capacity:10}")
     private long profileUpdateCapacity;
 
+    // Per-IP cap for POST /api/v1/service-categories/requests (60-minute window).
+    // This path sends an admin email on every successful request, so it is an
+    // inbox-flood surface — kept low (5/hr) to match the forgot-password email-bomb
+    // posture. IP-keyed for consistency with every other bucket in this filter
+    // (JWT is not yet parsed when AuthRateLimitFilter runs). Configurable so
+    // integration tests on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.category-request-capacity:5}")
+    private long categoryRequestCapacity;
+
+    private static final Duration CATEGORY_REQUEST_WINDOW = Duration.ofMinutes(60);
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
         return Caffeine.newBuilder()
@@ -225,6 +236,25 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofMinutes(65))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(resetPasswordCapacity, Duration.ofMinutes(60)))
+                        .build());
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/service-categories/requests}.
+     *
+     * <p>Cap: 5 requests per 60-minute window per source IP. Every successful
+     * request triggers an admin notification email, so this is an inbox-flood
+     * surface; the low cap mirrors the forgot-password email-bomb posture.
+     * {@code expireAfterAccess(65 min)} gives a 5-minute grace past the window so
+     * the entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> categoryRequestBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(CATEGORY_REQUEST_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(categoryRequestCapacity, CATEGORY_REQUEST_WINDOW))
                         .build());
     }
 
