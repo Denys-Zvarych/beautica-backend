@@ -159,4 +159,26 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
                 .as("category accepted by the service-create gate once APPROVED + active")
                 .isEqualTo(CATEGORY_NAME);
     }
+
+    @Test
+    @DisplayName("retired OTHER category (V66) is excluded from approved list and rejected on service create")
+    void should_excludeAndRejectOther_when_categoryRetired() throws Exception {
+        // Arrange — a salon to validate service creation against.
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "it-cat-other-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Other Retired Salon");
+
+        // Act + Assert 1 — OTHER must not appear in the approved (selectable) list.
+        assertThat(platformCategoryRepository.findApprovedActive())
+                .as("V66 soft-disabled OTHER; it must drop out of the approved picker")
+                .extracting(PlatformCategory::getName)
+                .doesNotContain("OTHER");
+
+        // Act + Assert 2 — creating a service with category=OTHER is rejected (400).
+        assertThatThrownBy(() ->
+                serviceCatalogService.addServiceToSalon(salonId, serviceWithCategory("OTHER")))
+                .as("retired OTHER must fail the service-create validation gate")
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Unknown category");
+    }
 }
