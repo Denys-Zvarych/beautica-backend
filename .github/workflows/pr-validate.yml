@@ -1,5 +1,20 @@
 name: PR Validate
 
+# ──────────────────────────────────────────────────────────────────────────
+# REGRESSION MERGE-GATE
+#
+# This workflow is the regression gate for the backend. It compiles main +
+# test sources and runs the FULL test suite on every pull request targeting
+# `dev` and `main`. A failure of the `Compile (gate)`, `Build`, or
+# `Run tests` step fails the whole check.
+#
+# REQUIRED GITHUB SETTING (cannot be set from code — the repo admin must do this):
+#   In GitHub → Settings → Branches → Branch protection rules, for both `dev`
+#   and `main`, enable "Require status checks to pass before merging" and add
+#   the "Build & Test" check (this job) as a required status check. Without
+#   that setting a red check does NOT block the merge button.
+# ──────────────────────────────────────────────────────────────────────────
+
 on:
   pull_request:
     branches:
@@ -45,6 +60,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
 
+      # Fast fail: compile main + test sources before the heavier build/test
+      # steps. This is the explicit compile half of the regression gate and
+      # surfaces a broken build in seconds rather than after the full suite.
+      - name: Compile (gate)
+        run: ./gradlew compileJava compileTestJava
+        env:
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
+
       - name: Build
         run: ./gradlew build -x test
         env:
@@ -71,3 +94,41 @@ jobs:
           name: test-reports
           path: build/reports/tests/
           retention-days: 7
+
+      # ────────────────────────────────────────────────────────────────────
+      # OpenAPI contract artifact (mobile contract-drift source)
+      #
+      # The mobile client (beautica-mobile) is code-generated from this
+      # backend's SpringDoc spec. To let a mobile contract-drift job consume a
+      # known-good spec we want to publish the serialized OpenAPI JSON here as
+      # a build artifact.
+      #
+      # NOT WIRED AS A FULL IN-CI EXPORT — and intentionally so:
+      #   The spec is served at runtime from /api-docs by the live Spring
+      #   context. Serializing it in CI means *booting the app*, which under
+      #   the `test` profile requires a real PostgreSQL (Testcontainers
+      #   supplies it only during `./gradlew test`, not for a standalone
+      #   `bootRun`) plus R2 / Firebase / SMTP placeholders. The `prod`
+      #   profile additionally sets `springdoc.api-docs.enabled: false`, so the
+      #   deployed instance does not expose it either. Standing all of that up
+      #   purely to dump a JSON file is the kind of heavy boot the task scope
+      #   explicitly asks us to avoid.
+      #
+      # HOW THE MOBILE SIDE SHOULD FETCH THE SPEC (current contract):
+      #   1. Run the backend locally with the `local` profile
+      #      (`./gradlew bootRun --args='--spring.profiles.active=local'`),
+      #      which keeps `springdoc.api-docs.enabled: true`.
+      #   2. Fetch the serialized spec:
+      #         curl -fsS http://localhost:8080/api-docs > openapi.json
+      #      (Swagger UI lives at http://localhost:8080/swagger-ui.html.)
+      #   3. Feed openapi.json to the mobile OpenAPI-codegen client
+      #      (see beautica-backend/openapi_generator_config.json).
+      #
+      # TODO(contract-drift): When a dedicated spec-export is justified, add a
+      #   `springdoc-openapi-gradle-plugin` `generateOpenApiDocs` task here,
+      #   backed by a `services: postgres` container + the `local`/`test`
+      #   profile, and upload the resulting openapi.json as an artifact named
+      #   `openapi-spec`. The mobile contract-drift job then downloads that
+      #   artifact instead of pointing at a running backend. Tracked so the
+      #   mobile client never silently drifts from the backend contract.
+      # ────────────────────────────────────────────────────────────────────
