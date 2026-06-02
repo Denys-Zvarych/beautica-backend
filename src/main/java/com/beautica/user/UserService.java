@@ -111,7 +111,14 @@ public class UserService {
             user.setBio(request.bio());
         }
         if (request.instagram() != null) {
-            user.setInstagram(request.instagram());
+            // Clear-field semantics: the mobile edit screen sends instagram="" to remove a
+            // stored handle. Bean Validation accepts "" (the @Pattern ^$ arm), but the DB
+            // CHECK constraint chk_users_instagram (V61) only permits NULL or a valid
+            // handle/URL — persisting "" raises a 23514 constraint violation (surfaced as a
+            // 409), which rolls back the whole transaction and silently drops firstName/
+            // lastName. Normalising a blank handle to NULL satisfies the constraint and makes
+            // "clear" mean "remove". MasterProfileUpdateContractIT pins this end-to-end.
+            user.setInstagram(request.instagram().isBlank() ? null : request.instagram());
         }
 
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
