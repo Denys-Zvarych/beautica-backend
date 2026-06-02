@@ -501,28 +501,80 @@ class IndependentMasterProfileUpdateTest {
                 .andExpect(jsonPath("$.message").isNotEmpty());
     }
 
-    // ── Fix 4 — QA CRITICAL: instagram empty string ───────────────────────────
+    // ── CRITICAL regression — instagram empty string is the "clear" signal ─────
 
     @Test
-    @DisplayName("PATCH /me/profile — 400 when instagram is empty string (Fix 1: ^$| arm removed)")
-    void should_return400_when_instagramIsEmptyString() throws Exception {
+    @DisplayName("PATCH /me/profile — 200 when instagram is empty string (clear-field contract)")
+    void should_return200_when_instagramIsEmptyString() throws Exception {
         var userId = UUID.randomUUID();
-        // After Fix 1 the ^$| arm is removed from the instagram @Pattern. An empty string
-        // no longer satisfies any branch of the regex and must produce a 400.
-        // Previously "" passed through to the service and silently overwrote an existing
-        // handle with "", which is semantically invalid and data-corrupting.
+        // CRITICAL regression: the mobile edit screen sends instagram="" to CLEAR the stored
+        // handle (master_update.dart: "an empty instagram CLEARS the value server-side"). The
+        // @Pattern carries an explicit ^$ alternation so "" is valid; UserService treats the
+        // non-null "" as an overwrite. Previously the pattern rejected "" with a 400, and
+        // because a single @Valid failure rejects the WHOLE body, firstName/lastName never
+        // persisted — the exact bug this guards against.
         var body = objectMapper.writeValueAsString(java.util.Map.of(
                 "phoneNumber", "+380671234567",
                 "instagram", ""));
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(stubProfile("+380671234567", null, ""));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 for the exact failing payload {firstName, lastName, bio:\"\", instagram:\"\"}")
+    void should_return200_when_clearingPayloadWithNamesSent() throws Exception {
+        var userId = UUID.randomUUID();
+        // The exact payload proven to fail live: names set, bio + instagram cleared via "".
+        // It must be accepted so firstName/lastName persist.
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("firstName", "Olena");
+        body.put("lastName", "Koval");
+        body.put("bio", "");
+        body.put("instagram", "");
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(stubProfile("Olena", "Koval", null, "", ""));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.firstName").value("Olena"))
+                .andExpect(jsonPath("$.data.lastName").value("Koval"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 with errors.instagram present when instagram is malformed")
+    void should_return400WithErrorsMap_when_instagramMalformed() throws Exception {
+        var userId = UUID.randomUUID();
+        // A genuine format violation still fails, AND the response now carries the top-level
+        // `errors` map (field → message) the mobile ErrorMapperInterceptor reads.
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("firstName", "Olena");
+        body.put("lastName", "Koval");
+        body.put("instagram", "bad handle!!");
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.message").isNotEmpty());
+                .andExpect(jsonPath("$.message").isNotEmpty())
+                .andExpect(jsonPath("$.errors.instagram").isNotEmpty());
     }
 
     // ── Fix 5 — QA MEDIUM: phone max-boundary ────────────────────────────────
