@@ -340,6 +340,34 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("handleValidation — populates top-level errors map (field → message) for the mobile client")
+    void should_populateErrorsMap_when_validationFails() throws NoSuchMethodException {
+        // Arrange — two field errors so the map shape is exercised; the mobile
+        // ErrorMapperInterceptor reads this top-level `errors` key to render inline errors.
+        MethodParameter param = new MethodParameter(
+                GlobalExceptionHandlerTest.class.getDeclaredMethod("dummyMethod", String.class), 0);
+        var bindingResult = new BeanPropertyBindingResult(new Object(), "target");
+        bindingResult.addError(new FieldError("target", "instagram",
+                "Instagram must be a handle (e.g. @username) or a full instagram.com URL"));
+        bindingResult.addError(new FieldError("target", "bio", "Bio must not exceed 2000 characters"));
+        var ex = new MethodArgumentNotValidException(param, bindingResult);
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleValidation(ex);
+
+        // Assert
+        assertThat(response.getBody().errors())
+                .as("errors map must carry the per-field messages keyed by field name")
+                .containsEntry("instagram",
+                        "Instagram must be a handle (e.g. @username) or a full instagram.com URL")
+                .containsEntry("bio", "Bio must not exceed 2000 characters");
+
+        assertThat(response.getBody().message())
+                .as("top-level message must remain the generic sentinel")
+                .isEqualTo("Validation failed — check request parameters");
+    }
+
+    @Test
     @DisplayName("Should return 400 with static message when MissingServletRequestPartException is thrown")
     void should_return400_when_missingRequestPart() {
         // Arrange — multipart endpoint called without the required 'file' part

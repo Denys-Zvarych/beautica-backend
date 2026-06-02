@@ -18,6 +18,7 @@ import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -76,11 +77,11 @@ public class ServiceCatalogService {
                 .description(request.description())
                 .category(request.category())
                 .baseDurationMinutes(request.baseDurationMinutes())
-                .basePrice(request.basePrice())
                 .bufferMinutesAfter(request.bufferMinutesAfter())
                 .isActive(true)
                 .build();
 
+        applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
         applyServiceType(definition, request);
 
         ServiceDefinition saved = serviceRepository.save(definition);
@@ -156,11 +157,11 @@ public class ServiceCatalogService {
                 .description(request.description())
                 .category(request.category())
                 .baseDurationMinutes(request.baseDurationMinutes())
-                .basePrice(request.basePrice())
                 .bufferMinutesAfter(request.bufferMinutesAfter())
                 .isActive(true)
                 .build();
 
+        applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
         applyServiceType(definition, request);
 
         ServiceDefinition savedDef = serviceRepository.save(definition);
@@ -290,6 +291,11 @@ public class ServiceCatalogService {
      * Applies PATCH-semantics: only non-null fields in {@code request} are written
      * to {@code definition}. Null fields are ignored — the entity retains its
      * existing value for those attributes.
+     *
+     * <p>Price block: if ALL four price fields are null the block is treated as absent
+     * and the existing pricing is preserved. When any price field is non-null the full
+     * mode payload has already been validated by {@code @ServicePriceValid}; this method
+     * applies all three price columns atomically.
      */
     private void applyPatchFields(ServiceDefinition definition,
             UpdateServiceDefinitionRequest request) {
@@ -307,11 +313,44 @@ public class ServiceCatalogService {
         if (request.baseDurationMinutes() != null) {
             definition.setBaseDurationMinutes(request.baseDurationMinutes());
         }
-        if (request.basePrice() != null) {
-            definition.setBasePrice(request.basePrice());
-        }
         if (request.bufferMinutesAfter() != null) {
             definition.setBufferMinutesAfter(request.bufferMinutesAfter());
+        }
+
+        // Price block — treat as atomic: all four null = absent (no change).
+        // @ServicePriceValid already guarantees consistency when any field is non-null.
+        boolean priceBlockPresent = request.priceType() != null
+                || request.price() != null
+                || request.priceMin() != null
+                || request.priceMax() != null;
+
+        if (priceBlockPresent) {
+            applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
+        }
+    }
+
+    /**
+     * Sets the three price columns on the entity from the validated mode payload.
+     *
+     * <p>Invariant (enforced upstream by {@code @ServicePriceValid}):
+     * <ul>
+     *   <li>FIXED: {@code price} non-null, stored in {@code basePrice}; {@code priceMax} = null.</li>
+     *   <li>RANGE: {@code priceMin} stored in {@code basePrice}, {@code priceMax} non-null.
+     *       {@code base_price} = floor, so {@code masters.min_effective_price} (V58) remains correct.</li>
+     * </ul>
+     */
+    private void applyPriceMode(ServiceDefinition definition, PriceType priceType,
+                                 java.math.BigDecimal price, java.math.BigDecimal priceMin,
+                                 java.math.BigDecimal priceMax) {
+        definition.setPriceType(priceType);
+        if (priceType == PriceType.FIXED) {
+            definition.setBasePrice(price);
+            definition.setPriceMax(null);
+        } else {
+            // RANGE: base_price = minimum (floor), price_max = ceiling.
+            // min_effective_price = MIN(COALESCE(price_override, base_price)) — still correct.
+            definition.setBasePrice(priceMin);
+            definition.setPriceMax(priceMax);
         }
     }
 

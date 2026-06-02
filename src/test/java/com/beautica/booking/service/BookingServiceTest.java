@@ -20,6 +20,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.salon.repository.SalonRepository;
@@ -159,6 +160,7 @@ class BookingServiceTest {
     private ServiceDefinition buildServiceDef(BigDecimal basePrice, int baseDuration, int buffer) {
         return ServiceDefinition.builder()
                 .name("Test Service")
+                .priceType(PriceType.FIXED)
                 .basePrice(basePrice)
                 .baseDurationMinutes(baseDuration)
                 .bufferMinutesAfter(buffer)

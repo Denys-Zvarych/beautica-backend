@@ -24,8 +24,15 @@ import jakarta.validation.constraints.Size;
  *       intact. The {@code @Pattern} still enforces format when a value is
  *       provided (Bean Validation skips null, so the pattern fires only for
  *       non-null values).</li>
- *   <li>{@code bio} and {@code instagram} retain the same optional semantics as
- *       before.</li>
+ *   <li>{@code bio} and {@code instagram} are optional <em>clearable</em> fields:
+ *       the mobile edit screen sends an empty string ({@code ""}) to clear a
+ *       previously stored value, and {@code UserService.updateMasterProfile}
+ *       treats any non-null value (including {@code ""}) as an overwrite. Both
+ *       validators therefore accept the empty string — {@code bio}'s control-char
+ *       {@code @Pattern} ({@code ^[^\p{Cntrl}]*$}) already matches {@code ""}, and
+ *       {@code instagram}'s pattern carries an explicit {@code ^$} alternation.
+ *       {@code phoneNumber} is deliberately <em>not</em> clearable: a blank phone
+ *       is a no-op (the service skips it), so its pattern stays strict.</li>
  *   <li>{@code @Size(max = N)} values match {@code @Column(length = N)} / TEXT
  *       on the entity exactly — the DB column is never the backstop.</li>
  * </ul>
@@ -62,7 +69,14 @@ public record MasterProfileUpdateRequest(
 
         @Size(max = 100, message = "Instagram handle must not exceed 100 characters")
         @Pattern(
-                regexp = "^@?[A-Za-z0-9._]{1,30}$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
+                // The leading ^$ alternation makes an empty string valid: the mobile client
+                // sends instagram="" to CLEAR the stored handle (UserService treats a non-null
+                // value — including "" — as an overwrite). Without it, the clear-intent payload
+                // was rejected with 400, which silently blocked firstName/lastName from persisting
+                // (a single @Valid failure rejects the whole body). null remains valid because
+                // Bean Validation skips null targets; the format check still fires for any
+                // non-empty value.
+                regexp = "^$|^@?[A-Za-z0-9._]{1,30}$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
                 message = "Instagram must be a handle (e.g. @username) or a full instagram.com URL"
         )
         String instagram

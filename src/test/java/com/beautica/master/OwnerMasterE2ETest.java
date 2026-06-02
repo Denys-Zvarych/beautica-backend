@@ -15,6 +15,7 @@ import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -173,7 +174,8 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
 
         // ── Step 5: create a service definition ───────────────────────────────
         var createSvcReq = new CreateServiceDefinitionRequest(
-                "E2E Hair Treatment", null, "HAIRCUT", 60, new BigDecimal("450.00"), 0, null);
+                "E2E Hair Treatment", null, "HAIRCUT", 60, 0,
+                PriceType.FIXED, new BigDecimal("450.00"), null, null, null);
         ResponseEntity<String> svcResp = restTemplate.exchange(
                 SALONS_URL + "/" + salonId + "/services", HttpMethod.POST,
                 new HttpEntity<>(createSvcReq, bearerHeaders(ownerToken)),

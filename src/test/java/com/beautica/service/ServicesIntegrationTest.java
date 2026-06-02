@@ -7,6 +7,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -90,8 +91,11 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 "Long-lasting shellac",
                 "MANICURE",
                 75,
-                new BigDecimal("600.00"),
                 10,
+                PriceType.FIXED,
+                new BigDecimal("600.00"),
+                null,
+                null,
                 null
         );
 
@@ -149,7 +153,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         UUID masterId = fixtures.createSalonMaster(salonId);
 
         var createRequest = new CreateServiceDefinitionRequest(
-                "Pedicure", null, "PEDICURE", 90, new BigDecimal("450.00"), 15, null);
+                "Pedicure", null, "PEDICURE", 90, 15,
+                PriceType.FIXED, new BigDecimal("450.00"), null, null, null);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, createRequest);
 
         var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);

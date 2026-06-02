@@ -7,6 +7,7 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.CategoryRequestResponse;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.entity.PlatformCategoryStatus;
 import com.beautica.service.repository.PlatformCategoryRepository;
@@ -87,7 +88,8 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
 
     private CreateServiceDefinitionRequest serviceWithCategory(String category) {
         return new CreateServiceDefinitionRequest(
-                "Workflow Service", "desc", category, 60, new BigDecimal("500.00"), 0, null);
+                "Workflow Service", "desc", category, 60, 0,
+                PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
     }
 
     @Test

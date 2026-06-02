@@ -15,6 +15,7 @@ import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -91,8 +92,11 @@ class ServiceCatalogServiceTest {
                 "Classic manicure",
                 null,
                 60,
-                new BigDecimal("350.00"),
                 10,
+                PriceType.FIXED,
+                new BigDecimal("350.00"),
+                null,
+                null,
                 null
         );
     }
@@ -481,7 +485,7 @@ class ServiceCatalogServiceTest {
         when(serviceType.isActive()).thenReturn(true);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, serviceTypeId);
+                "Manicure", "Classic manicure", null, 60, 10, PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
 
         ServiceDefinition savedDef = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -531,7 +535,7 @@ class ServiceCatalogServiceTest {
         UUID unknownTypeId = UUID.randomUUID();
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, unknownTypeId);
+                "Manicure", "Classic manicure", null, 60, 10, PriceType.FIXED, new BigDecimal("350.00"), null, null, unknownTypeId);
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
         when(serviceTypeLookup.getById(unknownTypeId)).thenThrow(new NotFoundException("Service type not found: " + unknownTypeId));
@@ -564,7 +568,7 @@ class ServiceCatalogServiceTest {
         when(serviceType.isActive()).thenReturn(true);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Pedicure", "Basic pedicure", null, 60, new BigDecimal("400.00"), 10, serviceTypeId);
+                "Pedicure", "Basic pedicure", null, 60, 10, PriceType.FIXED, new BigDecimal("400.00"), null, null, serviceTypeId);
 
         ServiceDefinition savedDef = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -614,7 +618,7 @@ class ServiceCatalogServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Pedicure", null, null, 60, new BigDecimal("400.00"), 0, unknownTypeId);
+                "Pedicure", null, null, 60, 0, PriceType.FIXED, new BigDecimal("400.00"), null, null, unknownTypeId);
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
         when(serviceTypeLookup.getById(unknownTypeId)).thenThrow(new NotFoundException("Service type not found: " + unknownTypeId));
@@ -637,7 +641,7 @@ class ServiceCatalogServiceTest {
         when(inactiveType.isActive()).thenReturn(false);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", null, 60, new BigDecimal("350.00"), 10, serviceTypeId);
+                "Manicure", "Classic manicure", null, 60, 10, PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(inactiveType);
@@ -663,7 +667,7 @@ class ServiceCatalogServiceTest {
         when(inactiveType.isActive()).thenReturn(false);
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Lash Lift", "Full lash lift", null, 90, new BigDecimal("600.00"), 15, serviceTypeId);
+                "Lash Lift", "Full lash lift", null, 90, 15, PriceType.FIXED, new BigDecimal("600.00"), null, null, serviceTypeId);
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(inactiveType);

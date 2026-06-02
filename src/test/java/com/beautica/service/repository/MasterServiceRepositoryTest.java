@@ -7,6 +7,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.user.User;
@@ -65,6 +66,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .name("Gel Manicure")
                 .category("MANICURE")
                 .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("450.00"))
                 .isActive(true)
                 .build();
@@ -82,6 +84,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .name("Classic Manicure")
                 .category("MANICURE")
                 .baseDurationMinutes(45)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
                 .isActive(true)
                 .build();
@@ -105,6 +108,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .name("Pedicure")
                 .category("PEDICURE")
                 .baseDurationMinutes(90)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("500.00"))
                 .isActive(true)
                 .build();
@@ -140,6 +144,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .name("Classic Manicure")
                 .category("MANICURE")
                 .baseDurationMinutes(45)
+                .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
                 .isActive(false)
                 .build();

@@ -9,6 +9,7 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.entity.PriceType;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -87,7 +88,8 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 "sec-owner-b-add-" + System.nanoTime() + "@beautica.test");
 
         var request = new CreateServiceDefinitionRequest(
-                "IDOR Service", null, "MANICURE", 30, new BigDecimal("100.00"), 0, null);
+                "IDOR Service", null, "MANICURE", 30, 0,
+                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
 
         // Act
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — IDOR must be blocked", salonAId);

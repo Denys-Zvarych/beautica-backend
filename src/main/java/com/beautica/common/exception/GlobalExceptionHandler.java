@@ -26,6 +26,8 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @RestControllerAdvice
@@ -123,26 +125,61 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiResponse<Void>> handleValidation(MethodArgumentNotValidException ex) {
-        // Generic message — per-field messages are never echoed to prevent information
-        // disclosure about internal field names, enum constants, or DB constraints (Anti-Bug §A/§N).
-        // Debug-level log is available for server-side triage without exposing details to callers.
-        log.debug("Validation failed: {}", ex.getBindingResult().getFieldErrors().stream()
+        // Top-level message stays a generic sentinel; the per-field detail lives in the
+        // `errors` map (field → message) so the mobile client can surface inline field
+        // errors (ErrorMapperInterceptor._extractFieldErrors reads the top-level `errors`
+        // key). Echoing the Bean Validation message for a known request-body field name is
+        // safe: the DTO field names are part of the public API contract. The §A/§N leak
+        // concern is enum constants, SQL fragments, and bound-value disclosure — those come
+        // from HttpMessageNotReadableException / DataIntegrityViolationException, not from a
+        // developer-authored @Size/@Pattern message on a declared field.
+        var fieldErrors = ex.getBindingResult().getFieldErrors();
+        log.debug("Validation failed: {}", fieldErrors.stream()
                 .map(FieldError::getDefaultMessage)
                 .collect(Collectors.joining("; ")));
+
+        Map<String, String> errors = fieldErrors.stream()
+                .collect(Collectors.toMap(
+                        FieldError::getField,
+                        fe -> fe.getDefaultMessage() != null ? fe.getDefaultMessage() : "Invalid value",
+                        // Two violations on the same field: keep the first, deterministic.
+                        (first, second) -> first,
+                        LinkedHashMap::new));
+
         String message = "Validation failed — check request parameters";
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
-                .body(ApiResponse.error(message));
+                .body(ApiResponse.validationError(message, errors));
     }
 
     @ExceptionHandler(ConstraintViolationException.class)
     public ResponseEntity<ApiResponse<Void>> handleConstraintViolation(ConstraintViolationException ex) {
-        // Detail logged at DEBUG only — field names and bound values are internal API surface
-        // that would aid DoS/enumeration attacks if echoed to unauthenticated callers (Anti-Bug §A/§N).
+        // Detail logged at DEBUG only. Unlike @RequestBody validation, the property path here
+        // includes the controller method + parameter name (e.g. "search.q") which is internal
+        // API surface — so the `errors` map is keyed by the LEAF property name only (e.g. "q"),
+        // and the bound values from ex.getMessage() are never echoed to the caller (§A/§N).
         log.debug("Constraint violation: {}", ex.getMessage());
+
+        Map<String, String> errors = ex.getConstraintViolations().stream()
+                .collect(Collectors.toMap(
+                        v -> leafPropertyName(v.getPropertyPath().toString()),
+                        v -> v.getMessage() != null ? v.getMessage() : "Invalid value",
+                        (first, second) -> first,
+                        LinkedHashMap::new));
+
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
-                .body(ApiResponse.error("Validation failed — check request parameters"));
+                .body(ApiResponse.validationError("Validation failed — check request parameters", errors));
+    }
+
+    /**
+     * Returns the last segment of a Bean Validation property path so the client sees the
+     * caller-facing parameter name ({@code "q"}) rather than the internal
+     * {@code methodName.paramName} path that {@link ConstraintViolationException} carries.
+     */
+    private static String leafPropertyName(String propertyPath) {
+        int lastDot = propertyPath.lastIndexOf('.');
+        return lastDot >= 0 ? propertyPath.substring(lastDot + 1) : propertyPath;
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)

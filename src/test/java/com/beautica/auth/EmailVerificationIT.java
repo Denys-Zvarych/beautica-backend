@@ -29,9 +29,11 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
@@ -99,7 +101,8 @@ class EmailVerificationIT extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.OK);
 
         var captor = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService).sendVerificationEmail(eq(email), captor.capture());
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                verify(emailNotificationService).sendVerificationEmail(eq(email), captor.capture()));
         Mockito.reset(emailNotificationService);
 
         return captor.getValue();
@@ -175,8 +178,9 @@ class EmailVerificationIT extends AbstractIntegrationTest {
 
         log.debug("Assert: sendVerificationEmail called once with a 6-digit code");
         var captor = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService, times(1))
-                .sendVerificationEmail(eq(email), captor.capture());
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                verify(emailNotificationService, times(1))
+                        .sendVerificationEmail(eq(email), captor.capture()));
 
         assertThat(captor.getValue())
                 .as("captured OTP must be exactly 6 decimal digits")
@@ -422,8 +426,9 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         assertThat(apiResponse.success()).isTrue();
 
         var captor2 = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService, times(1))
-                .sendVerificationEmail(eq(email), captor2.capture());
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                verify(emailNotificationService, times(1))
+                        .sendVerificationEmail(eq(email), captor2.capture()));
         String newCode = captor2.getValue();
 
         assertThat(newCode)
@@ -561,8 +566,8 @@ class EmailVerificationIT extends AbstractIntegrationTest {
                 .as("returned email must match the requested address")
                 .isEqualTo(email);
 
-        verify(emailNotificationService, never())
-                .sendVerificationEmail(any(), any());
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
+                verify(emailNotificationService, never()).sendVerificationEmail(any(), any()));
     }
 
     // ── Test 13 (QA HIGH) — cumulative lockout survives resend ────────────────
@@ -612,8 +617,9 @@ class EmailVerificationIT extends AbstractIntegrationTest {
                     String.class);
             if (i == 8) {
                 var captor = ArgumentCaptor.forClass(String.class);
-                verify(emailNotificationService)
-                        .sendVerificationEmail(eq(email), captor.capture());
+                await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                        verify(emailNotificationService)
+                                .sendVerificationEmail(eq(email), captor.capture()));
                 correctButLocked = captor.getValue();
                 assertThat(correctButLocked)
                         .as("last unlocked resend must dispatch a 6-digit OTP")
@@ -635,8 +641,8 @@ class EmailVerificationIT extends AbstractIntegrationTest {
 
         // The i=9 resend ran AFTER the lock tripped: a locked resend must dispatch
         // zero emails (the mock was reset right after the i=8 capture).
-        verify(emailNotificationService, never())
-                .sendVerificationEmail(eq(email), any());
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
+                verify(emailNotificationService, never()).sendVerificationEmail(eq(email), any()));
 
         // While locked, even the genuinely CORRECT code (captured from the last
         // unlocked resend) must be rejected with the wire-identical generic shape
@@ -690,7 +696,8 @@ class EmailVerificationIT extends AbstractIntegrationTest {
                 new ResendVerificationRequest(email),
                 String.class);
         var captor = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService).sendVerificationEmail(eq(email), captor.capture());
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                verify(emailNotificationService).sendVerificationEmail(eq(email), captor.capture()));
         String freshCode = captor.getValue();
 
         ResponseEntity<String> ok = restTemplate.postForEntity(

@@ -72,8 +72,32 @@ public class ServiceDefinition extends AuditableEntity {
     @Column(name = "base_duration_minutes", nullable = false)
     private int baseDurationMinutes;
 
-    @Column(name = "base_price", precision = 10, scale = 2)
+    /**
+     * Pricing mode for this service.
+     * <ul>
+     *   <li>{@code FIXED} — {@code basePrice} is the one static amount; {@code priceMax} is {@code null}.</li>
+     *   <li>{@code RANGE} — {@code basePrice} is the minimum (floor); {@code priceMax} is the ceiling.
+     *       The DB CHECK constraint {@code chk_service_def_price_mode} enforces {@code priceMax >= basePrice}.</li>
+     * </ul>
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "price_type", nullable = false, length = 10)
+    private PriceType priceType;
+
+    /**
+     * Canonical price floor. For {@code FIXED} mode this is the single amount; for {@code RANGE} mode
+     * this is the minimum. Used by {@code masters.min_effective_price} (V58) and
+     * {@code bookings.price_at_booking} — neither requires changes when RANGE is introduced.
+     */
+    @Column(name = "base_price", precision = 10, scale = 2, nullable = false)
     private BigDecimal basePrice;
+
+    /**
+     * RANGE ceiling. {@code NULL} for {@code FIXED} mode.
+     * DB constraint guarantees {@code priceMax >= basePrice} when non-null.
+     */
+    @Column(name = "price_max", precision = 10, scale = 2)
+    private BigDecimal priceMax;
 
     /**
      * Prep/cleanup buffer blocked after the appointment ends.
