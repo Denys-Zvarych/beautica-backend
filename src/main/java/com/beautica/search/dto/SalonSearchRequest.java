@@ -53,12 +53,12 @@ public record SalonSearchRequest(
         @Valid
         LocationFilter location,
 
-        @PositiveOrZero
-        @Max(500)
+        @PositiveOrZero(message = "page must be zero or positive")
+        @Max(value = 500, message = "page must be at most 500")
         Integer page,
 
-        @Positive
-        @Max(100)
+        @Positive(message = "size must be a positive number")
+        @Max(value = 100, message = "size must be at most 100")
         Integer size
 ) {
 }

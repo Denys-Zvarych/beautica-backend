@@ -21,17 +21,17 @@ public record InviteAcceptRequest(
         String password,
 
         @NotBlank(message = "First name is required")
-        @Size(max = 100)
+        @Size(max = 100, message = "First name must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "First name must not contain control characters")
         String firstName,
 
         @NotBlank(message = "Last name is required")
-        @Size(max = 100)
+        @Size(max = 100, message = "Last name must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Last name must not contain control characters")
         String lastName,
 
         @NotBlank(message = "Phone number is required")
-        @Size(max = 20)
+        @Size(max = 20, message = "Phone number must be at most 20 characters")
         @Pattern(regexp = "^[+\\d\\s\\-()]*$", message = "Phone number contains invalid characters")
         String phoneNumber
 ) {}

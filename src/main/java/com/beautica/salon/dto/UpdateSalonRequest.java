@@ -30,22 +30,22 @@ import java.util.UUID;
  * rather than a {@code DataIntegrityViolationException} 500 (§A).
  */
 public record UpdateSalonRequest(
-        @Size(max = 255)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 255, message = "Name must be at most 255 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
         String name,
-        @Size(max = 2000)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 2000, message = "Description must be at most 2000 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
         String description,
 
         // ---- Legacy free-text locality (deprecated; no longer persisted) ----
-        @Size(max = 100)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 100, message = "City must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "City must not contain control characters")
         String city,
-        @Size(max = 100)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 100, message = "Region must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Region must not contain control characters")
         String region,
-        @Size(max = 500)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 500, message = "Address must be at most 500 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Address must not contain control characters")
         String address,
 
         // ---- Phase 10.6 taxonomy locality + light structured address -------
@@ -54,21 +54,21 @@ public record UpdateSalonRequest(
         // otherwise reach the DB and yield a 500 instead of a clean 400 (§A).
         UUID cityId,
         UUID districtId,
-        @Size(max = 255)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 255, message = "Street must be at most 255 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Street must not contain control characters")
         String street,
-        @Size(max = 50)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 50, message = "Building number must be at most 50 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Building number must not contain control characters")
         String buildingNo,
-        @Size(max = 1000)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 1000, message = "Location note must be at most 1000 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Location note must not contain control characters")
         String locationNote,
 
         @Pattern(regexp = "^[+\\d\\s\\-()/]*$", message = "Invalid phone format")
-        @Size(max = 20) String phone,
+        @Size(max = 20, message = "Phone must be at most 20 characters") String phone,
         @Pattern(regexp = "^$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
                 message = "Must be a valid Instagram URL or empty")
-        @Size(max = 500) String instagramUrl
+        @Size(max = 500, message = "Instagram URL must be at most 500 characters") String instagramUrl
 ) {
 
     /** Projects the taxonomy FK pair into the validator's input shape. */

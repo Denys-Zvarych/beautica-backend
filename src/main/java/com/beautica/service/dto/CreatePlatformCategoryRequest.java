@@ -20,7 +20,7 @@ import jakarta.validation.constraints.Size;
  * </ul>
  */
 public record CreatePlatformCategoryRequest(
-        @NotBlank
+        @NotBlank(message = "Category name is required")
         @Size(max = 50, message = "Category name must be at most 50 characters")
         @Pattern(
                 regexp = "^[A-Z][A-Z0-9_]*$",

@@ -14,15 +14,17 @@ import java.util.UUID;
  *   provides the first-pass 400, the service provides authoritative booking-window enforcement.
  */
 public record CreateBookingRequest(
-        @NotNull UUID masterId,
-        @NotNull UUID masterServiceId,
-        @NotNull @Future ZonedDateTime startsAt,
-        @Size(max = 64)
+        @NotNull(message = "Master ID is required") UUID masterId,
+        @NotNull(message = "Service ID is required") UUID masterServiceId,
+        @NotNull(message = "Start time is required")
+        @Future(message = "Start time must be in the future")
+        ZonedDateTime startsAt,
+        @Size(max = 64, message = "Idempotency key must be at most 64 characters")
         @Pattern(regexp = "[A-Za-z0-9\\-_]{1,64}", message = "Idempotency key must be 1–64 alphanumeric/dash/underscore characters")
         String idempotencyKey,
         // Control-char ban mirrors CancelBookingRequest.comment and ScheduleExceptionRequest.note
         // (§D): @Size alone lets embedded NUL/newline reach the DB and produce a 500 not a 400.
-        @Size(max = 1000)
+        @Size(max = 1000, message = "Comment must be at most 1000 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Comment must not contain control characters")
         String clientComment
 ) {}

@@ -41,12 +41,12 @@ import java.util.UUID;
  */
 @ServicePriceValid
 public record CreateServiceDefinitionRequest(
-        @NotBlank
-        @Size(max = 100)
+        @NotBlank(message = "Name is required")
+        @Size(max = 100, message = "Name must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
         String name,
 
-        @Size(max = 2000)
+        @Size(max = 2000, message = "Description must be at most 2000 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
         String description,
 
@@ -61,30 +61,35 @@ public record CreateServiceDefinitionRequest(
                  message = "Category must contain only uppercase letters, digits, or underscores, and start with a letter")
         String category,
 
-        @NotNull @Positive @Max(480) int baseDurationMinutes,
+        @NotNull(message = "Duration is required")
+        @Positive(message = "Duration must be a positive number of minutes")
+        @Max(value = 480, message = "Duration must be at most 480 minutes (8 hours)")
+        int baseDurationMinutes,
 
-        @Min(0) @Max(120) int bufferMinutesAfter,
+        @Min(value = 0, message = "Buffer must be non-negative")
+        @Max(value = 120, message = "Buffer must be at most 120 minutes")
+        int bufferMinutesAfter,
 
         /** Pricing mode — required. Must be consistent with the price fields below. */
-        @NotNull
+        @NotNull(message = "Price type is required (FIXED or RANGE)")
         PriceType priceType,
 
         /**
          * FIXED-mode amount. Required when {@code priceType = FIXED}; must be null for RANGE.
          * Validated by {@link com.beautica.service.validation.ServicePriceValidator}.
          */
-        @DecimalMin(value = "0.01", inclusive = true)
-        @DecimalMax(value = "99999999.99")
-        @Digits(integer = 8, fraction = 2)
+        @DecimalMin(value = "0.01", inclusive = true, message = "Price must be at least 0.01")
+        @DecimalMax(value = "99999999.99", message = "Price exceeds the maximum allowed value")
+        @Digits(integer = 8, fraction = 2, message = "Price must have at most 8 integer digits and 2 decimal places")
         BigDecimal price,
 
         /**
          * RANGE floor. Required when {@code priceType = RANGE}; must be null for FIXED.
          * Validated by {@link com.beautica.service.validation.ServicePriceValidator}.
          */
-        @DecimalMin(value = "0.01", inclusive = true)
-        @DecimalMax(value = "99999999.99")
-        @Digits(integer = 8, fraction = 2)
+        @DecimalMin(value = "0.01", inclusive = true, message = "Minimum price must be at least 0.01")
+        @DecimalMax(value = "99999999.99", message = "Minimum price exceeds the maximum allowed value")
+        @Digits(integer = 8, fraction = 2, message = "Minimum price must have at most 8 integer digits and 2 decimal places")
         BigDecimal priceMin,
 
         /**
@@ -92,9 +97,9 @@ public record CreateServiceDefinitionRequest(
          * Must be strictly greater than {@code priceMin}.
          * Validated by {@link com.beautica.service.validation.ServicePriceValidator}.
          */
-        @DecimalMin(value = "0.01", inclusive = true)
-        @DecimalMax(value = "99999999.99")
-        @Digits(integer = 8, fraction = 2)
+        @DecimalMin(value = "0.01", inclusive = true, message = "Maximum price must be at least 0.01")
+        @DecimalMax(value = "99999999.99", message = "Maximum price exceeds the maximum allowed value")
+        @Digits(integer = 8, fraction = 2, message = "Maximum price must have at most 8 integer digits and 2 decimal places")
         BigDecimal priceMax,
 
         @Nullable UUID serviceTypeId
