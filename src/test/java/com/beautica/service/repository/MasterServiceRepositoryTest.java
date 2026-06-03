@@ -20,6 +20,10 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import org.springframework.data.domain.PageRequest;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 
@@ -346,5 +350,155 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
         assertThat(results.get(0).getServiceDefinition().getServiceType())
                 .as("serviceType must be null when no service_type_id is set on the definition")
                 .isNull();
+    }
+
+    // ── ordering regression (V68 / ORDER BY msa.createdAt ASC, msa.id ASC) ───────────────────────
+    //
+    // Bug: the query previously ended with `ORDER BY msa.id`, where msa.id is a random
+    // (v4) UUID. A master's services therefore came back in an arbitrary, non-deterministic
+    // order instead of creation order. Fix: `ORDER BY msa.createdAt ASC, msa.id ASC`.
+    //
+    // These tests pin creation-order ordering: they FAIL against the old `ORDER BY msa.id`
+    // (random UUID order) and PASS with the createdAt-based ordering.
+
+    @Test
+    @DisplayName("should_returnServicesInCreationOrder_when_masterHasMultipleServices")
+    void should_returnServicesInCreationOrder_when_masterHasMultipleServices() {
+        // Arrange — 5 assignments for the same master with strictly increasing createdAt
+        // timestamps assigned in a known sequence. createdAt is @CreationTimestamp (not
+        // builder-settable), so we persist each row then stamp an explicit, controlled
+        // created_at via native SQL. The expected order is the creation sequence below,
+        // which is independent of the random UUID primary key.
+        List<UUID> expectedDefIdsInCreationOrder = new ArrayList<>();
+        Instant base = Instant.parse("2026-01-01T08:00:00Z");
+
+        for (int i = 0; i < 5; i++) {
+            ServiceDefinition def = ServiceDefinition.builder()
+                    .ownerType(OwnerType.INDEPENDENT_MASTER)
+                    .ownerId(master.getId())
+                    .name("Service-" + i)
+                    .category("MANICURE")
+                    .baseDurationMinutes(30 + i)
+                    .priceType(PriceType.FIXED)
+                    .basePrice(new BigDecimal("100.00"))
+                    .isActive(true)
+                    .build();
+            em.persist(def);
+
+            MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                    .master(master)
+                    .serviceDefinition(def)
+                    .isActive(true)
+                    .build();
+            em.persist(assignment);
+            em.flush();
+
+            // Stamp a deterministic, strictly increasing created_at so creation order is
+            // unambiguous and decoupled from the random UUID id.
+            Instant createdAt = base.plus(i, ChronoUnit.MINUTES);
+            em.getEntityManager()
+                    .createNativeQuery("UPDATE master_services SET created_at = :ts WHERE id = :id")
+                    .setParameter("ts", createdAt)
+                    .setParameter("id", assignment.getId())
+                    .executeUpdate();
+
+            expectedDefIdsInCreationOrder.add(def.getId());
+        }
+        em.flush();
+        em.clear(); // force the query to read from the DB, not the first-level cache
+
+        // Sanity check: the random UUID order is NOT the creation order — otherwise this
+        // test could pass under the buggy `ORDER BY msa.id` by coincidence. With 5 random
+        // v4 UUIDs the chance of accidental coincidence is 1/120; assert it explicitly so a
+        // flaky pass can never mask a real ordering regression.
+        List<MasterServiceAssignment> rawById = masterServiceRepository
+                .findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200))
+                .stream()
+                .sorted(Comparator.comparing(MasterServiceAssignment::getId))
+                .toList();
+        List<UUID> defIdsSortedByAssignmentId = rawById.stream()
+                .map(a -> a.getServiceDefinition().getId())
+                .toList();
+        assertThat(defIdsSortedByAssignmentId)
+                .as("guard: UUID-id ordering must differ from creation ordering, "
+                        + "otherwise the buggy ORDER BY msa.id could pass by coincidence")
+                .isNotEqualTo(expectedDefIdsInCreationOrder);
+
+        // Act
+        List<MasterServiceAssignment> results =
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
+
+        // Assert — services come back in creation order (createdAt ASC), NOT random UUID order
+        assertThat(results).hasSize(5);
+        assertThat(results)
+                .extracting(a -> a.getServiceDefinition().getId())
+                .as("services must be returned in creation order (ORDER BY createdAt ASC), "
+                        + "not by the random UUID primary key")
+                .containsExactlyElementsOf(expectedDefIdsInCreationOrder);
+    }
+
+    @Test
+    @DisplayName("should_breakTiesById_when_servicesShareSameCreatedAt")
+    void should_breakTiesById_when_servicesShareSameCreatedAt() {
+        // Arrange — 3 assignments with the IDENTICAL created_at value. The ordering is then
+        // fully determined by the `, msa.id ASC` tiebreaker, making the result deterministic
+        // even when timestamps collide (e.g. several rows inserted in the same millisecond).
+        Instant sameTs = Instant.parse("2026-01-01T08:00:00Z");
+        List<UUID> assignmentIds = new ArrayList<>();
+        List<UUID> defIdByAssignment = new ArrayList<>();
+
+        for (int i = 0; i < 3; i++) {
+            ServiceDefinition def = ServiceDefinition.builder()
+                    .ownerType(OwnerType.INDEPENDENT_MASTER)
+                    .ownerId(master.getId())
+                    .name("Tie-" + i)
+                    .category("MANICURE")
+                    .baseDurationMinutes(30)
+                    .priceType(PriceType.FIXED)
+                    .basePrice(new BigDecimal("100.00"))
+                    .isActive(true)
+                    .build();
+            em.persist(def);
+
+            MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                    .master(master)
+                    .serviceDefinition(def)
+                    .isActive(true)
+                    .build();
+            em.persist(assignment);
+            em.flush();
+
+            em.getEntityManager()
+                    .createNativeQuery("UPDATE master_services SET created_at = :ts WHERE id = :id")
+                    .setParameter("ts", sameTs)
+                    .setParameter("id", assignment.getId())
+                    .executeUpdate();
+
+            assignmentIds.add(assignment.getId());
+            defIdByAssignment.add(def.getId());
+        }
+        em.flush();
+        em.clear();
+
+        // Expected order when createdAt is equal: assignments sorted by their id ASC,
+        // using PostgreSQL's UUID ordering. Postgres compares the 16 bytes as UNSIGNED,
+        // whereas Java's UUID.compareTo treats each 64-bit half as a SIGNED long — the two
+        // disagree whenever the most-significant bit is set. Replicate the DB's unsigned
+        // byte order here so the expected order matches `ORDER BY msa.id` in the query.
+        Comparator<UUID> postgresUuidOrder = Comparator
+                .comparingLong((UUID u) -> u.getMostSignificantBits() + Long.MIN_VALUE)
+                .thenComparingLong(u -> u.getLeastSignificantBits() + Long.MIN_VALUE);
+        List<UUID> expectedAssignmentIdOrder = assignmentIds.stream().sorted(postgresUuidOrder).toList();
+
+        // Act
+        List<MasterServiceAssignment> results =
+                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
+
+        // Assert — equal timestamps fall back to the id ASC tiebreaker (stable order)
+        assertThat(results).hasSize(3);
+        assertThat(results)
+                .extracting(MasterServiceAssignment::getId)
+                .as("equal createdAt must fall back to the `msa.id ASC` tiebreaker for a stable order")
+                .containsExactlyElementsOf(expectedAssignmentIdOrder);
     }
 }
