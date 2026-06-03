@@ -43,7 +43,7 @@ public class ServiceCatalogController {
     public ApiResponse<List<ServiceTypeResponse>> getServiceTypes(
             @RequestParam(required = false) UUID categoryId,
             @RequestParam(required = false)
-            @Size(min = 3, max = 100)
+            @Size(min = 3, max = 100, message = "Search query must be 3–100 characters")
             @Pattern(regexp = "^[^\\p{Cntrl}<>\"']+$",
                      message = "Search query must not contain control characters or HTML special characters")
             String q) {

@@ -232,6 +232,52 @@ class UserControllerTest {
                 .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
     }
 
+    // ── UpdateProfileRequest readable @Size / @Pattern message contract (regression) ─
+    // The address fields gained explicit message= strings. @RequestBody violations
+    // surface via MethodArgumentNotValidException → GlobalExceptionHandler.handleValidation,
+    // which keys the readable message by the DTO field name in the top-level errors map.
+    // These lock the exact per-field strings the mobile client renders inline.
+
+    @Test
+    @DisplayName("PATCH /me — errors.street carries the readable @Size message when street exceeds 255 chars (regression)")
+    void should_returnReadableSizeMessage_when_streetExceeds255Chars() throws Exception {
+        var userId = UUID.randomUUID();
+        // street is index 5: (firstName, lastName, phoneNumber, cityId, districtId, street, buildingNo, locationNote)
+        var tooLongStreet = "A".repeat(256);
+        var body = new UpdateProfileRequest("Jane", "Doe", null,
+                null, null, tooLongStreet, null, null);
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.street").value("Street must be at most 255 characters"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me — errors.street carries the readable @Pattern message when street contains a control character (regression)")
+    void should_returnReadablePatternMessage_when_streetHasControlCharacter() throws Exception {
+        var userId = UUID.randomUUID();
+        // Embedded NUL in street — @Pattern(^[^\p{Cntrl}]*$) must reject at the controller boundary.
+        // Raw JSON keeps the source file ASCII-clean; Jackson decodes   to the literal control char.
+        var body = "{\"firstName\":\"Jane\",\"lastName\":\"Doe\",\"street\":\"Main St\\u0000\"}";
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.street").value("Street must not contain control characters"));
+
+        org.mockito.Mockito.verify(userService, org.mockito.Mockito.never())
+                .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
+    }
+
     @Test
     @DisplayName("PATCH /me with no JWT → 401")
     void should_return401_when_patchProfileWithoutJwt() throws Exception {

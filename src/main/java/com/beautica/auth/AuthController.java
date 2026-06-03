@@ -153,7 +153,7 @@ public class AuthController {
 
     @GetMapping("/invite/validate")
     public ResponseEntity<ApiResponse<InvitePreviewResponse>> validateInvite(
-            @RequestParam @NotBlank @Size(max = 200) String token
+            @RequestParam @NotBlank @Size(max = 512, message = "Token is invalid") String token
     ) {
         InvitePreviewResponse response = inviteService.previewInvite(token);
         return ResponseEntity.ok(ApiResponse.ok(response));

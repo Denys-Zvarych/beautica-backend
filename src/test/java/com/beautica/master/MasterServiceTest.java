@@ -418,6 +418,87 @@ class MasterServiceTest {
         verify(workingHoursRepository, never()).saveAll(any());
     }
 
+    // ── upsertWorkingHours — duplicate-dayOfWeek guard (regression) ────────────
+    // A payload with two entries sharing the same dayOfWeek must be rejected with a
+    // BusinessException(BAD_REQUEST) BEFORE any DB work. Without this guard the
+    // byDay collector would silently collapse duplicates to the last-wins entry.
+    // The descriptive message stays server-side; GlobalExceptionHandler.handleBusiness
+    // rewrites it to the generic "Invalid request" 400 on the wire (asserted at the
+    // controller layer below).
+
+    @Test
+    @DisplayName("should_throwBadRequest_when_upsertWorkingHours_payloadHasDuplicateDay")
+    void should_throwBadRequest_when_upsertWorkingHoursPayloadHasDuplicateDay() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        // Two entries both targeting dayOfWeek=1 — the guard must trip on the second.
+        var first = new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(13, 0), true);
+        var duplicate = new WorkingHoursRequest(1, LocalTime.of(14, 0), LocalTime.of(18, 0), true);
+
+        assertThatThrownBy(() ->
+                masterService.upsertWorkingHours(actorId, masterId, List.of(first, duplicate)))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Duplicate working-hours entry for the same day");
+
+        // Guard runs before any repository access — no master lookup, no save.
+        verify(masterRepository, never()).findByIdWithSalonAndOwner(any());
+        verify(workingHoursRepository, never()).findByMasterIdAndIsActiveTrue(any());
+        verify(workingHoursRepository, never()).saveAll(any());
+    }
+
+    @Test
+    @DisplayName("should_upsertWorkingHours_when_payloadHasTwoDistinctDays")
+    void should_upsertWorkingHours_when_payloadHasTwoDistinctDays() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = mock(Master.class);
+
+        var monday = new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
+        var tuesday = new WorkingHoursRequest(2, LocalTime.of(10, 0), LocalTime.of(18, 0), true);
+
+        WorkingHours savedMon = WorkingHours.builder()
+                .master(master).dayOfWeek(1)
+                .startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(17, 0)).isActive(true).build();
+        WorkingHours savedTue = WorkingHours.builder()
+                .master(master).dayOfWeek(2)
+                .startTime(LocalTime.of(10, 0)).endTime(LocalTime.of(18, 0)).isActive(true).build();
+        ReflectionTestUtils.setField(savedMon, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(savedTue, "id", UUID.randomUUID());
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of(savedMon, savedTue));
+
+        List<WorkingHoursResponse> result =
+                masterService.upsertWorkingHours(actorId, masterId, List.of(monday, tuesday));
+
+        // Distinct days never trip the guard — both entries persisted.
+        assertThat(result).hasSize(2);
+        assertThat(result).extracting(WorkingHoursResponse::dayOfWeek).containsExactly(1, 2);
+        verify(workingHoursRepository).saveAll(anyList());
+    }
+
+    @Test
+    @DisplayName("should_returnEmptyListAsNoOp_when_upsertWorkingHoursPayloadIsEmpty")
+    void should_returnEmptyListAsNoOp_when_upsertWorkingHoursPayloadIsEmpty() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = mock(Master.class);
+
+        // Empty payload must never trip the duplicate guard; it stays a clean no-op
+        // (master is loaded, saveAll receives an empty list, an empty list is returned).
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of());
+
+        List<WorkingHoursResponse> result =
+                masterService.upsertWorkingHours(actorId, masterId, List.of());
+
+        assertThat(result).isEmpty();
+        verify(workingHoursRepository).saveAll(anyList());
+    }
+
     // ── deactivateMaster ──────────────────────────────────────────────────────
 
     @Test
