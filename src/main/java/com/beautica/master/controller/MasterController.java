@@ -91,7 +91,9 @@ public class MasterController {
     @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
     public ApiResponse<List<WorkingHoursResponse>> upsertWorkingHours(
             @PathVariable UUID masterId,
-            @Valid @RequestBody @Size(max = 7) List<WorkingHoursRequest> requests,
+            @Valid @RequestBody
+            @Size(max = 7, message = "At most 7 working-hours entries (one per weekday) are allowed")
+            List<WorkingHoursRequest> requests,
             Authentication authentication
     ) {
         UUID actorId = extractUserId(authentication);

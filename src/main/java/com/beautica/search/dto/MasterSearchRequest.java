@@ -76,30 +76,30 @@ public record MasterSearchRequest(
         @Valid
         LocationFilter location,
 
-        @Size(max = 100)
+        @Size(max = 100, message = "category must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
-                 message = "must not contain control characters or HTML special characters")
+                 message = "category must not contain control characters or HTML special characters")
         String category,
 
-        @DecimalMin("0")
-        @Digits(integer = 8, fraction = 2)
+        @DecimalMin(value = "0", message = "minPrice must be at least 0")
+        @Digits(integer = 8, fraction = 2, message = "minPrice must have at most 8 integer digits and 2 decimal places")
         BigDecimal minPrice,
 
-        @DecimalMin("0")
-        @Digits(integer = 8, fraction = 2)
+        @DecimalMin(value = "0", message = "maxPrice must be at least 0")
+        @Digits(integer = 8, fraction = 2, message = "maxPrice must have at most 8 integer digits and 2 decimal places")
         BigDecimal maxPrice,
 
-        @DecimalMin("0.0")
-        @DecimalMax("5.0")
-        @Digits(integer = 1, fraction = 2)
+        @DecimalMin(value = "0.0", message = "minRating must be between 0.0 and 5.0")
+        @DecimalMax(value = "5.0", message = "minRating must be between 0.0 and 5.0")
+        @Digits(integer = 1, fraction = 2, message = "minRating must have 1 integer digit and at most 2 decimal places")
         BigDecimal minRating,
 
-        @PositiveOrZero
-        @Max(500)
+        @PositiveOrZero(message = "page must be zero or positive")
+        @Max(value = 500, message = "page must be at most 500")
         Integer page,
 
-        @Positive
-        @Max(100)
+        @Positive(message = "size must be a positive number")
+        @Max(value = 100, message = "size must be at most 100")
         Integer size
 ) {
 

@@ -8,9 +8,11 @@ import jakarta.validation.constraints.NotNull;
 import java.time.LocalTime;
 
 public record WorkingHoursRequest(
-        @Min(1) @Max(7) int dayOfWeek,
-        @NotNull LocalTime startTime,
-        @NotNull LocalTime endTime,
+        @Min(value = 1, message = "Day of week must be between 1 (Monday) and 7 (Sunday)")
+        @Max(value = 7, message = "Day of week must be between 1 (Monday) and 7 (Sunday)")
+        int dayOfWeek,
+        @NotNull(message = "Start time is required") LocalTime startTime,
+        @NotNull(message = "End time is required") LocalTime endTime,
         boolean isActive
 ) {
     @AssertTrue(message = "startTime must be before endTime")

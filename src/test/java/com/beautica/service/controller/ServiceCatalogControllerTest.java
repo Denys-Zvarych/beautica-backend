@@ -42,6 +42,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
@@ -488,6 +489,45 @@ class ServiceCatalogControllerTest {
                         .param("q", "\"alert\"")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest());
+    }
+
+    // ── q @Size message contract (regression) ─────────────────────────────────
+    // The @Size(min=3,max=100) now carries the readable message
+    // "Search query must be 3–100 characters". AuthController/ServiceCatalogController
+    // are @Validated, so the @RequestParam violation surfaces as a
+    // ConstraintViolationException keyed by the leaf property name "q"
+    // (GlobalExceptionHandler.handleConstraintViolation). These two lock the exact
+    // wire message the mobile ErrorMapperInterceptor renders inline.
+
+    @Test
+    @DisplayName("GET /service-types?q=ab — errors.q carries the readable @Size message when q is too short (regression)")
+    void should_returnReadableSizeMessage_when_qParamTooShort() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?q=ab — readable @Size(min=3) message must surface under errors.q");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "ab")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.q").value("Search query must be 3–100 characters"));
+
+        verify(serviceCatalogService, never()).searchServiceTypes(any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?q=<101-char> — errors.q carries the readable @Size message when q is too long (regression)")
+    void should_returnReadableSizeMessage_when_qParamTooLong() throws Exception {
+        String longQ = "a".repeat(101);
+        log.debug("Act: GET /api/v1/service-types?q=<101 chars> — readable @Size(max=100) message must surface under errors.q");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", longQ)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.q").value("Search query must be 3–100 characters"));
+
+        verify(serviceCatalogService, never()).searchServiceTypes(any(), any());
     }
 
     @Test

@@ -57,6 +57,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -455,6 +457,42 @@ class MasterControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /{masterId}/working-hours — 400 with readable @Size(max=7) message when payload has 8 entries (regression)")
+    void should_return400WithReadableSizeMessage_when_workingHoursPayloadExceeds7Entries() throws Exception {
+        var masterId = UUID.randomUUID();
+        var userId = UUID.randomUUID();
+        when(authorizationService.canManageMasterSchedule(any(), eq(masterId))).thenReturn(true);
+
+        // 8 entries (days 1..7 plus a duplicate day 1) — exceeds @Size(max=7) on the list itself.
+        // MasterController is @Validated, so the violation surfaces as a ConstraintViolationException
+        // keyed by the leaf parameter name "requests" (GlobalExceptionHandler.handleConstraintViolation).
+        var eightEntries = List.of(
+                new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true),
+                new WorkingHoursRequest(2, LocalTime.of(9, 0), LocalTime.of(17, 0), true),
+                new WorkingHoursRequest(3, LocalTime.of(9, 0), LocalTime.of(17, 0), true),
+                new WorkingHoursRequest(4, LocalTime.of(9, 0), LocalTime.of(17, 0), true),
+                new WorkingHoursRequest(5, LocalTime.of(9, 0), LocalTime.of(17, 0), true),
+                new WorkingHoursRequest(6, LocalTime.of(9, 0), LocalTime.of(17, 0), true),
+                new WorkingHoursRequest(7, LocalTime.of(9, 0), LocalTime.of(17, 0), true),
+                new WorkingHoursRequest(1, LocalTime.of(10, 0), LocalTime.of(18, 0), true));
+        String body = objectMapper.writeValueAsString(eightEntries);
+
+        log.debug("Act: PATCH {}/{}/working-hours with 8 entries — readable @Size(max=7) message must surface",
+                MASTERS_URL, masterId);
+        mockMvc.perform(patch(MASTERS_URL + "/" + masterId + "/working-hours")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.requests")
+                        .value("At most 7 working-hours entries (one per weekday) are allowed"));
+
+        verify(masterService, never()).upsertWorkingHours(any(), any(), any());
+    }
+
+    @Test
     @DisplayName("PATCH /{masterId}/working-hours — 400 when startTime is after endTime")
     void should_return400_when_workingHoursStartTimeIsAfterEndTime() throws Exception {
         var masterId = UUID.randomUUID();
@@ -471,6 +509,43 @@ class MasterControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("PATCH /{masterId}/working-hours — 400 success:false when service throws duplicate-day BusinessException (descriptive text NOT leaked) (regression)")
+    void should_return400Generic_when_duplicateDayBusinessExceptionThrown() throws Exception {
+        var masterId = UUID.randomUUID();
+        var userId = UUID.randomUUID();
+        when(authorizationService.canManageMasterSchedule(any(), eq(masterId))).thenReturn(true);
+
+        // Two valid entries (within @Size(max=7)) that share dayOfWeek=1 — the size check passes,
+        // so the request reaches MasterService, whose duplicate-day guard throws
+        // BusinessException(BAD_REQUEST, "Duplicate working-hours entry for the same day").
+        // GlobalExceptionHandler.handleBusiness rewrites BAD_REQUEST to the generic "Invalid request";
+        // the descriptive message must NOT appear on the wire (it is debug-logged only).
+        var duplicateDayPayload = List.of(
+                new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(13, 0), true),
+                new WorkingHoursRequest(1, LocalTime.of(14, 0), LocalTime.of(18, 0), true));
+        String body = objectMapper.writeValueAsString(duplicateDayPayload);
+
+        when(masterService.upsertWorkingHours(eq(userId), eq(masterId), any()))
+                .thenThrow(new BusinessException(
+                        org.springframework.http.HttpStatus.BAD_REQUEST,
+                        "Duplicate working-hours entry for the same day"));
+
+        log.debug("Act: PATCH {}/{}/working-hours with two day=1 entries — must surface a generic 400",
+                MASTERS_URL, masterId);
+        mockMvc.perform(patch(MASTERS_URL + "/" + masterId + "/working-hours")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Invalid request"))
+                // The descriptive guard text must never reach the client body.
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("Duplicate"))));
     }
 
     // ── POST /{masterId}/schedule-exceptions ──────────────────────────────────

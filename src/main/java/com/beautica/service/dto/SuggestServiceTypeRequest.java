@@ -8,16 +8,16 @@ import jakarta.validation.constraints.Size;
 import java.util.UUID;
 
 public record SuggestServiceTypeRequest(
-        @NotBlank
-        @Size(max = 255)
+        @NotBlank(message = "Name is required")
+        @Size(max = 255, message = "Name must be at most 255 characters")
         // Full control-char ban (§D) — the prior narrow pattern only rejected \r\n\t
         // but allowed NUL (0x00) and other control bytes that produce a DB 500.
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
         String name,
 
-        @NotNull UUID categoryId,
+        @NotNull(message = "Category ID is required") UUID categoryId,
 
-        @Size(max = 1000)
+        @Size(max = 1000, message = "Description must be at most 1000 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
         String description
 ) {}

@@ -26,16 +26,16 @@ public record IndependentMasterUpdateRequest(
 
         UUID districtId,   // nullable — cities without urban districts
 
-        @Size(max = 255)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 255, message = "Street must be at most 255 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Street must not contain control characters")
         String street,
 
-        @Size(max = 50)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 50, message = "Building number must be at most 50 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Building number must not contain control characters")
         String buildingNo,
 
-        @Size(max = 1000)
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "must not contain control characters")
+        @Size(max = 1000, message = "Location note must be at most 1000 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Location note must not contain control characters")
         String locationNote   // nullable — free-text landmark / how-to-find
 
 ) {

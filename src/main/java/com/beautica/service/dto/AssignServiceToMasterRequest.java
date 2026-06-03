@@ -11,11 +11,11 @@ import java.math.BigDecimal;
 import java.util.UUID;
 
 public record AssignServiceToMasterRequest(
-        @NotNull UUID serviceDefId,
+        @NotNull(message = "Service definition ID is required") UUID serviceDefId,
 
         @DecimalMin(value = "0.01", message = "Price override must be positive")
         @DecimalMax(value = "99999.99", message = "Price override exceeds maximum")
-        @Digits(integer = 7, fraction = 2)
+        @Digits(integer = 7, fraction = 2, message = "Price override must have at most 7 integer digits and 2 decimal places")
         BigDecimal priceOverride,
 
         @Min(value = 1, message = "Duration override must be at least 1 minute")

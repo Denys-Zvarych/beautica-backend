@@ -13,15 +13,15 @@ import jakarta.validation.constraints.Size;
  */
 public record RegisterDeviceTokenRequest(
 
-        @NotBlank
-        @Size(max = 500)
+        @NotBlank(message = "Device token is required")
+        @Size(max = 500, message = "Device token must be at most 500 characters")
         @Pattern(
                 regexp = "^[A-Za-z0-9\\-_:]+$",
                 message = "Device token must contain only alphanumeric characters, hyphens, underscores, or colons"
         )
         String token,
 
-        @NotBlank
-        @Pattern(regexp = "^(ANDROID|IOS)$")
+        @NotBlank(message = "Platform is required")
+        @Pattern(regexp = "^(ANDROID|IOS)$", message = "Platform must be ANDROID or IOS")
         String platform
 ) {}

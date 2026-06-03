@@ -16,10 +16,10 @@ import jakarta.validation.constraints.Size;
  * manually after the request body is deserialized.
  */
 public record CancelBookingRequest(
-        @NotNull CancellationReason cancellationReason,
+        @NotNull(message = "Cancellation reason is required") CancellationReason cancellationReason,
         // max=1000 mirrors booking.client_comment VARCHAR(1000) (§A). Control-char
         // ban prevents embedded NUL/newline reaching the DB as a 500 instead of 400.
-        @Size(max = 1000)
+        @Size(max = 1000, message = "Comment must be at most 1000 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Comment must not contain control characters")
         String comment
 ) {}

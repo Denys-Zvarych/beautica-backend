@@ -35,6 +35,7 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -44,8 +45,10 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -276,6 +279,18 @@ public class MasterService {
     @Transactional
     public List<WorkingHoursResponse> upsertWorkingHours(
             UUID actorId, UUID masterId, List<WorkingHoursRequest> requests) {
+
+        // Reject a payload carrying two entries for the same weekday before any DB work.
+        // Without this guard the byDay.getOrDefault(...) loop below would silently collapse
+        // duplicates to the last-wins entry instead of surfacing the client error. Empty list
+        // stays a no-op (the check never trips). Surfaces as a clean 400 (§A) via handleBusiness.
+        Set<Integer> seenDays = new HashSet<>(requests.size());
+        for (WorkingHoursRequest req : requests) {
+            if (!seenDays.add(req.dayOfWeek())) {
+                throw new BusinessException(
+                        HttpStatus.BAD_REQUEST, "Duplicate working-hours entry for the same day");
+            }
+        }
 
         // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
         // the controller — no redundant DB round-trip needed here.
