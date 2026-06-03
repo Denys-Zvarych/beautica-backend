@@ -83,6 +83,11 @@ dependencies {
     // Observability
     implementation("org.springframework.boot:spring-boot-starter-actuator")
 
+    // Dev tooling — local-only automatic restart on recompile.
+    // 'developmentOnly' is excluded from the repackaged bootJar by the Spring Boot
+    // plugin, so DevTools never ships in the production artifact.
+    developmentOnly("org.springframework.boot:spring-boot-devtools")
+
     // Lombok
     compileOnly("org.projectlombok:lombok")
     annotationProcessor("org.projectlombok:lombok")
@@ -197,8 +202,32 @@ val coverageVerification = tasks.register<JacocoCoverageVerification>("jacocoCov
     )
 }
 
+// Regression guard: spring-boot-devtools must stay developmentOnly and never ship
+// in the production artifact. A plain JUnit test cannot enforce this — DevTools is
+// always present on testRuntimeClasspath (developmentOnly extends runtimeClasspath,
+// which tests inherit), so a classpath-presence assertion would be meaningless under
+// test. The authoritative signal is the Spring Boot plugin's productionRuntimeClasspath
+// configuration (exactly what gets packaged into the bootJar): DevTools MUST be absent
+// there. Flipping the scope to implementation/runtimeOnly drops it onto that
+// configuration and fails this task.
+val verifyNoDevtoolsInProd = tasks.register("verifyNoDevtoolsInProd") {
+    group = "verification"
+    description = "Fails if spring-boot-devtools leaks onto the production runtime classpath."
+    doLast {
+        val leaked = configurations.getByName("productionRuntimeClasspath")
+            .resolve()
+            .filter { it.name.contains("spring-boot-devtools") }
+        require(leaked.isEmpty()) {
+            "spring-boot-devtools must be declared 'developmentOnly' — it leaked onto " +
+                "productionRuntimeClasspath and would ship in the bootJar: " +
+                leaked.map { it.name }
+        }
+    }
+}
+
 // Enforce coverage thresholds as part of the standard check lifecycle so CI fails
 // automatically when coverage drops below the minimum without needing an explicit task flag.
 tasks.check {
     dependsOn(coverageVerification)
+    dependsOn(verifyNoDevtoolsInProd)
 }

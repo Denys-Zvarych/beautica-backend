@@ -88,7 +88,7 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             WHERE msa.master.id = :masterId
               AND msa.isActive = true
               AND sd.isActive = true
-            ORDER BY msa.id
+            ORDER BY msa.createdAt ASC, msa.id ASC
             """)
     List<MasterServiceAssignment> findByMasterIdAndIsActiveTrueWithGraph(
             @Param("masterId") UUID masterId,
