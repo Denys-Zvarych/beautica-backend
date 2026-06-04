@@ -105,9 +105,23 @@ public class SlotCalculationService {
             return List.of();
         }
 
-        // Step 6: compute day window in OffsetDateTime for the booking query
+        // Step 6: compute the booking-query window in OffsetDateTime.
+        // The lower bound is the date's start of day; the upper bound normally is date+1 00:00.
+        // crossesMidnight is ALWAYS false for persisted intervals: the model enforces endTime > startTime
+        // at four layers (WorkIntervalDto.isOrdered, MasterScheduleService validation, chk_interval_order,
+        // chk_exc_interval_order), so a resolved interval can never satisfy endTime <= startTime. A night
+        // shift is two single-calendar-day rows on two adjacent ISO weekdays, each subtracted on its own
+        // date query — never one wrapping interval. This widen GUARDS AN UNREACHABLE MODEL STATE: were a
+        // cross-midnight interval ever to slip through, its post-midnight slots (and the bookings on them)
+        // would run into the next calendar day, and a flat [date 00:00, date+1 00:00) window would never
+        // load a post-midnight booking (the native finder filters starts_at < windowEnd) → double-book.
+        // It stays defensive and cheap (one extra day only on a state that cannot occur); the normal path
+        // keeps the tight single-day window (Anti-Bug §E narrow window).
         OffsetDateTime dayStart = date.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
-        OffsetDateTime dayEnd   = date.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        boolean crossesMidnight = intervals.stream()
+                .anyMatch(iv -> !iv.endTime().isAfter(iv.startTime()));
+        LocalDate windowEndDate = crossesMidnight ? date.plusDays(2) : date.plusDays(1);
+        OffsetDateTime dayEnd = windowEndDate.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
         // Step 7: load existing bookings that overlap the day window (PENDING + CONFIRMED only).
         // Loaded once for the whole day and subtracted from every interval below.

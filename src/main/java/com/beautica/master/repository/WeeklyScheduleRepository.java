@@ -2,7 +2,9 @@ package com.beautica.master.repository;
 
 import com.beautica.common.DateRange;
 import com.beautica.master.entity.WeeklySchedule;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -33,12 +35,32 @@ public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, 
     List<WeeklySchedule> findCoveringDate(@Param("masterId") UUID masterId, @Param("date") LocalDate date);
 
     /**
-     * Non-graph variant: used only by the window-overlap invariant check, which reads
-     * {@code validFrom}/{@code validTo} alone and never traverses {@code intervals} — so no
-     * N+1 hazard (Anti-Bug §E exemption documented here). The list-read endpoint uses the
-     * graph variant {@link #findByMasterIdOrderByValidFromAscWithIntervals} instead.
+     * Non-graph variant, no row lock: retained for test/read assertions that inspect a master's
+     * validity windows outside a write transaction. Reads {@code validFrom}/{@code validTo} alone and
+     * never traverses {@code intervals} — so no N+1 hazard (Anti-Bug §E exemption documented here). The
+     * list-read endpoint uses the graph variant {@link #findByMasterIdOrderByValidFromAscWithIntervals};
+     * the write-path overlap invariant uses the locked {@link #findByMasterIdForUpdate} instead.
      */
     List<WeeklySchedule> findByMasterIdOrderByValidFromAsc(UUID masterId);
+
+    /**
+     * Phase 15.6 (MEDIUM-4, TOCTOU): {@code PESSIMISTIC_WRITE}-locked variant of
+     * {@link #findByMasterIdOrderByValidFromAsc}, called at the start of the create/update transaction
+     * so the check-then-insert window-overlap invariant is serialized per master. Two concurrent
+     * overlapping-window inserts for the same master can otherwise both pass the in-memory
+     * {@code assertNoWindowOverlap} check and both commit. The row lock forces the second transaction
+     * to wait for the first to commit before it re-reads, closing the race.
+     *
+     * <p>Reads {@code validFrom}/{@code validTo} only (the overlap check never traverses
+     * {@code intervals}), so no N+1 hazard — the §E exemption noted on the non-locking variant applies.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("""
+            SELECT ws FROM WeeklySchedule ws
+            WHERE ws.master.id = :masterId
+            ORDER BY ws.validFrom ASC
+            """)
+    List<WeeklySchedule> findByMasterIdForUpdate(@Param("masterId") UUID masterId);
 
     /**
      * Phase 15.5: a master's weekly templates ordered by {@code validFrom}, with

@@ -43,6 +43,13 @@ public class ScheduleDateMath {
     private static final int FAR_FUTURE_CAP_YEARS = 2;
 
     /**
+     * Hard lower bound on how far into the past a <em>read</em> window may reach: {@code today - 1 year}.
+     * Mirrors the {@code MasterController} calendar bounds guard so a caller cannot request an
+     * arbitrarily far-past {@code from} (e.g. year 1000) and trigger an oversized scan.
+     */
+    private static final int FAR_PAST_CAP_YEARS = 1;
+
+    /**
      * Maximum {@link ChronoUnit#DAYS} <em>between</em> the endpoints of a per-date expansion. A value of
      * 365 caps the materialised list at 366 inclusive dates (a full leap year). Wider spans are rejected
      * so callers cannot trigger unbounded loops or queries.
@@ -83,6 +90,14 @@ public class ScheduleDateMath {
     }
 
     /**
+     * Far-past floor for read windows: {@code today - 1 year}. {@link LocalDate#minusYears(long)} clamps a
+     * Feb-29 origin to Feb 28 in a non-leap target year, which is the correct behaviour.
+     */
+    public LocalDate pastFloor() {
+        return today().minusYears(FAR_PAST_CAP_YEARS);
+    }
+
+    /**
      * Guards a bounded availability/validity window: {@code from} may not be in the past, {@code to} may
      * not exceed the far-future {@link #cap()}, and {@code from} may not be after {@code to}. Violations
      * surface as a 400 {@link BusinessException}.
@@ -102,8 +117,10 @@ public class ScheduleDateMath {
     /**
      * Guards a bounded <em>read</em> window (Phase 15.5 GET endpoints). Unlike
      * {@link #assertWithinBounds}, the start <b>may be in the past</b> (the calendar shows greyed
-     * history), but the window must still be ordered, span no more than 366 inclusive days, and not
-     * reach past the far-future {@link #cap()}. Violations surface as a 400 {@link BusinessException}.
+     * history), but only as far back as the {@link #pastFloor() one-year past floor}; the window must
+     * also be ordered, span no more than 366 inclusive days, and not reach past the far-future
+     * {@link #cap()}. An arbitrarily far-past {@code from} (e.g. year 1000) is rejected so callers
+     * cannot trigger an oversized scan. Violations surface as a 400 {@link BusinessException}.
      */
     public void assertExpandable(LocalDate from, LocalDate to) {
         if (from == null || to == null) {
@@ -111,6 +128,9 @@ public class ScheduleDateMath {
         }
         if (from.isAfter(to)) {
             throw new BusinessException("Schedule range start must not be after its end");
+        }
+        if (from.isBefore(pastFloor())) {
+            throw new BusinessException("Schedule range start exceeds the allowed one-year past window");
         }
         if (to.isAfter(cap())) {
             throw new BusinessException("Schedule range end exceeds the allowed two-year window");

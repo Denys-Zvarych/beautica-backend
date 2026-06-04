@@ -375,9 +375,16 @@ public class MasterScheduleService {
         }
     }
 
-    /** Window overlap against the master's other schedules ({@code DateRange.overlaps}, null to = +∞). */
+    /**
+     * Window overlap against the master's other schedules ({@code DateRange.overlaps}, null to = +∞).
+     *
+     * <p><b>MEDIUM-4 (TOCTOU).</b> Reads the master's existing schedules under a
+     * {@code PESSIMISTIC_WRITE} row lock so two concurrent overlapping-window upserts for the same master
+     * are serialized: the second transaction blocks on the lock until the first commits, then re-reads and
+     * sees the freshly-inserted window — closing the check-then-insert race that previously let both commit.
+     */
     private void assertNoWindowOverlap(UUID masterId, UUID editingScheduleId, DateRange candidate) {
-        for (WeeklySchedule existing : weeklyScheduleRepository.findByMasterIdOrderByValidFromAsc(masterId)) {
+        for (WeeklySchedule existing : weeklyScheduleRepository.findByMasterIdForUpdate(masterId)) {
             if (editingScheduleId != null && existing.getId().equals(editingScheduleId)) {
                 continue; // the schedule being edited never conflicts with itself
             }

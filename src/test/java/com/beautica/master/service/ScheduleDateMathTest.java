@@ -162,6 +162,35 @@ class ScheduleDateMathTest {
     }
 
     @Test
+    void should_acceptStartAtPastFloor_when_assertExpandable() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2024, 5, 22));
+        // from = today - 1y exactly (the past floor). A 30-day window stays within the 365-day span cap.
+        LocalDate from = LocalDate.of(2023, 5, 22);
+        LocalDate to = LocalDate.of(2023, 6, 21);
+
+        math.assertExpandable(from, to);
+    }
+
+    @Test
+    void should_rejectAbsurdlyFarPastStart_when_assertExpandable() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2024, 5, 22));
+        LocalDate farPast = LocalDate.of(1000, 1, 1); // pastFloor = 2023-05-22
+
+        assertThatThrownBy(() -> math.assertExpandable(farPast, LocalDate.of(2024, 5, 22)))
+                .isInstanceOf(BusinessException.class);
+    }
+
+    @Test
+    void should_rejectStartJustBeyondPastFloor_when_assertExpandable() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2024, 5, 22));
+        // pastFloor = 2023-05-22; one day earlier must be rejected.
+        LocalDate justBeyond = LocalDate.of(2023, 5, 21);
+
+        assertThatThrownBy(() -> math.assertExpandable(justBeyond, LocalDate.of(2024, 5, 22)))
+                .isInstanceOf(BusinessException.class);
+    }
+
+    @Test
     void should_returnSingleDate_when_expandInclusiveOverOneDay() {
         ScheduleDateMath math = atKyivDate(LocalDate.of(2024, 5, 22));
 

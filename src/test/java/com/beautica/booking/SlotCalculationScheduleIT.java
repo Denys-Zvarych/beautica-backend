@@ -286,6 +286,62 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // 1b. Night shift as TWO single-day rows on adjacent ISO weekdays — post-midnight
+    //     booking subtraction (MEDIUM-2). The model FORBIDS cross-midnight intervals
+    //     (endTime <= startTime) at four layers; a night shift is the late part of one
+    //     ISO day plus the early part of the next, never one wrapping row.
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Night shift split across two ISO days — post-midnight bookings are subtracted")
+    class CrossMidnightBookingSubtraction {
+
+        @Test
+        @DisplayName("a booking on the early-Tuesday tail is subtracted; the late-Monday head is unaffected (no double-book)")
+        void should_subtractPostMidnightBooking_when_nightShiftSpansTwoIsoDays() {
+            Seed s = seedMasterWithService(60); // 60-min service, 30-min step
+            // 2024-06-03 is a Monday (ISO 1), 2024-06-04 a Tuesday (ISO 2). The night shift is modelled
+            // contract-correctly as TWO single-calendar-day intervals in one weekly template: the late
+            // part of Monday (22:00–23:59) and the early part of Tuesday (00:00–02:00). Each row obeys
+            // endTime > startTime — no wrapping interval.
+            LocalDate monday = LocalDate.of(2024, 6, 3);
+            LocalDate tuesday = monday.plusDays(1);
+            masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
+                    weekly(monday, null,
+                            day(1, iv(LocalTime.of(22, 0), LocalTime.of(23, 59))),
+                            day(2, iv(LocalTime.of(0, 0), LocalTime.of(2, 0)))));
+
+            // getAvailableSlots resolves ONE calendar date, so the night shift is verified across two
+            // queries — one per ISO day the shift touches.
+
+            // (a) Monday query — the late-Monday head produces its slots, unaffected by any Tuesday booking.
+            List<AvailableSlotResponse> mondaySlots = slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId());
+
+            assertThat(startWallClocks(mondaySlots))
+                    .as("late-Monday head 22:00–23:59 yields exactly the 22:00 / 22:30 slots "
+                            + "(a 60-min slot at 23:00 would end 00:00, past the 23:59 interval end)")
+                    .containsExactly(LocalTime.of(22, 0), LocalTime.of(22, 30));
+
+            // (b) Tuesday query — book 00:00–01:00 inside the early-Tuesday tail and confirm subtraction.
+            insertBooking(s, tuesday, LocalTime.of(0, 0), LocalTime.of(1, 0));
+
+            List<AvailableSlotResponse> tuesdaySlots = slotServiceWithTodayBefore(tuesday)
+                    .getAvailableSlots(s.masterId(), tuesday, s.masterServiceId());
+
+            List<LocalTime> tuesdayStarts = startWallClocks(tuesdaySlots);
+            // 60-min slots whose window overlaps the 00:00–01:00 booking are removed: 00:00–01:00 occupied,
+            // 00:30–01:30 overlaps → both excluded. 01:00–02:00 is clear and stays bookable.
+            assertThat(tuesdayStarts)
+                    .as("post-midnight booking is subtracted from the early-Tuesday tail")
+                    .doesNotContain(LocalTime.of(0, 0), LocalTime.of(0, 30));
+            assertThat(tuesdayStarts)
+                    .as("the slot clear of the booking remains bookable")
+                    .contains(LocalTime.of(1, 0));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // 2. DST — spring-forward and fall-back, derived from Europe/Kyiv tz rules
     // ════════════════════════════════════════════════════════════════════════════════
 
