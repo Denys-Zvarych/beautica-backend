@@ -131,6 +131,58 @@ public class MasterScheduleService {
         return scheduleMapper.toOverrideResponse(saved);
     }
 
+    // ---- Step 2b: weekly-template delete ------------------------------------------------
+
+    /**
+     * Deletes a master's weekly template by id. The schedule must belong to {@code masterId}
+     * (cross-master deletes surface as 404 to avoid an existence oracle). orphanRemoval cascades
+     * the working_intervals. Slots are evicted after commit.
+     */
+    @Transactional
+    public void deleteWeeklySchedule(UUID actorId, UUID masterId, UUID scheduleId) {
+        Master master = loadActiveMaster(masterId);
+        authz.enforceCanManageMasterSchedule(actorId, master);
+
+        WeeklySchedule schedule = weeklyScheduleRepository.findByIdWithIntervals(scheduleId)
+                .orElseThrow(() -> new NotFoundException("Schedule not found"));
+        if (!schedule.getMaster().getId().equals(master.getId())) {
+            // Cross-master delete attempt — surface as not-found to avoid an existence oracle.
+            throw new NotFoundException("Schedule not found");
+        }
+        weeklyScheduleRepository.delete(schedule);
+        evictSlotsAfterCommit(masterId);
+    }
+
+    // ---- Step 1/2 reads: list weekly templates & overrides ------------------------------
+
+    /**
+     * Lists a master's weekly templates (ordered by {@code validFrom}) with intervals projected.
+     * Read authorization is enforced by the controller's {@code @authz.canReadMasterSchedule}
+     * SpEL gate (Phase 15.5 / OQ-2), which performs the single ownership DB lookup; this method
+     * only loads and maps. Bounded by the fixed per-master set of validity windows.
+     */
+    @Transactional(readOnly = true)
+    public List<WeeklyScheduleResponse> listWeeklySchedules(UUID masterId) {
+        return weeklyScheduleRepository.findByMasterIdOrderByValidFromAscWithIntervals(masterId).stream()
+                .map(scheduleMapper::toWeeklyScheduleResponse)
+                .toList();
+    }
+
+    /**
+     * Lists a master's per-date overrides within {@code [from, to]} inclusive (≤366d window enforced
+     * here so the controller cannot request an unbounded scan). Read authorization is enforced by the
+     * controller's {@code @authz.canReadMasterSchedule} SpEL gate.
+     */
+    @Transactional(readOnly = true)
+    public List<ScheduleOverrideResponse> listOverrides(UUID masterId, LocalDate from, LocalDate to) {
+        dateMath.assertExpandable(from, to);
+        return scheduleExceptionRepository
+                .findByMasterIdAndDateBetweenWithIntervals(masterId, from, to).stream()
+                .sorted(Comparator.comparing(ScheduleException::getDate))
+                .map(scheduleMapper::toOverrideResponse)
+                .toList();
+    }
+
     // ---- Step 4: clear override ---------------------------------------------------------
 
     /** Deletes the override for {@code (master, date)} if present; the date reverts to template/gap. */
@@ -170,7 +222,9 @@ public class MasterScheduleService {
      */
     @Transactional(readOnly = true)
     public List<EffectiveDayResponse> resolveEffectiveRange(UUID masterId, LocalDate from, LocalDate to) {
-        dateMath.assertWithinBounds(from, to);
+        // Read path: past dates are included (the calendar paints greyed history — Phase 15.5 Step 3),
+        // so use the read-window guard rather than assertWithinBounds (which forbids a past start).
+        dateMath.assertExpandable(from, to);
         List<LocalDate> dates = dateMath.expandInclusive(from, to);
 
         Map<LocalDate, ScheduleException> overridesByDate = scheduleExceptionRepository

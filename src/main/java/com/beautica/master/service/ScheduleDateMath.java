@@ -100,6 +100,27 @@ public class ScheduleDateMath {
     }
 
     /**
+     * Guards a bounded <em>read</em> window (Phase 15.5 GET endpoints). Unlike
+     * {@link #assertWithinBounds}, the start <b>may be in the past</b> (the calendar shows greyed
+     * history), but the window must still be ordered, span no more than 366 inclusive days, and not
+     * reach past the far-future {@link #cap()}. Violations surface as a 400 {@link BusinessException}.
+     */
+    public void assertExpandable(LocalDate from, LocalDate to) {
+        if (from == null || to == null) {
+            throw new BusinessException("Both 'from' and 'to' are required");
+        }
+        if (from.isAfter(to)) {
+            throw new BusinessException("Schedule range start must not be after its end");
+        }
+        if (to.isAfter(cap())) {
+            throw new BusinessException("Schedule range end exceeds the allowed two-year window");
+        }
+        if (ChronoUnit.DAYS.between(from, to) > MAX_EXPANSION_SPAN_DAYS) {
+            throw new BusinessException("Date range exceeds the maximum of 366 days");
+        }
+    }
+
+    /**
      * "Весь поточний місяць" preset: from the later of today and the 1st of the month, through the last
      * day of the current month. {@code lastDayOfMonth()} is leap-aware (Feb → 28 or 29 correctly).
      */

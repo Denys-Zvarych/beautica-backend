@@ -32,7 +32,27 @@ public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, 
             """)
     List<WeeklySchedule> findCoveringDate(@Param("masterId") UUID masterId, @Param("date") LocalDate date);
 
+    /**
+     * Non-graph variant: used only by the window-overlap invariant check, which reads
+     * {@code validFrom}/{@code validTo} alone and never traverses {@code intervals} — so no
+     * N+1 hazard (Anti-Bug §E exemption documented here). The list-read endpoint uses the
+     * graph variant {@link #findByMasterIdOrderByValidFromAscWithIntervals} instead.
+     */
     List<WeeklySchedule> findByMasterIdOrderByValidFromAsc(UUID masterId);
+
+    /**
+     * Phase 15.5: a master's weekly templates ordered by {@code validFrom}, with
+     * {@code working_intervals} graph-fetched, for the {@code GET /weekly-schedules} list endpoint
+     * (the {@link com.beautica.master.service.ScheduleMapper} traverses {@code getIntervals()}).
+     * {@code DISTINCT} de-duplicates the fetch-join row multiplication.
+     */
+    @Query("""
+            SELECT DISTINCT ws FROM WeeklySchedule ws
+            LEFT JOIN FETCH ws.intervals
+            WHERE ws.master.id = :masterId
+            ORDER BY ws.validFrom ASC
+            """)
+    List<WeeklySchedule> findByMasterIdOrderByValidFromAscWithIntervals(@Param("masterId") UUID masterId);
 
     /**
      * Phase 15.4: every schedule for a master whose validity window <em>overlaps</em> {@code [from, to]},

@@ -12,10 +12,16 @@ import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
+import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.ScheduleExceptionRequest;
+import com.beautica.master.dto.ScheduleOverrideRequest;
+import com.beautica.master.dto.ScheduleOverrideResponse;
+import com.beautica.master.dto.WeeklyScheduleRequest;
+import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.Master;
+import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.MasterService;
 import com.beautica.user.UserService;
 import jakarta.validation.Valid;
@@ -35,6 +41,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -52,6 +59,7 @@ import java.util.UUID;
 public class MasterController {
 
     private final MasterService masterService;
+    private final MasterScheduleService masterScheduleService;
     private final SlotCalculationService slotCalculationService;
     private final UserService userService;
 
@@ -87,6 +95,15 @@ public class MasterController {
         ));
     }
 
+    /**
+     * @deprecated Phase 15.5 superseded the single-{@code WorkingHours}-per-weekday model with the
+     * weekly-template + per-date-override model. Slot calculation now reads the new model exclusively,
+     * so writes through this endpoint persist to the legacy {@code working_hours} table but <b>no longer
+     * affect bookable availability</b>. Migrate clients to
+     * {@code POST/PUT/DELETE /api/v1/masters/{masterId}/weekly-schedules}. Kept for backward-compat
+     * until a cleanup phase removes it.
+     */
+    @Deprecated(forRemoval = true)
     @PatchMapping("/{masterId}/working-hours")
     @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
     public ApiResponse<List<WorkingHoursResponse>> upsertWorkingHours(
@@ -100,6 +117,13 @@ public class MasterController {
         return ApiResponse.ok(masterService.upsertWorkingHours(actorId, masterId, requests));
     }
 
+    /**
+     * @deprecated Phase 15.5 replaced closure-only schedule exceptions with typed per-date overrides
+     * ({@code DAY_OFF} / {@code CUSTOM_HOURS}). Slot calculation reads the new model, so writes here no
+     * longer affect bookable availability. Migrate to
+     * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}. Kept for backward-compat until cleanup.
+     */
+    @Deprecated(forRemoval = true)
     @PostMapping("/{masterId}/schedule-exceptions")
     @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
     public ResponseEntity<ApiResponse<Void>> addScheduleException(
@@ -112,6 +136,11 @@ public class MasterController {
         return ResponseEntity.status(201).body(ApiResponse.ok(null));
     }
 
+    /**
+     * @deprecated Phase 15.5 replaced schedule exceptions with per-date overrides. Migrate to
+     * {@code DELETE /api/v1/masters/{masterId}/overrides/{date}}. Kept for backward-compat until cleanup.
+     */
+    @Deprecated(forRemoval = true)
     @DeleteMapping("/{masterId}/schedule-exceptions/{date}")
     @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
     public ResponseEntity<ApiResponse<Void>> removeScheduleException(
@@ -122,6 +151,114 @@ public class MasterController {
         UUID actorId = extractUserId(authentication);
         masterService.removeScheduleException(actorId, masterId, date);
         return ResponseEntity.noContent().build();
+    }
+
+    // ---- Phase 15.5: weekly-schedule endpoints ------------------------------------------
+
+    @GetMapping("/{masterId}/weekly-schedules")
+    @PreAuthorize("@authz.canReadMasterSchedule(authentication, #masterId)")
+    public ApiResponse<List<WeeklyScheduleResponse>> getWeeklySchedules(
+            @PathVariable UUID masterId
+    ) {
+        return ApiResponse.ok(masterScheduleService.listWeeklySchedules(masterId));
+    }
+
+    @PostMapping("/{masterId}/weekly-schedules")
+    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
+    public ResponseEntity<ApiResponse<WeeklyScheduleResponse>> createWeeklySchedule(
+            @PathVariable UUID masterId,
+            @Valid @RequestBody WeeklyScheduleRequest request,
+            Authentication authentication
+    ) {
+        UUID actorId = extractUserId(authentication);
+        WeeklyScheduleResponse created =
+                masterScheduleService.upsertWeeklySchedule(actorId, masterId, null, request);
+        return ResponseEntity.status(201).body(ApiResponse.ok(created));
+    }
+
+    @PutMapping("/{masterId}/weekly-schedules/{scheduleId}")
+    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
+    public ApiResponse<WeeklyScheduleResponse> updateWeeklySchedule(
+            @PathVariable UUID masterId,
+            @PathVariable UUID scheduleId,
+            @Valid @RequestBody WeeklyScheduleRequest request,
+            Authentication authentication
+    ) {
+        UUID actorId = extractUserId(authentication);
+        return ApiResponse.ok(
+                masterScheduleService.upsertWeeklySchedule(actorId, masterId, scheduleId, request));
+    }
+
+    @DeleteMapping("/{masterId}/weekly-schedules/{scheduleId}")
+    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
+    public ResponseEntity<ApiResponse<Void>> deleteWeeklySchedule(
+            @PathVariable UUID masterId,
+            @PathVariable UUID scheduleId,
+            Authentication authentication
+    ) {
+        UUID actorId = extractUserId(authentication);
+        masterScheduleService.deleteWeeklySchedule(actorId, masterId, scheduleId);
+        return ResponseEntity.noContent().build();
+    }
+
+    // ---- Phase 15.5: per-date override endpoints ----------------------------------------
+
+    @GetMapping("/{masterId}/overrides")
+    @PreAuthorize("@authz.canReadMasterSchedule(authentication, #masterId)")
+    public ApiResponse<List<ScheduleOverrideResponse>> getOverrides(
+            @PathVariable UUID masterId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
+    ) {
+        return ApiResponse.ok(masterScheduleService.listOverrides(masterId, from, to));
+    }
+
+    /**
+     * Idempotent upsert of a per-date override keyed by {@code {date}}. The path date is authoritative;
+     * a body whose {@code date} disagrees with the path is rejected as a 400 to avoid an ambiguous write.
+     */
+    @PutMapping("/{masterId}/overrides/{date}")
+    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
+    public ApiResponse<ScheduleOverrideResponse> upsertOverride(
+            @PathVariable UUID masterId,
+            @PathVariable @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @Valid @RequestBody ScheduleOverrideRequest request,
+            Authentication authentication
+    ) {
+        if (!date.equals(request.date())) {
+            throw new BusinessException("Path date must match the override body date");
+        }
+        UUID actorId = extractUserId(authentication);
+        return ApiResponse.ok(masterScheduleService.upsertOverride(actorId, masterId, request));
+    }
+
+    @DeleteMapping("/{masterId}/overrides/{date}")
+    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
+    public ResponseEntity<ApiResponse<Void>> clearOverride(
+            @PathVariable UUID masterId,
+            @PathVariable @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            Authentication authentication
+    ) {
+        UUID actorId = extractUserId(authentication);
+        masterScheduleService.clearOverride(actorId, masterId, date);
+        return ResponseEntity.noContent().build();
+    }
+
+    // ---- Phase 15.5: effective-availability read endpoint -------------------------------
+
+    /**
+     * The single endpoint the mobile Master-Schedule calendar reads to paint each date's state
+     * (template / custom / day-off / no-schedule). Past dates are included (read-only) so history can
+     * be greyed. Bounded to ≤366 days by the service layer.
+     */
+    @GetMapping("/{masterId}/effective-schedule")
+    @PreAuthorize("@authz.canReadMasterSchedule(authentication, #masterId)")
+    public ApiResponse<List<EffectiveDayResponse>> getEffectiveSchedule(
+            @PathVariable UUID masterId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
+    ) {
+        return ApiResponse.ok(masterScheduleService.resolveEffectiveRange(masterId, from, to));
     }
 
     @DeleteMapping("/{masterId}")

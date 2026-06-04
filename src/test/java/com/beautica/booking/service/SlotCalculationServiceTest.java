@@ -7,10 +7,11 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.TimeSlotCalculator;
 import com.beautica.common.util.TimeSlotCalculator.TimeRange;
-import com.beautica.master.entity.WorkingHours;
-import com.beautica.master.repository.ScheduleExceptionRepository;
-import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.master.dto.EffectiveDayResponse;
+import com.beautica.master.dto.EffectiveDaySource;
+import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.Master;
+import com.beautica.master.service.MasterScheduleService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -30,7 +31,6 @@ import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -39,7 +39,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -59,16 +58,13 @@ class SlotCalculationServiceTest {
     private static final Master ACTIVE_MASTER = Master.builder().isActive(true).build();
 
     @Mock
-    private WorkingHoursRepository workingHoursRepository;
-
-    @Mock
     private BookingRepository bookingRepository;
 
     @Mock
     private MasterServiceRepository masterServiceRepository;
 
     @Mock
-    private ScheduleExceptionRepository scheduleExceptionRepository;
+    private MasterScheduleService masterScheduleService;
 
     @Mock
     private TimeSlotCalculator timeSlotCalculator;
@@ -78,12 +74,37 @@ class SlotCalculationServiceTest {
     @BeforeEach
     void setUp() {
         slotCalculationService = new SlotCalculationService(
-                workingHoursRepository,
                 bookingRepository,
                 masterServiceRepository,
-                scheduleExceptionRepository,
+                masterScheduleService,
                 timeSlotCalculator,
                 clock);
+    }
+
+    // --- helpers: build EffectiveDayResponse the resolver would return for a date ---
+
+    private static EffectiveDayResponse templateDay(LocalDate date, LocalTime start, LocalTime end) {
+        return new EffectiveDayResponse(
+                date,
+                EffectiveDaySource.TEMPLATE,
+                List.of(new WorkIntervalDto(start, end)),
+                null);
+    }
+
+    private static EffectiveDayResponse dayOff(LocalDate date) {
+        return new EffectiveDayResponse(
+                date,
+                EffectiveDaySource.OVERRIDE_DAY_OFF,
+                List.of(),
+                null);
+    }
+
+    private static EffectiveDayResponse noSchedule(LocalDate date) {
+        return new EffectiveDayResponse(
+                date,
+                EffectiveDaySource.NO_SCHEDULE,
+                List.of(),
+                null);
     }
 
     @Test
@@ -93,7 +114,6 @@ class SlotCalculationServiceTest {
         UUID masterServiceId = UUID.randomUUID();
         // Use today in Kyiv — 2026-05-07 (UTC+3, so midnight UTC = 03:00 Kyiv → still May 7)
         LocalDate date = LocalDate.of(2026, 5, 7);
-        int dayOfWeek = date.getDayOfWeek().getValue(); // Thursday = 4
 
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -109,11 +129,12 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        // masterServiceRepository is now called first — stub it before working hours
+        // masterServiceRepository is called first — stub it before the schedule resolver
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.empty());
+        // No weekly template covers the date → NO_SCHEDULE with empty intervals
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(noSchedule(date));
 
         List<AvailableSlotResponse> result =
                 slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
@@ -128,15 +149,6 @@ class SlotCalculationServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 7);
-        int dayOfWeek = date.getDayOfWeek().getValue();
-
-        WorkingHours workingHours = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(17, 0))
-                .isActive(true)
-                .build();
 
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -152,13 +164,11 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(workingHours));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        // Schedule exception is present
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.of(new com.beautica.master.entity.ScheduleException()));
+        // A per-date DAY_OFF override closes the date → empty intervals
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(dayOff(date));
 
         List<AvailableSlotResponse> result =
                 slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
@@ -203,15 +213,6 @@ class SlotCalculationServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 7);
-        int dayOfWeek = date.getDayOfWeek().getValue();
-
-        WorkingHours workingHours = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(17, 0))
-                .isActive(true)
-                .build();
 
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -233,12 +234,11 @@ class SlotCalculationServiceTest {
         Instant slotEnd = slotStart.plus(Duration.ofMinutes(60));
         List<TimeRange> calculatorResult = List.of(new TimeRange(slotStart, slotEnd));
 
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(workingHours));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
+        // TEMPLATE day 09:00–17:00, no override → equivalent to the legacy working-hours window
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
         when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(
@@ -269,15 +269,6 @@ class SlotCalculationServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 7);
-        int dayOfWeek = date.getDayOfWeek().getValue();
-
-        WorkingHours workingHours = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(17, 0))
-                .isActive(true)
-                .build();
 
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -300,12 +291,10 @@ class SlotCalculationServiceTest {
         Instant slotEnd = slotStart.plus(Duration.ofMinutes(45));
         List<TimeRange> calculatorResult = List.of(new TimeRange(slotStart, slotEnd));
 
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(workingHours));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
         when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(
@@ -362,7 +351,8 @@ class SlotCalculationServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("exceeds maximum");
 
-        verify(workingHoursRepository, never()).findByMasterIdAndDayOfWeek(any(), anyInt());
+        // The duration guard fires before the schedule resolver is consulted.
+        verifyNoInteractions(masterScheduleService);
         verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
     }
 
@@ -381,7 +371,7 @@ class SlotCalculationServiceTest {
                 slotCalculationService.getAvailableSlots(masterId, tomorrow, masterServiceId))
                 .isInstanceOf(NotFoundException.class);
 
-        verifyNoInteractions(workingHoursRepository);
+        verifyNoInteractions(masterScheduleService);
     }
 
     @Test
@@ -401,7 +391,7 @@ class SlotCalculationServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("inactive");
 
-        verifyNoInteractions(workingHoursRepository);
+        verifyNoInteractions(masterScheduleService);
         verifyNoInteractions(timeSlotCalculator);
     }
 
@@ -411,7 +401,6 @@ class SlotCalculationServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 9);
-        int dayOfWeek = date.getDayOfWeek().getValue();
 
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -427,14 +416,6 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        WorkingHours workingHours = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(18, 0))
-                .isActive(true)
-                .build();
-
         Booking mockBooking = mock(Booking.class);
         when(mockBooking.getStartsAt())
                 .thenReturn(OffsetDateTime.parse("2026-05-09T09:00:00+03:00"));
@@ -443,10 +424,8 @@ class SlotCalculationServiceTest {
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(workingHours));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of(mockBooking));
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
@@ -472,7 +451,6 @@ class SlotCalculationServiceTest {
         UUID masterServiceId = UUID.randomUUID();
         // Clock is fixed to 2026-05-07T00:00Z → today in Kyiv is 2026-05-07; May 8 is tomorrow (valid)
         LocalDate date = LocalDate.of(2026, 5, 8);
-        int dayOfWeek = date.getDayOfWeek().getValue();
 
         ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
         when(serviceDefinition.getBaseDurationMinutes()).thenReturn(60);
@@ -484,20 +462,10 @@ class SlotCalculationServiceTest {
         when(msa.getDurationOverrideMinutes()).thenReturn(null);
         when(msa.getServiceDefinition()).thenReturn(serviceDefinition);
 
-        WorkingHours workingHours = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(18, 0))
-                .isActive(true)
-                .build();
-
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(any(), any()))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(any(), anyInt()))
-                .thenReturn(Optional.of(workingHours));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(any(), any()))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(any(), any()))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
@@ -518,7 +486,6 @@ class SlotCalculationServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 9);
-        int dayOfWeek = date.getDayOfWeek().getValue();
 
         // Service: 60 min duration + 30 min buffer = 90 min totalDuration
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
@@ -535,14 +502,6 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        WorkingHours workingHours = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(18, 0))
-                .isActive(true)
-                .build();
-
         // Existing booking occupies 09:00–10:00 Kyiv (06:00–07:00 UTC)
         Booking existingBooking = mock(Booking.class);
         when(existingBooking.getStartsAt())
@@ -552,10 +511,8 @@ class SlotCalculationServiceTest {
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(workingHours));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of(existingBooking));
         // Calculator returns empty — simulates the 10:00 slot being blocked because the
@@ -599,8 +556,8 @@ class SlotCalculationServiceTest {
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(any(), anyInt()))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(any(), any()))
+                .thenReturn(noSchedule(today));
 
         assertThatCode(() -> slotCalculationService.getAvailableSlots(masterId, today, masterServiceId))
                 .as("today must be accepted as the lower boundary without throwing")
@@ -631,8 +588,8 @@ class SlotCalculationServiceTest {
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(any(), anyInt()))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(any(), any()))
+                .thenReturn(noSchedule(maxDate));
 
         assertThatCode(() -> slotCalculationService.getAvailableSlots(masterId, maxDate, masterServiceId))
                 .as("today + 180 days must be accepted as the upper boundary without throwing")
@@ -645,7 +602,6 @@ class SlotCalculationServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 9);
-        int dayOfWeek = date.getDayOfWeek().getValue();
 
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -661,23 +617,13 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        WorkingHours workingHours = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(18, 0))
-                .isActive(true)
-                .build();
-
         Instant slotStart = Instant.parse("2026-05-09T06:00:00Z");
         Instant slotEnd   = Instant.parse("2026-05-09T07:00:00Z");
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(workingHours));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
@@ -709,7 +655,6 @@ class SlotCalculationServiceTest {
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 7);
         ZoneId kyiv = ZoneId.of("Europe/Kyiv");
-        int dayOfWeek = date.getDayOfWeek().getValue();
 
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -723,20 +668,11 @@ class SlotCalculationServiceTest {
                 .master(ACTIVE_MASTER)
                 .isActive(true)
                 .build();
-        WorkingHours wh = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(LocalTime.of(9, 0))
-                .endTime(LocalTime.of(17, 0))
-                .isActive(true)
-                .build();
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(wh));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
@@ -763,7 +699,6 @@ class SlotCalculationServiceTest {
         UUID masterId        = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date       = LocalDate.of(2026, 5, 7); // Thursday — working day
-        int dayOfWeek        = date.getDayOfWeek().getValue();
 
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -779,24 +714,15 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        WorkingHours wh = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(java.time.LocalTime.of(9, 0))
-                .endTime(java.time.LocalTime.of(17, 0))
-                .isActive(true)
-                .build();
-
-        java.time.OffsetDateTime slotStart = date.atTime(java.time.LocalTime.of(9, 0))
-                .atZone(java.time.ZoneId.of("Europe/Kyiv")).toOffsetDateTime();
+        java.time.OffsetDateTime slotStart = date.atTime(LocalTime.of(9, 0))
+                .atZone(ZoneId.of("Europe/Kyiv")).toOffsetDateTime();
         java.time.OffsetDateTime slotEnd   = slotStart.plusMinutes(60);
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(wh));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
+        // TEMPLATE day 09:00–17:00, no override
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
         when(bookingRepository.findOverlappingByMaster(eq(masterId), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
@@ -816,7 +742,6 @@ class SlotCalculationServiceTest {
         UUID masterId        = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate date       = LocalDate.of(2026, 5, 7);
-        int dayOfWeek        = date.getDayOfWeek().getValue();
 
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -832,20 +757,11 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        WorkingHours wh = WorkingHours.builder()
-                .id(UUID.randomUUID())
-                .dayOfWeek(dayOfWeek)
-                .startTime(java.time.LocalTime.of(9, 0))
-                .endTime(java.time.LocalTime.of(17, 0))
-                .isActive(true)
-                .build();
-
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek))
-                .thenReturn(Optional.of(wh));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.of(new com.beautica.master.entity.ScheduleException()));
+        // A per-date DAY_OFF override closes the date → empty intervals
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(dayOff(date));
 
         // Act
         List<AvailableSlotResponse> slots = slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
