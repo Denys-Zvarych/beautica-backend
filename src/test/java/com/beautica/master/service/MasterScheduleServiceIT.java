@@ -22,6 +22,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.Cache;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import jakarta.persistence.EntityManagerFactory;
@@ -77,6 +78,9 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
 
     @Autowired
     private EntityManagerFactory entityManagerFactory;
+
+    @Autowired
+    private org.springframework.cache.CacheManager cacheManager;
 
     // Safe-margin future dates: well clear of "today" so no-past-edit never trips by accident.
     private static final LocalDate FUTURE_FROM = LocalDate.now().plusDays(30);
@@ -530,6 +534,94 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
                     .as("EffectiveDayResponse must not have a note component (private free-text never leaks)")
                     .extracting(java.lang.reflect.RecordComponent::getName)
                     .doesNotContain("note");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // 5. Phase 15.6 performance guards — bounded query count (P1) + scoped eviction (P3)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Performance guards (15.6)")
+    class PerformanceGuards {
+
+        /**
+         * P1 — extends the 28-day bounded-query assertion to a full ~90-day quarter span. The resolver
+         * must still issue a constant number of statements (bulk-load overrides + templates, then fold
+         * in memory) — no per-date N+1 as the span grows 3×.
+         */
+        @Test
+        @DisplayName("P1 — a 90-day resolveEffectiveRange issues a constant query count (no N+1 as the span grows)")
+        void should_resolve90DaySpan_withConstantQueryCount() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null, day(1, iv(9, 17)), day(3, iv(10, 14))));
+            // Scatter overrides across the quarter so the fold exercises both override + template branches.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(monday.plusDays(15), ScheduleExceptionKind.DAY_OFF,
+                            ScheduleExceptionReason.VACATION, null, null));
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(monday.plusDays(60), ScheduleExceptionKind.CUSTOM_HOURS,
+                            null, null, List.of(iv(8, 9))));
+
+            Statistics stats = entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
+            boolean wasEnabled = stats.isStatisticsEnabled();
+            stats.setStatisticsEnabled(true);
+            stats.clear();
+
+            // 90 inclusive days (monday .. monday+89).
+            List<EffectiveDayResponse> days = scheduleService.resolveEffectiveRange(
+                    m.masterId(), monday, monday.plusDays(89));
+
+            long queries = stats.getPrepareStatementCount();
+            stats.setStatisticsEnabled(wasEnabled);
+
+            assertThat(days).as("one entry per inclusive date across the quarter").hasSize(90);
+            assertThat(byDate(days, monday.plusDays(15)).source())
+                    .isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
+            assertThat(byDate(days, monday.plusDays(60)).source())
+                    .isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
+            // Identical bound to the 28-day case: the statement count is span-independent (2 bulk loads,
+            // tolerance for read-only tx bookkeeping), proving the fold is in-memory.
+            assertThat(queries)
+                    .as("90-day fold must issue the same bounded query count as the 28-day fold — actual=%s", queries)
+                    .isLessThanOrEqualTo(4);
+        }
+
+        /**
+         * P3 — a schedule write evicts ONLY the writing master's available-slots keys (keyed by the
+         * master prefix), never a blanket {@code cache.clear()}. A second, unrelated master's cached
+         * slot entry must survive a write by the first master.
+         */
+        @Test
+        @DisplayName("P3 — a write evicts only the affected master's slot-cache keys, leaving other masters' entries intact")
+        void should_evictOnlyAffectedMasterSlots_onWrite() {
+            SeededMaster writer = seedIndependentMaster();
+            SeededMaster bystander = seedIndependentMaster();
+
+            Cache slots = cacheManager.getCache("available-slots");
+            assertThat(slots).as("available-slots cache must be configured").isNotNull();
+            slots.clear();
+
+            // Seed cache entries under the exact SimpleKey shape the resolver uses: {masterId, date, serviceId}.
+            UUID svc = UUID.randomUUID();
+            LocalDate date = FUTURE_FROM;
+            var writerKey = new org.springframework.cache.interceptor.SimpleKey(writer.masterId(), date, svc);
+            var bystanderKey = new org.springframework.cache.interceptor.SimpleKey(bystander.masterId(), date, svc);
+            slots.put(writerKey, List.of());
+            slots.put(bystanderKey, List.of());
+
+            // A real schedule write by the writer — eviction fires in the afterCommit synchronization.
+            scheduleService.upsertWeeklySchedule(writer.actorId(), writer.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(1, iv(9, 17))));
+
+            assertThat(slots.get(writerKey))
+                    .as("the writing master's slot key must be evicted after the schedule write")
+                    .isNull();
+            assertThat(slots.get(bystanderKey))
+                    .as("an unrelated master's slot key must survive — eviction is master-scoped, not a full clear")
+                    .isNotNull();
         }
     }
 
