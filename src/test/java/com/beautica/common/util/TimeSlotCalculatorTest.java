@@ -145,6 +145,63 @@ class TimeSlotCalculatorTest {
     }
 
     @Test
+    @DisplayName("cross-midnight window on a DST fall-back day uses civil end (25h day) — keeps the late slot")
+    void should_useCivilEnd_when_crossMidnightWindowOnFallBackDay() {
+        // Europe/Kyiv fall-back 2024-10-27: clock turns 04:00→03:00 (25h day). A 22:00→02:00 window ends
+        // at the CIVIL 02:00 on 2024-10-28 = 4 real hours after 22:00. The previous flat +24h bug computed
+        // the end from the same-day 02:00 instant + 24h = only 3 real hours, dropping the final slot.
+        LocalDate fallBackDate = LocalDate.of(2024, 10, 27);
+        // 2024-10-27T18:00:00Z = 20:00 Kyiv (+02 after the fall-back) — before the 22:00 window start.
+        calculator = new TimeSlotCalculator(fixedClock("2024-10-27T18:00:00Z"));
+
+        List<TimeRange> result = calculator.calculateAvailableSlots(
+                fallBackDate,
+                LocalTime.of(22, 0),
+                LocalTime.of(2, 0),
+                Duration.ofHours(1),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        // 4 real hours, 1h service, 30m step → 7 slots; the final 01:00 start (ends 02:00) survives.
+        assertThat(result).hasSize(7);
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart)).containsExactly(
+                LocalTime.of(22, 0), LocalTime.of(22, 30), LocalTime.of(23, 0), LocalTime.of(23, 30),
+                LocalTime.of(0, 0), LocalTime.of(0, 30), LocalTime.of(1, 0));
+        // The civil 02:00 on 2024-10-28 is the real end instant (4h after the 20:00Z start).
+        assertThat(result.get(result.size() - 1).end())
+                .isEqualTo(Instant.parse("2024-10-28T00:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("cross-midnight window on a DST spring-forward day uses civil end (23h day) — no invented slot")
+    void should_useCivilEnd_when_crossMidnightWindowOnSpringForwardDay() {
+        // Europe/Kyiv spring-forward 2024-03-31: 03:00→04:00 (23h day). A 22:00→02:00 window still ends at
+        // the CIVIL 02:00 on 2024-04-01 = 4 real hours after 22:00. The flat +24h bug computed 5 real hours
+        // (same-day 02:00 instant + 24h), inventing an extra non-bookable slot.
+        LocalDate springDate = LocalDate.of(2024, 3, 31);
+        // 2024-03-31T18:00:00Z = 21:00 Kyiv (+03 after the spring-forward) — before the 22:00 window start.
+        calculator = new TimeSlotCalculator(fixedClock("2024-03-31T18:00:00Z"));
+
+        List<TimeRange> result = calculator.calculateAvailableSlots(
+                springDate,
+                LocalTime.of(22, 0),
+                LocalTime.of(2, 0),
+                Duration.ofHours(1),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        // 4 real hours → 7 slots (not 9). No slot starts at or after the 01:30 mark that the bug invented.
+        assertThat(result).hasSize(7);
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart)).containsExactly(
+                LocalTime.of(22, 0), LocalTime.of(22, 30), LocalTime.of(23, 0), LocalTime.of(23, 30),
+                LocalTime.of(0, 0), LocalTime.of(0, 30), LocalTime.of(1, 0));
+        assertThat(result.get(result.size() - 1).end())
+                .isEqualTo(Instant.parse("2024-03-31T23:00:00Z"));
+    }
+
+    @Test
     @DisplayName("returns empty list when service duration exceeds the work window")
     void should_returnEmpty_when_serviceDurationLongerThanWorkWindow() {
         calculator = new TimeSlotCalculator(fixedClock("2026-05-07T06:00:00Z"));

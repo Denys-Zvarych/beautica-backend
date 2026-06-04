@@ -4,12 +4,11 @@ import com.beautica.common.AuditableEntity;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.OneToMany;
@@ -26,14 +25,28 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+/**
+ * Phase 15.1: the active-window weekly template for a master.
+ *
+ * <p>{@code validFrom}/{@code validTo} bound the date range the template applies to;
+ * {@code validTo == null} means open-ended (legacy backfill or "no end set"). Per-master
+ * schedule overlap is enforced in the service layer (Phase 15.4), not via a DB constraint
+ * (a GiST {@code daterange} exclusion with NULL-bound handling is deferred).
+ */
 @Entity
-@Table(name = "schedule_exceptions")
+@Table(
+        name = "weekly_schedules",
+        indexes = {
+                // Mirrors idx_weekly_schedules_master_window (V69): "schedule covering date D" lookups.
+                @Index(name = "idx_weekly_schedules_master_window", columnList = "master_id, valid_from, valid_to")
+        }
+)
 @Getter
 @Setter
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class ScheduleException extends AuditableEntity {
+public class WeeklySchedule extends AuditableEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
@@ -43,37 +56,19 @@ public class ScheduleException extends AuditableEntity {
     @JoinColumn(name = "master_id", nullable = false)
     private Master master;
 
-    @Column(nullable = false)
-    private LocalDate date;
+    @Column(name = "valid_from", nullable = false)
+    private LocalDate validFrom;
 
-    /**
-     * Phase 15.1: DAY_OFF (closure, carries a reason) vs CUSTOM_HOURS (override, no reason, has intervals).
-     * Existing rows default to DAY_OFF (DB DEFAULT, V71).
-     */
-    @Enumerated(EnumType.STRING)
-    @Column(nullable = false, length = 20)
-    @Builder.Default
-    private ScheduleExceptionKind kind = ScheduleExceptionKind.DAY_OFF;
-
-    /**
-     * Phase 15.1: now nullable — only meaningful for {@code DAY_OFF}. The DB CHECK
-     * {@code chk_exc_reason} (V71) enforces non-null for DAY_OFF and null for CUSTOM_HOURS.
-     */
     @Nullable
-    @Enumerated(EnumType.STRING)
-    private ScheduleExceptionReason reason;
+    @Column(name = "valid_to")
+    private LocalDate validTo;
 
-    private String note;
-
-    /**
-     * Phase 15.1: custom working intervals for a {@code CUSTOM_HOURS} exception; empty for {@code DAY_OFF}.
-     */
     @OneToMany(
-            mappedBy = "exception",
+            mappedBy = "schedule",
             cascade = CascadeType.ALL,
             orphanRemoval = true,
             fetch = FetchType.LAZY
     )
     @Builder.Default
-    private List<ScheduleExceptionInterval> intervals = new ArrayList<>();
+    private List<WorkingInterval> intervals = new ArrayList<>();
 }

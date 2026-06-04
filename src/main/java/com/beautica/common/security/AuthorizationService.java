@@ -125,6 +125,35 @@ public class AuthorizationService {
         }).orElse(false);
     }
 
+    /**
+     * Read predicate for the master-schedule endpoints (Phase 15.5 / OQ-2 — RESOLVED).
+     *
+     * <p>Returns true for the <b>owning master</b> — including a {@code SALON_MASTER} reading
+     * <b>his own</b> schedule (read-only role) — and for the master's {@code SALON_OWNER} /
+     * {@code SALON_ADMIN}. Returns false for {@code CLIENT} (no schedule-read path; clients see
+     * bookable slots only via the public {@code /slots} endpoint) and for any foreign master.
+     *
+     * <p>Role fast path: {@code CLIENT} can never read a schedule, so it is rejected immediately
+     * without a DB round-trip. All other roles proceed to the single master ownership lookup
+     * (one read-side DB hit is acceptable for a SpEL read predicate — Anti-Bug §D).
+     */
+    public boolean canReadMasterSchedule(Authentication auth, UUID masterId) {
+        boolean isClient = auth.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_CLIENT"));
+        if (isClient) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
+            // The owning master (INDEPENDENT_MASTER or any salon-bound master, incl. SALON_MASTER
+            // reading his own id) is always granted read access to his own schedule.
+            if (m.getUser() != null && m.getUser().getId().equals(actorId)) {
+                return true;
+            }
+            // Otherwise the actor must be the master's SALON_OWNER / SALON_ADMIN.
+            return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId, actorRole);
+        }).orElse(false);
+    }
+
     public void enforceCanManageSalon(UUID actorId, Salon salon) {
         if (!hasManagementAccess(salon.getId(), actorId)) {
             throw new ForbiddenException("Access denied");

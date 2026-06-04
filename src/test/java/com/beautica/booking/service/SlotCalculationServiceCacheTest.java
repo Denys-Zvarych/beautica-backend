@@ -3,9 +3,10 @@ package com.beautica.booking.service;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.util.TimeSlotCalculator;
 import com.beautica.config.CacheConfig;
+import com.beautica.master.dto.EffectiveDayResponse;
+import com.beautica.master.dto.EffectiveDaySource;
 import com.beautica.master.entity.Master;
-import com.beautica.master.repository.ScheduleExceptionRepository;
-import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.master.service.MasterScheduleService;
 import com.beautica.service.repository.MasterServiceRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -22,6 +23,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -46,10 +48,9 @@ class SlotCalculationServiceCacheTest {
         }
     }
 
-    @MockBean WorkingHoursRepository workingHoursRepository;
     @MockBean BookingRepository bookingRepository;
     @MockBean MasterServiceRepository masterServiceRepository;
-    @MockBean ScheduleExceptionRepository scheduleExceptionRepository;
+    @MockBean MasterScheduleService masterScheduleService;
     @MockBean TimeSlotCalculator timeSlotCalculator;
 
     @Autowired SlotCalculationService slotCalculationService;
@@ -64,8 +65,7 @@ class SlotCalculationServiceCacheTest {
                 cache.clear();
             }
         });
-        reset(masterServiceRepository, workingHoursRepository,
-                scheduleExceptionRepository, bookingRepository, timeSlotCalculator);
+        reset(masterServiceRepository, masterScheduleService, bookingRepository, timeSlotCalculator);
     }
 
     @Test
@@ -75,16 +75,9 @@ class SlotCalculationServiceCacheTest {
         UUID masterServiceId = UUID.randomUUID();
         LocalDate futureDate = LocalDate.now(clock).plusDays(7);
 
-        // Stub returns empty so getAvailableSlots completes without NPE
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
-                .thenReturn(Optional.empty());
-
-        // First call — cache miss, hits repository
-        // Empty optional → NotFoundException, but @Cacheable caches the exception result
-        // Actually with Caffeine, exceptions are NOT cached — each call with the same key
-        // that throws will re-invoke the method. We therefore stub a valid MSA to get
-        // a cacheable (non-throwing) result.
-        // Re-stub to use a valid response so the result is cacheable.
+        // A valid (non-throwing) MSA so the result is cacheable. With Caffeine, exceptions are NOT
+        // cached — each call with the same key that throws re-invokes the method — so we must return
+        // a successful result to exercise the @Cacheable hit/miss path.
         var sd = com.beautica.service.entity.ServiceDefinition.builder()
                 .id(UUID.randomUUID())
                 .baseDurationMinutes(60)
@@ -98,11 +91,13 @@ class SlotCalculationServiceCacheTest {
                 .master(activeMaster)
                 .isActive(true)
                 .build();
-        reset(masterServiceRepository);
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, futureDate.getDayOfWeek().getValue()))
-                .thenReturn(Optional.empty());
+        // No weekly template / override covers the date → NO_SCHEDULE, empty intervals, no slots.
+        // This keeps the result cacheable while exercising the resolver as the underlying data source.
+        when(masterScheduleService.resolveEffectiveDay(masterId, futureDate))
+                .thenReturn(new EffectiveDayResponse(
+                        futureDate, EffectiveDaySource.NO_SCHEDULE, List.of(), null));
 
         // First call — populates cache
         slotCalculationService.getAvailableSlots(masterId, futureDate, masterServiceId);
@@ -112,7 +107,7 @@ class SlotCalculationServiceCacheTest {
         // Assumption: evictAvailableSlots must be called OUTSIDE an active transaction.
         // @Transactional(NOT_SUPPORTED) suspends the caller's transaction — calling from within
         // a transaction body would suspend eviction, causing this test to give a false green.
-        // Evict the cache entry
+        // Evict the cache entry for the (masterId, date, masterServiceId) key
         slotCalculationService.evictAvailableSlots(masterId, futureDate, masterServiceId);
 
         // Third call — cache was evicted, repository called again

@@ -532,10 +532,18 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     }
 
     private void addWorkingHoursForEveryDay(UUID masterId) {
+        // Phase 15.5 rewired SlotCalculationService to read ONLY from the new schedule model
+        // (weekly_schedules / working_intervals). Mirror the V72 backfill shape: ONE open-ended
+        // weekly_schedules row (valid_from pinned to the documented epoch, valid_to NULL) plus
+        // SEVEN working_intervals rows (ISO day_of_week 1..7) so availability is not weekday-dependent.
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to) VALUES (?, ?, DATE '2020-01-01', NULL)",
+                scheduleId, masterId);
         for (int day = 1; day <= 7; day++) {
             jdbcTemplate.update(
-                    "INSERT INTO working_hours (id, master_id, day_of_week, start_time, end_time, is_active) VALUES (?, ?, ?, '08:00', '20:00', true)",
-                    UUID.randomUUID(), masterId, day);
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) VALUES (?, ?, ?, '08:00', '20:00')",
+                    UUID.randomUUID(), scheduleId, day);
         }
     }
 

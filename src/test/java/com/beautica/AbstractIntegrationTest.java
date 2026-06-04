@@ -64,6 +64,11 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM master_services");
         jdbcTemplate.execute("DELETE FROM service_definitions");
         jdbcTemplate.execute("DELETE FROM working_hours");
+        // Phase 15.1: schedule model. FK order — interval children before their parents,
+        // then weekly_schedules/schedule_exceptions before masters.
+        jdbcTemplate.execute("DELETE FROM working_intervals");
+        jdbcTemplate.execute("DELETE FROM schedule_exception_intervals");
+        jdbcTemplate.execute("DELETE FROM weekly_schedules");
         jdbcTemplate.execute("DELETE FROM schedule_exceptions");
         jdbcTemplate.execute("DELETE FROM masters");
         jdbcTemplate.execute("DELETE FROM invite_tokens");

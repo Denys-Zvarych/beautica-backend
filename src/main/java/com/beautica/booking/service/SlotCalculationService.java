@@ -1,16 +1,15 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
-import com.beautica.booking.entity.Booking;
-import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.TimeSlotCalculator;
 import com.beautica.common.util.TimeSlotCalculator.TimeRange;
-import com.beautica.master.entity.WorkingHours;
-import com.beautica.master.repository.ScheduleExceptionRepository;
-import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.booking.repository.BookingRepository;
+import com.beautica.master.dto.EffectiveDayResponse;
+import com.beautica.master.dto.WorkIntervalDto;
+import com.beautica.master.service.MasterScheduleService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
 import org.springframework.cache.annotation.CacheEvict;
@@ -22,8 +21,8 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -31,24 +30,21 @@ public class SlotCalculationService {
 
     private static final Duration SLOT_STEP = Duration.ofMinutes(30);
 
-    private final WorkingHoursRepository workingHoursRepository;
     private final BookingRepository bookingRepository;
     private final MasterServiceRepository masterServiceRepository;
-    private final ScheduleExceptionRepository scheduleExceptionRepository;
+    private final MasterScheduleService masterScheduleService;
     private final TimeSlotCalculator timeSlotCalculator;
     private final Clock kyivClock;
 
     public SlotCalculationService(
-            WorkingHoursRepository workingHoursRepository,
             BookingRepository bookingRepository,
             MasterServiceRepository masterServiceRepository,
-            ScheduleExceptionRepository scheduleExceptionRepository,
+            MasterScheduleService masterScheduleService,
             TimeSlotCalculator timeSlotCalculator,
             Clock clock) {
-        this.workingHoursRepository = workingHoursRepository;
         this.bookingRepository = bookingRepository;
         this.masterServiceRepository = masterServiceRepository;
-        this.scheduleExceptionRepository = scheduleExceptionRepository;
+        this.masterScheduleService = masterScheduleService;
         this.timeSlotCalculator = timeSlotCalculator;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
@@ -93,55 +89,68 @@ public class SlotCalculationService {
             throw new BusinessException("total service duration exceeds maximum allowed");
         }
 
-        // Slot calculation is master-type agnostic: working_hours, schedule_exceptions,
-        // and bookings are keyed by master_id alone. A SALON_OWNER master with working
-        // hours and an active master_services row is bookable identically to any other
-        // master type. Master liveness (masters.is_active) is checked above before
-        // reaching this point — do not remove that guard.
+        // Slot calculation is master-type agnostic: the effective-availability resolver
+        // (weekly templates + per-date overrides) and bookings are keyed by master_id alone.
+        // A SALON_OWNER master with a weekly template and an active master_services row is
+        // bookable identically to any other master type. Master liveness (masters.is_active)
+        // is checked above before reaching this point — do not remove that guard.
 
-        // Step 5: check working hours for the requested day of week
-        int dayOfWeek = date.getDayOfWeek().getValue(); // 1=Mon..7=Sun
-        Optional<WorkingHours> workingHoursOpt =
-                workingHoursRepository.findByMasterIdAndDayOfWeek(masterId, dayOfWeek);
-        if (workingHoursOpt.isEmpty()) {
-            return List.of();
-        }
-        WorkingHours workingHours = workingHoursOpt.get();
-
-        // Step 6: check schedule exception for this specific date
-        boolean hasException = scheduleExceptionRepository
-                .findByMasterIdAndDate(masterId, date)
-                .isPresent();
-        if (hasException) {
+        // Step 5: resolve the effective availability for this date via the Phase 15.4 resolver.
+        // This replaces the legacy single-WorkingHours window + schedule-exception closure check with
+        // the unified model: multi-interval days, validity windows, custom-hours overrides, and
+        // day-offs. NO_SCHEDULE (gap) or OVERRIDE_DAY_OFF resolve to empty intervals — no slots.
+        EffectiveDayResponse effective = masterScheduleService.resolveEffectiveDay(masterId, date);
+        List<WorkIntervalDto> intervals = effective.intervals();
+        if (intervals == null || intervals.isEmpty()) {
             return List.of();
         }
 
-        // Step 7: compute day window in OffsetDateTime for the booking query
+        // Step 6: compute the booking-query window in OffsetDateTime.
+        // The lower bound is the date's start of day; the upper bound normally is date+1 00:00.
+        // crossesMidnight is ALWAYS false for persisted intervals: the model enforces endTime > startTime
+        // at four layers (WorkIntervalDto.isOrdered, MasterScheduleService validation, chk_interval_order,
+        // chk_exc_interval_order), so a resolved interval can never satisfy endTime <= startTime. A night
+        // shift is two single-calendar-day rows on two adjacent ISO weekdays, each subtracted on its own
+        // date query — never one wrapping interval. This widen GUARDS AN UNREACHABLE MODEL STATE: were a
+        // cross-midnight interval ever to slip through, its post-midnight slots (and the bookings on them)
+        // would run into the next calendar day, and a flat [date 00:00, date+1 00:00) window would never
+        // load a post-midnight booking (the native finder filters starts_at < windowEnd) → double-book.
+        // It stays defensive and cheap (one extra day only on a state that cannot occur); the normal path
+        // keeps the tight single-day window (Anti-Bug §E narrow window).
         OffsetDateTime dayStart = date.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
-        OffsetDateTime dayEnd   = date.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        boolean crossesMidnight = intervals.stream()
+                .anyMatch(iv -> !iv.endTime().isAfter(iv.startTime()));
+        LocalDate windowEndDate = crossesMidnight ? date.plusDays(2) : date.plusDays(1);
+        OffsetDateTime dayEnd = windowEndDate.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
-        // Step 8: load existing bookings that overlap the day window (PENDING + CONFIRMED only)
+        // Step 7: load existing bookings that overlap the day window (PENDING + CONFIRMED only).
+        // Loaded once for the whole day and subtracted from every interval below.
         List<TimeRange> occupied = bookingRepository
                 .findOverlappingByMaster(masterId, dayStart, dayEnd)
                 .stream()
                 .map(b -> new TimeRange(b.getStartsAt().toInstant(), b.getEndsAt().toInstant()))
                 .toList();
 
-        // Step 9: delegate to TimeSlotCalculator
-        List<TimeRange> free = timeSlotCalculator.calculateAvailableSlots(
-                date,
-                workingHours.getStartTime(),
-                workingHours.getEndTime(),
-                totalDuration,
-                SLOT_STEP,
-                occupied);
-
-        // Step 10: map to response DTOs with Kyiv zone
-        return free.stream()
-                .map(r -> new AvailableSlotResponse(
+        // Step 8: generate candidate slots per resolved interval and union the results. Calling
+        // TimeSlotCalculator once per interval is the multi-interval generalization of the legacy
+        // single-window call — gaps between intervals (lunch breaks) naturally yield no slots. The
+        // DST/midnight rules inside TimeSlotCalculator are untouched and still apply per interval.
+        List<AvailableSlotResponse> result = new ArrayList<>();
+        for (WorkIntervalDto interval : intervals) {
+            List<TimeRange> free = timeSlotCalculator.calculateAvailableSlots(
+                    date,
+                    interval.startTime(),
+                    interval.endTime(),
+                    totalDuration,
+                    SLOT_STEP,
+                    occupied);
+            for (TimeRange r : free) {
+                result.add(new AvailableSlotResponse(
                         r.start().atZone(TimeZones.KYIV),
-                        r.end().atZone(TimeZones.KYIV)))
-                .toList();
+                        r.end().atZone(TimeZones.KYIV)));
+            }
+        }
+        return result;
     }
 
     // NOT_SUPPORTED: eviction must not run inside the caller's transaction — it fires after the

@@ -5,6 +5,7 @@ import com.beautica.auth.Role;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.ScheduleException;
+import com.beautica.master.entity.ScheduleExceptionKind;
 import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.user.User;
@@ -160,6 +161,7 @@ class MasterScheduleRepositoryTest extends AbstractDataJpaTest {
         ScheduleException exception = ScheduleException.builder()
                 .master(master)
                 .date(today)
+                .kind(ScheduleExceptionKind.DAY_OFF)
                 .reason(ScheduleExceptionReason.VACATION)
                 .build();
         em.persist(exception);
@@ -181,6 +183,7 @@ class MasterScheduleRepositoryTest extends AbstractDataJpaTest {
         ScheduleException exception = ScheduleException.builder()
                 .master(master)
                 .date(today)
+                .kind(ScheduleExceptionKind.DAY_OFF)
                 .reason(ScheduleExceptionReason.SICK_DAY)
                 .build();
         em.persist(exception);
@@ -201,6 +204,7 @@ class MasterScheduleRepositoryTest extends AbstractDataJpaTest {
         ScheduleException first = ScheduleException.builder()
                 .master(master)
                 .date(today)
+                .kind(ScheduleExceptionKind.DAY_OFF)
                 .reason(ScheduleExceptionReason.HOLIDAY)
                 .build();
         em.persist(first);

@@ -123,6 +123,9 @@ class MasterControllerTest {
     @MockBean
     private SlotCalculationService slotCalculationService;
 
+    @MockBean
+    private com.beautica.master.service.MasterScheduleService masterScheduleService;
+
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
 

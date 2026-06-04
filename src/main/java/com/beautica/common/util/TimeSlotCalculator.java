@@ -58,7 +58,17 @@ public class TimeSlotCalculator {
             return List.of();
         }
         if (workEndInst.isBefore(workStartInst)) {
-            workEndInst = workEndInst.plus(Duration.ofDays(1));
+            // DEFENSIVE, NOT REACHABLE THROUGH THE SCHEDULE API. The persisted model enforces
+            // end_time > start_time on every working interval at four layers (WorkIntervalDto.isOrdered,
+            // MasterScheduleService validation, chk_interval_order, chk_exc_interval_order), so a
+            // cross-midnight window (workEnd <= workStart) never arrives from a resolved schedule — a
+            // night shift is two single-calendar-day rows on two adjacent ISO weekdays, not one wrapping
+            // row. This branch exists only so the utility stays correct for any DIRECT caller that hands
+            // it a cross-midnight window: the end is the SAME wall-clock time on the next calendar day,
+            // resolved as a civil instant on date+1 so DST is applied correctly — a flat +24h
+            // (Duration.ofDays(1)) would be one real hour short on a 25h fall-back day and one hour long
+            // on a 23h spring-forward day, dropping or inventing a bookable slot (Anti-Bug §G).
+            workEndInst = date.plusDays(1).atTime(workEnd).atZone(TimeZones.KYIV).toInstant();
         }
 
         Instant nowInst = clock.instant();
