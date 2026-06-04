@@ -52,7 +52,8 @@ public class ScheduleException extends AuditableEntity {
      */
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
-    private ScheduleExceptionKind kind;
+    @Builder.Default
+    private ScheduleExceptionKind kind = ScheduleExceptionKind.DAY_OFF;
 
     /**
      * Phase 15.1: now nullable — only meaningful for {@code DAY_OFF}. The DB CHECK
