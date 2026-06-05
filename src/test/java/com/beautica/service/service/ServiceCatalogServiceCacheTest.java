@@ -7,6 +7,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PlatformCategoryStatus;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
@@ -117,6 +118,7 @@ class ServiceCatalogServiceCacheTest {
                 .id(serviceTypeId)
                 .nameUk("Манікюр")
                 .slug("manicure")
+                .platformCategoryName("MANICURE")
                 .active(true)
                 .build();
 
@@ -145,10 +147,12 @@ class ServiceCatalogServiceCacheTest {
                 .build();
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", null, 60, 10,
+                "Manicure", "Classic manicure", "MANICURE", 60, 10,
                 PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
 
         when(serviceTypeRepository.findById(serviceTypeId)).thenReturn(Optional.of(serviceType));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(salonRepository.existsById(salonId1)).thenReturn(true);
         when(salonRepository.existsById(salonId2)).thenReturn(true);
         when(serviceRepository.save(any(ServiceDefinition.class)))

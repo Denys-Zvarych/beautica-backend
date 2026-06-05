@@ -41,6 +41,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -539,6 +540,17 @@ public class ServiceCatalogService {
         ServiceType type = serviceTypeLookup.getById(request.serviceTypeId());
         if (!type.isActive()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
+        }
+        // Phase 16.3 cross-field guard: a present serviceTypeId must belong to the same
+        // platform category the request selected. The parent slug is the plain
+        // platform_category_name column re-parented in Phase 16.1 (no FK traversal needed),
+        // matched case-sensitively against the request category slug. This requires a DB
+        // lookup of the type, so it lives in the service layer rather than bean validation.
+        // Null-safe: a null type category yields a clean 400, never a 500 NPE. Post-V73 the
+        // platform_category_name column is NOT NULL + FK, so null is unreachable in prod.
+        if (!Objects.equals(type.getPlatformCategoryName(), request.category())) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "service type does not belong to the selected category");
         }
         definition.setServiceType(type);
     }
