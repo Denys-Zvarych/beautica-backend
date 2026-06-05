@@ -56,6 +56,7 @@ class ServiceCatalogServiceCacheTest {
     @MockBean CatalogCategoryRepository catalogCategoryRepository;
     @MockBean PlatformCategoryRepository platformCategoryRepository;
     @MockBean EmailService emailService;
+    @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
 
     @Autowired ServiceCatalogService serviceCatalogService;
     @Autowired CacheManager cacheManager;
