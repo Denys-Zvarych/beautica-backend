@@ -15,55 +15,75 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Contract test for V73__reparent_service_types_to_platform_categories.sql.
+ * Contract test for the re-parenting chain V73 → V74 → V75.
  *
- * <p>Acceptance criteria pinned here (from phase-16.1 spec):
+ * <p>V73 introduced {@code service_types.platform_category_name} and the
+ * structural guards (FK to {@code platform_categories.name}, NOT NULL,
+ * zero-orphan invariant). V74 reseeded {@code platform_categories} into the
+ * final 21-active-category taxonomy (26 total incl. 5 soft-disabled) and V75
+ * reseeded {@code service_types} into the final 140-leaf catalog. The slug/name
+ * source of truth is {@code docs/backend-phases/phase-17.1-taxonomy-slug-artifact.md}.
+ *
+ * <p>This class pins the <b>post-V75 final state</b>:
  * <ol>
- *   <li><b>9-slug coverage</b> — all nine target platform_category name slugs exist after V73.</li>
- *   <li><b>Zero orphans</b> — every service_type.platform_category_name resolves to one of
- *       the 9 live slugs; no NULL and no slug outside the live set.</li>
- *   <li><b>Nails split</b> — manicure-* → MANICURE, pedicure-* → PEDICURE,
- *       generic nail types → MANICURE.</li>
- *   <li><b>Hair split (ASSUMPTION)</b> — cut types (haircut-women/men/kids) → HAIRCUT;
- *       coloring/styling/treatment types → HAIR.</li>
- *   <li><b>Idempotency</b> — platform_categories has exactly the 9 approved live entries
- *       (no duplicates from re-apply); per-bucket counts are stable.</li>
- *   <li><b>Per-bucket counts</b> match the V73 mapping table:
- *       MANICURE=7, PEDICURE=2, EYELASH=8, BROWS=6, HAIRCUT=3, HAIR=6,
- *       FACE=6, BODY=6, MAKEUP=5 (total=49).</li>
- *   <li><b>Flyway history</b> — V73 recorded as success with a stable checksum.</li>
- *   <li><b>Legacy column intact</b> — service_types.category_id is still NOT NULL
- *       (deprecated in place; not dropped).</li>
+ *   <li><b>Structural contract (from V73, still holds)</b> — every
+ *       {@code service_type.platform_category_name} resolves to an active
+ *       {@code platform_categories} row; no NULL slug; legacy
+ *       {@code category_id} column intact and NOT NULL;
+ *       {@code platform_category_name} column NOT NULL with a closed-set FK
+ *       guard.</li>
+ *   <li><b>New totals</b> — 140 service_types; 21 active platform categories
+ *       (26 total).</li>
+ *   <li><b>V74 rename + soft-disable sets</b> — HAIRCUT→HAIRDRESSING,
+ *       MANICURE→NAIL_SERVICE, EYELASH→LASH_EXTENSIONS renamed and active;
+ *       PEDICURE, HAIR, BODY, FACE, OTHER soft-disabled (active=FALSE).</li>
+ *   <li><b>Per-category active leaf counts</b> match the phase-17.1 table.</li>
+ *   <li><b>Flyway history</b> — V73/V74/V75 recorded as success; zero failures.</li>
  * </ol>
  *
- * <p>All assertions are read-only against the post-migration state bootstrapped by
- * Testcontainers. {@link AbstractIntegrationTest#cleanDb()} does not truncate
+ * <p>All assertions are read-only against the post-migration state bootstrapped
+ * by Testcontainers. {@link AbstractIntegrationTest#cleanDb()} does not truncate
  * service_types or platform_categories (reference / catalog data), so these tests
  * are order-independent and do not need an AfterEach cleanup.
  */
-@DisplayName("V73 migration — re-parent service_types onto platform_categories")
+@DisplayName("V73→V75 migration — re-parent service_types onto the final taxonomy")
 class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
 
     /**
-     * The 9 live platform-category name slugs that must exist after V73.
-     * Order is the canonical display order from the seed migrations.
+     * The 21 active platform-category name slugs after V74 (the picker set).
+     * Source of truth: phase-17.1-taxonomy-slug-artifact.md § "21 platform categories".
      */
-    private static final Set<String> LIVE_SLUGS = Set.of(
-            "MANICURE", "PEDICURE", "EYELASH", "HAIRCUT",
-            "MAKEUP", "BROWS", "HAIR", "BODY", "FACE"
+    private static final Set<String> ACTIVE_SLUGS = Set.of(
+            "HAIRDRESSING", "HAIR_COLORING", "HAIR_TREATMENT", "HAIR_EXTENSIONS", "TRICHOLOGY",
+            "NAIL_SERVICE", "PODOLOGY", "BROWS", "LASH_LAMINATION", "LASH_EXTENSIONS",
+            "MAKEUP", "COSMETOLOGY", "HARDWARE_COSMETOLOGY", "INJECTION_COSMETOLOGY",
+            "AESTHETIC_COSMETOLOGY", "LASER_COSMETOLOGY", "HAIR_REMOVAL", "PERMANENT_MAKEUP",
+            "BARBERING", "BEARD_CARE", "SHAVING"
     );
 
+    /**
+     * Legacy slugs V74 soft-disables (active = FALSE) instead of deleting, so the
+     * UNIQUE(name) self-service guard and any legacy service_definitions FK survive.
+     */
+    private static final Set<String> SOFT_DISABLED_SLUGS = Set.of(
+            "PEDICURE", "HAIR", "BODY", "FACE", "OTHER"
+    );
+
+    private static final int TOTAL_SERVICE_TYPES = 140;
+    private static final int ACTIVE_CATEGORY_COUNT = 21;
+    private static final int TOTAL_CATEGORY_COUNT = 26;
+
     // =========================================================================
-    // 1. 9-slug coverage
+    // 1. Active-slug coverage (post-V74)
     // =========================================================================
 
     @Nested
-    @DisplayName("platform_categories 9-slug coverage")
-    class NineSlugCoverage {
+    @DisplayName("platform_categories active-slug coverage")
+    class ActiveSlugCoverage {
 
         @Test
-        @DisplayName("all 9 target slugs exist as APPROVED and active after V73")
-        void should_haveAllNineSlugs_when_v73Applied() {
+        @DisplayName("exactly the 21 active slugs exist as APPROVED + active after V74")
+        void should_haveTwentyOneActiveSlugs_when_v74Applied() {
             List<String> liveSlugs = jdbcTemplate.queryForList(
                     "SELECT name FROM platform_categories "
                     + "WHERE status = 'APPROVED' AND active = TRUE "
@@ -71,91 +91,112 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                     String.class);
 
             assertThat(liveSlugs)
-                    .as("platform_categories must contain exactly the 9 live slugs "
-                        + "after V73 seeds HAIR, BODY, FACE")
-                    .containsExactlyInAnyOrderElementsOf(LIVE_SLUGS);
+                    .as("platform_categories must contain exactly the 21 active taxonomy slugs after V74")
+                    .containsExactlyInAnyOrderElementsOf(ACTIVE_SLUGS);
         }
 
         @Test
-        @DisplayName("HAIR, BODY, FACE rows are present and APPROVED after V73")
-        void should_seedHairBodyFace_when_v73Applied() {
-            for (String newSlug : List.of("HAIR", "BODY", "FACE")) {
-                Map<String, Object> row = jdbcTemplate.queryForMap(
-                        "SELECT name, display_name, active, status "
-                        + "FROM platform_categories WHERE name = ?",
-                        newSlug);
+        @DisplayName("platform_categories has 21 active rows and 26 total (5 soft-disabled)")
+        void should_have21ActiveAnd26Total_when_v74Applied() {
+            Integer active = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM platform_categories WHERE active = TRUE",
+                    Integer.class);
+            Integer total = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM platform_categories",
+                    Integer.class);
 
-                assertThat(row.get("name")).isEqualTo(newSlug);
-                assertThat(row.get("active"))
-                        .as("%s must be active=TRUE", newSlug)
-                        .isEqualTo(Boolean.TRUE);
-                assertThat(row.get("status"))
-                        .as("%s must be APPROVED", newSlug)
-                        .isEqualTo("APPROVED");
-                assertThat(row.get("display_name"))
-                        .as("%s must have a non-blank Ukrainian display name", newSlug)
-                        .isNotNull()
-                        .isNotEqualTo("");
-            }
+            assertThat(active)
+                    .as("exactly 21 platform categories must be active after V74")
+                    .isEqualTo(ACTIVE_CATEGORY_COUNT);
+            assertThat(total)
+                    .as("26 total platform categories (21 active + 5 soft-disabled) after V74")
+                    .isEqualTo(TOTAL_CATEGORY_COUNT);
         }
 
         @Test
-        @DisplayName("HAIR display_name is the Ukrainian 'Волосся'")
-        void should_haveUkrainianDisplayName_when_hairSeeded() {
-            String displayName = jdbcTemplate.queryForObject(
-                    "SELECT display_name FROM platform_categories WHERE name = 'HAIR'",
-                    String.class);
-
-            assertThat(displayName).isEqualTo("Волосся");
-        }
-
-        @Test
-        @DisplayName("BODY display_name is the Ukrainian 'Тіло'")
-        void should_haveUkrainianDisplayName_when_bodySeeded() {
-            String displayName = jdbcTemplate.queryForObject(
-                    "SELECT display_name FROM platform_categories WHERE name = 'BODY'",
-                    String.class);
-
-            assertThat(displayName).isEqualTo("Тіло");
-        }
-
-        @Test
-        @DisplayName("FACE display_name is the Ukrainian 'Обличчя'")
-        void should_haveUkrainianDisplayName_when_faceSeeded() {
-            String displayName = jdbcTemplate.queryForObject(
-                    "SELECT display_name FROM platform_categories WHERE name = 'FACE'",
-                    String.class);
-
-            assertThat(displayName).isEqualTo("Обличчя");
+        @DisplayName("renamed slugs carry their final Ukrainian display names")
+        void should_haveUkrainianDisplayNames_when_renamesApplied() {
+            assertDisplayName("HAIRDRESSING", "Перукарські послуги");
+            assertDisplayName("NAIL_SERVICE", "Нігтьовий сервіс");
+            assertDisplayName("LASH_EXTENSIONS", "Нарощення вій");
         }
     }
 
     // =========================================================================
-    // 2. Zero orphans
+    // 2. V74 rename + soft-disable sets
     // =========================================================================
 
     @Nested
-    @DisplayName("zero orphan service_types")
+    @DisplayName("V74 rename + soft-disable disposition")
+    class RenameAndSoftDisable {
+
+        @Test
+        @DisplayName("legacy HAIRCUT/MANICURE/EYELASH slugs no longer exist (renamed in place)")
+        void should_haveRenamedLegacySlugs_when_v74Applied() {
+            for (String legacy : List.of("HAIRCUT", "MANICURE", "EYELASH")) {
+                Integer count = jdbcTemplate.queryForObject(
+                        "SELECT COUNT(*) FROM platform_categories WHERE name = ?",
+                        Integer.class, legacy);
+
+                assertThat(count)
+                        .as("legacy slug %s must be renamed away (1:1) by V74", legacy)
+                        .isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("PEDICURE, HAIR, BODY, FACE, OTHER are soft-disabled (active = FALSE)")
+        void should_softDisableSupersededSlugs_when_v74Applied() {
+            for (String slug : SOFT_DISABLED_SLUGS) {
+                Map<String, Object> row = jdbcTemplate.queryForMap(
+                        "SELECT active FROM platform_categories WHERE name = ?", slug);
+
+                assertThat(row.get("active"))
+                        .as("%s must be soft-disabled (active = FALSE) by V74", slug)
+                        .isEqualTo(Boolean.FALSE);
+            }
+        }
+
+        @Test
+        @DisplayName("BROWS and MAKEUP are kept active")
+        void should_keepBrowsAndMakeupActive_when_v74Applied() {
+            for (String slug : List.of("BROWS", "MAKEUP")) {
+                Boolean active = jdbcTemplate.queryForObject(
+                        "SELECT active FROM platform_categories WHERE name = ?",
+                        Boolean.class, slug);
+
+                assertThat(active)
+                        .as("%s must remain active after V74", slug)
+                        .isTrue();
+            }
+        }
+    }
+
+    // =========================================================================
+    // 3. Zero orphans + new total
+    // =========================================================================
+
+    @Nested
+    @DisplayName("zero orphan service_types + 140 total")
     class ZeroOrphans {
 
         @Test
-        @DisplayName("no service_type has a NULL platform_category_name after V73")
-        void should_haveNoNullPlatformCategoryName_when_v73Applied() {
+        @DisplayName("no service_type has a NULL platform_category_name")
+        void should_haveNoNullPlatformCategoryName_when_chainApplied() {
             Integer nullCount = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_types WHERE platform_category_name IS NULL",
                     Integer.class);
 
             assertThat(nullCount)
-                    .as("every service_type must have platform_category_name populated "
-                        + "after V73 — zero NULLs allowed")
+                    .as("every service_type must have platform_category_name populated — zero NULLs")
                     .isZero();
         }
 
         @Test
-        @DisplayName("no service_type platform_category_name points outside the 9 live slugs")
-        void should_haveZeroOrphanSlugs_when_v73Applied() {
-            // Anti-join: service_types whose platform_category_name does not
-            // appear in the live platform_categories set are orphans.
+        @DisplayName("no service_type platform_category_name points outside the active slug set")
+        void should_haveZeroOrphanSlugs_when_chainApplied() {
+            // Anti-join: service_types whose platform_category_name does not appear
+            // in the active platform_categories set are orphans.
             Integer orphans = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_types st "
                     + "WHERE NOT EXISTS ("
@@ -166,277 +207,109 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                     Integer.class);
 
             assertThat(orphans)
-                    .as("every service_type.platform_category_name must resolve to a "
-                        + "live (APPROVED + active) platform_categories row — zero orphans")
+                    .as("every service_type.platform_category_name must resolve to a live "
+                        + "(APPROVED + active) platform_categories row — zero orphans")
                     .isZero();
         }
 
         @Test
-        @DisplayName("total service_type count is 49 (matches V13 seed)")
-        void should_have49ServiceTypes_when_v13AndV73Applied() {
+        @DisplayName("total service_type count is 140 (V75 reseed)")
+        void should_have140ServiceTypes_when_v75Applied() {
             Integer total = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_types",
                     Integer.class);
 
             assertThat(total)
-                    .as("V13 seeds exactly 49 service_types; V73 must not insert or "
-                        + "delete any row — count must remain 49")
-                    .isEqualTo(49);
-        }
-    }
-
-    // =========================================================================
-    // 3. Nails split
-    // =========================================================================
-
-    @Nested
-    @DisplayName("nails split — manicure-* → MANICURE, pedicure-* → PEDICURE, generic → MANICURE")
-    class NailsSplit {
-
-        @Test
-        @DisplayName("manicure-classic → MANICURE")
-        void should_mapManicureClassicToManicure_when_v73Applied() {
-            assertPlatformCategory("manicure-classic", "MANICURE");
+                    .as("V75 reseeds the catalog to exactly 140 service_types")
+                    .isEqualTo(TOTAL_SERVICE_TYPES);
         }
 
         @Test
-        @DisplayName("manicure-hardware → MANICURE")
-        void should_mapManicureHardwareToManicure_when_v73Applied() {
-            assertPlatformCategory("manicure-hardware", "MANICURE");
-        }
-
-        @Test
-        @DisplayName("pedicure-classic → PEDICURE")
-        void should_mapPedicureClassicToPedicure_when_v73Applied() {
-            assertPlatformCategory("pedicure-classic", "PEDICURE");
-        }
-
-        @Test
-        @DisplayName("pedicure-hardware → PEDICURE")
-        void should_mapPedicureHardwareToPedicure_when_v73Applied() {
-            assertPlatformCategory("pedicure-hardware", "PEDICURE");
-        }
-
-        @Test
-        @DisplayName("gel-polish (generic nail) → MANICURE")
-        void should_mapGelPolishToManicure_when_v73Applied() {
-            assertPlatformCategory("gel-polish", "MANICURE");
-        }
-
-        @Test
-        @DisplayName("nail-art (generic nail) → MANICURE")
-        void should_mapNailArtToManicure_when_v73Applied() {
-            assertPlatformCategory("nail-art", "MANICURE");
-        }
-
-        @Test
-        @DisplayName("nail-extension-acrylic (generic nail) → MANICURE")
-        void should_mapNailExtensionAcrylicToManicure_when_v73Applied() {
-            assertPlatformCategory("nail-extension-acrylic", "MANICURE");
-        }
-
-        @Test
-        @DisplayName("nail-extension-gel (generic nail) → MANICURE")
-        void should_mapNailExtensionGelToManicure_when_v73Applied() {
-            assertPlatformCategory("nail-extension-gel", "MANICURE");
-        }
-
-        @Test
-        @DisplayName("polish-removal (generic nail) → MANICURE")
-        void should_mapPolishRemovalToManicure_when_v73Applied() {
-            assertPlatformCategory("polish-removal", "MANICURE");
-        }
-    }
-
-    // =========================================================================
-    // 4. Hair split (ASSUMPTION — these are the tests that protect the sign-off)
-    // =========================================================================
-
-    @Nested
-    @DisplayName("hair split (ASSUMPTION) — cut-intent → HAIRCUT, coloring/styling/treatment → HAIR")
-    class HairSplit {
-
-        @Test
-        @DisplayName("haircut-women (cut intent) → HAIRCUT")
-        void should_mapHaircutWomenToHaircut_when_v73Applied() {
-            assertPlatformCategory("haircut-women", "HAIRCUT");
-        }
-
-        @Test
-        @DisplayName("haircut-men (cut intent) → HAIRCUT")
-        void should_mapHaircutMenToHaircut_when_v73Applied() {
-            assertPlatformCategory("haircut-men", "HAIRCUT");
-        }
-
-        @Test
-        @DisplayName("haircut-kids (cut intent) → HAIRCUT")
-        void should_mapHaircutKidsToHaircut_when_v73Applied() {
-            assertPlatformCategory("haircut-kids", "HAIRCUT");
-        }
-
-        @Test
-        @DisplayName("hair-balayage (coloring technique) → HAIR")
-        void should_mapHairBalayageToHair_when_v73Applied() {
-            assertPlatformCategory("hair-balayage", "HAIR");
-        }
-
-        @Test
-        @DisplayName("hair-coloring → HAIR")
-        void should_mapHairColoringToHair_when_v73Applied() {
-            assertPlatformCategory("hair-coloring", "HAIR");
-        }
-
-        @Test
-        @DisplayName("hair-highlights → HAIR")
-        void should_mapHairHighlightsToHair_when_v73Applied() {
-            assertPlatformCategory("hair-highlights", "HAIR");
-        }
-
-        @Test
-        @DisplayName("hair-keratin (treatment) → HAIR")
-        void should_mapHairKeratinToHair_when_v73Applied() {
-            assertPlatformCategory("hair-keratin", "HAIR");
-        }
-
-        @Test
-        @DisplayName("hair-botox (treatment) → HAIR")
-        void should_mapHairBotoxToHair_when_v73Applied() {
-            assertPlatformCategory("hair-botox", "HAIR");
-        }
-
-        @Test
-        @DisplayName("hair-styling (styling, not cut) → HAIR")
-        void should_mapHairStylingToHair_when_v73Applied() {
-            assertPlatformCategory("hair-styling", "HAIR");
-        }
-    }
-
-    // =========================================================================
-    // 5. Idempotency — ON CONFLICT / stable counts after re-apply
-    // =========================================================================
-
-    @Nested
-    @DisplayName("idempotency — no duplicate categories, stable per-bucket counts")
-    class Idempotency {
-
-        @Test
-        @DisplayName("platform_categories has no duplicate name rows after V73")
-        void should_haveNoDuplicateCategoryNames_when_v73Applied() {
-            Integer duplicates = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM ("
-                    + "  SELECT name FROM platform_categories "
-                    + "  GROUP BY name HAVING COUNT(*) > 1"
-                    + ") dup",
+        @DisplayName("all service_types are active after V75 reseed")
+        void should_haveAllActive_when_v75Applied() {
+            Integer inactive = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM service_types WHERE is_active = FALSE",
                     Integer.class);
 
-            assertThat(duplicates)
-                    .as("ON CONFLICT (name) DO NOTHING guarantees no duplicate "
-                        + "platform_category rows even if V73 is applied twice")
+            assertThat(inactive)
+                    .as("V75 seeds all 140 leaves as active")
                     .isZero();
-        }
-
-        @Test
-        @DisplayName("HAIR, BODY, FACE each appear exactly once in platform_categories")
-        void should_haveExactlyOneRowPerNewCategory_when_v73Applied() {
-            for (String slug : List.of("HAIR", "BODY", "FACE")) {
-                Integer count = jdbcTemplate.queryForObject(
-                        "SELECT COUNT(*) FROM platform_categories WHERE name = ?",
-                        Integer.class, slug);
-
-                assertThat(count)
-                        .as("%s must appear exactly once in platform_categories", slug)
-                        .isEqualTo(1);
-            }
         }
     }
 
     // =========================================================================
-    // 6. Per-bucket counts
+    // 4. Per-category active leaf counts (phase-17.1 table)
     // =========================================================================
 
     @Nested
-    @DisplayName("per-bucket counts — match the V73 mapping table")
-    class PerBucketCounts {
+    @DisplayName("per-category active leaf counts — match the phase-17.1 table")
+    class PerCategoryCounts {
 
         @Test
-        @DisplayName("MANICURE bucket contains exactly 7 service_types")
-        void should_have7ManicureTypes_when_v73Applied() {
-            assertBucketCount("MANICURE", 7);
+        @DisplayName("each active category has the expected number of active leaves")
+        void should_haveExpectedLeafCounts_when_v75Applied() {
+            assertBucketCount("HAIRDRESSING", 11);
+            assertBucketCount("HAIR_COLORING", 9);
+            assertBucketCount("HAIR_TREATMENT", 7);
+            assertBucketCount("HAIR_EXTENSIONS", 4);
+            assertBucketCount("TRICHOLOGY", 3);
+            assertBucketCount("NAIL_SERVICE", 12);
+            assertBucketCount("PODOLOGY", 5);
+            assertBucketCount("BROWS", 8);
+            assertBucketCount("LASH_LAMINATION", 3);
+            assertBucketCount("LASH_EXTENSIONS", 10);
+            assertBucketCount("MAKEUP", 8);
+            assertBucketCount("COSMETOLOGY", 5);
+            assertBucketCount("HARDWARE_COSMETOLOGY", 5);
+            assertBucketCount("INJECTION_COSMETOLOGY", 6);
+            assertBucketCount("AESTHETIC_COSMETOLOGY", 3);
+            assertBucketCount("LASER_COSMETOLOGY", 7);
+            assertBucketCount("HAIR_REMOVAL", 6);
+            assertBucketCount("PERMANENT_MAKEUP", 6);
+            assertBucketCount("BARBERING", 10);
+            assertBucketCount("BEARD_CARE", 7);
+            assertBucketCount("SHAVING", 5);
         }
 
         @Test
-        @DisplayName("PEDICURE bucket contains exactly 2 service_types")
-        void should_have2PedicureTypes_when_v73Applied() {
-            assertBucketCount("PEDICURE", 2);
-        }
-
-        @Test
-        @DisplayName("EYELASH bucket contains exactly 8 service_types")
-        void should_have8EyelashTypes_when_v73Applied() {
-            assertBucketCount("EYELASH", 8);
-        }
-
-        @Test
-        @DisplayName("BROWS bucket contains exactly 6 service_types")
-        void should_have6BrowsTypes_when_v73Applied() {
-            assertBucketCount("BROWS", 6);
-        }
-
-        @Test
-        @DisplayName("HAIRCUT bucket contains exactly 3 service_types (ASSUMPTION)")
-        void should_have3HaircutTypes_when_v73Applied() {
-            assertBucketCount("HAIRCUT", 3);
-        }
-
-        @Test
-        @DisplayName("HAIR bucket contains exactly 6 service_types (ASSUMPTION)")
-        void should_have6HairTypes_when_v73Applied() {
-            assertBucketCount("HAIR", 6);
-        }
-
-        @Test
-        @DisplayName("FACE bucket contains exactly 6 service_types")
-        void should_have6FaceTypes_when_v73Applied() {
-            assertBucketCount("FACE", 6);
-        }
-
-        @Test
-        @DisplayName("BODY bucket contains exactly 6 service_types")
-        void should_have6BodyTypes_when_v73Applied() {
-            assertBucketCount("BODY", 6);
-        }
-
-        @Test
-        @DisplayName("MAKEUP bucket contains exactly 5 service_types")
-        void should_have5MakeupTypes_when_v73Applied() {
-            assertBucketCount("MAKEUP", 5);
-        }
-
-        @Test
-        @DisplayName("sum of all per-bucket counts equals 49 (total V13 seed)")
-        void should_haveTotalOf49AcrossAllBuckets_when_v73Applied() {
+        @DisplayName("sum of all per-category leaf counts equals 140")
+        void should_haveTotalOf140AcrossAllBuckets_when_v75Applied() {
             Integer total = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_types WHERE platform_category_name IS NOT NULL",
                     Integer.class);
 
             assertThat(total)
-                    .as("sum of MANICURE(7)+PEDICURE(2)+EYELASH(8)+BROWS(6)"
-                        + "+HAIRCUT(3)+HAIR(6)+FACE(6)+BODY(6)+MAKEUP(5) = 49")
-                    .isEqualTo(49);
+                    .as("the per-category active counts must sum to 140")
+                    .isEqualTo(TOTAL_SERVICE_TYPES);
+        }
+
+        @Test
+        @DisplayName("a representative renamed-bucket leaf resolves to its new slug (NAIL_SERVICE)")
+        void should_mapManicureLeafToNailService_when_v75Applied() {
+            // nail-service-manicure is the canonical manicure leaf under the renamed
+            // NAIL_SERVICE category (phase-17.1 § 6). Pins that the rename + reseed
+            // landed leaves under the new slug, not the dead MANICURE one.
+            assertPlatformCategory("nail-service-manicure", "NAIL_SERVICE");
+        }
+
+        @Test
+        @DisplayName("a representative HAIRDRESSING leaf resolves to the renamed slug")
+        void should_mapWomensCutToHairdressing_when_v75Applied() {
+            assertPlatformCategory("hairdressing-womens-cut", "HAIRDRESSING");
         }
     }
 
     // =========================================================================
-    // 7. Legacy column intact (deprecated in place, not dropped)
+    // 5. Legacy column intact + platform_category_name NOT NULL (V73 fix)
     // =========================================================================
 
     @Nested
-    @DisplayName("legacy schema — category_id NOT NULL (deprecated in place)")
-    class LegacySchemaIntact {
+    @DisplayName("schema — category_id NOT NULL kept; platform_category_name NOT NULL")
+    class SchemaColumns {
 
         @Test
         @DisplayName("service_types.category_id column is still present and NOT NULL")
-        void should_keepCategoryIdColumnNotNull_when_v73Applied() {
+        void should_keepCategoryIdColumnNotNull_when_chainApplied() {
             String isNullable = jdbcTemplate.queryForObject(
                     "SELECT is_nullable "
                     + "FROM information_schema.columns "
@@ -444,138 +317,47 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                     String.class);
 
             assertThat(isNullable)
-                    .as("service_types.category_id is deprecated in place by V73 — "
-                        + "the column must NOT be dropped; it must remain NOT NULL")
+                    .as("service_types.category_id is deprecated in place — the column must "
+                        + "remain present and NOT NULL")
                     .isEqualTo("NO");
         }
 
         @Test
-        @DisplayName("service_types.platform_category_name column exists after V73")
-        void should_havePlatformCategoryNameColumn_when_v73Applied() {
-            String dataType = jdbcTemplate.queryForObject(
-                    "SELECT data_type "
+        @DisplayName("service_types.platform_category_name column exists and is NOT NULL")
+        void should_havePlatformCategoryNameNotNull_when_chainApplied() {
+            Map<String, Object> col = jdbcTemplate.queryForMap(
+                    "SELECT data_type, is_nullable "
                     + "FROM information_schema.columns "
                     + "WHERE table_name = 'service_types' "
-                    + "  AND column_name = 'platform_category_name'",
-                    String.class);
+                    + "  AND column_name = 'platform_category_name'");
 
-            assertThat(dataType)
-                    .as("platform_category_name column must exist in service_types after V73")
+            assertThat(col.get("data_type"))
+                    .as("platform_category_name must be a varchar column")
                     .isEqualTo("character varying");
-        }
-    }
-
-    // =========================================================================
-    // 8. Flyway history
-    // =========================================================================
-
-    @Nested
-    @DisplayName("Flyway history")
-    class FlywayHistory {
-
-        @Test
-        @DisplayName("V73 recorded as success with a stable checksum")
-        void should_recordV73AsSuccess_when_chainApplied() {
-            Map<String, Object> v73 = jdbcTemplate.queryForMap(
-                    "SELECT success, checksum, script "
-                    + "FROM flyway_schema_history WHERE version = '73'");
-
-            assertThat(v73.get("success"))
-                    .as("V73 must be recorded as a successful migration")
-                    .isEqualTo(Boolean.TRUE);
-            assertThat(v73.get("script"))
-                    .isEqualTo("V73__reparent_service_types_to_platform_categories.sql");
-            assertThat(v73.get("checksum"))
-                    .as("V73 must carry a deterministic (non-null) checksum")
-                    .isNotNull();
-        }
-
-        @Test
-        @DisplayName("no failed migration in the full history after V73 applied")
-        void should_haveZeroFailedMigrations_when_v73InChain() {
-            Integer failed = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM flyway_schema_history WHERE success = FALSE",
-                    Integer.class);
-
-            assertThat(failed)
-                    .as("the full migration chain must have zero failures after V73")
-                    .isZero();
-        }
-    }
-
-    // =========================================================================
-    // 9. Schema constraints — pins the coming MEDIUM fixes (RED until fixed)
-    // =========================================================================
-
-    /**
-     * Groups 9a–9c pin three MEDIUM findings raised by the security/perf pass
-     * immediately after Phase 16.1 ships:
-     * <ul>
-     *   <li>9a — platform_category_name must be NOT NULL once all rows are
-     *       populated (the column was added nullable in V73 to allow a two-step
-     *       migration; the fix adds ALTER COLUMN … SET NOT NULL).</li>
-     *   <li>9b — an INSERT whose platform_category_name is outside the 9-slug
-     *       closed set must be rejected by a DB-level constraint (FK or closed
-     *       CHECK); currently the open regex CHECK accepts any
-     *       uppercase slug, so this test is RED until the guard lands.</li>
-     *   <li>9c — idx_service_types_platform_category (B-tree, partial
-     *       WHERE is_active = true) must exist for performant category
-     *       filtering; RED until the index migration runs.</li>
-     * </ul>
-     * Tests are marked with their expected state in the comment next to
-     * {@code @Test}.
-     */
-
-    @Nested
-    @DisplayName("schema constraint — platform_category_name NOT NULL (pins MEDIUM fix)")
-    class PlatformCategoryNameNotNull {
-
-        // Expected: RED until the ALTER COLUMN ... SET NOT NULL migration runs.
-        @Test
-        @DisplayName("platform_category_name column is NOT NULL after the closed-set guard migration")
-        void should_havePlatformCategoryNameAsNotNull_when_notNullConstraintAdded() {
-            // information_schema.columns.is_nullable = 'NO' proves the column
-            // carries a NOT NULL constraint. V73 added the column as nullable
-            // to permit a two-step migration; once all 49 rows are populated
-            // the column must be tightened to NOT NULL so future INSERTs that
-            // omit it are rejected at the DB level — not silently stored as NULL.
-            String isNullable = jdbcTemplate.queryForObject(
-                    "SELECT is_nullable "
-                    + "FROM information_schema.columns "
-                    + "WHERE table_name = 'service_types' "
-                    + "  AND column_name = 'platform_category_name'",
-                    String.class);
-
-            assertThat(isNullable)
-                    .as("service_types.platform_category_name must be NOT NULL — "
-                        + "V73 populated all 49 rows so the column can and must be "
-                        + "tightened; a NULL here would produce an orphan that the "
-                        + "ZeroOrphans anti-join tests above cannot catch until the "
-                        + "next SELECT")
+            assertThat(col.get("is_nullable"))
+                    .as("platform_category_name must be NOT NULL once all rows are populated")
                     .isEqualTo("NO");
         }
     }
 
+    // =========================================================================
+    // 6. Closed-set guard rejects unknown / lowercase slugs
+    // =========================================================================
+
     @Nested
-    @DisplayName("schema constraint — closed-set guard rejects unknown slugs (pins MEDIUM fix)")
+    @DisplayName("schema constraint — closed-set guard rejects invalid slugs")
     class ClosedSetGuard {
 
-        // Expected: RED until the closed-set constraint (FK or refined CHECK) lands.
         @Test
-        @DisplayName("INSERT with platform_category_name outside the 9-slug set is rejected by the DB")
+        @DisplayName("INSERT with platform_category_name outside the active set is rejected by the DB")
         void should_rejectInsert_when_platformCategoryNameNotInLiveSet() {
-            // Arrange — obtain a valid category_id from the seeded catalog so the
-            // mandatory FK constraint on service_types.category_id does not
-            // interfere; we want only the closed-set guard to fire.
+            // A valid category_id satisfies the mandatory category_id FK so that only
+            // the platform_category_name closed-set guard can fire.
             UUID categoryId = jdbcTemplate.queryForObject(
                     "SELECT id FROM service_categories LIMIT 1",
                     UUID.class);
 
-            // Act / Assert — 'UNKNOWN_BUCKET' matches the current open regex
-            // (^[A-Z][A-Z0-9_]*$) but is NOT one of the 9 live slugs. Once
-            // the MEDIUM fix closes the set (via an additional CHECK or FK),
-            // this INSERT must raise DataIntegrityViolationException. Until
-            // then, the test is RED as intended — it pins the fix contract.
+            // 'UNKNOWN_BUCKET' matches the uppercase regex but is not an active slug.
             assertThatThrownBy(() ->
                     jdbcTemplate.update(
                             "INSERT INTO service_types "
@@ -585,23 +367,14 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                             categoryId,
                             "Test type for constraint check",
                             "constraint-test-slug-" + UUID.randomUUID()))
-                    .isInstanceOf(DataIntegrityViolationException.class)
-                    .as("service_types.platform_category_name must reject 'UNKNOWN_BUCKET' — "
-                        + "a value that satisfies the current open CHECK regex "
-                        + "(^[A-Z][A-Z0-9_]*$) but is outside the 9 live slugs. "
-                        + "The MEDIUM fix must add a closed-set guard (FK to "
-                        + "platform_categories.name or a refined CHECK constraint) "
-                        + "that makes this INSERT fail.");
+                    .as("platform_category_name must be FK-constrained to an existing "
+                        + "platform_categories.name — 'UNKNOWN_BUCKET' must be rejected")
+                    .isInstanceOf(DataIntegrityViolationException.class);
         }
 
-        // Expected: GREEN now — existing CHECK already enforces the uppercase regex.
         @Test
-        @DisplayName("INSERT with platform_category_name in lowercase is rejected by the existing CHECK")
+        @DisplayName("INSERT with a lowercase platform_category_name is rejected by the CHECK")
         void should_rejectInsert_when_platformCategoryNameIsLowercase() {
-            // This test is GREEN now: the existing chk_service_types_platform_category_name
-            // CHECK (platform_category_name ~ '^[A-Z][A-Z0-9_]*$') already rejects
-            // lowercase slugs. Included here to document the existing constraint shape
-            // and provide a positive counterpart to the unknown-slug negative test.
             UUID categoryId = jdbcTemplate.queryForObject(
                     "SELECT id FROM service_categories LIMIT 1",
                     UUID.class);
@@ -615,26 +388,22 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                             categoryId,
                             "Test type for case check",
                             "case-test-slug-" + UUID.randomUUID()))
-                    .isInstanceOf(DataIntegrityViolationException.class)
-                    .as("chk_service_types_platform_category_name must reject 'manicure' "
-                        + "(lowercase) — the CHECK constraint requires uppercase-only slugs "
-                        + "matching ^[A-Z][A-Z0-9_]*$");
+                    .as("the uppercase-only CHECK / FK must reject the lowercase 'manicure'")
+                    .isInstanceOf(DataIntegrityViolationException.class);
         }
     }
 
+    // =========================================================================
+    // 7. Partial B-tree index for category filtering
+    // =========================================================================
+
     @Nested
-    @DisplayName("schema constraint — partial B-tree index exists (pins MEDIUM fix)")
+    @DisplayName("schema — idx_service_types_platform_category exists")
     class PlatformCategoryIndex {
 
-        // Expected: RED until the index migration runs.
         @Test
         @DisplayName("idx_service_types_platform_category index exists on service_types")
         void should_haveIdxServiceTypesPlatformCategory_when_indexMigrationApplied() {
-            // pg_indexes.indexname is the authoritative catalog for index presence.
-            // The MEDIUM perf finding requires a B-tree index named
-            // idx_service_types_platform_category on service_types to make
-            // platform-category filtering fast once 16.2+ endpoints start
-            // querying by slug. This test is RED until the index migration runs.
             List<String> indexes = jdbcTemplate.queryForList(
                     "SELECT indexname FROM pg_indexes "
                     + "WHERE tablename = 'service_types' "
@@ -642,31 +411,37 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                     String.class);
 
             assertThat(indexes)
-                    .as("idx_service_types_platform_category must exist on service_types — "
-                        + "required by the MEDIUM perf finding for fast category filtering "
-                        + "in Phase 16.2+ endpoints")
+                    .as("idx_service_types_platform_category must exist for fast category filtering")
                     .containsExactly("idx_service_types_platform_category");
         }
+    }
 
-        // Expected: RED until the index migration runs.
+    // =========================================================================
+    // 8. Flyway history
+    // =========================================================================
+
+    @Nested
+    @DisplayName("Flyway history")
+    class FlywayHistory {
+
         @Test
-        @DisplayName("idx_service_types_platform_category is a partial index (WHERE is_active = true)")
-        void should_makeIdxServiceTypesPlatformCategoryPartial_when_indexMigrationApplied() {
-            // Partial indexes are visible in pg_indexes.indexdef via a WHERE clause.
-            // A non-partial index on an active-filtered column wastes space on
-            // inactive rows. The MEDIUM fix mandates WHERE is_active = true.
-            String indexDef = jdbcTemplate.queryForObject(
-                    "SELECT indexdef FROM pg_indexes "
-                    + "WHERE tablename = 'service_types' "
-                    + "  AND indexname = 'idx_service_types_platform_category'",
-                    String.class);
+        @DisplayName("V73, V74 and V75 are recorded as success with stable checksums")
+        void should_recordReparentChainAsSuccess_when_chainApplied() {
+            assertMigrationSuccess("73", "V73__reparent_service_types_to_platform_categories.sql");
+            assertMigrationSuccess("74", "V74__seed_taxonomy_platform_categories.sql");
+            assertMigrationSuccess("75", "V75__reseed_service_types_taxonomy.sql");
+        }
 
-            assertThat(indexDef)
-                    .as("idx_service_types_platform_category must be a partial index "
-                        + "scoped to WHERE is_active = true; a full index wastes storage "
-                        + "on inactive/deleted service_type rows")
-                    .containsIgnoringCase("where")
-                    .containsIgnoringCase("is_active");
+        @Test
+        @DisplayName("no failed migration in the full history after the chain applied")
+        void should_haveZeroFailedMigrations_when_chainApplied() {
+            Integer failed = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM flyway_schema_history WHERE success = FALSE",
+                    Integer.class);
+
+            assertThat(failed)
+                    .as("the full migration chain must have zero failures")
+                    .isZero();
         }
     }
 
@@ -674,25 +449,49 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
     // shared helpers
     // =========================================================================
 
+    private void assertDisplayName(String slug, String expectedDisplayName) {
+        String actual = jdbcTemplate.queryForObject(
+                "SELECT display_name FROM platform_categories WHERE name = ?",
+                String.class, slug);
+
+        assertThat(actual)
+                .as("platform category '%s' must carry display name '%s'", slug, expectedDisplayName)
+                .isEqualTo(expectedDisplayName);
+    }
+
+    private void assertMigrationSuccess(String version, String expectedScript) {
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT success, checksum, script "
+                + "FROM flyway_schema_history WHERE version = ?", version);
+
+        assertThat(row.get("success"))
+                .as("V%s must be recorded as a successful migration", version)
+                .isEqualTo(Boolean.TRUE);
+        assertThat(row.get("script")).isEqualTo(expectedScript);
+        assertThat(row.get("checksum"))
+                .as("V%s must carry a deterministic (non-null) checksum", version)
+                .isNotNull();
+    }
+
     private void assertPlatformCategory(String slug, String expectedCategory) {
         String actual = jdbcTemplate.queryForObject(
                 "SELECT platform_category_name FROM service_types WHERE slug = ?",
                 String.class, slug);
 
         assertThat(actual)
-                .as("service_type '%s' must map to platform category '%s'",
-                        slug, expectedCategory)
+                .as("service_type '%s' must map to platform category '%s'", slug, expectedCategory)
                 .isEqualTo(expectedCategory);
     }
 
     private void assertBucketCount(String category, int expectedCount) {
         Integer count = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM service_types WHERE platform_category_name = ?",
+                "SELECT COUNT(*) FROM service_types "
+                + "WHERE platform_category_name = ? AND is_active = TRUE",
                 Integer.class, category);
 
         assertThat(count)
-                .as("platform category '%s' must contain exactly %d service_types "
-                    + "(per V73 mapping table)", category, expectedCount)
+                .as("platform category '%s' must contain exactly %d active service_types "
+                    + "(per phase-17.1 table)", category, expectedCount)
                 .isEqualTo(expectedCount);
     }
 }

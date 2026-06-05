@@ -28,6 +28,14 @@ class CatalogRepositoryTest extends AbstractDataJpaTest {
     @Autowired
     private TestEntityManager em;
 
+    /**
+     * A live, Flyway-seeded platform-category slug (phase-17.1). service_types.
+     * platform_category_name is NOT NULL and FK-constrained to platform_categories.name,
+     * so every fixture insert must carry a real active slug. The choice of slug is
+     * irrelevant to these category_id-scoped queries; NAIL_SERVICE is used uniformly.
+     */
+    private static final String SEEDED_PLATFORM_CATEGORY = "NAIL_SERVICE";
+
     @BeforeEach
     void cleanDatabase() {
         serviceTypeRepository.deleteAllInBatch();
@@ -56,6 +64,7 @@ class CatalogRepositoryTest extends AbstractDataJpaTest {
                 .nameEn(nameEn)
                 .slug(slug)
                 .active(active)
+                .platformCategoryName(SEEDED_PLATFORM_CATEGORY)
                 .build();
         return em.persist(type);
     }
@@ -542,6 +551,7 @@ class CatalogRepositoryTest extends AbstractDataJpaTest {
                     .nameEn("Other Type")
                     .slug("duplicate-slug")
                     .active(true)
+                    .platformCategoryName(SEEDED_PLATFORM_CATEGORY)
                     .build();
             em.persist(duplicate);
 
