@@ -99,7 +99,7 @@ class ServiceTestFixtures {
 
     UUID createServiceDefinition(String ownerToken, UUID salonId, String name) throws Exception {
         return createServiceDefinition(ownerToken, salonId,
-                new CreateServiceDefinitionRequest(name, null, "MANICURE", 60, 0,
+                new CreateServiceDefinitionRequest(name, null, "NAIL_SERVICE", 60, 0,
                         PriceType.FIXED, new BigDecimal("500.00"), null, null, null));
     }
 
@@ -118,7 +118,7 @@ class ServiceTestFixtures {
     }
 
     UUID createIndependentMasterService(String indepToken, String name) throws Exception {
-        var request = new CreateServiceDefinitionRequest(name, null, "MANICURE", 60, 0,
+        var request = new CreateServiceDefinitionRequest(name, null, "NAIL_SERVICE", 60, 0,
                 PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/independent-masters/me/services", HttpMethod.POST,

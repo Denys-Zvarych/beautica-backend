@@ -6,13 +6,13 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.notification.EmailService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
@@ -24,8 +24,8 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.PageRequest;
@@ -39,6 +39,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -51,13 +52,11 @@ public class ServiceCatalogService {
     private final MasterRepository masterRepository;
     private final CatalogCategoryLookup catalogCategoryLookup;
     private final PlatformCategoryRepository platformCategoryRepository;
-    private final EmailService emailService;
+    private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
+    private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
-
-    @Value("${app.admin-email}")
-    private String adminEmail;
 
     @Transactional
     public ServiceDefinitionResponse addServiceToSalon(
@@ -383,23 +382,50 @@ public class ServiceCatalogService {
                 .toList();
     }
 
-    public void suggestServiceType(SuggestServiceTypeRequest request, UUID requestedByUserId) {
-        String safeName = sanitizeEmailField(request.name());
-        String safeDescription = request.description() != null
-                ? sanitizeEmailField(request.description()) : "—";
-
-        String subject = "Beautica: Запит нового типу послуги — " + safeName;
-        String body = String.format(
-                "Від: %s (userId: %s)%nКатегорія ID: %s%nНазва: %s%nОпис: %s",
-                requestedByUserId, requestedByUserId, request.categoryId(),
-                safeName, safeDescription
-        );
-        emailService.sendAdminNotification(adminEmail, subject, body);
+    /**
+     * Returns active service types belonging to the given platform-category name slug,
+     * ordered by Ukrainian name ascending.
+     *
+     * <p>An unknown or inactive {@code categoryName} value returns an empty list (not 404)
+     * — the mobile picker treats it as "no types available for this category".
+     *
+     * <p>No caching: the {@code service_types} catalog is small and static, and a
+     * dedicated per-{@code categoryName} cache entry would need eviction on every
+     * {@code platform_categories} or {@code service_types} mutation. The query is
+     * cheap (partial B-tree index from V73) and the call rate low enough that the
+     * cache overhead would exceed the benefit.
+     *
+     * @param categoryName canonical uppercase platform-category name slug
+     *                     (e.g. {@code EYELASH}, {@code HAIR})
+     */
+    @Transactional(readOnly = true)
+    public List<PlatformServiceTypeResponse> findServiceTypesByPlatformCategory(String categoryName) {
+        // Intentional duplication of the controller's @NotBlank/@Size constraint: this guard
+        // defends non-HTTP callers (internal services, tests, future programmatic callers)
+        // where the Bean Validation boundary is not active.
+        if (categoryName == null || categoryName.strip().isEmpty()) {
+            return List.of();
+        }
+        return serviceTypeRepository.findActiveByPlatformCategoryName(categoryName)
+                .stream()
+                .map(PlatformServiceTypeResponse::from)
+                .toList();
     }
 
-    private static String sanitizeEmailField(String value) {
-        if (value == null) return "";
-        return value.replaceAll("[\r\n\t]", " ").strip();
+    public void suggestServiceType(SuggestServiceTypeRequest request, UUID requestedByUserId) {
+        // Resolve/validate the System-B category-name slug against platform_categories
+        // (active + APPROVED) BEFORE persisting — an unknown or inactive slug yields a
+        // clean 400 instead of persisting + emailing the admin a bogus suggestion
+        // (Phase 16.7 guard, preserved).
+        validateCategoryActive(request.categoryName());
+
+        // Phase 16.8: no longer fire-and-forget. Delegate to the suggestion service,
+        // which persists a PENDING service_type_suggestion row carrying a hashed
+        // single-use token and emails the admin a token-authenticated review link.
+        // Field escaping is handled by the suggestion's Thymeleaf email template
+        // (auto-escaped), so no manual sanitize is needed here.
+        serviceTypeSuggestionService.submitSuggestion(
+                request.categoryName(), request.name(), request.description(), requestedByUserId);
     }
 
     /**
@@ -506,6 +532,17 @@ public class ServiceCatalogService {
         ServiceType type = serviceTypeLookup.getById(request.serviceTypeId());
         if (!type.isActive()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
+        }
+        // Phase 16.3 cross-field guard: a present serviceTypeId must belong to the same
+        // platform category the request selected. The parent slug is the plain
+        // platform_category_name column re-parented in Phase 16.1 (no FK traversal needed),
+        // matched case-sensitively against the request category slug. This requires a DB
+        // lookup of the type, so it lives in the service layer rather than bean validation.
+        // Null-safe: a null type category yields a clean 400, never a 500 NPE. Post-V73 the
+        // platform_category_name column is NOT NULL + FK, so null is unreachable in prod.
+        if (!Objects.equals(type.getPlatformCategoryName(), request.category())) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "service type does not belong to the selected category");
         }
         definition.setServiceType(type);
     }

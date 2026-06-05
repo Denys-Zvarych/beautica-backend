@@ -15,6 +15,7 @@ import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PlatformCategoryStatus;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
@@ -483,9 +484,10 @@ class ServiceCatalogServiceTest {
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Манікюр");
         when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", null, 60, 10, PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+                "Manicure", "Classic manicure", "MANICURE", 60, 10, PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
 
         ServiceDefinition savedDef = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -499,6 +501,8 @@ class ServiceCatalogServiceTest {
         savedDef.setServiceType(serviceType);
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
 
@@ -566,9 +570,10 @@ class ServiceCatalogServiceTest {
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Педикюр");
         when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("PEDICURE");
 
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
-                "Pedicure", "Basic pedicure", null, 60, 10, PriceType.FIXED, new BigDecimal("400.00"), null, null, serviceTypeId);
+                "Pedicure", "Basic pedicure", "PEDICURE", 60, 10, PriceType.FIXED, new BigDecimal("400.00"), null, null, serviceTypeId);
 
         ServiceDefinition savedDef = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -588,6 +593,8 @@ class ServiceCatalogServiceTest {
         when(savedAssignment.isActive()).thenReturn(true);
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "PEDICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
@@ -676,6 +683,183 @@ class ServiceCatalogServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(serviceRepository, never()).save(any());
+        verify(masterServiceRepository, never()).save(any());
+    }
+
+    // ── Phase 16.3 cross-field create validation ─────────────────────────────────
+    // A present serviceTypeId whose platform-category slug differs from the request
+    // category must be rejected with a 400 BusinessException — the service type and the
+    // selected top-level category must agree. validateCategoryActive runs BEFORE the
+    // guard, so the REQUEST category must be stubbed active for the flow to reach it.
+
+    @Test
+    @DisplayName("throws 400 when serviceTypeId category differs from request category — addServiceToSalon")
+    void should_throw400_when_serviceTypeCategoryMismatch_addServiceToSalon() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        // Type belongs to HAIRCUT but the request selects MANICURE — cross-field mismatch.
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("HAIRCUT");
+
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+
+        assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .as("category mismatch must surface as 400 BAD_REQUEST")
+                        .isEqualTo(HttpStatus.BAD_REQUEST))
+                .hasMessageContaining("does not belong to the selected category");
+
+        verify(serviceRepository, never()).save(any());
+    }
+
+    // ── Phase 16.4: serviceTypeNameUk lifted onto the MasterServiceResponse create path ─────
+    // 16.3 already proves the type is resolved/set on the entity; these focus on the response
+    // SHAPE — the top-level serviceTypeId + serviceTypeNameUk fields the client reads back.
+
+    @Test
+    @DisplayName("addIndependentMasterService response carries serviceTypeId + serviceTypeNameUk when a type is chosen")
+    void should_liftServiceTypeFieldsToResponse_when_independentMasterCreatesWithServiceType() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        when(serviceType.getNameUk()).thenReturn("Манікюр");
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        // The saved ServiceDefinition carries the linked ServiceType — from() lifts it to the response.
+        ServiceDefinition savedDef = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(masterId)
+                .name("Manicure")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(10)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("350.00"))
+                .isActive(true)
+                .build();
+        savedDef.setServiceType(serviceType);
+
+        MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
+        when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
+        when(savedAssignment.getMaster()).thenReturn(master);
+        when(savedAssignment.getServiceDefinition()).thenReturn(savedDef);
+        when(savedAssignment.isActive()).thenReturn(true);
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
+
+        MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(userId, request);
+
+        assertThat(result.serviceTypeId())
+                .as("top-level serviceTypeId must be lifted onto the create response")
+                .isEqualTo(serviceTypeId);
+        assertThat(result.serviceTypeNameUk())
+                .as("top-level serviceTypeNameUk must carry the type's Ukrainian display name")
+                .isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("addIndependentMasterService response has null serviceTypeId + serviceTypeNameUk when no type is chosen")
+    void should_nullServiceTypeFieldsOnResponse_when_independentMasterCreatesWithoutServiceType() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+
+        // buildCreateRequest() has a null serviceTypeId — the picker was not used.
+        ServiceDefinition savedDef = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(masterId)
+                .name("Manicure")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(10)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("350.00"))
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
+        when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
+        when(savedAssignment.getMaster()).thenReturn(master);
+        when(savedAssignment.getServiceDefinition()).thenReturn(savedDef);
+        when(savedAssignment.isActive()).thenReturn(true);
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
+
+        MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(
+                userId, buildCreateRequest());
+
+        assertThat(result.serviceTypeId())
+                .as("serviceTypeId must be null when no service type was chosen")
+                .isNull();
+        assertThat(result.serviceTypeNameUk())
+                .as("serviceTypeNameUk must be null when no service type was chosen")
+                .isNull();
+        verify(serviceTypeLookup, never()).getById(any());
+    }
+
+    @Test
+    @DisplayName("throws 400 when serviceTypeId category differs from request category — addIndependentMasterService")
+    void should_throw400_when_serviceTypeCategoryMismatch_addIndependentMasterService() {
+        UUID userId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+
+        // Type belongs to HAIRCUT but the request selects MANICURE — cross-field mismatch.
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("HAIRCUT");
+
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+
+        assertThatThrownBy(() -> serviceCatalogService.addIndependentMasterService(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .as("category mismatch must surface as 400 BAD_REQUEST")
+                        .isEqualTo(HttpStatus.BAD_REQUEST))
+                .hasMessageContaining("does not belong to the selected category");
 
         verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());

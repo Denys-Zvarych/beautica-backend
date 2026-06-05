@@ -105,7 +105,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
         UUID salonId = fixtures.createSalon(ownerToken, "Range Pricing Salon");
 
         var request = new CreateServiceDefinitionRequest(
-                "Balayage", "Hand-painted highlights", "HAIRCUT", 180, 0,
+                "Balayage", "Hand-painted highlights", "HAIRDRESSING", 180, 0,
                 PriceType.RANGE, null, new BigDecimal("1200.00"), new BigDecimal("2500.00"), null);
 
         log.debug("Act: POST a RANGE service (priceMin=1200, priceMax=2500) to salon {}", salonId);
@@ -135,7 +135,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
         UUID salonId = fixtures.createSalon(ownerToken, "Fixed Pricing Salon");
 
         var request = new CreateServiceDefinitionRequest(
-                "Classic Manicure", null, "MANICURE", 60, 0,
+                "Classic Manicure", null, "NAIL_SERVICE", 60, 0,
                 PriceType.FIXED, new BigDecimal("450.00"), null, null, null);
 
         log.debug("Act: POST a FIXED service (price=450) to salon {}", salonId);
@@ -165,7 +165,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
                 "fixed-to-range-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Transition Salon A");
         var fixed = new CreateServiceDefinitionRequest(
-                "Lash Lift", null, "EYELASH", 60, 0,
+                "Lash Lift", null, "LASH_EXTENSIONS", 60, 0,
                 PriceType.FIXED, new BigDecimal("700.00"), null, null, null);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, fixed);
 
@@ -243,7 +243,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
 
         var body = new LinkedHashMap<String, Object>();
         body.put("name", "Inverted Range");
-        body.put("category", "MANICURE");
+        body.put("category", "NAIL_SERVICE");
         body.put("baseDurationMinutes", 60);
         body.put("bufferMinutesAfter", 0);
         body.put("priceType", "RANGE");
@@ -284,7 +284,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
 
         var body = new LinkedHashMap<String, Object>();
         body.put("name", "Mixed Mode Service");
-        body.put("category", "MANICURE");
+        body.put("category", "NAIL_SERVICE");
         body.put("baseDurationMinutes", 60);
         body.put("bufferMinutesAfter", 0);
         body.put("priceType", "FIXED");
@@ -411,7 +411,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
                 "idor-owner-a-" + System.nanoTime() + "@beautica.test");
         UUID salonA = fixtures.createSalon(ownerAToken, "Owner A Salon");
         var svc = new CreateServiceDefinitionRequest(
-                "Owner A Service", null, "MANICURE", 60, 0,
+                "Owner A Service", null, "NAIL_SERVICE", 60, 0,
                 PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonA, svc);
 
@@ -446,7 +446,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
                 "idor-del-a-" + System.nanoTime() + "@beautica.test");
         UUID salonA = fixtures.createSalon(ownerAToken, "Delete IDOR Salon A");
         var svc = new CreateServiceDefinitionRequest(
-                "Protected Service", null, "PEDICURE", 60, 0,
+                "Protected Service", null, "NAIL_SERVICE", 60, 0,
                 PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonA, svc);
 
@@ -485,7 +485,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
                 "role-client-" + System.nanoTime() + "@beautica.test");
 
         var request = new CreateServiceDefinitionRequest(
-                "Client Forbidden Service", null, "MANICURE", 60, 0,
+                "Client Forbidden Service", null, "NAIL_SERVICE", 60, 0,
                 PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
 
         log.debug("Act: a CLIENT POSTs a service to salon {}", salonId);
@@ -503,7 +503,7 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
     @DisplayName("POST /salons/{id}/services — 401 when no Authorization header is present")
     void should_return401_when_noToken() {
         var request = new CreateServiceDefinitionRequest(
-                "Anon Service", null, "MANICURE", 60, 0,
+                "Anon Service", null, "NAIL_SERVICE", 60, 0,
                 PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
 
         HttpHeaders noAuth = new HttpHeaders();

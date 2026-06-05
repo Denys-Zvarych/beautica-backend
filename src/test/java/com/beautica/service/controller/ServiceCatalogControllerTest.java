@@ -6,6 +6,7 @@ import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.CatalogCategoryResponse;
+import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
@@ -109,6 +110,10 @@ class ServiceCatalogControllerTest {
 
     private final UUID nailsCategoryId = UUID.randomUUID();
     private final UUID browsCategoryId = UUID.randomUUID();
+    // System-B category-name slugs for POST /service-types/suggest (the service is
+    // mocked in this @WebMvcTest, so any non-blank slug satisfies @NotBlank/@Pattern).
+    private static final String NAILS_CATEGORY_NAME = "NAIL_SERVICE";
+    private static final String BROWS_CATEGORY_NAME = "BROWS";
     private final UUID gelPolishTypeId = UUID.randomUUID();
     private final UUID browShapingTypeId = UUID.randomUUID();
 
@@ -257,7 +262,7 @@ class ServiceCatalogControllerTest {
         var userId = UUID.randomUUID();
         doNothing().when(serviceCatalogService).suggestServiceType(any(SuggestServiceTypeRequest.class), eq(userId));
 
-        var request = new SuggestServiceTypeRequest("Ламінування вій", nailsCategoryId, "Опис процедури");
+        var request = new SuggestServiceTypeRequest("Ламінування вій", NAILS_CATEGORY_NAME, "Опис процедури");
         log.debug("Act: POST /api/v1/service-types/suggest as SALON_OWNER");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -274,7 +279,7 @@ class ServiceCatalogControllerTest {
     @DisplayName("POST /service-types/suggest — 403 when CLIENT submits a suggestion")
     void should_return403_when_clientSuggestsServiceType() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new SuggestServiceTypeRequest("Sneaky Suggest", nailsCategoryId, null);
+        var request = new SuggestServiceTypeRequest("Sneaky Suggest", NAILS_CATEGORY_NAME, null);
         log.debug("Act: POST /api/v1/service-types/suggest as CLIENT — must be denied");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -289,23 +294,27 @@ class ServiceCatalogControllerTest {
     @DisplayName("POST /service-types/suggest — 400 when name is blank")
     void should_return400_when_nameIsBlank() throws Exception {
         var userId = UUID.randomUUID();
-        String invalidBody = "{\"name\":\"\",\"categoryId\":\"" + nailsCategoryId + "\"}";
+        var request = new SuggestServiceTypeRequest("", NAILS_CATEGORY_NAME, null);
         log.debug("Act: POST /api/v1/service-types/suggest with blank name — must return 400");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(invalidBody))
+                        .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).suggestServiceType(any(), any());
     }
 
     @Test
-    @DisplayName("POST /service-types/suggest — 400 when categoryId is missing")
-    void should_return400_when_categoryIdIsNull() throws Exception {
+    @DisplayName("POST /service-types/suggest — 400 when categoryName is missing (Phase 16.7: slug, not UUID)")
+    void should_return400_when_categoryNameIsMissing() throws Exception {
         var userId = UUID.randomUUID();
+        // Phase 16.7 re-keyed the DTO from a System-A UUID categoryId to a System-B
+        // categoryName slug. A body carrying neither field must fail @NotBlank.
         String invalidBody = "{\"name\":\"Нова послуга\"}";
-        log.debug("Act: POST /api/v1/service-types/suggest with missing categoryId — must return 400");
+        log.debug("Act: POST /api/v1/service-types/suggest with missing categoryName — must return 400");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
@@ -313,12 +322,105 @@ class ServiceCatalogControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(invalidBody))
                 .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).suggestServiceType(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /service-types/suggest — 400 when categoryName is blank (@NotBlank)")
+    void should_return400_when_suggestCategoryNameIsBlank() throws Exception {
+        var userId = UUID.randomUUID();
+        var request = new SuggestServiceTypeRequest("Нова послуга", "", null);
+        log.debug("Act: POST /api/v1/service-types/suggest with blank categoryName — must return 400");
+
+        mockMvc.perform(post("/api/v1/service-types/suggest")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).suggestServiceType(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /service-types/suggest — 400 with standard ApiResponse error shape when slug is unknown/inactive")
+    void should_return400WithApiResponseError_when_categoryNameUnknownOrInactive() throws Exception {
+        var userId = UUID.randomUUID();
+        // The service resolves the slug against platform_categories (APPROVED+active);
+        // an unknown/inactive slug throws BusinessException(400) which GlobalExceptionHandler
+        // renders as the standard {success:false, message:...} ApiResponse.
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException(
+                        org.springframework.http.HttpStatus.BAD_REQUEST, "Unknown category: GHOST_CATEGORY"))
+                .when(serviceCatalogService).suggestServiceType(any(SuggestServiceTypeRequest.class), eq(userId));
+        var request = new SuggestServiceTypeRequest("Нова послуга", "GHOST_CATEGORY", null);
+        log.debug("Act: POST /api/v1/service-types/suggest with unknown slug — service rejects with 400");
+
+        mockMvc.perform(post("/api/v1/service-types/suggest")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /service-types/suggest — 400 when categoryName contains a control character")
+    void should_return400_when_suggestCategoryNameContainsControlChar() throws Exception {
+        var userId = UUID.randomUUID();
+        // NUL byte inside the slug — @Pattern(^[^\\p{Cntrl}]*$) must reject before the service runs.
+        String invalidBody = "{\"name\":\"Нова послуга\",\"categoryName\":\"NAIL\\u0000SERVICE\"}";
+        log.debug("Act: POST /api/v1/service-types/suggest with NUL in categoryName — must return 400");
+
+        mockMvc.perform(post("/api/v1/service-types/suggest")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalidBody))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).suggestServiceType(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /service-types/suggest — 400 when name contains a control character")
+    void should_return400_when_nameContainsControlChar() throws Exception {
+        var userId = UUID.randomUUID();
+        String invalidBody = "{\"name\":\"Bad\\u0000Name\",\"categoryName\":\"" + NAILS_CATEGORY_NAME + "\"}";
+        log.debug("Act: POST /api/v1/service-types/suggest with NUL in name — must return 400");
+
+        mockMvc.perform(post("/api/v1/service-types/suggest")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalidBody))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).suggestServiceType(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /service-types/suggest — 400 when categoryName exceeds @Size(max=64)")
+    void should_return400_when_categoryNameExceeds64Chars() throws Exception {
+        var userId = UUID.randomUUID();
+        var request = new SuggestServiceTypeRequest("Нова послуга", "A".repeat(65), null);
+        log.debug("Act: POST /api/v1/service-types/suggest with 65-char categoryName — must return 400");
+
+        mockMvc.perform(post("/api/v1/service-types/suggest")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).suggestServiceType(any(), any());
     }
 
     @Test
     @DisplayName("POST /service-types/suggest — 401 when no authentication provided")
     void should_return401_when_noAuthProvided() throws Exception {
-        var request = new SuggestServiceTypeRequest("Ламінування вій", nailsCategoryId, null);
+        var request = new SuggestServiceTypeRequest("Ламінування вій", NAILS_CATEGORY_NAME, null);
         log.debug("Act: POST /api/v1/service-types/suggest without auth — must return 401");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -334,7 +436,7 @@ class ServiceCatalogControllerTest {
         var userId = UUID.randomUUID();
         doNothing().when(serviceCatalogService).suggestServiceType(any(), any());
 
-        var request = new SuggestServiceTypeRequest("Ботокс для брів", nailsCategoryId, "Опис");
+        var request = new SuggestServiceTypeRequest("Ботокс для брів", NAILS_CATEGORY_NAME, "Опис");
         log.debug("Act: POST /api/v1/service-types/suggest as SALON_ADMIN");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -351,7 +453,7 @@ class ServiceCatalogControllerTest {
         var userId = UUID.randomUUID();
         doNothing().when(serviceCatalogService).suggestServiceType(any(), any());
 
-        var request = new SuggestServiceTypeRequest("Нарощення нігтів", nailsCategoryId, null);
+        var request = new SuggestServiceTypeRequest("Нарощення нігтів", NAILS_CATEGORY_NAME, null);
         log.debug("Act: POST /api/v1/service-types/suggest as INDEPENDENT_MASTER");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -366,7 +468,7 @@ class ServiceCatalogControllerTest {
     @DisplayName("POST /service-types/suggest — 403 when SALON_MASTER submits a suggestion")
     void should_return403_when_salonMasterSuggestsServiceType() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new SuggestServiceTypeRequest("Корекція форми брів", browsCategoryId, null);
+        var request = new SuggestServiceTypeRequest("Корекція форми брів", BROWS_CATEGORY_NAME, null);
         log.debug("Act: POST /api/v1/service-types/suggest as SALON_MASTER");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -382,7 +484,7 @@ class ServiceCatalogControllerTest {
     void should_return400_when_nameExceeds255Chars() throws Exception {
         var userId = UUID.randomUUID();
         String longName = "a".repeat(256);
-        String invalidBody = "{\"name\":\"" + longName + "\",\"categoryId\":\"" + nailsCategoryId + "\"}";
+        String invalidBody = "{\"name\":\"" + longName + "\",\"categoryName\":\"" + NAILS_CATEGORY_NAME + "\"}";
         log.debug("Act: POST /api/v1/service-types/suggest with 256-char name — must return 400");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -398,7 +500,7 @@ class ServiceCatalogControllerTest {
     void should_return400_when_descriptionExceeds1000Chars() throws Exception {
         var userId = UUID.randomUUID();
         String longDescription = "a".repeat(1001);
-        String invalidBody = "{\"name\":\"Нова послуга\",\"categoryId\":\"" + nailsCategoryId
+        String invalidBody = "{\"name\":\"Нова послуга\",\"categoryName\":\"" + NAILS_CATEGORY_NAME
                 + "\",\"description\":\"" + longDescription + "\"}";
         log.debug("Act: POST /api/v1/service-types/suggest with 1001-char description — must return 400");
 
@@ -416,7 +518,7 @@ class ServiceCatalogControllerTest {
         var userId = UUID.randomUUID();
         doNothing().when(serviceCatalogService).suggestServiceType(any(), any());
 
-        var request = new SuggestServiceTypeRequest("Ламінування брів", browsCategoryId, "Деталі");
+        var request = new SuggestServiceTypeRequest("Ламінування брів", BROWS_CATEGORY_NAME, "Деталі");
         log.debug("Act: POST /api/v1/service-types/suggest — assert response body structure");
 
         mockMvc.perform(post("/api/v1/service-types/suggest")
@@ -543,5 +645,160 @@ class ServiceCatalogControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── GET /api/v1/service-types?categoryName=... (Phase 16.2) ───────────────
+    // The params="categoryName" discriminant on @GetMapping routes ONLY requests
+    // carrying categoryName to getServiceTypesByPlatformCategory(...). Requests
+    // with categoryId/q (or neither) continue to the legacy getServiceTypes(...)
+    // handler — the routing-isolation test below pins that contract.
+
+    private List<PlatformServiceTypeResponse> stubPlatformTypes() {
+        return List.of(
+                new PlatformServiceTypeResponse(gelPolishTypeId, "lash-classic", "Нарощування вій (класика)", "EYELASH"),
+                new PlatformServiceTypeResponse(browShapingTypeId, "lash-lamination", "Ламінування вій", "EYELASH"));
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=EYELASH — 200 with PlatformServiceType shape {id,slug,nameUk,categoryName}, no auth")
+    void should_return200WithPlatformTypeShape_when_categoryNameProvided() throws Exception {
+        when(serviceCatalogService.findServiceTypesByPlatformCategory(eq("EYELASH")))
+                .thenReturn(stubPlatformTypes());
+        log.debug("Act: GET /api/v1/service-types?categoryName=EYELASH — public, expect platform-type shape");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "EYELASH")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].id").value(gelPolishTypeId.toString()))
+                .andExpect(jsonPath("$.data[0].slug").value("lash-classic"))
+                .andExpect(jsonPath("$.data[0].nameUk").value("Нарощування вій (класика)"))
+                .andExpect(jsonPath("$.data[0].categoryName").value("EYELASH"))
+                // The legacy ServiceTypeResponse fields (categoryId, nameEn) must NOT leak
+                // into this contract — the DTO is deliberately separate (anti-bug §I).
+                .andExpect(jsonPath("$.data[0].categoryId").doesNotExist())
+                .andExpect(jsonPath("$.data[0].nameEn").doesNotExist());
+
+        verify(serviceCatalogService).findServiceTypesByPlatformCategory("EYELASH");
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=NOPE — 200 empty list (unknown slug is NOT 404)")
+    void should_return200EmptyList_when_categoryNameIsUnknown() throws Exception {
+        when(serviceCatalogService.findServiceTypesByPlatformCategory(eq("NOPE")))
+                .thenReturn(List.of());
+        log.debug("Act: GET /api/v1/service-types?categoryName=NOPE — unknown slug returns empty, not 404");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "NOPE")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(0));
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName= — 400 when categoryName is present but blank (@NotBlank)")
+    void should_return400_when_categoryNameIsBlank() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?categoryName= — present-but-blank must return 400");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=<101-char> — 400 when categoryName exceeds @Size(max=100)")
+    void should_return400_when_categoryNameExceeds100Chars() throws Exception {
+        String longName = "A".repeat(101);
+        log.debug("Act: GET /api/v1/service-types?categoryName=<101 chars> — must return 400");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", longName)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=<100-char> — 200 at the exact @Size(max=100) boundary")
+    void should_return200_when_categoryNameIsExactly100Chars() throws Exception {
+        String boundaryName = "A".repeat(100);
+        when(serviceCatalogService.findServiceTypesByPlatformCategory(eq(boundaryName)))
+                .thenReturn(List.of());
+        log.debug("Act: GET /api/v1/service-types?categoryName=<100 chars> — boundary must be accepted (200)");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", boundaryName)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verify(serviceCatalogService).findServiceTypesByPlatformCategory(boundaryName);
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=<script> — 400 when categoryName contains HTML angle brackets")
+    void should_return400_when_categoryNameContainsHtmlChars() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?categoryName=<script> — angle brackets rejected by @Pattern");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "<script>")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=A\\tB — 400 when categoryName contains a control character")
+    void should_return400_when_categoryNameContainsControlChar() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?categoryName=A<TAB>B — control char rejected by @Pattern");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "A\tB")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("Routing discriminant — categoryId request hits the legacy handler, NOT the platform-category handler")
+    void should_routeToLegacyHandler_when_categoryIdProvidedNotCategoryName() throws Exception {
+        var nailsOnly = List.of(
+                new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish"));
+        when(serviceCatalogService.searchServiceTypes(eq(nailsCategoryId), isNull())).thenReturn(nailsOnly);
+        log.debug("Act: GET /api/v1/service-types?categoryId={} — must route to legacy searchServiceTypes", nailsCategoryId);
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryId", nailsCategoryId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].categoryId").value(nailsCategoryId.toString()));
+
+        // The legacy handler ran; the platform-category handler must NOT have been touched.
+        verify(serviceCatalogService).searchServiceTypes(eq(nailsCategoryId), isNull());
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("Routing discriminant — q request hits the legacy handler, NOT the platform-category handler")
+    void should_routeToLegacyHandler_when_qProvidedNotCategoryName() throws Exception {
+        when(serviceCatalogService.searchServiceTypes(isNull(), eq("Гель"))).thenReturn(List.of());
+        log.debug("Act: GET /api/v1/service-types?q=Гель — must route to legacy searchServiceTypes");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "Гель")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verify(serviceCatalogService).searchServiceTypes(isNull(), eq("Гель"));
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
     }
 }

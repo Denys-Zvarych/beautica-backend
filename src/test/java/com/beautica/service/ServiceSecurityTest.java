@@ -88,7 +88,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 "sec-owner-b-add-" + System.nanoTime() + "@beautica.test");
 
         var request = new CreateServiceDefinitionRequest(
-                "IDOR Service", null, "MANICURE", 30, 0,
+                "IDOR Service", null, "NAIL_SERVICE", 30, 0,
                 PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
 
         // Act

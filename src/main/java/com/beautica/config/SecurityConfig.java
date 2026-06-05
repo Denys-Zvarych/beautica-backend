@@ -99,6 +99,14 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/approve").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/reject").permitAll();
+                    // Phase 16.8 service-type suggestion review pages — token-authenticated
+                    // (the unguessable single-use token IS the credential), identical to the
+                    // category-request review routes above. GET review performs NO state
+                    // change; only the POST approve/reject mutate. POST /service-types/suggest
+                    // (provider role-gated) is NOT listed and falls through to authenticated().
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types/suggestions/review").permitAll();
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/service-types/suggestions/approve").permitAll();
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/service-types/suggestions/reject").permitAll();
                     // Phase 10.4 KATOTTH locality reference reads — DELIBERATE
                     // public allow-list (not incidental). These three GETs
                     // expose only non-sensitive reference data (oblast/city/

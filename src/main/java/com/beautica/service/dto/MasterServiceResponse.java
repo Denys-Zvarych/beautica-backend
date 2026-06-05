@@ -2,6 +2,7 @@ package com.beautica.service.dto;
 
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.PriceType;
+import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -17,6 +18,11 @@ import java.util.UUID;
  *   <li>{@code priceType}, {@code priceMin}, {@code priceMax}, {@code priceDisplay} —
  *       surfaced from the nested {@link ServiceDefinitionResponse} for display purposes.</li>
  * </ul>
+ *
+ * <h2>Service type</h2>
+ * {@code serviceTypeId} / {@code serviceTypeNameUk} are lifted from the nested
+ * {@link ServiceDefinitionResponse} for client convenience; both are {@code null} when no
+ * service type was chosen on the create path (the picker is optional).
  */
 public record MasterServiceResponse(
         UUID id,
@@ -35,7 +41,21 @@ public record MasterServiceResponse(
         /** RANGE ceiling surfaced from the service definition; null for FIXED. */
         BigDecimal priceMax,
         /** Pre-formatted display string, e.g. {@code "500 грн"} or {@code "від 500 до 800 грн"}. */
-        String priceDisplay
+        String priceDisplay,
+        /**
+         * Chosen service type id, lifted from the nested {@link ServiceDefinitionResponse}.
+         * {@code null} when no service type was chosen (the picker is optional).
+         */
+        @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
+                description = "Chosen service type id; null when no service type was selected.")
+        UUID serviceTypeId,
+        /**
+         * Ukrainian display name of the chosen service type, lifted from the nested
+         * {@link ServiceDefinitionResponse}. {@code null} when no service type was chosen.
+         */
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Ukrainian display name of the chosen service type; null when none was selected.")
+        String serviceTypeNameUk
 ) {
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
         var sdResponse = ServiceDefinitionResponse.from(msa.getServiceDefinition());
@@ -64,7 +84,9 @@ public record MasterServiceResponse(
                 sdResponse.priceType(),
                 sdResponse.priceMin(),
                 sdResponse.priceMax(),
-                sdResponse.priceDisplay()
+                sdResponse.priceDisplay(),
+                sdResponse.serviceTypeId(),
+                sdResponse.serviceTypeNameUk()
         );
     }
 }

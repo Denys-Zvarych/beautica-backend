@@ -105,4 +105,52 @@ public class EmailService {
             log.error("Failed to send category-request notification email: {}", ex.getClass().getSimpleName());
         }
     }
+
+    /**
+     * Sends the platform admin a "new service-type suggestion" email with a
+     * Review/Approve/Reject link carrying the raw single-use token.
+     *
+     * <p>All dynamic values are rendered through Thymeleaf with auto-escaping, so a
+     * malicious suggested name or description cannot inject markup; the subject is a
+     * constant prefix + the already-validated category name (no CR/LF can reach a
+     * header because the fields come from the validated suggestion DTO).
+     *
+     * @param toEmail        admin recipient
+     * @param requesterId    requester UUID (shown for audit, never the token)
+     * @param categoryName   validated System-B category slug
+     * @param suggestedName  suggested service-type name (auto-escaped on render)
+     * @param description    optional description (auto-escaped on render; may be null)
+     * @param reviewUrl      fully-built review link with the raw token query param
+     */
+    @Async("emailExecutor")
+    public void sendServiceTypeSuggestionNotification(
+            String toEmail,
+            String requesterId,
+            String categoryName,
+            String suggestedName,
+            String description,
+            String reviewUrl) {
+        try {
+            Context ctx = new Context(Locale.of("uk"));
+            ctx.setVariable("requesterId", requesterId);
+            ctx.setVariable("categoryName", categoryName);
+            ctx.setVariable("suggestedName", suggestedName);
+            ctx.setVariable("description", description);
+            ctx.setVariable("reviewUrl", reviewUrl);
+
+            String html = templateEngine.process("email/service-type-suggestion", ctx);
+
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, "UTF-8");
+            helper.setFrom(fromEmail);
+            helper.setTo(toEmail);
+            helper.setSubject("Beautica: Нова пропозиція типу послуги — " + suggestedName);
+            helper.setText(html, true);
+            mailSender.send(message);
+        } catch (MailException ex) {
+            log.error("Failed to send service-type-suggestion notification email: {}", ex.getClass().getSimpleName());
+        } catch (Exception ex) {
+            log.error("Failed to send service-type-suggestion notification email: {}", ex.getClass().getSimpleName());
+        }
+    }
 }

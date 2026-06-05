@@ -298,6 +298,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .nameUk("Манікюр")
                 .nameEn("Manicure")
                 .slug("manicure-" + UUID.randomUUID())
+                .platformCategoryName("NAIL_SERVICE")
                 .build();
         em.persist(serviceType);
 

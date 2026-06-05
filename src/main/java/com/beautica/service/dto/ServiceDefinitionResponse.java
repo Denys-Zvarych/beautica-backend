@@ -3,6 +3,7 @@ package com.beautica.service.dto;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.util.PriceDisplayFormatter;
+import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -27,7 +28,11 @@ public record ServiceDefinitionResponse(
         int baseDurationMinutes,
         int bufferMinutesAfter,
         boolean isActive,
+        @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
+                description = "Chosen service type id; null when no service type was selected.")
         UUID serviceTypeId,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Ukrainian display name of the chosen service type; null when none was selected.")
         String serviceTypeNameUk,
         String photoUrl,
         PriceType priceType,

@@ -30,8 +30,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       contract is the difference between the conflict guard and the usability gate.</li>
  * </ul>
  *
- * <p>Each test first clears the 7 Flyway-seeded categories inside the rolled-back
- * test transaction so assertions are deterministic; the seeds are restored on rollback.
+ * <p>Each test first clears the Flyway-seeded service_types and platform_categories
+ * inside the rolled-back test transaction (FK order: leaves before categories) so
+ * assertions are deterministic; the seeds are restored on rollback.
  */
 @DisplayName("PlatformCategoryRepository — @DataJpaTest")
 class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
@@ -41,7 +42,14 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
 
     @BeforeEach
     void clearSeeds() {
-        em.getEntityManager().createQuery("DELETE FROM PlatformCategory").executeUpdate();
+        // FK order: service_types.platform_category_name references
+        // platform_categories.name, so the 140 seeded leaves must be cleared before
+        // the categories. Both deletes are rolled back at end-of-test (slice tx),
+        // so the Flyway seed is restored for the next test.
+        em.getEntityManager()
+                .createNativeQuery("DELETE FROM service_types").executeUpdate();
+        em.getEntityManager()
+                .createQuery("DELETE FROM PlatformCategory").executeUpdate();
         em.flush();
     }
 

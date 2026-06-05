@@ -112,4 +112,31 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
           FUNCTION('similarity', t.nameEn, :q)) DESC
         """)
     List<ServiceType> searchByNameAndCategory(@Param("q") String q, @Param("categoryId") UUID categoryId, Pageable pageable);
+
+    /**
+     * Returns active service types for the given platform-category name slug,
+     * ordered alphabetically by Ukrainian name.
+     *
+     * <p>No {@code JOIN FETCH} of {@code category} is performed — the caller maps
+     * to {@link com.beautica.service.dto.PlatformServiceTypeResponse} which reads
+     * only {@code platformCategoryName} (a plain {@code String} column), so the
+     * {@code category} lazy association is never traversed.
+     *
+     * <p>The match is case-sensitive against the canonical uppercase slugs stored
+     * in {@code platform_categories.name} (e.g. {@code EYELASH}, {@code HAIR}).
+     *
+     * <p>Backed by the partial B-tree index
+     * {@code idx_service_types_platform_category WHERE is_active = TRUE} from V73.
+     *
+     * <p>Phase doc specified "display order" but no {@code display_order} column
+     * exists on {@code service_types} — ordering falls back to {@code nameUk ASC},
+     * consistent with every other active-type finder in this repository.
+     */
+    @Query("""
+            SELECT t FROM ServiceType t
+            WHERE t.platformCategoryName = :categoryName
+              AND t.active = true
+            ORDER BY t.nameUk ASC
+            """)
+    List<ServiceType> findActiveByPlatformCategoryName(@Param("categoryName") String categoryName);
 }
