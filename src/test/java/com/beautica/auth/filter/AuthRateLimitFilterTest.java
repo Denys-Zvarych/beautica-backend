@@ -46,6 +46,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> forgotPasswordBuckets;
     @Mock private LoadingCache<String, Bucket> resetPasswordBuckets;
     @Mock private LoadingCache<String, Bucket> categoryRequestBuckets;
+    @Mock private LoadingCache<String, Bucket> suggestServiceTypeBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -57,7 +58,7 @@ class AuthRateLimitFilterTest {
                 registerBuckets, loginBuckets, refreshBuckets, verifyEmailBuckets,
                 slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, profileUpdateBuckets,
                 resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets,
-                categoryRequestBuckets);
+                categoryRequestBuckets, suggestServiceTypeBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -1478,6 +1479,109 @@ class AuthRateLimitFilterTest {
                     .as("chain must be forwarded — GET on the category-request path is not rate-limited")
                     .isNotNull();
             verifyNoInteractions(categoryRequestBuckets);
+        }
+    }
+
+    // ==========================================================================
+    // Phase 16.7 — POST /api/v1/service-types/suggest emails the admin on every
+    // successful suggestion, so it is an inbox-flood surface throttled at 5/hr
+    // (mirrors the category-request limiter). Window is 60 minutes → Retry-After 3600.
+    @Nested
+    @DisplayName("POST /api/v1/service-types/suggest — 5/hr inbox-flood guard")
+    class SuggestServiceTypeEndpoint {
+
+        @Test
+        @DisplayName("routes to suggestServiceTypeBuckets and passes through when within limit")
+        void should_routeToSuggestServiceTypeBuckets_when_withinLimit() throws Exception {
+            log.debug("Arrange: suggestServiceTypeBuckets returns a bucket that allows consumption");
+            when(suggestServiceTypeBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/service-types/suggest");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /service-types/suggest within limit");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when suggest bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest())
+                    .as("filter chain must be forwarded when the bucket allows the request")
+                    .isNotNull();
+            verify(suggestServiceTypeBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(categoryRequestBuckets);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(registerBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 with 3600s Retry-After on the 6th request within the window")
+        void should_return429_when_sixthSuggestWithinWindow() throws Exception {
+            // 5/hr cap: first five pass, the sixth is throttled. Retry-After mirrors the
+            // 60-minute suggest-service-type window (3600 s).
+            log.debug("Arrange: suggestServiceTypeBuckets allows 5 then denies the 6th");
+            when(suggestServiceTypeBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1))
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(false);
+
+            MockHttpServletResponse lastResponse = null;
+            MockFilterChain         lastChain    = null;
+
+            log.debug("Act: send 6 POSTs to /service-types/suggest from the same IP");
+            for (int i = 0; i < 6; i++) {
+                var request = postRequest("/api/v1/service-types/suggest");
+                lastResponse = new MockHttpServletResponse();
+                lastChain    = new MockFilterChain();
+                doFilter(request, lastResponse, lastChain);
+
+                if (i < 5) {
+                    assertThat(lastResponse.getStatus())
+                            .as("request %d must not be 429 — bucket not yet exhausted", i + 1)
+                            .isNotEqualTo(429);
+                }
+            }
+
+            assertThat(lastResponse.getStatus())
+                    .as("6th request must be 429 — suggest-service-type bucket exhausted (5/hr)")
+                    .isEqualTo(429);
+            assertThat(lastResponse.getHeader("Retry-After"))
+                    .as("Retry-After must reflect the 60-minute suggest-service-type window")
+                    .isEqualTo("3600");
+            assertThat(lastResponse.getContentType())
+                    .as("Content-Type must be application/json on 429 suggest response")
+                    .startsWith("application/json");
+            assertThat(lastResponse.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(lastChain.getRequest())
+                    .as("filter chain must not be forwarded on the throttled request")
+                    .isNull();
+            verify(suggestServiceTypeBuckets, times(6)).get(REMOTE_ADDR);
+            verifyNoInteractions(categoryRequestBuckets);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(registerBuckets);
+        }
+
+        @Test
+        @DisplayName("GET /api/v1/service-types/suggest is not rate-limited (POST-only)")
+        void should_passThrough_when_getSuggestServiceType() throws Exception {
+            log.debug("Arrange: GET on the suggest path — non-POST bypasses the limiter");
+            var request  = getRequest("/api/v1/service-types/suggest");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for GET /service-types/suggest");
+            doFilter(request, response, chain);
+
+            assertThat(chain.getRequest())
+                    .as("chain must be forwarded — GET on the suggest path is not rate-limited")
+                    .isNotNull();
+            verifyNoInteractions(suggestServiceTypeBuckets);
         }
     }
 }

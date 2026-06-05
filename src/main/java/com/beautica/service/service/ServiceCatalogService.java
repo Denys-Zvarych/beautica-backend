@@ -418,14 +418,19 @@ public class ServiceCatalogService {
     }
 
     public void suggestServiceType(SuggestServiceTypeRequest request, UUID requestedByUserId) {
+        // Resolve/validate the System-B category-name slug against platform_categories
+        // (active + APPROVED) BEFORE composing the admin email — an unknown or inactive
+        // slug yields a clean 400 instead of emailing the admin a bogus suggestion.
+        validateCategoryActive(request.categoryName());
+
         String safeName = sanitizeEmailField(request.name());
         String safeDescription = request.description() != null
                 ? sanitizeEmailField(request.description()) : "—";
 
         String subject = "Beautica: Запит нового типу послуги — " + safeName;
         String body = String.format(
-                "Від: %s (userId: %s)%nКатегорія ID: %s%nНазва: %s%nОпис: %s",
-                requestedByUserId, requestedByUserId, request.categoryId(),
+                "Від: %s (userId: %s)%nКатегорія: %s%nНазва: %s%nОпис: %s",
+                requestedByUserId, requestedByUserId, request.categoryName(),
                 safeName, safeDescription
         );
         emailService.sendAdminNotification(adminEmail, subject, body);

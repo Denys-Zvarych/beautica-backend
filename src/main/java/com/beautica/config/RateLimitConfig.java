@@ -86,6 +86,17 @@ public class RateLimitConfig {
 
     private static final Duration CATEGORY_REQUEST_WINDOW = Duration.ofMinutes(60);
 
+    // Per-IP cap for POST /api/v1/service-types/suggest (60-minute window).
+    // Like the category-request path, every successful suggestion emails the admin,
+    // so this is an inbox-flood surface — kept low (5/hr) to match that posture.
+    // IP-keyed for consistency with every other bucket in this filter (JWT is not yet
+    // parsed when AuthRateLimitFilter runs). Configurable so integration tests on
+    // 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.suggest-service-type-capacity:5}")
+    private long suggestServiceTypeCapacity;
+
+    private static final Duration SUGGEST_SERVICE_TYPE_WINDOW = Duration.ofMinutes(60);
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
         return Caffeine.newBuilder()
@@ -255,6 +266,25 @@ public class RateLimitConfig {
                 .expireAfterAccess(CATEGORY_REQUEST_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(categoryRequestCapacity, CATEGORY_REQUEST_WINDOW))
+                        .build());
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/service-types/suggest}.
+     *
+     * <p>Cap: 5 requests per 60-minute window per source IP. Every successful
+     * suggestion triggers an admin notification email, so this is an inbox-flood
+     * surface; the low cap mirrors the {@link #categoryRequestBuckets()} posture.
+     * {@code expireAfterAccess(65 min)} gives a 5-minute grace past the window so
+     * the entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> suggestServiceTypeBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SUGGEST_SERVICE_TYPE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(suggestServiceTypeCapacity, SUGGEST_SERVICE_TYPE_WINDOW))
                         .build());
     }
 

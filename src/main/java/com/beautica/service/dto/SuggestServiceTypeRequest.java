@@ -1,11 +1,8 @@
 package com.beautica.service.dto;
 
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
-
-import java.util.UUID;
 
 public record SuggestServiceTypeRequest(
         @NotBlank(message = "Name is required")
@@ -15,7 +12,13 @@ public record SuggestServiceTypeRequest(
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
         String name,
 
-        @NotNull(message = "Category ID is required") UUID categoryId,
+        // System-B category-name slug, validated against platform_categories
+        // (active + APPROVED) in the service layer. Same control-char ban as the
+        // catalog name/slug fields; @Size matches the platform_categories.name cap.
+        @NotBlank(message = "Category name is required")
+        @Size(max = 64, message = "Category name must be at most 64 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Category name must not contain control characters")
+        String categoryName,
 
         @Size(max = 1000, message = "Description must be at most 1000 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
