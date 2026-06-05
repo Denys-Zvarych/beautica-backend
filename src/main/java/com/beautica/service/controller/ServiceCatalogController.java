@@ -7,6 +7,7 @@ import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
+import io.swagger.v3.oas.annotations.Parameter;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
@@ -69,6 +70,8 @@ public class ServiceCatalogController {
     @GetMapping(value = "/service-types", params = "categoryName")
     public ApiResponse<List<PlatformServiceTypeResponse>> getServiceTypesByPlatformCategory(
             @RequestParam
+            @Parameter(required = true,
+                    description = "Canonical platform-category name slug (e.g. EYELASH, HAIR). Required.")
             @NotBlank(message = "categoryName must not be blank")
             @Size(max = 100, message = "categoryName must be at most 100 characters")
             @Pattern(regexp = "^[^\\p{Cntrl}<>\"']+$",

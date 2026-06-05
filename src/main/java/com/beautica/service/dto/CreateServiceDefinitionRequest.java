@@ -3,6 +3,7 @@ package com.beautica.service.dto;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.validation.PricedRequest;
 import com.beautica.service.validation.ServicePriceValid;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
@@ -102,6 +103,13 @@ public record CreateServiceDefinitionRequest(
         @Digits(integer = 8, fraction = 2, message = "Maximum price must have at most 8 integer digits and 2 decimal places")
         BigDecimal priceMax,
 
-        @Nullable UUID serviceTypeId
+        @Nullable
+        @Schema(
+                types = {"string", "null"},
+                format = "uuid",
+                nullable = true,
+                description = "Optional id of the chosen platform service type. "
+                        + "Omit or send null when the master skips the (optional) service-type picker.")
+        UUID serviceTypeId
 ) implements PricedRequest {
 }
