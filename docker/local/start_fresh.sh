@@ -17,9 +17,43 @@ port_5432_in_use() {
   fi
 }
 
-echo "Stopping system PostgreSQL if running..."
+# Best-effort diagnostic: print WHAT currently holds host port 5432.
+# Never let the probe itself abort the script (it runs under `set -e`).
+diagnose_port_5432() {
+  echo "  Diagnosing what holds port 5432..."
+
+  # 1. Listening socket + owning PID. `ss` shows the PID only with privileges,
+  #    so try passwordless sudo first and degrade gracefully to an unprivileged
+  #    probe (which still shows the socket, just without the PID).
+  if command -v ss >/dev/null 2>&1; then
+    if sudo -n ss -ltnp 'sport = :5432' 2>/dev/null | grep ':5432'; then
+      :
+    else
+      ss -ltnp 'sport = :5432' 2>/dev/null | grep ':5432' || true
+    fi
+  fi
+
+  # 2. Any Docker container (other than ours) publishing 5432.
+  if command -v docker >/dev/null 2>&1; then
+    docker ps --filter 'publish=5432' \
+      --format '  docker container: {{.Names}} ({{.Image}}) -> {{.Ports}}' 2>/dev/null || true
+  fi
+}
+
+# This host's user is in the `docker` group, so the Docker CLI does NOT need sudo.
+# Using sudo here would hang/fail on a password prompt in a non-interactive shell.
+#
+# Tear down THIS project's own stack FIRST. The common cause of a busy port 5432
+# is a leftover `beautica-postgres` container from a previous run — `down -v`
+# releases its published port. We must do this before blaming system PostgreSQL.
+echo "Removing containers AND volumes (fresh database)..."
+docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
+
+echo "Checking host port 5432..."
 if port_5432_in_use; then
-  echo "  Port 5432 is in use — attempting to stop the system PostgreSQL service..."
+  # The port survived our own `down -v`, so a NON-Docker process (typically the
+  # system PostgreSQL service) holds it. Attempt to stop system PostgreSQL.
+  echo "  Port 5432 still in use after tearing down our stack — attempting to stop the system PostgreSQL service..."
   # Stop BOTH the wrapper unit (postgresql.service) and the versioned cluster
   # unit (postgresql@14-main.service) — the cluster unit is what holds the port.
   # Try passwordless sudo first; if that fails, fall back to an interactive
@@ -36,10 +70,11 @@ if port_5432_in_use; then
   if port_5432_in_use; then
     {
       echo ""
-      echo "ERROR: host port 5432 is STILL in use after attempting to stop system PostgreSQL."
+      echo "ERROR: host port 5432 is STILL in use after tearing down our stack and stopping system PostgreSQL."
       echo "The Docker container 'beautica-postgres' cannot bind to 5432."
+      diagnose_port_5432
       echo ""
-      echo "Free the port manually, then re-run this script:"
+      echo "Free the port manually, then re-run this script. If it is system PostgreSQL:"
       echo "  sudo systemctl stop postgresql postgresql@14-main"
       echo ""
       echo "Or disable host PostgreSQL permanently (it will no longer auto-start):"
@@ -49,13 +84,8 @@ if port_5432_in_use; then
   fi
   echo "  Port 5432 is now free."
 else
-  echo "  Port 5432 is free — nothing to stop."
+  echo "  Port 5432 is free — proceeding."
 fi
-
-# This host's user is in the `docker` group, so the Docker CLI does NOT need sudo.
-# Using sudo here would hang/fail on a password prompt in a non-interactive shell.
-echo "Removing containers AND volumes (fresh database)..."
-docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
 
 echo "Starting Beautica local stack..."
 docker compose -f "$COMPOSE_FILE" up -d
