@@ -130,7 +130,21 @@ class ServiceControllerTest {
         var sdResponse = stubServiceDefResponse(UUID.randomUUID(), name);
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
+                null, null);
+    }
+
+    /** Phase 16.4: variant carrying the lifted serviceTypeId + serviceTypeNameUk so the JSON shape can be asserted. */
+    private MasterServiceResponse stubMasterServiceResponseWithType(
+            UUID id, UUID masterId, String name, UUID serviceTypeId, String serviceTypeNameUk) {
+        var sdResponse = new ServiceDefinitionResponse(
+                UUID.randomUUID(), name, null, null, 60, 10, true,
+                serviceTypeId, serviceTypeNameUk, null,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+        return new MasterServiceResponse(id, masterId, sdResponse,
+                null, null, new BigDecimal("350.00"), 60, true,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
+                serviceTypeId, serviceTypeNameUk);
     }
 
     // ── POST /api/v1/salons/{salonId}/services ─────────────────────────────────
@@ -338,6 +352,61 @@ class ServiceControllerTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.serviceDefinition.name").value("Lash Extensions"));
+    }
+
+    // ── Phase 16.4: serviceTypeId + serviceTypeNameUk on the create-response JSON ──────
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services — 201 response JSON carries serviceTypeId + serviceTypeNameUk when a type is chosen")
+    void should_returnServiceTypeFieldsInJson_when_independentMasterCreatesWithServiceType() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceTypeId = UUID.randomUUID();
+        var request = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+        var stub = stubMasterServiceResponseWithType(
+                UUID.randomUUID(), masterId, "Manicure", serviceTypeId, "Манікюр");
+
+        when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
+                .thenReturn(stub);
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services with a serviceTypeId — response must echo serviceTypeNameUk");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.serviceTypeId").value(serviceTypeId.toString()))
+                .andExpect(jsonPath("$.data.serviceTypeNameUk").value("Манікюр"));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services — 201 response JSON has null serviceTypeId + serviceTypeNameUk when no type is chosen")
+    void should_returnNullServiceTypeFieldsInJson_when_independentMasterCreatesWithoutServiceType() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var request = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
+        // stubMasterServiceResponse leaves both new fields null — the picker was not used.
+        var stub = stubMasterServiceResponse(UUID.randomUUID(), masterId, "Manicure");
+
+        when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
+                .thenReturn(stub);
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services without a serviceTypeId — response fields must be null");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.serviceTypeId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.serviceTypeNameUk").value(org.hamcrest.Matchers.nullValue()));
     }
 
     @Test

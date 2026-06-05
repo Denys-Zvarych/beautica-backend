@@ -5,6 +5,7 @@ import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.entity.ServiceType;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -186,7 +187,74 @@ class MasterServiceResponseTest {
                 .isEqualTo("від 600 до 1200 грн");
     }
 
+    // ── Phase 16.4: serviceTypeId + serviceTypeNameUk lifted from the nested definition ──
+
+    @Test
+    @DisplayName("serviceTypeId + serviceTypeNameUk are lifted from the nested ServiceDefinition's ServiceType")
+    void should_mapServiceTypeFields_when_serviceDefinitionHasServiceType() {
+        UUID serviceTypeId = UUID.randomUUID();
+        var serviceType = ServiceType.builder()
+                .id(serviceTypeId)
+                .nameUk("Манікюр")
+                .slug("manicure")
+                .platformCategoryName("MANICURE")
+                .active(true)
+                .build();
+
+        var response = MasterServiceResponse.from(buildAssignmentWithType(serviceType));
+
+        assertThat(response.serviceTypeId())
+                .as("serviceTypeId must be lifted from the nested ServiceDefinition's ServiceType")
+                .isEqualTo(serviceTypeId);
+        assertThat(response.serviceTypeNameUk())
+                .as("serviceTypeNameUk must be the chosen type's Ukrainian display name")
+                .isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("serviceTypeId + serviceTypeNameUk are both null when the ServiceDefinition has no ServiceType")
+    void should_mapNullServiceTypeFields_when_serviceDefinitionHasNoServiceType() {
+        var response = MasterServiceResponse.from(buildAssignmentWithType(null));
+
+        assertThat(response.serviceTypeId())
+                .as("serviceTypeId must be null when no service type was chosen (picker is optional)")
+                .isNull();
+        assertThat(response.serviceTypeNameUk())
+                .as("serviceTypeNameUk must be null when no service type was chosen")
+                .isNull();
+    }
+
     // --- helpers ---
+
+    private MasterServiceAssignment buildAssignmentWithType(ServiceType serviceType) {
+        var serviceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure Classic")
+                .category("MANICURE")
+                .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
+                .basePrice(BASE_PRICE)
+                .priceMax(null)
+                .bufferMinutesAfter(10)
+                .isActive(true)
+                .serviceType(serviceType)
+                .build();
+
+        var master = Master.builder()
+                .id(UUID.randomUUID())
+                .build();
+
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .priceOverride(null)
+                .durationOverrideMinutes(null)
+                .isActive(true)
+                .build();
+    }
 
     private MasterServiceAssignment buildAssignment(BigDecimal priceOverride, Integer durationOverride) {
         var serviceDefinition = ServiceDefinition.builder()
