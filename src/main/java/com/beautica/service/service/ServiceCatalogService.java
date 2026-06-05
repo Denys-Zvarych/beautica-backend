@@ -6,7 +6,6 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.notification.EmailService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
@@ -27,7 +26,6 @@ import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.PageRequest;
@@ -54,14 +52,11 @@ public class ServiceCatalogService {
     private final MasterRepository masterRepository;
     private final CatalogCategoryLookup catalogCategoryLookup;
     private final PlatformCategoryRepository platformCategoryRepository;
-    private final EmailService emailService;
+    private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
     private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
-
-    @Value("${app.admin-email}")
-    private String adminEmail;
 
     @Transactional
     public ServiceDefinitionResponse addServiceToSalon(
@@ -419,26 +414,18 @@ public class ServiceCatalogService {
 
     public void suggestServiceType(SuggestServiceTypeRequest request, UUID requestedByUserId) {
         // Resolve/validate the System-B category-name slug against platform_categories
-        // (active + APPROVED) BEFORE composing the admin email — an unknown or inactive
-        // slug yields a clean 400 instead of emailing the admin a bogus suggestion.
+        // (active + APPROVED) BEFORE persisting — an unknown or inactive slug yields a
+        // clean 400 instead of persisting + emailing the admin a bogus suggestion
+        // (Phase 16.7 guard, preserved).
         validateCategoryActive(request.categoryName());
 
-        String safeName = sanitizeEmailField(request.name());
-        String safeDescription = request.description() != null
-                ? sanitizeEmailField(request.description()) : "—";
-
-        String subject = "Beautica: Запит нового типу послуги — " + safeName;
-        String body = String.format(
-                "Від: %s (userId: %s)%nКатегорія: %s%nНазва: %s%nОпис: %s",
-                requestedByUserId, requestedByUserId, request.categoryName(),
-                safeName, safeDescription
-        );
-        emailService.sendAdminNotification(adminEmail, subject, body);
-    }
-
-    private static String sanitizeEmailField(String value) {
-        if (value == null) return "";
-        return value.replaceAll("[\r\n\t]", " ").strip();
+        // Phase 16.8: no longer fire-and-forget. Delegate to the suggestion service,
+        // which persists a PENDING service_type_suggestion row carrying a hashed
+        // single-use token and emails the admin a token-authenticated review link.
+        // Field escaping is handled by the suggestion's Thymeleaf email template
+        // (auto-escaped), so no manual sanitize is needed here.
+        serviceTypeSuggestionService.submitSuggestion(
+                request.categoryName(), request.name(), request.description(), requestedByUserId);
     }
 
     /**

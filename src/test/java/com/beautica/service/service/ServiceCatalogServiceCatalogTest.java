@@ -1,7 +1,6 @@
 package com.beautica.service.service;
 
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.notification.EmailService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
@@ -20,7 +19,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
-import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 import java.util.UUID;
@@ -45,15 +43,13 @@ import static org.mockito.Mockito.when;
 @DisplayName("ServiceCatalogService — catalog methods unit")
 class ServiceCatalogServiceCatalogTest {
 
-    private static final String ADMIN_EMAIL = "admin@beautica.test";
-
     @Mock private ServiceRepository serviceRepository;
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private SalonRepository salonRepository;
     @Mock private MasterRepository masterRepository;
     @Mock private CatalogCategoryLookup catalogCategoryLookup;
     @Mock private PlatformCategoryRepository platformCategoryRepository;
-    @Mock private EmailService emailService;
+    @Mock private ServiceTypeSuggestionService serviceTypeSuggestionService;
     @Mock private ServiceTypeLookup serviceTypeLookup;
     @Mock private ServiceTypeSearchService serviceTypeSearchService;
     @Mock private ServiceTypeRepository serviceTypeRepository;
@@ -70,13 +66,12 @@ class ServiceCatalogServiceCatalogTest {
                 masterRepository,
                 catalogCategoryLookup,
                 platformCategoryRepository,
-                emailService,
+                serviceTypeSuggestionService,
                 serviceTypeLookup,
                 serviceTypeSearchService,
                 serviceTypeRepository,
                 cacheManager
         );
-        ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
     // ── getCategories ──────────────────────────────────────────────────────────
@@ -230,8 +225,8 @@ class ServiceCatalogServiceCatalogTest {
     // ── suggestServiceType ────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("sends admin notification email with correct subject and body")
-    void should_sendAdminNotification_when_suggestServiceTypeCalled() {
+    @DisplayName("delegates to suggestion service with the validated slug, name, description and userId")
+    void should_delegateToSubmitSuggestion_when_suggestServiceTypeCalled() {
         UUID userId = UUID.randomUUID();
         String categoryName = "LASH_EXTENSIONS";
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
@@ -240,16 +235,17 @@ class ServiceCatalogServiceCatalogTest {
 
         service.suggestServiceType(request, userId);
 
-        verify(emailService).sendAdminNotification(
-                eq(ADMIN_EMAIL),
-                anyString(),
-                anyString()
+        verify(serviceTypeSuggestionService).submitSuggestion(
+                categoryName,
+                "Ламінування вій",
+                "Детальний опис",
+                userId
         );
     }
 
     @Test
-    @DisplayName("includes service name in the email subject")
-    void should_includeNameInSubject_when_suggestServiceTypeCalled() {
+    @DisplayName("passes the suggested name through to the suggestion service")
+    void should_passNameToSubmitSuggestion_when_suggestServiceTypeCalled() {
         UUID userId = UUID.randomUUID();
         String categoryName = "LASH_EXTENSIONS";
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
@@ -258,18 +254,21 @@ class ServiceCatalogServiceCatalogTest {
 
         service.suggestServiceType(request, userId);
 
-        var subjectCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendAdminNotification(
-                eq(ADMIN_EMAIL),
-                subjectCaptor.capture(),
-                anyString()
+        // Subject composition moved into ServiceTypeSuggestionService/EmailService (Phase 16.8)
+        // and is no longer observable here; at this layer we only assert the name is delegated.
+        var nameCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(serviceTypeSuggestionService).submitSuggestion(
+                eq(categoryName),
+                nameCaptor.capture(),
+                eq(null),
+                eq(userId)
         );
-        assertThat(subjectCaptor.getValue()).contains("Ламінування вій");
+        assertThat(nameCaptor.getValue()).isEqualTo("Ламінування вій");
     }
 
     @Test
-    @DisplayName("uses em dash placeholder in body when description is null")
-    void should_usePlaceholder_when_descriptionIsNull() {
+    @DisplayName("delegates a null description as-is to the suggestion service")
+    void should_delegateNullDescription_when_descriptionIsNull() {
         UUID userId = UUID.randomUUID();
         String categoryName = "LASH_EXTENSIONS";
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
@@ -278,18 +277,20 @@ class ServiceCatalogServiceCatalogTest {
 
         service.suggestServiceType(request, userId);
 
-        var bodyCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendAdminNotification(
-                eq(ADMIN_EMAIL),
-                anyString(),
-                bodyCaptor.capture()
+        // The em-dash placeholder for a null description is now composed inside
+        // ServiceTypeSuggestionService's email body (Phase 16.8) and is not observable
+        // at this layer — we only assert the raw null is forwarded untouched.
+        verify(serviceTypeSuggestionService).submitSuggestion(
+                categoryName,
+                "Ламінування вій",
+                null,
+                userId
         );
-        assertThat(bodyCaptor.getValue()).contains("—");
     }
 
     @Test
-    @DisplayName("body passed to sendAdminNotification includes the requesting userId")
-    void should_includeUserIdInBody_when_suggestServiceTypeCalled() {
+    @DisplayName("passes the requesting userId through to the suggestion service")
+    void should_passUserIdToSubmitSuggestion_when_suggestServiceTypeCalled() {
         UUID userId = UUID.randomUUID();
         String categoryName = "LASH_EXTENSIONS";
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
@@ -298,15 +299,18 @@ class ServiceCatalogServiceCatalogTest {
 
         service.suggestServiceType(request, userId);
 
-        var bodyCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendAdminNotification(
-                eq(ADMIN_EMAIL),
-                anyString(),
-                bodyCaptor.capture()
+        // Rendering the userId into the admin email body moved into
+        // ServiceTypeSuggestionService (Phase 16.8); here we assert the userId is delegated.
+        var userIdCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
+        verify(serviceTypeSuggestionService).submitSuggestion(
+                eq(categoryName),
+                eq("Ламінування вій"),
+                eq("Опис"),
+                userIdCaptor.capture()
         );
-        assertThat(bodyCaptor.getValue())
-                .as("email body must contain the userId of the requester")
-                .contains(userId.toString());
+        assertThat(userIdCaptor.getValue())
+                .as("the requester userId must be delegated to the suggestion service")
+                .isEqualTo(userId);
     }
 
     // ── suggestServiceType — Phase 16.7 System-B slug validation + hardening ────
@@ -332,8 +336,9 @@ class ServiceCatalogServiceCatalogTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST))
                 .hasMessageContaining("Unknown category");
 
-        // The validation gate runs BEFORE composing the email — no admin notification leaks out.
-        verifyNoInteractions(emailService);
+        // The validation gate runs BEFORE delegating — the suggestion service is never invoked,
+        // so no row is persisted and no admin notification leaks out.
+        verifyNoInteractions(serviceTypeSuggestionService);
     }
 
     @Test
@@ -353,14 +358,14 @@ class ServiceCatalogServiceCatalogTest {
                         .as("inactive/PENDING slug must surface as 400 BAD_REQUEST")
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
-        verifyNoInteractions(emailService);
+        verifyNoInteractions(serviceTypeSuggestionService);
         // The APPROVED+active gate was the rejection point.
         verify(platformCategoryRepository).existsByNameAndActiveTrueAndStatus(
                 inactiveSlug, PlatformCategoryStatus.APPROVED);
     }
 
     @Test
-    @DisplayName("suggestServiceType — admin email body carries the resolved category slug, not a UUID")
+    @DisplayName("suggestServiceType — forwards the resolved category slug (not a UUID) to the suggestion service")
     void should_includeSlugNotUuidInBody_when_suggestServiceTypeCalled() {
         UUID userId = UUID.randomUUID();
         String categoryName = "HAIRDRESSING";
@@ -370,21 +375,25 @@ class ServiceCatalogServiceCatalogTest {
 
         service.suggestServiceType(request, userId);
 
-        var bodyCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendAdminNotification(eq(ADMIN_EMAIL), anyString(), bodyCaptor.capture());
-        String body = bodyCaptor.getValue();
-        assertThat(body)
-                .as("admin email body must carry the resolved System-B slug, actual=%s", body)
-                .contains("HAIRDRESSING");
-        // Regression guard: the old contract interpolated a raw System-A UUID. The body must
-        // NOT contain a UUID-shaped category token (8-4-4-4-12 hex) other than the userId line.
-        assertThat(body)
-                .as("category line must not regress to a UUID, actual=%s", body)
-                .doesNotContain("categoryId");
+        // The admin email body is composed inside ServiceTypeSuggestionService (Phase 16.8);
+        // at this layer the contract is that the System-B slug — not a System-A UUID — is the
+        // category argument delegated to submitSuggestion.
+        var categoryCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(serviceTypeSuggestionService).submitSuggestion(
+                categoryCaptor.capture(), eq("Стрижка модельна"), eq("Опис"), eq(userId));
+        String delegatedCategory = categoryCaptor.getValue();
+        assertThat(delegatedCategory)
+                .as("the resolved System-B slug must be forwarded, actual=%s", delegatedCategory)
+                .isEqualTo("HAIRDRESSING");
+        // Regression guard: the old contract interpolated a raw System-A UUID. The delegated
+        // category must not be a UUID-shaped token (8-4-4-4-12 hex).
+        assertThat(delegatedCategory)
+                .as("category arg must not regress to a UUID, actual=%s", delegatedCategory)
+                .doesNotMatch("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
     }
 
     @Test
-    @DisplayName("suggestServiceType — validates the slug BEFORE composing the email (gate precedes dispatch)")
+    @DisplayName("suggestServiceType — validates the slug BEFORE delegating to the suggestion service (gate precedes dispatch)")
     void should_validateSlugBeforeEmail_when_suggestServiceTypeCalled() {
         UUID userId = UUID.randomUUID();
         String categoryName = "NAIL_SERVICE";
@@ -392,12 +401,13 @@ class ServiceCatalogServiceCatalogTest {
                 eq(categoryName), eq(PlatformCategoryStatus.APPROVED))).thenReturn(true);
         var request = new SuggestServiceTypeRequest("Манікюр", categoryName, null);
 
-        var inOrder = org.mockito.Mockito.inOrder(platformCategoryRepository, emailService);
+        var inOrder = org.mockito.Mockito.inOrder(platformCategoryRepository, serviceTypeSuggestionService);
         service.suggestServiceType(request, userId);
 
         inOrder.verify(platformCategoryRepository).existsByNameAndActiveTrueAndStatus(
                 categoryName, PlatformCategoryStatus.APPROVED);
-        inOrder.verify(emailService).sendAdminNotification(eq(ADMIN_EMAIL), anyString(), anyString());
+        inOrder.verify(serviceTypeSuggestionService).submitSuggestion(
+                categoryName, "Манікюр", null, userId);
     }
 
     @Test
