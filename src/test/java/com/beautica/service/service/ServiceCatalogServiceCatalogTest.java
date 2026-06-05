@@ -4,6 +4,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CatalogCategoryResponse;
+import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.entity.CatalogCategory;
@@ -11,6 +12,7 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.repository.ServiceTypeRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -26,6 +28,7 @@ import java.util.UUID;
 import com.beautica.common.exception.NotFoundException;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -49,6 +52,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private EmailService emailService;
     @Mock private ServiceTypeLookup serviceTypeLookup;
     @Mock private ServiceTypeSearchService serviceTypeSearchService;
+    @Mock private ServiceTypeRepository serviceTypeRepository;
     @Mock private CacheManager cacheManager;
 
     private ServiceCatalogService service;
@@ -65,6 +69,7 @@ class ServiceCatalogServiceCatalogTest {
                 emailService,
                 serviceTypeLookup,
                 serviceTypeSearchService,
+                serviceTypeRepository,
                 cacheManager
         );
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
@@ -321,5 +326,66 @@ class ServiceCatalogServiceCatalogTest {
         assertThatThrownBy(() -> service.searchServiceTypes(unknownCategoryId, null))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessage("Category not found");
+    }
+
+    // ── findServiceTypesByPlatformCategory (Phase 16.2) ───────────────────────
+
+    @Test
+    @DisplayName("maps ServiceType to PlatformServiceTypeResponse with nameUk and categoryName populated")
+    void should_mapNameUkAndCategoryName_when_findByPlatformCategory() {
+        UUID typeId = UUID.randomUUID();
+        var type = mock(ServiceType.class);
+        when(type.getId()).thenReturn(typeId);
+        when(type.getSlug()).thenReturn("lash-classic");
+        when(type.getNameUk()).thenReturn("Нарощування вій (класика)");
+        when(type.getPlatformCategoryName()).thenReturn("EYELASH");
+
+        when(serviceTypeRepository.findActiveByPlatformCategoryName("EYELASH"))
+                .thenReturn(List.of(type));
+
+        List<PlatformServiceTypeResponse> result =
+                service.findServiceTypesByPlatformCategory("EYELASH");
+
+        assertThat(result)
+                .extracting(
+                        PlatformServiceTypeResponse::id,
+                        PlatformServiceTypeResponse::slug,
+                        PlatformServiceTypeResponse::nameUk,
+                        PlatformServiceTypeResponse::categoryName)
+                .containsExactly(tuple(typeId, "lash-classic", "Нарощування вій (класика)", "EYELASH"));
+        verify(serviceTypeRepository).findActiveByPlatformCategoryName("EYELASH");
+    }
+
+    @Test
+    @DisplayName("returns empty list and never hits the repository when categoryName is null")
+    void should_returnEmptyAndSkipRepo_when_categoryNameIsNull() {
+        List<PlatformServiceTypeResponse> result =
+                service.findServiceTypesByPlatformCategory(null);
+
+        assertThat(result).isEmpty();
+        verify(serviceTypeRepository, never()).findActiveByPlatformCategoryName(any());
+    }
+
+    @Test
+    @DisplayName("returns empty list and never hits the repository when categoryName is blank/whitespace")
+    void should_returnEmptyAndSkipRepo_when_categoryNameIsBlank() {
+        List<PlatformServiceTypeResponse> result =
+                service.findServiceTypesByPlatformCategory("   ");
+
+        assertThat(result).isEmpty();
+        verify(serviceTypeRepository, never()).findActiveByPlatformCategoryName(any());
+    }
+
+    @Test
+    @DisplayName("returns empty list (not 404) when the repository finds no rows for a known-shaped slug")
+    void should_returnEmptyList_when_repositoryReturnsNoRows() {
+        when(serviceTypeRepository.findActiveByPlatformCategoryName("NOPE"))
+                .thenReturn(List.of());
+
+        List<PlatformServiceTypeResponse> result =
+                service.findServiceTypesByPlatformCategory("NOPE");
+
+        assertThat(result).isEmpty();
+        verify(serviceTypeRepository).findActiveByPlatformCategoryName("NOPE");
     }
 }

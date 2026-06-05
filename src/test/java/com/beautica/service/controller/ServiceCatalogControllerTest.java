@@ -6,6 +6,7 @@ import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.CatalogCategoryResponse;
+import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
@@ -543,5 +544,160 @@ class ServiceCatalogControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── GET /api/v1/service-types?categoryName=... (Phase 16.2) ───────────────
+    // The params="categoryName" discriminant on @GetMapping routes ONLY requests
+    // carrying categoryName to getServiceTypesByPlatformCategory(...). Requests
+    // with categoryId/q (or neither) continue to the legacy getServiceTypes(...)
+    // handler — the routing-isolation test below pins that contract.
+
+    private List<PlatformServiceTypeResponse> stubPlatformTypes() {
+        return List.of(
+                new PlatformServiceTypeResponse(gelPolishTypeId, "lash-classic", "Нарощування вій (класика)", "EYELASH"),
+                new PlatformServiceTypeResponse(browShapingTypeId, "lash-lamination", "Ламінування вій", "EYELASH"));
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=EYELASH — 200 with PlatformServiceType shape {id,slug,nameUk,categoryName}, no auth")
+    void should_return200WithPlatformTypeShape_when_categoryNameProvided() throws Exception {
+        when(serviceCatalogService.findServiceTypesByPlatformCategory(eq("EYELASH")))
+                .thenReturn(stubPlatformTypes());
+        log.debug("Act: GET /api/v1/service-types?categoryName=EYELASH — public, expect platform-type shape");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "EYELASH")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].id").value(gelPolishTypeId.toString()))
+                .andExpect(jsonPath("$.data[0].slug").value("lash-classic"))
+                .andExpect(jsonPath("$.data[0].nameUk").value("Нарощування вій (класика)"))
+                .andExpect(jsonPath("$.data[0].categoryName").value("EYELASH"))
+                // The legacy ServiceTypeResponse fields (categoryId, nameEn) must NOT leak
+                // into this contract — the DTO is deliberately separate (anti-bug §I).
+                .andExpect(jsonPath("$.data[0].categoryId").doesNotExist())
+                .andExpect(jsonPath("$.data[0].nameEn").doesNotExist());
+
+        verify(serviceCatalogService).findServiceTypesByPlatformCategory("EYELASH");
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=NOPE — 200 empty list (unknown slug is NOT 404)")
+    void should_return200EmptyList_when_categoryNameIsUnknown() throws Exception {
+        when(serviceCatalogService.findServiceTypesByPlatformCategory(eq("NOPE")))
+                .thenReturn(List.of());
+        log.debug("Act: GET /api/v1/service-types?categoryName=NOPE — unknown slug returns empty, not 404");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "NOPE")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(0));
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName= — 400 when categoryName is present but blank (@NotBlank)")
+    void should_return400_when_categoryNameIsBlank() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?categoryName= — present-but-blank must return 400");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=<101-char> — 400 when categoryName exceeds @Size(max=100)")
+    void should_return400_when_categoryNameExceeds100Chars() throws Exception {
+        String longName = "A".repeat(101);
+        log.debug("Act: GET /api/v1/service-types?categoryName=<101 chars> — must return 400");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", longName)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=<100-char> — 200 at the exact @Size(max=100) boundary")
+    void should_return200_when_categoryNameIsExactly100Chars() throws Exception {
+        String boundaryName = "A".repeat(100);
+        when(serviceCatalogService.findServiceTypesByPlatformCategory(eq(boundaryName)))
+                .thenReturn(List.of());
+        log.debug("Act: GET /api/v1/service-types?categoryName=<100 chars> — boundary must be accepted (200)");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", boundaryName)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verify(serviceCatalogService).findServiceTypesByPlatformCategory(boundaryName);
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=<script> — 400 when categoryName contains HTML angle brackets")
+    void should_return400_when_categoryNameContainsHtmlChars() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?categoryName=<script> — angle brackets rejected by @Pattern");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "<script>")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("GET /service-types?categoryName=A\\tB — 400 when categoryName contains a control character")
+    void should_return400_when_categoryNameContainsControlChar() throws Exception {
+        log.debug("Act: GET /api/v1/service-types?categoryName=A<TAB>B — control char rejected by @Pattern");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryName", "A\tB")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("Routing discriminant — categoryId request hits the legacy handler, NOT the platform-category handler")
+    void should_routeToLegacyHandler_when_categoryIdProvidedNotCategoryName() throws Exception {
+        var nailsOnly = List.of(
+                new ServiceTypeResponse(gelPolishTypeId, nailsCategoryId, "Гель-лак", "Gel Polish", "gel-polish"));
+        when(serviceCatalogService.searchServiceTypes(eq(nailsCategoryId), isNull())).thenReturn(nailsOnly);
+        log.debug("Act: GET /api/v1/service-types?categoryId={} — must route to legacy searchServiceTypes", nailsCategoryId);
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("categoryId", nailsCategoryId.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].categoryId").value(nailsCategoryId.toString()));
+
+        // The legacy handler ran; the platform-category handler must NOT have been touched.
+        verify(serviceCatalogService).searchServiceTypes(eq(nailsCategoryId), isNull());
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
+    }
+
+    @Test
+    @DisplayName("Routing discriminant — q request hits the legacy handler, NOT the platform-category handler")
+    void should_routeToLegacyHandler_when_qProvidedNotCategoryName() throws Exception {
+        when(serviceCatalogService.searchServiceTypes(isNull(), eq("Гель"))).thenReturn(List.of());
+        log.debug("Act: GET /api/v1/service-types?q=Гель — must route to legacy searchServiceTypes");
+
+        mockMvc.perform(get("/api/v1/service-types")
+                        .param("q", "Гель")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verify(serviceCatalogService).searchServiceTypes(isNull(), eq("Гель"));
+        verify(serviceCatalogService, never()).findServiceTypesByPlatformCategory(any());
     }
 }

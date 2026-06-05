@@ -13,6 +13,7 @@ import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
@@ -24,6 +25,7 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.CacheManager;
@@ -54,6 +56,7 @@ public class ServiceCatalogService {
     private final EmailService emailService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
+    private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
 
     @Value("${app.admin-email}")
@@ -380,6 +383,36 @@ public class ServiceCatalogService {
         }
         return serviceTypeLookup.getByCategory(categoryId).stream()
                 .map(ServiceTypeResponse::from)
+                .toList();
+    }
+
+    /**
+     * Returns active service types belonging to the given platform-category name slug,
+     * ordered by Ukrainian name ascending.
+     *
+     * <p>An unknown or inactive {@code categoryName} value returns an empty list (not 404)
+     * — the mobile picker treats it as "no types available for this category".
+     *
+     * <p>No caching: the {@code service_types} catalog is small and static, and a
+     * dedicated per-{@code categoryName} cache entry would need eviction on every
+     * {@code platform_categories} or {@code service_types} mutation. The query is
+     * cheap (partial B-tree index from V73) and the call rate low enough that the
+     * cache overhead would exceed the benefit.
+     *
+     * @param categoryName canonical uppercase platform-category name slug
+     *                     (e.g. {@code EYELASH}, {@code HAIR})
+     */
+    @Transactional(readOnly = true)
+    public List<PlatformServiceTypeResponse> findServiceTypesByPlatformCategory(String categoryName) {
+        // Intentional duplication of the controller's @NotBlank/@Size constraint: this guard
+        // defends non-HTTP callers (internal services, tests, future programmatic callers)
+        // where the Bean Validation boundary is not active.
+        if (categoryName == null || categoryName.strip().isEmpty()) {
+            return List.of();
+        }
+        return serviceTypeRepository.findActiveByPlatformCategoryName(categoryName)
+                .stream()
+                .map(PlatformServiceTypeResponse::from)
                 .toList();
     }
 

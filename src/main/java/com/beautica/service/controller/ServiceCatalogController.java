@@ -3,10 +3,12 @@ package com.beautica.service.controller;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.service.dto.CatalogCategoryResponse;
+import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
@@ -48,6 +50,31 @@ public class ServiceCatalogController {
                      message = "Search query must not contain control characters or HTML special characters")
             String q) {
         return ApiResponse.ok(serviceCatalogService.searchServiceTypes(categoryId, q));
+    }
+
+    /**
+     * Returns active service types for a platform category, keyed by the category's
+     * canonical name slug (e.g. {@code EYELASH}, {@code HAIR}).
+     *
+     * <p>The {@code params = "categoryName"} constraint on {@code @GetMapping} routes
+     * only requests that carry the {@code categoryName} query parameter here.
+     * Requests with {@code categoryId} or {@code q} continue to the existing handler.
+     *
+     * <p>Unknown slug → 200 with empty list. Present-but-blank slug → 400 (Bean
+     * Validation {@code @NotBlank} fires before the service is called).
+     *
+     * <p>This endpoint is {@code permitAll()} — the path is already open in
+     * {@code SecurityConfig}; no role annotation is needed.
+     */
+    @GetMapping(value = "/service-types", params = "categoryName")
+    public ApiResponse<List<PlatformServiceTypeResponse>> getServiceTypesByPlatformCategory(
+            @RequestParam
+            @NotBlank(message = "categoryName must not be blank")
+            @Size(max = 100, message = "categoryName must be at most 100 characters")
+            @Pattern(regexp = "^[^\\p{Cntrl}<>\"']+$",
+                     message = "categoryName must not contain control characters or HTML special characters")
+            String categoryName) {
+        return ApiResponse.ok(serviceCatalogService.findServiceTypesByPlatformCategory(categoryName));
     }
 
     @PostMapping("/service-types/suggest")
