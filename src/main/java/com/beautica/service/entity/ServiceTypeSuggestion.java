@@ -23,9 +23,12 @@ import java.util.UUID;
  * <p>This is its OWN small table, NOT a row in {@code service_types}: an unreviewed
  * suggestion must never appear in the catalog/picker. A suggestion is a PENDING row
  * carrying a hashed single-use token; a platform admin approves or rejects it via an
- * emailed token-authenticated link. Approve marks the record {@code APPROVED} only —
- * it does NOT auto-insert a {@code service_types} row (catalog promotion stays a
- * deliberate, separately-reviewed migration step; Phase 16.8 decision).
+ * emailed token-authenticated link. Approve marks the record {@code APPROVED}; the
+ * catalog/service materialization (a {@code service_types} row + a draft
+ * {@code service_definitions} row for the requesting master) is performed by
+ * {@code ServiceTypeSuggestionService.decide} via {@code ServiceTypePromotionService}
+ * (Phase 16.9, supersedes the Phase 16.8 "no auto-promotion" decision). This entity's
+ * mutators never touch repositories.
  *
  * <p>Mirrors {@link PlatformCategory} verbatim for security properties:
  * <ul>
@@ -107,8 +110,10 @@ public class ServiceTypeSuggestion {
     }
 
     /**
-     * Creates a PENDING suggestion: not promoted into the catalog until (and even
-     * after) approval, with a hashed single-use token and a 7-day expiry.
+     * Creates a PENDING suggestion: not promoted into the catalog until approval, with a
+     * hashed single-use token and a 7-day expiry. On approval the suggestion is
+     * materialized into a {@code service_types} row + a draft service for the requester
+     * (Phase 16.9).
      *
      * @param tokenHash SHA-256 hex of the raw token (raw token is emailed, never stored)
      */
@@ -125,8 +130,10 @@ public class ServiceTypeSuggestion {
 
     /**
      * Approves a PENDING suggestion: marks APPROVED and clears the token (single-use).
-     * Does NOT insert a {@code service_types} row. Caller guarantees the current
-     * status is PENDING.
+     * Caller guarantees the current status is PENDING. The catalog/service materialization
+     * happens in {@code ServiceTypeSuggestionService.decide} via
+     * {@code ServiceTypePromotionService} (Phase 16.9) — this mutator never touches
+     * repositories.
      */
     public void approve(OffsetDateTime decidedAt) {
         this.status = ServiceTypeSuggestionStatus.APPROVED;

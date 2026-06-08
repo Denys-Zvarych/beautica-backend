@@ -58,6 +58,7 @@ class ServiceTypeSuggestionServiceTest {
     @Mock private TokenGenerator tokenGenerator;
     @Mock private EmailService emailService;
     @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
+    @Mock private ServiceTypePromotionService promotionService;
 
     private ServiceTypeSuggestionService service;
 
@@ -66,7 +67,7 @@ class ServiceTypeSuggestionServiceTest {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new ServiceTypeSuggestionService(
                 suggestionRepository, tokenGenerator, emailService,
-                publicBaseUrlProperties, fixedClock);
+                publicBaseUrlProperties, promotionService, fixedClock);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
@@ -167,11 +168,11 @@ class ServiceTypeSuggestionServiceTest {
     }
 
     @Test
-    @DisplayName("should_notWriteServiceTypesRow_when_suggestionApproved")
-    void should_notWriteServiceTypesRow_when_suggestionApproved() {
-        // Phase 16.8 decision: approve marks the record APPROVED only — it must never
-        // touch service_types. The service holds NO ServiceTypeRepository collaborator;
-        // assert the only repository it owns sees no inserts beyond the suggestion lookup.
+    @DisplayName("should_invokePromote_when_suggestionApproved")
+    void should_invokePromote_when_suggestionApproved() {
+        // Phase 16.9 (supersedes 16.8): approve marks the record APPROVED AND materializes
+        // the requested service via the promotion writer, in the same transaction. Verify
+        // promote() is called exactly once with the just-approved suggestion.
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
@@ -179,9 +180,40 @@ class ServiceTypeSuggestionServiceTest {
 
         service.approve(RAW_TOKEN);
 
+        verify(promotionService).promote(pending);
         // No save() on approve — the decision mutates the managed entity in place.
         verify(suggestionRepository, never()).save(any());
         assertThat(pending.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.APPROVED);
+    }
+
+    @Test
+    @DisplayName("should_notInvokePromote_when_reject")
+    void should_notInvokePromote_when_reject() {
+        ServiceTypeSuggestion pending = pendingSuggestion(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+
+        service.reject(RAW_TOKEN);
+
+        verifyNoInteractions(promotionService);
+    }
+
+    @Test
+    @DisplayName("should_notInvokePromote_when_secondApproveAlreadyDecided")
+    void should_notInvokePromote_when_secondApproveAlreadyDecided() {
+        ServiceTypeSuggestion pending = pendingSuggestion(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+
+        service.approve(RAW_TOKEN);
+        // Replay: token cleared, status APPROVED → ALREADY_DECIDED before reaching promote.
+        DecisionOutcome second = service.approve(RAW_TOKEN);
+
+        assertThat(second).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
+        // promote() ran exactly once (the first approve), not on the replay.
+        verify(promotionService).promote(pending);
     }
 
     @Test

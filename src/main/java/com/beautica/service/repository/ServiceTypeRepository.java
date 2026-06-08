@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -139,4 +140,33 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
             ORDER BY t.nameUk ASC
             """)
     List<ServiceType> findActiveByPlatformCategoryName(@Param("categoryName") String categoryName);
+
+    /**
+     * True when a service type already carries the given globally-unique slug. Used by
+     * {@code SlugGenerator} to de-duplicate a generated slug before a new
+     * {@link ServiceType} insert (Phase 16.9.1).
+     */
+    boolean existsBySlug(String slug);
+
+    /**
+     * Reuse lookup for the promotion writer (Phase 16.9.1): returns the first active type
+     * with the given platform-category slug and a case-insensitive {@code nameUk} match.
+     * When present, promotion reuses it instead of creating a duplicate type (idempotency
+     * + dedup when two masters request the same name under the same category).
+     *
+     * <p>{@code JOIN FETCH t.category} so the caller may read the bucket without an N+1;
+     * the result drives a draft {@link com.beautica.service.entity.ServiceDefinition}
+     * whose response never traverses the category, but keeping the graph eager here is
+     * harmless and future-proof.
+     */
+    @Query("""
+            SELECT t FROM ServiceType t
+            JOIN FETCH t.category
+            WHERE t.platformCategoryName = :categoryName
+              AND LOWER(t.nameUk) = LOWER(:nameUk)
+              AND t.active = true
+            ORDER BY t.nameUk ASC
+            """)
+    Optional<ServiceType> findFirstActiveByPlatformCategoryNameAndNameUkIgnoreCase(
+            @Param("categoryName") String categoryName, @Param("nameUk") String nameUk);
 }

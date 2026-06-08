@@ -102,4 +102,27 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      */
     @Query("SELECT DISTINCT a.master.id FROM MasterServiceAssignment a WHERE a.serviceDefinition.id = :serviceDefId")
     List<UUID> findMasterIdsByServiceDefinitionId(@Param("serviceDefId") UUID serviceDefId);
+
+    /**
+     * Secondary idempotency guard for {@code ServiceTypePromotionService} (Phase 16.9.1):
+     * true when the given master already owns a draft assignment whose linked service
+     * definition carries the same {@code name} + {@code category} and {@code isDraft = true}.
+     *
+     * <p>The primary guard is the cleared single-use token (a replayed approve never
+     * re-enters the promote branch). This existence check is defense-in-depth so a future
+     * abnormal double-invocation of {@code promote} does not persist a duplicate draft.
+     */
+    @Query("""
+            SELECT COUNT(a) > 0
+            FROM MasterServiceAssignment a
+            JOIN a.serviceDefinition sd
+            WHERE a.master.id = :masterId
+              AND sd.name = :name
+              AND sd.category = :category
+              AND sd.isDraft = true
+            """)
+    boolean existsDraftAssignment(
+            @Param("masterId") UUID masterId,
+            @Param("name") String name,
+            @Param("category") String category);
 }

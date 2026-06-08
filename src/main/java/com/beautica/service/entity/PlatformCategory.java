@@ -87,6 +87,20 @@ public class PlatformCategory {
     @Column(nullable = false, length = 20)
     private PlatformCategoryStatus status = PlatformCategoryStatus.APPROVED;
 
+    /**
+     * System-A {@code service_categories.id} bucket this System-B category maps to
+     * (V78, Phase 16.9). Read-only — seeded/backfilled by Flyway, never set from the
+     * application. Used by {@code ServiceTypePromotionService} to resolve the NOT-NULL
+     * {@code category_id} FK when creating a new {@link ServiceType} on approval.
+     *
+     * <p>{@code null} for a brand-new self-service category that never got a V75 bucket;
+     * the promotion writer treats a null bucket as "cannot create a ServiceType" and
+     * falls back to a draft {@link ServiceDefinition} with {@code serviceType = null}.
+     */
+    @org.springframework.lang.Nullable
+    @Column(name = "service_category_id", updatable = false, insertable = false)
+    private UUID serviceCategoryId;
+
     @Column(name = "requested_by_user_id")
     private UUID requestedByUserId;
 

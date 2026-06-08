@@ -206,9 +206,10 @@ public class CategoryRequestService {
     /**
      * If the approved request carried an initial service-type name, turn it into a
      * PENDING {@link com.beautica.service.entity.ServiceTypeSuggestion} for the
-     * now-approved category (no auto-promotion; Phase 16.8 decision). A 409 dedup
-     * conflict is swallowed: the suggestion runs in its own REQUIRES_NEW transaction
-     * so its rollback cannot roll back the category approval.
+     * now-approved category (promotion now happens when the resulting suggestion is
+     * itself approved; Phase 16.9). A 409 dedup conflict is swallowed: the suggestion
+     * runs in its own REQUIRES_NEW transaction so its rollback cannot roll back the
+     * category approval.
      */
     private void createInitialServiceSuggestion(PlatformCategory category) {
         String initialServiceName = category.getInitialServiceName();

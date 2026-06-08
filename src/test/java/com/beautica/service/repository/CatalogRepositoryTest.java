@@ -38,7 +38,18 @@ class CatalogRepositoryTest extends AbstractDataJpaTest {
 
     @BeforeEach
     void cleanDatabase() {
+        // FK order: service_types -> service_categories, and (V78) platform_categories
+        // -> service_categories via fk_platform_categories_service_category (ON DELETE
+        // RESTRICT). The Flyway-seeded platform_categories rows reference the seeded
+        // service_categories buckets, so their FK must be cleared BEFORE deleting
+        // service_categories — otherwise the RESTRICT constraint rejects the delete.
+        // This test owns catalog repositories only; nulling the bucket map (rather than
+        // deleting platform_categories) keeps the seeded slugs intact while unblocking
+        // the truncate.
         serviceTypeRepository.deleteAllInBatch();
+        em.getEntityManager()
+                .createNativeQuery("UPDATE platform_categories SET service_category_id = NULL")
+                .executeUpdate();
         categoryRepository.deleteAllInBatch();
     }
 

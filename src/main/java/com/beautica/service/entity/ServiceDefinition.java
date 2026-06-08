@@ -112,6 +112,20 @@ public class ServiceDefinition extends AuditableEntity {
     private boolean isActive;
 
     /**
+     * Draft / needs-completion marker (V78, Phase 16.9). {@code true} for a service
+     * auto-materialized on suggestion approval with sentinel placeholder pricing
+     * ({@code basePrice = 0}, {@code priceType = FIXED}, {@code baseDurationMinutes = 0}):
+     * the requested NAME is attached to the owning master, but the row carries no real
+     * price/duration yet. A draft is always {@code isActive = false} as well, so it is
+     * excluded from search ({@code masters.min_effective_price}) and from the public
+     * {@code GET /masters/{id}/services} browse path. The master publishes it by
+     * completing price/duration (which clears {@code isDraft} and activates the row).
+     */
+    @Builder.Default
+    @Column(name = "is_draft", nullable = false)
+    private boolean isDraft = false;
+
+    /**
      * Optional URL pointing to the service photo (presigned R2 URL or direct HTTPS URL).
      * Nullable — services without a photo return {@code null} in the response DTO.
      * The DB column carries a CHECK (photo_url LIKE 'https://%') constraint (V62 migration).

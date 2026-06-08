@@ -42,7 +42,11 @@ import static org.mockito.Mockito.verify;
  *       captured from the notification.</li>
  *   <li>{@code loadForReview} does NOT mutate the row (defeats email-scanner pre-fetch).</li>
  *   <li>{@code approve} flips it to APPROVED, stamps {@code decided_at}, clears the token,
- *       and writes NO {@code service_types} row.</li>
+ *       and — for a category with a mapped System-A bucket — writes a {@code service_types}
+ *       row (Phase 16.9, supersedes the 16.8 "no auto-promotion" decision). Here the
+ *       requester is null (anonymous), so it is the catalog-only branch: a ServiceType is
+ *       created but NO draft {@code service_definitions} row (no master to own it). The
+ *       full requester→master→draft path is covered by {@code ServiceTypePromotionIntegrationTest}.</li>
  *   <li>An identical re-suggest while PENDING is rejected with a 409.</li>
  * </ol>
  *
@@ -71,6 +75,11 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
         // service_type_suggestion is not in AbstractIntegrationTest.cleanDb(); remove
         // only the rows this test created so sibling tests are unaffected.
         jdbcTemplate.update("DELETE FROM service_type_suggestion WHERE category_name = ?", CATEGORY);
+        // Phase 16.9: approve now promotes the suggestion into a service_types row.
+        // Remove the type this test created (matched by its generated name) so the seeded
+        // taxonomy and sibling tests are unaffected. service_types is seed reference data
+        // and is intentionally NOT in AbstractIntegrationTest.cleanDb().
+        jdbcTemplate.update("DELETE FROM service_types WHERE name_uk = ?", SUGGESTED);
     }
 
     private SuggestServiceTypeRequest request(String name) {
@@ -78,7 +87,7 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
     }
 
     @Test
-    @DisplayName("submit → review (no mutation) → approve persists state transitions, no service_types write")
+    @DisplayName("submit → review (no mutation) → approve persists state transitions + promotes a service_types row (catalog-only, null requester)")
     void should_completeSuggestionApprovalRoundTrip_when_adminApproves() {
         // requested_by_user_id is nullable (FK ON DELETE SET NULL); a null requester is a
         // supported anonymous-suggestion path and avoids needing a users fixture here.
@@ -140,15 +149,36 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
                 .as("token_hash cleared after the decision (single-use)").isNull();
         assertThat(approved.getTokenExpiresAt()).isNull();
 
-        // Assert 5 — approve must NOT insert a service_types row (Phase 16.8 decision).
+        // Assert 5 — Phase 16.9: approve now promotes the suggestion into the catalog.
+        // HAIRDRESSING maps to a System-A bucket (V78), so a new service_types row is
+        // created (+1). The requester is null → catalog-only branch, so NO draft
+        // service_definitions row is written.
         long serviceTypesAfter = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM service_types", Long.class);
         assertThat(serviceTypesAfter)
-                .as("approve marks the record only — no catalog auto-promotion")
-                .isEqualTo(serviceTypesBefore);
+                .as("approve promotes the suggestion into a new service_types row (novel name)")
+                .isEqualTo(serviceTypesBefore + 1);
+        Long createdType = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_types WHERE name_uk = ? AND platform_category_name = ?",
+                Long.class, SUGGESTED, CATEGORY);
+        assertThat(createdType)
+                .as("created ServiceType carries the suggested name + approved category")
+                .isEqualTo(1L);
+        Long draftCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE is_draft = TRUE AND name = ?",
+                Long.class, SUGGESTED);
+        assertThat(draftCount)
+                .as("null requester → catalog-only: no draft service is created")
+                .isEqualTo(0L);
 
-        // Act 6 — second approve is idempotent (token nulled) → neutral already-decided.
+        // Act 6 — second approve is idempotent (token nulled) → neutral already-decided,
+        // and creates NO second service_types row.
         assertThat(suggestionService.approve(rawToken)).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
+        long serviceTypesAfterReplay = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_types", Long.class);
+        assertThat(serviceTypesAfterReplay)
+                .as("replayed approve creates no duplicate type")
+                .isEqualTo(serviceTypesAfter);
     }
 
     @Test

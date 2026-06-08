@@ -26,9 +26,11 @@ import java.util.UUID;
  *
  * <p>A suggestion is persisted as a PENDING {@code service_type_suggestion} row
  * carrying a hashed single-use token; a platform admin approves or rejects it via an
- * emailed token-authenticated link. Approve marks the record {@code APPROVED} and
- * notifies — it does <strong>NOT</strong> insert a {@code service_types} row (no
- * auto-promotion; Phase 16.8 decision).
+ * emailed token-authenticated link. Approve marks the record {@code APPROVED} and then
+ * materializes the requested service for the requesting master via
+ * {@link ServiceTypePromotionService} — in the SAME transaction, so a promotion failure
+ * rolls back the approval and keeps it retryable (Phase 16.9; supersedes the Phase 16.8
+ * "no auto-promotion" decision).
  *
  * <p>Structurally a copy of {@link CategoryRequestService}. Security properties
  * enforced here, verbatim from that workflow:
@@ -53,6 +55,7 @@ public class ServiceTypeSuggestionService {
     private final TokenGenerator tokenGenerator;
     private final EmailService emailService;
     private final PublicBaseUrlProperties publicBaseUrlProperties;
+    private final ServiceTypePromotionService promotionService;
     private final Clock clock;
 
     @Value("${app.admin-email}")
@@ -156,10 +159,12 @@ public class ServiceTypeSuggestionService {
     }
 
     /**
-     * Approves the PENDING suggestion identified by the token: APPROVED, token
-     * cleared (single-use). Does NOT insert a {@code service_types} row. Idempotent:
-     * a second call returns {@link DecisionOutcome#ALREADY_DECIDED} (or
-     * INVALID_OR_EXPIRED) — no 500.
+     * Approves the PENDING suggestion identified by the token: APPROVED, token cleared
+     * (single-use), and the requested service materialized for the requesting master via
+     * {@link ServiceTypePromotionService} in this same transaction (Phase 16.9). A
+     * promotion failure rolls the whole approval back, so the admin can retry cleanly.
+     * Idempotent: a second call returns {@link DecisionOutcome#ALREADY_DECIDED} (or
+     * INVALID_OR_EXPIRED) BEFORE reaching the promote call — no 500, no double-create.
      */
     @Transactional
     public DecisionOutcome approve(String rawToken) {
@@ -193,7 +198,11 @@ public class ServiceTypeSuggestionService {
 
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
-            suggestion.approve(now);
+            suggestion.approve(now);          // flips APPROVED + clears the single-use token
+            // Materialize the requested service in the SAME transaction (Phase 16.9). A throw
+            // here rolls back the approve() flip (status stays PENDING, token intact) so the
+            // admin can retry — no "approved but not created" split-brain.
+            promotionService.promote(suggestion);
             return DecisionOutcome.APPROVED;
         }
         suggestion.reject(now);
