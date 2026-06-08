@@ -112,6 +112,58 @@ class ServiceTypeOpenApiContractTest extends AbstractIntegrationTest {
                 .isTrue();
     }
 
+    // ── 1b. GET /service-types 200 is a single unambiguous schema (no oneOf) ──
+
+    @Test
+    @DisplayName("GET /api/v1/service-types — 200 schema is a single $ref to "
+            + "ApiResponseListPlatformServiceTypeResponse, never a oneOf")
+    void should_publishSingle200Schema_when_specIsPublished() {
+        JsonNode schema = spec
+                .path("paths")
+                .path("/api/v1/service-types")
+                .path("get")
+                .path("responses")
+                .path("200")
+                .path("content");
+
+        // Content media type key varies ("*/*" for ApiResponse) — take the first entry.
+        JsonNode responseSchema = schema.elements().hasNext()
+                ? schema.elements().next().path("schema")
+                : MAPPER.missingNode();
+
+        assertThat(responseSchema.has("oneOf"))
+                .as("GET /api/v1/service-types 200 must NOT be a oneOf — the legacy "
+                        + "getServiceTypes operation must be @Operation(hidden=true) so SpringDoc "
+                        + "does not collapse two operations on this path into an ambiguous oneOf "
+                        + "that breaks mobile codegen; schema=%s", responseSchema)
+                .isFalse();
+
+        assertThat(responseSchema.path("$ref").asText())
+                .as("GET /api/v1/service-types 200 must $ref the single platform-type wrapper "
+                        + "ApiResponseListPlatformServiceTypeResponse; schema=%s", responseSchema)
+                .endsWith("/ApiResponseListPlatformServiceTypeResponse");
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/service-types — legacy categoryId & q params are NOT published "
+            + "(legacy operation hidden)")
+    void should_notPublishLegacyParams_when_specIsPublished() {
+        JsonNode parameters = spec
+                .path("paths")
+                .path("/api/v1/service-types")
+                .path("get")
+                .path("parameters");
+
+        assertThat(findParameterByName(parameters, "categoryId"))
+                .as("legacy categoryId param must not appear — the legacy operation is hidden; params=%s",
+                        parameters)
+                .isNull();
+        assertThat(findParameterByName(parameters, "q"))
+                .as("legacy q param must not appear — the legacy operation is hidden; params=%s",
+                        parameters)
+                .isNull();
+    }
+
     // ── 2. CreateServiceDefinitionRequest schema ──────────────────────────────
 
     @Test
