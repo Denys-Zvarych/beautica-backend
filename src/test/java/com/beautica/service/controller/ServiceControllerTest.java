@@ -122,7 +122,7 @@ class ServiceControllerTest {
     }
 
     private ServiceDefinitionResponse stubServiceDefResponse(UUID id, String name) {
-        return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null,
+        return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, false, null, null, null,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
     }
 
@@ -131,20 +131,20 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
-                null, null);
+                null, null, false);
     }
 
     /** Phase 16.4: variant carrying the lifted serviceTypeId + serviceTypeNameUk so the JSON shape can be asserted. */
     private MasterServiceResponse stubMasterServiceResponseWithType(
             UUID id, UUID masterId, String name, UUID serviceTypeId, String serviceTypeNameUk) {
         var sdResponse = new ServiceDefinitionResponse(
-                UUID.randomUUID(), name, null, null, 60, 10, true,
+                UUID.randomUUID(), name, null, null, 60, 10, true, false,
                 serviceTypeId, serviceTypeNameUk, null,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
-                serviceTypeId, serviceTypeNameUk);
+                serviceTypeId, serviceTypeNameUk, false);
     }
 
     // ── POST /api/v1/salons/{salonId}/services ─────────────────────────────────
@@ -490,6 +490,108 @@ class ServiceControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    // ── GET /api/v1/independent-masters/me/services — owner drafts (Phase 16.9 Part 2) ──
+
+    /** Draft variant: underlying definition is a draft (is_draft=true), assignment inactive (is_active=false). */
+    private MasterServiceResponse stubDraftMasterServiceResponse(UUID id, UUID masterId, String name) {
+        // ServiceDefinitionResponse: isActive=false, isDraft=true (positions per the existing stub helper).
+        var sdResponse = new ServiceDefinitionResponse(
+                UUID.randomUUID(), name, null, null, 0, 0, false, true, null, null, null,
+                PriceType.FIXED, BigDecimal.ZERO, null, null);
+        // MasterServiceResponse: isActive=false, isDraft=true (last field).
+        return new MasterServiceResponse(id, masterId, sdResponse,
+                null, null, BigDecimal.ZERO, 0, false,
+                PriceType.FIXED, BigDecimal.ZERO, null, null,
+                null, null, true);
+    }
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 200 and the list includes a draft row (isDraft=true, isActive=false)")
+    void should_return200_andIncludeDrafts_when_independentMasterListsOwnServices() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var activeId = UUID.randomUUID();
+        var draftId = UUID.randomUUID();
+
+        var active = stubMasterServiceResponse(activeId, masterId, "Gel Manicure");
+        var draft = stubDraftMasterServiceResponse(draftId, masterId, "Suggested Lashes");
+
+        when(serviceCatalogService.getMyServicesIncludingDrafts(userId))
+                .thenReturn(List.of(active, draft));
+
+        log.debug("Act: GET /api/v1/independent-masters/me/services as INDEPENDENT_MASTER — list must include the draft row");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(2))
+                // Active row: isDraft=false, isActive=true
+                .andExpect(jsonPath("$.data[0].id").value(activeId.toString()))
+                .andExpect(jsonPath("$.data[0].isDraft").value(false))
+                .andExpect(jsonPath("$.data[0].isActive").value(true))
+                // Draft row: isDraft=true, isActive=false — the new behaviour under test
+                .andExpect(jsonPath("$.data[1].id").value(draftId.toString()))
+                .andExpect(jsonPath("$.data[1].isDraft").value(true))
+                .andExpect(jsonPath("$.data[1].isActive").value(false))
+                .andExpect(jsonPath("$.data[1].serviceDefinition.isDraft").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 403 when CLIENT lists my services (role gate)")
+    void should_return403_when_clientListsMyServices() throws Exception {
+        var userId = UUID.randomUUID();
+        // @PreAuthorize("hasRole('INDEPENDENT_MASTER')") denies a CLIENT before the controller body runs.
+        log.debug("Act: GET /api/v1/independent-masters/me/services as CLIENT — must be denied with 403");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .getMyServicesIncludingDrafts(any());
+    }
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 403 when SALON_OWNER lists my services (role gate, owner is not a master)")
+    void should_return403_when_salonOwnerListsMyServices() throws Exception {
+        var userId = UUID.randomUUID();
+        log.debug("Act: GET /api/v1/independent-masters/me/services as SALON_OWNER — must be denied with 403");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .getMyServicesIncludingDrafts(any());
+    }
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 403 when SALON_MASTER lists my services (read-only role)")
+    void should_return403_when_salonMasterListsMyServices() throws Exception {
+        var userId = UUID.randomUUID();
+        log.debug("Act: GET /api/v1/independent-masters/me/services as SALON_MASTER — must be denied with 403");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .getMyServicesIncludingDrafts(any());
+    }
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 401 when no Authorization header is present")
+    void should_return401_when_listMyServicesWithoutAuth() throws Exception {
+        log.debug("Act: GET /api/v1/independent-masters/me/services without credentials — must return 401");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .getMyServicesIncludingDrafts(any());
+    }
+
     // ── DELETE /api/v1/services/{serviceDefId} ─────────────────────────────────
 
     @Test
@@ -591,7 +693,7 @@ class ServiceControllerTest {
 
         // Stub: service layer returns a RANGE ServiceDefinitionResponse
         var rangeStub = new ServiceDefinitionResponse(
-                serviceId, "Range Manicure", null, "MANICURE", 60, 0, true,
+                serviceId, "Range Manicure", null, "MANICURE", 60, 0, true, false,
                 null, null, null,
                 PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"),
                 "від 500 до 800 грн");
@@ -976,7 +1078,7 @@ class ServiceControllerTest {
         var serviceDefId = UUID.randomUUID();
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
         var stub = new ServiceDefinitionResponse(
-                serviceDefId, "Manicure", null, null, 60, 10, true, null, null, photoUrl,
+                serviceDefId, "Manicure", null, null, 60, 10, true, false, null, null, photoUrl,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);

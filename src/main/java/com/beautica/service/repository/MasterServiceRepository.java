@@ -95,6 +95,40 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             Pageable pageable);
 
     /**
+     * Owner-scoped variant of {@link #findByMasterIdAndIsActiveTrueWithGraph} (Phase 16.9
+     * Part 2): returns the master's own services <em>including drafts</em>.
+     *
+     * <p>Unlike the public query, the {@code msa.isActive = true} assignment filter is
+     * dropped and the definition predicate is widened to {@code sd.isActive = true OR
+     * sd.isDraft = true}. This is required because Phase 16.9 auto-creates a draft
+     * {@link ServiceDefinition} ({@code is_draft = true}, {@code is_active = false}) together
+     * with an <em>inactive</em> {@link MasterServiceAssignment}; the public query would hide
+     * both. Soft-deleted non-draft rows ({@code is_active = false AND is_draft = false}) stay
+     * excluded, matching the public list's soft-delete semantics.
+     *
+     * <p><strong>Owner-scoping:</strong> {@code masterId} must be the authenticated caller's
+     * own master id (derived from the principal), never a client-supplied path/query param —
+     * the service layer enforces this before calling. A master must not read another master's
+     * drafts.
+     *
+     * <p>Graph fetches {@code serviceDefinition}, its {@code serviceType}, and {@code master}
+     * so {@link com.beautica.service.dto.MasterServiceResponse#from} can traverse both hops
+     * without an N+1 or {@code LazyInitializationException}.
+     */
+    @Query("""
+            SELECT msa FROM MasterServiceAssignment msa
+            JOIN FETCH msa.serviceDefinition sd
+            LEFT JOIN FETCH sd.serviceType
+            JOIN FETCH msa.master
+            WHERE msa.master.id = :masterId
+              AND (sd.isActive = true OR sd.isDraft = true)
+            ORDER BY msa.createdAt ASC, msa.id ASC
+            """)
+    List<MasterServiceAssignment> findOwnedIncludingDraftsWithGraph(
+            @Param("masterId") UUID masterId,
+            Pageable pageable);
+
+    /**
      * Returns the distinct master IDs that have at least one assignment referencing
      * the given service definition. Used by {@link com.beautica.service.service.ServiceCatalogService}
      * to perform targeted per-key cache eviction when a service definition is deactivated,

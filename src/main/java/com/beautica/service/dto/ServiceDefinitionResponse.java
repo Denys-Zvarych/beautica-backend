@@ -28,6 +28,10 @@ public record ServiceDefinitionResponse(
         int baseDurationMinutes,
         int bufferMinutesAfter,
         boolean isActive,
+        @Schema(description = "True when this is an auto-created draft awaiting price/duration "
+                + "completion (is_draft=true, is_active=false). Always false on the public browse "
+                + "endpoint, which filters drafts out.")
+        boolean isDraft,
         @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
                 description = "Chosen service type id; null when no service type was selected.")
         UUID serviceTypeId,
@@ -54,6 +58,7 @@ public record ServiceDefinitionResponse(
                 sd.getBaseDurationMinutes(),
                 sd.getBufferMinutesAfter(),
                 sd.isActive(),
+                sd.isDraft(),
                 sd.getServiceType() != null ? sd.getServiceType().getId() : null,
                 sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null,
                 sd.getPhotoUrl(),
