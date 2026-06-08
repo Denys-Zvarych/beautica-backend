@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Repository-slice tests for {@link PlatformCategoryRepository} against a real
@@ -66,7 +67,7 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
     private PlatformCategory pending(String name, String displayName, String tokenHash) {
         OffsetDateTime now = OffsetDateTime.now();
         return persist(PlatformCategory.ofPendingRequest(
-                name, displayName, null, tokenHash, now, now.plusDays(7)));
+                name, displayName, null, tokenHash, now, now.plusDays(7), null));
     }
 
     // ── findApprovedActive ─────────────────────────────────────────────────────
@@ -188,5 +189,55 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
         assertThat(selectable)
                 .as("a PENDING (inactive) category must not pass the APPROVED+active gate")
                 .isFalse();
+    }
+
+    // ── initial_service_name column (V77 — behavior #5) ─────────────────────────
+
+    @Test
+    @DisplayName("round-trips a non-null initial_service_name value")
+    void should_roundTripInitialServiceName_when_persistedAndReloaded() {
+        OffsetDateTime now = OffsetDateTime.now();
+        PlatformCategory saved = persist(PlatformCategory.ofPendingRequest(
+                "WITH_INITIAL", "З назвою", null, "f".repeat(64), now, now.plusDays(7),
+                "Класичний манікюр"));
+        em.getEntityManager().detach(saved);
+
+        PlatformCategory reloaded = repository.findById(saved.getId()).orElseThrow();
+
+        assertThat(reloaded.getInitialServiceName())
+                .as("V77 initial_service_name column must persist and round-trip the stored value")
+                .isEqualTo("Класичний манікюр");
+    }
+
+    @Test
+    @DisplayName("a request without an initial service name leaves the column null")
+    void should_leaveInitialServiceNameNull_when_notProvided() {
+        PlatformCategory saved = pending("NO_INITIAL", "Без назви", "g".repeat(64));
+        em.getEntityManager().detach(saved);
+
+        PlatformCategory reloaded = repository.findById(saved.getId()).orElseThrow();
+
+        assertThat(reloaded.getInitialServiceName())
+                .as("optional column must be null when the request carried no initial service name")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("DB CHECK chk_platform_categories_initial_service_name rejects a control char")
+    void should_rejectControlChar_when_initialServiceNameViolatesDbCheck() {
+        // The DTO @Pattern blocks control chars at the edge; this proves the V77 CHECK
+        // is the backstop at the DB layer for any write path that bypasses validation.
+        // Native INSERT (the entity factory only ever receives validated/trimmed values).
+        assertThatThrownBy(() -> {
+            em.getEntityManager().createNativeQuery(
+                    "INSERT INTO platform_categories "
+                            + "(name, display_name, active, status, initial_service_name) "
+                            + "VALUES ('CTRL_CHAR', 'Контроль', false, 'PENDING', 'bad" + "\n" + "name')")
+                    .executeUpdate();
+            em.flush();
+        })
+                .as("V77 CHECK constraint must reject a control character at the DB layer")
+                .isInstanceOf(Exception.class)
+                .hasMessageContaining("chk_platform_categories_initial_service_name");
     }
 }

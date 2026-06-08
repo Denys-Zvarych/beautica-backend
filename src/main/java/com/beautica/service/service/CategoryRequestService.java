@@ -64,6 +64,7 @@ public class CategoryRequestService {
     private final TokenGenerator tokenGenerator;
     private final EmailService emailService;
     private final PublicBaseUrlProperties publicBaseUrlProperties;
+    private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final Clock clock;
 
     @Value("${app.admin-email}")
@@ -107,7 +108,8 @@ public class CategoryRequestService {
         OffsetDateTime now = OffsetDateTime.now(clock);
 
         PlatformCategory category = PlatformCategory.ofPendingRequest(
-                name, request.displayName(), requesterId, tokenHash, now, now.plus(TOKEN_TTL));
+                name, request.displayName(), requesterId, tokenHash, now, now.plus(TOKEN_TTL),
+                trimToNull(request.initialServiceName()));
         PlatformCategory saved = platformCategoryRepository.save(category);
 
         String reviewUrl = publicBaseUrlProperties.getPublicBaseUrl() + REVIEW_PATH + rawToken;
@@ -194,10 +196,45 @@ public class CategoryRequestService {
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
             category.approve(now);
+            createInitialServiceSuggestion(category);
             return DecisionOutcome.APPROVED;
         }
         category.reject(now);
         return DecisionOutcome.REJECTED;
+    }
+
+    /**
+     * If the approved request carried an initial service-type name, turn it into a
+     * PENDING {@link com.beautica.service.entity.ServiceTypeSuggestion} for the
+     * now-approved category (no auto-promotion; Phase 16.8 decision). A 409 dedup
+     * conflict is swallowed: the suggestion runs in its own REQUIRES_NEW transaction
+     * so its rollback cannot roll back the category approval.
+     */
+    private void createInitialServiceSuggestion(PlatformCategory category) {
+        String initialServiceName = category.getInitialServiceName();
+        if (initialServiceName == null) {
+            return;
+        }
+        try {
+            serviceTypeSuggestionService.submitSuggestionInternal(
+                    category.getName(), initialServiceName, null, category.getRequestedByUserId());
+        } catch (BusinessException e) {
+            if (e.getStatus() != HttpStatus.CONFLICT) {
+                throw e;
+            }
+            // 409 dedup: a matching suggestion already pending. No-op — the category
+            // approval must stand regardless. The inner REQUIRES_NEW transaction has
+            // already rolled back in isolation, so the approval commit is unaffected.
+        }
+    }
+
+    /** Blank or null becomes {@code null}; otherwise the trimmed value. */
+    private static String trimToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.strip();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 
     private Optional<PlatformCategory> findLivePending(String rawToken) {

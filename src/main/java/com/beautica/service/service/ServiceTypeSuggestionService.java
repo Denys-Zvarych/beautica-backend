@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
@@ -89,6 +90,33 @@ public class ServiceTypeSuggestionService {
      */
     @Transactional
     public void submitSuggestion(
+            String categoryName, String suggestedName, String description, UUID requestedByUserId) {
+        persistPendingAndNotify(categoryName, suggestedName, description, requestedByUserId);
+    }
+
+    /**
+     * Submits a PENDING suggestion from an already-trusted internal caller (e.g. the
+     * category-request approval path turning a carried "initial service name" into a
+     * suggestion). Bypasses the controller slug guard — the caller supplies the
+     * now-APPROVED System-B category slug directly — but applies the same 409 dedup and
+     * persistence as {@link #submitSuggestion}.
+     *
+     * <p>Marked {@code @Transactional(propagation = REQUIRES_NEW)} so the suggestion
+     * insert (and its dedup check) runs in its OWN suborbital transaction. A 409
+     * {@link BusinessException} rolls back only that inner transaction; the caller
+     * catches it and the outer category-approval transaction commits unaffected. Using
+     * the default {@code REQUIRED} here would mark the shared transaction rollback-only
+     * on the throw (Spring footgun) and doom the approval even if the caller catches it.
+     *
+     * @throws BusinessException 409 if an identical PENDING suggestion already exists
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void submitSuggestionInternal(
+            String categoryName, String suggestedName, String description, UUID requestedByUserId) {
+        persistPendingAndNotify(categoryName, suggestedName, description, requestedByUserId);
+    }
+
+    private void persistPendingAndNotify(
             String categoryName, String suggestedName, String description, UUID requestedByUserId) {
 
         if (suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(

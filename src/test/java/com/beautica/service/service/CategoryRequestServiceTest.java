@@ -18,6 +18,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Clock;
@@ -33,6 +34,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -51,6 +54,7 @@ class CategoryRequestServiceTest {
     @Mock private TokenGenerator tokenGenerator;
     @Mock private EmailService emailService;
     @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
+    @Mock private ServiceTypeSuggestionService serviceTypeSuggestionService;
 
     private CategoryRequestService service;
 
@@ -59,14 +63,30 @@ class CategoryRequestServiceTest {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new CategoryRequestService(
                 platformCategoryRepository, tokenGenerator, emailService,
-                publicBaseUrlProperties, fixedClock);
+                publicBaseUrlProperties, serviceTypeSuggestionService, fixedClock);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
     private PlatformCategory pendingCategory(OffsetDateTime expiresAt) {
         return PlatformCategory.ofPendingRequest(
                 "NAIL_ART", "Нейл-арт", UUID.randomUUID(), TOKEN_HASH,
-                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)), expiresAt);
+                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)), expiresAt, null);
+    }
+
+    private PlatformCategory pendingCategory(OffsetDateTime expiresAt, UUID requester, String initialServiceName) {
+        return PlatformCategory.ofPendingRequest(
+                "NAIL_ART", "Нейл-арт", requester, TOKEN_HASH,
+                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)), expiresAt, initialServiceName);
+    }
+
+    private void stubSubmitHappyPath() {
+        when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
+                .thenReturn(false);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://x");
+        when(platformCategoryRepository.save(any(PlatformCategory.class)))
+                .thenAnswer(inv -> inv.getArgument(0));
     }
 
     // ── submitRequest ─────────────────────────────────────────────────────────
@@ -84,7 +104,7 @@ class CategoryRequestServiceTest {
                 .thenAnswer(inv -> inv.getArgument(0));
 
         CategoryRequestResponse response = service.submitRequest(
-                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт"), requester);
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), requester);
 
         ArgumentCaptor<PlatformCategory> captor = ArgumentCaptor.forClass(PlatformCategory.class);
         verify(platformCategoryRepository).save(captor.capture());
@@ -109,7 +129,7 @@ class CategoryRequestServiceTest {
         when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://x");
         when(platformCategoryRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        service.submitRequest(new CreateCategoryRequestRequest("nail_art", "Нейл-арт"), UUID.randomUUID());
+        service.submitRequest(new CreateCategoryRequestRequest("nail_art", "Нейл-арт", null), UUID.randomUUID());
 
         verify(platformCategoryRepository).existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any());
     }
@@ -121,7 +141,7 @@ class CategoryRequestServiceTest {
                 .thenReturn(true);
 
         assertThatThrownBy(() -> service.submitRequest(
-                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт"), UUID.randomUUID()))
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), UUID.randomUUID()))
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").hasToString("409 CONFLICT");
 
@@ -138,7 +158,7 @@ class CategoryRequestServiceTest {
                 .thenReturn(true);
 
         assertThatThrownBy(() -> service.submitRequest(
-                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт"), UUID.randomUUID()))
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), UUID.randomUUID()))
                 .isInstanceOf(BusinessException.class);
 
         @SuppressWarnings("unchecked")
@@ -164,10 +184,58 @@ class CategoryRequestServiceTest {
         when(platformCategoryRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         var response = service.submitRequest(
-                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт"), UUID.randomUUID());
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), UUID.randomUUID());
 
         assertThat(response.status()).isEqualTo("PENDING");
         verify(platformCategoryRepository).save(any(PlatformCategory.class));
+    }
+
+    // ── submitRequest: initialServiceName persistence (behavior #2) ─────────────
+
+    @Test
+    @DisplayName("should_persistTrimmedInitialServiceName_when_provided")
+    void should_persistTrimmedInitialServiceName_when_provided() {
+        stubSubmitHappyPath();
+
+        service.submitRequest(
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", "  Класичний манікюр  "),
+                UUID.randomUUID());
+
+        ArgumentCaptor<PlatformCategory> captor = ArgumentCaptor.forClass(PlatformCategory.class);
+        verify(platformCategoryRepository).save(captor.capture());
+        assertThat(captor.getValue().getInitialServiceName())
+                .as("a provided initial service name must persist, trimmed")
+                .isEqualTo("Класичний манікюр");
+    }
+
+    @Test
+    @DisplayName("should_persistNullInitialServiceName_when_absent")
+    void should_persistNullInitialServiceName_when_absent() {
+        stubSubmitHappyPath();
+
+        service.submitRequest(
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), UUID.randomUUID());
+
+        ArgumentCaptor<PlatformCategory> captor = ArgumentCaptor.forClass(PlatformCategory.class);
+        verify(platformCategoryRepository).save(captor.capture());
+        assertThat(captor.getValue().getInitialServiceName())
+                .as("an absent initial service name must leave the column null")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_normalizeBlankInitialServiceNameToNull_when_blank")
+    void should_normalizeBlankInitialServiceNameToNull_when_blank() {
+        stubSubmitHappyPath();
+
+        service.submitRequest(
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", "   "), UUID.randomUUID());
+
+        ArgumentCaptor<PlatformCategory> captor = ArgumentCaptor.forClass(PlatformCategory.class);
+        verify(platformCategoryRepository).save(captor.capture());
+        assertThat(captor.getValue().getInitialServiceName())
+                .as("a blank initial service name must be normalized to null (trimToNull)")
+                .isNull();
     }
 
     // ── approve / reject ──────────────────────────────────────────────────────
@@ -186,6 +254,83 @@ class CategoryRequestServiceTest {
         assertThat(pending.isActive()).isTrue();
         assertThat(pending.getTokenHash()).isNull();
         assertThat(pending.getDecidedAt()).isNotNull();
+    }
+
+    // ── approve: initial-service suggestion side effect (behaviors #3, #4) ──────
+
+    @Test
+    @DisplayName("should_createPendingSuggestion_when_approvedCategoryCarriesInitialServiceName")
+    void should_createPendingSuggestion_when_approvedCategoryCarriesInitialServiceName() {
+        UUID requester = UUID.randomUUID();
+        PlatformCategory pending = pendingCategory(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, "Класичний манікюр");
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+
+        DecisionOutcome outcome = service.approve(RAW_TOKEN);
+
+        assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
+        // suggestion submitted for the approved slug (category.getName()), requester carried, description null
+        verify(serviceTypeSuggestionService).submitSuggestionInternal(
+                eq("NAIL_ART"), eq("Класичний манікюр"), isNull(), eq(requester));
+    }
+
+    @Test
+    @DisplayName("should_notCreateSuggestion_when_approvedCategoryHasNoInitialServiceName")
+    void should_notCreateSuggestion_when_approvedCategoryHasNoInitialServiceName() {
+        PlatformCategory pending = pendingCategory(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), UUID.randomUUID(), null);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+
+        DecisionOutcome outcome = service.approve(RAW_TOKEN);
+
+        assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
+        verifyNoInteractions(serviceTypeSuggestionService);
+    }
+
+    @Test
+    @DisplayName("should_keepApprovalCommitted_when_suggestionThrows409Conflict")
+    void should_keepApprovalCommitted_when_suggestionThrows409Conflict() {
+        // The REQUIRES_NEW boundary isolates the inner suggestion rollback; a 409 dedup
+        // must be swallowed so the category approval still stands.
+        UUID requester = UUID.randomUUID();
+        PlatformCategory pending = pendingCategory(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, "Дубль");
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        doThrow(new BusinessException(HttpStatus.CONFLICT, "A matching suggestion is already pending review"))
+                .when(serviceTypeSuggestionService)
+                .submitSuggestionInternal(eq("NAIL_ART"), eq("Дубль"), isNull(), eq(requester));
+
+        DecisionOutcome outcome = service.approve(RAW_TOKEN);
+
+        assertThat(outcome)
+                .as("a swallowed 409 must not propagate; approval outcome stands")
+                .isEqualTo(DecisionOutcome.APPROVED);
+        assertThat(pending.getStatus())
+                .as("category must end APPROVED despite the inner suggestion conflict")
+                .isEqualTo(PlatformCategoryStatus.APPROVED);
+        assertThat(pending.isActive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("should_propagate_when_suggestionThrowsNon409BusinessException")
+    void should_propagate_when_suggestionThrowsNon409BusinessException() {
+        // Only CONFLICT is swallowed; any other BusinessException must bubble up so a
+        // genuine fault is not silently lost behind the approval.
+        UUID requester = UUID.randomUUID();
+        PlatformCategory pending = pendingCategory(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, "Помилка");
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        doThrow(new BusinessException(HttpStatus.BAD_REQUEST, "boom"))
+                .when(serviceTypeSuggestionService)
+                .submitSuggestionInternal(eq("NAIL_ART"), eq("Помилка"), isNull(), eq(requester));
+
+        assertThatThrownBy(() -> service.approve(RAW_TOKEN))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").hasToString("400 BAD_REQUEST");
     }
 
     @Test

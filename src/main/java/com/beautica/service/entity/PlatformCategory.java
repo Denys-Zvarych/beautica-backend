@@ -72,6 +72,14 @@ public class PlatformCategory {
     @Column(name = "display_name", nullable = false, length = 100)
     private String displayName;
 
+    /**
+     * OPTIONAL initial service-type name carried on a self-service request. When set on
+     * a PENDING request, approval turns it into a PENDING {@link ServiceTypeSuggestion}
+     * for the now-approved category (no auto-promotion). Null on the seed/ops-CRUD path.
+     */
+    @Column(name = "initial_service_name", length = 255)
+    private String initialServiceName;
+
     @Column(nullable = false)
     private boolean active = true;
 
@@ -117,7 +125,9 @@ public class PlatformCategory {
      * Creates a PENDING self-service request: not selectable until approved, with a
      * hashed single-use token and a 7-day expiry.
      *
-     * @param tokenHash SHA-256 hex of the raw token (raw token is emailed, never stored)
+     * @param tokenHash          SHA-256 hex of the raw token (raw token is emailed, never stored)
+     * @param initialServiceName OPTIONAL initial service-type name (trimmed-to-null by the
+     *                           caller); turned into a PENDING suggestion on approval
      */
     public static PlatformCategory ofPendingRequest(
             String name,
@@ -125,13 +135,15 @@ public class PlatformCategory {
             UUID requestedByUserId,
             String tokenHash,
             OffsetDateTime requestedAt,
-            OffsetDateTime tokenExpiresAt) {
+            OffsetDateTime tokenExpiresAt,
+            String initialServiceName) {
         PlatformCategory category =
                 new PlatformCategory(name, displayName, PlatformCategoryStatus.PENDING, false);
         category.requestedByUserId = requestedByUserId;
         category.requestedAt = requestedAt;
         category.tokenHash = tokenHash;
         category.tokenExpiresAt = tokenExpiresAt;
+        category.initialServiceName = initialServiceName;
         return category;
     }
 

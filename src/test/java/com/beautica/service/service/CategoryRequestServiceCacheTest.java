@@ -65,6 +65,7 @@ class CategoryRequestServiceCacheTest {
     @MockBean TokenGenerator tokenGenerator;
     @MockBean EmailService emailService;
     @MockBean PublicBaseUrlProperties publicBaseUrlProperties;
+    @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
 
     @Autowired CategoryRequestService service;
     @Autowired CacheManager cacheManager;
@@ -79,7 +80,7 @@ class CategoryRequestServiceCacheTest {
         return PlatformCategory.ofPendingRequest(
                 "NAIL_ART", "Нейл-арт", null, TOKEN_HASH,
                 OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC),
-                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), null);
     }
 
     @Test

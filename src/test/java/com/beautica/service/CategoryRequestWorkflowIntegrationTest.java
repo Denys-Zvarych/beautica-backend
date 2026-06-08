@@ -65,6 +65,7 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
     @Autowired private CategoryRequestService categoryRequestService;
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private PlatformCategoryRepository platformCategoryRepository;
+    @Autowired private com.beautica.service.repository.ServiceTypeSuggestionRepository serviceTypeSuggestionRepository;
     @Autowired private TokenGenerator tokenGenerator;
 
     @Autowired private TestRestTemplate restTemplate;
@@ -82,7 +83,11 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
     @AfterEach
     void cleanCategory() {
         // platform_categories is not in AbstractIntegrationTest.cleanDb() (the 7 seeds
-        // must survive for sibling tests). Remove only the row this test created.
+        // must survive for sibling tests). Remove only the rows this test created.
+        // service_type_suggestion has no FK to platform_categories (slug stored as a
+        // plain string), so order between these two deletes is irrelevant.
+        jdbcTemplate.update(
+                "DELETE FROM service_type_suggestion WHERE category_name = ?", CATEGORY_NAME);
         jdbcTemplate.update("DELETE FROM platform_categories WHERE name = ?", CATEGORY_NAME);
     }
 
@@ -104,7 +109,7 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
 
         // Act 1 — submit the request.
         CategoryRequestResponse submitted = categoryRequestService.submitRequest(
-                new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт"), requesterId);
+                new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт", null), requesterId);
 
         // Assert 1 — row persisted PENDING with a HASHED token (stored value != raw token).
         assertThat(submitted.status()).isEqualTo("PENDING");
@@ -160,6 +165,77 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
         assertThat(created.category())
                 .as("category accepted by the service-create gate once APPROVED + active")
                 .isEqualTo(CATEGORY_NAME);
+    }
+
+    @Test
+    @DisplayName("approve with initial service name persists a PENDING service_type_suggestion (behavior #3)")
+    void should_createPendingSuggestion_when_approvingCategoryWithInitialServiceName() throws Exception {
+        // Arrange — a real persisted user (FK fk_platform_categories_requested_by).
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "it-cat-suggest-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Suggest Workflow Salon");
+        UUID requesterId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+
+        // Submit a request carrying an initial service-type name.
+        categoryRequestService.submitRequest(
+                new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт", "  Класичний манікюр  "),
+                requesterId);
+
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(emailService).sendCategoryRequestNotification(
+                anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
+                urlCaptor.capture());
+        String rawToken = urlCaptor.getValue()
+                .substring(urlCaptor.getValue().indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
+
+        // Act — approve the category.
+        DecisionOutcome outcome = categoryRequestService.approve(rawToken);
+
+        // Assert — category APPROVED and a PENDING suggestion now exists for its slug.
+        assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
+        var suggestions = serviceTypeSuggestionRepository.findAll().stream()
+                .filter(s -> CATEGORY_NAME.equals(s.getCategoryName()))
+                .toList();
+        assertThat(suggestions)
+                .as("approval must create exactly one PENDING suggestion for the approved slug")
+                .singleElement()
+                .satisfies(s -> {
+                    assertThat(s.getSuggestedName())
+                            .as("trimmed initial service name is carried into the suggestion")
+                            .isEqualTo("Класичний манікюр");
+                    assertThat(s.getDescription()).isNull();
+                    assertThat(s.getRequestedByUserId()).isEqualTo(requesterId);
+                    assertThat(s.isPending())
+                            .as("suggestion is created PENDING — no auto-promotion")
+                            .isTrue();
+                });
+    }
+
+    @Test
+    @DisplayName("approve without initial service name creates no suggestion (behavior #3 negative)")
+    void should_notCreateSuggestion_when_approvingCategoryWithoutInitialServiceName() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "it-cat-nosuggest-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "No-Suggest Workflow Salon");
+        UUID requesterId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        categoryRequestService.submitRequest(
+                new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт", null), requesterId);
+
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(emailService).sendCategoryRequestNotification(
+                anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
+                urlCaptor.capture());
+        String rawToken = urlCaptor.getValue()
+                .substring(urlCaptor.getValue().indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
+
+        categoryRequestService.approve(rawToken);
+
+        assertThat(serviceTypeSuggestionRepository.findAll().stream()
+                .filter(s -> CATEGORY_NAME.equals(s.getCategoryName())).toList())
+                .as("no initial service name → no suggestion created on approval")
+                .isEmpty();
     }
 
     @Test
