@@ -842,7 +842,7 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         var request = new UpdateServiceDefinitionRequest(
-                "Updated Manicure", null, null, null, null, PriceType.FIXED, new BigDecimal("400.00"), null, null);
+                "Updated Manicure", null, null, null, null, PriceType.FIXED, new BigDecimal("400.00"), null, null, null);
         var stub = stubServiceDefResponse(serviceDefId, "Updated Manicure");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
@@ -867,7 +867,7 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         // Only baseDurationMinutes is set — all other fields null (PATCH semantics)
-        var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null, null, null, null);
+        var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null, null, null, null, null);
         var stub = stubServiceDefResponse(serviceDefId, "Manicure");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);

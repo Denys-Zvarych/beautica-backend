@@ -201,7 +201,7 @@ class ServiceCatalogServicePricingTest {
 
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null,
-                PriceType.RANGE, null, new BigDecimal("600.00"), new BigDecimal("1000.00"));
+                PriceType.RANGE, null, new BigDecimal("600.00"), new BigDecimal("1000.00"), null);
 
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
@@ -242,7 +242,7 @@ class ServiceCatalogServicePricingTest {
 
         // Only update name — all four price fields null = price block absent
         var request = new UpdateServiceDefinitionRequest(
-                "New Manicure", null, null, null, null, null, null, null, null);
+                "New Manicure", null, null, null, null, null, null, null, null, null);
 
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
@@ -285,7 +285,7 @@ class ServiceCatalogServicePricingTest {
 
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null,
-                PriceType.RANGE, null, new BigDecimal("900.00"), new BigDecimal("1800.00"));
+                PriceType.RANGE, null, new BigDecimal("900.00"), new BigDecimal("1800.00"), null);
 
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 

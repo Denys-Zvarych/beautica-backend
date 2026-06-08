@@ -864,4 +864,94 @@ class ServiceCatalogServiceTest {
         verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
     }
+
+    // ── Phase 16.4 blank-name defaulting on create ───────────────────────────────
+    // name no longer @NotBlank: a null/blank name defaults to the selected service type's
+    // nameUk; a blank name with no service type → 400 "Name or service type is required".
+    // Blank is never persisted.
+
+    @Test
+    @DisplayName("defaults a blank name to the service type's nameUk on create — addServiceToSalon")
+    void should_defaultBlankNameToTypeNameUk_onCreate() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(serviceType.getNameUk()).thenReturn("Манікюр");
+
+        // Whitespace-only name + a valid serviceTypeId — name must default to the type's nameUk.
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "   ", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        serviceCatalogService.addServiceToSalon(salonId, request);
+
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(captor.capture());
+        assertThat(captor.getValue().getName())
+                .as("blank name on create must default to the type's Ukrainian name — never persist blank")
+                .isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("defaults a null name to the service type's nameUk on create — addServiceToSalon")
+    void should_defaultNullNameToTypeNameUk_onCreate() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(serviceType.getNameUk()).thenReturn("Манікюр");
+
+        // name null + a valid serviceTypeId — name must default to the type's nameUk.
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                null, "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        serviceCatalogService.addServiceToSalon(salonId, request);
+
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(captor.capture());
+        assertThat(captor.getValue().getName())
+                .as("null name on create must default to the type's Ukrainian name")
+                .isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("throws 400 'Name or service type is required' when name is blank and no service type is supplied on create")
+    void should_throw400_when_blankNameAndNoServiceType_onCreate() {
+        UUID salonId = UUID.randomUUID();
+
+        // Blank name + null serviceTypeId — nothing to derive a name from.
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "   ", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+
+        assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Name or service type is required")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(serviceRepository, never()).save(any());
+    }
 }

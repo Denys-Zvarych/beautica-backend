@@ -188,10 +188,29 @@ class ServiceTypeOpenApiContractTest extends AbstractIntegrationTest {
                         required)
                 .doesNotContain("serviceTypeId");
 
+        // name is now OPTIONAL on create: when blank, the service layer defaults it to the
+        // selected service type's Ukrainian name. @NotBlank was removed, so SpringDoc no
+        // longer lists name in required[]. The mobile create form lets masters leave it blank.
         assertThat(required)
-                .as("name must remain in the schema required[] — it is a mandatory create field; required=%s",
-                        required)
-                .contains("name");
+                .as("name must NOT be in the schema required[] — it is optional and defaults to "
+                        + "the service-type name when blank; required=%s", required)
+                .doesNotContain("name");
+    }
+
+    @Test
+    @DisplayName("UpdateServiceDefinitionRequest — serviceTypeId present and nullable")
+    void should_documentServiceTypeIdAsNullable_when_updateRequestSchemaPublished() {
+        JsonNode schema = schema("UpdateServiceDefinitionRequest");
+
+        JsonNode serviceTypeId = schema.path("properties").path("serviceTypeId");
+        assertThat(serviceTypeId.isMissingNode())
+                .as("UpdateServiceDefinitionRequest.serviceTypeId property must be present; schema=%s", schema)
+                .isFalse();
+
+        assertThat(typeContainsNull(serviceTypeId))
+                .as("UpdateServiceDefinitionRequest.serviceTypeId must be nullable "
+                        + "(type contains \"null\") in OpenAPI 3.1; type node=%s", serviceTypeId.path("type"))
+                .isTrue();
     }
 
     // ── 3. Response schemas expose nullable serviceTypeId + serviceTypeNameUk ──

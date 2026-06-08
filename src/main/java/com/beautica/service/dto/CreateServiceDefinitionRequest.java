@@ -42,7 +42,13 @@ import java.util.UUID;
  */
 @ServicePriceValid
 public record CreateServiceDefinitionRequest(
-        @NotBlank(message = "Name is required")
+        /**
+         * Custom service name (optional). When null or blank, the service layer defaults
+         * the persisted name to the selected service type's Ukrainian display name
+         * ({@code ServiceType.nameUk}). If no name is supplied and no service type is
+         * available to derive a default, the service layer rejects the request with a
+         * "Name or service type is required" validation error.
+         */
         @Size(max = 100, message = "Name must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
         String name,
