@@ -1,23 +1,97 @@
 #!/usr/bin/env bash
+# start.sh — Start the Beautica local Docker stack, PRESERVING the existing database.
+#
+# Containers are recreated but the Postgres data volume is kept, so all data
+# (and Flyway migration history) survives across restarts. For a clean wipe,
+# use start_fresh.sh instead.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
-echo "Stopping system PostgreSQL if running..."
-sudo systemctl stop postgresql 2>/dev/null || true
+# Returns 0 if host TCP port 5432 is currently bound (listening), 1 otherwise.
+# Works without root: prefer `ss`, fall back to `lsof`.
+port_5432_in_use() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 'sport = :5432' 2>/dev/null | grep -q ':5432'
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -ti tcp:5432 >/dev/null 2>&1
+  else
+    # No tooling to detect — assume free so we don't block the flow.
+    return 1
+  fi
+}
+
+# Best-effort diagnostic: print WHAT currently holds host port 5432.
+# Never let the probe itself abort the script (it runs under `set -e`).
+diagnose_port_5432() {
+  echo "  Diagnosing what holds port 5432..."
+
+  if command -v ss >/dev/null 2>&1; then
+    if sudo -n ss -ltnp 'sport = :5432' 2>/dev/null | grep ':5432'; then
+      :
+    else
+      ss -ltnp 'sport = :5432' 2>/dev/null | grep ':5432' || true
+    fi
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    docker ps --filter 'publish=5432' \
+      --format '  docker container: {{.Names}} ({{.Image}}) -> {{.Ports}}' 2>/dev/null || true
+  fi
+}
+
+# This host's user is in the `docker` group, so the Docker CLI does NOT need sudo.
+# Using sudo here would hang/fail on a password prompt in a non-interactive shell.
+#
+# Tear down THIS project's own stack FIRST, but KEEP the data volume (no `-v`).
+# This releases the published port while preserving the database.
+echo "Stopping existing stack (keeping database volume)..."
+docker compose -f "$COMPOSE_FILE" down 2>/dev/null || true
+
+echo "Checking host port 5432..."
+if port_5432_in_use; then
+  # The port survived our own `down`, so a NON-Docker process (typically the
+  # system PostgreSQL service) holds it. Attempt to stop system PostgreSQL.
+  echo "  Port 5432 still in use after tearing down our stack — attempting to stop the system PostgreSQL service..."
+  if sudo -n systemctl stop 'postgresql*.service' 2>/dev/null; then
+    echo "  Stopped system PostgreSQL (passwordless sudo)."
+  else
+    echo "  Passwordless sudo unavailable — you may be prompted for your password:"
+    sudo systemctl stop 'postgresql*.service' || true
+  fi
+
+  sleep 1
+  if port_5432_in_use; then
+    {
+      echo ""
+      echo "ERROR: host port 5432 is STILL in use after tearing down our stack and stopping system PostgreSQL."
+      echo "The Docker container 'beautica-postgres' cannot bind to 5432."
+      diagnose_port_5432
+      echo ""
+      echo "Free the port manually, then re-run this script. If it is system PostgreSQL:"
+      echo "  sudo systemctl stop postgresql postgresql@14-main"
+      echo ""
+      echo "Or disable host PostgreSQL permanently (it will no longer auto-start):"
+      echo "  sudo systemctl disable --now postgresql"
+    } >&2
+    exit 1
+  fi
+  echo "  Port 5432 is now free."
+else
+  echo "  Port 5432 is free — proceeding."
+fi
 
 echo "Starting Beautica local stack..."
-sudo docker compose -f "$COMPOSE_FILE" down 2>/dev/null || true
-sudo docker compose -f "$COMPOSE_FILE" up -d
+docker compose -f "$COMPOSE_FILE" up -d
 
 echo "Waiting for Postgres to be healthy..."
-until sudo docker inspect beautica-postgres --format '{{.State.Health.Status}}' 2>/dev/null | grep -q "healthy"; do
+until docker inspect beautica-postgres --format '{{.State.Health.Status}}' 2>/dev/null | grep -q "healthy"; do
   sleep 2
 done
 
 echo ""
-echo "Done."
+echo "Done. Existing database preserved — Flyway will apply only NEW migrations on next app start."
 echo "  Postgres : localhost:5432  (user: beautica / pass: beautica / db: beautica)"
 echo "  pgAdmin  : http://localhost:5050  (admin@admin.com / admin)"
 echo "  Mailpit  : http://localhost:8025  (SMTP → localhost:1025, no auth)"
