@@ -52,7 +52,7 @@ public class ScheduleMapper {
                         e.getKey(),
                         e.getValue().stream().sorted(BY_START).toList()))
                 .toList();
-        return new WeeklyScheduleResponse(schedule.getValidFrom(), schedule.getValidTo(), days);
+        return new WeeklyScheduleResponse(schedule.getId(), schedule.getValidFrom(), schedule.getValidTo(), days);
     }
 
     /** Maps a persisted per-date override to its read projection. */

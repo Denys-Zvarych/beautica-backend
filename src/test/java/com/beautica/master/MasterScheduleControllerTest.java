@@ -258,7 +258,7 @@ class MasterScheduleControllerTest {
         var masterId = UUID.randomUUID();
         when(authz.canManageMasterSchedule(any(), any())).thenReturn(true);
         when(masterScheduleService.upsertWeeklySchedule(any(), any(), any(), any()))
-                .thenReturn(new WeeklyScheduleResponse(LocalDate.now(), null, List.of()));
+                .thenReturn(new WeeklyScheduleResponse(UUID.randomUUID(), LocalDate.now(), null, List.of()));
         mockMvc.perform(post(BASE + "/" + masterId + "/weekly-schedules")
                         .with(as(UUID.randomUUID(), Role.INDEPENDENT_MASTER))
                         .with(csrf())
@@ -313,7 +313,7 @@ class MasterScheduleControllerTest {
         var scheduleId = UUID.randomUUID();
         when(authz.canManageMasterSchedule(any(), any())).thenReturn(true);
         when(masterScheduleService.upsertWeeklySchedule(any(), any(), any(), any()))
-                .thenReturn(new WeeklyScheduleResponse(LocalDate.now(), null, List.of()));
+                .thenReturn(new WeeklyScheduleResponse(UUID.randomUUID(), LocalDate.now(), null, List.of()));
         mockMvc.perform(put(BASE + "/" + masterId + "/weekly-schedules/" + scheduleId)
                         .with(as(UUID.randomUUID(), Role.INDEPENDENT_MASTER))
                         .with(csrf())

@@ -505,6 +505,75 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // 3b. Read identity — WeeklyScheduleResponse.id round-trips (regression: missing id)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Read identity — WeeklyScheduleResponse.id round-trip")
+    class ReadIdentity {
+
+        /**
+         * Regression for the missing-{@code id} gap: {@code WeeklyScheduleResponse} previously had no
+         * {@code id}, so a client reloading the list could not target {@code PUT
+         * /weekly-schedules/{scheduleId}} and re-POSTed a duplicate window — tripping the overlap guard.
+         * The listed response's {@code id} must be non-null AND equal the persisted entity's id, so an
+         * editor can round-trip it straight onto the update path.
+         */
+        @Test
+        @DisplayName("listWeeklySchedules exposes a non-null id equal to the persisted entity's id")
+        void should_exposePersistedId_when_listingWeeklySchedules() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(1, iv(9, 17))));
+            UUID persistedId = weeklyScheduleRepository
+                    .findByMasterIdOrderByValidFromAsc(m.masterId()).get(0).getId();
+
+            List<WeeklyScheduleResponse> listed = scheduleService.listWeeklySchedules(m.masterId());
+
+            assertThat(listed).singleElement()
+                    .extracting(WeeklyScheduleResponse::id)
+                    .as("the listed window must carry the persisted id so editors can target PUT, "
+                            + "not re-POST a duplicate that trips the overlap guard")
+                    .isNotNull()
+                    .isEqualTo(persistedId);
+        }
+
+        /**
+         * End-to-end reproduction of the original failure mode at the service layer: create a window,
+         * reload the list, then upsert using the id from the response. It must UPDATE in place (same id,
+         * intervals replaced) with no {@code BusinessException} overlap — proving the round-trip id closes
+         * the duplicate-window bug.
+         */
+        @Test
+        @DisplayName("re-upsert using the listed id updates in place — no overlap, same id, intervals replaced")
+        void should_updateInPlace_when_reUpsertingWithListedId() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(1, iv(9, 17))));
+
+            UUID listedId = scheduleService.listWeeklySchedules(m.masterId()).get(0).id();
+
+            // Re-upsert the SAME window (overlapping itself) targeting the listed id — the original bug
+            // was a re-POST (scheduleId == null) here, which tripped assertNoWindowOverlap.
+            WeeklyScheduleResponse updated = scheduleService.upsertWeeklySchedule(
+                    m.actorId(), m.masterId(), listedId,
+                    weekly(FUTURE_FROM, null, day(2, iv(10, 16))));
+
+            assertThat(updated.id())
+                    .as("the update must reuse the same window id, not create a second one")
+                    .isEqualTo(listedId);
+            assertThat(weeklyScheduleRepository.findByMasterIdOrderByValidFromAsc(m.masterId()))
+                    .as("the master must still have exactly one window — updated in place, not duplicated")
+                    .singleElement()
+                    .extracting(ws -> ws.getId()).isEqualTo(listedId);
+            assertThat(updated.days())
+                    .as("the targeted update replaced the intervals (Monday → Tuesday)")
+                    .singleElement()
+                    .extracting(d -> d.dayOfWeek()).isEqualTo(2);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // 4. Data exposure — note never leaks through the effective-day projection
     // ════════════════════════════════════════════════════════════════════════════════
 
