@@ -303,7 +303,12 @@ public class MasterScheduleService {
     }
 
     private void replaceIntervals(WeeklySchedule schedule, List<WeeklyScheduleDayRequest> days) {
-        schedule.getIntervals().clear(); // orphanRemoval deletes the old rows on flush
+        schedule.getIntervals().clear(); // orphanRemoval queues DELETEs for the old rows
+        // Force the orphan DELETEs to the DB before re-inserting. With hibernate.order_inserts=true
+        // the ActionQueue runs all INSERTs before all DELETEs, so a re-sent interval whose
+        // (schedule_id, day_of_week, start_time, end_time) matches a surviving old row would collide
+        // with uq_working_intervals_no_dup (23505). Flushing here makes it delete-before-insert.
+        weeklyScheduleRepository.flush();
         for (WeeklyScheduleDayRequest day : days) {
             if (day.intervals() == null) {
                 continue;
@@ -320,7 +325,11 @@ public class MasterScheduleService {
     }
 
     private void replaceOverrideIntervals(ScheduleException override, List<WorkIntervalDto> intervals) {
-        override.getIntervals().clear(); // orphanRemoval deletes the old rows on flush
+        override.getIntervals().clear(); // orphanRemoval queues DELETEs for the old rows
+        // Force the orphan DELETEs to the DB before re-inserting. With hibernate.order_inserts=true
+        // the ActionQueue runs all INSERTs before all DELETEs, so a re-sent interval whose unique key
+        // matches a surviving old row would collide (23505). Flushing here makes it delete-before-insert.
+        scheduleExceptionRepository.flush();
         for (WorkIntervalDto dto : intervals) {
             override.getIntervals().add(ScheduleExceptionInterval.builder()
                     .exception(override)

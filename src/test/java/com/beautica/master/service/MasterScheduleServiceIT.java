@@ -574,6 +574,91 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // 3c. Re-upsert duplicate-key collision — orphan DELETE must run before re-INSERT
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Regression for the working-intervals duplicate-key bug. Editing a day's working hours by adding a
+     * pause that splits the day re-sent at least one interval whose
+     * {@code (schedule_id, day_of_week, start_time, end_time)} (override: {@code (exception_id, start, end)})
+     * was byte-identical to a row already persisted from the previous save. With
+     * {@code hibernate.order_inserts=true} the {@code ActionQueue} runs every INSERT before every orphan
+     * DELETE, so the re-sent identical interval collided with {@code uq_working_intervals_no_dup} /
+     * {@code uq_exception_intervals_no_dup} and the write blew up with a
+     * {@link org.springframework.dao.DataIntegrityViolationException} (SQLState 23505).
+     *
+     * <p>The fix is the {@code repository.flush()} in {@code replaceIntervals} /
+     * {@code replaceOverrideIntervals} right after {@code getIntervals().clear()}, forcing the orphan
+     * DELETEs to the DB <b>before</b> the re-INSERTs. These tests must FAIL with 23505 without that flush
+     * and PASS with it. The collision only manifests against the live unique index — hence a real-DB IT.
+     */
+    @Nested
+    @DisplayName("Re-upsert duplicate-key collision — delete-before-insert (23505 regression)")
+    class ReUpsertDuplicateKey {
+
+        @Test
+        @DisplayName("weekly: re-upsert a day adding a pause (morning block unchanged) succeeds — no 23505")
+        void should_notCollide_when_reUpsertingWeeklyDayWithIdenticalMorningBlock() {
+            SeededMaster m = seedIndependentMaster();
+            // First save: a single morning block on day 2 (Tuesday).
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(2, iv(9, 13))));
+            UUID listedId = scheduleService.listWeeklySchedules(m.masterId()).get(0).id();
+
+            // Edit = "add a pause": keep the byte-identical 09:00-13:00 morning, add an afternoon block.
+            // The re-sent 09:00-13:00 row equals the already-persisted one → would collide on the unique
+            // index unless the orphan DELETE is flushed before the re-INSERT.
+            WeeklyScheduleResponse updated = scheduleService.upsertWeeklySchedule(
+                    m.actorId(), m.masterId(), listedId,
+                    weekly(FUTURE_FROM, null, day(2, iv(9, 13), iv(14, 18))));
+
+            assertThat(updated.id())
+                    .as("the edit must update the same window in place").isEqualTo(listedId);
+
+            // The persisted day 2 must hold exactly the two expected intervals — proving the re-INSERT
+            // landed (the bug aborted the whole write before any interval could be written/replaced).
+            EffectiveDayResponse tue = scheduleService.resolveEffectiveDay(
+                    m.masterId(), nextDateForDow(FUTURE_FROM, DayOfWeek.TUESDAY));
+            assertThat(tue.source()).isEqualTo(EffectiveDaySource.TEMPLATE);
+            assertThat(tue.intervals())
+                    .as("day 2 must persist exactly the unchanged morning + the new afternoon block")
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(
+                            tuple(LocalTime.of(9, 0), LocalTime.of(13, 0)),
+                            tuple(LocalTime.of(14, 0), LocalTime.of(18, 0)));
+        }
+
+        @Test
+        @DisplayName("override: re-upsert a CUSTOM_HOURS date adding a pause (morning block unchanged) succeeds — no 23505")
+        void should_notCollide_when_reUpsertingOverrideWithIdenticalMorningBlock() {
+            SeededMaster m = seedIndependentMaster();
+            // First save: a CUSTOM_HOURS override on FUTURE_FROM with a single morning block.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            null, null, List.of(iv(9, 13))));
+
+            // Edit = "add a pause": keep the byte-identical 09:00-13:00 morning, add an afternoon block.
+            // The re-sent 09:00-13:00 row equals the already-persisted exception interval → would collide
+            // unless replaceOverrideIntervals flushes the orphan DELETE before the re-INSERT.
+            ScheduleOverrideResponse updated = scheduleService.upsertOverride(
+                    m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            null, null, List.of(iv(9, 13), iv(14, 18))));
+
+            assertThat(updated.kind()).isEqualTo(ScheduleExceptionKind.CUSTOM_HOURS);
+
+            EffectiveDayResponse day = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
+            assertThat(day.source()).isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
+            assertThat(day.intervals())
+                    .as("the override must persist exactly the unchanged morning + the new afternoon block")
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(
+                            tuple(LocalTime.of(9, 0), LocalTime.of(13, 0)),
+                            tuple(LocalTime.of(14, 0), LocalTime.of(18, 0)));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // 4. Data exposure — note never leaks through the effective-day projection
     // ════════════════════════════════════════════════════════════════════════════════
 
