@@ -50,27 +50,32 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
 
     /**
-     * The 21 active platform-category name slugs after V74 (the picker set).
-     * Source of truth: phase-17.1-taxonomy-slug-artifact.md § "21 platform categories".
+     * The 20 active platform-category name slugs after the V74/V75 → V81 chain (the
+     * picker set). V81 folds the 21st category SHAVING into BEARD_CARE and
+     * soft-disables it, so SHAVING is NOT in this set anymore.
+     * Source of truth: phase-17.1-taxonomy-slug-artifact.md + V81 reconciliation.
      */
     private static final Set<String> ACTIVE_SLUGS = Set.of(
             "HAIRDRESSING", "HAIR_COLORING", "HAIR_TREATMENT", "HAIR_EXTENSIONS", "TRICHOLOGY",
             "NAIL_SERVICE", "PODOLOGY", "BROWS", "LASH_LAMINATION", "LASH_EXTENSIONS",
             "MAKEUP", "COSMETOLOGY", "HARDWARE_COSMETOLOGY", "INJECTION_COSMETOLOGY",
             "AESTHETIC_COSMETOLOGY", "LASER_COSMETOLOGY", "HAIR_REMOVAL", "PERMANENT_MAKEUP",
-            "BARBERING", "BEARD_CARE", "SHAVING"
+            "BARBERING", "BEARD_CARE"
     );
 
     /**
-     * Legacy slugs V74 soft-disables (active = FALSE) instead of deleting, so the
-     * UNIQUE(name) self-service guard and any legacy service_definitions FK survive.
+     * Slugs soft-disabled (active = FALSE) instead of deleted, so the UNIQUE(name)
+     * self-service guard and any legacy service_definitions FK survive: the 5 legacy
+     * V74 leftovers plus SHAVING (soft-disabled by V81 when folded into BEARD_CARE).
      */
     private static final Set<String> SOFT_DISABLED_SLUGS = Set.of(
-            "PEDICURE", "HAIR", "BODY", "FACE", "OTHER"
+            "PEDICURE", "HAIR", "BODY", "FACE", "OTHER", "SHAVING"
     );
 
-    private static final int TOTAL_SERVICE_TYPES = 140;
-    private static final int ACTIVE_CATEGORY_COUNT = 21;
+    // Post-V81 totals: V75 seeded 140 leaves; V81 hard-deletes nail-service-pedicure-toes -> 139.
+    // 26 platform_categories total (unchanged); 20 active after V81 soft-disables SHAVING.
+    private static final int TOTAL_SERVICE_TYPES = 139;
+    private static final int ACTIVE_CATEGORY_COUNT = 20;
     private static final int TOTAL_CATEGORY_COUNT = 26;
 
     // =========================================================================
@@ -82,8 +87,8 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
     class ActiveSlugCoverage {
 
         @Test
-        @DisplayName("exactly the 21 active slugs exist as APPROVED + active after V74")
-        void should_haveTwentyOneActiveSlugs_when_v74Applied() {
+        @DisplayName("exactly the 20 active slugs exist as APPROVED + active after V81")
+        void should_haveTwentyActiveSlugs_when_v81Applied() {
             List<String> liveSlugs = jdbcTemplate.queryForList(
                     "SELECT name FROM platform_categories "
                     + "WHERE status = 'APPROVED' AND active = TRUE "
@@ -91,13 +96,13 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                     String.class);
 
             assertThat(liveSlugs)
-                    .as("platform_categories must contain exactly the 21 active taxonomy slugs after V74")
+                    .as("platform_categories must contain exactly the 20 active taxonomy slugs after V81")
                     .containsExactlyInAnyOrderElementsOf(ACTIVE_SLUGS);
         }
 
         @Test
-        @DisplayName("platform_categories has 21 active rows and 26 total (5 soft-disabled)")
-        void should_have21ActiveAnd26Total_when_v74Applied() {
+        @DisplayName("platform_categories has 20 active rows and 26 total (6 soft-disabled)")
+        void should_have20ActiveAnd26Total_when_v81Applied() {
             Integer active = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM platform_categories WHERE active = TRUE",
                     Integer.class);
@@ -106,10 +111,10 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
                     Integer.class);
 
             assertThat(active)
-                    .as("exactly 21 platform categories must be active after V74")
+                    .as("exactly 20 platform categories must be active after V81 folds SHAVING")
                     .isEqualTo(ACTIVE_CATEGORY_COUNT);
             assertThat(total)
-                    .as("26 total platform categories (21 active + 5 soft-disabled) after V74")
+                    .as("26 total platform categories (20 active + 6 soft-disabled) after V81")
                     .isEqualTo(TOTAL_CATEGORY_COUNT);
         }
 
@@ -213,26 +218,26 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("total service_type count is 140 (V75 reseed)")
-        void should_have140ServiceTypes_when_v75Applied() {
+        @DisplayName("total service_type count is 139 (V75 reseed minus V81 pedicure-toes delete)")
+        void should_have139ServiceTypes_when_v81Applied() {
             Integer total = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_types",
                     Integer.class);
 
             assertThat(total)
-                    .as("V75 reseeds the catalog to exactly 140 service_types")
+                    .as("V75 seeds 140; V81 hard-deletes nail-service-pedicure-toes -> 139 service_types")
                     .isEqualTo(TOTAL_SERVICE_TYPES);
         }
 
         @Test
-        @DisplayName("all service_types are active after V75 reseed")
-        void should_haveAllActive_when_v75Applied() {
+        @DisplayName("all service_types are active after V75 reseed + V81 reconcile")
+        void should_haveAllActive_when_v81Applied() {
             Integer inactive = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_types WHERE is_active = FALSE",
                     Integer.class);
 
             assertThat(inactive)
-                    .as("V75 seeds all 140 leaves as active")
+                    .as("all surviving leaves are active (V81 re-parents, it does not deactivate)")
                     .isZero();
         }
     }
@@ -246,14 +251,14 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
     class PerCategoryCounts {
 
         @Test
-        @DisplayName("each active category has the expected number of active leaves")
-        void should_haveExpectedLeafCounts_when_v75Applied() {
+        @DisplayName("each active category has the expected number of active leaves (post-V81)")
+        void should_haveExpectedLeafCounts_when_v81Applied() {
             assertBucketCount("HAIRDRESSING", 11);
             assertBucketCount("HAIR_COLORING", 9);
             assertBucketCount("HAIR_TREATMENT", 7);
             assertBucketCount("HAIR_EXTENSIONS", 4);
             assertBucketCount("TRICHOLOGY", 3);
-            assertBucketCount("NAIL_SERVICE", 12);
+            assertBucketCount("NAIL_SERVICE", 11);   // V81 deleted nail-service-pedicure-toes (was 12)
             assertBucketCount("PODOLOGY", 5);
             assertBucketCount("BROWS", 8);
             assertBucketCount("LASH_LAMINATION", 3);
@@ -267,19 +272,19 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
             assertBucketCount("HAIR_REMOVAL", 6);
             assertBucketCount("PERMANENT_MAKEUP", 6);
             assertBucketCount("BARBERING", 10);
-            assertBucketCount("BEARD_CARE", 7);
-            assertBucketCount("SHAVING", 5);
+            assertBucketCount("BEARD_CARE", 12);     // V81 folded 5 shaving leaves in (was 7)
+            assertBucketCount("SHAVING", 0);         // V81 re-parented all shaving leaves out
         }
 
         @Test
-        @DisplayName("sum of all per-category leaf counts equals 140")
-        void should_haveTotalOf140AcrossAllBuckets_when_v75Applied() {
+        @DisplayName("sum of all per-category leaf counts equals 139")
+        void should_haveTotalOf139AcrossAllBuckets_when_v81Applied() {
             Integer total = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_types WHERE platform_category_name IS NOT NULL",
                     Integer.class);
 
             assertThat(total)
-                    .as("the per-category active counts must sum to 140")
+                    .as("the per-category counts must sum to 139 after V81 reconciliation")
                     .isEqualTo(TOTAL_SERVICE_TYPES);
         }
 
