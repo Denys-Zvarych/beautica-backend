@@ -74,6 +74,29 @@ public class ServiceController {
         return ApiResponse.ok(serviceCatalogService.getMasterServices(masterId));
     }
 
+    /**
+     * Returns the authenticated master's OWN active services.
+     *
+     * <p>Owner-scoped: the master is resolved from the authenticated principal's user id,
+     * never from a path/query parameter the caller controls — a master can only read their
+     * own services. This complements the public {@link #getMasterServices(UUID)} browse,
+     * which is keyed off a path parameter and is unchanged.
+     *
+     * <p>The role gate mirrors the create endpoint below
+     * ({@code POST /independent-masters/me/services}); ownership is enforced inside the
+     * service via the principal-derived master resolution.
+     */
+    @Operation(summary = "List my own active services",
+            description = "Returns the authenticated master's own active services. "
+                    + "Owner-scoped to the authenticated principal; never exposes another "
+                    + "master's services.")
+    @GetMapping("/independent-masters/me/services")
+    @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
+    public ApiResponse<List<MasterServiceResponse>> getMyServices(Authentication authentication) {
+        UUID userId = extractUserId(authentication);
+        return ApiResponse.ok(serviceCatalogService.getMyServices(userId));
+    }
+
     @PostMapping("/independent-masters/me/services")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> addIndependentMasterService(

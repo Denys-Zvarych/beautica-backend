@@ -43,6 +43,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -422,6 +423,62 @@ class ServiceCatalogServiceTest {
         assertThat(item.masterId()).isEqualTo(masterId);
         assertThat(item.serviceDefinition().id()).isEqualTo(serviceDefId);
         assertThat(item.isActive()).isTrue();
+    }
+
+    // ── getMyServices ───────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("getMyServices resolves the master from userId and returns the master's active services")
+    void should_returnActiveServices_when_getMyServicesForResolvedMaster() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID assignmentId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(masterId)
+                .name("Manicure")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(assignmentId);
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(null);
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+
+        List<MasterServiceResponse> result = serviceCatalogService.getMyServices(userId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).masterId()).isEqualTo(masterId);
+        assertThat(result.get(0).serviceDefinition().id()).isEqualTo(serviceDefId);
+        assertThat(result.get(0).isActive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("getMyServices throws NotFoundException when no master exists for the userId")
+    void should_throwNotFound_when_getMyServicesForUnknownUser() {
+        UUID userId = UUID.randomUUID();
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> serviceCatalogService.getMyServices(userId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
     }
 
     // ── deactivateServiceDefinition ────────────────────────────────────────────

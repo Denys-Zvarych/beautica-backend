@@ -490,6 +490,61 @@ class ServiceControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    // ── GET /api/v1/independent-masters/me/services — owner's active services ──
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 200 and returns the master's active services")
+    void should_returnMyServices_when_authenticatedIndependentMaster() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var firstId = UUID.randomUUID();
+        var secondId = UUID.randomUUID();
+
+        var first = stubMasterServiceResponse(firstId, masterId, "Gel Manicure");
+        var second = stubMasterServiceResponse(secondId, masterId, "Classic Pedicure");
+
+        when(serviceCatalogService.getMyServices(userId)).thenReturn(List.of(first, second));
+
+        log.debug("Act: GET /api/v1/independent-masters/me/services as INDEPENDENT_MASTER — returns active services");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].id").value(firstId.toString()))
+                .andExpect(jsonPath("$.data[0].isActive").value(true))
+                .andExpect(jsonPath("$.data[1].id").value(secondId.toString()))
+                .andExpect(jsonPath("$.data[1].isActive").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 401 when no Authorization header is present")
+    void should_return401_when_unauthenticated() throws Exception {
+        log.debug("Act: GET /api/v1/independent-masters/me/services without credentials — must return 401");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .getMyServices(any());
+    }
+
+    @Test
+    @DisplayName("GET /independent-masters/me/services — 403 when CLIENT attempts the call (role gate)")
+    void should_return403_when_wrongRole() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: GET /api/v1/independent-masters/me/services as CLIENT — must be denied with 403");
+        mockMvc.perform(get("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .getMyServices(any());
+    }
+
     // ── DELETE /api/v1/services/{serviceDefId} ─────────────────────────────────
 
     @Test
