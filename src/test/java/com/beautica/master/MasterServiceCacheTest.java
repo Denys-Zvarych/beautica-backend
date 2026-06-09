@@ -115,7 +115,9 @@ class MasterServiceCacheTest {
 
         Master master = mock(Master.class);
         when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
-        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(MASTER_ID)).thenReturn(List.of());
+        // upsert merge map is built from the all-rows finder (incl. inactive), not the
+        // active-only finder — matching production after the 23505 duplicate-INSERT fix.
+        when(workingHoursRepository.findByMasterId(MASTER_ID)).thenReturn(List.of());
         WorkingHours savedWh = mock(WorkingHours.class);
         when(workingHoursRepository.saveAll(any())).thenReturn(List.of(savedWh));
         when(savedWh.getDayOfWeek()).thenReturn(1);

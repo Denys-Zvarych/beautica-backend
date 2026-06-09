@@ -30,6 +30,7 @@ import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -389,7 +390,9 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
 
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        // upsert merge map is built from ALL rows (incl. inactive) via findByMasterId, not the
+        // active-only finder — matching production after the 23505 duplicate-INSERT fix.
+        when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of(saved));
 
         List<WorkingHoursResponse> result =
@@ -398,6 +401,76 @@ class MasterServiceTest {
         assertThat(result).hasSize(1);
         assertThat(result.get(0).dayOfWeek()).isEqualTo(1);
         verify(workingHoursRepository).saveAll(anyList());
+    }
+
+    // ── upsertWorkingHours — inactive-row reuse (regression: UNIQUE(master_id, day_of_week) 23505) ──
+    // Original bug: the merge map was built with the active-only finder
+    // (findByMasterIdAndIsActiveTrue), so a pre-existing INACTIVE (master_id, day_of_week) row was
+    // invisible. The merge treated that weekday as new → built a WorkingHours with a null @Id →
+    // saveAll emitted an INSERT that violated UNIQUE(master_id, day_of_week)
+    // (DataIntegrityViolationException, SQLState 23505).
+    // Fix: build the merge map from findByMasterId (ALL rows, incl. inactive) so the existing row
+    // is matched and UPDATEd in place (same @Id, setActive(true)) instead of re-INSERTed.
+
+    @Test
+    @DisplayName("should_updateInactiveRowInPlace_when_upsertWorkingHoursForPreviouslyDeactivatedDay")
+    void should_updateInactiveRowInPlace_when_upsertWorkingHoursForPreviouslyDeactivatedDay() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID existingRowId = UUID.randomUUID();
+        Master master = mock(Master.class);
+
+        // Pre-seed an EXISTING, INACTIVE working-hours row for day 2 with a non-null @Id.
+        // This is the row the active-only finder would have hidden, causing the duplicate INSERT.
+        WorkingHours existingInactiveRow = WorkingHours.builder()
+                .master(master)
+                .dayOfWeek(2)
+                .startTime(LocalTime.of(8, 0))
+                .endTime(LocalTime.of(12, 0))
+                .isActive(false)
+                .build();
+        ReflectionTestUtils.setField(existingInactiveRow, "id", existingRowId);
+
+        // Re-enable day 2 with new hours and isActive = true.
+        var request = new WorkingHoursRequest(2, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        // The merge map MUST be built from the all-rows finder so the inactive row is visible.
+        when(workingHoursRepository.findByMasterId(masterId))
+                .thenReturn(List.of(existingInactiveRow));
+        when(workingHoursRepository.saveAll(anyList()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        masterService.upsertWorkingHours(actorId, masterId, List.of(request));
+
+        // Capture exactly what was handed to saveAll — the merge result.
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<WorkingHours>> captor = ArgumentCaptor.forClass(List.class);
+        verify(workingHoursRepository).saveAll(captor.capture());
+        List<WorkingHours> persisted = captor.getValue();
+
+        // Exactly ONE row for day 2 — no second (duplicate) row was created.
+        assertThat(persisted)
+                .as("merge must produce a single row for day 2, not a duplicate INSERT")
+                .hasSize(1);
+
+        WorkingHours mergedRow = persisted.get(0);
+        // Updated IN PLACE: the SAME @Id is retained (no new row → no UNIQUE violation).
+        assertThat(mergedRow.getId())
+                .as("the existing inactive row must be reused, retaining its @Id")
+                .isEqualTo(existingRowId);
+        // The previously-inactive row is now active with the requested hours.
+        assertThat(mergedRow.isActive())
+                .as("the reused row must be re-activated")
+                .isTrue();
+        assertThat(mergedRow.getStartTime()).isEqualTo(LocalTime.of(9, 0));
+        assertThat(mergedRow.getEndTime()).isEqualTo(LocalTime.of(17, 0));
+        assertThat(mergedRow.getDayOfWeek()).isEqualTo(2);
+
+        // The merge map is built from the all-rows finder; the active-only finder must NOT be used
+        // on the upsert path (that finder would hide the inactive row and reintroduce the bug).
+        verify(workingHoursRepository).findByMasterId(masterId);
+        verify(workingHoursRepository, never()).findByMasterIdAndIsActiveTrue(any());
     }
 
     @Test
@@ -441,9 +514,9 @@ class MasterServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Duplicate working-hours entry for the same day");
 
-        // Guard runs before any repository access — no master lookup, no save.
+        // Guard runs before any repository access — no master lookup, no merge-map fetch, no save.
         verify(masterRepository, never()).findByIdWithSalonAndOwner(any());
-        verify(workingHoursRepository, never()).findByMasterIdAndIsActiveTrue(any());
+        verify(workingHoursRepository, never()).findByMasterId(any());
         verify(workingHoursRepository, never()).saveAll(any());
     }
 
@@ -467,7 +540,8 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(savedTue, "id", UUID.randomUUID());
 
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        // upsert merge map uses the all-rows finder (incl. inactive) — see production fix.
+        when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of(savedMon, savedTue));
 
         List<WorkingHoursResponse> result =
@@ -489,7 +563,8 @@ class MasterServiceTest {
         // Empty payload must never trip the duplicate guard; it stays a clean no-op
         // (master is loaded, saveAll receives an empty list, an empty list is returned).
         when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        // upsert merge map uses the all-rows finder (incl. inactive) — see production fix.
+        when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of());
 
         List<WorkingHoursResponse> result =

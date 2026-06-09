@@ -297,7 +297,12 @@ public class MasterService {
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
-        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)
+        // Merge against ALL existing rows (incl. inactive). The DB unique key is
+        // (master_id, day_of_week) unconditionally, so matching only active rows would miss a
+        // pre-existing inactive row for the same weekday and emit a duplicate INSERT (23505).
+        // Matching all rows lets us UPDATE the existing row in place — preserving its @Id and
+        // toggling is_active back on via setActive(...) below.
+        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterId(masterId)
                 .stream()
                 .collect(Collectors.toMap(WorkingHours::getDayOfWeek, wh -> wh));
 
