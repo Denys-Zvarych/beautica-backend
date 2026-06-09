@@ -206,30 +206,26 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Returns the authenticated master's OWN services, <em>including drafts</em>
-     * (Phase 16.9 Part 2).
+     * Returns the authenticated master's OWN active services.
      *
      * <p><strong>Owner-scoping:</strong> the master is resolved from the principal's
      * {@code userId} (the same {@link MasterRepository#findByUserId} resolution the create
-     * path uses) — never from a client-supplied id. A caller therefore can only read their
-     * own services and drafts, never another master's.
+     * path uses) — never from a client-supplied id. A caller can therefore only read their
+     * own services, never another master's.
      *
-     * <p>Unlike {@link #getMasterServices(UUID)} (public browse), this list includes
-     * draft definitions ({@code is_draft = true}, {@code is_active = false}) so the master
-     * can see and later complete the auto-created draft. The public path and its
-     * {@code masterServices} cache are untouched.
-     *
-     * <p>Intentionally NOT cached: draft state is mutable (a draft is completed/cleared
-     * frequently) and owner reads are low-volume + authenticated, so a dedicated cache
-     * surface would add eviction wiring on every draft-completion path for little benefit.
+     * <p>Returns the same active, owner-scoped list as {@link #getMasterServices(UUID)}
+     * (the public browse), just resolved via the authenticated principal instead of a path
+     * parameter. The result is intentionally NOT cached: owner reads are low-volume and
+     * authenticated, so a dedicated cache surface would add eviction wiring on every
+     * service mutation path for little benefit.
      */
     @Transactional(readOnly = true)
-    public List<MasterServiceResponse> getMyServicesIncludingDrafts(UUID userId) {
+    public List<MasterServiceResponse> getMyServices(UUID userId) {
         Master master = masterRepository.findByUserId(userId)
                 .orElseThrow(() -> new NotFoundException("Master not found for user: " + userId));
 
         return masterServiceRepository
-                .findOwnedIncludingDraftsWithGraph(master.getId(), PageRequest.of(0, 200))
+                .findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
                 .toList();

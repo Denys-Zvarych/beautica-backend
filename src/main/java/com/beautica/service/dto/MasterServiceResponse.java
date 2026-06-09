@@ -55,16 +55,7 @@ public record MasterServiceResponse(
          */
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Ukrainian display name of the chosen service type; null when none was selected.")
-        String serviceTypeNameUk,
-        /**
-         * True when the underlying service definition is an auto-created draft
-         * (Phase 16.9), lifted from the nested {@link ServiceDefinitionResponse}.
-         * Always {@code false} on the public browse endpoint (drafts are filtered out);
-         * the owner-scoped GET surfaces drafts so the master can complete them.
-         */
-        @Schema(description = "True when the underlying service definition is an auto-created "
-                + "draft awaiting completion. Always false on the public browse endpoint.")
-        boolean isDraft
+        String serviceTypeNameUk
 ) {
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
         var sdResponse = ServiceDefinitionResponse.from(msa.getServiceDefinition());
@@ -95,8 +86,7 @@ public record MasterServiceResponse(
                 sdResponse.priceMax(),
                 sdResponse.priceDisplay(),
                 sdResponse.serviceTypeId(),
-                sdResponse.serviceTypeNameUk(),
-                sdResponse.isDraft()
+                sdResponse.serviceTypeNameUk()
         );
     }
 }

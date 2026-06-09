@@ -503,169 +503,20 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .containsExactlyElementsOf(expectedAssignmentIdOrder);
     }
 
-    // ── findOwnedIncludingDraftsWithGraph (Phase 16.9 Part 2: owner sees drafts) ──────────────────
-    //
-    // The owner-scoped query drops the assignment isActive filter and widens the definition
-    // predicate to (sd.isActive=true OR sd.isDraft=true). These tests pin three guarantees the
-    // perf+security matrix flagged as owed:
-    //   1. active + draft rows both returned for the owning master;
-    //   2. cross-master isolation — another master's rows never leak;
-    //   3. soft-deleted non-draft rows (isActive=false AND isDraft=false) stay excluded.
-
-    /** Builds a second master (own user) so cross-master isolation can be exercised with real rows. */
-    private Master persistOtherMaster() {
-        User otherUser = new User(
-                "other-master-" + UUID.randomUUID() + "@example.com",
-                "$2a$10$hashedpassword",
-                Role.INDEPENDENT_MASTER,
-                "Other",
-                "Master",
-                "+380509876543"
-        );
-        em.persist(otherUser);
-
-        Master otherMaster = Master.builder()
-                .user(otherUser)
-                .masterType(MasterType.INDEPENDENT_MASTER)
-                .avgRating(BigDecimal.ZERO)
-                .reviewCount(0)
-                .isActive(true)
-                .build();
-        em.persist(otherMaster);
-        return otherMaster;
-    }
-
     @Test
-    @DisplayName("should_returnActiveAndDraftRows_when_ownerListsIncludingDrafts")
-    void should_returnActiveAndDraftRows_when_ownerListsIncludingDrafts() {
-        // Arrange — the master owns one ACTIVE definition (from setUp) and one DRAFT definition.
-        // The draft mirrors the V78 auto-materialized shape: isDraft=true, isActive=false, with an
-        // INACTIVE assignment (the public query filters assignment.isActive=true, so this must still
-        // come back from the owner query).
-        ServiceDefinition draftDef = ServiceDefinition.builder()
+    @DisplayName("should_excludeSoftDeletedDef_when_publicQueryUsedOnMasterWithInactiveDef")
+    void should_excludeSoftDeletedDef_when_publicQueryUsedOnMasterWithInactiveDef() {
+        // Arrange — same master owns an active definition (setUp) and a soft-deleted (inactive)
+        // definition. The public browse query must NOT surface the inactive definition.
+        ServiceDefinition softDeletedDef = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
-                .name("Suggested Lashes")
-                .category("LASHES")
-                .baseDurationMinutes(0)
-                .priceType(PriceType.FIXED)
-                .basePrice(BigDecimal.ZERO)
-                .isActive(false)
-                .isDraft(true)
-                .build();
-        em.persist(draftDef);
-
-        MasterServiceAssignment activeAssignment = MasterServiceAssignment.builder()
-                .master(master)
-                .serviceDefinition(serviceDefinition) // active def from setUp
-                .isActive(true)
-                .build();
-
-        MasterServiceAssignment draftAssignment = MasterServiceAssignment.builder()
-                .master(master)
-                .serviceDefinition(draftDef)
-                .isActive(false) // V78 creates an inactive assignment for the draft
-                .build();
-
-        em.persist(activeAssignment);
-        em.persist(draftAssignment);
-        em.flush();
-        em.clear();
-
-        // Act
-        List<MasterServiceAssignment> results =
-                masterServiceRepository.findOwnedIncludingDraftsWithGraph(master.getId(), PageRequest.of(0, 200));
-
-        // Assert — both the active and the draft definition are returned for the owner.
-        assertThat(results).hasSize(2);
-        assertThat(results)
-                .extracting(a -> a.getServiceDefinition().getId())
-                .containsExactlyInAnyOrder(serviceDefinition.getId(), draftDef.getId());
-        assertThat(results)
-                .extracting(a -> a.getServiceDefinition().isDraft())
-                .as("the draft row must be surfaced with isDraft=true alongside the active row")
-                .containsExactlyInAnyOrder(false, true);
-    }
-
-    @Test
-    @DisplayName("should_excludeOtherMastersRows_when_ownerListsIncludingDrafts")
-    void should_excludeOtherMastersRows_when_ownerListsIncludingDrafts() {
-        // Arrange — Master A (the setUp master) owns a DRAFT; Master B owns an ACTIVE service.
-        // Querying A's id must return only A's draft and never B's row (cross-master isolation).
-        ServiceDefinition masterADraft = ServiceDefinition.builder()
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(master.getId())
-                .name("A Draft")
-                .category("MANICURE")
-                .baseDurationMinutes(0)
-                .priceType(PriceType.FIXED)
-                .basePrice(BigDecimal.ZERO)
-                .isActive(false)
-                .isDraft(true)
-                .build();
-        em.persist(masterADraft);
-
-        MasterServiceAssignment masterAAssignment = MasterServiceAssignment.builder()
-                .master(master)
-                .serviceDefinition(masterADraft)
-                .isActive(false)
-                .build();
-        em.persist(masterAAssignment);
-
-        Master masterB = persistOtherMaster();
-        ServiceDefinition masterBActive = ServiceDefinition.builder()
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(masterB.getId())
-                .name("B Active")
+                .name("Retired Service")
                 .category("MANICURE")
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("500.00"))
-                .isActive(true)
-                .build();
-        em.persist(masterBActive);
-
-        MasterServiceAssignment masterBAssignment = MasterServiceAssignment.builder()
-                .master(masterB)
-                .serviceDefinition(masterBActive)
-                .isActive(true)
-                .build();
-        em.persist(masterBAssignment);
-        em.flush();
-        em.clear();
-
-        // Act — query Master A only
-        List<MasterServiceAssignment> results =
-                masterServiceRepository.findOwnedIncludingDraftsWithGraph(master.getId(), PageRequest.of(0, 200));
-
-        // Assert — only A's draft; B's active row must NOT leak across the master boundary.
-        assertThat(results).hasSize(1);
-        assertThat(results)
-                .extracting(a -> a.getServiceDefinition().getId())
-                .containsExactly(masterADraft.getId())
-                .doesNotContain(masterBActive.getId());
-        assertThat(results)
-                .extracting(a -> a.getMaster().getId())
-                .as("every returned row must belong to the queried master")
-                .containsOnly(master.getId());
-    }
-
-    @Test
-    @DisplayName("should_excludeSoftDeletedNonDraftRows_when_ownerListsIncludingDrafts")
-    void should_excludeSoftDeletedNonDraftRows_when_ownerListsIncludingDrafts() {
-        // Arrange — the master owns its active definition (setUp) plus a soft-deleted NON-draft
-        // definition (isActive=false AND isDraft=false). The widened predicate must still exclude
-        // the soft-deleted non-draft row — only the draft branch relaxes the activity filter.
-        ServiceDefinition softDeletedDef = ServiceDefinition.builder()
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(master.getId())
-                .name("Retired Pedicure")
-                .category("PEDICURE")
-                .baseDurationMinutes(90)
-                .priceType(PriceType.FIXED)
-                .basePrice(new BigDecimal("500.00"))
                 .isActive(false)
-                .isDraft(false)
                 .build();
         em.persist(softDeletedDef);
 
@@ -678,7 +529,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
         MasterServiceAssignment softDeletedAssignment = MasterServiceAssignment.builder()
                 .master(master)
                 .serviceDefinition(softDeletedDef)
-                .isActive(true) // assignment row left active by soft-delete, like the public-query bug
+                .isActive(false)
                 .build();
 
         em.persist(activeAssignment);
@@ -686,63 +537,15 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        // Act
-        List<MasterServiceAssignment> results =
-                masterServiceRepository.findOwnedIncludingDraftsWithGraph(master.getId(), PageRequest.of(0, 200));
-
-        // Assert — soft-deleted non-draft definition is hidden; only the active definition remains.
-        assertThat(results).hasSize(1);
-        assertThat(results)
-                .extracting(a -> a.getServiceDefinition().getId())
-                .containsExactly(serviceDefinition.getId())
-                .doesNotContain(softDeletedDef.getId());
-    }
-
-    @Test
-    @DisplayName("should_excludeDrafts_when_publicQueryUsedOnMasterWithDraft (regression guard on the public/owner divergence)")
-    void should_excludeDrafts_when_publicQueryUsedOnMasterWithDraft() {
-        // Arrange — same master owns an active definition (setUp) and a draft. This pins that the
-        // PUBLIC browse query continues to EXCLUDE drafts even though the owner query includes them,
-        // guarding the public/owner divergence introduced by Phase 16.9 Part 2.
-        ServiceDefinition draftDef = ServiceDefinition.builder()
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(master.getId())
-                .name("Hidden Draft")
-                .category("MANICURE")
-                .baseDurationMinutes(0)
-                .priceType(PriceType.FIXED)
-                .basePrice(BigDecimal.ZERO)
-                .isActive(false)
-                .isDraft(true)
-                .build();
-        em.persist(draftDef);
-
-        MasterServiceAssignment activeAssignment = MasterServiceAssignment.builder()
-                .master(master)
-                .serviceDefinition(serviceDefinition)
-                .isActive(true)
-                .build();
-
-        MasterServiceAssignment draftAssignment = MasterServiceAssignment.builder()
-                .master(master)
-                .serviceDefinition(draftDef)
-                .isActive(false)
-                .build();
-
-        em.persist(activeAssignment);
-        em.persist(draftAssignment);
-        em.flush();
-        em.clear();
-
         // Act — the PUBLIC query
         List<MasterServiceAssignment> publicResults =
                 masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
 
-        // Assert — the public browse must NOT surface the draft (divergence preserved).
+        // Assert — the public browse must NOT surface the inactive definition.
         assertThat(publicResults).hasSize(1);
         assertThat(publicResults)
                 .extracting(a -> a.getServiceDefinition().getId())
                 .containsExactly(serviceDefinition.getId())
-                .doesNotContain(draftDef.getId());
+                .doesNotContain(softDeletedDef.getId());
     }
 }

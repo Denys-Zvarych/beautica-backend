@@ -47,7 +47,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("V74/V75 taxonomy seed — data-contract invariants")
 class TaxonomySeedContractIT extends AbstractIntegrationTest {
 
-    private static final int TOTAL_SERVICE_TYPES = 140;
+    // V75 seeds 140; V81 hard-deletes nail-service-pedicure-toes (a Nails leaf) -> 139.
+    private static final int TOTAL_SERVICE_TYPES = 139;
 
     /**
      * The DB CHECK on {@code service_types.slug}
@@ -171,9 +172,9 @@ class TaxonomySeedContractIT extends AbstractIntegrationTest {
 
         // phase-17.1 § "Bucket distribution (21 → 8)" — leaf count per coarse bucket.
         @Test
-        @DisplayName("Nails bucket (0001) holds 17 leaves")
-        void should_have17NailLeaves_when_v75Applied() {
-            assertBucketLeafCount("11111111-0001-0000-0000-000000000000", 17);
+        @DisplayName("Nails bucket (0001) holds 16 leaves (V81 deleted nail-service-pedicure-toes)")
+        void should_have16NailLeaves_when_v81Applied() {
+            assertBucketLeafCount("11111111-0001-0000-0000-000000000000", 16);
         }
 
         @Test

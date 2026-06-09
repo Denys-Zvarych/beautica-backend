@@ -75,27 +75,26 @@ public class ServiceController {
     }
 
     /**
-     * Returns the authenticated master's OWN services, <strong>including drafts</strong>
-     * (Phase 16.9 Part 2).
+     * Returns the authenticated master's OWN active services.
      *
      * <p>Owner-scoped: the master is resolved from the authenticated principal's user id,
      * never from a path/query parameter the caller controls — a master can only read their
-     * own services and drafts. This complements the public
-     * {@link #getMasterServices(UUID)} browse, which excludes drafts and is unchanged.
+     * own services. This complements the public {@link #getMasterServices(UUID)} browse,
+     * which is keyed off a path parameter and is unchanged.
      *
      * <p>The role gate mirrors the create endpoint below
      * ({@code POST /independent-masters/me/services}); ownership is enforced inside the
      * service via the principal-derived master resolution.
      */
-    @Operation(summary = "List my own services including drafts",
-            description = "Returns the authenticated master's own services, including "
-                    + "auto-created drafts (is_draft=true). Owner-scoped to the authenticated "
-                    + "principal; never exposes another master's services.")
+    @Operation(summary = "List my own active services",
+            description = "Returns the authenticated master's own active services. "
+                    + "Owner-scoped to the authenticated principal; never exposes another "
+                    + "master's services.")
     @GetMapping("/independent-masters/me/services")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     public ApiResponse<List<MasterServiceResponse>> getMyServices(Authentication authentication) {
         UUID userId = extractUserId(authentication);
-        return ApiResponse.ok(serviceCatalogService.getMyServicesIncludingDrafts(userId));
+        return ApiResponse.ok(serviceCatalogService.getMyServices(userId));
     }
 
     @PostMapping("/independent-masters/me/services")

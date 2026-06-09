@@ -425,95 +425,60 @@ class ServiceCatalogServiceTest {
         assertThat(item.isActive()).isTrue();
     }
 
-    // ── getMyServicesIncludingDrafts (Phase 16.9 Part 2) ────────────────────────
+    // ── getMyServices ───────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("throws NotFound when no master exists for the authenticated user")
-    void should_throwNotFound_when_noMasterForUserOnGetMyServices() {
-        UUID userId = UUID.randomUUID();
-        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> serviceCatalogService.getMyServicesIncludingDrafts(userId))
-                .isInstanceOf(NotFoundException.class)
-                .hasMessageContaining("Master not found");
-
-        // Owner-scoping guard: a missing master must never trigger the draft query.
-        verify(masterServiceRepository, never()).findOwnedIncludingDraftsWithGraph(any(), any());
-    }
-
-    @Test
-    @DisplayName("returns active + draft rows scoped to the principal's master when the master exists")
-    void should_returnActiveAndDraftRows_when_masterExistsOnGetMyServices() {
+    @DisplayName("getMyServices resolves the master from userId and returns the master's active services")
+    void should_returnActiveServices_when_getMyServicesForResolvedMaster() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
-        UUID activeDefId = UUID.randomUUID();
-        UUID draftDefId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID assignmentId = UUID.randomUUID();
 
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(masterId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
 
-        ServiceDefinition activeDef = ServiceDefinition.builder()
-                .id(activeDefId)
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(serviceDefId)
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(masterId)
-                .name("Gel Manicure")
+                .name("Manicure")
                 .baseDurationMinutes(60)
                 .bufferMinutesAfter(0)
-                .priceType(PriceType.FIXED)
-                .basePrice(new BigDecimal("450.00"))
                 .isActive(true)
-                .isDraft(false)
                 .build();
 
-        ServiceDefinition draftDef = ServiceDefinition.builder()
-                .id(draftDefId)
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(masterId)
-                .name("Suggested Lashes")
-                .baseDurationMinutes(0)
-                .bufferMinutesAfter(0)
-                .priceType(PriceType.FIXED)
-                .basePrice(BigDecimal.ZERO)
-                .isActive(false)
-                .isDraft(true)
-                .build();
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(assignmentId);
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(null);
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
 
-        MasterServiceAssignment activeAssignment = mock(MasterServiceAssignment.class);
-        when(activeAssignment.getId()).thenReturn(UUID.randomUUID());
-        when(activeAssignment.getMaster()).thenReturn(master);
-        when(activeAssignment.getServiceDefinition()).thenReturn(activeDef);
-        when(activeAssignment.isActive()).thenReturn(true);
-        when(activeAssignment.getPriceOverride()).thenReturn(null);
-        when(activeAssignment.getDurationOverrideMinutes()).thenReturn(null);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
 
-        MasterServiceAssignment draftAssignment = mock(MasterServiceAssignment.class);
-        when(draftAssignment.getId()).thenReturn(UUID.randomUUID());
-        when(draftAssignment.getMaster()).thenReturn(master);
-        when(draftAssignment.getServiceDefinition()).thenReturn(draftDef);
-        when(draftAssignment.isActive()).thenReturn(false);
-        when(draftAssignment.getPriceOverride()).thenReturn(null);
-        when(draftAssignment.getDurationOverrideMinutes()).thenReturn(null);
+        List<MasterServiceResponse> result = serviceCatalogService.getMyServices(userId);
 
-        // The service must resolve the master from the principal, then query by that master's id.
-        when(masterServiceRepository.findOwnedIncludingDraftsWithGraph(eq(masterId), any(Pageable.class)))
-                .thenReturn(List.of(activeAssignment, draftAssignment));
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).masterId()).isEqualTo(masterId);
+        assertThat(result.get(0).serviceDefinition().id()).isEqualTo(serviceDefId);
+        assertThat(result.get(0).isActive()).isTrue();
+    }
 
-        List<MasterServiceResponse> result = serviceCatalogService.getMyServicesIncludingDrafts(userId);
+    @Test
+    @DisplayName("getMyServices throws NotFoundException when no master exists for the userId")
+    void should_throwNotFound_when_getMyServicesForUnknownUser() {
+        UUID userId = UUID.randomUUID();
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
 
-        assertThat(result).hasSize(2);
-        assertThat(result)
-                .extracting(MasterServiceResponse::isDraft)
-                .as("response must surface both the active (false) and draft (true) rows")
-                .containsExactly(false, true);
-        MasterServiceResponse draftItem = result.get(1);
-        assertThat(draftItem.serviceDefinition().id()).isEqualTo(draftDefId);
-        assertThat(draftItem.isDraft())
-                .as("the draft row must be flagged isDraft=true")
-                .isTrue();
-        assertThat(draftItem.isActive())
-                .as("the draft row must be flagged isActive=false")
-                .isFalse();
+        assertThatThrownBy(() -> serviceCatalogService.getMyServices(userId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
     }
 
     // ── deactivateServiceDefinition ────────────────────────────────────────────

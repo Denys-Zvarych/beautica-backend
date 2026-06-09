@@ -43,10 +43,10 @@ import static org.mockito.Mockito.verify;
  *   <li>{@code loadForReview} does NOT mutate the row (defeats email-scanner pre-fetch).</li>
  *   <li>{@code approve} flips it to APPROVED, stamps {@code decided_at}, clears the token,
  *       and — for a category with a mapped System-A bucket — writes a {@code service_types}
- *       row (Phase 16.9, supersedes the 16.8 "no auto-promotion" decision). Here the
- *       requester is null (anonymous), so it is the catalog-only branch: a ServiceType is
- *       created but NO draft {@code service_definitions} row (no master to own it). The
- *       full requester→master→draft path is covered by {@code ServiceTypePromotionIntegrationTest}.</li>
+ *       row (Phase 16.9, Option A catalog-only; supersedes the 16.8 "no auto-promotion"
+ *       decision). Under Option A approval creates ONLY the catalog ServiceType and NEVER a
+ *       draft {@code service_definitions} row — for ANY requester, not just a null one. The
+ *       dropdown-visibility contract is covered by {@code ServiceTypePromotionIntegrationTest}.</li>
  *   <li>An identical re-suggest while PENDING is rejected with a 409.</li>
  * </ol>
  *
@@ -149,10 +149,10 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
                 .as("token_hash cleared after the decision (single-use)").isNull();
         assertThat(approved.getTokenExpiresAt()).isNull();
 
-        // Assert 5 — Phase 16.9: approve now promotes the suggestion into the catalog.
-        // HAIRDRESSING maps to a System-A bucket (V78), so a new service_types row is
-        // created (+1). The requester is null → catalog-only branch, so NO draft
-        // service_definitions row is written.
+        // Assert 5 — Phase 16.9 (Option A, catalog-only): approve promotes the suggestion
+        // into a single new service_types row (+1). HAIRDRESSING maps to a System-A bucket
+        // (V78). Under Option A NO draft service_definitions row is ever written — for any
+        // requester, not merely because this one is null.
         long serviceTypesAfter = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM service_types", Long.class);
         assertThat(serviceTypesAfter)
@@ -165,10 +165,11 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
                 .as("created ServiceType carries the suggested name + approved category")
                 .isEqualTo(1L);
         Long draftCount = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM service_definitions WHERE is_draft = TRUE AND name = ?",
+                "SELECT COUNT(*) FROM service_definitions WHERE name = ?",
                 Long.class, SUGGESTED);
         assertThat(draftCount)
-                .as("null requester → catalog-only: no draft service is created")
+                .as("Option A catalog-only: no service_definitions row is ever created (the draft "
+                        + "surface was removed in V80)")
                 .isEqualTo(0L);
 
         // Act 6 — second approve is idempotent (token nulled) → neutral already-decided,
