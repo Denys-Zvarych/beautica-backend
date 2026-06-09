@@ -29,8 +29,13 @@ import jakarta.validation.constraints.Size;
  *       previously stored value, and {@code UserService.updateMasterProfile}
  *       treats any non-null value (including {@code ""}) as an overwrite. Both
  *       validators therefore accept the empty string — {@code bio}'s control-char
- *       {@code @Pattern} ({@code ^[^\p{Cntrl}]*$}) already matches {@code ""}, and
- *       {@code instagram}'s pattern carries an explicit {@code ^$} alternation.
+ *       {@code @Pattern} ({@code ^[^\x00-\x08\x0B\x0C\x0E-\x1F\x7F]*$}) already
+ *       matches {@code ""}, and {@code instagram}'s pattern carries an explicit
+ *       {@code ^$} alternation. Unlike the single-line fields, {@code bio} is
+ *       long-form multi-line text, so its pattern deliberately permits tab,
+ *       newline ({@code \n}) and carriage return ({@code \r}) while still
+ *       rejecting NUL and the remaining C0/DEL control characters — the explicit
+ *       ranges replace {@code \p{Cntrl}}, which would otherwise reject line breaks.
  *       {@code phoneNumber} is deliberately <em>not</em> clearable: a blank phone
  *       is a no-op (the service skips it), so its pattern stays strict.</li>
  *   <li>{@code @Size(max = N)} values match {@code @Column(length = N)} / TEXT
@@ -62,8 +67,14 @@ public record MasterProfileUpdateRequest(
 
         @Size(max = 2000, message = "Bio must not exceed 2000 characters")
         @Pattern(
-                regexp = "^[^\\p{Cntrl}]*$",
-                message = "Bio must not contain control characters"
+                // Bio is genuine long-form, multi-line free text (TEXT column). Tab (0x09),
+                // LF (0x0A) and CR (0x0D) are permitted so users can write multi-paragraph
+                // bios; every other C0 control char (0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F) and
+                // DEL (0x7F) is still rejected to preserve the original NUL/control-injection
+                // guard. Java's default \p{Cntrl} also matches tab/LF/CR, hence the explicit
+                // ranges instead.
+                regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",
+                message = "Bio must not contain control characters other than line breaks and tabs"
         )
         String bio,
 
