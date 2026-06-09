@@ -165,10 +165,11 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
                 .as("created ServiceType carries the suggested name + approved category")
                 .isEqualTo(1L);
         Long draftCount = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM service_definitions WHERE is_draft = TRUE AND name = ?",
+                "SELECT COUNT(*) FROM service_definitions WHERE name = ?",
                 Long.class, SUGGESTED);
         assertThat(draftCount)
-                .as("Option A catalog-only: no draft service is ever created")
+                .as("Option A catalog-only: no service_definitions row is ever created (the draft "
+                        + "surface was removed in V80)")
                 .isEqualTo(0L);
 
         // Act 6 — second approve is idempotent (token nulled) → neutral already-decided,

@@ -10,14 +10,15 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Content-assertion IT for the V78 migration (Phase 16.9.4) against the real Flyway-applied
- * schema (Testcontainers). "Flyway applied with no error" proves nothing about the data —
- * these assertions pin V78's actual contract (QA pattern Q21):
+ * Content-assertion IT for the V78 bucket-map migration (Phase 16.9.4) plus the V80 draft-drop
+ * (catalog-only reversal) against the real Flyway-applied schema (Testcontainers). "Flyway
+ * applied with no error" proves nothing about the data — these assertions pin the actual
+ * contract (QA pattern Q21):
  * <ol>
- *   <li>{@code service_definitions.is_draft} exists, NOT NULL, DEFAULT FALSE — an INSERT
- *       that omits it yields {@code false} (existing create paths stay non-draft);</li>
+ *   <li>{@code service_definitions.is_draft} is GONE after V80 dropped the dead draft surface;</li>
  *   <li>every seeded platform category that V78 maps carries a non-null
- *       {@code service_category_id} (e.g. HAIRDRESSING → the Hair bucket);</li>
+ *       {@code service_category_id} (e.g. HAIRDRESSING → the Hair bucket) — still live under
+ *       catalog-only promotion;</li>
  *   <li>a platform category V78 does NOT map (e.g. a brand-new self-service category)
  *       keeps {@code service_category_id} NULL — the promotion writer's fallback branch;</li>
  *   <li>the backfill UPDATEs are guarded {@code WHERE service_category_id IS NULL}, so a
@@ -28,7 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * or {@code service_definitions} seed/reference state beyond rows it owns; the temporary
  * rows this test inserts are removed in {@link #cleanup()}.
  */
-@DisplayName("V78 migration — content + idempotency assertions")
+@DisplayName("V78 bucket-map + V80 draft-drop — content + idempotency assertions")
 class V78MigrationIntegrationTest extends AbstractIntegrationTest {
 
     private static final UUID HAIR_BUCKET = UUID.fromString("11111111-0004-0000-0000-000000000000");
@@ -36,25 +37,21 @@ class V78MigrationIntegrationTest extends AbstractIntegrationTest {
 
     @AfterEach
     void cleanup() {
-        jdbcTemplate.update("DELETE FROM service_definitions WHERE name = ?", "V78_IT_draft_default_probe");
         jdbcTemplate.update("DELETE FROM platform_categories WHERE name = ?", UNMAPPED_CATEGORY);
     }
 
     @Test
-    @DisplayName("service_definitions.is_draft defaults FALSE when an INSERT omits the column")
-    void should_defaultIsDraftFalse_when_columnOmittedOnInsert() {
-        UUID id = UUID.randomUUID();
-        // INSERT deliberately omits is_draft — the V78 DEFAULT FALSE must apply so that
-        // every legacy/create-path row is non-draft.
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions "
-                        + "(id, owner_type, owner_id, name, base_duration_minutes, price_type, base_price, is_active) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'V78_IT_draft_default_probe', 30, 'FIXED', 100.00, true)",
-                id, UUID.randomUUID());
-
-        Boolean isDraft = jdbcTemplate.queryForObject(
-                "SELECT is_draft FROM service_definitions WHERE id = ?", Boolean.class, id);
-        assertThat(isDraft).as("V78 ADD COLUMN ... DEFAULT FALSE applies when INSERT omits is_draft").isFalse();
+    @DisplayName("service_definitions.is_draft is dropped after V80 (catalog-only reversal)")
+    void should_dropIsDraftColumn_when_v80Applied() {
+        // The draft surface was removed in V80; the column must no longer exist on the
+        // Flyway-applied schema.
+        Integer columnCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                        + "WHERE table_name = 'service_definitions' AND column_name = 'is_draft'",
+                Integer.class);
+        assertThat(columnCount)
+                .as("V80 dropped service_definitions.is_draft — the dead draft surface is gone")
+                .isZero();
     }
 
     @Test
