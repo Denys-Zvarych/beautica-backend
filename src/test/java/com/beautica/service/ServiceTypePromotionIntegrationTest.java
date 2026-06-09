@@ -3,7 +3,7 @@ package com.beautica.service;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.TokenGenerator;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import com.beautica.service.service.ServiceTypeSuggestionService;
@@ -15,9 +15,7 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
 
-import java.math.BigDecimal;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -31,28 +29,36 @@ import static org.mockito.Mockito.verify;
  * {@code ServiceTypeSuggestionService.approve} which delegates to
  * {@code ServiceTypePromotionService.promote} inside the SAME transaction.
  *
- * <p><strong>CRITICAL fix verified here.</strong> The promotion writer persists the draft
- * with {@code base_duration_minutes = 0}. V6's {@code chk_service_def_base_duration CHECK
- * (base_duration_minutes > 0)} originally rejected this, rolling back every master-attributed
- * approval. V79 relaxed the CHECK to {@code (is_draft OR base_duration_minutes > 0)} so the
- * 0-minute draft sentinel persists while the {@code > 0} invariant is preserved for real
- * (non-draft) services. {@link #should_persistDraftAndKeepItOutOfBrowseAndSearchFloor_when_masterSuggestionApproved()}
- * is the acceptance test pinning that contract end-to-end against PostgreSQL — a regression
- * to the CHECK (or to the draft sentinels) re-breaks it. Unit tests (mocked repository)
- * cannot see the DB constraint; only this IT does.
+ * <p><strong>Option A (catalog-only) acceptance.</strong> Phase 16.9 was reversed from
+ * Option B (auto-create draft master service) to Option A: approval creates ONLY a platform
+ * {@code ServiceType} under the approved category — so it appears in the mobile
+ * "Тип послуги" dropdown ({@code GET /service-types?categoryName=}, Phase 16.2) — and creates
+ * NO {@code ServiceDefinition} (draft) and NO {@code MasterServiceAssignment} on the
+ * requester's own list. The master adds their service later by picking the now-available
+ * type. This IT pins the dropdown contract end-to-end against PostgreSQL.
  *
  * <p>HAIRDRESSING is seeded APPROVED+active (V74) and maps to the Hair System-A bucket
  * (V78). {@link com.beautica.notification.EmailService} is a {@code @MockBean} (inherited) —
  * the raw token is captured to drive the approve step.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Service-type promotion — full requester→master→draft integration")
+@DisplayName("Service-type promotion — catalog-only (Option A) integration")
 class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
 
     private static final String CATEGORY = "HAIRDRESSING";
     private static final String SUGGESTED = "ITPromote Hot Oil Treatment";
     private static final String DESCRIPTION = "Promotion IT suggestion";
     private static final String TOKEN_QUERY_PARAM = "token=";
+
+    // ── novel-category (null System-A bucket) regression fixtures ──────────────────
+    // A brand-new self-service category created via the category-request workflow that
+    // V78's bucket backfill never touched, so platform_categories.service_category_id is
+    // NULL. This is the ORIGINAL failing case: promotion must fall back to the permanent
+    // "Other / Інше" System-A bucket (V13) to satisfy the service_types.category_id NOT NULL.
+    private static final String NOVEL_CATEGORY = "ITPROMO_NOVEL_CATEGORY";
+    private static final String NOVEL_SUGGESTED = "ITPromote Scalp Detox Ritual";
+    private static final UUID OTHER_BUCKET_ID =
+            UUID.fromString("11111111-0008-0000-0000-000000000000");
 
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private ServiceTypeSuggestionService suggestionService;
@@ -62,10 +68,50 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
     @AfterEach
     void cleanPromotionArtifacts() {
         // service_type_suggestion + service_types are seed/standalone tables NOT in
-        // AbstractIntegrationTest.cleanDb(); remove only this test's rows. master_services,
-        // service_definitions, masters, users ARE cleaned by the base class.
+        // AbstractIntegrationTest.cleanDb(); remove only this test's rows. masters + users
+        // ARE cleaned by the base class. (Option A writes no service_definitions /
+        // master_services, so there is nothing extra to clean there.)
         jdbcTemplate.update("DELETE FROM service_type_suggestion WHERE category_name = ?", CATEGORY);
         jdbcTemplate.update("DELETE FROM service_types WHERE name_uk = ?", SUGGESTED);
+
+        // Novel-category regression rows. FK order: service_types -> service_type_suggestion
+        // -> platform_categories (the suggestion references the category by name slug, not FK,
+        // but the promoted type carries platform_category_name = NOVEL_CATEGORY, so clear the
+        // type first). platform_categories is seed reference data NOT in cleanDb(); the row we
+        // insert here is test-local and must be removed so the seeded taxonomy is untouched.
+        jdbcTemplate.update("DELETE FROM service_types WHERE name_uk = ?", NOVEL_SUGGESTED);
+        jdbcTemplate.update("DELETE FROM service_type_suggestion WHERE category_name = ?", NOVEL_CATEGORY);
+        jdbcTemplate.update("DELETE FROM platform_categories WHERE name = ?", NOVEL_CATEGORY);
+    }
+
+    /**
+     * Inserts a brand-new APPROVED + active platform category whose System-A bucket mapping
+     * (V78 {@code service_category_id}) is NULL — exactly the shape a self-service category
+     * created through the category-request workflow has before any bucket backfill. Returns
+     * after asserting the precondition the regression depends on: the bucket IS null.
+     */
+    private void seedNovelUnmappedCategory() {
+        jdbcTemplate.update(
+                "INSERT INTO platform_categories (name, display_name, status, active, service_category_id) " +
+                "VALUES (?, ?, 'APPROVED', true, NULL)",
+                NOVEL_CATEGORY, "Промо нова категорія");
+        Object bucket = jdbcTemplate.queryForObject(
+                "SELECT service_category_id FROM platform_categories WHERE name = ?",
+                Object.class, NOVEL_CATEGORY);
+        assertThat(bucket)
+                .as("precondition: novel category has NO System-A bucket (the original failing case)")
+                .isNull();
+    }
+
+    private String submitAndCaptureRawToken(String categoryName, String suggestedName, UUID requesterUserId) {
+        serviceCatalogService.suggestServiceType(
+                new SuggestServiceTypeRequest(suggestedName, categoryName, DESCRIPTION), requesterUserId);
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(emailService).sendServiceTypeSuggestionNotification(
+                anyString(), anyString(), eq(categoryName), eq(suggestedName), eq(DESCRIPTION),
+                urlCaptor.capture());
+        String url = urlCaptor.getValue();
+        return url.substring(url.indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
     }
 
     private UUID seedIndependentMaster() {
@@ -88,80 +134,112 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
                 "SELECT id FROM masters WHERE user_id = ?", UUID.class, userId);
     }
 
-    private String submitAndCaptureRawToken(UUID requesterUserId) {
-        serviceCatalogService.suggestServiceType(
-                new SuggestServiceTypeRequest(SUGGESTED, CATEGORY, DESCRIPTION), requesterUserId);
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendServiceTypeSuggestionNotification(
-                anyString(), anyString(), eq(CATEGORY), eq(SUGGESTED), eq(DESCRIPTION), urlCaptor.capture());
-        String url = urlCaptor.getValue();
-        return url.substring(url.indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
-    }
-
     @Test
-    @DisplayName("approve promotes a persisted DRAFT for the requesting master, excluded from public browse + search floor; replay adds nothing")
-    void should_persistDraftAndKeepItOutOfBrowseAndSearchFloor_when_masterSuggestionApproved() {
+    @DisplayName("approve creates only a catalog ServiceType visible in the dropdown; NO draft service / assignment for the requester; replay adds nothing")
+    void should_createOnlyCatalogTypeVisibleInDropdown_when_masterSuggestionApproved() {
         UUID userId = seedIndependentMaster();
         UUID masterId = masterIdFor(userId);
-        String rawToken = submitAndCaptureRawToken(userId);
+        String rawToken = submitAndCaptureRawToken(CATEGORY, SUGGESTED, userId);
 
         // Act — approve runs promote() in the same @Transactional boundary.
         DecisionOutcome outcome = suggestionService.approve(rawToken);
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
 
-        // ── Assert 1: a service_types row was created for the suggested name. ──
-        UUID serviceTypeId = jdbcTemplate.queryForObject(
-                "SELECT id FROM service_types WHERE name_uk = ? AND platform_category_name = ?",
-                UUID.class, SUGGESTED, CATEGORY);
-        assertThat(serviceTypeId).as("approval created the catalog ServiceType").isNotNull();
+        // ── Assert 1: the dropdown contract — GET /service-types?categoryName= now lists it. ──
+        List<PlatformServiceTypeResponse> dropdown =
+                serviceCatalogService.findServiceTypesByPlatformCategory(CATEGORY);
+        assertThat(dropdown)
+                .as("approved suggestion appears in the mobile service-type dropdown (Phase 16.2)")
+                .anyMatch(t -> SUGGESTED.equals(t.nameUk()) && CATEGORY.equals(t.categoryName()));
 
-        // ── Assert 2: a DRAFT service_definitions row, sentinel pricing, master-owned. ──
-        Map<String, Object> draft = jdbcTemplate.queryForMap(
-                "SELECT owner_type, owner_id, name, category, base_price, price_type, "
-                        + "base_duration_minutes, is_active, is_draft, service_type_id "
-                        + "FROM service_definitions WHERE name = ? AND is_draft = TRUE", SUGGESTED);
-        assertThat(draft.get("is_draft")).as("materialized service is a draft").isEqualTo(true);
-        assertThat(draft.get("is_active")).as("draft inactive → excluded from search + browse").isEqualTo(false);
-        assertThat(draft.get("owner_type")).isEqualTo("INDEPENDENT_MASTER");
-        assertThat(draft.get("owner_id")).isEqualTo(masterId);
-        assertThat(draft.get("category")).isEqualTo(CATEGORY);
-        assertThat(draft.get("price_type")).isEqualTo("FIXED");
-        assertThat(((BigDecimal) draft.get("base_price"))).isEqualByComparingTo(BigDecimal.ZERO);
-        assertThat(draft.get("service_type_id"))
-                .as("draft links the created ServiceType (mapped-bucket branch)").isEqualTo(serviceTypeId);
+        // ── Assert 2: exactly one service_types row was created for the suggested name. ──
+        long typeCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_types WHERE name_uk = ? AND platform_category_name = ?",
+                Long.class, SUGGESTED, CATEGORY);
+        assertThat(typeCount).as("approval created exactly one catalog ServiceType").isEqualTo(1L);
 
-        // ── Assert 3: an INACTIVE master_services assignment links master ↔ draft. ──
-        Boolean assignmentInactive = jdbcTemplate.queryForObject(
-                "SELECT NOT ms.is_active FROM master_services ms "
-                        + "JOIN service_definitions sd ON sd.id = ms.service_def_id "
-                        + "WHERE ms.master_id = ? AND sd.name = ?", Boolean.class, masterId, SUGGESTED);
-        assertThat(assignmentInactive).as("assignment created and inactive").isTrue();
+        // ── Assert 3: NO draft service_definitions row for the suggested name (Option A). ──
+        long draftCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE name = ?", Long.class, SUGGESTED);
+        assertThat(draftCount)
+                .as("Option A: approval must NOT create any ServiceDefinition (draft)")
+                .isZero();
 
-        // ── Assert 4: the public browse path excludes the draft. ──
-        List<MasterServiceResponse> browse = serviceCatalogService.getMasterServices(masterId);
-        assertThat(browse)
-                .as("draft (is_active=false) must never appear in the public GET /masters/{id}/services")
-                .noneMatch(s -> SUGGESTED.equals(s.serviceDefinition().name()));
+        // ── Assert 4: NO master_services assignment for the requester. ──
+        long assignmentCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services WHERE master_id = ?", Long.class, masterId);
+        assertThat(assignmentCount)
+                .as("Option A: approval must NOT attach a service to the requester's own list")
+                .isZero();
 
         // ── Assert 5: the search floor (masters.min_effective_price) is untouched (null). ──
-        BigDecimal floor = jdbcTemplate.queryForObject(
-                "SELECT min_effective_price FROM masters WHERE id = ?", BigDecimal.class, masterId);
+        var floor = jdbcTemplate.queryForObject(
+                "SELECT min_effective_price FROM masters WHERE id = ?", java.math.BigDecimal.class, masterId);
         assertThat(floor)
-                .as("a ₴0 draft must not become the search price floor").isNull();
+                .as("catalog-only approval must not touch the search price floor").isNull();
 
-        // ── Assert 6: replay is a no-op — no duplicate draft / type. ──
-        long draftsBefore = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM service_definitions WHERE name = ?", Long.class, SUGGESTED);
+        // ── Assert 6: replay is a no-op — no duplicate type, still zero drafts. ──
         long typesBefore = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM service_types WHERE name_uk = ?", Long.class, SUGGESTED);
 
         assertThat(suggestionService.approve(rawToken)).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
 
-        long draftsAfter = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM service_definitions WHERE name = ?", Long.class, SUGGESTED);
         long typesAfter = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM service_types WHERE name_uk = ?", Long.class, SUGGESTED);
-        assertThat(draftsAfter).as("replayed approve creates no second draft").isEqualTo(draftsBefore);
+        long draftsAfter = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE name = ?", Long.class, SUGGESTED);
         assertThat(typesAfter).as("replayed approve creates no second type").isEqualTo(typesBefore);
+        assertThat(draftsAfter).as("replayed approve still creates no draft").isZero();
+    }
+
+    /**
+     * The ORIGINAL failing case as a true regression: a NOVEL category whose
+     * {@code platform_categories.service_category_id} is NULL. Under the buggy Option B this
+     * path created NO {@code ServiceType} (the name never reached the dropdown) and instead
+     * wrote a draft {@code ServiceDefinition} + inactive {@code MasterServiceAssignment}.
+     * Option A must (a) create the catalog {@code ServiceType} — falling back to the permanent
+     * "Other" System-A bucket so the NOT-NULL {@code category_id} holds against real
+     * PostgreSQL — making it visible in the dropdown, and (b) write zero drafts / zero
+     * assignments. The unit test mocks the repositories, so only this IT proves the fallback
+     * bucket row actually exists and the FK is satisfied at commit.
+     */
+    @Test
+    @DisplayName("novel category with NULL System-A bucket — approve binds the type to the permanent 'Other' bucket, lists it in the dropdown, writes NO draft/assignment")
+    void should_promoteToOtherBucketAndDropdown_when_novelCategoryHasNoSystemABucket() {
+        seedNovelUnmappedCategory();
+        UUID userId = seedIndependentMaster();
+        UUID masterId = masterIdFor(userId);
+        String rawToken = submitAndCaptureRawToken(NOVEL_CATEGORY, NOVEL_SUGGESTED, userId);
+
+        // Act — approve must NOT 500 despite the null bucket (the original break point).
+        DecisionOutcome outcome = suggestionService.approve(rawToken);
+        assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
+
+        // ── positive: the suggested name surfaces in the dropdown for the novel category. ──
+        List<PlatformServiceTypeResponse> dropdown =
+                serviceCatalogService.findServiceTypesByPlatformCategory(NOVEL_CATEGORY);
+        assertThat(dropdown)
+                .as("novel-category suggestion appears in the service-type dropdown (was missing under Option B)")
+                .anyMatch(t -> NOVEL_SUGGESTED.equals(t.nameUk()) && NOVEL_CATEGORY.equals(t.categoryName()));
+
+        // ── the type persisted, bound to the permanent 'Other' System-A bucket. ──
+        UUID boundBucketId = jdbcTemplate.queryForObject(
+                "SELECT category_id FROM service_types WHERE name_uk = ? AND platform_category_name = ?",
+                UUID.class, NOVEL_SUGGESTED, NOVEL_CATEGORY);
+        assertThat(boundBucketId)
+                .as("null-mapped category falls back to the permanent 'Other' bucket (V13) so category_id NOT NULL holds")
+                .isEqualTo(OTHER_BUCKET_ID);
+
+        // ── negative: Option B's draft service + master assignment must NOT exist. ──
+        long draftCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE name = ?", Long.class, NOVEL_SUGGESTED);
+        assertThat(draftCount)
+                .as("Option A: novel-category approval must NOT create a draft ServiceDefinition")
+                .isZero();
+        long assignmentCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services WHERE master_id = ?", Long.class, masterId);
+        assertThat(assignmentCount)
+                .as("Option A: novel-category approval must NOT attach a service to the requester")
+                .isZero();
     }
 }
