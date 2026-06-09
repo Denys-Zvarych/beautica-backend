@@ -90,7 +90,7 @@ class CategoryRequestControllerTest {
         UUID userId = UUID.randomUUID();
         when(categoryRequestService.submitRequest(any(CreateCategoryRequestRequest.class), eq(userId)))
                 .thenReturn(new CategoryRequestResponse("NAIL_ART", "Нейл-арт", "PENDING"));
-        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт");
+        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null);
 
         mockMvc.perform(post("/api/v1/service-categories/requests")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
@@ -105,7 +105,7 @@ class CategoryRequestControllerTest {
     @Test
     @DisplayName("should_return403_when_clientSubmitsRequest")
     void should_return403_when_clientSubmitsRequest() throws Exception {
-        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт");
+        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null);
 
         mockMvc.perform(post("/api/v1/service-categories/requests")
                         .with(authenticatedAs(UUID.randomUUID(), "client@beautica.test", Role.CLIENT))
@@ -118,7 +118,7 @@ class CategoryRequestControllerTest {
     @Test
     @DisplayName("should_return403_when_salonMasterSubmitsRequest")
     void should_return403_when_salonMasterSubmitsRequest() throws Exception {
-        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт");
+        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null);
 
         mockMvc.perform(post("/api/v1/service-categories/requests")
                         .with(authenticatedAs(UUID.randomUUID(), "smaster@beautica.test", Role.SALON_MASTER))
@@ -131,7 +131,7 @@ class CategoryRequestControllerTest {
     @Test
     @DisplayName("should_return401_when_unauthenticatedSubmitsRequest")
     void should_return401_when_unauthenticatedSubmitsRequest() throws Exception {
-        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт");
+        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null);
 
         mockMvc.perform(post("/api/v1/service-categories/requests")
                         .with(csrf())
@@ -163,6 +163,49 @@ class CategoryRequestControllerTest {
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(invalid))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("should_return201_when_requestCarriesValidInitialServiceName")
+    void should_return201_when_requestCarriesValidInitialServiceName() throws Exception {
+        UUID userId = UUID.randomUUID();
+        when(categoryRequestService.submitRequest(any(CreateCategoryRequestRequest.class), eq(userId)))
+                .thenReturn(new CategoryRequestResponse("NAIL_ART", "Нейл-арт", "PENDING"));
+        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", "Класичний манікюр");
+
+        mockMvc.perform(post("/api/v1/service-categories/requests")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.status").value("PENDING"));
+    }
+
+    @Test
+    @DisplayName("should_return400_when_initialServiceNameExceedsMaxLength")
+    void should_return400_when_initialServiceNameExceedsMaxLength() throws Exception {
+        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", "a".repeat(256));
+
+        mockMvc.perform(post("/api/v1/service-categories/requests")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("should_return400_when_initialServiceNameHasControlChar")
+    void should_return400_when_initialServiceNameHasControlChar() throws Exception {
+        var body = new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", "Manicure\nDeluxe");
+
+        mockMvc.perform(post("/api/v1/service-categories/requests")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isBadRequest());
     }
 

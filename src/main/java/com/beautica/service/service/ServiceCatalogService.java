@@ -69,10 +69,12 @@ public class ServiceCatalogService {
 
         validateCategoryActive(request.category());
 
+        ServiceType serviceType = resolveServiceType(request.serviceTypeId(), request.category());
+
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonId)
-                .name(request.name())
+                .name(resolveCreateName(request.name(), serviceType))
                 .description(request.description())
                 .category(request.category())
                 .baseDurationMinutes(request.baseDurationMinutes())
@@ -81,7 +83,9 @@ public class ServiceCatalogService {
                 .build();
 
         applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
-        applyServiceType(definition, request);
+        if (serviceType != null) {
+            definition.setServiceType(serviceType);
+        }
 
         ServiceDefinition saved = serviceRepository.save(definition);
         return ServiceDefinitionResponse.from(saved);
@@ -149,10 +153,12 @@ public class ServiceCatalogService {
 
         validateCategoryActive(request.category());
 
+        ServiceType serviceType = resolveServiceType(request.serviceTypeId(), request.category());
+
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
-                .name(request.name())
+                .name(resolveCreateName(request.name(), serviceType))
                 .description(request.description())
                 .category(request.category())
                 .baseDurationMinutes(request.baseDurationMinutes())
@@ -161,7 +167,9 @@ public class ServiceCatalogService {
                 .build();
 
         applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
-        applyServiceType(definition, request);
+        if (serviceType != null) {
+            definition.setServiceType(serviceType);
+        }
 
         ServiceDefinition savedDef = serviceRepository.save(definition);
 
@@ -192,6 +200,36 @@ public class ServiceCatalogService {
         // nothing for a non-existent master.
         return masterServiceRepository
                 .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
+                .stream()
+                .map(MasterServiceResponse::from)
+                .toList();
+    }
+
+    /**
+     * Returns the authenticated master's OWN services, <em>including drafts</em>
+     * (Phase 16.9 Part 2).
+     *
+     * <p><strong>Owner-scoping:</strong> the master is resolved from the principal's
+     * {@code userId} (the same {@link MasterRepository#findByUserId} resolution the create
+     * path uses) — never from a client-supplied id. A caller therefore can only read their
+     * own services and drafts, never another master's.
+     *
+     * <p>Unlike {@link #getMasterServices(UUID)} (public browse), this list includes
+     * draft definitions ({@code is_draft = true}, {@code is_active = false}) so the master
+     * can see and later complete the auto-created draft. The public path and its
+     * {@code masterServices} cache are untouched.
+     *
+     * <p>Intentionally NOT cached: draft state is mutable (a draft is completed/cleared
+     * frequently) and owner reads are low-volume + authenticated, so a dedicated cache
+     * surface would add eviction wiring on every draft-completion path for little benefit.
+     */
+    @Transactional(readOnly = true)
+    public List<MasterServiceResponse> getMyServicesIncludingDrafts(UUID userId) {
+        Master master = masterRepository.findByUserId(userId)
+                .orElseThrow(() -> new NotFoundException("Master not found for user: " + userId));
+
+        return masterServiceRepository
+                .findOwnedIncludingDraftsWithGraph(master.getId(), PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
                 .toList();
@@ -299,15 +337,25 @@ public class ServiceCatalogService {
     private void applyPatchFields(ServiceDefinition definition,
             UpdateServiceDefinitionRequest request) {
 
-        if (request.name() != null) {
-            definition.setName(request.name());
-        }
-        if (request.description() != null) {
-            definition.setDescription(request.description());
-        }
+        // Category first: it determines the target category against which a
+        // service-type change is consistency-checked below.
         if (request.category() != null) {
             validateCategoryActive(request.category());
             definition.setCategory(request.category());
+        }
+
+        // Service type (PATCH): null = leave unchanged (never clears). When present,
+        // resolve + active-check + cross-category consistency against the *effective*
+        // category — the just-applied new category, or the existing one if unchanged.
+        if (request.serviceTypeId() != null) {
+            ServiceType serviceType = resolveServiceType(request.serviceTypeId(), definition.getCategory());
+            definition.setServiceType(serviceType);
+        }
+
+        applyNamePatch(definition, request);
+
+        if (request.description() != null) {
+            definition.setDescription(request.description());
         }
         if (request.baseDurationMinutes() != null) {
             definition.setBaseDurationMinutes(request.baseDurationMinutes());
@@ -326,6 +374,35 @@ public class ServiceCatalogService {
         if (priceBlockPresent) {
             applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
         }
+    }
+
+    /**
+     * Applies PATCH name semantics:
+     * <ul>
+     *   <li>{@code name} absent ({@code null}) — leave the existing name unchanged.</li>
+     *   <li>{@code name} present and non-blank — overwrite with the supplied value.</li>
+     *   <li>{@code name} present but blank (whitespace) — default to the (now effective)
+     *       service type's Ukrainian display name. If no service type is set on the entity
+     *       after this PATCH, reject with a clear validation error rather than persisting blank.</li>
+     * </ul>
+     *
+     * <p>Called after the service-type patch so {@code definition.getServiceType()} already
+     * reflects any type change made by this same request.
+     */
+    private void applyNamePatch(ServiceDefinition definition, UpdateServiceDefinitionRequest request) {
+        if (request.name() == null) {
+            return;
+        }
+        if (!request.name().isBlank()) {
+            definition.setName(request.name());
+            return;
+        }
+        // Explicitly blank name — default to the effective service type's Ukrainian name.
+        ServiceType effectiveType = definition.getServiceType();
+        if (effectiveType == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name or service type is required");
+        }
+        definition.setName(effectiveType.getNameUk());
     }
 
     /**
@@ -525,25 +602,67 @@ public class ServiceCatalogService {
         }
     }
 
-    private void applyServiceType(ServiceDefinition definition, CreateServiceDefinitionRequest request) {
-        if (request.serviceTypeId() == null) {
-            return;
+    /**
+     * Resolves and validates an optional {@code serviceTypeId} against a target category.
+     *
+     * <p>Returns {@code null} when {@code serviceTypeId} is null (the caller leaves the
+     * service type untouched). When non-null, the type is loaded, asserted active, and
+     * checked for cross-category consistency (Phase 16.3): the type's
+     * {@code platform_category_name} must equal {@code targetCategory}.
+     *
+     * <p>Used by both create (target = request category) and update (target = the effective
+     * category after the PATCH — the new category if the request changes it, otherwise the
+     * existing one).
+     *
+     * @param serviceTypeId  optional service-type id (may be {@code null})
+     * @param targetCategory the platform-category slug the type must belong to
+     * @return the validated {@link ServiceType}, or {@code null} when {@code serviceTypeId} is null
+     * @throws BusinessException (400) when the type is inactive or belongs to another category
+     */
+    @Nullable
+    private ServiceType resolveServiceType(@Nullable UUID serviceTypeId, String targetCategory) {
+        if (serviceTypeId == null) {
+            return null;
         }
-        ServiceType type = serviceTypeLookup.getById(request.serviceTypeId());
+        ServiceType type = serviceTypeLookup.getById(serviceTypeId);
         if (!type.isActive()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
         }
         // Phase 16.3 cross-field guard: a present serviceTypeId must belong to the same
         // platform category the request selected. The parent slug is the plain
         // platform_category_name column re-parented in Phase 16.1 (no FK traversal needed),
-        // matched case-sensitively against the request category slug. This requires a DB
+        // matched case-sensitively against the target category slug. This requires a DB
         // lookup of the type, so it lives in the service layer rather than bean validation.
         // Null-safe: a null type category yields a clean 400, never a 500 NPE. Post-V73 the
         // platform_category_name column is NOT NULL + FK, so null is unreachable in prod.
-        if (!Objects.equals(type.getPlatformCategoryName(), request.category())) {
+        if (!Objects.equals(type.getPlatformCategoryName(), targetCategory)) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "service type does not belong to the selected category");
         }
-        definition.setServiceType(type);
+        return type;
+    }
+
+    /**
+     * Resolves the persisted name for a create request.
+     *
+     * <p>When the request supplies a non-blank name it is used verbatim. When the name is
+     * null or blank, the persisted name defaults to the selected service type's Ukrainian
+     * display name ({@link ServiceType#getNameUk()}). When neither a name nor a service type
+     * is available, the request is rejected with a clear validation error — never persist a
+     * blank name.
+     *
+     * @param requestName the (optional) custom name from the request
+     * @param serviceType the resolved service type, or {@code null} when none was selected
+     * @return the non-blank name to persist
+     * @throws BusinessException (400) when neither a name nor a service type is available
+     */
+    private String resolveCreateName(@Nullable String requestName, @Nullable ServiceType serviceType) {
+        if (requestName != null && !requestName.isBlank()) {
+            return requestName;
+        }
+        if (serviceType == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name or service type is required");
+        }
+        return serviceType.getNameUk();
     }
 }

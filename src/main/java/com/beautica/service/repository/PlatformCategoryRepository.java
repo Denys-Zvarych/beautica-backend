@@ -35,6 +35,13 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
     Optional<PlatformCategory> findByTokenHash(String tokenHash);
 
     /**
+     * Resolves a platform category by its canonical (exact-case) name slug. Used by
+     * {@code ServiceTypePromotionService} (Phase 16.9.1) to read the V78
+     * {@code service_category_id} bucket needed to create a {@link com.beautica.service.entity.ServiceType}.
+     */
+    Optional<PlatformCategory> findByName(String name);
+
+    /**
      * Approved + active categories for the authenticated picker
      * ({@code GET /api/v1/service-categories/approved}), ordered for deterministic
      * output. Bounded by the predicate (no unbounded full-table scan of stale rows).

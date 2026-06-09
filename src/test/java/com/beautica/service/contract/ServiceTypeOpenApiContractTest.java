@@ -112,6 +112,58 @@ class ServiceTypeOpenApiContractTest extends AbstractIntegrationTest {
                 .isTrue();
     }
 
+    // ── 1b. GET /service-types 200 is a single unambiguous schema (no oneOf) ──
+
+    @Test
+    @DisplayName("GET /api/v1/service-types — 200 schema is a single $ref to "
+            + "ApiResponseListPlatformServiceTypeResponse, never a oneOf")
+    void should_publishSingle200Schema_when_specIsPublished() {
+        JsonNode schema = spec
+                .path("paths")
+                .path("/api/v1/service-types")
+                .path("get")
+                .path("responses")
+                .path("200")
+                .path("content");
+
+        // Content media type key varies ("*/*" for ApiResponse) — take the first entry.
+        JsonNode responseSchema = schema.elements().hasNext()
+                ? schema.elements().next().path("schema")
+                : MAPPER.missingNode();
+
+        assertThat(responseSchema.has("oneOf"))
+                .as("GET /api/v1/service-types 200 must NOT be a oneOf — the legacy "
+                        + "getServiceTypes operation must be @Operation(hidden=true) so SpringDoc "
+                        + "does not collapse two operations on this path into an ambiguous oneOf "
+                        + "that breaks mobile codegen; schema=%s", responseSchema)
+                .isFalse();
+
+        assertThat(responseSchema.path("$ref").asText())
+                .as("GET /api/v1/service-types 200 must $ref the single platform-type wrapper "
+                        + "ApiResponseListPlatformServiceTypeResponse; schema=%s", responseSchema)
+                .endsWith("/ApiResponseListPlatformServiceTypeResponse");
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/service-types — legacy categoryId & q params are NOT published "
+            + "(legacy operation hidden)")
+    void should_notPublishLegacyParams_when_specIsPublished() {
+        JsonNode parameters = spec
+                .path("paths")
+                .path("/api/v1/service-types")
+                .path("get")
+                .path("parameters");
+
+        assertThat(findParameterByName(parameters, "categoryId"))
+                .as("legacy categoryId param must not appear — the legacy operation is hidden; params=%s",
+                        parameters)
+                .isNull();
+        assertThat(findParameterByName(parameters, "q"))
+                .as("legacy q param must not appear — the legacy operation is hidden; params=%s",
+                        parameters)
+                .isNull();
+    }
+
     // ── 2. CreateServiceDefinitionRequest schema ──────────────────────────────
 
     @Test
@@ -136,10 +188,29 @@ class ServiceTypeOpenApiContractTest extends AbstractIntegrationTest {
                         required)
                 .doesNotContain("serviceTypeId");
 
+        // name is now OPTIONAL on create: when blank, the service layer defaults it to the
+        // selected service type's Ukrainian name. @NotBlank was removed, so SpringDoc no
+        // longer lists name in required[]. The mobile create form lets masters leave it blank.
         assertThat(required)
-                .as("name must remain in the schema required[] — it is a mandatory create field; required=%s",
-                        required)
-                .contains("name");
+                .as("name must NOT be in the schema required[] — it is optional and defaults to "
+                        + "the service-type name when blank; required=%s", required)
+                .doesNotContain("name");
+    }
+
+    @Test
+    @DisplayName("UpdateServiceDefinitionRequest — serviceTypeId present and nullable")
+    void should_documentServiceTypeIdAsNullable_when_updateRequestSchemaPublished() {
+        JsonNode schema = schema("UpdateServiceDefinitionRequest");
+
+        JsonNode serviceTypeId = schema.path("properties").path("serviceTypeId");
+        assertThat(serviceTypeId.isMissingNode())
+                .as("UpdateServiceDefinitionRequest.serviceTypeId property must be present; schema=%s", schema)
+                .isFalse();
+
+        assertThat(typeContainsNull(serviceTypeId))
+                .as("UpdateServiceDefinitionRequest.serviceTypeId must be nullable "
+                        + "(type contains \"null\") in OpenAPI 3.1; type node=%s", serviceTypeId.path("type"))
+                .isTrue();
     }
 
     // ── 3. Response schemas expose nullable serviceTypeId + serviceTypeNameUk ──

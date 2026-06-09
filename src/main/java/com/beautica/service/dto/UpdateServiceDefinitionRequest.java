@@ -3,6 +3,8 @@ package com.beautica.service.dto;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.validation.PricedRequest;
 import com.beautica.service.validation.ServicePriceValid;
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
@@ -12,6 +14,7 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 import java.math.BigDecimal;
+import java.util.UUID;
 
 /**
  * PATCH-semantics request DTO for updating a {@link com.beautica.service.entity.ServiceDefinition}.
@@ -97,6 +100,27 @@ public record UpdateServiceDefinitionRequest(
         @DecimalMin(value = "0.01", inclusive = true, message = "priceMax must be greater than 0.00")
         @DecimalMax(value = "99999999.99", message = "priceMax exceeds maximum allowed value")
         @Digits(integer = 8, fraction = 2, message = "priceMax must have at most 8 integer digits and 2 decimal places")
-        BigDecimal priceMax
+        BigDecimal priceMax,
+
+        /**
+         * Optional id of the platform service type to switch this definition to (PATCH).
+         *
+         * <p>PATCH semantics: {@code null} means "leave the existing service type unchanged" —
+         * it never clears an already-set type. When non-null, the service layer resolves the
+         * type, asserts it is active, and applies the Phase-16.3 cross-category consistency
+         * check: the type must belong to the category this PATCH is moving the definition to
+         * (the new {@code category} when the request also changes it, otherwise the existing one).
+         *
+         * <p>Mirrors {@code CreateServiceDefinitionRequest.serviceTypeId}: optional UUID, no
+         * {@code @NotNull} because PATCH is partial.
+         */
+        @Nullable
+        @Schema(
+                types = {"string", "null"},
+                format = "uuid",
+                nullable = true,
+                description = "Optional id of the platform service type to switch this service to. "
+                        + "Omit or send null to leave the current service type unchanged.")
+        UUID serviceTypeId
 ) implements PricedRequest {
 }

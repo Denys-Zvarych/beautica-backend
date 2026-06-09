@@ -72,12 +72,34 @@ public class PlatformCategory {
     @Column(name = "display_name", nullable = false, length = 100)
     private String displayName;
 
+    /**
+     * OPTIONAL initial service-type name carried on a self-service request. When set on
+     * a PENDING request, approval turns it into a PENDING {@link ServiceTypeSuggestion}
+     * for the now-approved category (no auto-promotion). Null on the seed/ops-CRUD path.
+     */
+    @Column(name = "initial_service_name", length = 255)
+    private String initialServiceName;
+
     @Column(nullable = false)
     private boolean active = true;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
     private PlatformCategoryStatus status = PlatformCategoryStatus.APPROVED;
+
+    /**
+     * System-A {@code service_categories.id} bucket this System-B category maps to
+     * (V78, Phase 16.9). Read-only — seeded/backfilled by Flyway, never set from the
+     * application. Used by {@code ServiceTypePromotionService} to resolve the NOT-NULL
+     * {@code category_id} FK when creating a new {@link ServiceType} on approval.
+     *
+     * <p>{@code null} for a brand-new self-service category that never got a V75 bucket;
+     * the promotion writer treats a null bucket as "cannot create a ServiceType" and
+     * falls back to a draft {@link ServiceDefinition} with {@code serviceType = null}.
+     */
+    @org.springframework.lang.Nullable
+    @Column(name = "service_category_id", updatable = false, insertable = false)
+    private UUID serviceCategoryId;
 
     @Column(name = "requested_by_user_id")
     private UUID requestedByUserId;
@@ -117,7 +139,9 @@ public class PlatformCategory {
      * Creates a PENDING self-service request: not selectable until approved, with a
      * hashed single-use token and a 7-day expiry.
      *
-     * @param tokenHash SHA-256 hex of the raw token (raw token is emailed, never stored)
+     * @param tokenHash          SHA-256 hex of the raw token (raw token is emailed, never stored)
+     * @param initialServiceName OPTIONAL initial service-type name (trimmed-to-null by the
+     *                           caller); turned into a PENDING suggestion on approval
      */
     public static PlatformCategory ofPendingRequest(
             String name,
@@ -125,13 +149,15 @@ public class PlatformCategory {
             UUID requestedByUserId,
             String tokenHash,
             OffsetDateTime requestedAt,
-            OffsetDateTime tokenExpiresAt) {
+            OffsetDateTime tokenExpiresAt,
+            String initialServiceName) {
         PlatformCategory category =
                 new PlatformCategory(name, displayName, PlatformCategoryStatus.PENDING, false);
         category.requestedByUserId = requestedByUserId;
         category.requestedAt = requestedAt;
         category.tokenHash = tokenHash;
         category.tokenExpiresAt = tokenExpiresAt;
+        category.initialServiceName = initialServiceName;
         return category;
     }
 

@@ -176,20 +176,25 @@ class ServiceValidationMessageContractTest {
                         .value("Duration must be a positive number of minutes"));
     }
 
-    // ── 2. @NotBlank — blank name ──────────────────────────────────────────────
+    // ── 2. name is no longer @NotBlank ─────────────────────────────────────────
+    // @NotBlank was removed from CreateServiceDefinitionRequest.name: the name is
+    // optional and the service layer defaults it to the selected service type's
+    // Ukrainian display name when blank. A blank/whitespace name therefore passes
+    // Bean Validation and is accepted by the controller (service is mocked here).
 
     @Test
-    @DisplayName("POST /salons/{id}/services — errors.name carries the readable @NotBlank message when name is blank")
-    void should_returnReadableNotBlankMessage_when_nameIsBlank() throws Exception {
+    @DisplayName("POST /salons/{id}/services — a blank name passes validation (no @NotBlank on name)")
+    void should_acceptBlankName_when_nameIsOptional() throws Exception {
         var salonId = UUID.randomUUID();
         String body = "{\"name\":\"   \",\"category\":\"MANICURE\","
                 + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
                 + "\"priceType\":\"FIXED\",\"price\":350.00}";
 
-        log.debug("Act: POST create-service with blank name — @NotBlank readable message must surface under errors.name");
+        log.debug("Act: POST create-service with blank name — must NOT be rejected for a missing name");
         postService(salonId, body)
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.errors.name").value("Name is required"));
+                .andExpect(status().isCreated());
+
+        verify(serviceCatalogService).addServiceToSalon(eq(salonId), any());
     }
 
     // ── 3. @Size(max) — name overflow ──────────────────────────────────────────
@@ -253,19 +258,20 @@ class ServiceValidationMessageContractTest {
     @DisplayName("POST /salons/{id}/services — errors map carries a distinct key per simultaneous violation")
     void should_returnAllFieldKeys_when_multipleViolationsAtOnce() throws Exception {
         var salonId = UUID.randomUUID();
-        // Three independent field violations in one request:
-        //   name        → @NotBlank  ("Name is required")
+        // Two independent field violations in one request — each must surface under its
+        // own errors.* key with the readable message. (name is no longer @NotBlank, so a
+        // blank name is not a violation; we pick two fields whose blank/out-of-range value
+        // deterministically fails exactly one constraint each.)
         //   baseDuration → @Max(480) ("Duration must be at most 480 minutes (8 hours)")
         //   buffer       → @Max(120) ("Buffer must be at most 120 minutes")
-        String body = "{\"name\":\"\",\"category\":\"MANICURE\","
+        String body = "{\"name\":\"Manicure\",\"category\":\"MANICURE\","
                 + "\"baseDurationMinutes\":1123,\"bufferMinutesAfter\":200,"
                 + "\"priceType\":\"FIXED\",\"price\":350.00}";
 
-        log.debug("Act: POST create-service with name+duration+buffer all invalid — each must appear as its own errors.* key");
+        log.debug("Act: POST create-service with duration+buffer invalid — each must appear as its own errors.* key");
         postService(salonId, body)
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.errors.name").value("Name is required"))
                 .andExpect(jsonPath("$.errors.baseDurationMinutes")
                         .value("Duration must be at most 480 minutes (8 hours)"))
                 .andExpect(jsonPath("$.errors.bufferMinutesAfter")

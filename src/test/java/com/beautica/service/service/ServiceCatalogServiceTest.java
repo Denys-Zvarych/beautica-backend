@@ -43,6 +43,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -422,6 +423,97 @@ class ServiceCatalogServiceTest {
         assertThat(item.masterId()).isEqualTo(masterId);
         assertThat(item.serviceDefinition().id()).isEqualTo(serviceDefId);
         assertThat(item.isActive()).isTrue();
+    }
+
+    // ── getMyServicesIncludingDrafts (Phase 16.9 Part 2) ────────────────────────
+
+    @Test
+    @DisplayName("throws NotFound when no master exists for the authenticated user")
+    void should_throwNotFound_when_noMasterForUserOnGetMyServices() {
+        UUID userId = UUID.randomUUID();
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> serviceCatalogService.getMyServicesIncludingDrafts(userId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Master not found");
+
+        // Owner-scoping guard: a missing master must never trigger the draft query.
+        verify(masterServiceRepository, never()).findOwnedIncludingDraftsWithGraph(any(), any());
+    }
+
+    @Test
+    @DisplayName("returns active + draft rows scoped to the principal's master when the master exists")
+    void should_returnActiveAndDraftRows_when_masterExistsOnGetMyServices() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID activeDefId = UUID.randomUUID();
+        UUID draftDefId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        ServiceDefinition activeDef = ServiceDefinition.builder()
+                .id(activeDefId)
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(masterId)
+                .name("Gel Manicure")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("450.00"))
+                .isActive(true)
+                .isDraft(false)
+                .build();
+
+        ServiceDefinition draftDef = ServiceDefinition.builder()
+                .id(draftDefId)
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(masterId)
+                .name("Suggested Lashes")
+                .baseDurationMinutes(0)
+                .bufferMinutesAfter(0)
+                .priceType(PriceType.FIXED)
+                .basePrice(BigDecimal.ZERO)
+                .isActive(false)
+                .isDraft(true)
+                .build();
+
+        MasterServiceAssignment activeAssignment = mock(MasterServiceAssignment.class);
+        when(activeAssignment.getId()).thenReturn(UUID.randomUUID());
+        when(activeAssignment.getMaster()).thenReturn(master);
+        when(activeAssignment.getServiceDefinition()).thenReturn(activeDef);
+        when(activeAssignment.isActive()).thenReturn(true);
+        when(activeAssignment.getPriceOverride()).thenReturn(null);
+        when(activeAssignment.getDurationOverrideMinutes()).thenReturn(null);
+
+        MasterServiceAssignment draftAssignment = mock(MasterServiceAssignment.class);
+        when(draftAssignment.getId()).thenReturn(UUID.randomUUID());
+        when(draftAssignment.getMaster()).thenReturn(master);
+        when(draftAssignment.getServiceDefinition()).thenReturn(draftDef);
+        when(draftAssignment.isActive()).thenReturn(false);
+        when(draftAssignment.getPriceOverride()).thenReturn(null);
+        when(draftAssignment.getDurationOverrideMinutes()).thenReturn(null);
+
+        // The service must resolve the master from the principal, then query by that master's id.
+        when(masterServiceRepository.findOwnedIncludingDraftsWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(activeAssignment, draftAssignment));
+
+        List<MasterServiceResponse> result = serviceCatalogService.getMyServicesIncludingDrafts(userId);
+
+        assertThat(result).hasSize(2);
+        assertThat(result)
+                .extracting(MasterServiceResponse::isDraft)
+                .as("response must surface both the active (false) and draft (true) rows")
+                .containsExactly(false, true);
+        MasterServiceResponse draftItem = result.get(1);
+        assertThat(draftItem.serviceDefinition().id()).isEqualTo(draftDefId);
+        assertThat(draftItem.isDraft())
+                .as("the draft row must be flagged isDraft=true")
+                .isTrue();
+        assertThat(draftItem.isActive())
+                .as("the draft row must be flagged isActive=false")
+                .isFalse();
     }
 
     // ── deactivateServiceDefinition ────────────────────────────────────────────
@@ -863,5 +955,95 @@ class ServiceCatalogServiceTest {
 
         verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
+    }
+
+    // ── Phase 16.4 blank-name defaulting on create ───────────────────────────────
+    // name no longer @NotBlank: a null/blank name defaults to the selected service type's
+    // nameUk; a blank name with no service type → 400 "Name or service type is required".
+    // Blank is never persisted.
+
+    @Test
+    @DisplayName("defaults a blank name to the service type's nameUk on create — addServiceToSalon")
+    void should_defaultBlankNameToTypeNameUk_onCreate() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(serviceType.getNameUk()).thenReturn("Манікюр");
+
+        // Whitespace-only name + a valid serviceTypeId — name must default to the type's nameUk.
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "   ", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        serviceCatalogService.addServiceToSalon(salonId, request);
+
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(captor.capture());
+        assertThat(captor.getValue().getName())
+                .as("blank name on create must default to the type's Ukrainian name — never persist blank")
+                .isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("defaults a null name to the service type's nameUk on create — addServiceToSalon")
+    void should_defaultNullNameToTypeNameUk_onCreate() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(serviceType.getNameUk()).thenReturn("Манікюр");
+
+        // name null + a valid serviceTypeId — name must default to the type's nameUk.
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                null, "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        serviceCatalogService.addServiceToSalon(salonId, request);
+
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(captor.capture());
+        assertThat(captor.getValue().getName())
+                .as("null name on create must default to the type's Ukrainian name")
+                .isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("throws 400 'Name or service type is required' when name is blank and no service type is supplied on create")
+    void should_throw400_when_blankNameAndNoServiceType_onCreate() {
+        UUID salonId = UUID.randomUUID();
+
+        // Blank name + null serviceTypeId — nothing to derive a name from.
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "   ", "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+
+        assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Name or service type is required")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(serviceRepository, never()).save(any());
     }
 }

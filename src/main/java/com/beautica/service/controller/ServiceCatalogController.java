@@ -7,6 +7,7 @@ import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.service.ServiceCatalogService;
+import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -42,6 +43,24 @@ public class ServiceCatalogController {
         return ApiResponse.ok(serviceCatalogService.getCategories());
     }
 
+    /**
+     * Legacy System-A catalog search over the orphan {@code service_types} table,
+     * filtered by {@code categoryId} and/or trigram {@code q}. Retained as a
+     * callable internal endpoint but <strong>excluded from the published OpenAPI
+     * spec</strong> via {@code @Operation(hidden = true)}.
+     *
+     * <p>Without hiding it, SpringDoc collapses this operation and
+     * {@link #getServiceTypesByPlatformCategory(String)} — both mapped to
+     * {@code GET /api/v1/service-types} — into a single ambiguous {@code oneOf}
+     * 200 response. Because {@link ServiceTypeResponse} and
+     * {@link PlatformServiceTypeResponse} both deserialize the real
+     * {@code {id,slug,nameUk,categoryName}} payload, the generated mobile client
+     * throws {@code UnsupportedError("more than one match found")} and the
+     * service-types list renders empty. Hiding the legacy operation leaves a
+     * single, unambiguous 200 schema ({@code ApiResponse<List<PlatformServiceTypeResponse>>})
+     * for the live {@code ?categoryName=} lookup.
+     */
+    @Operation(hidden = true)
     @GetMapping("/service-types")
     public ApiResponse<List<ServiceTypeResponse>> getServiceTypes(
             @RequestParam(required = false) UUID categoryId,
