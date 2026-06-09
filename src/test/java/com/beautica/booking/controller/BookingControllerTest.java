@@ -979,13 +979,31 @@ class BookingControllerTest {
     // ── QA-HIGH: StatusUpdateRequest.comment @Pattern — decline control-char guard
 
     @Test
-    @DisplayName("PATCH /{bookingId}/decline — 400 when comment contains a control character (newline injection)")
+    @DisplayName("PATCH /{bookingId}/decline — 204 when comment contains a newline (multi-line note is allowed)")
+    void should_return204_when_declineCommentContainsNewline() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        // Newline (0x0A) is whitespace, not a forbidden C0 control char — @Pattern must accept it
+        var body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\""
+                + ",\"comment\":\"line one\\nline two\"}";
+        when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/decline — 400 when comment contains a forbidden control character (NUL byte)")
     void should_return400_when_declineCommentContainsControlCharacter() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        // Newline in comment — matches \p{Cntrl}, must be rejected at the controller boundary
+        // NUL byte (0x00) — a forbidden C0 control char, must be rejected at the controller boundary
         var body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\""
-                + ",\"comment\":\"legit comment\\nX-Injected: header\"}";
+                + ",\"comment\":\"legit comment\\u0000embedded null\"}";
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
@@ -1001,13 +1019,31 @@ class BookingControllerTest {
     // ── QA-HIGH: StatusUpdateRequest.comment @Pattern — not-complete control-char guard
 
     @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 400 when comment contains a control character (tab injection)")
+    @DisplayName("PATCH /{bookingId}/not-complete — 204 when comment contains a tab (whitespace is allowed)")
+    void should_return204_when_notCompleteCommentContainsTab() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        // Tab (0x09) is whitespace, not a forbidden C0 control char — @Pattern must accept it
+        var body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\""
+                + ",\"comment\":\"no-show note\\ttab-separated\"}";
+        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/not-complete — 400 when comment contains a forbidden control character (NUL byte)")
     void should_return400_when_notCompleteCommentContainsControlCharacter() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        // Tab character — matches \p{Cntrl}, must be rejected before the service is reached
+        // NUL byte (0x00) — a forbidden C0 control char, must be rejected before the service is reached
         var body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\""
-                + ",\"comment\":\"no-show note\\ttab-injected\"}";
+                + ",\"comment\":\"no-show note\\u0000tab-injected\"}";
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
