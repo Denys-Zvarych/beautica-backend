@@ -273,9 +273,14 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
         void should_rejectFarFuture_butAllowOpenEnded() {
             SeededMaster m = seedIndependentMaster();
 
+            // +2 days (not +1): the service computes cap() from LocalDate.now(kyivClock) while this
+            // test uses the default system clock (UTC on CI). Kyiv is always UTC+2/+3 ahead, so in the
+            // UTC-evening window the two clocks land on different calendar days and a +1-day validTo
+            // equals the cap exactly — the strict isAfter check then does not reject and the test flakes.
+            // A 2-day margin guarantees validTo is strictly past the cap regardless of the 1-day skew.
             assertThatThrownBy(() -> scheduleService.upsertWeeklySchedule(
                     m.actorId(), m.masterId(), null,
-                    weekly(FUTURE_FROM, LocalDate.now().plusYears(2).plusDays(1), day(1, iv(9, 17)))))
+                    weekly(FUTURE_FROM, LocalDate.now().plusYears(2).plusDays(2), day(1, iv(9, 17)))))
                     .as("validTo past today+2y must be rejected")
                     .isInstanceOf(BusinessException.class);
 
