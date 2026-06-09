@@ -54,7 +54,8 @@ public record CreateServiceDefinitionRequest(
         String name,
 
         @Size(max = 2000, message = "Description must be at most 2000 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
+        @Pattern(regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",
+                message = "Description must not contain control characters other than line breaks and tabs")
         String description,
 
         /**

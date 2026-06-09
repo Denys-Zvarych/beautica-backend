@@ -866,17 +866,21 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("POST /salons/{id}/services — 400 when service description contains a control character (tab injection)")
+    @DisplayName("POST /salons/{id}/services — 400 when service description contains a banned C0 control char (NUL byte)")
     void should_return400_when_serviceDescriptionContainsControlCharacter() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        // Tab character in description — @Pattern(^[^\p{Cntrl}]*$) must reject
-        var body = "{\"name\":\"Manicure\""
-                + ",\"description\":\"Good desc\\tbad\""
+        // Valid category is supplied so the @NotBlank category constraint does NOT fire — the ONLY
+        // remaining violation is the description's embedded NUL byte, which the description @Pattern
+        // ([^\x00-\x08\x0B\x0C\x0E-\x1F\x7F]*) must reject. This isolates the description rule:
+        // previously the body omitted category, so the 400 fired for the wrong reason (missing
+        // category) while a now-legal tab masqueraded as a control-char rejection.
+        var body = "{\"name\":\"Manicure\",\"category\":\"MANICURE\""
+                + ",\"description\":\"Good desc\\u0000bad\""
                 + ",\"baseDurationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"bufferMinutesAfter\":0}";
 
-        log.debug("Act: POST /api/v1/salons/{}/services with description containing tab — must return 400", salonId);
+        log.debug("Act: POST /api/v1/salons/{}/services with valid category + NUL byte in description — must return 400 on description", salonId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
@@ -887,6 +891,33 @@ class ServiceControllerTest {
 
         org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
                 .addServiceToSalon(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 201 when service description contains a tab + newline (long-form text now accepted)")
+    void should_return201_when_serviceDescriptionContainsTabAndNewline() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
+                .thenReturn(stubServiceDefResponse(serviceId, "Manicure"));
+        // Tab (\t) and line breaks (\n) are now legal in description — long-form copy legitimately
+        // contains them. Valid category supplied so the only field under test is description.
+        var body = "{\"name\":\"Manicure\",\"category\":\"MANICURE\""
+                + ",\"description\":\"Line one\\nLine two\\tindented\""
+                + ",\"baseDurationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"bufferMinutesAfter\":0}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services with tab + newline in description — must return 201 (now accepted)", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true));
+
+        org.mockito.Mockito.verify(serviceCatalogService).addServiceToSalon(eq(salonId), any());
     }
 
     // ── PATCH /api/v1/services/{serviceDefId} ──────────────────────────────────
