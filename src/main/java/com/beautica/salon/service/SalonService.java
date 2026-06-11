@@ -53,6 +53,14 @@ public class SalonService {
 
         boolean isFirstSalon = !salonRepository.existsByOwnerId(owner.getId());
 
+        // Phase 12.1: a salon is a discoverable provider — its locality must satisfy the
+        // most-specific-node rule before anything is persisted. Validate UNCONDITIONALLY
+        // (mirroring updateSalon): an absent cityId is itself a violation (CITY_REQUIRED),
+        // so the previous cityId != null guard let an invalid/absent locality slip through
+        // at creation only to be blocked later at update. Runs before save() so nothing is
+        // persisted on rejection.
+        localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+
         var salon = Salon.builder()
                 .owner(owner)
                 .name(request.name())
@@ -73,14 +81,12 @@ public class SalonService {
 
         Salon savedSalon = salonRepository.save(salon);
 
-        // Phase 10.3: validate locality when cityId is provided (nullable on creation —
-        // the mobile flow always sends it, but the field is optional for backwards compat).
-        // Sync location to owner's User row so /users/me reflects the salon address.
-        // userRepository.save is intentionally scoped inside this guard: when no structured
-        // location is provided there is nothing to sync, and the multi-salon test asserts
-        // that save(owner) is never called unconditionally.
+        // Phase 10.3: sync location to owner's User row so /users/me reflects the salon
+        // address. Locality validation already ran unconditionally above (Phase 12.1) —
+        // this guard now only governs the User-row sync. userRepository.save is intentionally
+        // scoped inside the guard: when no structured location is provided there is nothing to
+        // sync, and the multi-salon test asserts that save(owner) is never called unconditionally.
         if (request.cityId() != null) {
-            localityWriteValidator.validateProviderLocality(request.toLocalityInput());
             owner.setCityId(request.cityId());
             owner.setDistrictId(request.districtId());
             owner.setStreet(request.street());

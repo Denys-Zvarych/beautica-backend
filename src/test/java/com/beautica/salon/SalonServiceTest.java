@@ -277,6 +277,62 @@ class SalonServiceTest {
     }
 
     @Test
+    @DisplayName("createSalon — propagates BusinessException from localityWriteValidator and persists nothing when locality is absent (cityId null)")
+    void should_throwBusinessException_when_localityAbsentOnCreateSalon() {
+        // Regression (Phase 12.1): createSalon must validate locality UNCONDITIONALLY,
+        // exactly like updateSalon. Previously an absent cityId skipped validation and a
+        // salon was persisted with no locality, only to be blocked later at updateSalon.
+        // Arrange
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        // cityId == null — the validator's most-specific-node rule rejects this (CITY_REQUIRED).
+        var request = new CreateSalonRequest(
+                "No Geo Salon", null, null, null, null, null, null,
+                null, null, null, null, null
+        );
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
+                .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
+
+        // Act + Assert — same exception type updateSalon throws for the same case.
+        assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+
+        // No salon persisted, no owner location sync, no master auto-creation on rejection.
+        verify(salonRepository, never()).save(any());
+        verify(userRepository, never()).save(any(User.class));
+        verify(masterService, never()).createMasterForOwner(any(User.class), any(Salon.class));
+    }
+
+    @Test
+    @DisplayName("createSalon — validates locality before persisting and succeeds when locality is valid")
+    void should_validateLocalityBeforeSave_when_createSalonWithValidLocality() {
+        // Happy path: a valid locality passes the validator (mock no-op) and the salon is saved.
+        // Asserts validation runs BEFORE save (ordering) so nothing persists on rejection.
+        UUID ownerId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest(
+                "Valid Geo Salon", null, null, null, null, null, null,
+                cityId, districtId, "Main St", "1", null
+        );
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "Valid Geo Salon");
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.name()).isEqualTo("Valid Geo Salon");
+        var inOrder = org.mockito.Mockito.inOrder(localityWriteValidator, salonRepository);
+        inOrder.verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
+        inOrder.verify(salonRepository).save(any(Salon.class));
+    }
+
+    @Test
     @DisplayName("deactivateSalon — sets isActive to false and saves when owner requests")
     void should_deactivateSalon_when_ownerRequests() {
         UUID ownerId = UUID.randomUUID();
