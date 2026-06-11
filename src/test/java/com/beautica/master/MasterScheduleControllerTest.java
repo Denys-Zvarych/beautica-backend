@@ -380,18 +380,23 @@ class MasterScheduleControllerTest {
     }
 
     @Test
-    @DisplayName("PUT overrides/{date} — 400 when DAY_OFF body omits reason")
+    @DisplayName("PUT overrides/{date} — 200 when DAY_OFF body omits reason (reason optional, V82)")
     void putOverride_dayOffWithoutReason() throws Exception {
         var masterId = UUID.randomUUID();
         var date = LocalDate.now().plusDays(1);
         when(authz.canManageMasterSchedule(any(), any())).thenReturn(true);
+        // V82 relaxed the contract: a DAY_OFF override no longer requires a reason. The bare body now
+        // passes @AssertTrue isKindConsistent() and reaches the service, which returns the saved override.
+        when(masterScheduleService.upsertOverride(any(), any(), any()))
+                .thenReturn(new ScheduleOverrideResponse(
+                        date, ScheduleExceptionKind.DAY_OFF, null, null, List.of()));
         String body = "{\"date\":\"" + date + "\",\"kind\":\"DAY_OFF\"}";
         mockMvc.perform(put(BASE + "/" + masterId + "/overrides/" + date)
                         .with(as(UUID.randomUUID(), Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
-                .andExpect(status().isBadRequest());
+                .andExpect(status().isOk());
     }
 
     @Test

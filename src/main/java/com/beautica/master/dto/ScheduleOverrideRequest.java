@@ -19,7 +19,7 @@ import java.util.List;
  * backward-compat on the existing endpoint until Phase 15.5 supersedes it. The {@code kind}
  * discriminator selects the consistent field set:
  * <ul>
- *   <li>{@link ScheduleExceptionKind#DAY_OFF} — closure; {@code reason} required, {@code intervals} empty.</li>
+ *   <li>{@link ScheduleExceptionKind#DAY_OFF} — closure; {@code reason} optional (V82), {@code intervals} empty.</li>
  *   <li>{@link ScheduleExceptionKind#CUSTOM_HOURS} — different hours; {@code reason} absent,
  *       {@code intervals} non-empty.</li>
  * </ul>
@@ -39,7 +39,7 @@ public record ScheduleOverrideRequest(
         @NotNull(message = "Kind is required")
         ScheduleExceptionKind kind,
 
-        // Required iff DAY_OFF.
+        // Optional for DAY_OFF (V82); must be absent for CUSTOM_HOURS.
         ScheduleExceptionReason reason,
 
         // DAY_OFF only. TEXT column in DB — application cap at 2000 (§A). Control-char ban
@@ -54,14 +54,15 @@ public record ScheduleOverrideRequest(
         List<WorkIntervalDto> intervals
 ) {
 
-    @AssertTrue(message = "DAY_OFF requires a reason and no intervals; CUSTOM_HOURS requires intervals and no reason")
+    @AssertTrue(message = "DAY_OFF must have no intervals; CUSTOM_HOURS requires intervals and no reason")
     public boolean isKindConsistent() {
         if (kind == null) {
             return true; // @NotNull on kind reports the missing-kind error.
         }
         boolean hasIntervals = intervals != null && !intervals.isEmpty();
         return switch (kind) {
-            case DAY_OFF -> reason != null && !hasIntervals;
+            // reason is OPTIONAL for DAY_OFF (V82 relaxed chk_exc_reason); still no intervals.
+            case DAY_OFF -> !hasIntervals;
             case CUSTOM_HOURS -> reason == null && hasIntervals;
         };
     }

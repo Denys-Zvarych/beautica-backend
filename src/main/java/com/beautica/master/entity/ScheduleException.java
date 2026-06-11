@@ -47,7 +47,7 @@ public class ScheduleException extends AuditableEntity {
     private LocalDate date;
 
     /**
-     * Phase 15.1: DAY_OFF (closure, carries a reason) vs CUSTOM_HOURS (override, no reason, has intervals).
+     * Phase 15.1: DAY_OFF (closure, optional reason since V82) vs CUSTOM_HOURS (override, no reason, has intervals).
      * Existing rows default to DAY_OFF (DB DEFAULT, V71).
      */
     @Enumerated(EnumType.STRING)
@@ -56,8 +56,9 @@ public class ScheduleException extends AuditableEntity {
     private ScheduleExceptionKind kind = ScheduleExceptionKind.DAY_OFF;
 
     /**
-     * Phase 15.1: now nullable — only meaningful for {@code DAY_OFF}. The DB CHECK
-     * {@code chk_exc_reason} (V71) enforces non-null for DAY_OFF and null for CUSTOM_HOURS.
+     * Phase 15.1: nullable — only meaningful for {@code DAY_OFF}, where it is now OPTIONAL.
+     * The DB CHECK {@code chk_exc_reason}, relaxed in V82, leaves DAY_OFF.reason unconstrained
+     * (may be null or non-null) and still enforces null for {@code CUSTOM_HOURS}.
      */
     @Nullable
     @Enumerated(EnumType.STRING)

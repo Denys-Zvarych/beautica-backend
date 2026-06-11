@@ -330,15 +330,30 @@ class ScheduleDtoValidationTest {
         }
 
         @Test
-        @DisplayName("rejects DAY_OFF (isKindConsistent) when reason is null")
-        void should_reject_when_dayOffWithoutReason() {
+        @DisplayName("accepts DAY_OFF when reason is null and no intervals (reason optional, V82)")
+        void should_accept_when_dayOffWithoutReason() {
+            // V82 relaxed isKindConsistent(): a DAY_OFF override no longer requires a reason. With a null
+            // reason and no intervals the cross-field rule must NOT fire. This assertion would FAIL against
+            // the pre-V82 validator (which required reason != null for DAY_OFF).
             var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
                     null, null, List.of());
 
-            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+            assertThat(validator.validate(req))
+                    .as("DAY_OFF with null reason + no intervals is now valid (V82)")
+                    .isEmpty();
+        }
 
-            assertThat(violations).isNotEmpty();
-            assertThat(hasViolationOn(violations, "kindConsistent")).isTrue();
+        @Test
+        @DisplayName("accepts DAY_OFF when reason is null and intervals list is null (no-intervals via null, V82)")
+        void should_accept_when_dayOffWithNullReasonAndNullIntervals() {
+            // hasIntervals derives from intervals==null||isEmpty(); a null list is the wire shape for the
+            // bare `{date, kind:DAY_OFF}` body and must validate clean under the relaxed rule.
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
+                    null, null, null);
+
+            assertThat(validator.validate(req))
+                    .as("DAY_OFF with null reason + null intervals is valid (V82)")
+                    .isEmpty();
         }
 
         @Test

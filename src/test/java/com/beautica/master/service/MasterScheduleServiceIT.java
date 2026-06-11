@@ -664,6 +664,89 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // 3d. V82 — DAY_OFF reason is OPTIONAL; null reason persists against the relaxed CHECK
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Regression for V82 ({@code chk_exc_reason} relaxed to
+     * {@code (kind = 'DAY_OFF' OR (kind = 'CUSTOM_HOURS' AND reason IS NULL))}).
+     *
+     * <p>The highest-value guard for the contract change: only a real INSERT against the live Postgres
+     * CHECK proves the migration actually loosened the constraint. Under the old V71 CHECK
+     * ({@code kind = 'DAY_OFF' AND reason IS NOT NULL}) a null-reason DAY_OFF row would be rejected with
+     * SQLState 23514 and the {@code upsertOverride} write would blow up — so these tests FAIL on the old
+     * migration and PASS on V82. The mirrored CUSTOM_HOURS-with-reason rejection confirms V82 left the
+     * other side of the CHECK byte-for-byte intact (a reason on CUSTOM_HOURS is still forbidden).
+     */
+    @Nested
+    @DisplayName("V82 — DAY_OFF reason optional (relaxed chk_exc_reason)")
+    class DayOffReasonOptional {
+
+        @Test
+        @DisplayName("persists a DAY_OFF override with a NULL reason and resolves it to OVERRIDE_DAY_OFF")
+        void should_persistAndResolve_when_dayOffReasonNull() {
+            SeededMaster m = seedIndependentMaster();
+
+            // No reason supplied: the V71 CHECK would 23514-reject this INSERT; V82 accepts it.
+            ScheduleOverrideResponse mgmt = scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
+                            null, null, null));
+
+            assertThat(mgmt.kind()).isEqualTo(ScheduleExceptionKind.DAY_OFF);
+            assertThat(mgmt.reason())
+                    .as("a reason-less DAY_OFF round-trips with a null reason")
+                    .isNull();
+
+            // The row really landed against the live CHECK — verify the persisted reason column is NULL.
+            assertThat(scheduleExceptionRepository.findByMasterIdAndDate(m.masterId(), FUTURE_FROM))
+                    .as("the null-reason DAY_OFF override is persisted (V82 CHECK allows it)")
+                    .isPresent()
+                    .get()
+                    .extracting(e -> e.getReason())
+                    .isNull();
+
+            // And it resolves through the public effective-day projection as a day-off with no reason.
+            EffectiveDayResponse pub = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
+            assertThat(pub.source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
+            assertThat(pub.reason()).as("no reason was set, so none resolves").isNull();
+            assertThat(pub.intervals()).as("a day-off carries no working intervals").isEmpty();
+        }
+
+        @Test
+        @DisplayName("still persists a DAY_OFF override WITH a reason (backward compat against V82)")
+        void should_stillPersist_when_dayOffReasonPresent() {
+            SeededMaster m = seedIndependentMaster();
+
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
+                            ScheduleExceptionReason.VACATION, null, null));
+
+            EffectiveDayResponse pub = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
+            assertThat(pub.source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
+            assertThat(pub.reason())
+                    .as("an existing reason still persists and resolves under V82")
+                    .isEqualTo(ScheduleExceptionReason.VACATION);
+        }
+
+        @Test
+        @DisplayName("CUSTOM_HOURS with a reason is still rejected — V82 left the other side of the CHECK intact")
+        void should_reject_when_customHoursCarriesReason() {
+            SeededMaster m = seedIndependentMaster();
+
+            // The DTO @AssertTrue guard rejects this first; the assertion pins the contract is still RED on
+            // a CUSTOM_HOURS reason (V82 only loosened the DAY_OFF side, never the CUSTOM_HOURS side).
+            assertThatThrownBy(() -> scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            ScheduleExceptionReason.OTHER, null, List.of(iv(10, 14)))))
+                    .as("a CUSTOM_HOURS override carrying a reason must still be rejected")
+                    .isInstanceOf(BusinessException.class);
+
+            assertThat(scheduleExceptionRepository.findByMasterIdAndDate(m.masterId(), FUTURE_FROM))
+                    .as("no CUSTOM_HOURS-with-reason override may be persisted").isEmpty();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // 4. Data exposure — note never leaks through the effective-day projection
     // ════════════════════════════════════════════════════════════════════════════════
 

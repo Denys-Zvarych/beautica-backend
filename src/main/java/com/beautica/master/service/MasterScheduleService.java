@@ -349,12 +349,13 @@ public class MasterScheduleService {
     private void validateOverrideConsistency(ScheduleOverrideRequest request) {
         boolean hasIntervals = request.intervals() != null && !request.intervals().isEmpty();
         boolean ok = switch (request.kind()) {
-            case DAY_OFF -> request.reason() != null && !hasIntervals;
+            // reason is OPTIONAL for DAY_OFF (V82 relaxed chk_exc_reason); still no intervals.
+            case DAY_OFF -> !hasIntervals;
             case CUSTOM_HOURS -> request.reason() == null && hasIntervals;
         };
         if (!ok) {
             throw new BusinessException(
-                    "DAY_OFF requires a reason and no intervals; CUSTOM_HOURS requires intervals and no reason");
+                    "DAY_OFF must have no intervals; CUSTOM_HOURS requires intervals and no reason");
         }
         if (request.kind() == ScheduleExceptionKind.CUSTOM_HOURS) {
             assertIntervalsNonOverlapping(request.intervals());
