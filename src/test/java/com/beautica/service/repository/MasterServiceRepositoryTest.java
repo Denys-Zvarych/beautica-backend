@@ -395,11 +395,18 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
             em.flush();
 
             // Stamp a deterministic, strictly increasing created_at so creation order is
-            // unambiguous and decoupled from the random UUID id.
+            // unambiguous and decoupled from the id. We also overwrite the Hibernate-generated
+            // UUID with a deterministic id whose lexicographic order is the REVERSE of the
+            // creation order (i=0 -> highest id, i=4 -> lowest). This guarantees the guard below
+            // ("id ordering differs from creation ordering") always holds instead of relying on
+            // a 1/120 random-UUID coincidence, which made this test flaky (PR #78 CI).
             Instant createdAt = base.plus(i, ChronoUnit.MINUTES);
+            UUID deterministicId = UUID.fromString(
+                    String.format("%08d-0000-4000-8000-000000000000", 4 - i));
             em.getEntityManager()
-                    .createNativeQuery("UPDATE master_services SET created_at = :ts WHERE id = :id")
+                    .createNativeQuery("UPDATE master_services SET created_at = :ts, id = :newId WHERE id = :id")
                     .setParameter("ts", createdAt)
+                    .setParameter("newId", deterministicId)
                     .setParameter("id", assignment.getId())
                     .executeUpdate();
 
