@@ -11,7 +11,6 @@ import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WeeklyScheduleRepository;
 import com.beautica.master.service.MasterScheduleService;
@@ -460,7 +459,7 @@ class MasterScheduleEdgeCaseIT extends AbstractIntegrationTest {
             assertThatThrownBy(() -> scheduleService.upsertOverride(
                     m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(LocalDate.of(2023, 12, 31),
-                            ScheduleExceptionKind.DAY_OFF, ScheduleExceptionReason.OTHER, null, null)))
+                            ScheduleExceptionKind.DAY_OFF, null)))
                     .as("a past override (yesterday in Kyiv) is rejected")
                     .isInstanceOf(BusinessException.class);
 
@@ -543,7 +542,7 @@ class MasterScheduleEdgeCaseIT extends AbstractIntegrationTest {
             // Apply a CUSTOM_HOURS override → it beats the template.
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(monday, ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(12, 14))));
+                            List.of(iv(12, 14))));
             EffectiveDayResponse afterOverride = scheduleService.resolveEffectiveDay(m.masterId(), monday);
             assertThat(afterOverride.source()).isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
             assertThat(afterOverride.intervals())
@@ -565,12 +564,11 @@ class MasterScheduleEdgeCaseIT extends AbstractIntegrationTest {
 
             // First a DAY_OFF closure.
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
-                    new ScheduleOverrideRequest(date, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.VACATION, null, null));
+                    new ScheduleOverrideRequest(date, ScheduleExceptionKind.DAY_OFF, null));
             // Then a CUSTOM_HOURS for the same date — must REPLACE, not add a second row.
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(date, ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(13, 15))));
+                            List.of(iv(13, 15))));
 
             Integer rowCount = jdbc.queryForObject(
                     "SELECT COUNT(*) FROM schedule_exceptions WHERE master_id = ? AND date = ?",
@@ -597,8 +595,7 @@ class MasterScheduleEdgeCaseIT extends AbstractIntegrationTest {
             scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
                     weekly(LocalDate.of(2024, 6, 1), LocalDate.of(2024, 6, 30), day(1, iv(9, 17))));
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
-                    new ScheduleOverrideRequest(monday, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, null, null));
+                    new ScheduleOverrideRequest(monday, ScheduleExceptionKind.DAY_OFF, null));
 
             // Confirm the override is in effect, then clear it.
             assertThat(scheduleService.resolveEffectiveDay(m.masterId(), monday).source())

@@ -19,7 +19,6 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
-import org.springframework.lang.Nullable;
 
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -47,24 +46,14 @@ public class ScheduleException extends AuditableEntity {
     private LocalDate date;
 
     /**
-     * Phase 15.1: DAY_OFF (closure, optional reason since V82) vs CUSTOM_HOURS (override, no reason, has intervals).
-     * Existing rows default to DAY_OFF (DB DEFAULT, V71).
+     * Phase 15.1: DAY_OFF (closure, no reason, no intervals) vs CUSTOM_HOURS (override, has intervals).
+     * Existing rows default to DAY_OFF (DB DEFAULT, V71). The former {@code reason} and {@code note}
+     * fields were removed in V83 — a day-off carries neither.
      */
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
     @Builder.Default
     private ScheduleExceptionKind kind = ScheduleExceptionKind.DAY_OFF;
-
-    /**
-     * Phase 15.1: nullable — only meaningful for {@code DAY_OFF}, where it is now OPTIONAL.
-     * The DB CHECK {@code chk_exc_reason}, relaxed in V82, leaves DAY_OFF.reason unconstrained
-     * (may be null or non-null) and still enforces null for {@code CUSTOM_HOURS}.
-     */
-    @Nullable
-    @Enumerated(EnumType.STRING)
-    private ScheduleExceptionReason reason;
-
-    private String note;
 
     /**
      * Phase 15.1: custom working intervals for a {@code CUSTOM_HOURS} exception; empty for {@code DAY_OFF}.

@@ -7,7 +7,6 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.ScheduleException;
 import com.beautica.master.entity.ScheduleExceptionInterval;
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.entity.WeeklySchedule;
 import com.beautica.master.entity.WorkingInterval;
 import com.beautica.user.User;
@@ -294,48 +293,56 @@ class WeeklyScheduleSchemaIT extends AbstractDataJpaTest {
         }
     }
 
-    // ── 4. ScheduleException discriminator (kind / reason / intervals) ───────────
+    // ── 4. ScheduleException discriminator (kind / intervals) — V83: reason + note DROPPED ───────
 
     @Nested
-    @DisplayName("ScheduleException kind discriminator")
+    @DisplayName("ScheduleException kind discriminator (V83 — no reason/note columns)")
     class ExceptionKind {
 
         @Test
-        @DisplayName("DAY_OFF with null reason is rejected by chk_exc_reason")
-        void should_reject_when_dayOffHasNullReason() {
+        @DisplayName("V83 dropped the reason + note columns from schedule_exceptions")
+        void should_haveDroppedReasonAndNoteColumns() {
+            // The strongest schema-layer guard for V83: query the live information_schema. A missed V83
+            // (or a partial rollback) would leave either column present and fail this assertion. Running
+            // against the real Testcontainers Postgres — a mock could never surface a bad migration.
+            @SuppressWarnings("unchecked")
+            List<String> columns = em.getEntityManager().createNativeQuery(
+                    "SELECT column_name FROM information_schema.columns "
+                            + "WHERE table_name = 'schedule_exceptions'")
+                    .getResultList();
+
+            assertThat(columns)
+                    .as("V83 must keep the kind discriminator")
+                    .contains("kind")
+                    .as("V83 physically dropped reason + note")
+                    .doesNotContain("reason", "note");
+        }
+
+        @Test
+        @DisplayName("DAY_OFF with zero intervals persists and round-trips (no reason/note needed, V83)")
+        void should_roundTrip_when_dayOff() {
             ScheduleException ex = ScheduleException.builder()
                     .master(em.find(Master.class, masterId))
                     .date(LocalDate.of(2026, 5, 1))
                     .kind(ScheduleExceptionKind.DAY_OFF)
-                    .reason(null)
                     .build();
             em.persist(ex);
+            em.flush();
+            em.clear();
 
-            assertThatThrownBy(em::flush).isInstanceOf(PersistenceException.class);
+            ScheduleException reloaded = scheduleExceptionRepository.findById(ex.getId()).orElseThrow();
+
+            assertThat(reloaded.getKind()).isEqualTo(ScheduleExceptionKind.DAY_OFF);
+            assertThat(reloaded.getIntervals()).as("a DAY_OFF carries no intervals").isEmpty();
         }
 
         @Test
-        @DisplayName("CUSTOM_HOURS with a non-null reason is rejected by chk_exc_reason")
-        void should_reject_when_customHoursHasReason() {
-            ScheduleException ex = ScheduleException.builder()
-                    .master(em.find(Master.class, masterId))
-                    .date(LocalDate.of(2026, 5, 2))
-                    .kind(ScheduleExceptionKind.CUSTOM_HOURS)
-                    .reason(ScheduleExceptionReason.OTHER)
-                    .build();
-            em.persist(ex);
-
-            assertThatThrownBy(em::flush).isInstanceOf(PersistenceException.class);
-        }
-
-        @Test
-        @DisplayName("CUSTOM_HOURS with intervals and null reason persists and round-trips")
+        @DisplayName("CUSTOM_HOURS with intervals persists and round-trips")
         void should_roundTrip_when_customHoursWithIntervals() {
             ScheduleException ex = ScheduleException.builder()
                     .master(em.find(Master.class, masterId))
                     .date(LocalDate.of(2026, 5, 3))
                     .kind(ScheduleExceptionKind.CUSTOM_HOURS)
-                    .reason(null)
                     .build();
             ex.getIntervals().add(ScheduleExceptionInterval.builder()
                     .exception(ex).startTime(LocalTime.of(11, 0)).endTime(LocalTime.of(15, 0)).build());
@@ -348,7 +355,6 @@ class WeeklyScheduleSchemaIT extends AbstractDataJpaTest {
             ScheduleException reloaded = scheduleExceptionRepository.findById(ex.getId()).orElseThrow();
 
             assertThat(reloaded.getKind()).isEqualTo(ScheduleExceptionKind.CUSTOM_HOURS);
-            assertThat(reloaded.getReason()).as("CUSTOM_HOURS carries no reason").isNull();
             assertThat(reloaded.getIntervals())
                     .as("LAZY @OneToMany exception intervals load")
                     .hasSize(2)
@@ -359,33 +365,12 @@ class WeeklyScheduleSchemaIT extends AbstractDataJpaTest {
         }
 
         @Test
-        @DisplayName("DAY_OFF with a reason and zero intervals persists (legacy closure behaviour preserved)")
-        void should_roundTrip_when_dayOffWithReason() {
-            ScheduleException ex = ScheduleException.builder()
-                    .master(em.find(Master.class, masterId))
-                    .date(LocalDate.of(2026, 5, 4))
-                    .kind(ScheduleExceptionKind.DAY_OFF)
-                    .reason(ScheduleExceptionReason.VACATION)
-                    .build();
-            em.persist(ex);
-            em.flush();
-            em.clear();
-
-            ScheduleException reloaded = scheduleExceptionRepository.findById(ex.getId()).orElseThrow();
-
-            assertThat(reloaded.getKind()).isEqualTo(ScheduleExceptionKind.DAY_OFF);
-            assertThat(reloaded.getReason()).isEqualTo(ScheduleExceptionReason.VACATION);
-            assertThat(reloaded.getIntervals()).isEmpty();
-        }
-
-        @Test
         @DisplayName("schedule_exception_interval with end_time <= start_time is rejected by chk_exc_interval_order")
         void should_reject_when_exceptionIntervalEndNotAfterStart() {
             ScheduleException ex = ScheduleException.builder()
                     .master(em.find(Master.class, masterId))
                     .date(LocalDate.of(2026, 5, 5))
                     .kind(ScheduleExceptionKind.CUSTOM_HOURS)
-                    .reason(null)
                     .build();
             ex.getIntervals().add(ScheduleExceptionInterval.builder()
                     .exception(ex).startTime(LocalTime.of(12, 0)).endTime(LocalTime.of(12, 0)).build());

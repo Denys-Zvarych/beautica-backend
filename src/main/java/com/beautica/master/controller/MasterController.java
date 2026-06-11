@@ -13,7 +13,6 @@ import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.EffectiveDayResponse;
-import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
 import com.beautica.master.dto.WeeklyScheduleRequest;
@@ -115,42 +114,6 @@ public class MasterController {
     ) {
         UUID actorId = extractUserId(authentication);
         return ApiResponse.ok(masterService.upsertWorkingHours(actorId, masterId, requests));
-    }
-
-    /**
-     * @deprecated Phase 15.5 replaced closure-only schedule exceptions with typed per-date overrides
-     * ({@code DAY_OFF} / {@code CUSTOM_HOURS}). Slot calculation reads the new model, so writes here no
-     * longer affect bookable availability. Migrate to
-     * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}. Kept for backward-compat until cleanup.
-     */
-    @Deprecated(forRemoval = true)
-    @PostMapping("/{masterId}/schedule-exceptions")
-    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
-    public ResponseEntity<ApiResponse<Void>> addScheduleException(
-            @PathVariable UUID masterId,
-            @Valid @RequestBody ScheduleExceptionRequest request,
-            Authentication authentication
-    ) {
-        UUID actorId = extractUserId(authentication);
-        masterService.addScheduleException(actorId, masterId, request);
-        return ResponseEntity.status(201).body(ApiResponse.ok(null));
-    }
-
-    /**
-     * @deprecated Phase 15.5 replaced schedule exceptions with per-date overrides. Migrate to
-     * {@code DELETE /api/v1/masters/{masterId}/overrides/{date}}. Kept for backward-compat until cleanup.
-     */
-    @Deprecated(forRemoval = true)
-    @DeleteMapping("/{masterId}/schedule-exceptions/{date}")
-    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
-    public ResponseEntity<ApiResponse<Void>> removeScheduleException(
-            @PathVariable UUID masterId,
-            @PathVariable @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
-            Authentication authentication
-    ) {
-        UUID actorId = extractUserId(authentication);
-        masterService.removeScheduleException(actorId, masterId, date);
-        return ResponseEntity.noContent().build();
     }
 
     // ---- Phase 15.5: weekly-schedule endpoints ------------------------------------------

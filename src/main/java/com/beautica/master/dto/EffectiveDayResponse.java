@@ -1,7 +1,5 @@
 package com.beautica.master.dto;
 
-import com.beautica.master.entity.ScheduleExceptionReason;
-
 import java.time.LocalDate;
 import java.util.List;
 
@@ -10,16 +8,14 @@ import java.util.List;
  * the read-availability endpoint (Phase 15.5) that the mobile calendar paints.
  *
  * <p>The {@code source} disambiguates how the {@code intervals} were derived (template vs override vs
- * no schedule). {@code reason} is populated only when {@code source == OVERRIDE_DAY_OFF}; for a closed
- * or unscheduled date {@code intervals} is empty.
+ * no schedule). For a closed or unscheduled date {@code intervals} is empty. A day-off carries no
+ * reason (the {@code reason} field was removed in V83).
  *
  * <p><b>Wire format:</b> {@code date} is a {@link LocalDate}, serialized ISO-8601 as {@code yyyy-MM-dd}.
- * Computation of the effective projection lands in Phase 15.4–15.5.
  */
 public record EffectiveDayResponse(
         LocalDate date,
         EffectiveDaySource source,
-        List<WorkIntervalDto> intervals,
-        ScheduleExceptionReason reason
+        List<WorkIntervalDto> intervals
 ) {
 }

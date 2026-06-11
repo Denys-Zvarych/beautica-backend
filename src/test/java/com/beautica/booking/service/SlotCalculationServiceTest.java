@@ -87,24 +87,21 @@ class SlotCalculationServiceTest {
         return new EffectiveDayResponse(
                 date,
                 EffectiveDaySource.TEMPLATE,
-                List.of(new WorkIntervalDto(start, end)),
-                null);
+                List.of(new WorkIntervalDto(start, end)));
     }
 
     private static EffectiveDayResponse dayOff(LocalDate date) {
         return new EffectiveDayResponse(
                 date,
                 EffectiveDaySource.OVERRIDE_DAY_OFF,
-                List.of(),
-                null);
+                List.of());
     }
 
     private static EffectiveDayResponse noSchedule(LocalDate date) {
         return new EffectiveDayResponse(
                 date,
                 EffectiveDaySource.NO_SCHEDULE,
-                List.of(),
-                null);
+                List.of());
     }
 
     @Test

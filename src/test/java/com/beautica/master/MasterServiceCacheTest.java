@@ -3,14 +3,10 @@ package com.beautica.master;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.config.CacheConfig;
-import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.entity.Master;
-import com.beautica.master.entity.ScheduleException;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.repository.SalonRepository;
@@ -83,7 +79,6 @@ class MasterServiceCacheTest {
     @MockBean UserRepository userRepository;
     @MockBean SalonRepository salonRepository;
     @MockBean WorkingHoursRepository workingHoursRepository;
-    @MockBean ScheduleExceptionRepository scheduleExceptionRepository;
     @MockBean BookingRepository bookingRepository;
     @MockBean CityRepository cityRepository;
 
@@ -138,66 +133,9 @@ class MasterServiceCacheTest {
                 .isNull();
     }
 
-    @Test
-    @DisplayName("addScheduleException evicts the master-calendar cache after commit")
-    void should_evictMasterCalendarCache_when_addScheduleException() {
-        Cache cache = cacheManager.getCache("master-calendar");
-        assertThat(cache).isNotNull();
-        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
-        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        cache.put(cacheKey, "value");
-        assertThat(cache.get(cacheKey)).isNotNull();
-
-        Master master = mock(Master.class);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
-
-        LocalDate exceptionDate = LocalDate.now().plusDays(3);
-        ScheduleExceptionRequest request = new ScheduleExceptionRequest(
-                exceptionDate, ScheduleExceptionReason.SICK_DAY, null);
-
-        when(scheduleExceptionRepository.findByMasterIdAndDate(MASTER_ID, exceptionDate))
-                .thenReturn(Optional.empty());
-        ScheduleException saved = mock(ScheduleException.class);
-        when(scheduleExceptionRepository.save(any())).thenReturn(saved);
-
-        // Act — wrap in transaction so afterCommit() fires
-        transactionTemplate.execute(status -> {
-            masterService.addScheduleException(ACTOR_ID, MASTER_ID, request);
-            return null;
-        });
-
-        assertThat(cache.get(cacheKey))
-                .as("master-calendar cache must be evicted after addScheduleException commits")
-                .isNull();
-    }
-
-    @Test
-    @DisplayName("removeScheduleException evicts the master-calendar cache after commit")
-    void should_evictMasterCalendarCache_when_removeScheduleException() {
-        Cache cache = cacheManager.getCache("master-calendar");
-        assertThat(cache).isNotNull();
-        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
-        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        cache.put(cacheKey, "value");
-        assertThat(cache.get(cacheKey)).isNotNull();
-
-        Master master = mock(Master.class);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
-
-        LocalDate exceptionDate = LocalDate.now().plusDays(5);
-        when(scheduleExceptionRepository.findByMasterIdAndDate(MASTER_ID, exceptionDate))
-                .thenReturn(Optional.empty());
-
-        // Act — wrap in transaction so afterCommit() fires
-        transactionTemplate.execute(status -> {
-            masterService.removeScheduleException(ACTOR_ID, MASTER_ID, exceptionDate);
-            return null;
-        });
-
-        assertThat(cache.get(cacheKey))
-                .as("master-calendar cache must be evicted after removeScheduleException commits")
-                .isNull();
-    }
+    // V83 removed MasterService.addScheduleException / removeScheduleException. Per-date override
+    // cache eviction now lives in MasterScheduleService and is covered by MasterScheduleServiceIT
+    // (real-Postgres) — there is no longer a unit-level cache-evict path to assert here.
 
     @Test
     @DisplayName("deactivateMaster evicts the master-calendar cache after commit")

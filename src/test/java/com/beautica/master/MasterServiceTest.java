@@ -11,16 +11,12 @@ import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
-import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
-import com.beautica.master.entity.ScheduleException;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.entity.Salon;
@@ -44,7 +40,6 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
-import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Optional;
@@ -68,7 +63,6 @@ class MasterServiceTest {
     @Mock private UserRepository userRepository;
     @Mock private SalonRepository salonRepository;
     @Mock private WorkingHoursRepository workingHoursRepository;
-    @Mock private ScheduleExceptionRepository scheduleExceptionRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private CacheManager cacheManager;
     // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
@@ -617,137 +611,10 @@ class MasterServiceTest {
         verify(masterRepository, never()).save(any());
     }
 
-    // ── addScheduleException ───────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("should_addScheduleException_when_authorizedActorRequests")
-    void should_addScheduleException_when_authorizedActorRequests() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        LocalDate date = LocalDate.of(2026, 5, 1);
-
-        Master master = mock(Master.class);
-        ScheduleException saved = ScheduleException.builder()
-                .master(master)
-                .date(date)
-                .reason(ScheduleExceptionReason.HOLIDAY)
-                .build();
-        ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
-
-        var request = new ScheduleExceptionRequest(date, ScheduleExceptionReason.HOLIDAY, null);
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
-        when(scheduleExceptionRepository.save(any(ScheduleException.class))).thenReturn(saved);
-
-        ScheduleException result = masterService.addScheduleException(actorId, masterId, request);
-
-        assertThat(result.getDate()).isEqualTo(date);
-        assertThat(result.getReason()).isEqualTo(ScheduleExceptionReason.HOLIDAY);
-        verify(scheduleExceptionRepository).save(any(ScheduleException.class));
-    }
-
-    @Test
-    @DisplayName("should_throwNotFound_when_addScheduleException_masterMissing")
-    void should_throwNotFound_when_unauthorizedActorAddsScheduleException() {
-        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        LocalDate date = LocalDate.of(2026, 5, 1);
-        var request = new ScheduleExceptionRequest(date, ScheduleExceptionReason.HOLIDAY, null);
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> masterService.addScheduleException(actorId, masterId, request))
-                .isInstanceOf(NotFoundException.class);
-
-        verify(scheduleExceptionRepository, never()).save(any());
-    }
-
-    @Test
-    @DisplayName("should_updateExistingScheduleException_when_dateAlreadyExistsForMaster")
-    void should_updateExistingScheduleException_when_dateAlreadyExistsForMaster() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        LocalDate date = LocalDate.of(2026, 6, 15);
-
-        Master master = mock(Master.class);
-
-        ScheduleException existingException = ScheduleException.builder()
-                .master(master)
-                .date(date)
-                .reason(ScheduleExceptionReason.HOLIDAY)
-                .note(null)
-                .build();
-        ReflectionTestUtils.setField(existingException, "id", UUID.randomUUID());
-
-        var request = new ScheduleExceptionRequest(date, ScheduleExceptionReason.VACATION, "Going on vacation");
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.of(existingException));
-        when(scheduleExceptionRepository.save(existingException)).thenReturn(existingException);
-
-        ScheduleException result = masterService.addScheduleException(actorId, masterId, request);
-
-        assertThat(result.getReason()).isEqualTo(ScheduleExceptionReason.VACATION);
-        assertThat(result.getNote()).isEqualTo("Going on vacation");
-        verify(scheduleExceptionRepository).save(existingException);
-    }
-
-    // ── removeScheduleException ────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("should_removeScheduleException_when_authorizedActorRequests")
-    void should_removeScheduleException_when_authorizedActorRequests() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        LocalDate date = LocalDate.of(2026, 6, 1);
-
-        Master master = mock(Master.class);
-        ScheduleException exception = mock(ScheduleException.class);
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.of(exception));
-
-        masterService.removeScheduleException(actorId, masterId, date);
-
-        verify(scheduleExceptionRepository).delete(exception);
-    }
-
-    @Test
-    @DisplayName("should_doNothing_when_removeScheduleException_dateHasNoException")
-    void should_doNothing_when_removeScheduleException_dateHasNoException() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        LocalDate date = LocalDate.of(2026, 6, 1);
-        Master master = mock(Master.class);
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
-        when(scheduleExceptionRepository.findByMasterIdAndDate(masterId, date))
-                .thenReturn(Optional.empty());
-
-        masterService.removeScheduleException(actorId, masterId, date);
-
-        verify(scheduleExceptionRepository, never()).delete(any());
-    }
-
-    @Test
-    @DisplayName("should_throwNotFound_when_removeScheduleException_masterMissing")
-    void should_throwNotFound_when_removeScheduleException_masterMissing() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        LocalDate date = LocalDate.of(2026, 6, 1);
-
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> masterService.removeScheduleException(actorId, masterId, date))
-                .isInstanceOf(NotFoundException.class);
-
-        verify(scheduleExceptionRepository, never()).delete(any());
-    }
+    // V83 removed the POST/DELETE /masters/{id}/schedule-exceptions legacy endpoints and the
+    // MasterService.addScheduleException / removeScheduleException methods. Per-date overrides are
+    // now owned exclusively by MasterScheduleService (PUT/DELETE /masters/{id}/schedule/overrides),
+    // covered by MasterScheduleServiceIT + MasterScheduleControllerTest.
 
     // ── getMasterByUserId ──────────────────────────────────────────────────────
 

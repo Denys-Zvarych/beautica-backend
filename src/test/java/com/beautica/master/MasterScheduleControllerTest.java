@@ -55,6 +55,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
@@ -133,7 +134,7 @@ class MasterScheduleControllerTest {
     }
 
     private String customOverrideBody(LocalDate date) throws Exception {
-        var req = new ScheduleOverrideRequest(date, ScheduleExceptionKind.CUSTOM_HOURS, null, null,
+        var req = new ScheduleOverrideRequest(date, ScheduleExceptionKind.CUSTOM_HOURS,
                 List.of(new WorkIntervalDto(LocalTime.of(9, 0), LocalTime.of(13, 0))));
         return objectMapper.writeValueAsString(req);
     }
@@ -355,7 +356,7 @@ class MasterScheduleControllerTest {
         when(authz.canManageMasterSchedule(any(), any())).thenReturn(true);
         when(masterScheduleService.upsertOverride(any(), any(), any()))
                 .thenReturn(new ScheduleOverrideResponse(
-                        date, ScheduleExceptionKind.CUSTOM_HOURS, null, null, List.of()));
+                        date, ScheduleExceptionKind.CUSTOM_HOURS, List.of()));
         mockMvc.perform(put(BASE + "/" + masterId + "/overrides/" + date)
                         .with(as(UUID.randomUUID(), Role.INDEPENDENT_MASTER))
                         .with(csrf())
@@ -380,23 +381,27 @@ class MasterScheduleControllerTest {
     }
 
     @Test
-    @DisplayName("PUT overrides/{date} — 200 when DAY_OFF body omits reason (reason optional, V82)")
-    void putOverride_dayOffWithoutReason() throws Exception {
+    @DisplayName("PUT overrides/{date} — 200 when bare DAY_OFF body has only date + kind (V83 — no reason/note)")
+    void putOverride_dayOffBareBody() throws Exception {
         var masterId = UUID.randomUUID();
         var date = LocalDate.now().plusDays(1);
         when(authz.canManageMasterSchedule(any(), any())).thenReturn(true);
-        // V82 relaxed the contract: a DAY_OFF override no longer requires a reason. The bare body now
-        // passes @AssertTrue isKindConsistent() and reaches the service, which returns the saved override.
+        // V83 wire shape: a DAY_OFF override is just {date, kind}. The bare body passes @AssertTrue
+        // isKindConsistent() (DAY_OFF -> no intervals) and reaches the service, which returns the override.
         when(masterScheduleService.upsertOverride(any(), any(), any()))
                 .thenReturn(new ScheduleOverrideResponse(
-                        date, ScheduleExceptionKind.DAY_OFF, null, null, List.of()));
+                        date, ScheduleExceptionKind.DAY_OFF, List.of()));
         String body = "{\"date\":\"" + date + "\",\"kind\":\"DAY_OFF\"}";
         mockMvc.perform(put(BASE + "/" + masterId + "/overrides/" + date)
                         .with(as(UUID.randomUUID(), Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
-                .andExpect(status().isOk());
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.kind").value("DAY_OFF"))
+                // V83 contract: the response shape must not carry reason or note keys.
+                .andExpect(jsonPath("$.data.reason").doesNotExist())
+                .andExpect(jsonPath("$.data.note").doesNotExist());
     }
 
     @Test

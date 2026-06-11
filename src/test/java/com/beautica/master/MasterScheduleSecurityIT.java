@@ -4,7 +4,6 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.WeeklyScheduleDayRequest;
 import com.beautica.master.dto.WeeklyScheduleRequest;
@@ -250,8 +249,7 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
             SeededMaster victim = seedIndependentMaster();
             SeededMaster attacker = seedIndependentMaster();
             scheduleService.upsertOverride(victim.owner().userId(), victim.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, null, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
             ResponseEntity<String> resp = restTemplate.exchange(
                     BASE + "/" + victim.masterId() + "/overrides/" + FUTURE_FROM, HttpMethod.DELETE,
@@ -401,22 +399,19 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
-    // S3 — note (potential SICK_DAY PII) never leaks on public / unauthorized read paths
+    // S3 — V83 contract: reason/note keys never appear on any read path (columns dropped)
     // ════════════════════════════════════════════════════════════════════════════════
 
     @Nested
-    @DisplayName("S3 — note never leaks")
-    class NoteExposure {
-
-        private static final String SECRET = "Surgery at Clinic X — strictly private";
+    @DisplayName("S3 — reason/note never appear in serialized read bodies (V83)")
+    class ResponseShapeExposure {
 
         @Test
-        @DisplayName("the SICK_DAY note is absent from the PUBLIC GET /masters/{id} profile body")
-        void should_notLeakNote_onPublicProfile() {
+        @DisplayName("the PUBLIC GET /masters/{id} profile body carries no reason or note key")
+        void should_notExposeReasonOrNote_onPublicProfile() {
             SeededMaster m = seedIndependentMaster();
             scheduleService.upsertOverride(m.owner().userId(), m.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, SECRET, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
             // No auth header — this is the unauthenticated public profile endpoint.
             ResponseEntity<String> resp = restTemplate.getForEntity(
@@ -424,18 +419,17 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(resp.getBody())
-                    .as("the public master profile must never echo a private schedule note")
-                    .doesNotContain(SECRET)
-                    .doesNotContain("\"note\"");
+                    .as("the public master profile must not echo a removed reason/note key (V83)")
+                    .doesNotContain("\"note\"")
+                    .doesNotContain("\"reason\"");
         }
 
         @Test
-        @DisplayName("the SICK_DAY note is absent from the (authorized) public effective-schedule projection")
-        void should_notLeakNote_onEffectiveScheduleRead() {
+        @DisplayName("the (authorized) effective-schedule projection serializes no reason or note key")
+        void should_notExposeReasonOrNote_onEffectiveScheduleRead() {
             SeededMaster m = seedIndependentMaster();
             scheduleService.upsertOverride(m.owner().userId(), m.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, SECRET, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
             ResponseEntity<String> resp = get(
                     "/" + m.masterId() + "/effective-schedule?from=" + FUTURE_FROM + "&to=" + FUTURE_FROM,
@@ -443,9 +437,9 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(resp.getBody())
-                    .as("EffectiveDayResponse carries the reason but never the free-text note")
-                    .contains("SICK_DAY")          // the reason IS exposed (non-PII enum)
-                    .doesNotContain(SECRET)         // the free-text note is NOT
+                    .as("EffectiveDayResponse exposes only date/source/intervals — no reason/note (V83)")
+                    .contains("OVERRIDE_DAY_OFF")   // the source IS exposed
+                    .doesNotContain("\"reason\"")
                     .doesNotContain("\"note\"");
         }
     }

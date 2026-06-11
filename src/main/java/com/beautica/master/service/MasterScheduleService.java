@@ -121,8 +121,6 @@ public class MasterScheduleService {
                 .orElseGet(() -> ScheduleException.builder().master(master).date(request.date()).build());
 
         override.setKind(request.kind());
-        override.setReason(request.reason());
-        override.setNote(request.note());
         replaceOverrideIntervals(override, request.kind() == ScheduleExceptionKind.CUSTOM_HOURS
                 ? request.intervals() : List.of());
 
@@ -250,19 +248,19 @@ public class MasterScheduleService {
     private EffectiveDayResponse resolveFromOverride(LocalDate date, ScheduleException override) {
         if (scheduleMapper.isDayOff(override)) {
             return scheduleMapper.toEffectiveDay(
-                    date, EffectiveDaySource.OVERRIDE_DAY_OFF, List.of(), override.getReason());
+                    date, EffectiveDaySource.OVERRIDE_DAY_OFF, List.of());
         }
         return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.OVERRIDE_CUSTOM,
-                scheduleMapper.toIntervalDtos(override.getIntervals()), null);
+                scheduleMapper.toIntervalDtos(override.getIntervals()));
     }
 
     private EffectiveDayResponse resolveFromTemplate(LocalDate date, WeeklySchedule covering) {
         if (covering == null) {
-            return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.NO_SCHEDULE, List.of(), null);
+            return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.NO_SCHEDULE, List.of());
         }
         List<WorkIntervalDto> intervals =
                 scheduleMapper.toIntervalDtosForDay(covering, dateMath.isoDow(date));
-        return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.TEMPLATE, intervals, null);
+        return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.TEMPLATE, intervals);
     }
 
     private WeeklySchedule firstCovering(List<WeeklySchedule> windows, LocalDate date) {
@@ -349,13 +347,12 @@ public class MasterScheduleService {
     private void validateOverrideConsistency(ScheduleOverrideRequest request) {
         boolean hasIntervals = request.intervals() != null && !request.intervals().isEmpty();
         boolean ok = switch (request.kind()) {
-            // reason is OPTIONAL for DAY_OFF (V82 relaxed chk_exc_reason); still no intervals.
             case DAY_OFF -> !hasIntervals;
-            case CUSTOM_HOURS -> request.reason() == null && hasIntervals;
+            case CUSTOM_HOURS -> hasIntervals;
         };
         if (!ok) {
             throw new BusinessException(
-                    "DAY_OFF must have no intervals; CUSTOM_HOURS requires intervals and no reason");
+                    "DAY_OFF must have no intervals; CUSTOM_HOURS requires intervals");
         }
         if (request.kind() == ScheduleExceptionKind.CUSTOM_HOURS) {
             assertIntervalsNonOverlapping(request.intervals());

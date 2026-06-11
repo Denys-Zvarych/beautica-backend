@@ -97,7 +97,7 @@ class SlotCalculationServiceCacheTest {
         // This keeps the result cacheable while exercising the resolver as the underlying data source.
         when(masterScheduleService.resolveEffectiveDay(masterId, futureDate))
                 .thenReturn(new EffectiveDayResponse(
-                        futureDate, EffectiveDaySource.NO_SCHEDULE, List.of(), null));
+                        futureDate, EffectiveDaySource.NO_SCHEDULE, List.of()));
 
         // First call — populates cache
         slotCalculationService.getAvailableSlots(masterId, futureDate, masterServiceId);
