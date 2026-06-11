@@ -34,7 +34,8 @@ public record CreateSalonRequest(
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
         String name,
         @Size(max = 2000, message = "Description must be at most 2000 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Description must not contain control characters")
+        @Pattern(regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",
+                message = "Description must not contain control characters other than line breaks and tabs")
         String description,
         @Size(max = 100, message = "City must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "City must not contain control characters")

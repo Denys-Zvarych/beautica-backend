@@ -11,7 +11,6 @@ import com.beautica.master.dto.WeeklyScheduleDayRequest;
 import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.service.MasterScheduleService;
 import com.beautica.service.repository.MasterServiceRepository;
 import org.junit.jupiter.api.DisplayName;
@@ -201,7 +200,7 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
             // Override that Monday to a narrow 10:00–12:00 custom window.
             masterScheduleService.upsertOverride(s.actorId(), s.masterId(),
                     new ScheduleOverrideRequest(monday, ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(LocalTime.of(10, 0), LocalTime.of(12, 0)))));
+                            List.of(iv(LocalTime.of(10, 0), LocalTime.of(12, 0)))));
 
             List<AvailableSlotResponse> slots = slotServiceWithTodayBefore(monday)
                     .getAvailableSlots(s.masterId(), monday, s.masterServiceId());
@@ -219,8 +218,7 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
             masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
                     weekly(monday, null, day(1, iv(LocalTime.of(9, 0), LocalTime.of(17, 0)))));
             masterScheduleService.upsertOverride(s.actorId(), s.masterId(),
-                    new ScheduleOverrideRequest(monday, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.VACATION, null, null));
+                    new ScheduleOverrideRequest(monday, ScheduleExceptionKind.DAY_OFF, null));
 
             List<AvailableSlotResponse> slots = slotServiceWithTodayBefore(monday)
                     .getAvailableSlots(s.masterId(), monday, s.masterServiceId());
@@ -270,7 +268,7 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
             LocalDate monday = LocalDate.of(2024, 6, 3);
             masterScheduleService.upsertOverride(s.actorId(), s.masterId(),
                     new ScheduleOverrideRequest(monday, ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(LocalTime.of(9, 0), LocalTime.of(12, 0)))));
+                            List.of(iv(LocalTime.of(9, 0), LocalTime.of(12, 0)))));
             // Book 10:00–11:00 Kyiv on that date (PENDING).
             insertBooking(s, monday, LocalTime.of(10, 0), LocalTime.of(11, 0));
 

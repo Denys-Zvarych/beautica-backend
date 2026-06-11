@@ -13,7 +13,6 @@ import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WeeklyScheduleRepository;
 import org.hibernate.SessionFactory;
@@ -54,7 +53,8 @@ import static org.assertj.core.api.Assertions.tuple;
  *       interval overlap/ordering, seconds zeroing.</li>
  *   <li><b>Effective-availability resolver</b> — override beats template beats gap; multi-week range
  *       folds correctly without N+1 / lazy-init.</li>
- *   <li><b>Data exposure</b> — {@code EffectiveDayResponse} never carries the free-text {@code note}.</li>
+ *   <li><b>Data exposure</b> — {@code EffectiveDayResponse} exposes only date/source/intervals (the
+ *       former {@code reason}/{@code note} were removed in V83).</li>
  * </ul>
  *
  * <p>Dates are chosen relative to {@code LocalDate.now()} with a safe margin so the suite is
@@ -165,8 +165,7 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
 
             assertThatThrownBy(() -> scheduleService.upsertOverride(
                     attacker.actorId(), victim.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.VACATION, "secret", null)))
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null)))
                     .isInstanceOf(ForbiddenException.class);
 
             assertThat(scheduleExceptionRepository.findByMasterIdAndDate(victim.masterId(), FUTURE_FROM))
@@ -180,8 +179,7 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             SeededMaster attacker = seedIndependentMaster();
             // Victim legitimately owns a day-off override.
             scheduleService.upsertOverride(victim.actorId(), victim.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, null, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
             assertThatThrownBy(() -> scheduleService.clearOverride(
                     attacker.actorId(), victim.masterId(), FUTURE_FROM))
@@ -255,7 +253,7 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             assertThatThrownBy(() -> scheduleService.upsertOverride(
                     m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(LocalDate.now().minusDays(1),
-                            ScheduleExceptionKind.DAY_OFF, ScheduleExceptionReason.OTHER, null, null)))
+                            ScheduleExceptionKind.DAY_OFF, null)))
                     .isInstanceOf(BusinessException.class);
         }
 
@@ -273,9 +271,14 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
         void should_rejectFarFuture_butAllowOpenEnded() {
             SeededMaster m = seedIndependentMaster();
 
+            // +2 days (not +1): the service computes cap() from LocalDate.now(kyivClock) while this
+            // test uses the default system clock (UTC on CI). Kyiv is always UTC+2/+3 ahead, so in the
+            // UTC-evening window the two clocks land on different calendar days and a +1-day validTo
+            // equals the cap exactly — the strict isAfter check then does not reject and the test flakes.
+            // A 2-day margin guarantees validTo is strictly past the cap regardless of the 1-day skew.
             assertThatThrownBy(() -> scheduleService.upsertWeeklySchedule(
                     m.actorId(), m.masterId(), null,
-                    weekly(FUTURE_FROM, LocalDate.now().plusYears(2).plusDays(1), day(1, iv(9, 17)))))
+                    weekly(FUTURE_FROM, LocalDate.now().plusYears(2).plusDays(2), day(1, iv(9, 17)))))
                     .as("validTo past today+2y must be rejected")
                     .isInstanceOf(BusinessException.class);
 
@@ -390,7 +393,7 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             assertThatThrownBy(() -> scheduleService.upsertOverride(
                     m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(9, 13), iv(12, 15)))))
+                            List.of(iv(9, 13), iv(12, 15)))))
                     .isInstanceOf(BusinessException.class);
         }
     }
@@ -418,11 +421,10 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             // Custom-hours override on Monday → wins over the template.
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(monday, ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(12, 14))));
+                            List.of(iv(12, 14))));
             // Day-off override on Tuesday → wins over the template.
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
-                    new ScheduleOverrideRequest(monday.plusDays(1), ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.HOLIDAY, null, null));
+                    new ScheduleOverrideRequest(monday.plusDays(1), ScheduleExceptionKind.DAY_OFF, null));
 
             // Resolve [monday-1 .. monday+7]: monday-1 and monday+7 are outside the template = NO_SCHEDULE.
             List<EffectiveDayResponse> days = scheduleService.resolveEffectiveRange(
@@ -437,10 +439,9 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             assertThat(mon.intervals())
                     .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
                     .containsExactly(tuple(LocalTime.of(12, 0), LocalTime.of(14, 0)));
-            // Tuesday: day-off override beats template, carries its reason, empty intervals.
+            // Tuesday: day-off override beats template, empty intervals (V83 — no reason field).
             EffectiveDayResponse tue = byDate(days, monday.plusDays(1));
             assertThat(tue.source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
-            assertThat(tue.reason()).isEqualTo(ScheduleExceptionReason.HOLIDAY);
             assertThat(tue.intervals()).isEmpty();
             // Wednesday: covered by template, no working interval that weekday → TEMPLATE, empty intervals.
             EffectiveDayResponse wed = byDate(days, monday.plusDays(2));
@@ -476,11 +477,10 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
                     weekly(monday, null, day(1, iv(9, 17)), day(3, iv(10, 14))));
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
-                    new ScheduleOverrideRequest(monday.plusDays(10), ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.VACATION, null, null));
+                    new ScheduleOverrideRequest(monday.plusDays(10), ScheduleExceptionKind.DAY_OFF, null));
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(monday.plusDays(20), ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(8, 9))));
+                            List.of(iv(8, 9))));
 
             Statistics stats = entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
             boolean wasEnabled = stats.isStatisticsEnabled();
@@ -505,7 +505,223 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
-    // 4. Data exposure — note never leaks through the effective-day projection
+    // 3b. Read identity — WeeklyScheduleResponse.id round-trips (regression: missing id)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Read identity — WeeklyScheduleResponse.id round-trip")
+    class ReadIdentity {
+
+        /**
+         * Regression for the missing-{@code id} gap: {@code WeeklyScheduleResponse} previously had no
+         * {@code id}, so a client reloading the list could not target {@code PUT
+         * /weekly-schedules/{scheduleId}} and re-POSTed a duplicate window — tripping the overlap guard.
+         * The listed response's {@code id} must be non-null AND equal the persisted entity's id, so an
+         * editor can round-trip it straight onto the update path.
+         */
+        @Test
+        @DisplayName("listWeeklySchedules exposes a non-null id equal to the persisted entity's id")
+        void should_exposePersistedId_when_listingWeeklySchedules() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(1, iv(9, 17))));
+            UUID persistedId = weeklyScheduleRepository
+                    .findByMasterIdOrderByValidFromAsc(m.masterId()).get(0).getId();
+
+            List<WeeklyScheduleResponse> listed = scheduleService.listWeeklySchedules(m.masterId());
+
+            assertThat(listed).singleElement()
+                    .extracting(WeeklyScheduleResponse::id)
+                    .as("the listed window must carry the persisted id so editors can target PUT, "
+                            + "not re-POST a duplicate that trips the overlap guard")
+                    .isNotNull()
+                    .isEqualTo(persistedId);
+        }
+
+        /**
+         * End-to-end reproduction of the original failure mode at the service layer: create a window,
+         * reload the list, then upsert using the id from the response. It must UPDATE in place (same id,
+         * intervals replaced) with no {@code BusinessException} overlap — proving the round-trip id closes
+         * the duplicate-window bug.
+         */
+        @Test
+        @DisplayName("re-upsert using the listed id updates in place — no overlap, same id, intervals replaced")
+        void should_updateInPlace_when_reUpsertingWithListedId() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(1, iv(9, 17))));
+
+            UUID listedId = scheduleService.listWeeklySchedules(m.masterId()).get(0).id();
+
+            // Re-upsert the SAME window (overlapping itself) targeting the listed id — the original bug
+            // was a re-POST (scheduleId == null) here, which tripped assertNoWindowOverlap.
+            WeeklyScheduleResponse updated = scheduleService.upsertWeeklySchedule(
+                    m.actorId(), m.masterId(), listedId,
+                    weekly(FUTURE_FROM, null, day(2, iv(10, 16))));
+
+            assertThat(updated.id())
+                    .as("the update must reuse the same window id, not create a second one")
+                    .isEqualTo(listedId);
+            assertThat(weeklyScheduleRepository.findByMasterIdOrderByValidFromAsc(m.masterId()))
+                    .as("the master must still have exactly one window — updated in place, not duplicated")
+                    .singleElement()
+                    .extracting(ws -> ws.getId()).isEqualTo(listedId);
+            assertThat(updated.days())
+                    .as("the targeted update replaced the intervals (Monday → Tuesday)")
+                    .singleElement()
+                    .extracting(d -> d.dayOfWeek()).isEqualTo(2);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // 3c. Re-upsert duplicate-key collision — orphan DELETE must run before re-INSERT
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Regression for the working-intervals duplicate-key bug. Editing a day's working hours by adding a
+     * pause that splits the day re-sent at least one interval whose
+     * {@code (schedule_id, day_of_week, start_time, end_time)} (override: {@code (exception_id, start, end)})
+     * was byte-identical to a row already persisted from the previous save. With
+     * {@code hibernate.order_inserts=true} the {@code ActionQueue} runs every INSERT before every orphan
+     * DELETE, so the re-sent identical interval collided with {@code uq_working_intervals_no_dup} /
+     * {@code uq_exception_intervals_no_dup} and the write blew up with a
+     * {@link org.springframework.dao.DataIntegrityViolationException} (SQLState 23505).
+     *
+     * <p>The fix is the {@code repository.flush()} in {@code replaceIntervals} /
+     * {@code replaceOverrideIntervals} right after {@code getIntervals().clear()}, forcing the orphan
+     * DELETEs to the DB <b>before</b> the re-INSERTs. These tests must FAIL with 23505 without that flush
+     * and PASS with it. The collision only manifests against the live unique index — hence a real-DB IT.
+     */
+    @Nested
+    @DisplayName("Re-upsert duplicate-key collision — delete-before-insert (23505 regression)")
+    class ReUpsertDuplicateKey {
+
+        @Test
+        @DisplayName("weekly: re-upsert a day adding a pause (morning block unchanged) succeeds — no 23505")
+        void should_notCollide_when_reUpsertingWeeklyDayWithIdenticalMorningBlock() {
+            SeededMaster m = seedIndependentMaster();
+            // First save: a single morning block on day 2 (Tuesday).
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(2, iv(9, 13))));
+            UUID listedId = scheduleService.listWeeklySchedules(m.masterId()).get(0).id();
+
+            // Edit = "add a pause": keep the byte-identical 09:00-13:00 morning, add an afternoon block.
+            // The re-sent 09:00-13:00 row equals the already-persisted one → would collide on the unique
+            // index unless the orphan DELETE is flushed before the re-INSERT.
+            WeeklyScheduleResponse updated = scheduleService.upsertWeeklySchedule(
+                    m.actorId(), m.masterId(), listedId,
+                    weekly(FUTURE_FROM, null, day(2, iv(9, 13), iv(14, 18))));
+
+            assertThat(updated.id())
+                    .as("the edit must update the same window in place").isEqualTo(listedId);
+
+            // The persisted day 2 must hold exactly the two expected intervals — proving the re-INSERT
+            // landed (the bug aborted the whole write before any interval could be written/replaced).
+            EffectiveDayResponse tue = scheduleService.resolveEffectiveDay(
+                    m.masterId(), nextDateForDow(FUTURE_FROM, DayOfWeek.TUESDAY));
+            assertThat(tue.source()).isEqualTo(EffectiveDaySource.TEMPLATE);
+            assertThat(tue.intervals())
+                    .as("day 2 must persist exactly the unchanged morning + the new afternoon block")
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(
+                            tuple(LocalTime.of(9, 0), LocalTime.of(13, 0)),
+                            tuple(LocalTime.of(14, 0), LocalTime.of(18, 0)));
+        }
+
+        @Test
+        @DisplayName("override: re-upsert a CUSTOM_HOURS date adding a pause (morning block unchanged) succeeds — no 23505")
+        void should_notCollide_when_reUpsertingOverrideWithIdenticalMorningBlock() {
+            SeededMaster m = seedIndependentMaster();
+            // First save: a CUSTOM_HOURS override on FUTURE_FROM with a single morning block.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(9, 13))));
+
+            // Edit = "add a pause": keep the byte-identical 09:00-13:00 morning, add an afternoon block.
+            // The re-sent 09:00-13:00 row equals the already-persisted exception interval → would collide
+            // unless replaceOverrideIntervals flushes the orphan DELETE before the re-INSERT.
+            ScheduleOverrideResponse updated = scheduleService.upsertOverride(
+                    m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(9, 13), iv(14, 18))));
+
+            assertThat(updated.kind()).isEqualTo(ScheduleExceptionKind.CUSTOM_HOURS);
+
+            EffectiveDayResponse day = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
+            assertThat(day.source()).isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
+            assertThat(day.intervals())
+                    .as("the override must persist exactly the unchanged morning + the new afternoon block")
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(
+                            tuple(LocalTime.of(9, 0), LocalTime.of(13, 0)),
+                            tuple(LocalTime.of(14, 0), LocalTime.of(18, 0)));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // 3d. V83 — DAY_OFF persistence against the live schema (reason + note columns DROPPED)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Highest-value guard for the V83 contract change. V83 physically DROPPED the {@code reason} and
+     * {@code note} columns (and the {@code chk_exc_reason} / {@code chk_exception_reason} CHECKs) from
+     * {@code schedule_exceptions}, keeping only {@code kind} + {@code chk_exc_kind}.
+     *
+     * <p>Only a real INSERT against the live Testcontainers Postgres proves the migration actually
+     * removed the columns: the entity no longer maps reason/note, so any Hibernate INSERT still
+     * referencing those columns (a missed V83) would fail with a "column does not exist" error. A mock
+     * would never catch a bad V83 — the schedule ITs run on a dedicated Flyway pool with the real schema.
+     */
+    @Nested
+    @DisplayName("V83 — DAY_OFF persists against the live schema (no reason/note columns)")
+    class DayOffPersistence {
+
+        @Test
+        @DisplayName("persists a DAY_OFF override and resolves it to OVERRIDE_DAY_OFF with empty intervals")
+        void should_persistAndResolve_when_dayOff() {
+            SeededMaster m = seedIndependentMaster();
+
+            // A bare DAY_OFF override (no reason/note exist in the V83 wire shape or schema).
+            ScheduleOverrideResponse mgmt = scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
+
+            assertThat(mgmt.kind()).isEqualTo(ScheduleExceptionKind.DAY_OFF);
+            assertThat(mgmt.intervals()).as("a day-off override carries no intervals").isEmpty();
+
+            // The row really landed against the live V83 schema — verify it persisted with the right kind.
+            assertThat(scheduleExceptionRepository.findByMasterIdAndDate(m.masterId(), FUTURE_FROM))
+                    .as("the DAY_OFF override is persisted against the V83 schema (reason/note dropped)")
+                    .isPresent()
+                    .get()
+                    .extracting(e -> e.getKind())
+                    .isEqualTo(ScheduleExceptionKind.DAY_OFF);
+
+            // And it resolves through the public effective-day projection as a closed day.
+            EffectiveDayResponse pub = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
+            assertThat(pub.source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
+            assertThat(pub.intervals()).as("a day-off carries no working intervals").isEmpty();
+        }
+
+        @Test
+        @DisplayName("DAY_OFF response/effective-day records structurally carry no reason or note component (V83)")
+        void should_notExposeReasonOrNote_inResponseShapes() {
+            // Guards the response-shape contract change directly: the V83 records were re-shaped to
+            // (date, kind, intervals) / (date, source, intervals). A reintroduced reason/note component
+            // would fail this assertion before any serialization could leak it.
+            assertThat(EffectiveDayResponse.class.getRecordComponents())
+                    .as("EffectiveDayResponse must not carry a reason or note component (V83 removed both)")
+                    .extracting(java.lang.reflect.RecordComponent::getName)
+                    .doesNotContain("reason", "note");
+
+            assertThat(ScheduleOverrideResponse.class.getRecordComponents())
+                    .as("ScheduleOverrideResponse must not carry a reason or note component (V83 removed both)")
+                    .extracting(java.lang.reflect.RecordComponent::getName)
+                    .doesNotContain("reason", "note");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // 4. Data exposure — the public effective-day projection exposes only date/source/intervals
     // ════════════════════════════════════════════════════════════════════════════════
 
     @Nested
@@ -513,27 +729,21 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     class DataExposure {
 
         @Test
-        @DisplayName("EffectiveDayResponse carries reason + intervals but NOT the free-text note; management response does")
-        void should_notExposeNote_inEffectiveDay_butExposeIt_inOverrideResponse() {
+        @DisplayName("EffectiveDayResponse exposes only date/source/intervals — no private free-text leaks (V83)")
+        void should_exposeOnlyDateSourceIntervals_inEffectiveDay() {
             SeededMaster m = seedIndependentMaster();
-            String secretNote = "Surgery at Clinic X — private";
-            ScheduleOverrideResponse mgmt = scheduleService.upsertOverride(
+            scheduleService.upsertOverride(
                     m.actorId(), m.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, secretNote, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
-            // The management projection is allowed to carry the note.
-            assertThat(mgmt.note()).as("management override response exposes the note to the owner")
-                    .isEqualTo(secretNote);
-
-            // The public effective-day projection must NOT — and structurally cannot — carry it.
             EffectiveDayResponse pub = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
             assertThat(pub.source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
-            assertThat(pub.reason()).isEqualTo(ScheduleExceptionReason.SICK_DAY);
+
+            // Structural guard: the projection has exactly date/source/intervals — no reason/note ever.
             assertThat(EffectiveDayResponse.class.getRecordComponents())
-                    .as("EffectiveDayResponse must not have a note component (private free-text never leaks)")
+                    .as("EffectiveDayResponse exposes exactly date/source/intervals (V83 removed reason/note)")
                     .extracting(java.lang.reflect.RecordComponent::getName)
-                    .doesNotContain("note");
+                    .containsExactlyInAnyOrder("date", "source", "intervals");
         }
     }
 
@@ -559,11 +769,10 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
                     weekly(monday, null, day(1, iv(9, 17)), day(3, iv(10, 14))));
             // Scatter overrides across the quarter so the fold exercises both override + template branches.
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
-                    new ScheduleOverrideRequest(monday.plusDays(15), ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.VACATION, null, null));
+                    new ScheduleOverrideRequest(monday.plusDays(15), ScheduleExceptionKind.DAY_OFF, null));
             scheduleService.upsertOverride(m.actorId(), m.masterId(),
                     new ScheduleOverrideRequest(monday.plusDays(60), ScheduleExceptionKind.CUSTOM_HOURS,
-                            null, null, List.of(iv(8, 9))));
+                            List.of(iv(8, 9))));
 
             Statistics stats = entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
             boolean wasEnabled = stats.isStatisticsEnabled();

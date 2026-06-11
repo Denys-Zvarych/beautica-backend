@@ -1,12 +1,10 @@
 package com.beautica.master.dto;
 
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.FutureOrPresent;
 import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 import java.time.LocalDate;
@@ -15,13 +13,11 @@ import java.util.List;
 /**
  * Phase 15.2: a per-date override of the weekly template — one row per calendar date.
  *
- * <p>Replaces the closure-only {@link ScheduleExceptionRequest} shape; the old DTO stays for
- * backward-compat on the existing endpoint until Phase 15.5 supersedes it. The {@code kind}
- * discriminator selects the consistent field set:
+ * <p>The {@code kind} discriminator selects the consistent field set:
  * <ul>
- *   <li>{@link ScheduleExceptionKind#DAY_OFF} — closure; {@code reason} required, {@code intervals} empty.</li>
- *   <li>{@link ScheduleExceptionKind#CUSTOM_HOURS} — different hours; {@code reason} absent,
- *       {@code intervals} non-empty.</li>
+ *   <li>{@link ScheduleExceptionKind#DAY_OFF} — closure; {@code intervals} empty. A day-off carries
+ *       no reason and no note (both removed in V83).</li>
+ *   <li>{@link ScheduleExceptionKind#CUSTOM_HOURS} — different hours; {@code intervals} non-empty.</li>
  * </ul>
  *
  * <p><b>Wire format:</b> {@code date} is a {@link LocalDate}, serialized ISO-8601 as {@code yyyy-MM-dd}.
@@ -39,30 +35,21 @@ public record ScheduleOverrideRequest(
         @NotNull(message = "Kind is required")
         ScheduleExceptionKind kind,
 
-        // Required iff DAY_OFF.
-        ScheduleExceptionReason reason,
-
-        // DAY_OFF only. TEXT column in DB — application cap at 2000 (§A). Control-char ban
-        // prevents embedded NUL/newline reaching the DB and producing a 500.
-        @Size(max = 2000, message = "Note must be at most 2000 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Note must not contain control characters")
-        String note,
-
         // Required iff CUSTOM_HOURS.
         @Valid
         @Size(max = 6, message = "An override may have at most 6 intervals")
         List<WorkIntervalDto> intervals
 ) {
 
-    @AssertTrue(message = "DAY_OFF requires a reason and no intervals; CUSTOM_HOURS requires intervals and no reason")
+    @AssertTrue(message = "DAY_OFF must have no intervals; CUSTOM_HOURS requires intervals")
     public boolean isKindConsistent() {
         if (kind == null) {
             return true; // @NotNull on kind reports the missing-kind error.
         }
         boolean hasIntervals = intervals != null && !intervals.isEmpty();
         return switch (kind) {
-            case DAY_OFF -> reason != null && !hasIntervals;
-            case CUSTOM_HOURS -> reason == null && hasIntervals;
+            case DAY_OFF -> !hasIntervals;
+            case CUSTOM_HOURS -> hasIntervals;
         };
     }
 }

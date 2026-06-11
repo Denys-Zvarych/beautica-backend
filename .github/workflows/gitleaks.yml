@@ -1,0 +1,53 @@
+name: Gitleaks
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECRET SCAN (free replacement for GitHub Advanced Security push protection)
+#
+# Scans the repository for committed secrets (API keys, tokens, DB URLs,
+# private keys, etc.) using gitleaks. Runs on every PR and push to dev/main,
+# plus a weekly FULL-HISTORY sweep. Any finding fails the job.
+#
+# Cost / licensing:
+#   - Free for personal-account repos (Denys-Zvarych/*). The GITLEAKS_LICENSE
+#     env var is ONLY required for repos owned by a GitHub *organization*; if
+#     these repos are ever moved under an org, get a free key at
+#     https://gitleaks.io and add it as the `GITLEAKS_LICENSE` repo secret.
+#   - Uses no paid GitHub Advanced Security features.
+#
+# To make this BLOCK merges (recommended after going private):
+#   GitHub → Settings → Branches → branch protection for `dev` and `main` →
+#   "Require status checks to pass" → add the "Scan for secrets" check.
+# ──────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  schedule:
+    # Weekly full-history sweep — Mondays 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write   # lets gitleaks-action post a summary comment on PRs
+
+jobs:
+  gitleaks:
+    name: Scan for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # fetch-depth: 0 pulls the ENTIRE history so the scheduled deep scan
+          # and the PR/push diff range both have every commit available.
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.x — keep updated via Dependabot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Org-owned repos only — leave unset for personal accounts:
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}

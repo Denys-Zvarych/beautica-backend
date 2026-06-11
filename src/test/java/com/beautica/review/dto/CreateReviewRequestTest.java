@@ -194,4 +194,51 @@ class CreateReviewRequestTest {
                 .isNotEmpty();
         assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
     }
+
+    // ── newline/tab loosening regression: body now allows \n, \r, \t ──────────
+
+    @Test
+    @DisplayName("accepts comment when comment body contains line breaks and a tab (long-form copy)")
+    void should_acceptComment_when_commentBodyContainsNewlineAndTab() {
+        // Leading char is visible (anchor satisfied); body carries \n, \r, \t which are now
+        // permitted by the second char class [^\x00-\x08\x0B\x0C\x0E-\x1F\x7F].
+        var comment = "Great service!\nSecond line\r\n\tindented closing remark";
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, comment);
+
+        assertThat(validator.validate(request))
+                .as("comment body with \\n/\\r/\\t must be accepted, actual=%s", comment)
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("rejects comment when comment STARTS with a newline (first-char anchor still holds)")
+    void should_rejectComment_when_commentStartsWithNewline() {
+        // The leading-char anchor [^\p{Cntrl}\s] forbids a comment that begins with whitespace
+        // or a control char — a leading \n must still be rejected even though \n is body-legal.
+        var comment = "\n leading newline then text";
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, comment);
+
+        Set<ConstraintViolation<CreateReviewRequest>> violations = validator.validate(request);
+
+        assertThat(violations)
+                .as("comment starting with a newline must fail the first-char anchor")
+                .isNotEmpty();
+        assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
+    }
+
+    @Test
+    @DisplayName("rejects comment when comment body contains a non-newline C0 control char (VT 0x0B)")
+    void should_rejectComment_when_commentBodyContainsVerticalTab() {
+        // Vertical tab (0x0B) is explicitly in the banned class — confirms the loosening did NOT
+        // open the gate to every control char, only \t \n \r.
+        var comment = "x" + "\u000B" + "vertical tab in body";
+        var request = new CreateReviewRequest(UUID.randomUUID(), 3, comment);
+
+        Set<ConstraintViolation<CreateReviewRequest>> violations = validator.validate(request);
+
+        assertThat(violations)
+                .as("comment with embedded VT (0x0B) must still fail @Pattern validation")
+                .isNotEmpty();
+        assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("comment"));
+    }
 }

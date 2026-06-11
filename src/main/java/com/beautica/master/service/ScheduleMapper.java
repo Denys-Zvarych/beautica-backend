@@ -52,7 +52,7 @@ public class ScheduleMapper {
                         e.getKey(),
                         e.getValue().stream().sorted(BY_START).toList()))
                 .toList();
-        return new WeeklyScheduleResponse(schedule.getValidFrom(), schedule.getValidTo(), days);
+        return new WeeklyScheduleResponse(schedule.getId(), schedule.getValidFrom(), schedule.getValidTo(), days);
     }
 
     /** Maps a persisted per-date override to its read projection. */
@@ -60,8 +60,6 @@ public class ScheduleMapper {
         return new ScheduleOverrideResponse(
                 exception.getDate(),
                 exception.getKind(),
-                exception.getReason(),
-                exception.getNote(),
                 toIntervalDtos(exception.getIntervals()));
     }
 
@@ -69,9 +67,8 @@ public class ScheduleMapper {
     public EffectiveDayResponse toEffectiveDay(
             LocalDate date,
             EffectiveDaySource source,
-            List<WorkIntervalDto> intervals,
-            com.beautica.master.entity.ScheduleExceptionReason reason) {
-        return new EffectiveDayResponse(date, source, intervals, reason);
+            List<WorkIntervalDto> intervals) {
+        return new EffectiveDayResponse(date, source, intervals);
     }
 
     /** Maps an override's intervals (already graph-fetched), ordered by start time. */

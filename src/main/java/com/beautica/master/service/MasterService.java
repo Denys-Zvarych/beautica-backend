@@ -14,15 +14,12 @@ import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
-import com.beautica.master.dto.ScheduleExceptionRequest;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
-import com.beautica.master.entity.ScheduleException;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
@@ -61,7 +58,6 @@ public class MasterService {
     private final UserRepository userRepository;
     private final SalonRepository salonRepository;
     private final WorkingHoursRepository workingHoursRepository;
-    private final ScheduleExceptionRepository scheduleExceptionRepository;
     private final BookingRepository bookingRepository;
     private final CacheManager cacheManager;
     private final CityRepository cityRepository;
@@ -297,7 +293,12 @@ public class MasterService {
         var master = masterRepository.findByIdWithSalonAndOwner(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
-        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)
+        // Merge against ALL existing rows (incl. inactive). The DB unique key is
+        // (master_id, day_of_week) unconditionally, so matching only active rows would miss a
+        // pre-existing inactive row for the same weekday and emit a duplicate INSERT (23505).
+        // Matching all rows lets us UPDATE the existing row in place — preserving its @Id and
+        // toggling is_active back on via setActive(...) below.
+        Map<Integer, WorkingHours> byDay = workingHoursRepository.findByMasterId(masterId)
                 .stream()
                 .collect(Collectors.toMap(WorkingHours::getDayOfWeek, wh -> wh));
 
@@ -318,48 +319,6 @@ public class MasterService {
                 .toList();
         evictMasterCalendarAfterCommit(masterId);
         return saved;
-    }
-
-    @Transactional
-    public ScheduleException addScheduleException(
-            UUID actorId, UUID masterId, ScheduleExceptionRequest request) {
-
-        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
-        // the controller — no redundant DB round-trip needed here.
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
-                .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        var existing = scheduleExceptionRepository.findByMasterIdAndDate(masterId, request.date());
-        ScheduleException result;
-        if (existing.isPresent()) {
-            var ex = existing.get();
-            ex.setReason(request.reason());
-            ex.setNote(request.note());
-            result = scheduleExceptionRepository.save(ex);
-        } else {
-            var exception = ScheduleException.builder()
-                    .master(master)
-                    .date(request.date())
-                    .reason(request.reason())
-                    .note(request.note())
-                    .build();
-            result = scheduleExceptionRepository.save(exception);
-        }
-
-        evictMasterCalendarAfterCommit(masterId);
-        return result;
-    }
-
-    @Transactional
-    public void removeScheduleException(UUID actorId, UUID masterId, LocalDate date) {
-        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
-        // the controller — no redundant DB round-trip needed here.
-        masterRepository.findByIdWithSalonAndOwner(masterId)
-                .orElseThrow(() -> new NotFoundException("Master not found"));
-
-        scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
-                .ifPresent(scheduleExceptionRepository::delete);
-        evictMasterCalendarAfterCommit(masterId);
     }
 
     /**

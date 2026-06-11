@@ -4,10 +4,10 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.WeeklyScheduleDayRequest;
 import com.beautica.master.dto.WeeklyScheduleRequest;
+import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.service.MasterScheduleService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -249,8 +249,7 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
             SeededMaster victim = seedIndependentMaster();
             SeededMaster attacker = seedIndependentMaster();
             scheduleService.upsertOverride(victim.owner().userId(), victim.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, null, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
             ResponseEntity<String> resp = restTemplate.exchange(
                     BASE + "/" + victim.masterId() + "/overrides/" + FUTURE_FROM, HttpMethod.DELETE,
@@ -263,10 +262,78 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
         }
 
         private UUID resolveOnlyScheduleId(SeededMaster m) {
-            // The management GET returns WeeklyScheduleResponse which has no id; resolve the persisted id
-            // straight from the DB so the HTTP IDOR test pins the REAL cross-master schedule.
-            return jdbcTemplate.queryForObject(
-                    "SELECT id FROM weekly_schedules WHERE master_id = ?", UUID.class, m.masterId());
+            // The management GET now returns WeeklyScheduleResponse.id, so resolve the persisted id from the
+            // wire payload itself — the same path a real editor uses to target PUT (no DB-side shortcut).
+            return readOnlyListedScheduleId(m, m.owner());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // S4 — read identity round-trip: GET exposes id → PUT updates in place (no duplicate)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("S4 — weekly-schedule id round-trip")
+    class IdRoundTrip {
+
+        /**
+         * Regression for the missing-{@code id} gap that produced the duplicate-window bug:
+         * {@code GET /weekly-schedules} returned windows with no identity, so a mobile client that
+         * reloaded could not target {@code PUT /weekly-schedules/{scheduleId}} — it re-POSTed and tripped
+         * {@code MasterScheduleService.assertNoWindowOverlap} ({@code BusinessException} "...overlaps an
+         * existing window starting..."). This pins the full HTTP loop: create → reload → PUT the listed id
+         * → 200, same id, updated in place, exactly one window persisted.
+         */
+        @Test
+        @DisplayName("GET exposes a non-null id; PUT-ing it updates in place (200, same id, no duplicate, no overlap)")
+        void should_exposeIdAndUpdateInPlace_when_reEditingAfterReload() throws Exception {
+            SeededMaster m = seedIndependentMaster();
+
+            // Create the initial window over HTTP.
+            ResponseEntity<String> created = restTemplate.exchange(
+                    BASE + "/" + m.masterId() + "/weekly-schedules", HttpMethod.POST,
+                    new HttpEntity<>(weeklyBody(), auth(m.owner())), String.class);
+            assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+            // Reload the list and read the id straight off the wire — the very path the mobile client uses.
+            UUID listedId = readOnlyListedScheduleId(m, m.owner());
+            assertThat(listedId)
+                    .as("GET /weekly-schedules must expose a non-null window id for editors to target PUT")
+                    .isNotNull();
+
+            // PUT the SAME window (overlapping itself) targeting the listed id — the original failure was a
+            // re-POST here, which 422'd on the overlap guard. With the id, this updates in place.
+            String updatedBody = objectMapper.writeValueAsString(new WeeklyScheduleRequest(
+                    FUTURE_FROM, null,
+                    List.of(new WeeklyScheduleDayRequest(2,
+                            List.of(new WorkIntervalDto(LocalTime.of(10, 0), LocalTime.of(16, 0)))))));
+            ResponseEntity<String> put = restTemplate.exchange(
+                    BASE + "/" + m.masterId() + "/weekly-schedules/" + listedId, HttpMethod.PUT,
+                    new HttpEntity<>(updatedBody, auth(m.owner())), String.class);
+
+            assertThat(put.getStatusCode())
+                    .as("re-editing the reloaded id must succeed in place, not trip the overlap guard")
+                    .isEqualTo(HttpStatus.OK);
+            assertThat(objectMapper.readTree(put.getBody()).path("data").path("id").asText())
+                    .as("the PUT response must echo the same window id, not a freshly created one")
+                    .isEqualTo(listedId.toString());
+            assertThat(scheduleService.listWeeklySchedules(m.masterId()))
+                    .as("exactly one window must remain — updated in place, never duplicated")
+                    .singleElement()
+                    .extracting(WeeklyScheduleResponse::id).isEqualTo(listedId);
+        }
+    }
+
+    /** Reads the master's single weekly window id from the management GET wire payload. */
+    private UUID readOnlyListedScheduleId(SeededMaster m, Actor reader) {
+        try {
+            ResponseEntity<String> resp = get("/" + m.masterId() + "/weekly-schedules", reader);
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+            var data = objectMapper.readTree(resp.getBody()).path("data");
+            assertThat(data).as("the listed payload must contain exactly one window").hasSize(1);
+            return UUID.fromString(data.get(0).path("id").asText());
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to read listed schedule id", e);
         }
     }
 
@@ -332,22 +399,19 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
-    // S3 — note (potential SICK_DAY PII) never leaks on public / unauthorized read paths
+    // S3 — V83 contract: reason/note keys never appear on any read path (columns dropped)
     // ════════════════════════════════════════════════════════════════════════════════
 
     @Nested
-    @DisplayName("S3 — note never leaks")
-    class NoteExposure {
-
-        private static final String SECRET = "Surgery at Clinic X — strictly private";
+    @DisplayName("S3 — reason/note never appear in serialized read bodies (V83)")
+    class ResponseShapeExposure {
 
         @Test
-        @DisplayName("the SICK_DAY note is absent from the PUBLIC GET /masters/{id} profile body")
-        void should_notLeakNote_onPublicProfile() {
+        @DisplayName("the PUBLIC GET /masters/{id} profile body carries no reason or note key")
+        void should_notExposeReasonOrNote_onPublicProfile() {
             SeededMaster m = seedIndependentMaster();
             scheduleService.upsertOverride(m.owner().userId(), m.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, SECRET, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
             // No auth header — this is the unauthenticated public profile endpoint.
             ResponseEntity<String> resp = restTemplate.getForEntity(
@@ -355,18 +419,17 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(resp.getBody())
-                    .as("the public master profile must never echo a private schedule note")
-                    .doesNotContain(SECRET)
-                    .doesNotContain("\"note\"");
+                    .as("the public master profile must not echo a removed reason/note key (V83)")
+                    .doesNotContain("\"note\"")
+                    .doesNotContain("\"reason\"");
         }
 
         @Test
-        @DisplayName("the SICK_DAY note is absent from the (authorized) public effective-schedule projection")
-        void should_notLeakNote_onEffectiveScheduleRead() {
+        @DisplayName("the (authorized) effective-schedule projection serializes no reason or note key")
+        void should_notExposeReasonOrNote_onEffectiveScheduleRead() {
             SeededMaster m = seedIndependentMaster();
             scheduleService.upsertOverride(m.owner().userId(), m.masterId(),
-                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF,
-                            ScheduleExceptionReason.SICK_DAY, SECRET, null));
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
 
             ResponseEntity<String> resp = get(
                     "/" + m.masterId() + "/effective-schedule?from=" + FUTURE_FROM + "&to=" + FUTURE_FROM,
@@ -374,9 +437,9 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(resp.getBody())
-                    .as("EffectiveDayResponse carries the reason but never the free-text note")
-                    .contains("SICK_DAY")          // the reason IS exposed (non-PII enum)
-                    .doesNotContain(SECRET)         // the free-text note is NOT
+                    .as("EffectiveDayResponse exposes only date/source/intervals — no reason/note (V83)")
+                    .contains("OVERRIDE_DAY_OFF")   // the source IS exposed
+                    .doesNotContain("\"reason\"")
                     .doesNotContain("\"note\"");
         }
     }

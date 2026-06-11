@@ -1,7 +1,6 @@
 package com.beautica.master.dto;
 
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
 import jakarta.validation.Validator;
@@ -320,77 +319,115 @@ class ScheduleDtoValidationTest {
     @DisplayName("ScheduleOverrideRequest")
     class ScheduleOverrideRequestTests {
 
-        @Test
-        @DisplayName("accepts DAY_OFF when reason present and no intervals")
-        void should_accept_when_dayOffWithReason() {
-            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
-                    ScheduleExceptionReason.VACATION, "Away", List.of());
+        // V83 removed reason + note entirely. The wire shape is now (date, kind, intervals) and
+        // isKindConsistent() pins exactly: DAY_OFF -> no intervals; CUSTOM_HOURS -> has intervals.
 
-            assertThat(validator.validate(req)).isEmpty();
+        @Test
+        @DisplayName("accepts DAY_OFF when intervals empty (V83 — no reason/note exist)")
+        void should_accept_when_dayOffWithNoIntervals() {
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF, List.of());
+
+            assertThat(validator.validate(req))
+                    .as("DAY_OFF with an empty interval list is valid")
+                    .isEmpty();
         }
 
         @Test
-        @DisplayName("rejects DAY_OFF (isKindConsistent) when reason is null")
-        void should_reject_when_dayOffWithoutReason() {
-            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
-                    null, null, List.of());
+        @DisplayName("accepts DAY_OFF when intervals list is null (bare {date, kind:DAY_OFF} body)")
+        void should_accept_when_dayOffWithNullIntervals() {
+            // hasIntervals derives from intervals==null||isEmpty(); a null list is the wire shape for the
+            // bare `{date, kind:DAY_OFF}` body and must validate clean.
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF, null);
 
-            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
-
-            assertThat(violations).isNotEmpty();
-            assertThat(hasViolationOn(violations, "kindConsistent")).isTrue();
+            assertThat(validator.validate(req))
+                    .as("DAY_OFF with a null interval list is valid")
+                    .isEmpty();
         }
 
         @Test
         @DisplayName("rejects DAY_OFF (isKindConsistent) when intervals are present")
         void should_reject_when_dayOffWithIntervals() {
             var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
-                    ScheduleExceptionReason.HOLIDAY, null, List.of(interval("09:00:00", "12:00:00")));
+                    List.of(interval("09:00:00", "12:00:00")));
 
             Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
 
             assertThat(violations).isNotEmpty();
-            assertThat(hasViolationOn(violations, "kindConsistent")).isTrue();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("a DAY_OFF carrying intervals must trip the cross-field rule")
+                    .isTrue();
         }
 
         @Test
-        @DisplayName("accepts CUSTOM_HOURS when intervals present and no reason")
+        @DisplayName("accepts CUSTOM_HOURS when intervals present")
         void should_accept_when_customHoursWithIntervals() {
             var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
-                    null, null, List.of(interval("10:00:00", "14:00:00")));
+                    List.of(interval("10:00:00", "14:00:00")));
 
             assertThat(validator.validate(req)).isEmpty();
         }
 
         @Test
-        @DisplayName("rejects CUSTOM_HOURS (isKindConsistent) when a reason is present")
-        void should_reject_when_customHoursWithReason() {
-            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
-                    ScheduleExceptionReason.OTHER, null, List.of(interval("10:00:00", "14:00:00")));
+        @DisplayName("rejects CUSTOM_HOURS (isKindConsistent) when intervals are empty")
+        void should_reject_when_customHoursWithEmptyIntervals() {
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS, List.of());
 
             Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
 
             assertThat(violations).isNotEmpty();
-            assertThat(hasViolationOn(violations, "kindConsistent")).isTrue();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("CUSTOM_HOURS with an empty interval list must trip the cross-field rule")
+                    .isTrue();
         }
 
         @Test
-        @DisplayName("rejects CUSTOM_HOURS (isKindConsistent) when intervals are empty")
-        void should_reject_when_customHoursWithoutIntervals() {
-            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
-                    null, null, List.of());
+        @DisplayName("rejects CUSTOM_HOURS (isKindConsistent) when intervals list is null")
+        void should_reject_when_customHoursWithNullIntervals() {
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS, null);
 
             Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
 
             assertThat(violations).isNotEmpty();
-            assertThat(hasViolationOn(violations, "kindConsistent")).isTrue();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("CUSTOM_HOURS with a null interval list must trip the cross-field rule")
+                    .isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects intervals (@Size) when CUSTOM_HOURS supplies more than 6 intervals")
+        void should_reject_when_moreThanSixIntervals() {
+            var seven = List.of(
+                    interval("08:00:00", "08:30:00"), interval("09:00:00", "09:30:00"),
+                    interval("10:00:00", "10:30:00"), interval("11:00:00", "11:30:00"),
+                    interval("12:00:00", "12:30:00"), interval("13:00:00", "13:30:00"),
+                    interval("14:00:00", "14:30:00"));
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS, seven);
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "intervals"))
+                    .as("@Size(max=6) on intervals must fire")
+                    .isTrue();
+        }
+
+        @Test
+        @DisplayName("cascades (@Valid) — a malformed nested interval fails the parent override")
+        void should_cascade_when_nestedIntervalInvalid() {
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
+                    List.of(interval("17:00:00", "09:00:00")));
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(hasViolationOn(violations, "intervals[0].ordered"))
+                    .as("@Valid must cascade into the nested WorkIntervalDto isOrdered() rule")
+                    .isTrue();
         }
 
         @Test
         @DisplayName("rejects date when null (@NotNull)")
         void should_reject_when_dateNull() {
-            var req = new ScheduleOverrideRequest(null, ScheduleExceptionKind.DAY_OFF,
-                    ScheduleExceptionReason.VACATION, null, List.of());
+            var req = new ScheduleOverrideRequest(null, ScheduleExceptionKind.DAY_OFF, List.of());
 
             assertThat(hasViolationOn(validator.validate(req), "date")).isTrue();
         }
@@ -398,8 +435,7 @@ class ScheduleDtoValidationTest {
         @Test
         @DisplayName("rejects kind when null (@NotNull; isKindConsistent short-circuits true)")
         void should_reject_when_kindNull() {
-            var req = new ScheduleOverrideRequest(FUTURE, null,
-                    ScheduleExceptionReason.VACATION, null, List.of());
+            var req = new ScheduleOverrideRequest(FUTURE, null, List.of());
 
             Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
 
@@ -409,39 +445,6 @@ class ScheduleDtoValidationTest {
             assertThat(hasViolationOn(violations, "kindConsistent"))
                     .as("isKindConsistent() guards null kind and must not pile on a spurious error")
                     .isFalse();
-        }
-
-        @Test
-        @DisplayName("rejects note (@Pattern) when it contains a control character")
-        void should_reject_when_noteHasControlChar() {
-            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
-                    ScheduleExceptionReason.SICK_DAY, "line1\nline2", List.of());
-
-            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
-
-            assertThat(violations).isNotEmpty();
-            assertThat(hasViolationOn(violations, "note")).isTrue();
-        }
-
-        @Test
-        @DisplayName("accepts note at exactly 2000 chars (max boundary)")
-        void should_accept_when_note2000Chars() {
-            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
-                    ScheduleExceptionReason.VACATION, "x".repeat(2000), List.of());
-
-            assertThat(validator.validate(req)).isEmpty();
-        }
-
-        @Test
-        @DisplayName("rejects note (@Size) when 2001 chars (max=2000)")
-        void should_reject_when_note2001Chars() {
-            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.DAY_OFF,
-                    ScheduleExceptionReason.VACATION, "x".repeat(2001), List.of());
-
-            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
-
-            assertThat(violations).isNotEmpty();
-            assertThat(hasViolationOn(violations, "note")).isTrue();
         }
     }
 }

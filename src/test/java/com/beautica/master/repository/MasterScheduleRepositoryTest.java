@@ -6,7 +6,6 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.ScheduleException;
 import com.beautica.master.entity.ScheduleExceptionKind;
-import com.beautica.master.entity.ScheduleExceptionReason;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -162,7 +161,6 @@ class MasterScheduleRepositoryTest extends AbstractDataJpaTest {
                 .master(master)
                 .date(today)
                 .kind(ScheduleExceptionKind.DAY_OFF)
-                .reason(ScheduleExceptionReason.VACATION)
                 .build();
         em.persist(exception);
         em.flush();
@@ -184,7 +182,6 @@ class MasterScheduleRepositoryTest extends AbstractDataJpaTest {
                 .master(master)
                 .date(today)
                 .kind(ScheduleExceptionKind.DAY_OFF)
-                .reason(ScheduleExceptionReason.SICK_DAY)
                 .build();
         em.persist(exception);
         em.flush();
@@ -205,7 +202,6 @@ class MasterScheduleRepositoryTest extends AbstractDataJpaTest {
                 .master(master)
                 .date(today)
                 .kind(ScheduleExceptionKind.DAY_OFF)
-                .reason(ScheduleExceptionReason.HOLIDAY)
                 .build();
         em.persist(first);
         em.flush();
@@ -213,7 +209,7 @@ class MasterScheduleRepositoryTest extends AbstractDataJpaTest {
         ScheduleException duplicate = ScheduleException.builder()
                 .master(master)
                 .date(today)
-                .reason(ScheduleExceptionReason.OTHER)
+                .kind(ScheduleExceptionKind.DAY_OFF)
                 .build();
         em.persist(duplicate);
 

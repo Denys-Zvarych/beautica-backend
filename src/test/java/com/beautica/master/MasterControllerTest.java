@@ -65,7 +65,6 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -551,46 +550,8 @@ class MasterControllerTest {
                         org.hamcrest.Matchers.containsString("Duplicate"))));
     }
 
-    // ── POST /{masterId}/schedule-exceptions ──────────────────────────────────
-
-    @Test
-    @DisplayName("POST /{masterId}/schedule-exceptions — 400 when required 'date' field is absent")
-    void should_return400_when_missingDateInScheduleExceptionRequest() throws Exception {
-        var masterId = UUID.randomUUID();
-        var userId = UUID.randomUUID();
-        when(authorizationService.canManageMasterSchedule(any(), eq(masterId))).thenReturn(true);
-
-        // date is @NotNull — omitting it must fail Bean Validation with 400
-        String body = "{\"reason\":\"HOLIDAY\"}";
-
-        log.debug("Act: POST {}/{}/schedule-exceptions with missing 'date' field — must be rejected with 400",
-                MASTERS_URL, masterId);
-        mockMvc.perform(post(MASTERS_URL + "/" + masterId + "/schedule-exceptions")
-                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("POST /{masterId}/schedule-exceptions — 400 when date is in the past")
-    void should_return400_when_scheduleExceptionDateIsInThePast() throws Exception {
-        var masterId = UUID.randomUUID();
-        var userId = UUID.randomUUID();
-        when(authorizationService.canManageMasterSchedule(any(), eq(masterId))).thenReturn(true);
-
-        // date in 2020 — clearly in the past, fails @FutureOrPresent
-        String body = "{\"date\":\"2020-01-01\",\"reason\":\"HOLIDAY\"}";
-        log.debug("Act: POST {}/{}/schedule-exceptions with past date 2020-01-01", MASTERS_URL, masterId);
-
-        mockMvc.perform(post(MASTERS_URL + "/" + masterId + "/schedule-exceptions")
-                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isBadRequest());
-    }
+    // V83 deleted the legacy POST/DELETE /{masterId}/schedule-exceptions endpoints. Per-date overrides
+    // are now served by PUT/DELETE /{masterId}/schedule/overrides — covered by MasterScheduleControllerTest.
 
     // ── DELETE /{masterId} ────────────────────────────────────────────────────
 
@@ -633,48 +594,6 @@ class MasterControllerTest {
         log.debug("Act: DELETE {}/{} as SALON_OWNER without ownership — must be 403", MASTERS_URL, masterId);
         mockMvc.perform(delete(MASTERS_URL + "/" + masterId)
                         .with(authenticatedAs(foreignOwnerId, "other@beautica.test", Role.SALON_OWNER))
-                        .with(csrf()))
-                .andExpect(status().isForbidden());
-    }
-
-    // ── DELETE /{masterId}/schedule-exceptions/{date} ─────────────────────────
-
-    @Test
-    @DisplayName("DELETE /{masterId}/schedule-exceptions/{date} — 204 when owner removes exception")
-    void should_return204_when_ownerRemovesScheduleException() throws Exception {
-        var userId = UUID.randomUUID();
-        var masterId = UUID.randomUUID();
-        var exceptionDate = LocalDate.of(2026, 6, 1);
-        when(authorizationService.canManageMasterSchedule(any(), eq(masterId))).thenReturn(true);
-        doNothing().when(masterService).removeScheduleException(eq(userId), eq(masterId), eq(exceptionDate));
-
-        log.debug("Act: DELETE {}/{}/schedule-exceptions/{} as INDEPENDENT_MASTER", MASTERS_URL, masterId, exceptionDate);
-        mockMvc.perform(delete(MASTERS_URL + "/" + masterId + "/schedule-exceptions/" + exceptionDate)
-                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
-                        .with(csrf()))
-                .andExpect(status().isNoContent());
-    }
-
-    @Test
-    @DisplayName("DELETE /{masterId}/schedule-exceptions/{date} — 401 when no Authorization header")
-    void should_return401_when_noTokenOnDeleteScheduleException() throws Exception {
-        var masterId = UUID.randomUUID();
-
-        mockMvc.perform(delete(MASTERS_URL + "/" + masterId + "/schedule-exceptions/2026-06-01")
-                        .with(csrf()))
-                .andExpect(status().isUnauthorized());
-    }
-
-    @Test
-    @DisplayName("DELETE /{masterId}/schedule-exceptions/{date} — 403 when SALON_MASTER calls endpoint")
-    void should_return403_when_salonMasterDeletesScheduleException() throws Exception {
-        var salonMasterUserId = UUID.randomUUID();
-        var masterId = UUID.randomUUID();
-        when(authorizationService.canManageMasterSchedule(any(), eq(masterId))).thenReturn(false);
-
-        log.debug("Act: DELETE {}/{}/schedule-exceptions/2026-06-01 as SALON_MASTER — must be denied", MASTERS_URL, masterId);
-        mockMvc.perform(delete(MASTERS_URL + "/" + masterId + "/schedule-exceptions/2026-06-01")
-                        .with(authenticatedAs(salonMasterUserId, "smaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf()))
                 .andExpect(status().isForbidden());
     }
