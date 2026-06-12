@@ -66,8 +66,10 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
     void should_autoCreateOwnerMaster_on_firstSalonCreation() {
         // Arrange
         UUID ownerId = persistOwner("owner-first@beautica.test");
+        UUID cityId = jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
         var request = new CreateSalonRequest(
-                "Velvet Studio", null, "Kyiv", null, null, null, null, null, null, null, null, null);
+                "Velvet Studio", null, "Kyiv", null, null, null, null, cityId, null, null, null, null);
 
         // Act
         var salonResponse = salonService.createSalon(ownerId, request);
@@ -106,10 +108,12 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
     void should_notAutoCreateMaster_on_secondSalonCreation() {
         // Arrange
         UUID ownerId = persistOwner("owner-second@beautica.test");
+        UUID cityId = jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
         var firstRequest = new CreateSalonRequest(
-                "First Studio", null, "Kyiv", null, null, null, null, null, null, null, null, null);
+                "First Studio", null, "Kyiv", null, null, null, null, cityId, null, null, null, null);
         var secondRequest = new CreateSalonRequest(
-                "Second Studio", null, "Lviv", null, null, null, null, null, null, null, null, null);
+                "Second Studio", null, "Lviv", null, null, null, null, cityId, null, null, null, null);
 
         // Act — create first salon (triggers auto-master)
         salonService.createSalon(ownerId, firstRequest);

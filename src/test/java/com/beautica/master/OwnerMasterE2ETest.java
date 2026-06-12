@@ -124,7 +124,11 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         log.debug("Step 1 complete — owner={}, client={}", ownerEmail, clientEmail);
 
         // ── Step 2: create salon ──────────────────────────────────────────────
-        var createSalonReq = new CreateSalonRequest("E2E Owner Studio", null, "Kyiv", null, null, null, null, null, null, null, null, null);
+        // Vinnytsia has no urban districts in the official KATOTTH classifier, so
+        // no districtId is required — only cityId is mandatory for provider locality.
+        UUID vinnytsiaCityId = jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        var createSalonReq = new CreateSalonRequest("E2E Owner Studio", null, "Kyiv", null, null, null, null, vinnytsiaCityId, null, null, null, null);
         ResponseEntity<String> salonResp = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(createSalonReq, bearerHeaders(ownerToken)),
