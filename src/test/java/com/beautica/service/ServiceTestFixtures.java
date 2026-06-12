@@ -60,7 +60,11 @@ class ServiceTestFixtures {
     }
 
     UUID createSalon(String ownerToken, String name) throws Exception {
-        String body = "{\"name\":\"" + name + "\"}";
+        // Vinnytsia has no urban districts in the official KATOTTH classifier, so
+        // no districtId is required — only cityId is mandatory for provider locality.
+        UUID cityId = jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        String body = "{\"name\":\"" + name + "\",\"cityId\":\"" + cityId + "\"}";
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons", HttpMethod.POST,
                 new HttpEntity<>(body, bearerHeaders(ownerToken)),

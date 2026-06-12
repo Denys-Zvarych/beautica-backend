@@ -236,7 +236,11 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
     }
 
     private void createSalon(String ownerToken, String salonName) throws Exception {
-        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, null, null, null, null, null);
+        // Vinnytsia has no urban districts in the official KATOTTH classifier, so
+        // no districtId is required — only cityId is mandatory for provider locality.
+        UUID cityId = jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null, null, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(ownerToken)),

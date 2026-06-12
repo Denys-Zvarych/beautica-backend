@@ -136,6 +136,16 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
+  json:
+    # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
+    # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB
+    # value (e.g. a `comment`/`note`) is rejected before it is materialised onto the heap
+    # and before @Size validation runs — closing a cross-cutting DoS-amplification gap.
+    # 65536 chars = 64 KB: >16x headroom over the 4000-char largest free-text @Size field
+    # while still blocking multi-MB payloads. Applies in every profile (incl. test).
+    max-string-length: ${APP_JSON_MAX_STRING_LENGTH:65536}
+    max-nesting-depth: ${APP_JSON_MAX_NESTING_DEPTH:64}
+    max-number-length: ${APP_JSON_MAX_NUMBER_LENGTH:100}
   # Externally-reachable base URL of THIS backend. Used to build the admin
   # category-approval link in the notification email. Distinct from
   # app.frontend.base-url (the app origin) — the approval page is served here.
