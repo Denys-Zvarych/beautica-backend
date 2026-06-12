@@ -7,6 +7,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -1197,5 +1199,286 @@ class ServiceControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"photoUrl\":\"https://\"}"))
                 .andExpect(status().isBadRequest());
+    }
+
+    // ── POST /api/v1/independent-masters/me/services/bulk ──────────────────────
+    //
+    // First-time bulk setup, self path. The @WebMvcTest slice pins the HTTP contract:
+    // role gate (INDEPENDENT_MASTER), bean-validation of the batch envelope + per-item
+    // price mode, and the GlobalExceptionHandler rendering of the service-layer 409.
+    // The service-layer behaviour (derivation, all-or-nothing) is covered by
+    // ServiceCatalogServiceBulkCreateTest; the DB rollback by BulkServiceSetupIntegrationTest.
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 201 with the created services list")
+    void should_return201_when_independentMasterBulkCreates() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var firstId = UUID.randomUUID();
+        var secondId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null),
+                new BulkServiceItemRequest(UUID.randomUUID(), 120, PriceType.RANGE, null, new BigDecimal("800.00"), new BigDecimal("1500.00"))));
+
+        var created = List.of(
+                stubMasterServiceResponse(firstId, masterId, "Манікюр"),
+                stubMasterServiceResponse(secondId, masterId, "Фарбування"));
+        when(serviceCatalogService.bulkCreateIndependentMasterServices(eq(userId), any(BulkCreateServicesRequest.class)))
+                .thenReturn(created);
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk as INDEPENDENT_MASTER with a 2-item batch");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].id").value(firstId.toString()))
+                .andExpect(jsonPath("$.data[1].id").value(secondId.toString()));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 409 envelope when the master already has active services")
+    void should_return409_when_bulkSetupAndMasterAlreadyHasServices() throws Exception {
+        var userId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
+
+        when(serviceCatalogService.bulkCreateIndependentMasterServices(eq(userId), any()))
+                .thenThrow(new BusinessException(HttpStatus.CONFLICT,
+                        "Bulk setup is only available for a master with no active services"));
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk when master already has services — expect 409 envelope");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when items list is empty (@NotEmpty)")
+    void should_return400_when_bulkItemsEmpty() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with empty items — @NotEmpty must reject with 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"items\":[]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when items list exceeds 100 (@Size(max=100))")
+    void should_return400_when_bulkItemsExceedMax() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // Build 101 valid items so the ONLY violation is the @Size(max=100) cap.
+        StringBuilder items = new StringBuilder("{\"items\":[");
+        for (int i = 0; i < 101; i++) {
+            if (i > 0) items.append(',');
+            items.append("{\"serviceTypeId\":\"").append(UUID.randomUUID())
+                    .append("\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}");
+        }
+        items.append("]}");
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with 101 items — @Size(max=100) must reject with 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(items.toString()))
+                .andExpect(status().isBadRequest());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when a per-item RANGE has priceMax <= priceMin (@ServicePriceValid cascades through @Valid)")
+    void should_return400_when_bulkItemRangeMaxNotGreaterThanMin() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // Per-item @ServicePriceValid must fire through the list element @Valid cascade.
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"RANGE\",\"priceMin\":800.00,\"priceMax\":500.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with item priceMax<priceMin — must return 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when a per-item FIXED also carries priceMin/priceMax")
+    void should_return400_when_bulkItemFixedAlsoCarriesRangeFields() throws Exception {
+        var userId = UUID.randomUUID();
+
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"priceMin\":300.00,\"priceMax\":400.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with FIXED + range fields both set — must return 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 403 when a CLIENT calls the self bulk endpoint (role gate)")
+    void should_return403_when_clientCallsSelfBulk() throws Exception {
+        var userId = UUID.randomUUID();
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk as CLIENT — must be denied with 403");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 401 when no Authorization header is present")
+    void should_return401_when_selfBulkWithoutAuth() throws Exception {
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk without credentials — must return 401");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isUnauthorized());
+    }
+
+    // ── POST /api/v1/salons/{salonId}/masters/{masterId}/services/bulk ─────────
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 201 when SALON_OWNER bulk-creates on behalf of their master")
+    void should_return201_when_ownerBulkCreatesForMaster() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
+        var created = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Манікюр"));
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.bulkCreateSalonMasterServices(eq(salonId), eq(masterId), any()))
+                .thenReturn(created);
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk as SALON_OWNER", salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].masterId").value(masterId.toString()));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 201 when SALON_ADMIN bulk-creates on behalf (intentional canManageSalon broadening)")
+    void should_return201_when_salonAdminBulkCreatesForMaster() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
+        var created = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Манікюр"));
+
+        // The bulk on-behalf endpoint has NO hasRole gate — it relies on canManageSalon,
+        // which the contract intentionally grants to SALON_ADMIN as well as SALON_OWNER.
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.bulkCreateSalonMasterServices(eq(salonId), eq(masterId), any()))
+                .thenReturn(created);
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk as SALON_ADMIN — must be allowed on-behalf", salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 403 when the master is not in the salon (masterBelongsToSalon IDOR guard)")
+    void should_return403_when_bulkTargetsMasterInAnotherSalon() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonAId = UUID.randomUUID();
+        var masterInSalonBId = UUID.randomUUID();
+
+        // Owner can manage salon A, but the target master belongs to salon B → guard denies.
+        when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterInSalonBId, salonAId)).thenReturn(false);
+
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk targeting a master in another salon — must return 403", salonAId, masterInSalonBId);
+        mockMvc.perform(post("/api/v1/salons/" + salonAId + "/masters/" + masterInSalonBId + "/services/bulk")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateSalonMasterServices(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 403 when caller cannot manage the salon")
+    void should_return403_when_bulkOnBehalfByNonManager() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
+
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk by a non-manager — must return 403", salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
+                        .with(authenticatedAs(userId, "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateSalonMasterServices(any(), any(), any());
     }
 }

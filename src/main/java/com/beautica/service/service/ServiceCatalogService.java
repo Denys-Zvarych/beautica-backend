@@ -8,6 +8,8 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -39,7 +41,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 @Service
@@ -190,6 +194,216 @@ public class ServiceCatalogService {
         evictMasterServicesCache(List.of(master.getId()));
 
         return MasterServiceResponse.from(savedAssignment);
+    }
+
+    /**
+     * First-time bulk service setup for an INDEPENDENT_MASTER acting on their own behalf.
+     *
+     * <p>The acting master is resolved from the authenticated principal's {@code userId}
+     * (never a client-supplied id), mirroring {@link #addIndependentMasterService}. The
+     * batch is created all-or-nothing in this single transaction.
+     *
+     * @throws ForbiddenException if the user is not an INDEPENDENT_MASTER
+     * @throws BusinessException  (409) if the master already has any active service
+     */
+    @Transactional
+    public List<MasterServiceResponse> bulkCreateIndependentMasterServices(
+            UUID userId,
+            BulkCreateServicesRequest request) {
+
+        Master master = masterRepository.findByUserId(userId)
+                .orElseThrow(() -> new NotFoundException("Master not found for user: " + userId));
+
+        if (master.getMasterType() != MasterType.INDEPENDENT_MASTER) {
+            throw new ForbiddenException("Only independent masters can add their own services");
+        }
+
+        return bulkCreateForMaster(master, OwnerType.INDEPENDENT_MASTER, master.getId(), request);
+    }
+
+    /**
+     * First-time bulk service setup performed by a SALON_OWNER/SALON_ADMIN on behalf of a
+     * master in their salon (including the owner-operated master row).
+     *
+     * <p>Salon-membership of the target master is verified here as the second half of the
+     * controller's {@code @PreAuthorize} role gate (anti-bug §D split), mirroring
+     * {@link #assignServiceToMaster}. Services are owned by the master row, not the salon —
+     * no salon-level catalog entity is created.
+     *
+     * @throws ForbiddenException if the master does not belong to the given salon
+     * @throws BusinessException  (409) if the master already has any active service
+     */
+    @Transactional
+    public List<MasterServiceResponse> bulkCreateSalonMasterServices(
+            UUID salonId,
+            UUID masterId,
+            BulkCreateServicesRequest request) {
+
+        Master master = masterRepository.findById(masterId)
+                .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
+
+        if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        return bulkCreateForMaster(master, OwnerType.INDEPENDENT_MASTER, master.getId(), request);
+    }
+
+    /**
+     * Shared first-time bulk-create core for a resolved master.
+     *
+     * <p>Services in this platform are owned by the master row regardless of how the master
+     * was created (independent or salon-bound), so both entry points persist
+     * {@code ownerType = INDEPENDENT_MASTER, ownerId = master.id} and a per-definition
+     * {@link MasterServiceAssignment} — identical to {@link #addIndependentMasterService}.
+     *
+     * <p>Enforces the first-time precondition (409 when any active service already exists),
+     * rejects duplicate {@code serviceTypeId}s, derives each service name + category from the
+     * chosen {@link ServiceType}, reuses {@link #applyPriceMode} for the validated price mode,
+     * and persists the whole batch transactionally (all-or-nothing).
+     */
+    private List<MasterServiceResponse> bulkCreateForMaster(
+            Master master,
+            OwnerType ownerType,
+            UUID ownerId,
+            BulkCreateServicesRequest request) {
+
+        if (masterServiceRepository.existsActiveServiceForMaster(master.getId())) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Bulk setup is only available for a master with no active services");
+        }
+
+        rejectDuplicateServiceTypeIds(request.items());
+
+        // PERF: resolve all service types in ONE query (the ids are already distinct,
+        // guaranteed by rejectDuplicateServiceTypeIds) instead of N serialized findById
+        // calls, then validate every DISTINCT derived category in ONE query instead of a
+        // SELECT EXISTS per item. Both walks share this resolved-types map.
+        Map<UUID, ServiceType> typesById = resolveBulkServiceTypes(request.items());
+        validateBulkCategoriesActive(typesById.values());
+
+        List<MasterServiceResponse> created = request.items().stream()
+                .map(item -> createSingleFromBulkItem(
+                        master, ownerType, ownerId, item, typesById.get(item.serviceTypeId())))
+                .toList();
+
+        // Keep the pre-computed min_effective_price in sync for the master's search entry
+        // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
+        masterRepository.refreshMinEffectivePrice(master.getId());
+        evictMasterServicesCache(List.of(master.getId()));
+
+        return created;
+    }
+
+    /**
+     * Batch-resolves every {@link ServiceType} referenced by the bulk items in ONE
+     * {@code findAllById} query (the ids are already distinct — see
+     * {@link #rejectDuplicateServiceTypeIds}). Each requested id must exist and be
+     * active, otherwise the same errors the per-item path raised are thrown: a missing
+     * id is a 404 {@link NotFoundException}, an inactive type is a 400.
+     *
+     * @return a map keyed by service-type id, covering every requested id
+     */
+    private Map<UUID, ServiceType> resolveBulkServiceTypes(List<BulkServiceItemRequest> items) {
+        List<UUID> ids = items.stream()
+                .map(BulkServiceItemRequest::serviceTypeId)
+                .toList();
+
+        Map<UUID, ServiceType> typesById = serviceTypeRepository.findAllById(ids).stream()
+                .collect(java.util.stream.Collectors.toMap(ServiceType::getId, java.util.function.Function.identity()));
+
+        for (UUID id : ids) {
+            ServiceType type = typesById.get(id);
+            if (type == null) {
+                throw new NotFoundException("ServiceType not found: " + id);
+            }
+            if (!type.isActive()) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
+            }
+        }
+        return typesById;
+    }
+
+    /**
+     * Validates every DISTINCT category derived from the resolved service types in a
+     * SINGLE query (PERF: collapses up to N {@code SELECT EXISTS} into one
+     * {@code ... WHERE name IN (:names)}). The derived categories are highly duplicated
+     * across items, so the distinct set is typically tiny. Any requested category not
+     * returned as APPROVED + active triggers the same 400 as
+     * {@link #validateCategoryActive(String)}.
+     */
+    private void validateBulkCategoriesActive(java.util.Collection<ServiceType> types) {
+        Set<String> requested = types.stream()
+                .map(ServiceType::getPlatformCategoryName)
+                .filter(Objects::nonNull)
+                .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
+
+        if (requested.isEmpty()) {
+            return;
+        }
+
+        Set<String> selectable = Set.copyOf(platformCategoryRepository.findSelectableNamesIn(requested));
+        for (String category : requested) {
+            if (!selectable.contains(category)) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
+            }
+        }
+    }
+
+    /**
+     * Creates one {@link ServiceDefinition} + {@link MasterServiceAssignment} from a bulk
+     * item, using the pre-resolved {@link ServiceType} (type existence, active-check, and
+     * category validation are already done in batch by the caller). The service-type's name
+     * + parent category are the source of truth for the persisted name and category (no
+     * free-text name accepted).
+     */
+    private MasterServiceResponse createSingleFromBulkItem(
+            Master master,
+            OwnerType ownerType,
+            UUID ownerId,
+            BulkServiceItemRequest item,
+            ServiceType serviceType) {
+
+        String category = serviceType.getPlatformCategoryName();
+
+        ServiceDefinition definition = ServiceDefinition.builder()
+                .ownerType(ownerType)
+                .ownerId(ownerId)
+                .name(serviceType.getNameUk())
+                .category(category)
+                .baseDurationMinutes(item.durationMinutes())
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        applyPriceMode(definition, item.priceType(), item.price(), item.priceMin(), item.priceMax());
+        definition.setServiceType(serviceType);
+
+        ServiceDefinition savedDef = serviceRepository.save(definition);
+
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(savedDef)
+                .isActive(true)
+                .build();
+
+        return MasterServiceResponse.from(masterServiceRepository.save(assignment));
+    }
+
+    /**
+     * Rejects a batch that toggles the same service type on twice. Without this guard a
+     * caller could create two near-identical services in one call, which the first-time
+     * setup screen never intends.
+     */
+    private void rejectDuplicateServiceTypeIds(List<BulkServiceItemRequest> items) {
+        long distinct = items.stream()
+                .map(BulkServiceItemRequest::serviceTypeId)
+                .distinct()
+                .count();
+        if (distinct != items.size()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Duplicate service type in bulk request");
+        }
     }
 
     @Transactional(readOnly = true)

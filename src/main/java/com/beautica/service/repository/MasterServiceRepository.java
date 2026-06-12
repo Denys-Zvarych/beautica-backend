@@ -102,4 +102,23 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      */
     @Query("SELECT DISTINCT a.master.id FROM MasterServiceAssignment a WHERE a.serviceDefinition.id = :serviceDefId")
     List<UUID> findMasterIdsByServiceDefinitionId(@Param("serviceDefId") UUID serviceDefId);
+
+    /**
+     * Returns true if the given master has at least one assignment whose linked service
+     * definition is <em>also</em> active — i.e. at least one service visible in the
+     * master's menu and the public browse.
+     *
+     * <p>Used by the first-time bulk-setup precondition: the bulk endpoint is valid only
+     * when a master currently has zero active services. The {@code sd.isActive = true}
+     * predicate mirrors {@link #findByMasterIdAndIsActiveTrueWithGraph} so a soft-deleted
+     * definition does not count as an active service and does not block the first-time flow.
+     */
+    @Query("""
+            SELECT COUNT(msa) > 0
+            FROM MasterServiceAssignment msa
+            WHERE msa.master.id = :masterId
+              AND msa.isActive = true
+              AND msa.serviceDefinition.isActive = true
+            """)
+    boolean existsActiveServiceForMaster(@Param("masterId") UUID masterId);
 }

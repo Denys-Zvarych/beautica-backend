@@ -97,6 +97,17 @@ public class RateLimitConfig {
 
     private static final Duration SUGGEST_SERVICE_TYPE_WINDOW = Duration.ofMinutes(60);
 
+    // Per-IP cap for the two first-time bulk-service-setup endpoints (60-second window):
+    //   - POST /api/v1/independent-masters/me/services/bulk
+    //   - POST /api/v1/salons/{salonId}/masters/{masterId}/services/bulk
+    // Even the 409 (first-time-only) path runs full 100-item validation, so this is an
+    // authenticated DoS-amplifier surface — kept low (10/min) to match the other write
+    // buckets (media, profile-update, device-token). IP-keyed for consistency with every
+    // other bucket in this filter (JWT is not yet parsed when AuthRateLimitFilter runs).
+    // Configurable so integration tests on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.bulk-service-setup-capacity:10}")
+    private long bulkServiceSetupCapacity;
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
         return Caffeine.newBuilder()
@@ -285,6 +296,32 @@ public class RateLimitConfig {
                 .expireAfterAccess(SUGGEST_SERVICE_TYPE_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(suggestServiceTypeCapacity, SUGGEST_SERVICE_TYPE_WINDOW))
+                        .build());
+    }
+
+    /**
+     * Per-IP bucket for the two first-time bulk-service-setup endpoints
+     * ({@code POST .../services/bulk}).
+     *
+     * <p>Cap: 10 requests per 60-second window per source IP — matching the other
+     * authenticated write buckets ({@link #mediaUploadBuckets()},
+     * {@link #profileUpdateBuckets()}, {@link #deviceTokenBuckets()}). Each request can
+     * carry up to 100 items whose validation (type resolution, category checks,
+     * persistence) runs even on the 409 first-time-only path, so an unthrottled
+     * token-holder is a DoS amplifier; the low cap removes that lever while staying
+     * generous for a legitimate retry.
+     *
+     * <p>IP-keyed (not user-keyed) for consistency with every other bucket in this
+     * filter: JWT parsing happens in
+     * {@link com.beautica.auth.JwtAuthenticationFilter} which runs after this filter.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> bulkServiceSetupBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(Duration.ofHours(1))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(bulkServiceSetupCapacity, Duration.ofMinutes(1)))
                         .build());
     }
 
