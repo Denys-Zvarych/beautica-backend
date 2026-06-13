@@ -160,6 +160,27 @@ public class AuthorizationService {
         }
     }
 
+    /**
+     * Service-layer (defense-in-depth) ownership guard for a {@link ServiceDefinition}
+     * mutation, the actorId-accepting twin of {@link #canManageServiceDefinition}.
+     *
+     * <p>Reuses the same {@code findOwnerUserId} projection the SpEL {@code @PreAuthorize}
+     * gate uses, so no entity is loaded twice and no new query is introduced. A missing
+     * definition is treated as access-denied (403), consistent with the SpEL variant which
+     * returns {@code false} for an unknown id (anti-bug §B/§D — never leak existence via
+     * a distinct status).
+     *
+     * @throws ForbiddenException if the actor is not the owner of the definition's parent
+     */
+    public void enforceCanManageServiceDefinition(UUID actorId, UUID serviceDefId) {
+        boolean allowed = serviceRepository.findOwnerUserId(serviceDefId)
+                .map(ownerUserId -> ownerUserId.equals(actorId))
+                .orElse(false);
+        if (!allowed) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
     public void enforceCanManageMaster(UUID actorId, Master master) {
         boolean allowed;
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {

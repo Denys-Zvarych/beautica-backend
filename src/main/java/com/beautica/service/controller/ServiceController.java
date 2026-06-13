@@ -164,11 +164,15 @@ public class ServiceController {
     }
 
     @DeleteMapping("/services/{serviceDefId}")
-    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
+    // Role-only fast gate here; ownership is enforced once inside the service against the
+    // already-needed findOwnerUserId projection (anti-bug §D split — no duplicate SpEL
+    // canManage* lookup that would issue a second round-trip).
+    @PreAuthorize("hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER')")
     public ResponseEntity<Void> deactivateServiceDefinition(
-            @PathVariable UUID serviceDefId
+            @PathVariable UUID serviceDefId,
+            Authentication authentication
     ) {
-        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(extractUserId(authentication), serviceDefId);
         return ResponseEntity.noContent().build();
     }
 

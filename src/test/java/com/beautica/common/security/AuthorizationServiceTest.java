@@ -508,6 +508,50 @@ class AuthorizationServiceTest {
         verify(serviceRepository, never()).findOwnerUserId(any());
     }
 
+    // ── enforceCanManageServiceDefinition (B14 service-layer guard) ────────────
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition does not throw when actor owns the service definition")
+    void should_notThrow_when_actorOwnsServiceDefinition() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.findOwnerUserId(serviceDefId)).thenReturn(Optional.of(actorId));
+
+        assertThatCode(() -> authorizationService.enforceCanManageServiceDefinition(actorId, serviceDefId))
+                .as("owner of the service definition must pass the B14 guard")
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition throws ForbiddenException when actor is NOT the owner")
+    void should_throwForbidden_when_actorIsNotServiceDefinitionOwner() {
+        UUID actorId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.findOwnerUserId(serviceDefId)).thenReturn(Optional.of(ownerId));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(actorId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Access denied");
+    }
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition throws ForbiddenException when the service definition does not exist (no existence oracle)")
+    void should_throwForbidden_when_serviceDefinitionDoesNotExistOnEnforce() {
+        UUID actorId = UUID.randomUUID();
+        UUID missing = UUID.randomUUID();
+
+        when(serviceRepository.findOwnerUserId(missing)).thenReturn(Optional.empty());
+
+        // Unknown id is treated as access-denied (403), consistent with canManageServiceDefinition —
+        // never a distinct 404 that would leak existence (anti-bug §B/§D).
+        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(actorId, missing))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Access denied");
+    }
+
     // ── canManageBooking ───────────────────────────────────────────────────────
 
     @Test

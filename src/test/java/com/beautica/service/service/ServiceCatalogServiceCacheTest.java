@@ -57,6 +57,10 @@ class ServiceCatalogServiceCacheTest {
     @MockBean PlatformCategoryRepository platformCategoryRepository;
     @MockBean EmailService emailService;
     @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
+    // B14: ServiceCatalogService now collaborates with AuthorizationService for the
+    // service-layer ownership guard. Mock it (void enforce* defaults to a no-op) so the
+    // cache-behaviour tests below exercise the happy owner path.
+    @MockBean(name = "authz") com.beautica.common.security.AuthorizationService authz;
 
     @Autowired ServiceCatalogService serviceCatalogService;
     @Autowired CacheManager cacheManager;
@@ -99,8 +103,8 @@ class ServiceCatalogServiceCacheTest {
 
         // Populate cache
         serviceCatalogService.getMasterServices(masterId);
-        // Evict all masterServices entries
-        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+        // Evict all masterServices entries (owner actor — guard mock is a no-op)
+        serviceCatalogService.deactivateServiceDefinition(UUID.randomUUID(), serviceDefId);
         // Cache was evicted — repository must be queried again
         serviceCatalogService.getMasterServices(masterId);
 
@@ -264,7 +268,7 @@ class ServiceCatalogServiceCacheTest {
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         // Act — no active Spring transaction here; eviction runs immediately in the else-branch.
-        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(UUID.randomUUID(), serviceDefId);
 
         // Assert — the cache entry for the affected master must be gone.
         assertThat(slotsCache.get(cacheKey)).isNull();

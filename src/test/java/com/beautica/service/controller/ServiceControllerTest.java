@@ -4,6 +4,7 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
@@ -47,6 +48,9 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -550,17 +554,22 @@ class ServiceControllerTest {
     // ── DELETE /api/v1/services/{serviceDefId} ─────────────────────────────────
 
     @Test
-    @DisplayName("DELETE /services/{id} — 204 when owner deactivates their service definition")
+    @DisplayName("DELETE /services/{id} — 204 when SALON_OWNER passes the role gate; controller forwards its userId as actorId to the service")
     void should_return204_when_ownerDeactivatesService() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+        // §D split: the DELETE gate is role-only (hasAnyRole SALON_OWNER/INDEPENDENT_MASTER).
+        // Ownership is enforced inside the service (B14), not via canManageServiceDefinition SpEL.
+        // deactivateServiceDefinition is void — default Mockito no-op = success.
 
         log.debug("Act: DELETE /api/v1/services/{} as SALON_OWNER — must return 204", serviceDefId);
         mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf()))
                 .andExpect(status().isNoContent());
+
+        // Controller must pass the authenticated principal's userId as the actorId (B14 split).
+        verify(serviceCatalogService).deactivateServiceDefinition(userId, serviceDefId);
     }
 
     // ── Validation boundary tests ─────────────────────────────────────────────
@@ -777,46 +786,79 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 403 when CLIENT role calls the delete endpoint")
+    @DisplayName("DELETE /services/{id} — 403 when CLIENT role calls the delete endpoint (role-only gate denies)")
     void should_return403_when_clientCallsDeleteService() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        // canManageServiceDefinition returns false for a CLIENT: a CLIENT user never owns
-        // a service definition, so AuthorizationService denies the request.
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
+        // §D split: the role-only @PreAuthorize(hasAnyRole SALON_OWNER/INDEPENDENT_MASTER) denies a
+        // CLIENT before the controller body runs — the service method is never reached.
 
         log.debug("Act: DELETE /api/v1/services/{} as CLIENT — must be denied with 403", serviceDefId);
         mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
                         .with(csrf()))
                 .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).deactivateServiceDefinition(any(), any());
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 204 when INDEPENDENT_MASTER deletes their own service definition")
+    @DisplayName("DELETE /services/{id} — 403 when SALON_MASTER (read-only role) calls the delete endpoint (role-only gate denies)")
+    void should_return403_when_salonMasterCallsDeleteService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        log.debug("Act: DELETE /api/v1/services/{} as SALON_MASTER — read-only role must be denied with 403", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).deactivateServiceDefinition(any(), any());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 403 when SALON_ADMIN calls the delete endpoint (role-only gate excludes SALON_ADMIN)")
+    void should_return403_when_salonAdminCallsDeleteService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        // SALON_ADMIN is intentionally NOT in hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER').
+
+        log.debug("Act: DELETE /api/v1/services/{} as SALON_ADMIN — must be denied with 403", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).deactivateServiceDefinition(any(), any());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 204 when INDEPENDENT_MASTER passes the role gate; service receives its userId as actorId")
     void should_return204_when_independentMasterDeletesOwnService() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        // canManageServiceDefinition returns true: this master owns the definition.
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-        // deactivateServiceDefinition is void — default Mockito behaviour is a no-op,
-        // which is exactly what we want.
+        // Role gate passes for INDEPENDENT_MASTER; deactivateServiceDefinition is void (no-op = success).
 
         log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER — must deactivate and return 204", serviceDefId);
         mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf()))
                 .andExpect(status().isNoContent());
+
+        verify(serviceCatalogService).deactivateServiceDefinition(userId, serviceDefId);
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 403 when INDEPENDENT_MASTER tries to delete SALON-owned service")
+    @DisplayName("DELETE /services/{id} — 403 when INDEPENDENT_MASTER targets a SALON-owned service (B14 service-layer guard throws ForbiddenException)")
     void should_return403_when_independentMasterDeletesSalonOwnedService() throws Exception {
         var imUserId = UUID.randomUUID();
         var salonOwnedServiceId = UUID.randomUUID();
-        // canManageServiceDefinition returns false because the independent master does not own
-        // this service definition (it belongs to a salon).
-        when(authorizationService.canManageServiceDefinition(any(), eq(salonOwnedServiceId))).thenReturn(false);
+        // §D split: the IM passes the role-only gate, then the service-layer B14 guard
+        // (authz.enforceCanManageServiceDefinition) rejects the non-owner with ForbiddenException,
+        // which GlobalExceptionHandler renders as 403.
+        doThrow(new ForbiddenException("Access denied"))
+                .when(serviceCatalogService).deactivateServiceDefinition(imUserId, salonOwnedServiceId);
 
         log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER targeting salon-owned service — must return 403", salonOwnedServiceId);
         mockMvc.perform(delete("/api/v1/services/" + salonOwnedServiceId)
@@ -826,14 +868,14 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 403 when authenticated owner targets a non-existent service definition UUID")
+    @DisplayName("DELETE /services/{id} — 403 when authenticated owner targets a non-existent service definition (B14 guard treats unknown id as denied)")
     void should_return403_when_ownerDeletesNonExistentServiceDefinition() throws Exception {
-        // canManageServiceDefinition returns false when service definition does not exist
-        // (findOwnerUserId returns empty → orElse(false)).
-        // Spring Security short-circuits with 403, the service method is never invoked.
+        // §D split: owner passes the role-only gate; the service-layer B14 guard treats an unknown
+        // serviceDefId as access-denied (no existence oracle), throwing ForbiddenException → 403.
         var userId = UUID.randomUUID();
         var nonExistentId = UUID.randomUUID();
-        when(authorizationService.canManageServiceDefinition(any(), eq(nonExistentId))).thenReturn(false);
+        doThrow(new ForbiddenException("Access denied"))
+                .when(serviceCatalogService).deactivateServiceDefinition(userId, nonExistentId);
 
         log.debug("Act: DELETE /api/v1/services/{} with valid owner token but missing service def — must return 403", nonExistentId);
         mockMvc.perform(delete("/api/v1/services/" + nonExistentId)

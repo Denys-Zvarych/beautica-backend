@@ -61,6 +61,7 @@ public class ServiceCatalogService {
     private final ServiceTypeSearchService serviceTypeSearchService;
     private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
+    private final com.beautica.common.security.AuthorizationService authz;
 
     @Transactional
     public ServiceDefinitionResponse addServiceToSalon(
@@ -446,8 +447,13 @@ public class ServiceCatalogService {
     }
 
     @Transactional
-    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller — any future caller must enforce the same guard.
-    public void deactivateServiceDefinition(UUID serviceDefId) {
+    // Controller applies the role-only fast gate (hasAnyRole SALON_OWNER/INDEPENDENT_MASTER);
+    // ownership is enforced here (anti-bug §D/§B14 defense-in-depth) so a future non-HTTP caller
+    // cannot bypass the SpEL @PreAuthorize. Reuses the same findOwnerUserId projection the SpEL
+    // gate uses — no extra entity load.
+    public void deactivateServiceDefinition(UUID actorId, UUID serviceDefId) {
+        authz.enforceCanManageServiceDefinition(actorId, serviceDefId);
+
         // Step 1: identify only the masters that actually use this service definition
         // so the afterCommit eviction targets their cache entries instead of flushing
         // every master (replacing allEntries=true, anti-bug §F).
