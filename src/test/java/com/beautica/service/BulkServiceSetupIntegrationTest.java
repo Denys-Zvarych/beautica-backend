@@ -2,11 +2,13 @@ package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.entity.PriceType;
+import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -29,8 +31,15 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * Full-stack integration tests for the first-time bulk service-setup flow
@@ -61,6 +70,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     @Autowired private ObjectMapper objectMapper;
     @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private PasswordEncoder passwordEncoder;
+    @Autowired private ServiceCatalogService serviceCatalogService;
 
     private ServiceTestFixtures fixtures;
     private List<ServiceTestFixtures.SeededServiceType> seededTypes;
@@ -243,5 +253,101 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         assertThat(fixtures.countServiceDefinitionsForMaster(masterInSalonB))
                 .as("the denied request must not persist anything for the salon-B master")
                 .isEqualTo(0L);
+    }
+
+    // ── TOCTOU concurrency regression (Step 2.7 Rule 3) ────────────────────────
+
+    /**
+     * True-concurrency regression for the {@code pg_advisory_xact_lock} TOCTOU guard.
+     *
+     * <p>Before the fix, two concurrent first-time bulk POSTs for the SAME master both passed
+     * the {@code existsActiveServiceForMaster} read-then-write check and both committed,
+     * doubling the menu. This test fires two {@link ServiceCatalogService#bulkCreateIndependentMasterServices}
+     * calls on the Spring proxy — each runs in its OWN {@code @Transactional}, so each holds a
+     * per-transaction advisory lock keyed by the master id. A {@link CyclicBarrier} releases both
+     * threads into lock acquisition together (no {@code Thread.sleep}). The lock serializes them:
+     * the winner commits its batch, the loser's re-check under the lock sees the now-existing
+     * services and rejects with a 409 {@link BusinessException}.
+     *
+     * <p>The decisive assertion is the final DB count: exactly ONE batch survives — proving the
+     * race can no longer double the menu. Calling the service bean (not HTTP) is what gives each
+     * thread its own transaction-scoped lock with deterministic barrier coordination.
+     */
+    @Test
+    @DisplayName("two concurrent first-time bulk setups for one master serialize on the advisory lock — exactly one 201, one 409, NO menu doubling")
+    void should_serializeAndRejectSecond_when_twoConcurrentBulkSetupsRaceForSameMaster() throws Exception {
+        String email = "indep-race-" + System.nanoTime() + "@beautica.test";
+        fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+        UUID userId = jdbcTemplate.queryForObject(
+                "SELECT id FROM users WHERE email = ?", UUID.class, email);
+
+        // Each thread requests a DIFFERENT 2-item batch so that, whichever wins, the survivor's
+        // batch size (2) is unambiguous — a doubled menu would yield 4 rows.
+        var batchA = new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "350.00"),
+                range(seededTypes.get(1).id(), 120, "800.00", "1500.00")));
+        var batchB = new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 45, "275.00"),
+                range(seededTypes.get(1).id(), 90, "600.00", "1200.00")));
+
+        CyclicBarrier startLine = new CyclicBarrier(2);
+        AtomicInteger successCount = new AtomicInteger();
+        AtomicInteger conflictCount = new AtomicInteger();
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            log.debug("Act: two threads call bulkCreateIndependentMasterServices for the same master, released together by a barrier");
+            Future<Throwable> a = pool.submit(() -> attemptBulk(startLine, userId, batchA, successCount, conflictCount));
+            Future<Throwable> b = pool.submit(() -> attemptBulk(startLine, userId, batchB, successCount, conflictCount));
+
+            Throwable errA = a.get(30, TimeUnit.SECONDS);
+            Throwable errB = b.get(30, TimeUnit.SECONDS);
+
+            // Whichever thread lost must have failed with a 409 BusinessException — never any
+            // other error (a deadlock, lock-timeout or constraint violation would be a real bug).
+            assertThat(List.of(java.util.Optional.ofNullable(errA), java.util.Optional.ofNullable(errB)))
+                    .filteredOn(java.util.Optional::isPresent)
+                    .extracting(java.util.Optional::get)
+                    .as("the only allowed failure is the 409 first-time-violation; got %s / %s", errA, errB)
+                    .allSatisfy(t -> assertThat(t)
+                            .isInstanceOf(BusinessException.class)
+                            .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT)));
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(successCount.get())
+                .as("exactly one concurrent caller wins the lock and commits its batch")
+                .isEqualTo(1);
+        assertThat(conflictCount.get())
+                .as("the loser's re-check under the lock sees existing services and gets a 409")
+                .isEqualTo(1);
+        assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
+                .as("the decisive guard: only ONE batch (2 rows) survives — the race can no longer double the menu")
+                .isEqualTo(2L);
+    }
+
+    /**
+     * Runs one bulk-setup attempt after meeting the other thread at the barrier. Returns the
+     * thrown exception (or {@code null} on success) instead of letting it escape, so the test
+     * thread can assert on BOTH outcomes deterministically. Bumps the matching counter.
+     */
+    private Throwable attemptBulk(CyclicBarrier startLine, UUID userId,
+                                  BulkCreateServicesRequest request,
+                                  AtomicInteger successCount, AtomicInteger conflictCount) {
+        try {
+            startLine.await(10, TimeUnit.SECONDS); // both threads cross together — no sleep
+            serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+            successCount.incrementAndGet();
+            return null;
+        } catch (BusinessException e) {
+            if (e.getStatus() == HttpStatus.CONFLICT) {
+                conflictCount.incrementAndGet();
+            }
+            return e;
+        } catch (Throwable t) {
+            return t;
+        }
     }
 }

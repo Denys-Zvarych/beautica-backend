@@ -269,6 +269,20 @@ public class ServiceCatalogService {
             UUID ownerId,
             BulkCreateServicesRequest request) {
 
+        // TOCTOU guard: serialize concurrent first-time bulk setups for the same master.
+        // existsActiveServiceForMaster is a read-then-write check with no DB-level
+        // uniqueness backstop, so two concurrent bulk POSTs could both pass it and both
+        // commit, doubling the menu. Acquire a transaction-scoped advisory lock keyed by
+        // masterId BEFORE the precondition check (which is re-evaluated under the lock,
+        // inside this same @Transactional) — the second caller blocks until the first
+        // commits, then its re-check sees the now-existing services and rejects with 409.
+        // Mirrors the booking overlap-guard advisory lock (anti-bug pattern).
+        Integer lockResult = masterServiceRepository.acquireBulkSetupLock(master.getId());
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Bulk-setup lock acquisition failed");
+        }
+
         if (masterServiceRepository.existsActiveServiceForMaster(master.getId())) {
             throw new BusinessException(HttpStatus.CONFLICT,
                     "Bulk setup is only available for a master with no active services");
