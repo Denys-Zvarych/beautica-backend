@@ -1,5 +1,6 @@
 package com.beautica.auth.dto;
 
+import com.beautica.common.validation.NoDigits;
 import com.beautica.common.validation.StrongPassword;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -25,11 +26,13 @@ public record RegisterRequest(
         @NotBlank(message = "First name is required")
         @Size(max = 100, message = "First name must not exceed 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "First name must not contain control characters")
+        @NoDigits(message = "First name must not contain a number")
         String firstName,
 
         @NotBlank(message = "Last name is required")
         @Size(max = 100, message = "Last name must not exceed 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Last name must not contain control characters")
+        @NoDigits(message = "Last name must not contain a number")
         String lastName,
 
         @NotBlank(message = "Phone number is required")

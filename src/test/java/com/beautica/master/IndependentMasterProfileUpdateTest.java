@@ -646,6 +646,89 @@ class IndependentMasterProfileUpdateTest {
                 .andExpect(jsonPath("$.data.lastName").value(lastName));
     }
 
+    // ── QA: firstName/lastName @NoDigits — number guard ──────────────────────
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 with errors.firstName when firstName contains a digit (@NoDigits)")
+    void should_return400_when_firstNameContainsDigit() throws Exception {
+        var userId = UUID.randomUUID();
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("firstName", "Olena5");
+        body.put("lastName", "Koval");
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.firstName").value("First name must not contain a number"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 with errors.lastName when lastName contains a digit (@NoDigits)")
+    void should_return400_when_lastNameContainsDigit() throws Exception {
+        var userId = UUID.randomUUID();
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("firstName", "Olena");
+        body.put("lastName", "Koval6");
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.lastName").value("Last name must not contain a number"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 when firstName/lastName carry hyphen + apostrophe but no digit (@NoDigits)")
+    void should_return200_when_namesUseHyphenApostropheWithoutDigit() throws Exception {
+        var userId = UUID.randomUUID();
+        var firstName = "Анна-Марія";
+        var lastName = "О’Коннор";
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("firstName", firstName);
+        body.put("lastName", lastName);
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(stubProfile(firstName, lastName, "+380671234567", null, null));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.firstName").value(firstName))
+                .andExpect(jsonPath("$.data.lastName").value(lastName));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 when first/last name are omitted (optional — @NoDigits skips null)")
+    void should_return200_when_namesOmitted() throws Exception {
+        var userId = UUID.randomUUID();
+        // Only bio supplied; firstName/lastName null. @NoDigits skips null so the body validates,
+        // proving the constraint does not turn the optional name fields into required ones.
+        var body = objectMapper.writeValueAsString(java.util.Map.of("bio", "Just a bio update"));
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(new MasterPublicProfileResponse(null, null, "+380670000000", "Just a bio update", null));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
     // ── Fix 6 — QA MEDIUM: bio exact-boundary ────────────────────────────────
 
     @Test
