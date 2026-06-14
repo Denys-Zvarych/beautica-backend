@@ -321,6 +321,63 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("should return 400 with errors.token='Token is invalid' when token has a non-base64url char (charset guard)")
+    void should_return400WithTokenFieldError_when_tokenHasDisallowedChar() throws Exception {
+        // Arrange — a token containing characters OUTSIDE the unpadded base64url alphabet
+        // [A-Za-z0-9_-] that SecureTokenGenerator emits: '+' and '=' are padded-base64 chars
+        // the new @Pattern("^[A-Za-z0-9_-]+$") guard now rejects BEFORE the SHA-256 hash + DB
+        // lookup. This is the security-backlog charset guard regression net.
+        String malformedToken = "abc+def==ghi";
+
+        // Act — JSON body, so '+'/'=' travel verbatim (no URL-encoding involved).
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/reset-password",
+                new ResetPasswordRequest(malformedToken, "ValidPassword1!"),
+                String.class);
+
+        // Assert — Bean Validation rejects it as a standard 400 validation envelope.
+        assertThat(response.getStatusCode())
+                .as("a token with a disallowed charset char must be rejected at validation, not at the DB")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        var body = objectMapper.readValue(response.getBody(),
+                new TypeReference<ApiResponse<Void>>() {});
+        assertThat(body.success())
+                .as("success must be false")
+                .isFalse();
+
+        // The per-field error map carries the exact @Pattern message keyed by the DTO field.
+        assertThat(body.errors())
+                .as("errors map must carry the token field error from the @Pattern charset guard")
+                .containsEntry("token", "Token is invalid");
+    }
+
+    @Test
+    @DisplayName("should return 400 with errors.token='Token is invalid' when token contains a space")
+    void should_return400WithTokenFieldError_when_tokenContainsSpace() throws Exception {
+        // Arrange — a space is also outside [A-Za-z0-9_-]; covers the whitespace variant
+        // the prompt calls out explicitly (distinct from the '+'/'=' padding case above).
+        String malformedToken = "token with space";
+
+        // Act
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/reset-password",
+                new ResetPasswordRequest(malformedToken, "ValidPassword1!"),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("a token containing whitespace must be rejected at validation")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        var body = objectMapper.readValue(response.getBody(),
+                new TypeReference<ApiResponse<Void>>() {});
+        assertThat(body.errors())
+                .as("errors map must carry the token field error for the whitespace case too")
+                .containsEntry("token", "Token is invalid");
+    }
+
+    @Test
     @DisplayName("should revoke all refresh tokens after successful reset (global logout)")
     void should_revokeAllRefreshTokens_when_resetSucceeds() throws Exception {
         String email = "reset.sessions@beautica.com";

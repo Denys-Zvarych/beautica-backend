@@ -18,6 +18,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.MethodParameter;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -310,6 +311,83 @@ class GlobalExceptionHandlerTest {
         assertThat(debugEvents.get(0).getFormattedMessage())
                 .as("DEBUG log must contain the original internal message")
                 .contains(internalMessage);
+    }
+
+    @Test
+    @DisplayName("handleDataIntegrityViolation — returns 409 with static message and never leaks the DB constraint cause")
+    void should_return409StaticMessage_when_dataIntegrityViolationThrown() {
+        // Arrange — a DataIntegrityViolationException whose most-specific cause carries a
+        // leaky DB constraint name (the kind Postgres emits: "duplicate key value violates
+        // unique constraint \"uq_users_email\""). The handler must collapse every variant —
+        // unique violation, FK violation, NOT-NULL violation — to one static body so the
+        // client cannot use the message as an enumeration oracle (which constraint fired),
+        // and the constraint/column/value detail must never reach the caller (§I/§N).
+        String leakyCause = "duplicate key value violates unique constraint \"uq_users_email\"";
+        var ex = new DataIntegrityViolationException("could not execute statement",
+                new RuntimeException(leakyCause));
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleDataIntegrityViolation(ex);
+
+        // Assert — HTTP contract
+        assertThat(response.getStatusCode())
+                .as("data-integrity violation must map to 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("message must be the single static conflict string")
+                .isEqualTo("Request conflicts with existing data");
+
+        // Assert — no leak of the underlying constraint detail in the response body
+        assertThat(response.getBody().message())
+                .as("response must NOT leak the constraint name 'uq_users_email'")
+                .doesNotContain("uq_users_email");
+
+        assertThat(response.getBody().message())
+                .as("response must NOT leak the raw DB error phrase")
+                .doesNotContain("duplicate key")
+                .doesNotContain("unique constraint");
+    }
+
+    @Test
+    @DisplayName("handleDataIntegrityViolation — emits the real cause only at DEBUG, never in the response")
+    void should_logCauseAtDebugOnly_when_dataIntegrityViolationThrown() {
+        // Arrange — the leaky cause must surface in the DEBUG log for ops triage but never
+        // in the client body. This pins the §I/§N split: detail for the server, silence for
+        // the caller.
+        String leakyCause = "insert or update on table \"bookings\" violates foreign key "
+                + "constraint \"fk_bookings_master\"";
+        var ex = new DataIntegrityViolationException("could not execute statement",
+                new RuntimeException(leakyCause));
+        listAppender.list.clear();
+
+        // Act
+        handler.handleDataIntegrityViolation(ex);
+
+        // Assert — exactly one DEBUG event carrying the real cause for server-side triage
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleDataIntegrityViolation must emit exactly one DEBUG log for triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must contain the real cause for ops visibility")
+                .contains("fk_bookings_master");
+
+        // And no event at any level may have leaked the cause anywhere other than DEBUG —
+        // i.e. there is no ERROR/WARN/INFO event carrying it (would imply over-logging).
+        boolean nonDebugLeak = listAppender.list.stream()
+                .filter(e -> e.getLevel() != Level.DEBUG)
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(m -> m.contains("fk_bookings_master"));
+        assertThat(nonDebugLeak)
+                .as("the cause must appear ONLY at DEBUG, not at any louder level")
+                .isFalse();
     }
 
     @Test
