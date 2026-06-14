@@ -1,5 +1,6 @@
 package com.beautica.auth.dto;
 
+import com.beautica.common.validation.NoDigits;
 import com.beautica.common.validation.StrongPassword;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
@@ -23,11 +24,13 @@ public record InviteAcceptRequest(
         @NotBlank(message = "First name is required")
         @Size(max = 100, message = "First name must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "First name must not contain control characters")
+        @NoDigits(message = "First name must not contain a number")
         String firstName,
 
         @NotBlank(message = "Last name is required")
         @Size(max = 100, message = "Last name must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Last name must not contain control characters")
+        @NoDigits(message = "Last name must not contain a number")
         String lastName,
 
         @NotBlank(message = "Phone number is required")

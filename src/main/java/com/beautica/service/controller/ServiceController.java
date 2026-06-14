@@ -3,6 +3,7 @@ package com.beautica.service.controller;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
+import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
@@ -108,12 +109,70 @@ public class ServiceController {
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
-    @DeleteMapping("/services/{serviceDefId}")
-    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
-    public ResponseEntity<Void> deactivateServiceDefinition(
-            @PathVariable UUID serviceDefId
+    /**
+     * First-time bulk service setup for the authenticated INDEPENDENT_MASTER.
+     *
+     * <p>Self-scoped: the acting master is resolved from the principal, never a path/query
+     * parameter — mirroring {@link #addIndependentMasterService}. Valid only when the master
+     * currently has ZERO active services; otherwise the service returns 409 (first-time-only
+     * product rule, enforced server-side). The whole batch is created in one transaction
+     * (all-or-nothing) and the response is the same {@link MasterServiceResponse} list shape
+     * the single-create endpoint returns.
+     */
+    @Operation(summary = "Bulk-create my services (first-time setup)",
+            description = "Creates every selected service in one transaction. Only valid when "
+                    + "the master has no active services yet (409 otherwise).")
+    @PostMapping("/independent-masters/me/services/bulk")
+    @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
+    public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMyServices(
+            @Valid @RequestBody BulkCreateServicesRequest request,
+            Authentication authentication
     ) {
-        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+        UUID userId = extractUserId(authentication);
+        List<MasterServiceResponse> response =
+                serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+        return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    /**
+     * First-time bulk service setup performed on behalf of a master in a salon.
+     *
+     * <p>Authorized for the salon's SALON_OWNER and SALON_ADMIN via {@code canManageSalon},
+     * with {@code masterBelongsToSalon} closing the timing-oracle IDOR (same guard pair as
+     * {@link #assignServiceToMaster}). SALON_ADMIN inclusion is intentional and matches the
+     * confirmed contract — admins manage masters' menus but own no services themselves.
+     * The owner-operated master row resolves through the same path (its {@code salon_id}
+     * equals {@code salonId}).
+     *
+     * <p>Valid only when the target master has ZERO active services (409 otherwise). The
+     * whole batch is created in one transaction (all-or-nothing).
+     */
+    @Operation(summary = "Bulk-create a salon master's services (first-time setup)",
+            description = "Creates every selected service for the given master in one "
+                    + "transaction. Only valid when the master has no active services yet "
+                    + "(409 otherwise).")
+    @PostMapping("/salons/{salonId}/masters/{masterId}/services/bulk")
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
+    public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMasterServices(
+            @PathVariable UUID salonId,
+            @PathVariable UUID masterId,
+            @Valid @RequestBody BulkCreateServicesRequest request
+    ) {
+        List<MasterServiceResponse> response =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+        return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    @DeleteMapping("/services/{serviceDefId}")
+    // Role-only fast gate here; ownership is enforced once inside the service against the
+    // already-needed findOwnerUserId projection (anti-bug §D split — no duplicate SpEL
+    // canManage* lookup that would issue a second round-trip).
+    @PreAuthorize("hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER')")
+    public ResponseEntity<Void> deactivateServiceDefinition(
+            @PathVariable UUID serviceDefId,
+            Authentication authentication
+    ) {
+        serviceCatalogService.deactivateServiceDefinition(extractUserId(authentication), serviceDefId);
         return ResponseEntity.noContent().build();
     }
 

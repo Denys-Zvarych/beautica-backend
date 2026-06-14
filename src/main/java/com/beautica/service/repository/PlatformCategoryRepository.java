@@ -28,6 +28,22 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
             String name, List<com.beautica.service.entity.PlatformCategoryStatus> statuses);
 
     /**
+     * Batch selectability check: returns the subset of {@code names} that exist as
+     * APPROVED + active categories (exact case). The bulk-create path collects the
+     * DISTINCT categories derived from the resolved service types and validates them
+     * in a single round-trip instead of one {@code SELECT EXISTS} per item; the
+     * service asserts the returned set equals the requested set (any missing name →
+     * the same 400 as {@code validateCategoryActive}).
+     */
+    @Query("""
+            SELECT pc.name FROM PlatformCategory pc
+             WHERE pc.name IN :names
+               AND pc.active = true
+               AND pc.status = com.beautica.service.entity.PlatformCategoryStatus.APPROVED
+            """)
+    List<String> findSelectableNamesIn(@org.springframework.data.repository.query.Param("names") java.util.Collection<String> names);
+
+    /**
      * Token lookup for the approve/reject POST. Matched on the hashed token only;
      * expiry, status, and constant-time comparison are enforced in the service.
      * Returns at most one row — token_hash is effectively unique while PENDING.

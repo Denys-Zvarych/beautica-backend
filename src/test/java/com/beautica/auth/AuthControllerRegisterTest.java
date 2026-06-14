@@ -249,6 +249,82 @@ class AuthControllerRegisterTest {
         verify(authService, never()).register(any(RegisterRequest.class));
     }
 
+    // ── QA: RegisterRequest firstName/lastName @NoDigits — number guard ────────
+
+    @Test
+    @DisplayName("400 Bad Request with errors.firstName when firstName contains a digit (@NoDigits)")
+    void should_return400_when_firstNameContainsDigit() throws Exception {
+        log.debug("Arrange: no mock needed — digit in firstName fails @NoDigits before service is reached");
+
+        log.debug("Act: POST {} with firstName containing a digit", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "digit-first@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Taras2",
+                                  "lastName": "Shevchenko"
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.firstName").value("First name must not contain a number"));
+
+        log.debug("Assert: service must NOT be invoked when Bean Validation fails");
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
+    @Test
+    @DisplayName("400 Bad Request with errors.lastName when lastName contains a digit (@NoDigits)")
+    void should_return400_when_lastNameContainsDigit() throws Exception {
+        log.debug("Act: POST {} with lastName containing a digit", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "digit-last@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Taras",
+                                  "lastName": "Shevchenko1"
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.lastName").value("Last name must not contain a number"));
+
+        verify(authService, never()).register(any(RegisterRequest.class));
+    }
+
+    @Test
+    @DisplayName("200 OK when firstName/lastName carry a hyphen, apostrophe and space but no digit (@NoDigits)")
+    void should_return200_when_namesUseHyphenApostropheSpaceWithoutDigit() throws Exception {
+        log.debug("Arrange: stub authService to return a minimal RegistrationResponse");
+        when(authService.register(any(RegisterRequest.class)))
+                .thenReturn(RegistrationResponse.of("nodigit-name@beautica.test"));
+
+        // Hyphen + apostrophe + space, all letters Cyrillic/Latin — @NoDigits must pass.
+        log.debug("Act: POST {} with digit-free hyphen/apostrophe/space names", REGISTER_URL);
+        mvc.perform(post(REGISTER_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "email": "nodigit-name@beautica.test",
+                                  "password": "Str0ngP@ss1!",
+                                  "role": "CLIENT",
+                                  "firstName": "Анна-Марія",
+                                  "lastName": "О’Коннор",
+                                  "phoneNumber": "+380501234567"
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        verify(authService).register(any(RegisterRequest.class));
+    }
+
     @Test
     @DisplayName("400 Bad Request when password does not meet @StrongPassword policy")
     void should_return400_when_passwordIsWeak() throws Exception {

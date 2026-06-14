@@ -278,6 +278,112 @@ class UserControllerTest {
                 .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
     }
 
+    // ── UpdateProfileRequest @NoDigits regression (MEDIUM fix) ────────────────────
+    // PATCH /users/me previously bypassed the no-digit person-name rule. @NoDigits is
+    // now wired onto firstName/lastName; these lock the controller-boundary behaviour:
+    // a digit-bearing name is rejected with the readable per-field error string, a
+    // name with the allowed punctuation (hyphen/apostrophe/space) is accepted, and a
+    // null name pair still passes because both fields are optional on this edit DTO.
+
+    @Test
+    @DisplayName("PATCH /me — 400 with errors.firstName @NoDigits message when firstName contains a digit (regression)")
+    void should_return400WithFirstNameError_when_firstNameContainsDigit() throws Exception {
+        var userId = UUID.randomUUID();
+        var body = new UpdateProfileRequest("Oksana2", "Kovalenko", null,
+                null, null, null, null, null);
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.firstName").value("First name must not contain a number"));
+
+        org.mockito.Mockito.verify(userService, org.mockito.Mockito.never())
+                .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 400 with errors.lastName @NoDigits message when lastName contains a digit (regression)")
+    void should_return400WithLastNameError_when_lastNameContainsDigit() throws Exception {
+        var userId = UUID.randomUUID();
+        var body = new UpdateProfileRequest("Oksana", "Kovalenko9", null,
+                null, null, null, null, null);
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.lastName").value("Last name must not contain a number"));
+
+        org.mockito.Mockito.verify(userService, org.mockito.Mockito.never())
+                .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 200 when names use allowed punctuation (hyphen/apostrophe/space), no @NoDigits trip")
+    void should_return200_when_nameHasHyphenApostropheSpaceButNoDigit() throws Exception {
+        var userId = UUID.randomUUID();
+        var updated = new UserProfileResponse(
+                userId, "jane@example.com", "CLIENT",
+                "Анна-Марія", "О’Коннор", null,
+                null, null, null, null, null, // cityId, districtId, street, buildingNo, locationNote
+                null, null,                   // bio, instagram
+                true, false, null
+        );
+        when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
+                .thenReturn(updated);
+
+        var body = new UpdateProfileRequest("Анна-Марія", "О’Коннор", null,
+                null, null, null, null, null);
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.firstName").value("Анна-Марія"))
+                .andExpect(jsonPath("$.data.lastName").value("О’Коннор"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 200 when both first and last name are null (optional fields, no @NoDigits trip)")
+    void should_return200_when_bothNamesNull() throws Exception {
+        var userId = UUID.randomUUID();
+        var updated = new UserProfileResponse(
+                userId, "jane@example.com", "CLIENT",
+                "Jane", "Doe", "+380671234567",
+                null, null, null, null, null, // cityId, districtId, street, buildingNo, locationNote
+                null, null,                   // bio, instagram
+                true, false, null
+        );
+        when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
+                .thenReturn(updated);
+
+        // A null first/last name pair is a valid no-op for these fields — @NoDigits
+        // (like @Size) must not fire on null, so the request reaches the service.
+        var body = new UpdateProfileRequest(null, null, "+380671234567",
+                null, null, null, null, null);
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        org.mockito.Mockito.verify(userService)
+                .updateProfile(eq(userId), any(UpdateProfileRequest.class));
+    }
+
     @Test
     @DisplayName("PATCH /me with no JWT → 401")
     void should_return401_when_patchProfileWithoutJwt() throws Exception {

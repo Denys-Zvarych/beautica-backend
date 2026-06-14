@@ -191,6 +191,52 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
                 .isFalse();
     }
 
+    // ── findSelectableNamesIn (bulk-create category batch validation) ───────────
+
+    @Test
+    @DisplayName("findSelectableNamesIn returns only APPROVED+active names from the requested set")
+    void should_returnOnlySelectableNames_when_findSelectableNamesIn() {
+        approved("HAIR", "Волосся");
+        approved("NAIL_SERVICE", "Манікюр");
+        // PENDING — must be excluded even though requested.
+        pending("PENDING_CAT", "Очікує", "a".repeat(64));
+        // REJECTED (inactive) — must be excluded.
+        PlatformCategory rejected = PlatformCategory.ofApproved("REJECTED_CAT", "Відхилено");
+        rejected.reject(OffsetDateTime.now());
+        persist(rejected);
+
+        List<String> selectable = repository.findSelectableNamesIn(
+                List.of("HAIR", "NAIL_SERVICE", "PENDING_CAT", "REJECTED_CAT", "ABSENT_CAT"));
+
+        assertThat(selectable)
+                .as("only APPROVED+active categories are selectable; PENDING/REJECTED/absent are filtered")
+                .containsExactlyInAnyOrder("HAIR", "NAIL_SERVICE");
+    }
+
+    @Test
+    @DisplayName("findSelectableNamesIn is exact-case (mirrors the per-item usability gate)")
+    void should_beExactCase_when_findSelectableNamesIn() {
+        approved("HAIR", "Волосся");
+
+        List<String> selectable = repository.findSelectableNamesIn(List.of("hair", "HAIR"));
+
+        assertThat(selectable)
+                .as("the batch selectability check is exact-case, like existsByNameAndActiveTrueAndStatus")
+                .containsExactly("HAIR");
+    }
+
+    @Test
+    @DisplayName("findSelectableNamesIn returns empty when none of the requested names is selectable")
+    void should_returnEmpty_when_noRequestedNameSelectable() {
+        approved("HAIR", "Волосся");
+
+        List<String> selectable = repository.findSelectableNamesIn(List.of("ABSENT_ONE", "ABSENT_TWO"));
+
+        assertThat(selectable)
+                .as("a request set disjoint from the selectable categories yields an empty list")
+                .isEmpty();
+    }
+
     // ── initial_service_name column (V77 — behavior #5) ─────────────────────────
 
     @Test

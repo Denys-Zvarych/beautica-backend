@@ -102,4 +102,48 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      */
     @Query("SELECT DISTINCT a.master.id FROM MasterServiceAssignment a WHERE a.serviceDefinition.id = :serviceDefId")
     List<UUID> findMasterIdsByServiceDefinitionId(@Param("serviceDefId") UUID serviceDefId);
+
+    /**
+     * Returns true if the given master has at least one assignment whose linked service
+     * definition is <em>also</em> active — i.e. at least one service visible in the
+     * master's menu and the public browse.
+     *
+     * <p>Used by the first-time bulk-setup precondition: the bulk endpoint is valid only
+     * when a master currently has zero active services. The {@code sd.isActive = true}
+     * predicate mirrors {@link #findByMasterIdAndIsActiveTrueWithGraph} so a soft-deleted
+     * definition does not count as an active service and does not block the first-time flow.
+     */
+    @Query("""
+            SELECT COUNT(msa) > 0
+            FROM MasterServiceAssignment msa
+            WHERE msa.master.id = :masterId
+              AND msa.isActive = true
+              AND msa.serviceDefinition.isActive = true
+            """)
+    boolean existsActiveServiceForMaster(@Param("masterId") UUID masterId);
+
+    /**
+     * Acquires a transaction-scoped Postgres advisory lock keyed by the master id so that
+     * concurrent first-time bulk-setup calls for the same master serialize.
+     *
+     * <p>Phase 16.x (TOCTOU): {@link #existsActiveServiceForMaster} is a read-then-write
+     * check with no DB-level unique/idempotency backstop, so two concurrent bulk POSTs from
+     * the same principal could both pass the "no active services" precondition and both
+     * commit, doubling the master's menu. Taking this lock before the precondition (re-)check
+     * — inside the same {@code @Transactional} — forces the second caller to wait until the
+     * first commits, after which its re-check sees the now-existing services and rejects (409).
+     *
+     * <p>The lock is held until the surrounding transaction commits or rolls back
+     * ({@code pg_advisory_xact_lock} — no manual unlock needed). Mirrors the booking
+     * overlap-guard lock in {@code BookingRepository#acquireAdvisoryLock}.
+     *
+     * <p>Hash collision risk: {@code hashtextextended} produces a 64-bit hash of the UUID
+     * text. Birthday-paradox probability is negligible for current master counts; a collision
+     * would only cause two unrelated masters' bulk setups to serialize, never a correctness
+     * bug.
+     */
+    @Query(value = """
+            SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))) sub
+            """, nativeQuery = true)
+    Integer acquireBulkSetupLock(@Param("masterId") UUID masterId);
 }

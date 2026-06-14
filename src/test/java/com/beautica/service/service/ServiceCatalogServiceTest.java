@@ -83,6 +83,9 @@ class ServiceCatalogServiceTest {
     @Mock
     private CacheManager cacheManager;
 
+    @Mock
+    private com.beautica.common.security.AuthorizationService authz;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 
@@ -484,20 +487,24 @@ class ServiceCatalogServiceTest {
     // ── deactivateServiceDefinition ────────────────────────────────────────────
 
     @Test
-    @DisplayName("deactivates ServiceDefinition when service definition exists")
+    @DisplayName("deactivates ServiceDefinition when actor is the owner and service definition exists")
     void should_deactivateServiceDefinition_when_serviceDefinitionExists() {
+        UUID actorId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
         UUID masterA = UUID.randomUUID();
         UUID masterB = UUID.randomUUID();
 
+        // Owner passes the B14 service-layer ownership guard (void → default no-op).
         // MEDIUM-3: the service loads affected master IDs before the bulk UPDATE so it can
         // refresh their min_effective_price after deactivation — stub must be present.
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterA, masterB));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
-        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
 
+        // B14: ownership guard is invoked at method entry with the actor + target id.
+        verify(authz).enforceCanManageServiceDefinition(actorId, serviceDefId);
         verify(serviceRepository).deactivateById(serviceDefId);
         // Fix MEDIUM-6: refreshMinEffectivePriceForAll collapses N round-trips into one bulk UPDATE.
         verify(masterRepository).refreshMinEffectivePriceForAll(List.of(masterA, masterB));
@@ -506,12 +513,13 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("throws NotFoundException when service definition does not exist")
+    @DisplayName("throws NotFoundException when owner deactivates a service definition that does not exist")
     void should_throwNotFoundException_when_serviceDefinitionDoesNotExist() {
+        UUID actorId = UUID.randomUUID();
         UUID missing = UUID.randomUUID();
         when(serviceRepository.deactivateById(missing)).thenReturn(0);
 
-        assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(missing))
+        assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(actorId, missing))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining(missing.toString());
     }
@@ -519,14 +527,39 @@ class ServiceCatalogServiceTest {
     @Test
     @DisplayName("uses deactivateById (bulk UPDATE) rather than save — deactivation must not trigger a full entity replace")
     void should_useDeactivateById_not_save_when_deactivating() {
+        UUID actorId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
 
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
-        serviceCatalogService.deactivateServiceDefinition(serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
 
         verify(serviceRepository).deactivateById(serviceDefId);
         verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("B14: propagates ForbiddenException and performs no UPDATE or cache eviction when actor is NOT the owner")
+    void should_throwForbiddenAndSkipUpdate_when_actorIsNotTheOwner() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        // The B14 defense-in-depth guard rejects a non-owner actor at method entry, before any
+        // cache-eviction registration or the deactivation UPDATE.
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageServiceDefinition(actorId, serviceDefId);
+
+        assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Access denied");
+
+        // No state change: the UPDATE never runs, no affected-master lookup, no price refresh.
+        verify(serviceRepository, never()).deactivateById(any());
+        verify(masterServiceRepository, never()).findMasterIdsByServiceDefinitionId(any());
+        verify(masterRepository, never()).refreshMinEffectivePriceForAll(any());
+        verify(masterRepository, never()).refreshMinEffectivePrice(any());
+        // No cache eviction registered/performed (guard throws before evict wiring).
+        verify(cacheManager, never()).getCache(any());
     }
 
     // ── serviceType linkage ────────────────────────────────────────────────────

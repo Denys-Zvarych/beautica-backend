@@ -75,6 +75,28 @@ class ServiceTestFixtures {
         return parsed.data().id();
     }
 
+    /**
+     * Inserts a salon (with a fresh SALON_OWNER user) directly via JDBC and returns its id.
+     * Used when a test needs a second, foreign salon + master but does NOT need to act as that
+     * owner — avoiding an extra {@code /auth/login} round-trip (and its per-IP bucket cost).
+     */
+    UUID insertSalonWithOwner(String name) {
+        UUID cityId = jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID ownerUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
+                ownerUserId, "jdbc-owner-" + UUID.randomUUID() + "@beautica.test",
+                passwordEncoder.encode(TEST_PASSWORD));
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerUserId, name, cityId);
+        return salonId;
+    }
+
     UUID createSalonMaster(UUID salonId) {
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "master-" + UUID.randomUUID() + "@beautica.test";
@@ -132,6 +154,61 @@ class ServiceTestFixtures {
         var parsed = objectMapper.readValue(
                 resp.getBody(), new TypeReference<ApiResponse<MasterServiceResponse>>() {});
         return parsed.data().serviceDefinition().id();
+    }
+
+    /**
+     * Creates a SALON_ADMIN user assigned to {@code salonId} and returns a bearer token.
+     * canManageSalon resolves the admin's authority via users.salon_id, so the assignment
+     * must be persisted for the on-behalf bulk endpoint to authorize the admin.
+     */
+    String createSalonAdminAndGetToken(UUID salonId, String email) throws Exception {
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'SALON_ADMIN', ?, true, true)",
+                UUID.randomUUID(), email, hash, salonId);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    /** Resolves the master row id created when an independent master registers (1:1 with the user). */
+    UUID resolveMasterIdForUserEmail(String email) {
+        return jdbcTemplate.queryForObject(
+                "SELECT m.id FROM masters m JOIN users u ON u.id = m.user_id WHERE u.email = ?",
+                UUID.class, email);
+    }
+
+    /**
+     * Returns up to {@code limit} active, seeded service types (id + nameUk + platform
+     * category name) whose category is an APPROVED+active platform category — i.e. fully
+     * selectable for the bulk-create flow. Distinct categories preferred is not required;
+     * the test only needs valid, resolvable ids.
+     */
+    java.util.List<SeededServiceType> activeSelectableServiceTypes(int limit) {
+        return jdbcTemplate.query(
+                "SELECT st.id, st.name_uk, st.platform_category_name "
+                        + "FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT ?",
+                (rs, n) -> new SeededServiceType(
+                        rs.getObject("id", UUID.class),
+                        rs.getString("name_uk"),
+                        rs.getString("platform_category_name")),
+                limit);
+    }
+
+    long countServiceDefinitionsForMaster(UUID masterId) {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE owner_id = ?", Long.class, masterId);
+        return count == null ? 0L : count;
+    }
+
+    record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
     }
 
     HttpHeaders bearerHeaders(String token) {

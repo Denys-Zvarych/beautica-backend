@@ -510,6 +510,89 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .containsExactlyElementsOf(expectedAssignmentIdOrder);
     }
 
+    // ── existsActiveServiceForMaster (first-time bulk-setup precondition) ─────────
+
+    @Test
+    @DisplayName("should_returnTrue_when_masterHasAnActiveServiceWithActiveDefinition")
+    void should_returnTrue_when_masterHasAnActiveServiceWithActiveDefinition() {
+        // setUp persisted an active ServiceDefinition; attach an active assignment.
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .isActive(true)
+                .build();
+        em.persist(assignment);
+        em.flush();
+
+        boolean hasActive = masterServiceRepository.existsActiveServiceForMaster(master.getId());
+
+        assertThat(hasActive)
+                .as("an active assignment on an active definition must block first-time bulk setup")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("should_returnFalse_when_masterHasNoAssignments")
+    void should_returnFalse_when_masterHasNoAssignments() {
+        // No assignments persisted for this master at all.
+        boolean hasActive = masterServiceRepository.existsActiveServiceForMaster(master.getId());
+
+        assertThat(hasActive)
+                .as("a master with zero assignments is eligible for first-time bulk setup")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("should_returnFalse_when_onlyAssignmentReferencesSoftDeletedDefinition")
+    void should_returnFalse_when_onlyAssignmentReferencesSoftDeletedDefinition() {
+        // A soft-deleted definition must NOT count as an active service — otherwise a master
+        // who deleted all their services could never re-run the first-time bulk flow.
+        ServiceDefinition softDeletedDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(master.getId())
+                .name("Retired Service")
+                .category("MANICURE")
+                .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("500.00"))
+                .isActive(false)
+                .build();
+        em.persist(softDeletedDef);
+
+        MasterServiceAssignment assignmentOnSoftDeleted = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(softDeletedDef)
+                .isActive(true)
+                .build();
+        em.persist(assignmentOnSoftDeleted);
+        em.flush();
+
+        boolean hasActive = masterServiceRepository.existsActiveServiceForMaster(master.getId());
+
+        assertThat(hasActive)
+                .as("a soft-deleted (inactive) definition must not count as an active service")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("should_returnFalse_when_onlyAssignmentIsInactive")
+    void should_returnFalse_when_onlyAssignmentIsInactive() {
+        // The assignment itself is inactive, even though the definition is active.
+        MasterServiceAssignment inactiveAssignment = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .isActive(false)
+                .build();
+        em.persist(inactiveAssignment);
+        em.flush();
+
+        boolean hasActive = masterServiceRepository.existsActiveServiceForMaster(master.getId());
+
+        assertThat(hasActive)
+                .as("an inactive assignment must not count as an active service")
+                .isFalse();
+    }
+
     @Test
     @DisplayName("should_excludeSoftDeletedDef_when_publicQueryUsedOnMasterWithInactiveDef")
     void should_excludeSoftDeletedDef_when_publicQueryUsedOnMasterWithInactiveDef() {

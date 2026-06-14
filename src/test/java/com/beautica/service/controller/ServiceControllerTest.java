@@ -4,9 +4,12 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -45,6 +48,9 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -548,17 +554,22 @@ class ServiceControllerTest {
     // ── DELETE /api/v1/services/{serviceDefId} ─────────────────────────────────
 
     @Test
-    @DisplayName("DELETE /services/{id} — 204 when owner deactivates their service definition")
+    @DisplayName("DELETE /services/{id} — 204 when SALON_OWNER passes the role gate; controller forwards its userId as actorId to the service")
     void should_return204_when_ownerDeactivatesService() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+        // §D split: the DELETE gate is role-only (hasAnyRole SALON_OWNER/INDEPENDENT_MASTER).
+        // Ownership is enforced inside the service (B14), not via canManageServiceDefinition SpEL.
+        // deactivateServiceDefinition is void — default Mockito no-op = success.
 
         log.debug("Act: DELETE /api/v1/services/{} as SALON_OWNER — must return 204", serviceDefId);
         mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf()))
                 .andExpect(status().isNoContent());
+
+        // Controller must pass the authenticated principal's userId as the actorId (B14 split).
+        verify(serviceCatalogService).deactivateServiceDefinition(userId, serviceDefId);
     }
 
     // ── Validation boundary tests ─────────────────────────────────────────────
@@ -775,46 +786,79 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 403 when CLIENT role calls the delete endpoint")
+    @DisplayName("DELETE /services/{id} — 403 when CLIENT role calls the delete endpoint (role-only gate denies)")
     void should_return403_when_clientCallsDeleteService() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        // canManageServiceDefinition returns false for a CLIENT: a CLIENT user never owns
-        // a service definition, so AuthorizationService denies the request.
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
+        // §D split: the role-only @PreAuthorize(hasAnyRole SALON_OWNER/INDEPENDENT_MASTER) denies a
+        // CLIENT before the controller body runs — the service method is never reached.
 
         log.debug("Act: DELETE /api/v1/services/{} as CLIENT — must be denied with 403", serviceDefId);
         mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
                         .with(csrf()))
                 .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).deactivateServiceDefinition(any(), any());
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 204 when INDEPENDENT_MASTER deletes their own service definition")
+    @DisplayName("DELETE /services/{id} — 403 when SALON_MASTER (read-only role) calls the delete endpoint (role-only gate denies)")
+    void should_return403_when_salonMasterCallsDeleteService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        log.debug("Act: DELETE /api/v1/services/{} as SALON_MASTER — read-only role must be denied with 403", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).deactivateServiceDefinition(any(), any());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 403 when SALON_ADMIN calls the delete endpoint (role-only gate excludes SALON_ADMIN)")
+    void should_return403_when_salonAdminCallsDeleteService() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        // SALON_ADMIN is intentionally NOT in hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER').
+
+        log.debug("Act: DELETE /api/v1/services/{} as SALON_ADMIN — must be denied with 403", serviceDefId);
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).deactivateServiceDefinition(any(), any());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id} — 204 when INDEPENDENT_MASTER passes the role gate; service receives its userId as actorId")
     void should_return204_when_independentMasterDeletesOwnService() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        // canManageServiceDefinition returns true: this master owns the definition.
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-        // deactivateServiceDefinition is void — default Mockito behaviour is a no-op,
-        // which is exactly what we want.
+        // Role gate passes for INDEPENDENT_MASTER; deactivateServiceDefinition is void (no-op = success).
 
         log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER — must deactivate and return 204", serviceDefId);
         mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf()))
                 .andExpect(status().isNoContent());
+
+        verify(serviceCatalogService).deactivateServiceDefinition(userId, serviceDefId);
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 403 when INDEPENDENT_MASTER tries to delete SALON-owned service")
+    @DisplayName("DELETE /services/{id} — 403 when INDEPENDENT_MASTER targets a SALON-owned service (B14 service-layer guard throws ForbiddenException)")
     void should_return403_when_independentMasterDeletesSalonOwnedService() throws Exception {
         var imUserId = UUID.randomUUID();
         var salonOwnedServiceId = UUID.randomUUID();
-        // canManageServiceDefinition returns false because the independent master does not own
-        // this service definition (it belongs to a salon).
-        when(authorizationService.canManageServiceDefinition(any(), eq(salonOwnedServiceId))).thenReturn(false);
+        // §D split: the IM passes the role-only gate, then the service-layer B14 guard
+        // (authz.enforceCanManageServiceDefinition) rejects the non-owner with ForbiddenException,
+        // which GlobalExceptionHandler renders as 403.
+        doThrow(new ForbiddenException("Access denied"))
+                .when(serviceCatalogService).deactivateServiceDefinition(imUserId, salonOwnedServiceId);
 
         log.debug("Act: DELETE /api/v1/services/{} as INDEPENDENT_MASTER targeting salon-owned service — must return 403", salonOwnedServiceId);
         mockMvc.perform(delete("/api/v1/services/" + salonOwnedServiceId)
@@ -824,14 +868,14 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 403 when authenticated owner targets a non-existent service definition UUID")
+    @DisplayName("DELETE /services/{id} — 403 when authenticated owner targets a non-existent service definition (B14 guard treats unknown id as denied)")
     void should_return403_when_ownerDeletesNonExistentServiceDefinition() throws Exception {
-        // canManageServiceDefinition returns false when service definition does not exist
-        // (findOwnerUserId returns empty → orElse(false)).
-        // Spring Security short-circuits with 403, the service method is never invoked.
+        // §D split: owner passes the role-only gate; the service-layer B14 guard treats an unknown
+        // serviceDefId as access-denied (no existence oracle), throwing ForbiddenException → 403.
         var userId = UUID.randomUUID();
         var nonExistentId = UUID.randomUUID();
-        when(authorizationService.canManageServiceDefinition(any(), eq(nonExistentId))).thenReturn(false);
+        doThrow(new ForbiddenException("Access denied"))
+                .when(serviceCatalogService).deactivateServiceDefinition(userId, nonExistentId);
 
         log.debug("Act: DELETE /api/v1/services/{} with valid owner token but missing service def — must return 403", nonExistentId);
         mockMvc.perform(delete("/api/v1/services/" + nonExistentId)
@@ -1197,5 +1241,286 @@ class ServiceControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"photoUrl\":\"https://\"}"))
                 .andExpect(status().isBadRequest());
+    }
+
+    // ── POST /api/v1/independent-masters/me/services/bulk ──────────────────────
+    //
+    // First-time bulk setup, self path. The @WebMvcTest slice pins the HTTP contract:
+    // role gate (INDEPENDENT_MASTER), bean-validation of the batch envelope + per-item
+    // price mode, and the GlobalExceptionHandler rendering of the service-layer 409.
+    // The service-layer behaviour (derivation, all-or-nothing) is covered by
+    // ServiceCatalogServiceBulkCreateTest; the DB rollback by BulkServiceSetupIntegrationTest.
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 201 with the created services list")
+    void should_return201_when_independentMasterBulkCreates() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var firstId = UUID.randomUUID();
+        var secondId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null),
+                new BulkServiceItemRequest(UUID.randomUUID(), 120, PriceType.RANGE, null, new BigDecimal("800.00"), new BigDecimal("1500.00"))));
+
+        var created = List.of(
+                stubMasterServiceResponse(firstId, masterId, "Манікюр"),
+                stubMasterServiceResponse(secondId, masterId, "Фарбування"));
+        when(serviceCatalogService.bulkCreateIndependentMasterServices(eq(userId), any(BulkCreateServicesRequest.class)))
+                .thenReturn(created);
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk as INDEPENDENT_MASTER with a 2-item batch");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].id").value(firstId.toString()))
+                .andExpect(jsonPath("$.data[1].id").value(secondId.toString()));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 409 envelope when the master already has active services")
+    void should_return409_when_bulkSetupAndMasterAlreadyHasServices() throws Exception {
+        var userId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
+
+        when(serviceCatalogService.bulkCreateIndependentMasterServices(eq(userId), any()))
+                .thenThrow(new BusinessException(HttpStatus.CONFLICT,
+                        "Bulk setup is only available for a master with no active services"));
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk when master already has services — expect 409 envelope");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when items list is empty (@NotEmpty)")
+    void should_return400_when_bulkItemsEmpty() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with empty items — @NotEmpty must reject with 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"items\":[]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when items list exceeds 100 (@Size(max=100))")
+    void should_return400_when_bulkItemsExceedMax() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // Build 101 valid items so the ONLY violation is the @Size(max=100) cap.
+        StringBuilder items = new StringBuilder("{\"items\":[");
+        for (int i = 0; i < 101; i++) {
+            if (i > 0) items.append(',');
+            items.append("{\"serviceTypeId\":\"").append(UUID.randomUUID())
+                    .append("\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}");
+        }
+        items.append("]}");
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with 101 items — @Size(max=100) must reject with 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(items.toString()))
+                .andExpect(status().isBadRequest());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when a per-item RANGE has priceMax <= priceMin (@ServicePriceValid cascades through @Valid)")
+    void should_return400_when_bulkItemRangeMaxNotGreaterThanMin() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // Per-item @ServicePriceValid must fire through the list element @Valid cascade.
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"RANGE\",\"priceMin\":800.00,\"priceMax\":500.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with item priceMax<priceMin — must return 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 400 when a per-item FIXED also carries priceMin/priceMax")
+    void should_return400_when_bulkItemFixedAlsoCarriesRangeFields() throws Exception {
+        var userId = UUID.randomUUID();
+
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"priceMin\":300.00,\"priceMax\":400.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with FIXED + range fields both set — must return 400");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 403 when a CLIENT calls the self bulk endpoint (role gate)")
+    void should_return403_when_clientCallsSelfBulk() throws Exception {
+        var userId = UUID.randomUUID();
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk as CLIENT — must be denied with 403");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateIndependentMasterServices(any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 401 when no Authorization header is present")
+    void should_return401_when_selfBulkWithoutAuth() throws Exception {
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk without credentials — must return 401");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isUnauthorized());
+    }
+
+    // ── POST /api/v1/salons/{salonId}/masters/{masterId}/services/bulk ─────────
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 201 when SALON_OWNER bulk-creates on behalf of their master")
+    void should_return201_when_ownerBulkCreatesForMaster() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
+        var created = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Манікюр"));
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.bulkCreateSalonMasterServices(eq(salonId), eq(masterId), any()))
+                .thenReturn(created);
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk as SALON_OWNER", salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].masterId").value(masterId.toString()));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 201 when SALON_ADMIN bulk-creates on behalf (intentional canManageSalon broadening)")
+    void should_return201_when_salonAdminBulkCreatesForMaster() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
+        var created = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Манікюр"));
+
+        // The bulk on-behalf endpoint has NO hasRole gate — it relies on canManageSalon,
+        // which the contract intentionally grants to SALON_ADMIN as well as SALON_OWNER.
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.bulkCreateSalonMasterServices(eq(salonId), eq(masterId), any()))
+                .thenReturn(created);
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk as SALON_ADMIN — must be allowed on-behalf", salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 403 when the master is not in the salon (masterBelongsToSalon IDOR guard)")
+    void should_return403_when_bulkTargetsMasterInAnotherSalon() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonAId = UUID.randomUUID();
+        var masterInSalonBId = UUID.randomUUID();
+
+        // Owner can manage salon A, but the target master belongs to salon B → guard denies.
+        when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterInSalonBId, salonAId)).thenReturn(false);
+
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk targeting a master in another salon — must return 403", salonAId, masterInSalonBId);
+        mockMvc.perform(post("/api/v1/salons/" + salonAId + "/masters/" + masterInSalonBId + "/services/bulk")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateSalonMasterServices(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 403 when caller cannot manage the salon")
+    void should_return403_when_bulkOnBehalfByNonManager() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
+
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk by a non-manager — must return 403", salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
+                        .with(authenticatedAs(userId, "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateSalonMasterServices(any(), any(), any());
     }
 }

@@ -38,6 +38,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String MASTERS_ME_PROFILE_PATH = "/api/v1/masters/me/profile";
     private static final String CATEGORY_REQUEST_PATH = "/api/v1/service-categories/requests";
     private static final String SUGGEST_SERVICE_TYPE_PATH = "/api/v1/service-types/suggest";
+    // First-time bulk-service-setup endpoints. The independent path is an exact match;
+    // the salon path carries {salonId}/{masterId} variables, so it is matched by prefix +
+    // suffix (same technique as the parameterized SLOTS_PATH below).
+    private static final String BULK_IM_SERVICES_PATH = "/api/v1/independent-masters/me/services/bulk";
+    private static final String BULK_SALON_SERVICES_PREFIX = "/api/v1/salons/";
+    private static final String BULK_SALON_SERVICES_SUFFIX = "/services/bulk";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
@@ -77,6 +83,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP bucket for POST /api/v1/service-types/suggest — every successful
     // suggestion emails the admin, so this is an inbox-flood surface (5/hr).
     private final LoadingCache<String, Bucket> suggestServiceTypeBuckets;
+    // Per-IP bucket for the two first-time bulk-service-setup endpoints. Even the 409
+    // first-time-only path runs full 100-item validation, so an authenticated token-holder
+    // is a DoS amplifier without this guard (10/min).
+    private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -91,7 +101,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
             @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
             @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
-            @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets) {
+            @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -105,6 +116,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.resetPasswordBuckets = resetPasswordBuckets;
         this.categoryRequestBuckets = categoryRequestBuckets;
         this.suggestServiceTypeBuckets = suggestServiceTypeBuckets;
+        this.bulkServiceSetupBuckets = bulkServiceSetupBuckets;
     }
 
     @Override
@@ -155,6 +167,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         || IM_LOCALITY_PATH.equals(path)
                         || MASTERS_ME_PROFILE_PATH.equals(path))) {
             applyRateLimit(request, response, filterChain, profileUpdateBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Bulk-service-setup rate-limit: POST on either bulk route. The independent route
+        // is an exact path; the salon route carries {salonId}/{masterId} variables, so it is
+        // matched by prefix + suffix (same technique as the SLOTS_PATH branch above). Cap:
+        // 10 requests/min per IP (shared bulkServiceSetupBuckets).
+        if (HttpMethod.POST.matches(method)
+                && (BULK_IM_SERVICES_PATH.equals(path)
+                        || (path.startsWith(BULK_SALON_SERVICES_PREFIX)
+                                && path.endsWith(BULK_SALON_SERVICES_SUFFIX)))) {
+            applyRateLimit(request, response, filterChain, bulkServiceSetupBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
