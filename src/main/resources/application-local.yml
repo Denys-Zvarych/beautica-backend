@@ -55,8 +55,10 @@ app:
   admin-email: ${ADMIN_EMAIL:dev-admin@localhost}
   public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
   security:
-    # Local dev only — never use in prod. Generate prod value: openssl rand -base64 32
-    otp-pepper: local-dev-otp-pepper-not-for-prod-min32chars
+    # Local dev only — never use in prod. Generate prod value: openssl rand -base64 32.
+    # Env-wrapped so a future profile copy can't silently reuse the committed dev value;
+    # the default keeps local behaviour unchanged.
+    otp-pepper: ${APP_OTP_PEPPER:local-dev-otp-pepper-not-for-prod-min32chars}
   verification:
     cumulative-failure-threshold: 10
     lockout-duration: 15m

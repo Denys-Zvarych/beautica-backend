@@ -184,9 +184,13 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ApiResponse<Void>> handleDataIntegrityViolation(DataIntegrityViolationException ex) {
+        // Single static message — distinguishing "duplicate" from "foreign key" in the
+        // HTTP body is an enumeration oracle (reveals which constraint fired). The real
+        // cause is logged at DEBUG only, never echoed to the caller (§I/§N).
+        log.debug("Data integrity violation: {}", ex.getMostSpecificCause().getMessage());
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
-                .body(ApiResponse.error("Conflict: duplicate or constraint violation"));
+                .body(ApiResponse.error("Request conflicts with existing data"));
     }
 
     @ExceptionHandler(JwtException.class)
@@ -242,10 +246,11 @@ public class GlobalExceptionHandler {
      */
     @ExceptionHandler(MissingServletRequestPartException.class)
     public ResponseEntity<ApiResponse<Void>> handleMissingPart(MissingServletRequestPartException ex) {
-        // Static message — part name comes from server-side annotations today, but could be
-        // attacker-influenced in future endpoints. The client only needs to know to send
+        // Static message — the part name comes from server-side annotations today, but could
+        // be attacker-influenced in future endpoints, so it is not interpolated anywhere
+        // (neither the HTTP body nor the log). The client only needs to know to send
         // multipart/form-data with a 'file' field; the part name adds no diagnostic value (§I).
-        log.debug("Missing request part: {}", ex.getRequestPartName());
+        log.debug("Missing required multipart request part");
         return ResponseEntity
                 .badRequest()
                 .body(ApiResponse.error("Required file part is missing"));
