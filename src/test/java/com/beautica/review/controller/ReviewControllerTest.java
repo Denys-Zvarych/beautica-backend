@@ -14,6 +14,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -45,6 +48,7 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -133,49 +137,27 @@ class ReviewControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
     }
 
-    @Test
-    @DisplayName("POST /reviews — 403 when SALON_OWNER attempts to submit a review")
-    void should_return403_when_nonClientSubmitsReview() throws Exception {
-        var ownerId = UUID.randomUUID();
+    @ParameterizedTest(name = "{0} → 403")
+    @EnumSource(value = Role.class, names = "CLIENT", mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("POST /reviews — 403 when a non-CLIENT role attempts to submit a review")
+    void should_return403_when_nonClientRoleSubmitsReview(Role role) throws Exception {
+        // @PreAuthorize("hasRole('CLIENT')") gates POST /reviews — every other role is
+        // forbidden. EXCLUDE CLIENT so the matrix covers SALON_OWNER, SALON_ADMIN,
+        // SALON_MASTER, INDEPENDENT_MASTER. The body is otherwise valid, so a 403 proves
+        // the authorization gate fires BEFORE service invocation.
+        var userId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
                 new CreateReviewRequest(UUID.randomUUID(), 5, null));
 
         mockMvc.perform(post(REVIEWS_URL)
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(authenticatedAs(userId, role.name().toLowerCase() + "@beautica.test", role))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isForbidden());
-    }
 
-    @Test
-    @DisplayName("POST /reviews — 403 when SALON_MASTER attempts to submit a review")
-    void should_return403_when_salonMasterSubmitsReview() throws Exception {
-        var masterId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(
-                new CreateReviewRequest(UUID.randomUUID(), 5, null));
-
-        mockMvc.perform(post(REVIEWS_URL)
-                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isForbidden());
-    }
-
-    @Test
-    @DisplayName("POST /reviews — 403 when INDEPENDENT_MASTER attempts to submit a review")
-    void should_return403_when_independentMasterSubmitsReview() throws Exception {
-        var masterId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(
-                new CreateReviewRequest(UUID.randomUUID(), 5, null));
-
-        mockMvc.perform(post(REVIEWS_URL)
-                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isForbidden());
+        // Authorization must short-circuit — the service is never reached for a denied role.
+        verifyNoInteractions(reviewService);
     }
 
     @Test
@@ -191,12 +173,33 @@ class ReviewControllerTest {
                 .andExpect(status().isUnauthorized());
     }
 
-    @Test
-    @DisplayName("POST /reviews — 400 when rating exceeds maximum (6 > 5)")
-    void should_return400_when_ratingOutOfRange() throws Exception {
+    // ── rating boundary matrix (@Min(1) / @Max(5)) ────────────────────────────
+
+    @ParameterizedTest(name = "rating={0} → 201")
+    @ValueSource(ints = {1, 5})
+    @DisplayName("POST /reviews — 201 when rating is at an in-range boundary (1 or 5)")
+    void should_return201_when_ratingAtInRangeBoundary(int rating) throws Exception {
         var clientId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new CreateReviewRequest(UUID.randomUUID(), 6, null));
+                new CreateReviewRequest(UUID.randomUUID(), rating, null));
+        when(reviewService.createReview(any(), any())).thenReturn(stubReviewResponse());
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @ParameterizedTest(name = "rating={0} → 400")
+    @ValueSource(ints = {0, 6})
+    @DisplayName("POST /reviews — 400 when rating is just outside [1,5] (0 below min, 6 above max)")
+    void should_return400_when_ratingOutOfRange(int rating) throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), rating, null));
 
         mockMvc.perform(post(REVIEWS_URL)
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -204,14 +207,17 @@ class ReviewControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isBadRequest());
+
+        // Bean Validation rejects the body before the service is invoked.
+        verifyNoInteractions(reviewService);
     }
 
     @Test
-    @DisplayName("POST /reviews — 400 when rating is zero (below minimum of 1)")
-    void should_return400_when_ratingZero() throws Exception {
+    @DisplayName("POST /reviews — 400 when rating is null (@NotNull)")
+    void should_return400_when_ratingNull() throws Exception {
         var clientId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new CreateReviewRequest(UUID.randomUUID(), 0, null));
+                new CreateReviewRequest(UUID.randomUUID(), null, null));
 
         mockMvc.perform(post(REVIEWS_URL)
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -219,6 +225,78 @@ class ReviewControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(reviewService);
+    }
+
+    // ── comment boundary matrix (@Size(min=1, max=2000)) ──────────────────────
+
+    @Test
+    @DisplayName("POST /reviews — 201 when comment is exactly 2000 chars (max boundary accepted)")
+    void should_return201_when_commentAtMaxLength() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, "x".repeat(2000)));
+        when(reviewService.createReview(any(), any())).thenReturn(stubReviewResponse());
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 201 when comment is null (optional — no comment is valid)")
+    void should_return201_when_commentNull() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, null));
+        when(reviewService.createReview(any(), any())).thenReturn(stubReviewResponse());
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 400 when comment is 2001 chars (one over max)")
+    void should_return400_when_commentOverMaxLength() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, "x".repeat(2001)));
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(reviewService);
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 400 when comment is empty string (@Size min=1 / blank rejected)")
+    void should_return400_when_commentBlank() throws Exception {
+        var clientId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new CreateReviewRequest(UUID.randomUUID(), 5, ""));
+
+        mockMvc.perform(post(REVIEWS_URL)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(reviewService);
     }
 
     @Test
