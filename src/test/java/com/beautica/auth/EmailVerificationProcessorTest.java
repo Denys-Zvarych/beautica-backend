@@ -369,6 +369,108 @@ class EmailVerificationProcessorTest {
         assertThat(processor.isLocked(user)).isFalse();
     }
 
+    // ─── leading-zero OTP end-to-end: seed real digest → verify (QA LOW) ──────
+
+    /**
+     * Wires a <em>real</em> {@link SecureTokenGenerator} into a fresh processor so
+     * the seeded hash and the verification compare share one HMAC implementation —
+     * exercising generate-or-seed → hashOtp → MessageDigest.isEqual end-to-end.
+     * This is the only place the OTP string is hashed by production code on both
+     * sides of the comparison, which is what makes the zero-strip guard meaningful.
+     */
+    @org.junit.jupiter.api.Nested
+    @DisplayName("leading-zero OTP — fixed-width, no strip, end-to-end")
+    class LeadingZeroOtp {
+
+        private final SecureTokenGenerator realGenerator =
+                new SecureTokenGenerator(new com.beautica.config.OtpPepperConfig(
+                        "leading-zero-otp-test-pepper-min-32-characters!"));
+
+        private EmailVerificationProcessor realProcessor() {
+            Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
+            var policy = new VerificationPolicyConfig(
+                    CUMULATIVE_THRESHOLD, LOCKOUT, Duration.ofHours(24), Duration.ofSeconds(60));
+            return new EmailVerificationProcessor(userRepository, realGenerator, clock, policy);
+        }
+
+        private User seededWith(String email, String rawOtp) {
+            var user = buildUnverified(UUID.randomUUID(), email);
+            // Seed exactly what the resend/issue path would persist: the HMAC of the
+            // literal 6-char OTP string produced by the real generator.
+            user.setVerificationCodeHash(realGenerator.hashOtp(rawOtp));
+            user.setVerificationCodeExpiresAt(FIXED_NOW.plusSeconds(900));
+            user.setVerificationAttempts((short) 0);
+            return user;
+        }
+
+        @Test
+        @DisplayName("a seeded leading-zero OTP (000123) verifies via the real hash path")
+        void should_verify_when_seededLeadingZeroOtpSubmittedVerbatim() {
+            var email = "lz1@example.com";
+            var rawOtp = "000123";
+            var user = seededWith(email, rawOtp);
+            when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
+
+            UUID result = realProcessor().verifyAndReturnUserId(new VerifyEmailRequest(email, rawOtp));
+
+            assertThat(result).isEqualTo(user.getId());
+            assertThat(user.isEmailVerified())
+                    .as("a zero-padded code submitted verbatim must verify")
+                    .isTrue();
+        }
+
+        @Test
+        @DisplayName("the all-zero OTP (000000) verifies as a real success, not only as the decoy")
+        void should_verify_when_seededAllZeroOtp() {
+            var email = "lz0@example.com";
+            var rawOtp = "000000";
+            var user = seededWith(email, rawOtp);
+            when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
+
+            UUID result = realProcessor().verifyAndReturnUserId(new VerifyEmailRequest(email, rawOtp));
+
+            assertThat(result).isEqualTo(user.getId());
+            assertThat(user.isEmailVerified()).isTrue();
+        }
+
+        @Test
+        @DisplayName("trailing-zero edge (001000) verifies verbatim through the real hash path")
+        void should_verify_when_seededTrailingZeroOtp() {
+            var email = "lz2@example.com";
+            var rawOtp = "001000";
+            var user = seededWith(email, rawOtp);
+            when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
+
+            UUID result = realProcessor().verifyAndReturnUserId(new VerifyEmailRequest(email, rawOtp));
+
+            assertThat(result).isEqualTo(user.getId());
+            assertThat(user.isEmailVerified()).isTrue();
+        }
+
+        @Test
+        @DisplayName("a zero-STRIPPED submission (123) does NOT verify against a code seeded as 000123")
+        void should_rejectAndIncrement_when_strippedFormSubmittedForLeadingZeroCode() {
+            // The core of the finding: if anything stripped leading zeros, "123" would
+            // match a "000123" seed. It must instead be a generic INVALID_CODE.
+            var email = "lz3@example.com";
+            var user = seededWith(email, "000123");
+            when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
+
+            assertThatThrownBy(() -> realProcessor()
+                    .verifyAndReturnUserId(new VerifyEmailRequest(email, "123")))
+                    .isInstanceOf(VerificationException.class)
+                    .extracting(ex -> ((VerificationException) ex).getCode())
+                    .isEqualTo(VerificationException.Code.INVALID_CODE);
+
+            assertThat(user.isEmailVerified())
+                    .as("a zero-stripped code must never verify against a zero-padded seed")
+                    .isFalse();
+            assertThat(user.getVerificationAttempts())
+                    .as("the wrong (stripped) submission consumes one attempt")
+                    .isEqualTo((short) 1);
+        }
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────────────
 
     private User buildUnverified(UUID id, String email) {
