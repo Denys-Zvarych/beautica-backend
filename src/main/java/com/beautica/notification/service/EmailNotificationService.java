@@ -7,7 +7,9 @@ import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
 import org.springframework.mail.MailException;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
@@ -15,6 +17,7 @@ import org.springframework.stereotype.Service;
 import org.thymeleaf.context.Context;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
+import java.io.IOException;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
@@ -33,8 +36,50 @@ public class EmailNotificationService {
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final DateTimeFormatter DATE_FMT =
             DateTimeFormatter.ofPattern("HH:mm, d MMMM yyyy", Locale.forLanguageTag("uk"));
-    private static final ClassPathResource LOGO =
-            new ClassPathResource("static/email/beautica-logo.png");
+    private static final String LOGO_CID = "beauticaLogo";
+
+    /**
+     * Logo bytes are read from the classpath exactly once at class load. A {@link ClassPathResource}
+     * re-opens (and re-reads) the underlying stream on every {@code addInline} send, so the PNG was
+     * being re-read per email. We cache the immutable byte[] and wrap a fresh {@link ByteArrayResource}
+     * per attach: {@code MimeMessageHelper.addInline} only calls {@code getInputStream()} (read-only,
+     * returns a new {@code ByteArrayInputStream} each time) — it never mutates the shared array.
+     *
+     * <p>Load failure is non-fatal: a missing/unreadable logo must never crash application boot
+     * (a static-init throw becomes {@code ExceptionInInitializerError}) nor fail an email send.
+     * On failure this stays {@code null}, a warning is logged once, and the send path skips
+     * {@code addInline} — the email still goes out, just without the inline logo.
+     */
+    private static final byte[] LOGO_BYTES = loadLogoBytes();
+
+    private static byte[] loadLogoBytes() {
+        try {
+            return new ClassPathResource("static/email/beautica-logo.png").getContentAsByteArray();
+        } catch (IOException e) {
+            // Graceful degradation: log once, send emails without the logo rather than crash boot.
+            log.warn("Email logo not readable from classpath (static/email/beautica-logo.png); "
+                    + "emails will be sent without the inline logo. exception={}", e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /** Fresh wrapper around the cached bytes per attach — JavaMail does not mutate the resource. */
+    private static Resource logoResource() {
+        return new ByteArrayResource(LOGO_BYTES) {
+            @Override
+            public String getFilename() {
+                // MimeMessageHelper infers the inline part's content type from the filename extension.
+                return "beautica-logo.png";
+            }
+        };
+    }
+
+    /** Attaches the inline logo when available; silently skips it when the logo failed to load. */
+    private static void addLogoInline(MimeMessageHelper helper) throws MessagingException {
+        if (LOGO_BYTES != null) {
+            helper.addInline(LOGO_CID, logoResource());
+        }
+    }
 
     private final JavaMailSender mailSender;
     private final SpringTemplateEngine templateEngine;
@@ -117,7 +162,7 @@ public class EmailNotificationService {
             String html = templateEngine.process("email/reset-password", ctx);
             helper.setText(html, true);
 
-            helper.addInline("beauticaLogo", LOGO);
+            addLogoInline(helper);
 
             mailSender.send(message);
         } catch (MessagingException | MailException e) {
@@ -142,7 +187,7 @@ public class EmailNotificationService {
             helper.setText(html, true);
 
             // Embed logo as CID inline attachment
-            helper.addInline("beauticaLogo", LOGO);
+            addLogoInline(helper);
 
             mailSender.send(message);
         } catch (MessagingException | MailException e) {
@@ -174,7 +219,7 @@ public class EmailNotificationService {
             helper.setTo(to.replaceAll("[\r\n]", ""));
             helper.setSubject(subject);
             helper.setText(html, true);
-            helper.addInline("beauticaLogo", LOGO);
+            addLogoInline(helper);
             mailSender.send(message);
         } catch (MessagingException | MailException ex) {
             // Deliberate swallow: delivery failures must not crash the outbox drain loop.
