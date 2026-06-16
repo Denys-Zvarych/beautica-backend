@@ -771,9 +771,15 @@ class AuthServiceTest {
         when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
 
+        // Exact retry-after contract (the value flows into the Retry-After header):
+        //   issuedAt   = now - 30s
+        //   nextAllowed = issuedAt + cooldown(60s) = now + 30s
+        //   retryAfter  = secondsBetween(now, nextAllowed) + 1 = 30 + 1 = 31
         assertThatThrownBy(() -> authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL)))
                 .isInstanceOf(ResendThrottledException.class)
-                .satisfies(ex -> assertThat(((ResendThrottledException) ex).getRetryAfterSeconds()).isGreaterThan(0));
+                .satisfies(ex -> assertThat(((ResendThrottledException) ex).getRetryAfterSeconds())
+                        .as("retry-after = remaining cooldown (30s) rounded up by the +1 ceiling")
+                        .isEqualTo(31L));
 
         verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }

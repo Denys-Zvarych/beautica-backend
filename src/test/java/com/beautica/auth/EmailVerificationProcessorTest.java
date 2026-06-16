@@ -233,6 +233,34 @@ class EmailVerificationProcessorTest {
                 .isEqualTo(VerificationException.Code.CODE_EXPIRED);
     }
 
+    @Test
+    @DisplayName("CODE_EXPIRED when the stored hash is present but its expiry timestamp is null (mixed state)")
+    void should_throwCodeExpired_when_hashPresentButExpiresAtNull() {
+        // Mixed/inconsistent persisted state: a non-null code hash with a null
+        // expiry. Line 109's `expiresAt == null` operand short-circuits BEFORE the
+        // isBefore(now) expiry check, so this surfaces as CODE_EXPIRED and the
+        // stale hash is NOT compared (no hashOtp call on the incoming code).
+        var email = "mixedstate@example.com";
+        var storedHash = "a".repeat(64);
+        var user = buildUnverified(UUID.randomUUID(), email);
+        user.setVerificationCodeHash(storedHash);
+        user.setVerificationCodeExpiresAt(null);
+        when(userRepository.findByEmailForUpdate(email)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> processor.verifyAndReturnUserId(new VerifyEmailRequest(email, "123456")))
+                .isInstanceOf(VerificationException.class)
+                .extracting(ex -> ((VerificationException) ex).getCode())
+                .isEqualTo(VerificationException.Code.CODE_EXPIRED);
+
+        assertThat(user.getVerificationCodeHash())
+                .as("the mixed-state guard returns before any clear or compare; the stale hash is left untouched")
+                .isEqualTo(storedHash);
+        assertThat(user.getVerificationAttempts())
+                .as("the attempt counter is not consumed when the guard short-circuits before the compare")
+                .isZero();
+        org.mockito.Mockito.verify(tokenGenerator, org.mockito.Mockito.never()).hashOtp("123456");
+    }
+
     // ─── QA HIGH: resend-surviving cumulative lockout ─────────────────────────
 
     @Test
