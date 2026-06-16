@@ -410,6 +410,26 @@ class MediaServiceTest {
     }
 
     @Test
+    @DisplayName("throws ForbiddenException when INDEPENDENT_MASTER has no master profile on uploadPortfolioPhoto")
+    void should_throwForbidden_when_independentMasterHasNoProfile() {
+        // Symmetric empty branch to should_throwForbidden_when_salonOwnerHasNoActiveSalon:
+        // resolvePortfolioTarget() looks up the master profile for an INDEPENDENT_MASTER and
+        // throws ForbiddenException("No master profile found for user") when absent. Only the
+        // happy path (Optional.of(master)) was previously stubbed, so this empty branch was
+        // never exercised — a regression that dropped the orElseThrow would have gone unnoticed.
+        UUID actorId = UUID.randomUUID();
+        when(masterRepo.findByUserId(any(UUID.class))).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(actorId, Role.INDEPENDENT_MASTER, jpegFile()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("No master profile found");
+
+        // The R2 upload runs only AFTER the target resolves — it must never be reached.
+        verify(r2, never()).uploadFile(anyString(), any(), anyLong(), anyString());
+        verifyNoInteractions(mediaRepo);
+    }
+
+    @Test
     @DisplayName("throws 403 when a CLIENT uploads a portfolio photo")
     void should_throwForbidden_when_clientUploadsPortfolio() {
         assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.CLIENT, jpegFile()))

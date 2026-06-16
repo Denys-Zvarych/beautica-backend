@@ -460,6 +460,36 @@ class R2StorageServiceTest {
                 .isEmpty();
     }
 
+    @Test
+    @DisplayName("buildPublicUrl appends literal 'null' when key is null in enabled mode — no service-level guard, behaviour pinned")
+    void should_appendLiteralNull_when_keyIsNullOnBuildPublicUrlEnabled() {
+        // buildPublicUrl has no null/empty-key guard in enabled mode: it returns
+        // publicUrlPrefix + "/" + key. A null key is String-concatenated to the literal
+        // "null" (no NPE). Pin this so a future null-guard addition is a deliberate,
+        // test-visible green→red flip rather than a silent behaviour change.
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        String url = service.buildPublicUrl(null);
+
+        assertThat(url)
+                .as("null key concatenates to the literal 'null' — no service-level guard exists")
+                .isEqualTo("https://pub.example.r2.dev/null");
+    }
+
+    @Test
+    @DisplayName("buildPublicUrl yields a trailing-slash URL when key is empty in enabled mode — no service-level guard, behaviour pinned")
+    void should_yieldTrailingSlashUrl_when_keyIsEmptyOnBuildPublicUrlEnabled() {
+        // An empty key produces publicUrlPrefix + "/" + "" = ".../". Pin this boundary so a
+        // future guard (e.g. rejecting blank keys) is a visible, deliberate change.
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        String url = service.buildPublicUrl("");
+
+        assertThat(url)
+                .as("empty key concatenates to a bare trailing-slash URL — no service-level guard exists")
+                .isEqualTo("https://pub.example.r2.dev/");
+    }
+
     // ── Fix 10 — disabled-mode uploadFile return shape ────────────────────────
 
     @Test
