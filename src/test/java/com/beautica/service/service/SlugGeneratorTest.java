@@ -68,4 +68,28 @@ class SlugGeneratorTest {
         assertThat(slug).matches(ENTITY_SLUG);
         assertThat(slug).doesNotStartWith("-").doesNotEndWith("-");
     }
+
+    @Test
+    @DisplayName("should_appendLongerRandomToken_when_allShorterCandidatesCollide")
+    void should_appendLongerRandomToken_when_allShorterCandidatesCollide() {
+        // Reject the base, every numeric suffix, and every 6-char random short token —
+        // i.e. anything WITHOUT a 16-char random suffix. This drives the generator past
+        // the numeric loop and all 5 random-short-token attempts to the longer-token
+        // fallback. Matching by suffix length (not exact value) keeps the test decoupled
+        // from SecureRandom output while still proving the loop terminates.
+        Predicate<String> onlyLongTokenIsFree = candidate -> {
+            int lastDash = candidate.lastIndexOf('-');
+            String suffix = lastDash < 0 ? candidate : candidate.substring(lastDash + 1);
+            // Free (not taken) only when the suffix is the 16-char fallback token.
+            return !suffix.matches("[a-z0-9]{16}");
+        };
+
+        String slug = generator.uniqueSlug("Балаяж", "HAIR_COLORING", onlyLongTokenIsFree);
+
+        // Terminated and produced a valid, fallback-shaped slug.
+        assertThat(slug).matches(ENTITY_SLUG);
+        assertThat(slug).startsWith("balaiazh-");
+        String suffix = slug.substring(slug.lastIndexOf('-') + 1);
+        assertThat(suffix).as("longer fallback token, actual=%s", suffix).hasSize(16);
+    }
 }

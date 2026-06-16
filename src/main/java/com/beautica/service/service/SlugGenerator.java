@@ -18,8 +18,8 @@ import java.util.function.Predicate;
  * <p>Pipeline: transliterate Ukrainian → Latin, lowercase, strip to {@code [a-z0-9-]},
  * collapse and trim hyphens. A name that transliterates to nothing usable falls back to
  * the category slug plus a random suffix. Uniqueness is enforced by suffixing
- * {@code -2}, {@code -3}, … until free, capped; on exhaustion a 6-char random suffix is
- * appended.
+ * {@code -2}, {@code -3}, … until free, capped; on exhaustion a bounded number of 6-char
+ * random suffixes are tried, then a single longer (16-char) token guarantees termination.
  *
  * <p>Stateless and side-effect-free apart from the injected existence check — safe to
  * call inside the promotion transaction.
@@ -30,7 +30,9 @@ public class SlugGenerator {
 
     private static final int MAX_SLUG_LENGTH = 255;
     private static final int MAX_NUMERIC_SUFFIX_ATTEMPTS = 50;
+    private static final int MAX_RANDOM_SUFFIX_ATTEMPTS = 5;
     private static final int RANDOM_SUFFIX_LENGTH = 6;
+    private static final int RANDOM_SUFFIX_FALLBACK_LENGTH = 16;
     private static final String FALLBACK_BASE = "service";
     private static final char[] BASE36 = "abcdefghijklmnopqrstuvwxyz0123456789".toCharArray();
 
@@ -78,11 +80,16 @@ public class SlugGenerator {
             }
         }
         // Numeric suffixes exhausted — append a random base36 token. Practically collision-free.
-        String candidate;
-        do {
-            candidate = truncate(base) + "-" + randomToken();
-        } while (slugExists.test(candidate));
-        return candidate;
+        for (int attempt = 0; attempt < MAX_RANDOM_SUFFIX_ATTEMPTS; attempt++) {
+            String candidate = truncate(base) + "-" + randomToken(RANDOM_SUFFIX_LENGTH);
+            if (!slugExists.test(candidate)) {
+                return candidate;
+            }
+        }
+        // Vanishingly unlikely (5 collisions over the 2.1B base36 keyspace) — widen the
+        // token rather than loop unbounded. The longer token keeps the operation succeeding
+        // while guaranteeing the loop terminates.
+        return truncate(base) + "-" + randomToken(RANDOM_SUFFIX_FALLBACK_LENGTH);
     }
 
     private String transliterate(String input) {
@@ -126,9 +133,9 @@ public class SlugGenerator {
         return cut;
     }
 
-    private String randomToken() {
-        StringBuilder sb = new StringBuilder(RANDOM_SUFFIX_LENGTH);
-        for (int i = 0; i < RANDOM_SUFFIX_LENGTH; i++) {
+    private String randomToken(int length) {
+        StringBuilder sb = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
             sb.append(BASE36[random.nextInt(BASE36.length)]);
         }
         return sb.toString();
