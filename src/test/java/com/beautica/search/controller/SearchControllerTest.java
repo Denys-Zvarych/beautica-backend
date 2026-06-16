@@ -215,6 +215,183 @@ class SearchControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
+    // ── Boundary matrix: page / size @Max + @Positive/@PositiveOrZero edges ───
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when ?size is exactly 100 (at @Max ceiling, accepted)")
+    void should_return200_when_sizeAtMaxCeiling() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 100), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with size=100 — exactly at @Max(100), must be accepted (200)", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "100")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when ?size is exactly 1 (at @Positive lower edge, accepted)")
+    void should_return200_when_sizeAtPositiveLowerEdge() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 1), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with size=1 — lowest @Positive value, must be accepted (200)", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "1")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when ?page is exactly 500 (at @Max ceiling, accepted)")
+    void should_return200_when_pageAtMaxCeiling() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(500, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with page=500 — exactly at @Max(500), must be accepted (200)", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "500")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── Boundary matrix: minPrice / maxPrice negative + precision (@DecimalMin / @Digits) ──
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when minPrice is negative (@DecimalMin(0))")
+    void should_return400_when_minPriceNegative() throws Exception {
+        log.debug("Act: GET {} with minPrice=-0.01 — must fail @DecimalMin(0) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "-0.01")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when maxPrice is negative (@DecimalMin(0))")
+    void should_return400_when_maxPriceNegative() throws Exception {
+        log.debug("Act: GET {} with maxPrice=-1 — must fail @DecimalMin(0) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("maxPrice", "-1")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when minPrice has 3 decimal places (@Digits fraction=2)")
+    void should_return400_when_minPriceExceedsFractionPrecision() throws Exception {
+        log.debug("Act: GET {} with minPrice=10.123 — must fail @Digits(fraction=2) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "10.123")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when minPrice has 9 integer digits (@Digits integer=8)")
+    void should_return400_when_minPriceExceedsIntegerPrecision() throws Exception {
+        log.debug("Act: GET {} with minPrice=123456789 (9 int digits) — must fail @Digits(integer=8) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "123456789")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when minPrice has exactly 8 integer + 2 fraction digits (at @Digits ceiling)")
+    void should_return200_when_minPriceAtDigitsCeiling() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with minPrice=12345678.90 — exactly NUMERIC(10,2), must be accepted (200)", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "12345678.90")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── Boundary matrix: minRating range 0.0..5.0 (@DecimalMin / @DecimalMax) ──
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when minRating is exactly 0.0 (at @DecimalMin lower edge)")
+    void should_return200_when_minRatingAtLowerEdge() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with minRating=0.0 — exactly at @DecimalMin(0.0), must be accepted (200)", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minRating", "0.0")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when minRating is exactly 5.0 (at @DecimalMax upper edge)")
+    void should_return200_when_minRatingAtUpperEdge() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with minRating=5.0 — exactly at @DecimalMax(5.0), must be accepted (200)", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minRating", "5.0")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when minRating exceeds 5.0 (@DecimalMax upper bound)")
+    void should_return400_when_minRatingAboveUpperBound() throws Exception {
+        log.debug("Act: GET {} with minRating=5.01 — must fail @DecimalMax(5.0) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minRating", "5.01")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when minRating is negative (@DecimalMin lower bound)")
+    void should_return400_when_minRatingNegative() throws Exception {
+        log.debug("Act: GET {} with minRating=-0.01 — must fail @DecimalMin(0.0) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minRating", "-0.01")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
     @Test
     @DisplayName("GET /api/v1/search/masters — paginated envelope is present in response JSON")
     void should_returnPaginatedResponse_when_resultPageReturned() throws Exception {
@@ -349,6 +526,46 @@ class SearchControllerTest {
         mockMvc.perform(get(SALONS_URL)
                         .param("page", "501")
                         .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when ?size is exactly 100 (at @Max ceiling, accepted)")
+    void should_return200_when_sizeAtMaxCeiling_forSalonSearch() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(0, 100), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        log.debug("Act: GET {} with size=100 — exactly at @Max(100), must be accepted (200)", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "100")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when ?page is exactly 500 (at @Max ceiling, accepted)")
+    void should_return200_when_pageAtMaxCeiling_forSalonSearch() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(500, 20), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        log.debug("Act: GET {} with page=500 — exactly at @Max(500), must be accepted (200)", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "500")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when ?size is zero (@Positive lower bound)")
+    void should_return400_when_sizeIsZero_forSalonSearch() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "0")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest());
     }
