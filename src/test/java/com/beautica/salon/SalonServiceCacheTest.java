@@ -127,7 +127,7 @@ class SalonServiceCacheTest {
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Populate cache
         salonService.getOwnerSalons(ownerId);
@@ -163,7 +163,7 @@ class SalonServiceCacheTest {
 
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Populate salon-detail cache
         salonService.getSalonEntity(salonId);
@@ -190,7 +190,7 @@ class SalonServiceCacheTest {
 
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Populate ownerSalons cache for this owner
         salonService.getOwnerSalons(actorId);
@@ -219,7 +219,7 @@ class SalonServiceCacheTest {
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Populate salon-detail cache
         salonService.getSalonEntity(salonId);
@@ -245,7 +245,7 @@ class SalonServiceCacheTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Seed the search:salons cache with a sentinel entry so we can confirm it is cleared.
         // evictSearchSalonsCacheAfterCommit() calls cache.clear() — blanket eviction — so any

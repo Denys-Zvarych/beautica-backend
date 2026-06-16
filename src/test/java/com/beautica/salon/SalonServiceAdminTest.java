@@ -76,7 +76,7 @@ class SalonServiceAdminTest {
                 null, null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
         // Authorization is exclusively enforced by @PreAuthorize on SalonController — not re-checked in service.
 
         SalonResponse response = salonService.updateSalon(adminId, salonId, request);
