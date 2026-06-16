@@ -12,12 +12,14 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
+import org.hibernate.annotations.DynamicUpdate;
 
 import java.time.Instant;
 import java.util.UUID;
 
 
 @Entity
+@DynamicUpdate
 @Table(
         name = "users",
         // Mirrors the partial index idx_users_stale_unverified_otp from V50 so
