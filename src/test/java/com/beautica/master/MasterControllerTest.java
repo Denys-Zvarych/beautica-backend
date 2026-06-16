@@ -259,22 +259,66 @@ class MasterControllerTest {
     }
 
     @Test
-    @DisplayName("GET /me — 200 with master profile when authenticated INDEPENDENT_MASTER")
+    @DisplayName("GET /me — 200 with every MasterDetailResponse field serialized for authenticated INDEPENDENT_MASTER")
     void should_return200WithProfile_when_independentMasterRequestsOwnProfile() throws Exception {
         var userId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
+        var workingHoursId = UUID.randomUUID();
+        var cityUuid = UUID.randomUUID();
+        var oblastUuid = UUID.randomUUID();
+        var districtUuid = UUID.randomUUID();
+
+        // Fully-populated fixture: each of the 19 record components carries a distinct, asserted
+        // value so the /me contract is pinned field-by-field (was: only masterId + firstName).
+        // salon is left null on purpose — the handler must still emit it as JSON null, which the
+        // assertions below verify. workingHours carries one row to lock the nested mapping.
+        var workingHoursRow = new WorkingHoursResponse(
+                workingHoursId, 1, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
+        MasterDetailResponse fullDetail = new MasterDetailResponse(
+                masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
+                "вул. Хрещатик", "1A", "green door",
+                "Nail artist", "@oksana.nails", "https://cdn.beautica.test/a.png",
+                new BigDecimal("4.75"), 12, MasterType.INDEPENDENT_MASTER, null,
+                List.of(workingHoursRow),
+                cityUuid, oblastUuid, districtUuid);
 
         // Controller now delegates to a single getMyMasterDetail(UUID) call — stub that method only.
-        when(masterService.getMyMasterDetail(userId)).thenReturn(stubMasterDetail(masterId, userId));
+        when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
 
-        log.debug("Act: GET {}/me as INDEPENDENT_MASTER — must return 200 with own profile", MASTERS_URL);
+        log.debug("Act: GET {}/me as INDEPENDENT_MASTER — must return 200 with own full profile", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL + "/me")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
+                // ── scalar identity + display fields ──
                 .andExpect(jsonPath("$.data.masterId").value(masterId.toString()))
-                .andExpect(jsonPath("$.data.firstName").value("Oksana"));
+                .andExpect(jsonPath("$.data.firstName").value("Oksana"))
+                .andExpect(jsonPath("$.data.lastName").value("Kovalenko"))
+                .andExpect(jsonPath("$.data.phoneNumber").value("+380671234567"))
+                .andExpect(jsonPath("$.data.city").value("Київ"))
+                .andExpect(jsonPath("$.data.street").value("вул. Хрещатик"))
+                .andExpect(jsonPath("$.data.buildingNo").value("1A"))
+                .andExpect(jsonPath("$.data.locationNote").value("green door"))
+                .andExpect(jsonPath("$.data.bio").value("Nail artist"))
+                .andExpect(jsonPath("$.data.instagram").value("@oksana.nails"))
+                .andExpect(jsonPath("$.data.avatarUrl").value("https://cdn.beautica.test/a.png"))
+                .andExpect(jsonPath("$.data.avgRating").value(4.75))
+                .andExpect(jsonPath("$.data.reviewCount").value(12))
+                .andExpect(jsonPath("$.data.masterType").value("INDEPENDENT_MASTER"))
+                // ── salon: null in this fixture, still emitted as JSON null ──
+                .andExpect(jsonPath("$.data.salon").doesNotExist())
+                // ── nested working-hours mapping ──
+                .andExpect(jsonPath("$.data.workingHours").isArray())
+                .andExpect(jsonPath("$.data.workingHours[0].id").value(workingHoursId.toString()))
+                .andExpect(jsonPath("$.data.workingHours[0].dayOfWeek").value(1))
+                .andExpect(jsonPath("$.data.workingHours[0].startTime").value("09:00:00"))
+                .andExpect(jsonPath("$.data.workingHours[0].endTime").value("17:00:00"))
+                .andExpect(jsonPath("$.data.workingHours[0].isActive").value(true))
+                // ── locality cascade IDs (unmasked on the authenticated /me path) ──
+                .andExpect(jsonPath("$.data.cityId").value(cityUuid.toString()))
+                .andExpect(jsonPath("$.data.oblastId").value(oblastUuid.toString()))
+                .andExpect(jsonPath("$.data.districtId").value(districtUuid.toString()));
     }
 
     @Test
