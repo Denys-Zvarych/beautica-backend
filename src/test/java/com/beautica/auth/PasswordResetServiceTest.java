@@ -14,6 +14,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
@@ -35,6 +36,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -160,6 +162,27 @@ class PasswordResetServiceTest {
         service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
 
         verify(passwordResetTokenRepository).markAllUsedByUserId(USER_ID);
+    }
+
+    @Test
+    @DisplayName("requestReset — supersede (markAllUsed) strictly precedes save of the new token (no two-live-tokens window)")
+    void should_supersedePriorTokens_strictlyBefore_savingNewToken() {
+        log.debug("Arrange: active+verified user requesting a fresh reset link");
+        User user = activeVerifiedUser();
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+
+        log.debug("Act: requestReset — supersede must run before the new token is persisted");
+        service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
+
+        // Ordering invariant: prior tokens are invalidated FIRST, then the new token is
+        // saved. If save() ever ran before markAllUsedByUserId(), the bulk sweep would
+        // immediately consume the brand-new token (or two live tokens would coexist).
+        // Pin the order so a refactor cannot silently reorder these two calls.
+        InOrder inOrder = inOrder(passwordResetTokenRepository);
+        inOrder.verify(passwordResetTokenRepository).markAllUsedByUserId(USER_ID);
+        inOrder.verify(passwordResetTokenRepository).save(any(PasswordResetToken.class));
     }
 
     // =========================================================================
@@ -354,6 +377,30 @@ class PasswordResetServiceTest {
         verify(refreshTokenRepository).deleteByUserId(USER_ID);
         // No new session token is minted as a side-effect of the reset (no auto-login).
         verify(refreshTokenRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("resetPassword — token whose expiresAt EQUALS now is still valid (boundary: expiry is strict isBefore, exclusive of now)")
+    void should_resetPassword_when_tokenExpiresExactlyAtNow() {
+        log.debug("Arrange: token with expiresAt == clock.now() (exact expiry boundary)");
+        // Production check is `expiresAt.isBefore(now)` — strict. At expiresAt == now,
+        // isBefore() is false, so the token is NOT expired and the reset must succeed.
+        PasswordResetToken boundaryToken = new PasswordResetToken(HASHED_TOKEN, USER_ID, FIXED_NOW);
+        User user = activeVerifiedUser();
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(passwordResetTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(boundaryToken));
+        when(userRepository.findById(USER_ID)).thenReturn(Optional.of(user));
+
+        log.debug("Act: resetPassword at the exact expiry boundary");
+        service.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "NewValidPass1!"));
+
+        // Boundary is VALID (inclusive of now): the password is updated and the token consumed.
+        assertThat(passwordEncoder.matches("NewValidPass1!", user.getPasswordHash()))
+                .as("expiresAt == now must be accepted as not-yet-expired")
+                .isTrue();
+        assertThat(boundaryToken.isUsed())
+                .as("boundary token is consumed on successful reset")
+                .isTrue();
     }
 
     // =========================================================================
