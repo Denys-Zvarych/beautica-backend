@@ -20,7 +20,7 @@ public record CreateBookingRequest(
         @Future(message = "Start time must be in the future")
         ZonedDateTime startsAt,
         @Size(max = 64, message = "Idempotency key must be at most 64 characters")
-        @Pattern(regexp = "[A-Za-z0-9\\-_]{1,64}", message = "Idempotency key must be 1–64 alphanumeric/dash/underscore characters")
+        @Pattern(regexp = "^[A-Za-z0-9\\-_]{1,64}$", message = "Idempotency key must be 1–64 alphanumeric/dash/underscore characters")
         String idempotencyKey,
         // Control-char ban mirrors CancelBookingRequest.comment (§D): @Size alone lets embedded
         // NUL reach the DB and produce a 500 not a 400. Line
