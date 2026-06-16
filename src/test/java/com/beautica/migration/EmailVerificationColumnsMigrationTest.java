@@ -66,6 +66,22 @@ class EmailVerificationColumnsMigrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("email_verified carries a COLUMN_DEFAULT of false (catalog-level, not just per-row)")
+    void should_declareEmailVerifiedDefaultFalse_when_migrationApplied() {
+        // The seeded-row test below proves the default *resolves* to false, but a
+        // future migration could drop the DEFAULT clause and registration code would
+        // still set the column explicitly — masking the catalog drift. Pin the
+        // COLUMN_DEFAULT directly so the V48 `DEFAULT FALSE` clause itself is the
+        // contract under test. Postgres normalises the literal to lower-case `false`.
+        String columnDefault =
+                jdbcTemplate.queryForObject(COLUMN_DEFAULT_QUERY, String.class, "email_verified");
+
+        assertThat(columnDefault)
+                .as("users.email_verified COLUMN_DEFAULT (V48 'DEFAULT FALSE')")
+                .isEqualTo("false");
+    }
+
+    @Test
     @DisplayName("should_addVerificationCodeHashColumn_when_migrationApplied")
     void should_addVerificationCodeHashColumn_when_migrationApplied() {
         String dataType = jdbcTemplate.queryForObject(COLUMN_QUERY, String.class, "verification_code_hash");
