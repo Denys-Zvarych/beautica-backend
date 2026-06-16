@@ -2,6 +2,7 @@ package com.beautica.master.repository;
 
 import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
+import com.beautica.master.entity.DiscreteTime;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.ScheduleException;
@@ -98,6 +99,14 @@ class WeeklyScheduleSchemaIT extends AbstractDataJpaTest {
                 .dayOfWeek(dayOfWeek)
                 .startTime(start)
                 .endTime(end)
+                .build();
+    }
+
+    private DiscreteTime discreteTime(WeeklySchedule schedule, int dayOfWeek, LocalTime slot) {
+        return DiscreteTime.builder()
+                .schedule(schedule)
+                .dayOfWeek(dayOfWeek)
+                .slotTime(slot)
                 .build();
     }
 
@@ -427,6 +436,150 @@ class WeeklyScheduleSchemaIT extends AbstractDataJpaTest {
 
             assertThat(workingIntervalRepository.findByScheduleId(scheduleId))
                     .as("working_intervals cascade-deleted with their schedule").isEmpty();
+        }
+    }
+
+    // ── 6. Phase 15.8 — working_interval_times (V84, EXPLICIT_TIMES discrete slots) ───────
+
+    @Nested
+    @DisplayName("V84 working_interval_times (Phase 15.8 discrete EXPLICIT_TIMES slots)")
+    class DiscreteTimes {
+
+        @Test
+        @DisplayName("V84 created the working_interval_times table")
+        void should_haveCreatedWorkingIntervalTimesTable() {
+            // Information-schema guard for V84: a missed/partial migration would not surface the table.
+            // Running against the real Testcontainers Postgres — a mock could never catch a bad migration.
+            @SuppressWarnings("unchecked")
+            List<String> columns = em.getEntityManager().createNativeQuery(
+                    "SELECT column_name FROM information_schema.columns "
+                            + "WHERE table_name = 'working_interval_times'")
+                    .getResultList();
+
+            assertThat(columns)
+                    .as("V84 must create working_interval_times with its discrete-slot columns")
+                    .contains("id", "schedule_id", "day_of_week", "slot_time");
+        }
+
+        @Test
+        @DisplayName("persists discrete times for a schedule and round-trips them via the LAZY @OneToMany Set")
+        void should_roundTripDiscreteTimes_when_persistedAndReloaded() {
+            WeeklySchedule schedule = persistSchedule(LocalDate.of(2026, 1, 1), null);
+            em.persist(discreteTime(schedule, 1, LocalTime.of(9, 0)));
+            em.persist(discreteTime(schedule, 1, LocalTime.of(11, 30)));
+            em.persist(discreteTime(schedule, 4, LocalTime.of(15, 0)));
+            em.flush();
+            em.clear(); // force a real DB reload + LAZY init of the discreteTimes Set
+
+            WeeklySchedule reloaded = weeklyScheduleRepository.findById(schedule.getId()).orElseThrow();
+
+            assertThat(reloaded.getDiscreteTimes())
+                    .as("LAZY @OneToMany discreteTimes load")
+                    .hasSize(3)
+                    .extracting(DiscreteTime::getDayOfWeek, DiscreteTime::getSlotTime)
+                    .containsExactlyInAnyOrder(
+                            tuple(1, LocalTime.of(9, 0)),
+                            tuple(1, LocalTime.of(11, 30)),
+                            tuple(4, LocalTime.of(15, 0)));
+        }
+
+        @Test
+        @DisplayName("duplicate (schedule_id, day_of_week, slot_time) is rejected by uq_working_interval_times_no_dup")
+        void should_reject_when_duplicateDiscreteTime() {
+            WeeklySchedule schedule = persistSchedule(LocalDate.of(2026, 1, 1), null);
+            em.persist(discreteTime(schedule, 1, LocalTime.of(9, 0)));
+            em.flush();
+            em.persist(discreteTime(schedule, 1, LocalTime.of(9, 0)));
+
+            assertThatThrownBy(em::flush).isInstanceOf(PersistenceException.class);
+        }
+
+        @Test
+        @DisplayName("same slot_time on a different day_of_week is allowed (uniqueness is per (schedule, day, time))")
+        void should_allow_when_sameSlotTimeDifferentDay() {
+            WeeklySchedule schedule = persistSchedule(LocalDate.of(2026, 1, 1), null);
+            em.persist(discreteTime(schedule, 1, LocalTime.of(9, 0)));
+            em.persist(discreteTime(schedule, 2, LocalTime.of(9, 0)));
+            em.flush();
+            em.clear();
+
+            WeeklySchedule reloaded = weeklyScheduleRepository.findById(schedule.getId()).orElseThrow();
+
+            assertThat(reloaded.getDiscreteTimes())
+                    .as("the same wall-clock time on Mon and Tue is two distinct rows")
+                    .hasSize(2);
+        }
+
+        @Test
+        @DisplayName("day_of_week = 0 is rejected (below ISO range 1..7)")
+        void should_reject_when_discreteDayOfWeekZero() {
+            WeeklySchedule schedule = persistSchedule(LocalDate.of(2026, 1, 1), null);
+            em.persist(discreteTime(schedule, 0, LocalTime.of(9, 0)));
+
+            assertThatThrownBy(em::flush).isInstanceOf(PersistenceException.class);
+        }
+
+        @Test
+        @DisplayName("day_of_week = 8 is rejected (above ISO range 1..7)")
+        void should_reject_when_discreteDayOfWeekEight() {
+            WeeklySchedule schedule = persistSchedule(LocalDate.of(2026, 1, 1), null);
+            em.persist(discreteTime(schedule, 8, LocalTime.of(9, 0)));
+
+            assertThatThrownBy(em::flush).isInstanceOf(PersistenceException.class);
+        }
+
+        @Test
+        @DisplayName("deleting a weekly_schedule cascades to its working_interval_times (FK ON DELETE CASCADE)")
+        void should_cascadeToDiscreteTimes_when_scheduleDeleted() {
+            WeeklySchedule schedule = persistSchedule(LocalDate.of(2026, 1, 1), null);
+            em.persist(discreteTime(schedule, 1, LocalTime.of(9, 0)));
+            em.persist(discreteTime(schedule, 1, LocalTime.of(10, 0)));
+            em.flush();
+            UUID scheduleId = schedule.getId();
+            em.clear();
+
+            // Native delete so the DB FK ON DELETE CASCADE fires (not JPA orphan removal).
+            em.getEntityManager().createNativeQuery("DELETE FROM weekly_schedules WHERE id = :id")
+                    .setParameter("id", scheduleId)
+                    .executeUpdate();
+            em.flush();
+            em.clear();
+
+            @SuppressWarnings("unchecked")
+            List<UUID> remaining = em.getEntityManager().createNativeQuery(
+                    "SELECT id FROM working_interval_times WHERE schedule_id = :sid")
+                    .setParameter("sid", scheduleId)
+                    .getResultList();
+
+            assertThat(remaining)
+                    .as("working_interval_times cascade-deleted with their schedule").isEmpty();
+        }
+
+        @Test
+        @DisplayName("deleting a master cascades through weekly_schedules to working_interval_times")
+        void should_cascadeToDiscreteTimes_when_masterDeleted() {
+            WeeklySchedule schedule = persistSchedule(LocalDate.of(2026, 1, 1), null);
+            em.persist(discreteTime(schedule, 3, LocalTime.of(13, 0)));
+            em.flush();
+            UUID scheduleId = schedule.getId();
+            em.clear();
+
+            em.getEntityManager().createNativeQuery("DELETE FROM masters WHERE id = :id")
+                    .setParameter("id", masterId)
+                    .executeUpdate();
+            em.flush();
+            em.clear();
+
+            @SuppressWarnings("unchecked")
+            List<UUID> remaining = em.getEntityManager().createNativeQuery(
+                    "SELECT id FROM working_interval_times WHERE schedule_id = :sid")
+                    .setParameter("sid", scheduleId)
+                    .getResultList();
+
+            assertThat(weeklyScheduleRepository.findById(scheduleId))
+                    .as("weekly_schedule cascade-deleted with its master").isEmpty();
+            assertThat(remaining)
+                    .as("working_interval_times cascade-deleted transitively with the master").isEmpty();
         }
     }
 }

@@ -9,10 +9,12 @@ import com.beautica.master.dto.EffectiveDaySource;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
 import com.beautica.master.dto.WeeklyScheduleDayRequest;
+import com.beautica.master.dto.WeeklyScheduleDayResponse;
 import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
+import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WeeklyScheduleRepository;
 import org.hibernate.SessionFactory;
@@ -131,6 +133,15 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
 
     private static WorkIntervalDto iv(int startHour, int endHour) {
         return new WorkIntervalDto(LocalTime.of(startHour, 0), LocalTime.of(endHour, 0));
+    }
+
+    /** An EXPLICIT_TIMES weekday carrying the given discrete start times (Phase 15.8). */
+    private static WeeklyScheduleDayRequest explicitDay(int dow, LocalTime... times) {
+        return new WeeklyScheduleDayRequest(dow, WeekdayMode.EXPLICIT_TIMES, null, List.of(times));
+    }
+
+    private static LocalTime t(int h, int m) {
+        return LocalTime.of(h, m);
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
@@ -505,6 +516,174 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // 2c. Phase 15.8 — EXPLICIT_TIMES per-weekday discrete-time mode
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("EXPLICIT_TIMES discrete-time mode (15.8)")
+    class ExplicitTimes {
+
+        @Test
+        @DisplayName("upsert + reload — an EXPLICIT_TIMES weekday persists times sorted, de-duplicated, mode derived")
+        void should_persistSortedDedupedTimes_when_explicitTimesDay() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+
+            // Unsorted, with a duplicate (11:00 twice) — the service must sort + dedupe on persist.
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null,
+                            explicitDay(1, t(13, 0), t(9, 0), t(11, 0), t(11, 0))));
+
+            // Reload from the DB (not the in-flight response) so this proves storage, not just mapping.
+            WeeklyScheduleResponse reloaded =
+                    scheduleService.listWeeklySchedules(m.masterId()).get(0);
+
+            WeeklyScheduleDayResponse monDay = reloaded.days().stream()
+                    .filter(d -> d.dayOfWeek() == 1).findFirst().orElseThrow();
+
+            assertThat(monDay.mode())
+                    .as("a weekday with discrete-time rows derives mode EXPLICIT_TIMES")
+                    .isEqualTo(WeekdayMode.EXPLICIT_TIMES);
+            assertThat(monDay.times())
+                    .as("times are sorted ascending and de-duplicated (11:00 once)")
+                    .containsExactly(t(9, 0), t(11, 0), t(13, 0));
+            assertThat(monDay.intervals())
+                    .as("an EXPLICIT_TIMES day carries no intervals").isEmpty();
+        }
+
+        @Test
+        @DisplayName("resolveEffectiveDay — an EXPLICIT_TIMES day returns derived window [min..max] AND populated times")
+        void should_returnDerivedWindowAndTimes_when_resolvingExplicitTimesDay() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null, explicitDay(1, t(9, 0), t(12, 30), t(16, 0))));
+
+            EffectiveDayResponse resp = scheduleService.resolveEffectiveDay(m.masterId(), monday);
+
+            assertThat(resp.source()).isEqualTo(EffectiveDaySource.TEMPLATE);
+            assertThat(resp.times())
+                    .as("the discrete slot chips are surfaced for the EXPLICIT_TIMES day")
+                    .containsExactly(t(9, 0), t(12, 30), t(16, 0));
+            assertThat(resp.intervals())
+                    .as("the derived display window is the single [min..max] interval")
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(tuple(t(9, 0), t(16, 0)));
+        }
+
+        @Test
+        @DisplayName("legacy INTERVAL-only schedule resolves to mode INTERVAL with null effective-day times")
+        void should_resolveToIntervalMode_when_legacyIntervalOnly() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null, day(1, iv(9, 17))));
+
+            // Read projection: the day is INTERVAL with empty times (no discrete rows, no backfill).
+            WeeklyScheduleResponse reloaded = scheduleService.listWeeklySchedules(m.masterId()).get(0);
+            WeeklyScheduleDayResponse monDay = reloaded.days().stream()
+                    .filter(d -> d.dayOfWeek() == 1).findFirst().orElseThrow();
+            assertThat(monDay.mode()).isEqualTo(WeekdayMode.INTERVAL);
+            assertThat(monDay.times()).as("an INTERVAL day carries no discrete times").isEmpty();
+            assertThat(monDay.intervals())
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(tuple(t(9, 0), t(17, 0)));
+
+            // Effective-day: an INTERVAL day leaves the additive `times` field null (15.8 contract).
+            EffectiveDayResponse resp = scheduleService.resolveEffectiveDay(m.masterId(), monday);
+            assertThat(resp.source()).isEqualTo(EffectiveDaySource.TEMPLATE);
+            assertThat(resp.times())
+                    .as("an INTERVAL effective-day has null times (additive/nullable per 15.8)").isNull();
+            assertThat(resp.intervals())
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(tuple(t(9, 0), t(17, 0)));
+        }
+
+        @Test
+        @DisplayName("mode flip INTERVAL → EXPLICIT_TIMES clears the interval rows (full-replace upsert)")
+        void should_clearIntervals_when_flippedToExplicitTimes() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            UUID scheduleId = scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null, day(1, iv(9, 17)))).id();
+
+            // Re-upsert the SAME schedule, flipping Monday to EXPLICIT_TIMES.
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), scheduleId,
+                    weekly(monday, null, explicitDay(1, t(10, 0), t(14, 0))));
+
+            WeeklyScheduleResponse reloaded = scheduleService.listWeeklySchedules(m.masterId()).get(0);
+            WeeklyScheduleDayResponse monDay = reloaded.days().stream()
+                    .filter(d -> d.dayOfWeek() == 1).findFirst().orElseThrow();
+
+            assertThat(monDay.mode()).isEqualTo(WeekdayMode.EXPLICIT_TIMES);
+            assertThat(monDay.times()).containsExactly(t(10, 0), t(14, 0));
+            assertThat(monDay.intervals())
+                    .as("the prior INTERVAL rows must be cleared by the full-replace upsert").isEmpty();
+            // Hard storage proof: no working_intervals rows survive for this schedule.
+            Long intervalRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM working_intervals WHERE schedule_id = ?", Long.class, scheduleId);
+            assertThat(intervalRows).as("interval rows physically deleted on the flip").isZero();
+        }
+
+        @Test
+        @DisplayName("mode flip EXPLICIT_TIMES → INTERVAL clears the discrete-time rows (full-replace upsert)")
+        void should_clearDiscreteTimes_when_flippedBackToInterval() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            UUID scheduleId = scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null, explicitDay(1, t(10, 0), t(14, 0)))).id();
+
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), scheduleId,
+                    weekly(monday, null, day(1, iv(9, 17))));
+
+            WeeklyScheduleResponse reloaded = scheduleService.listWeeklySchedules(m.masterId()).get(0);
+            WeeklyScheduleDayResponse monDay = reloaded.days().stream()
+                    .filter(d -> d.dayOfWeek() == 1).findFirst().orElseThrow();
+
+            assertThat(monDay.mode()).isEqualTo(WeekdayMode.INTERVAL);
+            assertThat(monDay.times()).as("discrete-time rows cleared on the flip back").isEmpty();
+            assertThat(monDay.intervals())
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(tuple(t(9, 0), t(17, 0)));
+            Long discreteRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM working_interval_times WHERE schedule_id = ?",
+                    Long.class, scheduleId);
+            assertThat(discreteRows).as("discrete-time rows physically deleted on the flip back").isZero();
+        }
+
+        @Test
+        @DisplayName("an EXPLICIT_TIMES day with an empty times list is rejected")
+        void should_reject_when_explicitTimesDayHasNoTimes() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+
+            assertThatThrownBy(() -> scheduleService.upsertWeeklySchedule(
+                    m.actorId(), m.masterId(), null,
+                    weekly(monday, null,
+                            new WeeklyScheduleDayRequest(1, WeekdayMode.EXPLICIT_TIMES, null, List.of()))))
+                    .as("an EXPLICIT_TIMES day must carry at least one discrete time")
+                    .isInstanceOf(BusinessException.class);
+        }
+
+        @Test
+        @DisplayName("IDOR — an EXPLICIT_TIMES upsert to a foreign master's schedule is forbidden (no persistence)")
+        void should_rejectExplicitTimesUpsert_when_foreignActor() {
+            SeededMaster victim = seedIndependentMaster();
+            SeededMaster attacker = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+
+            assertThatThrownBy(() -> scheduleService.upsertWeeklySchedule(
+                    attacker.actorId(), victim.masterId(), null,
+                    weekly(monday, null, explicitDay(1, t(9, 0), t(12, 0)))))
+                    .as("an EXPLICIT_TIMES write follows the same ownership gate as INTERVAL")
+                    .isInstanceOf(ForbiddenException.class);
+
+            assertThat(weeklyScheduleRepository.findByMasterIdOrderByValidFromAsc(victim.masterId()))
+                    .as("no schedule may be persisted for the victim").isEmpty();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // 3b. Read identity — WeeklyScheduleResponse.id round-trips (regression: missing id)
     // ════════════════════════════════════════════════════════════════════════════════
 
@@ -729,8 +908,8 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     class DataExposure {
 
         @Test
-        @DisplayName("EffectiveDayResponse exposes only date/source/intervals — no private free-text leaks (V83)")
-        void should_exposeOnlyDateSourceIntervals_inEffectiveDay() {
+        @DisplayName("EffectiveDayResponse exposes exactly date/source/intervals/times — no private free-text leaks (V83 + 15.8)")
+        void should_exposeOnlyDateSourceIntervalsTimes_inEffectiveDay() {
             SeededMaster m = seedIndependentMaster();
             scheduleService.upsertOverride(
                     m.actorId(), m.masterId(),
@@ -739,11 +918,14 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             EffectiveDayResponse pub = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
             assertThat(pub.source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
 
-            // Structural guard: the projection has exactly date/source/intervals — no reason/note ever.
+            // Structural guard: the projection has exactly date/source/intervals/times — no reason/note ever.
+            // Phase 15.8 widened the contract with `times` (discrete EXPLICIT_TIMES slots); `mode` was
+            // intentionally NOT added to EffectiveDayResponse (only the weekly-template DTOs carry mode).
             assertThat(EffectiveDayResponse.class.getRecordComponents())
-                    .as("EffectiveDayResponse exposes exactly date/source/intervals (V83 removed reason/note)")
+                    .as("EffectiveDayResponse exposes exactly date/source/intervals/times "
+                            + "(V83 removed reason/note; 15.8 added times, NOT mode)")
                     .extracting(java.lang.reflect.RecordComponent::getName)
-                    .containsExactlyInAnyOrder("date", "source", "intervals");
+                    .containsExactlyInAnyOrder("date", "source", "intervals", "times");
         }
     }
 
