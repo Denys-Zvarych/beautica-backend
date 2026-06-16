@@ -106,6 +106,17 @@ dependencies {
     testImplementation("org.apache.httpcomponents.client5:httpclient5")
 }
 
+// Disable the plain (non-executable) jar task. The Spring Boot plugin otherwise
+// produces two artifacts in build/libs/: the runnable bootJar
+// (beautica-<version>.jar) and a non-runnable plain jar
+// (beautica-<version>-plain.jar). The Dockerfile copies build/libs/*.jar, so a
+// second jar makes that glob ambiguous. This is a single-module application with
+// no consumer of the plain jar, so disabling it leaves bootJar as the sole
+// artifact and keeps the Docker COPY deterministic.
+tasks.named<Jar>("jar") {
+    enabled = false
+}
+
 tasks.withType<Test> {
     useJUnitPlatform()
     // Docker Engine 25+ requires minimum API version 1.40.
