@@ -22,7 +22,9 @@ import lombok.Setter;
 
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 @Entity
@@ -66,4 +68,24 @@ public class ScheduleException extends AuditableEntity {
     )
     @Builder.Default
     private List<ScheduleExceptionInterval> intervals = new ArrayList<>();
+
+    /**
+     * Phase 15.9: discrete bookable start times for an {@link WeekdayMode#EXPLICIT_TIMES} per-date
+     * {@code CUSTOM_HOURS} override; empty for {@code DAY_OFF} and for {@code INTERVAL} custom-hours.
+     *
+     * <p>Modelled as a {@link Set} (not a {@code List}) deliberately, exactly as
+     * {@link WeeklySchedule#getDiscreteTimes()}: {@code intervals} is already a bag ({@code List}), and
+     * Hibernate forbids fetch-joining two bags in one query ({@code MultipleBagFetchException}). The
+     * override finders {@code LEFT JOIN FETCH} only {@code intervals}; this {@code Set} is hydrated by
+     * {@code hibernate.default_batch_fetch_size} (no second fetch-join — avoids the cartesian product).
+     * Mode exclusivity (an override is EITHER in {@code intervals} OR here) is a service-layer invariant.
+     */
+    @OneToMany(
+            mappedBy = "exception",
+            cascade = CascadeType.ALL,
+            orphanRemoval = true,
+            fetch = FetchType.LAZY
+    )
+    @Builder.Default
+    private Set<OverrideDiscreteTime> discreteTimes = new LinkedHashSet<>();
 }

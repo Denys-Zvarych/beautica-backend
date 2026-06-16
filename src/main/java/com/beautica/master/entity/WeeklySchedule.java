@@ -22,7 +22,9 @@ import org.springframework.lang.Nullable;
 
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -71,4 +73,22 @@ public class WeeklySchedule extends AuditableEntity {
     )
     @Builder.Default
     private List<WorkingInterval> intervals = new ArrayList<>();
+
+    /**
+     * Phase 15.8: discrete bookable start times for {@link WeekdayMode#EXPLICIT_TIMES} weekdays.
+     *
+     * <p>Modelled as a {@link Set} (not a {@code List}) deliberately: {@code intervals} is already a bag
+     * ({@code List}), and Hibernate forbids fetch-joining two bags in one query
+     * ({@code MultipleBagFetchException}). A {@code Set} second collection lets both be {@code LEFT JOIN
+     * FETCH}-ed together (the §E "no N+1" requirement) without the multiple-bag failure. Mode exclusivity
+     * (a day is EITHER in {@code intervals} OR here) is a service-layer invariant.
+     */
+    @OneToMany(
+            mappedBy = "schedule",
+            cascade = CascadeType.ALL,
+            orphanRemoval = true,
+            fetch = FetchType.LAZY
+    )
+    @Builder.Default
+    private Set<DiscreteTime> discreteTimes = new LinkedHashSet<>();
 }

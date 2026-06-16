@@ -12,10 +12,13 @@ import com.beautica.master.dto.WeeklyScheduleDayRequest;
 import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkIntervalDto;
+import com.beautica.master.entity.DiscreteTime;
 import com.beautica.master.entity.Master;
+import com.beautica.master.entity.OverrideDiscreteTime;
 import com.beautica.master.entity.ScheduleException;
 import com.beautica.master.entity.ScheduleExceptionInterval;
 import com.beautica.master.entity.ScheduleExceptionKind;
+import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.entity.WeeklySchedule;
 import com.beautica.master.entity.WorkingInterval;
 import com.beautica.master.repository.MasterRepository;
@@ -59,6 +62,7 @@ import java.util.stream.Collectors;
 public class MasterScheduleService {
 
     private static final int MAX_INTERVALS_PER_DAY = 6;
+    private static final int MAX_DISCRETE_TIMES_PER_DAY = 24;
 
     private final WeeklyScheduleRepository weeklyScheduleRepository;
     private final ScheduleExceptionRepository scheduleExceptionRepository;
@@ -88,13 +92,13 @@ public class MasterScheduleService {
         dateMath.assertWithinBounds(validFrom, effectiveTo);
 
         List<WeeklyScheduleDayRequest> days = request.days() != null ? request.days() : List.of();
-        days.forEach(this::validateDayIntervals);
+        days.forEach(this::validateDay);
         assertNoWindowOverlap(masterId, scheduleId, new DateRange(validFrom, request.validTo()));
 
         WeeklySchedule schedule = resolveScheduleForUpsert(scheduleId, master);
         schedule.setValidFrom(validFrom);
         schedule.setValidTo(request.validTo());
-        replaceIntervals(schedule, days);
+        replaceDayCollections(schedule, days);
 
         WeeklySchedule saved = weeklyScheduleRepository.save(schedule);
         evictSlotsAfterCommit(masterId);
@@ -121,8 +125,14 @@ public class MasterScheduleService {
                 .orElseGet(() -> ScheduleException.builder().master(master).date(request.date()).build());
 
         override.setKind(request.kind());
-        replaceOverrideIntervals(override, request.kind() == ScheduleExceptionKind.CUSTOM_HOURS
+        // Phase 15.9: route a CUSTOM_HOURS override by its mode. Every upsert is a full replace, so both
+        // child collections are cleared first; an INTERVAL override contributes no discrete times and an
+        // EXPLICIT_TIMES override contributes no intervals. A DAY_OFF clears both.
+        boolean explicitTimes = request.kind() == ScheduleExceptionKind.CUSTOM_HOURS
+                && request.effectiveMode() == WeekdayMode.EXPLICIT_TIMES;
+        replaceOverrideIntervals(override, request.kind() == ScheduleExceptionKind.CUSTOM_HOURS && !explicitTimes
                 ? request.intervals() : List.of());
+        replaceOverrideDiscreteTimes(override, explicitTimes ? request.times() : List.of());
 
         ScheduleException saved = scheduleExceptionRepository.save(override);
         evictSlotsAfterCommit(masterId);
@@ -250,6 +260,15 @@ public class MasterScheduleService {
             return scheduleMapper.toEffectiveDay(
                     date, EffectiveDaySource.OVERRIDE_DAY_OFF, List.of());
         }
+        // Phase 15.9: an EXPLICIT_TIMES custom-hours override (≥1 discrete-time row) projects its discrete
+        // times AND a derived window [min..max] as the single interval, mirroring the EXPLICIT_TIMES
+        // template day. Override precedence is preserved — this branch is reached only when an override
+        // covers the date (template never consulted).
+        List<LocalTime> times = scheduleMapper.toOverrideDiscreteTimes(override);
+        if (!times.isEmpty()) {
+            return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.OVERRIDE_CUSTOM,
+                    scheduleMapper.toDerivedWindow(times), times);
+        }
         return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.OVERRIDE_CUSTOM,
                 scheduleMapper.toIntervalDtos(override.getIntervals()));
     }
@@ -258,8 +277,15 @@ public class MasterScheduleService {
         if (covering == null) {
             return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.NO_SCHEDULE, List.of());
         }
-        List<WorkIntervalDto> intervals =
-                scheduleMapper.toIntervalDtosForDay(covering, dateMath.isoDow(date));
+        int isoDow = dateMath.isoDow(date);
+        // Phase 15.8: an EXPLICIT_TIMES day (≥1 discrete-time row) projects its discrete times AND a
+        // derived window [min..max] as the single interval, so window-only consumers keep working.
+        List<LocalTime> times = scheduleMapper.toDiscreteTimesForDay(covering, isoDow);
+        if (!times.isEmpty()) {
+            return scheduleMapper.toEffectiveDay(
+                    date, EffectiveDaySource.TEMPLATE, scheduleMapper.toDerivedWindow(times), times);
+        }
+        List<WorkIntervalDto> intervals = scheduleMapper.toIntervalDtosForDay(covering, isoDow);
         return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.TEMPLATE, intervals);
     }
 
@@ -300,25 +326,51 @@ public class MasterScheduleService {
         return schedule;
     }
 
-    private void replaceIntervals(WeeklySchedule schedule, List<WeeklyScheduleDayRequest> days) {
-        schedule.getIntervals().clear(); // orphanRemoval queues DELETEs for the old rows
-        // Force the orphan DELETEs to the DB before re-inserting. With hibernate.order_inserts=true
-        // the ActionQueue runs all INSERTs before all DELETEs, so a re-sent interval whose
-        // (schedule_id, day_of_week, start_time, end_time) matches a surviving old row would collide
-        // with uq_working_intervals_no_dup (23505). Flushing here makes it delete-before-insert.
+    /**
+     * Phase 15.8: atomically rebuilds <em>both</em> day collections from the request, routing each day by
+     * its mode. Because every upsert is a full replace, a day that flips mode (e.g. INTERVAL →
+     * EXPLICIT_TIMES) naturally clears the opposite collection: an EXPLICIT_TIMES day contributes no
+     * {@link WorkingInterval} and an INTERVAL day contributes no {@link DiscreteTime}, and both collections
+     * are cleared before re-insert.
+     */
+    private void replaceDayCollections(WeeklySchedule schedule, List<WeeklyScheduleDayRequest> days) {
+        schedule.getIntervals().clear();      // orphanRemoval queues DELETEs for the old interval rows
+        schedule.getDiscreteTimes().clear();  // orphanRemoval queues DELETEs for the old discrete-time rows
+        // Force the orphan DELETEs to the DB before re-inserting. With hibernate.order_inserts=true the
+        // ActionQueue runs all INSERTs before all DELETEs, so a re-sent row whose unique key matches a
+        // surviving old row would collide (23505: uq_working_intervals_no_dup /
+        // uq_working_interval_times_no_dup). Flushing here makes it delete-before-insert.
         weeklyScheduleRepository.flush();
+
         for (WeeklyScheduleDayRequest day : days) {
-            if (day.intervals() == null) {
-                continue;
+            switch (day.effectiveMode()) {
+                case INTERVAL -> addIntervals(schedule, day);
+                case EXPLICIT_TIMES -> addDiscreteTimes(schedule, day);
             }
-            for (WorkIntervalDto dto : day.intervals()) {
-                schedule.getIntervals().add(WorkingInterval.builder()
-                        .schedule(schedule)
-                        .dayOfWeek(day.dayOfWeek())
-                        .startTime(zeroSeconds(dto.startTime()))
-                        .endTime(zeroSeconds(dto.endTime()))
-                        .build());
-            }
+        }
+    }
+
+    private void addIntervals(WeeklySchedule schedule, WeeklyScheduleDayRequest day) {
+        if (day.intervals() == null) {
+            return;
+        }
+        for (WorkIntervalDto dto : day.intervals()) {
+            schedule.getIntervals().add(WorkingInterval.builder()
+                    .schedule(schedule)
+                    .dayOfWeek(day.dayOfWeek())
+                    .startTime(zeroSeconds(dto.startTime()))
+                    .endTime(zeroSeconds(dto.endTime()))
+                    .build());
+        }
+    }
+
+    private void addDiscreteTimes(WeeklySchedule schedule, WeeklyScheduleDayRequest day) {
+        for (LocalTime time : normalizeDayTimes(day.times())) {
+            schedule.getDiscreteTimes().add(DiscreteTime.builder()
+                    .schedule(schedule)
+                    .dayOfWeek(day.dayOfWeek())
+                    .slotTime(time)
+                    .build());
         }
     }
 
@@ -337,25 +389,92 @@ public class MasterScheduleService {
         }
     }
 
-    // ---- validation ---------------------------------------------------------------------
-
-    /** Per-day: ≤ max count, individually ordered, pairwise non-overlapping (sorted by start). */
-    private void validateDayIntervals(WeeklyScheduleDayRequest day) {
-        assertIntervalsNonOverlapping(day.intervals());
+    /**
+     * Phase 15.9: atomically replaces an override's discrete-time rows. Mirrors
+     * {@link #replaceOverrideIntervals}: clears the collection (orphanRemoval queues DELETEs) and flushes
+     * before re-insert so a re-sent time whose unique key matches a surviving old row cannot collide
+     * (23505: {@code uq_schedule_exception_times_no_dup}) under {@code hibernate.order_inserts=true}.
+     * Times are seconds-zeroed, de-duplicated and ascending (shared {@link #normalizeDayTimes}).
+     */
+    private void replaceOverrideDiscreteTimes(ScheduleException override, List<LocalTime> times) {
+        override.getDiscreteTimes().clear(); // orphanRemoval queues DELETEs for the old rows
+        scheduleExceptionRepository.flush();
+        for (LocalTime time : normalizeDayTimes(times)) {
+            override.getDiscreteTimes().add(OverrideDiscreteTime.builder()
+                    .exception(override)
+                    .slotTime(time)
+                    .build());
+        }
     }
 
+    // ---- validation ---------------------------------------------------------------------
+
+    /**
+     * Phase 15.8: validates one weekday by its mode. INTERVAL → interval non-overlap rules;
+     * EXPLICIT_TIMES → discrete-time rules. Mode exclusivity (no intervals AND times on the same day) is a
+     * DTO {@code @AssertTrue} invariant — here we trust {@link WeeklyScheduleDayRequest#effectiveMode()}.
+     */
+    private void validateDay(WeeklyScheduleDayRequest day) {
+        switch (day.effectiveMode()) {
+            case INTERVAL -> assertIntervalsNonOverlapping(day.intervals());
+            case EXPLICIT_TIMES -> validateDayTimes(day.times());
+        }
+    }
+
+    /**
+     * Phase 15.8: an EXPLICIT_TIMES day must carry a non-empty, in-bounds list of discrete times within the
+     * {@code ≤ MAX_DISCRETE_TIMES_PER_DAY} cap. De-duplication and ascending sort are applied on persist
+     * (see {@link #normalizeDayTimes}); here we reject the empty/oversized cases that {@code @AssertTrue}
+     * does not (a malformed payload that reached the service is defended in depth).
+     */
+    private void validateDayTimes(List<LocalTime> times) {
+        if (times == null || times.isEmpty()) {
+            throw new BusinessException("An EXPLICIT_TIMES day must have at least one time");
+        }
+        if (normalizeDayTimes(times).size() > MAX_DISCRETE_TIMES_PER_DAY) {
+            throw new BusinessException(
+                    "A day may have at most " + MAX_DISCRETE_TIMES_PER_DAY + " discrete times");
+        }
+    }
+
+    /** Seconds-zeroed, de-duplicated, ascending discrete times for one day. */
+    private List<LocalTime> normalizeDayTimes(List<LocalTime> times) {
+        if (times == null) {
+            return List.of();
+        }
+        return times.stream()
+                .map(this::zeroSeconds)
+                .distinct()
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * Phase 15.9: defence-in-depth mirror of the DTO {@code @AssertTrue} (a malformed payload that reached
+     * the service is still rejected). A {@code DAY_OFF} carries neither intervals nor times; a
+     * {@code CUSTOM_HOURS} override carries either intervals (INTERVAL) or a non-empty times list
+     * (EXPLICIT_TIMES), never both. Mode-specific content rules reuse the shared 15.8 helpers.
+     */
     private void validateOverrideConsistency(ScheduleOverrideRequest request) {
         boolean hasIntervals = request.intervals() != null && !request.intervals().isEmpty();
+        boolean hasTimes = request.times() != null && !request.times().isEmpty();
         boolean ok = switch (request.kind()) {
-            case DAY_OFF -> !hasIntervals;
-            case CUSTOM_HOURS -> hasIntervals;
+            case DAY_OFF -> !hasIntervals && !hasTimes;
+            case CUSTOM_HOURS -> switch (request.effectiveMode()) {
+                case INTERVAL -> hasIntervals && !hasTimes;
+                case EXPLICIT_TIMES -> hasTimes && !hasIntervals;
+            };
         };
         if (!ok) {
             throw new BusinessException(
-                    "DAY_OFF must have no intervals; CUSTOM_HOURS requires intervals");
+                    "DAY_OFF carries no intervals or times; CUSTOM_HOURS carries either intervals "
+                            + "(INTERVAL) or a non-empty times list (EXPLICIT_TIMES), never both");
         }
         if (request.kind() == ScheduleExceptionKind.CUSTOM_HOURS) {
-            assertIntervalsNonOverlapping(request.intervals());
+            switch (request.effectiveMode()) {
+                case INTERVAL -> assertIntervalsNonOverlapping(request.intervals());
+                case EXPLICIT_TIMES -> validateDayTimes(request.times());
+            }
         }
     }
 
