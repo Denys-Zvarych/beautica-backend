@@ -169,11 +169,15 @@ public class PasswordResetService {
         User user = userRepository.findById(token.getUserId())
                 .orElseThrow(() -> new BusinessException(HttpStatus.BAD_REQUEST, GENERIC_RESET_ERROR));
 
+        // Both `user` and `token` are managed entities loaded within this @Transactional
+        // boundary, so Hibernate dirty-checking flushes these mutations on commit — no
+        // explicit save() call is required (it would be a redundant no-op).
         user.setPasswordHash(newPasswordHash);
-        userRepository.save(user);
 
+        // Primary single-use enforcement: flip the just-validated, pessimistically-locked
+        // row directly. This is the authoritative consume — kept independent of the bulk
+        // sweep below, which is defence-in-depth only.
         token.markUsed();
-        passwordResetTokenRepository.save(token);
 
         // Defence in depth: invalidate every other outstanding reset token for the user,
         // then terminate all existing sessions (global logout).

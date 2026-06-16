@@ -297,15 +297,12 @@ class PasswordResetServiceTest {
         log.debug("Act: resetPassword with new valid password");
         service.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "NewValidPass1!"));
 
-        // Password hash must have changed and BCrypt must accept the new value.
-        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
-        verify(userRepository).save(userCaptor.capture());
-        String savedHash = userCaptor.getValue().getPasswordHash();
-        assertThat(passwordEncoder.matches("NewValidPass1!", savedHash)).isTrue();
+        // `user` is a managed entity loaded in-tx; its mutation flushes on commit (no save() call).
+        // Assert the new BCrypt hash was applied directly to the loaded entity.
+        assertThat(passwordEncoder.matches("NewValidPass1!", user.getPasswordHash())).isTrue();
 
-        // Token must be marked used.
+        // `token` is likewise managed; markUsed() is the authoritative single-use consume.
         assertThat(token.isUsed()).isTrue();
-        verify(passwordResetTokenRepository).save(token);
     }
 
     @Test
