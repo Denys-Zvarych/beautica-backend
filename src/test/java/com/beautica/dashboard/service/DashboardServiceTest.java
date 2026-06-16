@@ -25,7 +25,9 @@ import java.sql.Date;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -41,6 +43,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
+@DisplayName("DashboardService — revenue summary scoping, aggregation, and Kyiv-zoned day bucketing")
 class DashboardServiceTest {
 
     // 2026-05-13T10:00:00Z → 2026-05-13T13:00:00+03:00 (Kyiv) → today = 2026-05-13
@@ -74,8 +77,61 @@ class DashboardServiceTest {
         // Assert — fromDate param starts on today-30, toDate param on today+1 (exclusive upper bound)
         LocalDate expectedFrom = TODAY_KYIV.minusDays(30);
         LocalDate expectedTo   = TODAY_KYIV.plusDays(1);
-        verify(query).setParameter(eq("fromDate"), argStartsWith(expectedFrom.toString()));
-        verify(query).setParameter(eq("toDate"),   argStartsWith(expectedTo.toString()));
+        verify(query).setParameter(eq("fromDate"), offsetDateOf(expectedFrom));
+        verify(query).setParameter(eq("toDate"),   offsetDateOf(expectedTo));
+    }
+
+    // ── 1b. Kyiv DST spring-forward boundary ──────────────────────────────
+
+    @Test
+    @DisplayName("range across Kyiv spring-forward (2026-03-29) — day bounds anchored to Kyiv local midnight, offset flips +02:00→+03:00")
+    void should_anchorBoundsToKyivLocalMidnight_when_rangeCrossesSpringForwardDst() {
+        // Kyiv DST 2026: clocks jump 03:00 → 04:00 on Sun 2026-03-29.
+        // Start-of-day for 2026-03-28 is still +02:00 (winter); start-of-day for the
+        // exclusive upper bound 2026-03-31 is +03:00 (summer). Bucketing is Europe/Kyiv
+        // (SQL: DATE(b.starts_at AT TIME ZONE 'Europe/Kyiv'); Java: atStartOfDay(KYIV)),
+        // NOT UTC — so the bound OffsetDateTimes must carry the Kyiv-local offset, and a
+        // day-bucketing regression that anchored to UTC midnight would surface as a wrong
+        // offset (or a date shifted by the +02/+03 hours) here.
+        DashboardService svc = newService(Clock.fixed(FIXED_INSTANT, UTC));
+
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        stubEmptyQuery(em, query);
+
+        LocalDate from = LocalDate.of(2026, 3, 28); // winter side of the transition
+        LocalDate to   = LocalDate.of(2026, 3, 30); // summer side of the transition
+
+        // Act
+        svc.getRevenueSummary(actorId, Role.SALON_OWNER, from, to, null, null, Optional.empty());
+
+        // Assert — capture both temporal bounds and verify Kyiv-local midnight anchoring.
+        org.mockito.ArgumentCaptor<OffsetDateTime> fromCaptor =
+                org.mockito.ArgumentCaptor.forClass(OffsetDateTime.class);
+        org.mockito.ArgumentCaptor<OffsetDateTime> toCaptor =
+                org.mockito.ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(query).setParameter(eq("fromDate"), fromCaptor.capture());
+        verify(query).setParameter(eq("toDate"),   toCaptor.capture());
+
+        OffsetDateTime fromDt = fromCaptor.getValue();
+        OffsetDateTime toDt   = toCaptor.getValue();
+
+        // fromDate: 2026-03-28 Kyiv local midnight, winter offset +02:00
+        assertThat(fromDt.toLocalDate()).isEqualTo(LocalDate.of(2026, 3, 28));
+        assertThat(fromDt.toLocalTime()).isEqualTo(java.time.LocalTime.MIDNIGHT);
+        assertThat(fromDt.getOffset()).isEqualTo(ZoneOffset.ofHours(2));
+
+        // toDate: exclusive upper bound = to.plusDays(1) = 2026-03-31, summer offset +03:00
+        assertThat(toDt.toLocalDate()).isEqualTo(LocalDate.of(2026, 3, 31));
+        assertThat(toDt.toLocalTime()).isEqualTo(java.time.LocalTime.MIDNIGHT);
+        assertThat(toDt.getOffset()).isEqualTo(ZoneOffset.ofHours(3));
+
+        // The offset MUST differ across the DST day — proves the bounds are zoned in
+        // Europe/Kyiv and not a fixed UTC offset that would mis-bucket the rollover day.
+        assertThat(fromDt.getOffset())
+                .as("DST boundary: from-bound offset must differ from to-bound offset")
+                .isNotEqualTo(toDt.getOffset());
     }
 
     // ── 2. Range validation ───────────────────────────────────────────────
@@ -686,9 +742,16 @@ class DashboardServiceTest {
 
     /**
      * Mockito {@code argThat} helper: matches an {@code OffsetDateTime} whose
-     * {@code toString()} starts with the given date prefix (e.g. "2026-04-13").
+     * {@code toLocalDate()} equals the expected date exactly.
+     *
+     * <p>Replaces the previous string-prefix matcher, which was false-positive prone:
+     * {@code OffsetDateTime.toString().startsWith("2026-05-1")} matches every day from
+     * the 10th through the 19th, and a same-day check could be satisfied by an unintended
+     * time-of-day. The bound values are built via {@code LocalDate.atStartOfDay(KYIV)}, so
+     * {@code toLocalDate()} is the canonical Kyiv-local calendar date — compare it directly.
      */
-    private Object argStartsWith(String prefix) {
-        return org.mockito.ArgumentMatchers.argThat(v -> v != null && v.toString().startsWith(prefix));
+    private OffsetDateTime offsetDateOf(LocalDate expected) {
+        return org.mockito.ArgumentMatchers.argThat(v ->
+                v instanceof OffsetDateTime odt && odt.toLocalDate().equals(expected));
     }
 }
