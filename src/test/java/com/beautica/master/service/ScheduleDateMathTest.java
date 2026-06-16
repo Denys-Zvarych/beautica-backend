@@ -126,6 +126,58 @@ class ScheduleDateMathTest {
         assertThat(math.cap()).isEqualTo(LocalDate.of(2026, 2, 28));
     }
 
+    /**
+     * Leap-day clamp on a SECOND ordinary leap year (2028), proving the cap clamp is not hard-pinned to
+     * 2024: anchor 2028-02-29 (leap), {@code cap() = +2y} lands in 2030 which is NOT a leap year, so the
+     * non-existent 2030-02-29 must clamp down to 2030-02-28.
+     */
+    @org.junit.jupiter.api.DisplayName("cap() clamps a 2028 leap-day anchor to Feb 28 of the non-leap target year (2030)")
+    @Test
+    void should_clampLeapDayOriginTo2030Feb28_when_computingCapFrom2028LeapDay() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2028, 2, 29));
+
+        assertThat(math.cap())
+                .as("2028-02-29 +2y must clamp into non-leap 2030, actual=%s", math.cap())
+                .isEqualTo(LocalDate.of(2030, 2, 28));
+    }
+
+    /**
+     * Century-non-leap edge: 2100 is divisible by 4 but NOT by 400, so under the proleptic Gregorian
+     * calendar it is NOT a leap year (Feb 2100 has only 28 days). The anchor 2096-02-29 IS valid (2096 is
+     * a leap year). Advancing 48 months ({@code nextNMonths(48)}) lands on Feb 2100, where the missing
+     * Feb 29 must clamp to Feb 28 — proving the clamp follows the century-rule, not a naive "year % 4" test.
+     */
+    @org.junit.jupiter.api.DisplayName("nextNMonths clamps a leap-day anchor to Feb 28 across the 2100 century-non-leap boundary")
+    @Test
+    void should_clampToFeb28_when_nextNMonthsCrossesIntoCenturyNonLeapYear2100() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2096, 2, 29));
+
+        DateRange range = math.nextNMonths(48); // 4 years forward: 2096-02-29 -> 2100-02-xx
+
+        assertThat(range.from()).isEqualTo(LocalDate.of(2096, 2, 29));
+        assertThat(range.to())
+                .as("2100 is century-non-leap (÷4 but not ÷400), so Feb 29 must clamp to Feb 28, actual=%s",
+                        range.to())
+                .isEqualTo(LocalDate.of(2100, 2, 28));
+    }
+
+    /**
+     * Century-non-leap edge through the {@code lastDayOfMonth} adjuster: for Feb 2100 (NOT a leap year),
+     * the "whole current month" preset must end on Feb 28, not Feb 29 — pinning that the adjuster is
+     * century-rule aware and not hard-pinned to a 4-yearly leap assumption.
+     */
+    @org.junit.jupiter.api.DisplayName("wholeCurrentMonth ends Feb 2100 on the 28th (century-non-leap), not the 29th")
+    @Test
+    void should_endFeb2100OnThe28th_when_wholeCurrentMonthInCenturyNonLeapFebruary() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2100, 2, 10));
+
+        DateRange range = math.wholeCurrentMonth();
+
+        assertThat(range)
+                .as("Feb 2100 has 28 days (century-non-leap), actual=%s", range)
+                .isEqualTo(new DateRange(LocalDate.of(2100, 2, 10), LocalDate.of(2100, 2, 28)));
+    }
+
     @Test
     void should_passValidRange_when_assertWithinBounds() {
         ScheduleDateMath math = atKyivDate(LocalDate.of(2024, 5, 22));
