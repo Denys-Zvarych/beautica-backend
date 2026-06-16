@@ -164,7 +164,8 @@ class SalonServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.createSalon(userId, request))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Only SALON_OWNER may create a salon");
 
         verify(salonRepository, never()).save(any());
     }
@@ -177,7 +178,8 @@ class SalonServiceTest {
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.getSalonEntity(salonId))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Salon not found");
     }
 
     @Test
@@ -248,7 +250,8 @@ class SalonServiceTest {
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
         assertThatThrownBy(() -> salonService.updateSalon(ownerId, salonId, request))
-                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                .hasMessageContaining("City is required");
 
         verify(salonRepository, never()).save(any());
     }
@@ -272,7 +275,8 @@ class SalonServiceTest {
 
         // Act + Assert
         assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
-                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                .hasMessageContaining("City is required");
 
         verify(userRepository, never()).save(any(User.class));
     }
@@ -298,7 +302,8 @@ class SalonServiceTest {
 
         // Act + Assert — same exception type updateSalon throws for the same case.
         assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
-                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                .hasMessageContaining("City is required");
 
         // No salon persisted, no owner location sync, no master auto-creation on rejection.
         verify(salonRepository, never()).save(any());
@@ -365,7 +370,8 @@ class SalonServiceTest {
         when(salonRepository.findByIdAndOwnerId(salonId, attackerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Salon not found or access denied");
 
         verify(salonRepository, never()).save(any());
         verify(userRepository).findById(attackerId);
@@ -402,7 +408,8 @@ class SalonServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.deactivateSalon(userId, salonId))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Only SALON_OWNER may deactivate a salon");
 
         verify(salonRepository, never()).save(any());
     }
@@ -415,7 +422,8 @@ class SalonServiceTest {
         when(userRepository.findById(ownerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(ownerId, salonId))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("User not found");
 
         verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
     }
@@ -431,7 +439,8 @@ class SalonServiceTest {
         when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Salon not found");
 
         verify(inviteService, never()).sendInvite(any(), any());
     }

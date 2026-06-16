@@ -338,6 +338,9 @@ class ReviewControllerTest {
         mockMvc.perform(get(REVIEWS_URL + "/{reviewId}", reviewId)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.message").isNotEmpty());
+                .andExpect(jsonPath("$.success").value(false))
+                // GlobalExceptionHandler#handleNotFound redacts the exception message to a
+                // generic constant — the raw "Review not found" detail must NOT leak to clients.
+                .andExpect(jsonPath("$.message").value("Resource not found"));
     }
 }
