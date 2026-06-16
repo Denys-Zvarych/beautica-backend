@@ -137,4 +137,18 @@ class StrongPasswordValidatorTest {
 
         assertThat(valid).as("password=%s", input).isFalse();
     }
+
+    @Test
+    @DisplayName("accepts when the only digit/uppercase sits after a newline (find scans across lines, unlike a .* full-match)")
+    void should_accept_when_digitAndUppercaseAppearOnlyAfterNewline() {
+        // Both the uppercase letter and the digit live on the line *after* the embedded
+        // newline. A presence check that anchors to a non-DOTALL ".*X.*" full-match would
+        // reject this (the '.' run cannot cross '\n'); Matcher.find() on a bare [0-9]/[A-Z]
+        // class scans the whole string and accepts it. Pins the documented find() contract.
+        String input = "abcdefg\nH1";
+
+        boolean valid = validator.isValid(input, null);
+
+        assertThat(valid).as("password=%s", input).isTrue();
+    }
 }
