@@ -598,4 +598,151 @@ class ScheduleDtoValidationTest {
                     .isFalse();
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ScheduleOverrideRequest — Phase 15.9 EXPLICIT_TIMES mode exclusivity + @Size(times)
+    // ════════════════════════════════════════════════════════════════════════
+    @Nested
+    @DisplayName("ScheduleOverrideRequest — EXPLICIT_TIMES mode (15.9)")
+    class ScheduleOverrideRequestExplicitTimes {
+
+        private static LocalTime time(String hhmmss) {
+            return LocalTime.parse(hhmmss);
+        }
+
+        /** Full 5-arg override request: (date, kind, mode, intervals, times). */
+        private ScheduleOverrideRequest override(ScheduleExceptionKind kind, WeekdayMode mode,
+                                                 List<WorkIntervalDto> intervals, List<LocalTime> times) {
+            return new ScheduleOverrideRequest(FUTURE, kind, mode, intervals, times);
+        }
+
+        @Test
+        @DisplayName("accepts a CUSTOM_HOURS EXPLICIT_TIMES override with a non-empty times list and no intervals")
+        void should_accept_when_explicitTimesWithTimesOnly() {
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.EXPLICIT_TIMES,
+                    null, List.of(time("09:00:00"), time("11:00:00")));
+
+            assertThat(validator.validate(req))
+                    .as("EXPLICIT_TIMES carrying only times is the canonical valid override shape").isEmpty();
+        }
+
+        @Test
+        @DisplayName("rejects (isKindConsistent) a CUSTOM_HOURS INTERVAL override that also carries discrete times")
+        void should_reject_when_intervalOverrideCarriesTimes() {
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.INTERVAL,
+                    List.of(interval("09:00:00", "17:00:00")), List.of(time("10:00:00")));
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("an INTERVAL override carrying times must trip the mode-exclusivity rule").isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isKindConsistent) a CUSTOM_HOURS EXPLICIT_TIMES override that also carries intervals")
+        void should_reject_when_explicitTimesOverrideCarriesIntervals() {
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.EXPLICIT_TIMES,
+                    List.of(interval("09:00:00", "17:00:00")), List.of(time("10:00:00")));
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("an EXPLICIT_TIMES override carrying intervals must trip the mode-exclusivity rule")
+                    .isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isKindConsistent) a CUSTOM_HOURS EXPLICIT_TIMES override with an empty times list")
+        void should_reject_when_explicitTimesOverrideEmpty() {
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.EXPLICIT_TIMES,
+                    null, List.of());
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("an EXPLICIT_TIMES override must carry a non-empty times list").isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isKindConsistent) a CUSTOM_HOURS EXPLICIT_TIMES override with null times")
+        void should_reject_when_explicitTimesOverrideNull() {
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.EXPLICIT_TIMES, null, null);
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("a null times list is not a valid EXPLICIT_TIMES override").isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isKindConsistent) a DAY_OFF override that carries discrete times")
+        void should_reject_when_dayOffOverrideCarriesTimes() {
+            var req = override(ScheduleExceptionKind.DAY_OFF, WeekdayMode.INTERVAL,
+                    null, List.of(time("10:00:00")));
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "kindConsistent"))
+                    .as("a DAY_OFF carrying discrete times must trip the cross-field rule").isTrue();
+        }
+
+        @Test
+        @DisplayName("accepts exactly 24 discrete times (the @Size upper boundary)")
+        void should_accept_when_exactly24Times() {
+            List<LocalTime> twentyFour = java.util.stream.IntStream.range(0, 24)
+                    .mapToObj(h -> LocalTime.of(h, 0)).toList();
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.EXPLICIT_TIMES,
+                    null, twentyFour);
+
+            assertThat(validator.validate(req))
+                    .as("24 override times is exactly at the @Size(max=24) cap and must pass").isEmpty();
+        }
+
+        @Test
+        @DisplayName("rejects times (@Size) when more than 24 discrete times supplied")
+        void should_reject_when_moreThan24Times() {
+            List<LocalTime> twentyFive = new java.util.ArrayList<>(java.util.stream.IntStream.range(0, 24)
+                    .mapToObj(h -> LocalTime.of(h, 0)).toList());
+            twentyFive.add(LocalTime.of(23, 30));
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.EXPLICIT_TIMES,
+                    null, twentyFive);
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "times"))
+                    .as("@Size(max=24) on override times must fire for 25 entries").isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects times when an element is null (@NotNull on the list element)")
+        void should_reject_when_nullTimeElement() {
+            var withNull = new java.util.ArrayList<LocalTime>();
+            withNull.add(time("09:00:00"));
+            withNull.add(null);
+            var req = override(ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.EXPLICIT_TIMES, null, withNull);
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations).isNotEmpty();
+            assertThat(violations.stream().anyMatch(c -> c.getPropertyPath().toString().startsWith("times")))
+                    .as("a null discrete-time element must trip the @NotNull list-element constraint").isTrue();
+        }
+
+        @Test
+        @DisplayName("null mode defaults to INTERVAL — the 3-arg convenience override validates clean (back-compat)")
+        void should_defaultToInterval_when_modeNull() {
+            // The pre-15.9 3-arg constructor sets mode=INTERVAL and times=null.
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
+                    List.of(interval("09:00:00", "17:00:00")));
+
+            assertThat(validator.validate(req))
+                    .as("a pre-15.9 (INTERVAL) override validates clean").isEmpty();
+        }
+    }
 }

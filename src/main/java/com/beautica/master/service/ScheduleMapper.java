@@ -7,6 +7,7 @@ import com.beautica.master.dto.WeeklyScheduleDayResponse;
 import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.DiscreteTime;
+import com.beautica.master.entity.OverrideDiscreteTime;
 import com.beautica.master.entity.ScheduleException;
 import com.beautica.master.entity.ScheduleExceptionInterval;
 import com.beautica.master.entity.ScheduleExceptionKind;
@@ -83,12 +84,35 @@ public class ScheduleMapper {
         return new WeeklyScheduleResponse(schedule.getId(), schedule.getValidFrom(), schedule.getValidTo(), days);
     }
 
-    /** Maps a persisted per-date override to its read projection. */
+    /**
+     * Maps a persisted per-date override to its read projection. Phase 15.9: a {@code CUSTOM_HOURS}
+     * override with ≥1 discrete-time row is {@link WeekdayMode#EXPLICIT_TIMES} (carrying sorted
+     * {@code times}, empty {@code intervals}); otherwise {@link WeekdayMode#INTERVAL} (carrying sorted
+     * {@code intervals}, empty {@code times}). A {@code DAY_OFF} reports {@link WeekdayMode#INTERVAL} with
+     * both lists empty.
+     */
     public ScheduleOverrideResponse toOverrideResponse(ScheduleException exception) {
+        List<LocalTime> times = toOverrideDiscreteTimes(exception);
+        if (!times.isEmpty()) {
+            return new ScheduleOverrideResponse(
+                    exception.getDate(), exception.getKind(),
+                    WeekdayMode.EXPLICIT_TIMES, List.of(), times);
+        }
         return new ScheduleOverrideResponse(
-                exception.getDate(),
-                exception.getKind(),
-                toIntervalDtos(exception.getIntervals()));
+                exception.getDate(), exception.getKind(),
+                WeekdayMode.INTERVAL, toIntervalDtos(exception.getIntervals()), List.of());
+    }
+
+    /**
+     * Phase 15.9: the sorted, de-duplicated discrete start times of a per-date override. Empty when the
+     * override has no discrete-time rows (i.e. it is an INTERVAL custom-hours override or a DAY_OFF).
+     */
+    public List<LocalTime> toOverrideDiscreteTimes(ScheduleException exception) {
+        return exception.getDiscreteTimes().stream()
+                .map(OverrideDiscreteTime::getSlotTime)
+                .sorted()
+                .distinct()
+                .collect(Collectors.toList());
     }
 
     /**

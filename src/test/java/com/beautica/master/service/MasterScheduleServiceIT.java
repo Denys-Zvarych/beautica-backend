@@ -684,6 +684,217 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // 2d. Phase 15.9 — EXPLICIT_TIMES per-DATE override (discrete times on schedule_exceptions)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Phase 15.9 — extends the EXPLICIT_TIMES mode (15.8, weekly template) to a per-date CUSTOM_HOURS
+     * override (a {@link com.beautica.master.entity.ScheduleException} carrying {@link OverrideDiscreteTime}
+     * rows in {@code schedule_exception_times} / V85). Drives the full upsert → reload → resolve path
+     * against the real Testcontainers Postgres so storage, derivation and override-precedence are proven
+     * end-to-end, not just at the mapping layer.
+     *
+     * <p>The contract pinned here:
+     * <ul>
+     *   <li>An EXPLICIT_TIMES override persists its times sorted + de-duplicated, derives
+     *       {@code mode=EXPLICIT_TIMES}, and carries NO intervals.</li>
+     *   <li>{@code resolveEffectiveDay} for such a date returns {@code source=OVERRIDE_CUSTOM}, a populated
+     *       {@code times} list AND a derived display window {@code [min..max]} as the single interval.</li>
+     *   <li><b>Override wins over the weekday template</b> — an EXPLICIT_TIMES override on a concrete date
+     *       beats a covering weekly INTERVAL day for that same weekday.</li>
+     *   <li>Mode flip on the SAME override clears the opposite child collection (INTERVAL↔EXPLICIT_TIMES),
+     *       and the physical {@code schedule_exception_*} rows are gone.</li>
+     *   <li>A DAY_OFF override carries neither intervals nor discrete times.</li>
+     * </ul>
+     */
+    @Nested
+    @DisplayName("EXPLICIT_TIMES per-date override (15.9)")
+    class OverrideExplicitTimes {
+
+        /** An EXPLICIT_TIMES CUSTOM_HOURS override request carrying the given discrete start times. */
+        private ScheduleOverrideRequest explicitOverride(LocalDate date, LocalTime... times) {
+            return new ScheduleOverrideRequest(date, ScheduleExceptionKind.CUSTOM_HOURS,
+                    WeekdayMode.EXPLICIT_TIMES, null, List.of(times));
+        }
+
+        @Test
+        @DisplayName("upsert + reload — an EXPLICIT_TIMES override persists times sorted, de-duplicated, mode derived, no intervals")
+        void should_persistSortedDedupedTimes_when_explicitTimesOverride() {
+            SeededMaster m = seedIndependentMaster();
+
+            // Unsorted, with a duplicate (11:00 twice) — the service must sort + dedupe on persist.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    explicitOverride(FUTURE_FROM, t(13, 0), t(9, 0), t(11, 0), t(11, 0)));
+
+            // Reload via the list projection (re-reads from the DB), not the in-flight write response.
+            ScheduleOverrideResponse reloaded = scheduleService
+                    .listOverrides(m.masterId(), FUTURE_FROM, FUTURE_FROM).get(0);
+
+            assertThat(reloaded.kind()).isEqualTo(ScheduleExceptionKind.CUSTOM_HOURS);
+            assertThat(reloaded.mode())
+                    .as("an override with discrete-time rows derives mode EXPLICIT_TIMES")
+                    .isEqualTo(WeekdayMode.EXPLICIT_TIMES);
+            assertThat(reloaded.times())
+                    .as("override times are sorted ascending and de-duplicated (11:00 once)")
+                    .containsExactly(t(9, 0), t(11, 0), t(13, 0));
+            assertThat(reloaded.intervals())
+                    .as("an EXPLICIT_TIMES override carries no intervals").isEmpty();
+
+            // Hard storage proof: exactly the three deduped rows landed in schedule_exception_times.
+            UUID exceptionId = scheduleExceptionRepository
+                    .findByMasterIdAndDate(m.masterId(), FUTURE_FROM).orElseThrow().getId();
+            Long timeRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM schedule_exception_times WHERE exception_id = ?",
+                    Long.class, exceptionId);
+            assertThat(timeRows).as("three discrete-time rows persisted (duplicate collapsed)").isEqualTo(3L);
+            Long intervalRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM schedule_exception_intervals WHERE exception_id = ?",
+                    Long.class, exceptionId);
+            assertThat(intervalRows).as("no interval rows for an EXPLICIT_TIMES override").isZero();
+        }
+
+        @Test
+        @DisplayName("resolveEffectiveDay — an EXPLICIT_TIMES override returns OVERRIDE_CUSTOM with derived window [min..max] AND populated times")
+        void should_returnDerivedWindowAndTimes_when_resolvingExplicitTimesOverride() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    explicitOverride(FUTURE_FROM, t(9, 0), t(12, 30), t(16, 0)));
+
+            EffectiveDayResponse resp = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
+
+            assertThat(resp.source())
+                    .as("an EXPLICIT_TIMES override resolves as OVERRIDE_CUSTOM").isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
+            assertThat(resp.times())
+                    .as("the discrete slot chips are surfaced for the EXPLICIT_TIMES override")
+                    .containsExactly(t(9, 0), t(12, 30), t(16, 0));
+            assertThat(resp.intervals())
+                    .as("the derived display window is the single [min..max] interval")
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(tuple(t(9, 0), t(16, 0)));
+        }
+
+        @Test
+        @DisplayName("override WINS over the weekday template — an EXPLICIT_TIMES override on a date beats a covering weekly INTERVAL day")
+        void should_overrideBeatTemplate_when_explicitTimesOverrideOnTemplateWeekday() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+
+            // Weekly template: Monday is an INTERVAL working day 09:00-17:00.
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null, day(1, iv(9, 17))));
+            // EXPLICIT_TIMES override on that concrete Monday → must win over the template.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    explicitOverride(monday, t(10, 0), t(13, 0), t(15, 30)));
+
+            EffectiveDayResponse resp = scheduleService.resolveEffectiveDay(m.masterId(), monday);
+
+            assertThat(resp.source())
+                    .as("the override is consulted before the template for its date")
+                    .isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
+            assertThat(resp.times())
+                    .as("the effective times are the override's discrete times, NOT the template window")
+                    .containsExactly(t(10, 0), t(13, 0), t(15, 30));
+            assertThat(resp.intervals())
+                    .as("the derived window is [10:00..15:30], not the template's 09:00-17:00")
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(tuple(t(10, 0), t(15, 30)));
+        }
+
+        @Test
+        @DisplayName("mode flip INTERVAL → EXPLICIT_TIMES on the same date clears the override's interval rows")
+        void should_clearIntervals_when_overrideFlippedToExplicitTimes() {
+            SeededMaster m = seedIndependentMaster();
+            // First: an INTERVAL custom-hours override.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(9, 13), iv(14, 18))));
+            UUID exceptionId = scheduleExceptionRepository
+                    .findByMasterIdAndDate(m.masterId(), FUTURE_FROM).orElseThrow().getId();
+
+            // Re-upsert the SAME date, flipping to EXPLICIT_TIMES.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    explicitOverride(FUTURE_FROM, t(10, 0), t(14, 0)));
+
+            ScheduleOverrideResponse reloaded = scheduleService
+                    .listOverrides(m.masterId(), FUTURE_FROM, FUTURE_FROM).get(0);
+            assertThat(reloaded.mode()).isEqualTo(WeekdayMode.EXPLICIT_TIMES);
+            assertThat(reloaded.times()).containsExactly(t(10, 0), t(14, 0));
+            assertThat(reloaded.intervals())
+                    .as("the prior INTERVAL rows must be cleared by the full-replace upsert").isEmpty();
+            Long intervalRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM schedule_exception_intervals WHERE exception_id = ?",
+                    Long.class, exceptionId);
+            assertThat(intervalRows).as("interval rows physically deleted on the flip").isZero();
+        }
+
+        @Test
+        @DisplayName("mode flip EXPLICIT_TIMES → INTERVAL on the same date clears the override's discrete-time rows")
+        void should_clearDiscreteTimes_when_overrideFlippedBackToInterval() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    explicitOverride(FUTURE_FROM, t(10, 0), t(14, 0)));
+            UUID exceptionId = scheduleExceptionRepository
+                    .findByMasterIdAndDate(m.masterId(), FUTURE_FROM).orElseThrow().getId();
+
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(9, 17))));
+
+            ScheduleOverrideResponse reloaded = scheduleService
+                    .listOverrides(m.masterId(), FUTURE_FROM, FUTURE_FROM).get(0);
+            assertThat(reloaded.mode()).isEqualTo(WeekdayMode.INTERVAL);
+            assertThat(reloaded.times()).as("discrete-time rows cleared on the flip back").isEmpty();
+            assertThat(reloaded.intervals())
+                    .extracting(WorkIntervalDto::startTime, WorkIntervalDto::endTime)
+                    .containsExactly(tuple(t(9, 0), t(17, 0)));
+            Long timeRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM schedule_exception_times WHERE exception_id = ?",
+                    Long.class, exceptionId);
+            assertThat(timeRows).as("discrete-time rows physically deleted on the flip back").isZero();
+        }
+
+        @Test
+        @DisplayName("a DAY_OFF override carries neither intervals nor discrete times (15.9 mode is INTERVAL, both empty)")
+        void should_carryNeitherIntervalsNorTimes_when_dayOff() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
+
+            ScheduleOverrideResponse reloaded = scheduleService
+                    .listOverrides(m.masterId(), FUTURE_FROM, FUTURE_FROM).get(0);
+            assertThat(reloaded.kind()).isEqualTo(ScheduleExceptionKind.DAY_OFF);
+            assertThat(reloaded.mode())
+                    .as("a DAY_OFF reports the default INTERVAL mode with both lists empty")
+                    .isEqualTo(WeekdayMode.INTERVAL);
+            assertThat(reloaded.intervals()).as("a DAY_OFF carries no intervals").isEmpty();
+            assertThat(reloaded.times()).as("a DAY_OFF carries no discrete times").isEmpty();
+
+            UUID exceptionId = scheduleExceptionRepository
+                    .findByMasterIdAndDate(m.masterId(), FUTURE_FROM).orElseThrow().getId();
+            Long timeRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM schedule_exception_times WHERE exception_id = ?",
+                    Long.class, exceptionId);
+            assertThat(timeRows).as("a DAY_OFF persists zero discrete-time rows").isZero();
+        }
+
+        @Test
+        @DisplayName("IDOR — an EXPLICIT_TIMES override upsert to a foreign master is forbidden (no persistence)")
+        void should_rejectExplicitTimesOverride_when_foreignActor() {
+            SeededMaster victim = seedIndependentMaster();
+            SeededMaster attacker = seedIndependentMaster();
+
+            assertThatThrownBy(() -> scheduleService.upsertOverride(
+                    attacker.actorId(), victim.masterId(),
+                    explicitOverride(FUTURE_FROM, t(9, 0), t(12, 0))))
+                    .as("an EXPLICIT_TIMES override follows the same ownership gate as INTERVAL/DAY_OFF")
+                    .isInstanceOf(ForbiddenException.class);
+
+            assertThat(scheduleExceptionRepository.findByMasterIdAndDate(victim.masterId(), FUTURE_FROM))
+                    .as("no override may be persisted for the victim").isEmpty();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // 3b. Read identity — WeeklyScheduleResponse.id round-trips (regression: missing id)
     // ════════════════════════════════════════════════════════════════════════════════
 

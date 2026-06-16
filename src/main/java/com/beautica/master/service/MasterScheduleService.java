@@ -14,9 +14,11 @@ import com.beautica.master.dto.WeeklyScheduleResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.DiscreteTime;
 import com.beautica.master.entity.Master;
+import com.beautica.master.entity.OverrideDiscreteTime;
 import com.beautica.master.entity.ScheduleException;
 import com.beautica.master.entity.ScheduleExceptionInterval;
 import com.beautica.master.entity.ScheduleExceptionKind;
+import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.entity.WeeklySchedule;
 import com.beautica.master.entity.WorkingInterval;
 import com.beautica.master.repository.MasterRepository;
@@ -123,8 +125,14 @@ public class MasterScheduleService {
                 .orElseGet(() -> ScheduleException.builder().master(master).date(request.date()).build());
 
         override.setKind(request.kind());
-        replaceOverrideIntervals(override, request.kind() == ScheduleExceptionKind.CUSTOM_HOURS
+        // Phase 15.9: route a CUSTOM_HOURS override by its mode. Every upsert is a full replace, so both
+        // child collections are cleared first; an INTERVAL override contributes no discrete times and an
+        // EXPLICIT_TIMES override contributes no intervals. A DAY_OFF clears both.
+        boolean explicitTimes = request.kind() == ScheduleExceptionKind.CUSTOM_HOURS
+                && request.effectiveMode() == WeekdayMode.EXPLICIT_TIMES;
+        replaceOverrideIntervals(override, request.kind() == ScheduleExceptionKind.CUSTOM_HOURS && !explicitTimes
                 ? request.intervals() : List.of());
+        replaceOverrideDiscreteTimes(override, explicitTimes ? request.times() : List.of());
 
         ScheduleException saved = scheduleExceptionRepository.save(override);
         evictSlotsAfterCommit(masterId);
@@ -252,6 +260,15 @@ public class MasterScheduleService {
             return scheduleMapper.toEffectiveDay(
                     date, EffectiveDaySource.OVERRIDE_DAY_OFF, List.of());
         }
+        // Phase 15.9: an EXPLICIT_TIMES custom-hours override (≥1 discrete-time row) projects its discrete
+        // times AND a derived window [min..max] as the single interval, mirroring the EXPLICIT_TIMES
+        // template day. Override precedence is preserved — this branch is reached only when an override
+        // covers the date (template never consulted).
+        List<LocalTime> times = scheduleMapper.toOverrideDiscreteTimes(override);
+        if (!times.isEmpty()) {
+            return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.OVERRIDE_CUSTOM,
+                    scheduleMapper.toDerivedWindow(times), times);
+        }
         return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.OVERRIDE_CUSTOM,
                 scheduleMapper.toIntervalDtos(override.getIntervals()));
     }
@@ -372,6 +389,24 @@ public class MasterScheduleService {
         }
     }
 
+    /**
+     * Phase 15.9: atomically replaces an override's discrete-time rows. Mirrors
+     * {@link #replaceOverrideIntervals}: clears the collection (orphanRemoval queues DELETEs) and flushes
+     * before re-insert so a re-sent time whose unique key matches a surviving old row cannot collide
+     * (23505: {@code uq_schedule_exception_times_no_dup}) under {@code hibernate.order_inserts=true}.
+     * Times are seconds-zeroed, de-duplicated and ascending (shared {@link #normalizeDayTimes}).
+     */
+    private void replaceOverrideDiscreteTimes(ScheduleException override, List<LocalTime> times) {
+        override.getDiscreteTimes().clear(); // orphanRemoval queues DELETEs for the old rows
+        scheduleExceptionRepository.flush();
+        for (LocalTime time : normalizeDayTimes(times)) {
+            override.getDiscreteTimes().add(OverrideDiscreteTime.builder()
+                    .exception(override)
+                    .slotTime(time)
+                    .build());
+        }
+    }
+
     // ---- validation ---------------------------------------------------------------------
 
     /**
@@ -414,18 +449,32 @@ public class MasterScheduleService {
                 .toList();
     }
 
+    /**
+     * Phase 15.9: defence-in-depth mirror of the DTO {@code @AssertTrue} (a malformed payload that reached
+     * the service is still rejected). A {@code DAY_OFF} carries neither intervals nor times; a
+     * {@code CUSTOM_HOURS} override carries either intervals (INTERVAL) or a non-empty times list
+     * (EXPLICIT_TIMES), never both. Mode-specific content rules reuse the shared 15.8 helpers.
+     */
     private void validateOverrideConsistency(ScheduleOverrideRequest request) {
         boolean hasIntervals = request.intervals() != null && !request.intervals().isEmpty();
+        boolean hasTimes = request.times() != null && !request.times().isEmpty();
         boolean ok = switch (request.kind()) {
-            case DAY_OFF -> !hasIntervals;
-            case CUSTOM_HOURS -> hasIntervals;
+            case DAY_OFF -> !hasIntervals && !hasTimes;
+            case CUSTOM_HOURS -> switch (request.effectiveMode()) {
+                case INTERVAL -> hasIntervals && !hasTimes;
+                case EXPLICIT_TIMES -> hasTimes && !hasIntervals;
+            };
         };
         if (!ok) {
             throw new BusinessException(
-                    "DAY_OFF must have no intervals; CUSTOM_HOURS requires intervals");
+                    "DAY_OFF carries no intervals or times; CUSTOM_HOURS carries either intervals "
+                            + "(INTERVAL) or a non-empty times list (EXPLICIT_TIMES), never both");
         }
         if (request.kind() == ScheduleExceptionKind.CUSTOM_HOURS) {
-            assertIntervalsNonOverlapping(request.intervals());
+            switch (request.effectiveMode()) {
+                case INTERVAL -> assertIntervalsNonOverlapping(request.intervals());
+                case EXPLICIT_TIMES -> validateDayTimes(request.times());
+            }
         }
     }
 

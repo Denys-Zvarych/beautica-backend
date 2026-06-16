@@ -5,6 +5,7 @@ import com.beautica.auth.Role;
 import com.beautica.master.entity.DiscreteTime;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.master.entity.OverrideDiscreteTime;
 import com.beautica.master.entity.ScheduleException;
 import com.beautica.master.entity.ScheduleExceptionInterval;
 import com.beautica.master.entity.ScheduleExceptionKind;
@@ -580,6 +581,146 @@ class WeeklyScheduleSchemaIT extends AbstractDataJpaTest {
                     .as("weekly_schedule cascade-deleted with its master").isEmpty();
             assertThat(remaining)
                     .as("working_interval_times cascade-deleted transitively with the master").isEmpty();
+        }
+    }
+
+    // ── 7. Phase 15.9 — schedule_exception_times (V85, EXPLICIT_TIMES per-date override slots) ───────
+
+    @Nested
+    @DisplayName("V85 schedule_exception_times (Phase 15.9 per-date override discrete slots)")
+    class OverrideDiscreteTimes {
+
+        private ScheduleException persistCustomHoursException(LocalDate date) {
+            ScheduleException ex = ScheduleException.builder()
+                    .master(em.find(Master.class, masterId))
+                    .date(date)
+                    .kind(ScheduleExceptionKind.CUSTOM_HOURS)
+                    .build();
+            em.persist(ex);
+            em.flush();
+            return ex;
+        }
+
+        private OverrideDiscreteTime overrideTime(ScheduleException ex, LocalTime slot) {
+            return OverrideDiscreteTime.builder().exception(ex).slotTime(slot).build();
+        }
+
+        @Test
+        @DisplayName("V85 created the schedule_exception_times table with its discrete-slot columns")
+        void should_haveCreatedScheduleExceptionTimesTable() {
+            // Information-schema guard for V85: a missed/partial migration would not surface the table.
+            // Running against the real Testcontainers Postgres — a mock could never catch a bad migration.
+            @SuppressWarnings("unchecked")
+            List<String> columns = em.getEntityManager().createNativeQuery(
+                    "SELECT column_name FROM information_schema.columns "
+                            + "WHERE table_name = 'schedule_exception_times'")
+                    .getResultList();
+
+            assertThat(columns)
+                    .as("V85 must create schedule_exception_times with its discrete-slot columns "
+                            + "(no day_of_week — the override is already date-scoped)")
+                    .contains("id", "exception_id", "slot_time")
+                    .doesNotContain("day_of_week");
+        }
+
+        @Test
+        @DisplayName("persists override discrete times for an exception and round-trips them via the LAZY @OneToMany Set")
+        void should_roundTripOverrideDiscreteTimes_when_persistedAndReloaded() {
+            ScheduleException ex = persistCustomHoursException(LocalDate.of(2026, 5, 11));
+            em.persist(overrideTime(ex, LocalTime.of(9, 0)));
+            em.persist(overrideTime(ex, LocalTime.of(11, 30)));
+            em.persist(overrideTime(ex, LocalTime.of(15, 0)));
+            em.flush();
+            em.clear(); // force a real DB reload + LAZY init of the discreteTimes Set
+
+            ScheduleException reloaded = scheduleExceptionRepository.findById(ex.getId()).orElseThrow();
+
+            assertThat(reloaded.getDiscreteTimes())
+                    .as("LAZY @OneToMany override discreteTimes load")
+                    .hasSize(3)
+                    .extracting(OverrideDiscreteTime::getSlotTime)
+                    .containsExactlyInAnyOrder(LocalTime.of(9, 0), LocalTime.of(11, 30), LocalTime.of(15, 0));
+        }
+
+        @Test
+        @DisplayName("duplicate (exception_id, slot_time) is rejected by uq_schedule_exception_times_no_dup")
+        void should_reject_when_duplicateOverrideDiscreteTime() {
+            ScheduleException ex = persistCustomHoursException(LocalDate.of(2026, 5, 12));
+            em.persist(overrideTime(ex, LocalTime.of(9, 0)));
+            em.flush();
+            em.persist(overrideTime(ex, LocalTime.of(9, 0)));
+
+            assertThatThrownBy(em::flush).isInstanceOf(PersistenceException.class);
+        }
+
+        @Test
+        @DisplayName("the same slot_time on a different exception (date) is allowed (uniqueness is per (exception, time))")
+        void should_allow_when_sameSlotTimeDifferentException() {
+            ScheduleException mon = persistCustomHoursException(LocalDate.of(2026, 5, 13));
+            ScheduleException tue = persistCustomHoursException(LocalDate.of(2026, 5, 14));
+            em.persist(overrideTime(mon, LocalTime.of(9, 0)));
+            em.persist(overrideTime(tue, LocalTime.of(9, 0)));
+            em.flush();
+            em.clear();
+
+            assertThat(scheduleExceptionRepository.findById(mon.getId()).orElseThrow().getDiscreteTimes())
+                    .as("09:00 on a different override date is a distinct row").hasSize(1);
+            assertThat(scheduleExceptionRepository.findById(tue.getId()).orElseThrow().getDiscreteTimes())
+                    .hasSize(1);
+        }
+
+        @Test
+        @DisplayName("deleting a schedule_exception cascades to its schedule_exception_times (FK ON DELETE CASCADE)")
+        void should_cascadeToOverrideTimes_when_exceptionDeleted() {
+            ScheduleException ex = persistCustomHoursException(LocalDate.of(2026, 5, 15));
+            em.persist(overrideTime(ex, LocalTime.of(9, 0)));
+            em.persist(overrideTime(ex, LocalTime.of(10, 0)));
+            em.flush();
+            UUID exceptionId = ex.getId();
+            em.clear();
+
+            // Native delete so the DB FK ON DELETE CASCADE fires (not JPA orphan removal).
+            em.getEntityManager().createNativeQuery("DELETE FROM schedule_exceptions WHERE id = :id")
+                    .setParameter("id", exceptionId)
+                    .executeUpdate();
+            em.flush();
+            em.clear();
+
+            @SuppressWarnings("unchecked")
+            List<UUID> remaining = em.getEntityManager().createNativeQuery(
+                    "SELECT id FROM schedule_exception_times WHERE exception_id = :eid")
+                    .setParameter("eid", exceptionId)
+                    .getResultList();
+
+            assertThat(remaining)
+                    .as("schedule_exception_times cascade-deleted with their schedule_exception").isEmpty();
+        }
+
+        @Test
+        @DisplayName("deleting a master cascades through schedule_exceptions to schedule_exception_times")
+        void should_cascadeToOverrideTimes_when_masterDeleted() {
+            ScheduleException ex = persistCustomHoursException(LocalDate.of(2026, 5, 16));
+            em.persist(overrideTime(ex, LocalTime.of(13, 0)));
+            em.flush();
+            UUID exceptionId = ex.getId();
+            em.clear();
+
+            em.getEntityManager().createNativeQuery("DELETE FROM masters WHERE id = :id")
+                    .setParameter("id", masterId)
+                    .executeUpdate();
+            em.flush();
+            em.clear();
+
+            @SuppressWarnings("unchecked")
+            List<UUID> remaining = em.getEntityManager().createNativeQuery(
+                    "SELECT id FROM schedule_exception_times WHERE exception_id = :eid")
+                    .setParameter("eid", exceptionId)
+                    .getResultList();
+
+            assertThat(scheduleExceptionRepository.findById(exceptionId))
+                    .as("schedule_exception cascade-deleted with its master").isEmpty();
+            assertThat(remaining)
+                    .as("schedule_exception_times cascade-deleted transitively with the master").isEmpty();
         }
     }
 }
