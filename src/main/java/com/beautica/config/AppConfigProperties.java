@@ -14,7 +14,8 @@ import org.springframework.context.annotation.Configuration;
         InternalApiKeyProperties.class,
         PublicBaseUrlProperties.class,
         SupportProperties.class,
-        TurbosmsProperties.class
+        TurbosmsProperties.class,
+        BookingSmsProperties.class
 })
 public class AppConfigProperties {
 }

@@ -37,7 +37,6 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.math.BigDecimal;
 import java.time.Clock;
-import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -51,9 +50,6 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class BookingService {
-
-    private static final int MIN_MINUTES_AHEAD = 15;
-    private static final int MAX_DAYS_AHEAD = 180;
 
     private final BookingRepository bookingRepository;
     private final MasterRepository masterRepository;
@@ -302,14 +298,9 @@ public class BookingService {
     }
 
     private void validateStartsAt(OffsetDateTime startsAt) {
-        // Fix M4 (PERF): compute Duration once — two separate calls created redundant objects
-        Duration gap = Duration.between(clock.instant(), startsAt.toInstant());
-        if (gap.toMinutes() < MIN_MINUTES_AHEAD) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Booking must start at least 15 minutes from now");
-        }
-        if (gap.toDays() > MAX_DAYS_AHEAD) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Booking cannot be more than 180 days in the future");
-        }
+        // Shared with GuestBookingService (DRY) so the authenticated and guest paths
+        // enforce the identical lead-time floor + max-window cap.
+        BookingStartsAtValidator.validate(startsAt, clock);
     }
 
     private void registerSlotEviction(UUID masterId, LocalDate date, UUID masterServiceId) {

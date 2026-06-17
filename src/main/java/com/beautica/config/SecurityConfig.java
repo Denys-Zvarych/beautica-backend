@@ -148,6 +148,13 @@ public class SecurityConfig {
                     // dedicated per-IP Bucket4j throttle guards /send (AuthRateLimitFilter);
                     // the per-phone limit + generic-401 verify guard live in PhoneOtpService.
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/book/otp/**").permitAll();
+                    // Phase 13.3 — Guest Booking Creation. An unauthenticated client on the
+                    // public booking page holds only a guest JWT (type=GUEST, no Spring
+                    // principal), so the create-booking POST must be permitAll at the filter
+                    // chain; GuestBookingService validates the guest token itself. Scoped
+                    // tightly to POST /api/v1/book/*/booking (single path segment for the slug,
+                    // then literal /booking) so no other authenticated POST under /book is opened.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/*/booking").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),

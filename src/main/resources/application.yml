@@ -136,6 +136,24 @@ app:
   invite:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
+  booking:
+    # Phase 13.3 — guest booking. How many days ahead the public availability
+    # endpoint (GET /book/{slug}/availability) will serve slots.
+    availability-max-days: ${BOOKING_AVAILABILITY_MAX_DAYS:60}
+    sms:
+      # Ukrainian SMS copy with {placeholder} tokens substituted at send time
+      # (GuestBookingService / BookingReminderJob). Multiline via YAML block scalar.
+      # Rendered text (a guest's appointment details) is never logged.
+      confirmation: |-
+        Beautica: Запис підтверджено!
+        {masterName}, {serviceName}
+        {date} о {time}
+
+        Скасувати: {cancelUrl}
+      reminder: |-
+        Beautica: Нагадуємо!
+        {serviceName} у {masterName}
+        Завтра о {time}
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

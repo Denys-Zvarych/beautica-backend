@@ -744,4 +744,47 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         assertThat(hydrated.get(0).getMaster()).isNotNull();
     }
 
+    // ── findGuestBookingsForReminder — already-reminded exclusion pin ──────────
+    // The BookingReminderJobTest comment claims "already-reminded excluded by query" but the
+    // unit test only exercises the empty-result path. This DataJpaTest pins the real contract:
+    // the JPQL filters reminderSent = false, so a guest booking already marked reminderSent=true
+    // is NOT re-fetched (and therefore never double-SMS'd) on the next hourly sweep.
+
+    @Test
+    @DisplayName("should_excludeAlreadyRemindedGuestBooking_when_findGuestBookingsForReminder")
+    void should_excludeAlreadyRemindedGuestBooking_when_findGuestBookingsForReminder() {
+        // Two non-overlapping slots for the same master (the DB exclusion constraint
+        // no_overlapping_bookings forbids same-master time overlap), both inside the sweep window.
+        OffsetDateTime dueStart = OffsetDateTime.of(2026, 6, 2, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime dueEnd = OffsetDateTime.of(2026, 6, 2, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        // Due, not yet reminded → MUST be returned.
+        Booking due = Booking.guestBooking(
+                master, masterService, null, dueStart, dueEnd,
+                new BigDecimal("450.00"), 60, 0, "Олена", "Коваль", "+380501234567");
+        em.persist(due);
+
+        // Later same-day slot, already reminded → MUST be excluded by the query.
+        Booking alreadyReminded = Booking.guestBooking(
+                master, masterService, null,
+                OffsetDateTime.of(2026, 6, 2, 14, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 2, 15, 0, 0, 0, ZoneOffset.UTC),
+                new BigDecimal("450.00"), 60, 0, "Ірина", "Левко", "+380507654321");
+        alreadyReminded.setReminderSent(true);
+        em.persist(alreadyReminded);
+        em.flush();
+        em.clear();
+
+        OffsetDateTime from = OffsetDateTime.of(2026, 6, 2, 0, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime to = OffsetDateTime.of(2026, 6, 3, 0, 0, 0, 0, ZoneOffset.UTC);
+
+        List<Booking> result = bookingRepository.findGuestBookingsForReminder(from, to);
+
+        assertThat(result)
+                .as("only the not-yet-reminded due booking is returned; the reminderSent=true "
+                        + "booking is excluded so it is never re-sent")
+                .extracting(Booking::getId)
+                .containsExactly(due.getId());
+    }
+
 }

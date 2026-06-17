@@ -329,4 +329,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """, nativeQuery = true)
     Integer acquireAdvisoryLock(@Param("masterId") UUID masterId);
 
+    // ── Guest-booking reminder sweep (Phase 13.3) ─────────────────────────────
+    /**
+     * Loads guest (LINK) bookings due for a 24h reminder SMS. Bounded by a narrow
+     * {@code [from, to)} window supplied by {@link com.beautica.booking.job.BookingReminderJob}
+     * (Anti-Bug §E-3: not unbounded), and aligned with the partial index
+     * {@code idx_bookings_reminder} (LINK + reminder_sent = FALSE).
+     *
+     * <p>The fetched rows are mutated ({@code reminderSent = true}) and saved by the
+     * job inside its transaction, so the {@code masterService}/{@code serviceDefinition}
+     * graph is joined to render the reminder text without a lazy load.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.reminderSent = false
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt BETWEEN :from AND :to
+            """)
+    List<Booking> findGuestBookingsForReminder(
+            @Param("from") OffsetDateTime from,
+            @Param("to") OffsetDateTime to);
 }
