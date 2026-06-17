@@ -49,6 +49,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> suggestServiceTypeBuckets;
     @Mock private LoadingCache<String, Bucket> bulkServiceSetupBuckets;
     @Mock private LoadingCache<String, Bucket> supportContactBuckets;
+    @Mock private LoadingCache<String, Bucket> otpSendBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -61,7 +62,7 @@ class AuthRateLimitFilterTest {
                 slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, profileUpdateBuckets,
                 resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets,
                 categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets,
-                supportContactBuckets);
+                supportContactBuckets, otpSendBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -1688,6 +1689,123 @@ class AuthRateLimitFilterTest {
                     .as("chain must be forwarded — GET on the support-contact path is not rate-limited")
                     .isNotNull();
             verifyNoInteractions(supportContactBuckets);
+        }
+    }
+
+    // Phase 13.2 — POST /api/v1/book/otp/send: per-IP SMS-bomb guard (3 / 15 min).
+    // Window is 15 minutes → Retry-After 900. This is the IP-layer defence complementing
+    // the per-phone rate limit inside PhoneOtpService.
+    @Nested
+    @DisplayName("POST /api/v1/book/otp/send — 3/15min SMS-bomb guard")
+    class OtpSendEndpoint {
+
+        @Test
+        @DisplayName("routes to otpSendBuckets and passes through when within limit")
+        void should_routeToOtpSendBuckets_when_withinLimit() throws Exception {
+            log.debug("Arrange: otpSendBuckets returns a bucket that allows consumption");
+            when(otpSendBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/book/otp/send");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /book/otp/send within limit");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when otp-send bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest())
+                    .as("filter chain must be forwarded when the bucket allows the request")
+                    .isNotNull();
+            verify(otpSendBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(supportContactBuckets);
+            verifyNoInteractions(loginBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 with 900s Retry-After when otp-send called over the limit")
+        void should_return429_when_otpSendCalledOverLimit() throws Exception {
+            // 3 / 15 min cap: first three pass, the fourth is throttled. Retry-After mirrors
+            // the 15-minute otp-send window (900 s).
+            log.debug("Arrange: otpSendBuckets allows 3 then denies the 4th");
+            when(otpSendBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1))
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(false);
+
+            MockHttpServletResponse lastResponse = null;
+            MockFilterChain         lastChain    = null;
+
+            log.debug("Act: send 4 POSTs to /book/otp/send from the same IP");
+            for (int i = 0; i < 4; i++) {
+                var request = postRequest("/api/v1/book/otp/send");
+                lastResponse = new MockHttpServletResponse();
+                lastChain    = new MockFilterChain();
+                doFilter(request, lastResponse, lastChain);
+
+                if (i < 3) {
+                    assertThat(lastResponse.getStatus())
+                            .as("request %d must not be 429 — bucket not yet exhausted", i + 1)
+                            .isNotEqualTo(429);
+                }
+            }
+
+            assertThat(lastResponse.getStatus())
+                    .as("4th request must be 429 — otp-send bucket exhausted (3/15min)")
+                    .isEqualTo(429);
+            assertThat(lastResponse.getHeader("Retry-After"))
+                    .as("Retry-After must reflect the 15-minute otp-send window")
+                    .isEqualTo("900");
+            assertThat(lastResponse.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(lastChain.getRequest())
+                    .as("filter chain must not be forwarded on the throttled request")
+                    .isNull();
+            verify(otpSendBuckets, times(4)).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+        }
+
+        @Test
+        @DisplayName("POST /api/v1/book/otp/verify IS rate-limited per-IP (internal verify bucket, not otpSendBuckets)")
+        void should_rateLimit_when_postOtpVerify() throws Exception {
+            // CRITICAL-fix IP layer: /verify is throttled by an internal verify bucket
+            // (10 / 15 min), NOT by the injected otpSendBuckets. Fire well above the cap
+            // from one IP and assert at least one request is throttled (429) and not
+            // forwarded — and that the /send bucket is never consulted for a /verify path.
+            log.debug("Arrange: fire many POST /book/otp/verify from one IP — internal verify bucket must throttle");
+
+            MockHttpServletResponse lastResponse = null;
+            MockFilterChain lastChain = null;
+            boolean anyThrottled = false;
+
+            for (int i = 0; i < 25; i++) {
+                var request  = postRequest("/api/v1/book/otp/verify");
+                lastResponse = new MockHttpServletResponse();
+                lastChain    = new MockFilterChain();
+                doFilter(request, lastResponse, lastChain);
+                if (lastResponse.getStatus() == 429) {
+                    anyThrottled = true;
+                    break;
+                }
+            }
+
+            assertThat(anyThrottled)
+                    .as("POST /book/otp/verify must be IP-throttled by the internal verify bucket")
+                    .isTrue();
+            assertThat(lastResponse.getStatus())
+                    .as("the throttled verify request must return 429")
+                    .isEqualTo(429);
+            assertThat(lastResponse.getHeader("Retry-After"))
+                    .as("Retry-After must reflect the 15-minute verify window")
+                    .isEqualTo("900");
+            assertThat(lastChain.getRequest())
+                    .as("the throttled verify request must NOT be forwarded down the chain")
+                    .isNull();
+            // /verify must never consume the /send bucket.
+            verifyNoInteractions(otpSendBuckets);
         }
     }
 }

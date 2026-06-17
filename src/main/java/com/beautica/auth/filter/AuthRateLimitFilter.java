@@ -1,6 +1,9 @@
 package com.beautica.auth.filter;
 
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.BandwidthBuilder;
 import io.github.bucket4j.Bucket;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -13,6 +16,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 @Component
 public class AuthRateLimitFilter extends OncePerRequestFilter {
@@ -45,6 +49,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String BULK_SALON_SERVICES_PREFIX = "/api/v1/salons/";
     private static final String BULK_SALON_SERVICES_SUFFIX = "/services/bulk";
     private static final String SUPPORT_CONTACT_PATH = "/api/v1/support/contact";
+    private static final String OTP_SEND_PATH = "/api/v1/book/otp/send";
+    private static final String OTP_VERIFY_PATH = "/api/v1/book/otp/verify";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
@@ -57,6 +63,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final int VERIFY_EMAIL_RETRY_AFTER_SECONDS = 900;
     // forgot-password / reset-password bucket window is 60 minutes.
     private static final int FORGOT_PASSWORD_RETRY_AFTER_SECONDS = 3600;
+    // otp-send bucket window is 15 minutes — Retry-After reflects the actual window.
+    private static final int OTP_SEND_RETRY_AFTER_SECONDS = 900;
+    // otp-verify bucket window is 15 minutes — Retry-After reflects the actual window.
+    private static final int OTP_VERIFY_RETRY_AFTER_SECONDS = 900;
+    // Per-IP cap for POST /api/v1/book/otp/verify (10 / 15 min). Higher than /send (3)
+    // since a legitimate guest may retype a code, but bounded so a single IP cannot pour
+    // unlimited verify attempts at freshly-sent OTPs and defeat the per-OTP attempt cap by
+    // re-sending. This bucket is built internally (not an injected @Qualifier bean) so the
+    // existing 16-arg constructor — depended on by several slice/regression tests — is
+    // unchanged.
+    private static final long OTP_VERIFY_CAPACITY = 10;
+    private static final Duration OTP_VERIFY_WINDOW = Duration.ofMinutes(15);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -93,6 +111,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP bucket for POST /api/v1/support/contact — every successful request emails
     // the support inbox, so this is an email-bomb / outbound-quota surface (5/hr).
     private final LoadingCache<String, Bucket> supportContactBuckets;
+    // Per-IP bucket for POST /api/v1/book/otp/send — every successful request sends a
+    // billable SMS, so this is an SMS-bomb / outbound-quota surface (3 / 15 min). This is
+    // the IP-layer defence complementing the per-phone rate limit in PhoneOtpService.
+    private final LoadingCache<String, Bucket> otpSendBuckets;
+    // Per-IP bucket for POST /api/v1/book/otp/verify — the IP-layer half of the CRITICAL
+    // brute-force fix (the per-OTP attempt counter in PhoneOtpService is the other half).
+    // Built internally rather than injected so the public 16-arg constructor stays stable
+    // for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> otpVerifyBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -109,7 +136,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
             @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
             @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
-            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets) {
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -125,6 +153,20 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.suggestServiceTypeBuckets = suggestServiceTypeBuckets;
         this.bulkServiceSetupBuckets = bulkServiceSetupBuckets;
         this.supportContactBuckets = supportContactBuckets;
+        this.otpSendBuckets = otpSendBuckets;
+        this.otpVerifyBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(otpVerifyBandwidth())
+                        .build());
+    }
+
+    private static Bandwidth otpVerifyBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(OTP_VERIFY_CAPACITY)
+                .refillIntervally(OTP_VERIFY_CAPACITY, OTP_VERIFY_WINDOW)
+                .build();
     }
 
     @Override
@@ -225,6 +267,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (SUPPORT_CONTACT_PATH.equals(path)) {
             cache = supportContactBuckets;
             retryAfterSeconds = SUPPORT_CONTACT_RETRY_AFTER_SECONDS;
+        } else if (OTP_SEND_PATH.equals(path)) {
+            cache = otpSendBuckets;
+            retryAfterSeconds = OTP_SEND_RETRY_AFTER_SECONDS;
+        } else if (OTP_VERIFY_PATH.equals(path)) {
+            cache = otpVerifyBuckets;
+            retryAfterSeconds = OTP_VERIFY_RETRY_AFTER_SECONDS;
         } else {
             filterChain.doFilter(request, response);
             return;

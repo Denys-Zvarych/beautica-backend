@@ -84,6 +84,9 @@ public abstract class AbstractIntegrationTest {
         // the cleanup intent clear. Must precede the users DELETE.
         jdbcTemplate.execute("DELETE FROM password_reset_tokens");
         jdbcTemplate.execute("DELETE FROM device_tokens");
+        // Phase 13.2: phone_otps has no FK (guest flow, no user row) — delete anywhere,
+        // kept here with the other side tables so a fresh DB is left for the next test.
+        jdbcTemplate.execute("DELETE FROM phone_otps");
         jdbcTemplate.execute("DELETE FROM users");
 
         cacheManager.getCacheNames().forEach(name -> {

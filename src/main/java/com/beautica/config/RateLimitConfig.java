@@ -120,6 +120,19 @@ public class RateLimitConfig {
 
     private static final Duration SUPPORT_CONTACT_WINDOW = Duration.ofMinutes(60);
 
+    // Per-IP cap for POST /api/v1/book/otp/send (15-minute window). Every successful
+    // request dispatches an SMS via Turbosms — a billable, outbound-quota / SMS-bomb
+    // surface — so this is the IP-layer defence that complements the per-phone rate
+    // limit inside PhoneOtpService (dual-layer). Cap mirrors the per-phone service cap
+    // (3 / 15 min) so a single IP cannot out-pace what one phone is allowed. IP-keyed
+    // for consistency with every other bucket in this filter (JWT is not parsed when
+    // AuthRateLimitFilter runs — and this is a permitAll endpoint anyway). Configurable
+    // so integration tests on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.otp-send-capacity:3}")
+    private long otpSendCapacity;
+
+    private static final Duration OTP_SEND_WINDOW = Duration.ofMinutes(15);
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
         return Caffeine.newBuilder()
@@ -354,6 +367,27 @@ public class RateLimitConfig {
                 .expireAfterAccess(SUPPORT_CONTACT_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(supportContactCapacity, SUPPORT_CONTACT_WINDOW))
+                        .build());
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/book/otp/send}.
+     *
+     * <p>Cap: 3 requests per 15-minute window per source IP — matching the per-phone
+     * service-layer cap in {@code PhoneOtpService} so neither layer is the looser of the
+     * two. Each successful request sends a billable SMS, so this is an SMS-bomb /
+     * outbound-quota surface guarded at the IP layer (the per-phone check guards a single
+     * number; this guards a single network identity rotating phones).
+     * {@code expireAfterAccess(20 min)} gives a 5-minute grace past the window so the
+     * entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> otpSendBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(OTP_SEND_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(otpSendCapacity, OTP_SEND_WINDOW))
                         .build());
     }
 

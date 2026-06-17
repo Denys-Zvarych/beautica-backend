@@ -140,6 +140,14 @@ public class SecurityConfig {
                     // before anyRequest().authenticated() below. CSRF is already disabled
                     // on /api/** and the response carries no owner identifiers (§I-2).
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/book/**").permitAll();
+                    // Phase 13.2 — Phone OTP & Guest Token. Unauthenticated clients on the
+                    // public booking page request and verify an SMS code before they hold any
+                    // JWT, so POST /api/v1/book/otp/{send,verify} must be permitAll. Scoped
+                    // tightly to /otp/** (not all POST /book/**) so future authenticated
+                    // booking-write endpoints under /book are not accidentally opened. A
+                    // dedicated per-IP Bucket4j throttle guards /send (AuthRateLimitFilter);
+                    // the per-phone limit + generic-401 verify guard live in PhoneOtpService.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/otp/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),
