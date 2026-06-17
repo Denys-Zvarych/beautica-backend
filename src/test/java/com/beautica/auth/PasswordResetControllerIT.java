@@ -431,17 +431,29 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     // Private helpers
     // =========================================================================
 
-    /** Registers a CLIENT user and immediately marks their email verified in the DB. */
+    /** Registers a CLIENT user and asserts their email is marked verified in the DB. */
     private void registerAndVerify(String email, String password) {
-        restTemplate.postForEntity(
+        ResponseEntity<String> registerResponse = restTemplate.postForEntity(
                 "/api/v1/auth/register",
                 new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
                 String.class);
-        transactionTemplate.executeWithoutResult(status ->
-                userRepository.findByEmail(email).ifPresent(u -> {
-                    u.setEmailVerified(true);
-                    userRepository.save(u);
-                }));
+        assertThat(registerResponse.getStatusCode())
+                .as("register must succeed before the test can verify the account")
+                .isEqualTo(HttpStatus.OK);
+
+        transactionTemplate.executeWithoutResult(status -> {
+            User user = userRepository.findByEmail(email)
+                    .orElseThrow(() -> new AssertionError(
+                            "registered user not visible after register POST committed: " + email));
+            user.setEmailVerified(true);
+            userRepository.save(user);
+        });
+
+        // Assert the precondition requestReset() depends on: active AND verified.
+        User reread = userRepository.findByEmail(email).orElseThrow();
+        assertThat(reread.isActive() && reread.isEmailVerified())
+                .as("user must be active and email-verified before forgot-password, else requestReset() no-ops")
+                .isTrue();
     }
 
     /**
