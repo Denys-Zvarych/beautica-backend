@@ -535,6 +535,79 @@ class ServiceCatalogServiceUpdateTest {
                 .isSameAs(existingType);
     }
 
+    // ── updateServiceDefinition — category-only PATCH re-validates the EXISTING type ──
+    // Regression: a category-only PATCH (new category, serviceTypeId == null) on a
+    // definition that already carries a serviceType must re-check the existing type
+    // against the just-applied category. Before the fix the consistency check was
+    // skipped on a category-only PATCH, so a HAIR category could be stored against a
+    // NAILS-typed definition — a silently inconsistent (category, serviceType) pair (200).
+
+    @Test
+    @DisplayName("throws 400 when a category-only PATCH leaves the EXISTING serviceType in a different category (regression)")
+    void should_throw400_when_categoryOnlyPatchOrphansExistingServiceType_onUpdate() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+
+        // The stored type belongs to NAILS; the PATCH moves the definition to HAIR with no
+        // serviceTypeId — the existing type must be re-validated against the NEW category.
+        ServiceType nailsType = mock(ServiceType.class);
+        when(nailsType.getPlatformCategoryName()).thenReturn("NAILS");
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
+        existing.setServiceType(nailsType);
+
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "HAIR", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+
+        // Only category changes (HAIR); serviceTypeId is null — no re-resolve, so the guard
+        // must re-check the already-set NAILS type against HAIR and reject.
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, "HAIR", null, null, null, null, null, null, null);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("service type does not belong to the selected category")
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        // The inconsistent pair must never be persisted.
+        verify(serviceRepository, never()).save(any());
+        verify(serviceTypeLookup, never()).getById(any());
+    }
+
+    @Test
+    @DisplayName("accepts a category-only PATCH when the EXISTING serviceType still belongs to the new category")
+    void should_accept_when_categoryOnlyPatchStillMatchesExistingServiceType_onUpdate() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+
+        // The stored type belongs to HAIR; the PATCH re-applies HAIR — the pair stays consistent.
+        ServiceType hairType = mock(ServiceType.class);
+        when(hairType.getPlatformCategoryName()).thenReturn("HAIR");
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
+        existing.setServiceType(hairType);
+
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "HAIR", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
+                .thenReturn(List.of());
+
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, "HAIR", null, null, null, null, null, null, null);
+
+        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+
+        // No re-resolve of the type, but the existing matching type must survive and persist.
+        verify(serviceTypeLookup, never()).getById(any());
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(captor.capture());
+        assertThat(captor.getValue().getCategory())
+                .as("category must be updated to HAIR").isEqualTo("HAIR");
+        assertThat(captor.getValue().getServiceType())
+                .as("the still-consistent existing type must be retained").isSameAs(hairType);
+    }
+
     // ── updateServiceDefinition — blank-name defaulting (Phase 16.4) ───────────
     // name absent (null) → unchanged; name present non-blank → overwrite;
     // name present but blank → default to the EFFECTIVE service type's nameUk;

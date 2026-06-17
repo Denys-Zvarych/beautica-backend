@@ -580,6 +580,16 @@ public class ServiceCatalogService {
         if (request.serviceTypeId() != null) {
             ServiceType serviceType = resolveServiceType(request.serviceTypeId(), definition.getCategory());
             definition.setServiceType(serviceType);
+        } else if (request.category() != null && definition.getServiceType() != null) {
+            // Category-only PATCH: the existing service type is not re-resolved, so re-check
+            // that it still belongs to the just-applied category. Without this guard a
+            // category change silently orphans the existing service type (effective pair
+            // inconsistent: definition.category != serviceType.platformCategoryName).
+            ServiceType existing = definition.getServiceType();
+            if (!Objects.equals(existing.getPlatformCategoryName(), definition.getCategory())) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "service type does not belong to the selected category");
+            }
         }
 
         applyNamePatch(definition, request);
