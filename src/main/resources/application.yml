@@ -143,6 +143,16 @@ app:
     # startup — when unset, the contact endpoint returns a clean 503 business
     # error instead of crashing the app or emailing an empty recipient.
     email: ${SUPPORT_EMAIL:}
+  sms:
+    # Turbosms SMS provider (Phase 13.1) — cheapest UA provider, shared SMS layer
+    # for Phase 13 OTP + notifications. Env-driven token; blank default does NOT
+    # fail startup (graceful degradation like app.support / R2 / Firebase) — a send
+    # attempt with no token throws a clean SmsDeliveryException. The token is a
+    # secret and is never logged.
+    turbosms:
+      token: ${TURBOSMS_TOKEN:}
+      sender-name: ${TURBOSMS_SENDER_NAME:Beautica}
+      base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB

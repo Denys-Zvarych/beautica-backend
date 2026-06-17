@@ -104,6 +104,8 @@ dependencies {
     // Apache HttpClient 5 — required for TestRestTemplate to support PATCH
     // (JDK HttpURLConnection rejects PATCH; HttpComponentsClientHttpRequestFactory does not)
     testImplementation("org.apache.httpcomponents.client5:httpclient5")
+    // WireMock — stubs the Turbosms HTTP endpoint in TurbosmsService tests (Phase 13.1).
+    testImplementation("org.wiremock:wiremock-standalone:3.9.1")
 }
 
 // Disable the plain (non-executable) jar task. The Spring Boot plugin otherwise

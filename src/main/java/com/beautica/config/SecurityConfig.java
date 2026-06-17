@@ -134,6 +134,12 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts/{oblastId}/cities").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/cities/{cityId}/districts").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/search/**").permitAll();
+                    // Phase 13.1 — Guest Booking Link. The public booking page
+                    // (beautica.app/book/{slug}) is opened by unauthenticated clients
+                    // from a shared link, so GET /api/v1/book/** is permitAll. Placed
+                    // before anyRequest().authenticated() below. CSRF is already disabled
+                    // on /api/** and the response carries no owner identifiers (§I-2).
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/book/**").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),

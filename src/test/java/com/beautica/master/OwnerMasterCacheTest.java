@@ -92,6 +92,8 @@ class OwnerMasterCacheTest {
     @MockBean ScheduleExceptionRepository scheduleExceptionRepository;
     @MockBean BookingRepository bookingRepository;
     @MockBean CityRepository cityRepository;
+    // Phase 13.1: MasterService now constructor-depends on BookingSlugService.
+    @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

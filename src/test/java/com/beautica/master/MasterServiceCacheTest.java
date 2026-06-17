@@ -81,6 +81,9 @@ class MasterServiceCacheTest {
     @MockBean WorkingHoursRepository workingHoursRepository;
     @MockBean BookingRepository bookingRepository;
     @MockBean CityRepository cityRepository;
+    // Phase 13.1: MasterService now constructor-depends on BookingSlugService.
+    // This slice does not exercise the creation paths, so a mock satisfies the wiring.
+    @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

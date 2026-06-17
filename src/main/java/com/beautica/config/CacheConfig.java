@@ -201,6 +201,17 @@ public class CacheConfig {
                         .maximumSize(600)
                         .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
+        // Phase 13.1 — public guest-booking lookup behind GET /api/v1/book/{slug}/info,
+        // keyed on the slug. permitAll + uncached previously meant a DB master lookup +
+        // bounded service-list query per hit (scrape / DB-amplification surface). A short
+        // 60-sec TTL caps that fan-out while a freshly-edited profile self-heals within a
+        // minute, so NO @CacheEvict wiring is needed. sync=true on the @Cacheable annotation
+        // collapses the thundering herd when a popular slug expires (Anti-Bug §F-7).
+        manager.registerCustomCache("booking-slug-info",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS)
+                        .build());
         return manager;
     }
 }

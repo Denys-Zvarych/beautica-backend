@@ -13,7 +13,8 @@ import org.springframework.context.annotation.Configuration;
         PasswordResetPolicyConfig.class,
         InternalApiKeyProperties.class,
         PublicBaseUrlProperties.class,
-        SupportProperties.class
+        SupportProperties.class,
+        TurbosmsProperties.class
 })
 public class AppConfigProperties {
 }

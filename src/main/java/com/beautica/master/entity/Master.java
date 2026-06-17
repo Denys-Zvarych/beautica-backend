@@ -87,4 +87,19 @@ public class Master extends AuditableEntity {
     @Nullable
     @Column(name = "min_effective_price", precision = 10, scale = 2)
     private BigDecimal minEffectivePrice;
+
+    /**
+     * Public booking-page slug — the unguessable-ish key behind
+     * {@code beautica.app/book/{slug}} (Phase 13.1). Globally unique across all
+     * masters (partial unique index {@code idx_masters_booking_slug}). Nullable:
+     * backfilled lazily by {@link com.beautica.booking.service.BookingSlugService}
+     * on first lookup or on master creation. ASCII, lowercase, &le; 60 chars.
+     */
+    // V86: partial unique index idx_masters_booking_slug (WHERE booking_slug IS NOT NULL)
+    // owns the constraint — legacy NULL rows must stay non-unique. unique=true here would
+    // generate a FULL unique constraint under ddl-auto, which is wrong (and drifts under
+    // ddl-auto=validate) — omit unique=true. JPA @Index cannot express partial WHERE.
+    @Nullable
+    @Column(name = "booking_slug", length = 60)
+    private String bookingSlug;
 }
