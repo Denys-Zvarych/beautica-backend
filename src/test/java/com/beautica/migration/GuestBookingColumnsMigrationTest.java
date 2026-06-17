@@ -16,6 +16,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * to {@code 'APP'}, and the polymorphic {@code chk_bookings_guest_fields} CHECK
  * rejects a half-populated LINK row.
  *
+ * <p>Also verifies the V91 relaxation: an <em>active</em> LINK row (PENDING/CONFIRMED)
+ * still requires a non-null {@code cancel_token}, but a LINK row in a terminal status
+ * (e.g. {@code CANCELLED}) may carry a NULL token — this is the guest-cancel path that
+ * nulls the token while setting status = CANCELLED.
+ *
  * <p>Schema assertions use {@code information_schema}; behaviour assertions seed a
  * minimal master + service graph and insert through {@code bookings} directly.
  */
@@ -95,6 +100,40 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
                 VALUES (?, ?, ?, 'CONFIRMED', NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 1 hour',
                     350.00, 60, 0, 'LINK', 'Олена', 'Коваль', '+380501234567', ?, NOW(), NOW())
                 """, bookingId, ids.masterId(), ids.masterServiceId(), UUID.randomUUID());
+
+        String source = jdbcTemplate.queryForObject(
+                "SELECT booking_source FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(source).isEqualTo("LINK");
+    }
+
+    @Test
+    @DisplayName("CHECK still rejects an ACTIVE LINK booking (CONFIRMED) with a NULL cancel_token")
+    void should_rejectActiveLinkBooking_when_cancelTokenNull() {
+        Ids ids = seedGraph();
+
+        assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO bookings (id, master_id, master_service_id, status, starts_at, ends_at,
+                    price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking,
+                    booking_source, guest_name, guest_surname, guest_phone, cancel_token, created_at, updated_at)
+                VALUES (?, ?, ?, 'CONFIRMED', NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 1 hour',
+                    350.00, 60, 0, 'LINK', 'Олена', 'Коваль', '+380501234567', NULL, NOW(), NOW())
+                """, UUID.randomUUID(), ids.masterId(), ids.masterServiceId()))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("V91: CHECK accepts a terminal LINK booking (CANCELLED) with a NULL cancel_token")
+    void should_acceptTerminalLinkBooking_when_cancelTokenNull() {
+        Ids ids = seedGraph();
+        UUID bookingId = UUID.randomUUID();
+
+        jdbcTemplate.update("""
+                INSERT INTO bookings (id, master_id, master_service_id, status, starts_at, ends_at,
+                    price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking,
+                    booking_source, guest_name, guest_surname, guest_phone, cancel_token, created_at, updated_at)
+                VALUES (?, ?, ?, 'CANCELLED', NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 1 hour',
+                    350.00, 60, 0, 'LINK', 'Олена', 'Коваль', '+380501234567', NULL, NOW(), NOW())
+                """, bookingId, ids.masterId(), ids.masterServiceId());
 
         String source = jdbcTemplate.queryForObject(
                 "SELECT booking_source FROM bookings WHERE id = ?", String.class, bookingId);

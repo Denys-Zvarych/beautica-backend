@@ -21,6 +21,13 @@ public class BookingSmsProperties {
      */
     private int availabilityMaxDays = 60;
 
+    /**
+     * Minimum lead time, in hours, before {@code startsAt} during which a guest may
+     * still cancel via the cancel link (Phase 13.4). A cancellation requested when
+     * {@code startsAt - now < this} is rejected with HTTP 422. Default 2.
+     */
+    private int cancelWindowHours = 2;
+
     private final Sms sms = new Sms();
 
     public int getAvailabilityMaxDays() {
@@ -29,6 +36,14 @@ public class BookingSmsProperties {
 
     public void setAvailabilityMaxDays(int availabilityMaxDays) {
         this.availabilityMaxDays = availabilityMaxDays;
+    }
+
+    public int getCancelWindowHours() {
+        return cancelWindowHours;
+    }
+
+    public void setCancelWindowHours(int cancelWindowHours) {
+        this.cancelWindowHours = cancelWindowHours;
     }
 
     public Sms getSms() {
@@ -65,12 +80,29 @@ public class BookingSmsProperties {
             this.confirmation = confirmation;
         }
 
+        /**
+         * Cancellation-confirmation template (Phase 13.4). Placeholders:
+         * {@code {serviceName}}, {@code {masterName}}, {@code {date}}, {@code {time}}.
+         */
+        private String cancellation =
+                "Beautica: Ваш запис скасовано.\n"
+                        + "{serviceName} у {masterName}\n"
+                        + "{date} о {time}";
+
         public String getReminder() {
             return reminder;
         }
 
         public void setReminder(String reminder) {
             this.reminder = reminder;
+        }
+
+        public String getCancellation() {
+            return cancellation;
+        }
+
+        public void setCancellation(String cancellation) {
+            this.cancellation = cancellation;
         }
     }
 }

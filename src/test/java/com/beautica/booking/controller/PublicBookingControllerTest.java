@@ -4,9 +4,11 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingSlugInfoResponse;
+import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.dto.ServiceSummaryDto;
+import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.BookingSlugService;
 import com.beautica.booking.service.GuestBookingService;
 import com.beautica.common.exception.BusinessException;
@@ -40,6 +42,7 @@ import java.util.UUID;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -71,6 +74,7 @@ class PublicBookingControllerTest {
                     .authorizeHttpRequests(auth -> auth
                             .requestMatchers(HttpMethod.GET, "/api/v1/book/**").permitAll()
                             .requestMatchers(HttpMethod.POST, "/api/v1/book/*/booking").permitAll()
+                            .requestMatchers(HttpMethod.POST, "/api/v1/book/cancel/*").permitAll()
                             .anyRequest().authenticated())
                     .exceptionHandling(ex -> ex
                             .authenticationEntryPoint((req, res, exc) ->
@@ -91,6 +95,9 @@ class PublicBookingControllerTest {
 
     @MockBean
     private GuestBookingService guestBookingService;
+
+    @MockBean
+    private BookingCancellationService bookingCancellationService;
 
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
@@ -237,5 +244,111 @@ class PublicBookingControllerTest {
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(guestBookingService);
+    }
+
+    // ── Phase 13.4: guest cancel by link ──────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /book/cancel/{token} — 200 with cancellable=true, NO auth required")
+    void should_return200WithCancellableTrue_when_tokenValid() throws Exception {
+        UUID token = UUID.randomUUID();
+        var info = new CancelTokenInfoResponse(
+                "Марія Левченко", "Манікюр",
+                OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), true,
+                OffsetDateTime.parse("2099-06-10T10:00:00+03:00"));
+        when(bookingCancellationService.getInfo(token)).thenReturn(info);
+
+        mockMvc.perform(get("/api/v1/book/cancel/" + token).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.masterName").value("Марія Левченко"))
+                .andExpect(jsonPath("$.serviceName").value("Манікюр"))
+                .andExpect(jsonPath("$.cancellable").value(true))
+                .andExpect(jsonPath("$.windowClosesAt").exists());
+    }
+
+    @Test
+    @DisplayName("GET /book/cancel/{token} — 200 with cancellable=false when inside the window")
+    void should_return200WithCancellableFalse_when_insideWindow() throws Exception {
+        UUID token = UUID.randomUUID();
+        var info = new CancelTokenInfoResponse(
+                "Ivan", "Стрижка",
+                OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), false,
+                OffsetDateTime.parse("2099-06-10T10:00:00+03:00"));
+        when(bookingCancellationService.getInfo(token)).thenReturn(info);
+
+        mockMvc.perform(get("/api/v1/book/cancel/" + token).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.cancellable").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /book/cancel/{token} — 404 when token unknown / consumed (no hint)")
+    void should_return404_when_cancelTokenUnknown() throws Exception {
+        UUID token = UUID.randomUUID();
+        when(bookingCancellationService.getInfo(token))
+                .thenThrow(new NotFoundException("Cancel token not found"));
+
+        mockMvc.perform(get("/api/v1/book/cancel/" + token).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /book/cancel/{token} — 400 when the token is not a UUID (Spring converter, no DB hit)")
+    void should_return400_when_cancelTokenMalformed() throws Exception {
+        mockMvc.perform(get("/api/v1/book/cancel/not-a-uuid").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(bookingCancellationService);
+    }
+
+    @Test
+    @DisplayName("POST /book/cancel/{token} — 204 No Content, NO auth required")
+    void should_return204_when_cancelSucceeds() throws Exception {
+        UUID token = UUID.randomUUID();
+        org.mockito.Mockito.doNothing().when(bookingCancellationService).cancel(token);
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token))
+                .andExpect(status().isNoContent());
+
+        verify(bookingCancellationService).cancel(token);
+    }
+
+    @Test
+    @DisplayName("POST /book/cancel/{token} — 422 when inside the cancellation window")
+    void should_return422_when_postInsideWindow() throws Exception {
+        UUID token = UUID.randomUUID();
+        org.mockito.Mockito.doThrow(new BusinessException(
+                        org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY,
+                        "Скасування недоступне — менше ніж 2 год до запису"))
+                .when(bookingCancellationService).cancel(token);
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token))
+                .andExpect(status().isUnprocessableEntity())
+                // End-to-end through the real GlobalExceptionHandler: the cancel-window 422 copy
+                // must reach the client verbatim (Ukrainian, with the window-hours interpolated) —
+                // not redacted like CONFLICT/BAD_REQUEST. Pins the cancel path specifically, not
+                // just the generic handler unit test.
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Скасування недоступне — менше ніж 2 год до запису"));
+    }
+
+    @Test
+    @DisplayName("POST /book/cancel/{token} — 404 when token already consumed (idempotent replay)")
+    void should_return404_when_postTokenConsumed() throws Exception {
+        UUID token = UUID.randomUUID();
+        org.mockito.Mockito.doThrow(new NotFoundException("Cancel token not found"))
+                .when(bookingCancellationService).cancel(token);
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("POST /book/cancel/{token} — 400 when the token is not a UUID (no DB hit, no hint)")
+    void should_return400_when_postCancelTokenMalformed() throws Exception {
+        mockMvc.perform(post("/api/v1/book/cancel/not-a-uuid"))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(bookingCancellationService);
     }
 }

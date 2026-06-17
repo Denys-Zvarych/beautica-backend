@@ -73,6 +73,12 @@ public class GlobalExceptionHandler {
         String clientMessage = switch (ex.getStatus()) {
             case CONFLICT -> "Request could not be completed due to a conflict";
             case BAD_REQUEST -> "Invalid request";
+            // 422 carries deliberate, user-facing domain copy (e.g. the Ukrainian
+            // cancel-window-closed message in Phase 13.4) that the client must display
+            // verbatim. These messages are non-sensitive product strings — no enum
+            // constants, SQL, IDs, or bound values — so echoing ex.getMessage() here is
+            // safe and intended, unlike the genericised CONFLICT/BAD_REQUEST branches.
+            case UNPROCESSABLE_ENTITY -> ex.getMessage();
             default -> "Request could not be completed";
         };
         return ResponseEntity

@@ -155,6 +155,15 @@ public class SecurityConfig {
                     // tightly to POST /api/v1/book/*/booking (single path segment for the slug,
                     // then literal /booking) so no other authenticated POST under /book is opened.
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/book/*/booking").permitAll();
+                    // Phase 13.4 — Guest Booking Cancellation by Link. The cancel link in
+                    // the confirmation SMS is opened by an unauthenticated guest holding no
+                    // JWT; the one-time cancel_token in the path is the credential. GET is
+                    // already covered by the /api/v1/book/** permitAll above; the cancel POST
+                    // must also be permitAll. Scoped tightly to POST /api/v1/book/cancel/*
+                    // (literal "cancel" segment, then exactly one token segment) — a different
+                    // path shape from POST /api/v1/book/*/booking (slug, then literal
+                    // "booking"), so the two matchers cannot shadow or collide with each other.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/cancel/*").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),

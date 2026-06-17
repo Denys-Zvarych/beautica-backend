@@ -2,8 +2,10 @@ package com.beautica.booking.controller;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingSlugInfoResponse;
+import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
+import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.BookingSlugService;
 import com.beautica.booking.service.GuestBookingService;
 import jakarta.validation.Valid;
@@ -49,6 +51,7 @@ public class PublicBookingController {
 
     private final BookingSlugService bookingSlugService;
     private final GuestBookingService guestBookingService;
+    private final BookingCancellationService bookingCancellationService;
 
     /**
      * Public booking-page info for {@code slug}. 404 when the slug is unknown.
@@ -96,5 +99,29 @@ public class PublicBookingController {
             @Valid @RequestBody GuestBookingRequest request) {
         GuestBookingResponse response = guestBookingService.createGuestBooking(authorization, slug, request);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    /**
+     * Cancel-page info for a one-time cancel token (Phase 13.4). 404 when the token is
+     * unknown, already consumed, or the booking is no longer {@code CONFIRMED} — no
+     * information is leaked about which condition held. {@code token} is a
+     * {@link UUID} {@code @PathVariable}: Spring's converter returns 400 on a malformed
+     * value before this method runs, so no manual format validation is needed.
+     */
+    @GetMapping("/cancel/{token}")
+    public ResponseEntity<CancelTokenInfoResponse> cancelInfo(@PathVariable UUID token) {
+        return ResponseEntity.ok(bookingCancellationService.getInfo(token));
+    }
+
+    /**
+     * Cancels a guest booking by its one-time token (Phase 13.4) → 204 No Content. A
+     * replayed POST (token already consumed) returns 404; a request inside the
+     * cancellation window returns 422. The service consumes the token atomically so
+     * concurrent POSTs trigger exactly one cancellation side-effect.
+     */
+    @PostMapping("/cancel/{token}")
+    public ResponseEntity<Void> cancel(@PathVariable UUID token) {
+        bookingCancellationService.cancel(token);
+        return ResponseEntity.noContent().build();
     }
 }

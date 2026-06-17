@@ -115,11 +115,14 @@ public class Booking extends AuditableEntity {
     @Column(name = "provider_comment", length = 1000)
     private String providerComment;
 
-    // ── Guest-booking columns (Phase 13.3 / V89) ──────────────────────────────
+    // ── Guest-booking columns (Phase 13.3 / V89; relaxed by V91) ──────────────
     // A LINK booking is created via beautica.app/book/{slug} by a phone-verified,
     // account-less client. The DB CHECK chk_bookings_guest_fields enforces that
-    // LINK ⇒ guestName/guestPhone/cancelToken non-null and APP ⇒ all null; the
-    // application mirror lives in Booking.guestBooking(...).
+    // LINK ⇒ guestName/guestPhone non-null and APP ⇒ all null; the application
+    // mirror lives in Booking.guestBooking(...). V91 relaxes the cancelToken clause
+    // so a LINK row may have a NULL cancelToken once status is terminal
+    // (CANCELLED/COMPLETED/NOT_COMPLETED/DECLINED) — the guest-cancel UPDATE nulls
+    // the token while setting status = CANCELLED.
 
     // Defaults to APP so the regular (registered-client) booking path and existing
     // fixtures need not set it explicitly — Hibernate always emits the column in the

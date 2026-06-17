@@ -354,4 +354,50 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     List<Booking> findGuestBookingsForReminder(
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to);
+
+    // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
+    /**
+     * Resolves a guest (LINK) booking by its one-time {@code cancel_token} for the
+     * public cancel page. The lookup hits the V90 partial-unique index
+     * {@code idx_bookings_cancel_token} (UNIQUE over non-NULL rows only).
+     *
+     * <p>The master + service graph is JOIN-FETCHed so the cancel-info page can render
+     * {@code masterName}/{@code serviceName} without a lazy load (Anti-Bug §E-2).
+     *
+     * <p>A consumed token is {@code NULL} (set by {@link #consumeCancelToken}), so a
+     * replayed link returns empty → 404 (no info leak about token state).
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.cancelToken = :cancelToken
+            """)
+    Optional<Booking> findByCancelTokenWithGraph(@Param("cancelToken") UUID cancelToken);
+
+    /**
+     * Atomically consumes a cancel token: flips a still-{@code CONFIRMED} guest booking
+     * to {@code CANCELLED} and nulls the token, in a single conditional UPDATE.
+     *
+     * <p><b>One-time / race-safe.</b> The {@code WHERE cancel_token = :token AND status =
+     * CONFIRMED} predicate guarantees that of N concurrent {@code POST /cancel/{token}}
+     * requests, exactly ONE UPDATE affects 1 row; every other affects 0. Only the winner
+     * fires the cancellation SMS + master notification, so the side-effects run exactly
+     * once. A replayed POST (token already NULL) updates 0 rows → the service maps it to
+     * 404. This mirrors the atomic check-and-set used by the Phase 13.2 OTP recorder and
+     * avoids the check-then-act double-cancel race a load→mutate→save flow would leave open.
+     *
+     * @return the number of rows updated — {@code 1} for the winner, {@code 0} otherwise
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
+                   b.cancelToken = null
+             WHERE b.cancelToken = :cancelToken
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    int consumeCancelToken(@Param("cancelToken") UUID cancelToken);
 }

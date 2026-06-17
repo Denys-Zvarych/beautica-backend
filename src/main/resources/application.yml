@@ -140,6 +140,10 @@ app:
     # Phase 13.3 — guest booking. How many days ahead the public availability
     # endpoint (GET /book/{slug}/availability) will serve slots.
     availability-max-days: ${BOOKING_AVAILABILITY_MAX_DAYS:60}
+    # Phase 13.4 — guest cancel by link. Minimum lead time (hours) before the
+    # appointment during which a guest may still cancel via the cancel link.
+    # A cancel request inside this window returns 422.
+    cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
     sms:
       # Ukrainian SMS copy with {placeholder} tokens substituted at send time
       # (GuestBookingService / BookingReminderJob). Multiline via YAML block scalar.
@@ -154,6 +158,10 @@ app:
         Beautica: Нагадуємо!
         {serviceName} у {masterName}
         Завтра о {time}
+      cancellation: |-
+        Beautica: Ваш запис скасовано.
+        {serviceName} у {masterName}
+        {date} о {time}
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

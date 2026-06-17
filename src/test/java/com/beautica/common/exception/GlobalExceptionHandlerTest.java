@@ -291,6 +291,28 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("Should return 422 and SURFACE the user-facing message when UNPROCESSABLE_ENTITY BusinessException")
+    void should_return422_with_message_when_unprocessableEntityBusinessException() {
+        // Arrange — 422 carries deliberate, user-facing domain copy (Phase 13.4 cancel
+        // window). Unlike CONFLICT/BAD_REQUEST, this message must reach the client verbatim.
+        var ex = new BusinessException(
+                HttpStatus.UNPROCESSABLE_ENTITY,
+                "Скасування недоступне — менше ніж 2 год до запису");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleBusiness(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 422")
+                .isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        assertThat(response.getBody().message())
+                .as("422 user-facing copy must be surfaced verbatim")
+                .isEqualTo("Скасування недоступне — менше ніж 2 год до запису");
+    }
+
+    @Test
     @DisplayName("handleBusiness — internal message is emitted at DEBUG level for server-side triage")
     void should_emitDebugLog_when_businessExceptionThrown() {
         // Arrange
