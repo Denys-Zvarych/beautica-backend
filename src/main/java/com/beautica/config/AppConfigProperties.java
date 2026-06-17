@@ -12,7 +12,8 @@ import org.springframework.context.annotation.Configuration;
         VerificationPolicyConfig.class,
         PasswordResetPolicyConfig.class,
         InternalApiKeyProperties.class,
-        PublicBaseUrlProperties.class
+        PublicBaseUrlProperties.class,
+        SupportProperties.class
 })
 public class AppConfigProperties {
 }

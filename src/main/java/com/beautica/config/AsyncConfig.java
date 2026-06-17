@@ -51,6 +51,40 @@ public class AsyncConfig implements AsyncConfigurer {
         return new DelegatingSecurityContextTaskExecutor(executor);
     }
 
+    // Dedicated SMTP pool for Help/Contact-us support emails — isolated from emailExecutor
+    // so a burst of ~5MB attachment sends cannot starve transactional auth/invite/password-reset
+    // mail. Smaller pool (core 1, max 2, queue 20) because support traffic is low-volume and
+    // already per-IP rate-limited (5/hr). Same SecurityContext + classloader propagation rationale
+    // as emailExecutor (jakarta.mail StreamProvider ServiceLoader resolution).
+    @Bean(name = "supportEmailExecutor")
+    public TaskExecutor supportEmailExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(2);
+        executor.setQueueCapacity(20);
+        executor.setThreadNamePrefix("support-email-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(20);
+        // Propagate the webapp classloader into support-email-* threads so that
+        // ServiceLoader (jakarta.mail.util.StreamProvider) resolves META-INF/services/
+        // entries from the application classpath rather than the system classloader.
+        executor.setTaskDecorator(runnable -> {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            return () -> {
+                ClassLoader prev = Thread.currentThread().getContextClassLoader();
+                Thread.currentThread().setContextClassLoader(cl);
+                try {
+                    runnable.run();
+                } finally {
+                    Thread.currentThread().setContextClassLoader(prev);
+                }
+            };
+        });
+        executor.initialize();
+        return new DelegatingSecurityContextTaskExecutor(executor);
+    }
+
     // FCM/APNs push — dedicated pool to prevent SMTP starvation under push burst.
     // Same SecurityContext propagation rationale as emailExecutor.
     @Bean(name = "pushExecutor")

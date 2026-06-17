@@ -48,6 +48,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> categoryRequestBuckets;
     @Mock private LoadingCache<String, Bucket> suggestServiceTypeBuckets;
     @Mock private LoadingCache<String, Bucket> bulkServiceSetupBuckets;
+    @Mock private LoadingCache<String, Bucket> supportContactBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -59,7 +60,8 @@ class AuthRateLimitFilterTest {
                 registerBuckets, loginBuckets, refreshBuckets, verifyEmailBuckets,
                 slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, profileUpdateBuckets,
                 resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets,
-                categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets);
+                categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets,
+                supportContactBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -1583,6 +1585,109 @@ class AuthRateLimitFilterTest {
                     .as("chain must be forwarded — GET on the suggest path is not rate-limited")
                     .isNotNull();
             verifyNoInteractions(suggestServiceTypeBuckets);
+        }
+    }
+
+    // ==========================================================================
+    // POST /api/v1/support/contact emails the support inbox on every successful
+    // request, so it is an email-bomb / outbound-quota surface throttled at 5/hr
+    // (mirrors the category-request limiter). Window is 60 minutes → Retry-After 3600.
+    @Nested
+    @DisplayName("POST /api/v1/support/contact — 5/hr email-bomb guard")
+    class SupportContactEndpoint {
+
+        @Test
+        @DisplayName("routes to supportContactBuckets and passes through when within limit")
+        void should_routeToSupportContactBuckets_when_withinLimit() throws Exception {
+            log.debug("Arrange: supportContactBuckets returns a bucket that allows consumption");
+            when(supportContactBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/support/contact");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /support/contact within limit");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when support-contact bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest())
+                    .as("filter chain must be forwarded when the bucket allows the request")
+                    .isNotNull();
+            verify(supportContactBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(categoryRequestBuckets);
+            verifyNoInteractions(suggestServiceTypeBuckets);
+            verifyNoInteractions(loginBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 with 3600s Retry-After when supportContact called over the limit")
+        void should_return429_when_supportContactCalledOverLimit() throws Exception {
+            // 5/hr cap: first five pass, the sixth is throttled. Retry-After mirrors the
+            // 60-minute support-contact window (3600 s).
+            log.debug("Arrange: supportContactBuckets allows 5 then denies the 6th");
+            when(supportContactBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1))
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(true)
+                    .thenReturn(false);
+
+            MockHttpServletResponse lastResponse = null;
+            MockFilterChain         lastChain    = null;
+
+            log.debug("Act: send 6 POSTs to /support/contact from the same IP");
+            for (int i = 0; i < 6; i++) {
+                var request = postRequest("/api/v1/support/contact");
+                lastResponse = new MockHttpServletResponse();
+                lastChain    = new MockFilterChain();
+                doFilter(request, lastResponse, lastChain);
+
+                if (i < 5) {
+                    assertThat(lastResponse.getStatus())
+                            .as("request %d must not be 429 — bucket not yet exhausted", i + 1)
+                            .isNotEqualTo(429);
+                }
+            }
+
+            assertThat(lastResponse.getStatus())
+                    .as("6th request must be 429 — support-contact bucket exhausted (5/hr)")
+                    .isEqualTo(429);
+            assertThat(lastResponse.getHeader("Retry-After"))
+                    .as("Retry-After must reflect the 60-minute support-contact window")
+                    .isEqualTo("3600");
+            assertThat(lastResponse.getContentType())
+                    .as("Content-Type must be application/json on 429 support-contact response")
+                    .startsWith("application/json");
+            assertThat(lastResponse.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(lastChain.getRequest())
+                    .as("filter chain must not be forwarded on the throttled request")
+                    .isNull();
+            verify(supportContactBuckets, times(6)).get(REMOTE_ADDR);
+            verifyNoInteractions(categoryRequestBuckets);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(registerBuckets);
+        }
+
+        @Test
+        @DisplayName("GET /api/v1/support/contact is not rate-limited (POST-only)")
+        void should_passThrough_when_getSupportContact() throws Exception {
+            log.debug("Arrange: GET on the support-contact path — non-POST bypasses the limiter");
+            var request  = getRequest("/api/v1/support/contact");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for GET /support/contact");
+            doFilter(request, response, chain);
+
+            assertThat(chain.getRequest())
+                    .as("chain must be forwarded — GET on the support-contact path is not rate-limited")
+                    .isNotNull();
+            verifyNoInteractions(supportContactBuckets);
         }
     }
 }

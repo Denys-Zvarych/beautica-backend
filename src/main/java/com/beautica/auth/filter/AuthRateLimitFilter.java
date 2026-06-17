@@ -44,11 +44,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String BULK_IM_SERVICES_PATH = "/api/v1/independent-masters/me/services/bulk";
     private static final String BULK_SALON_SERVICES_PREFIX = "/api/v1/salons/";
     private static final String BULK_SALON_SERVICES_SUFFIX = "/services/bulk";
+    private static final String SUPPORT_CONTACT_PATH = "/api/v1/support/contact";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
     // suggest-service-type bucket window is 60 minutes — Retry-After reflects the window.
     private static final int SUGGEST_SERVICE_TYPE_RETRY_AFTER_SECONDS = 3600;
+    // support-contact bucket window is 60 minutes — Retry-After reflects the window.
+    private static final int SUPPORT_CONTACT_RETRY_AFTER_SECONDS = 3600;
     // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
     // so clients do not spin-retry every 60 s and waste their remaining IP quota.
     private static final int VERIFY_EMAIL_RETRY_AFTER_SECONDS = 900;
@@ -87,6 +90,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // first-time-only path runs full 100-item validation, so an authenticated token-holder
     // is a DoS amplifier without this guard (10/min).
     private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
+    // Per-IP bucket for POST /api/v1/support/contact — every successful request emails
+    // the support inbox, so this is an email-bomb / outbound-quota surface (5/hr).
+    private final LoadingCache<String, Bucket> supportContactBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -102,7 +108,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
             @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
             @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
-            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets) {
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -117,6 +124,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.categoryRequestBuckets = categoryRequestBuckets;
         this.suggestServiceTypeBuckets = suggestServiceTypeBuckets;
         this.bulkServiceSetupBuckets = bulkServiceSetupBuckets;
+        this.supportContactBuckets = supportContactBuckets;
     }
 
     @Override
@@ -214,6 +222,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (SUGGEST_SERVICE_TYPE_PATH.equals(path)) {
             cache = suggestServiceTypeBuckets;
             retryAfterSeconds = SUGGEST_SERVICE_TYPE_RETRY_AFTER_SECONDS;
+        } else if (SUPPORT_CONTACT_PATH.equals(path)) {
+            cache = supportContactBuckets;
+            retryAfterSeconds = SUPPORT_CONTACT_RETRY_AFTER_SECONDS;
         } else {
             filterChain.doFilter(request, response);
             return;

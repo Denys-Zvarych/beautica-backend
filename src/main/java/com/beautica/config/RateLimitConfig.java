@@ -108,6 +108,18 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.bulk-service-setup-capacity:10}")
     private long bulkServiceSetupCapacity;
 
+    // Per-IP cap for POST /api/v1/support/contact (60-minute window).
+    // Each successful call sends an email to the support inbox, so this is an
+    // email-bomb / outbound-quota DoS surface — kept low (5/hr) to mirror the
+    // category-request and suggest-service-type inbox-flood posture. IP-keyed for
+    // consistency with every other bucket in this filter (JWT is not yet parsed when
+    // AuthRateLimitFilter runs). Configurable so integration tests on 127.0.0.1 can
+    // raise the cap.
+    @Value("${app.rate-limit.support-contact-capacity:5}")
+    private long supportContactCapacity;
+
+    private static final Duration SUPPORT_CONTACT_WINDOW = Duration.ofMinutes(60);
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
         return Caffeine.newBuilder()
@@ -322,6 +334,26 @@ public class RateLimitConfig {
                 .expireAfterAccess(Duration.ofHours(1))
                 .build(key -> Bucket.builder()
                         .addLimit(bandwidthOf(bulkServiceSetupCapacity, Duration.ofMinutes(1)))
+                        .build());
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/support/contact}.
+     *
+     * <p>Cap: 5 requests per 60-minute window per source IP. Every successful request
+     * sends an email to the fixed support inbox, so this is an email-bomb / outbound-quota
+     * surface; the low cap mirrors the {@link #categoryRequestBuckets()} and
+     * {@link #suggestServiceTypeBuckets()} posture. {@code expireAfterAccess(65 min)} gives
+     * a 5-minute grace past the window so the entry is not evicted the instant the window
+     * rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> supportContactBuckets() {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SUPPORT_CONTACT_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(bandwidthOf(supportContactCapacity, SUPPORT_CONTACT_WINDOW))
                         .build());
     }
 

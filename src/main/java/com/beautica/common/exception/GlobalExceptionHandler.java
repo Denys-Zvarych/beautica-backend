@@ -23,6 +23,7 @@ import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
@@ -304,6 +305,21 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.NOT_FOUND)
                 .body(ApiResponse.error("Resource not found"));
+    }
+
+    /**
+     * Thrown by the multipart resolver when an uploaded request body exceeds the
+     * configured {@code spring.servlet.multipart.max-*-size} (5 MB). Without this
+     * mapping the generic {@code Exception} fallback turns an oversized upload into
+     * a 500. The correct status is 413 Payload Too Large. The static message does
+     * not echo the configured limit (no internal-config disclosure, §I).
+     */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMaxUploadSize(MaxUploadSizeExceededException ex) {
+        log.debug("Upload rejected — request body exceeds the multipart size limit");
+        return ResponseEntity
+                .status(HttpStatus.PAYLOAD_TOO_LARGE)
+                .body(ApiResponse.error("Upload exceeds the maximum allowed size"));
     }
 
     @ExceptionHandler(Exception.class)
