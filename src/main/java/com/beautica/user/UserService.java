@@ -59,9 +59,25 @@ public class UserService {
 
         applyLocality(user, request);
 
+        // Phase 19.6: optional Instagram handle. A null value leaves the stored handle
+        // unchanged; a blank value clears it (symmetric to the master contacts-edit path
+        // in updateMasterProfile). normalizeInstagram strips a leading @ and trims so the
+        // stored form is canonical and satisfies the V61 chk_users_instagram CHECK.
+        if (request.instagram() != null) {
+            user.setInstagram(normalizeInstagram(request.instagram()));
+        }
+
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
-        // Locality changes (cityId, districtId) are search filter keys — always clear search cache.
-        evictUserCachesAfterCommit(userId, user.getRole(), true);
+        // Mirror updateMasterProfile's narrow searchAffected gate: the search:masters projection
+        // is fed by the master's DISPLAY NAME (firstName/lastName) and LOCALITY filter keys
+        // (cityId/districtId). instagram/phoneNumber/street/buildingNo/locationNote never appear
+        // in search results, so editing only those must not blanket-clear every cached search page.
+        // null = not changed under the PATCH semantics used throughout this method.
+        boolean searchAffected = request.firstName() != null
+                || request.lastName() != null
+                || request.cityId() != null
+                || request.districtId() != null;
+        evictUserCachesAfterCommit(userId, user.getRole(), searchAffected);
 
         return UserProfileResponse.from(user);
     }
@@ -269,5 +285,25 @@ public class UserService {
         }
         user.setCity(city.getNameUk());
         user.setRegion(oblast.getNameUk());
+    }
+
+    /**
+     * Normalises a raw Instagram value before persistence: trims surrounding
+     * whitespace and strips a single leading {@code @} so the stored form is the
+     * bare handle (or full URL). A blank or {@code @}-only value normalises to
+     * {@code null}, which both clears the field and satisfies the V61
+     * {@code chk_users_instagram} CHECK (NULL or a valid handle/URL). The DTO
+     * {@code @Pattern} has already constrained the shape at the boundary; this
+     * method only canonicalises an already-valid value.
+     *
+     * @param raw the validated request value (never {@code null} — callers guard)
+     * @return the canonical handle/URL, or {@code null} when the value is blank
+     */
+    private String normalizeInstagram(String raw) {
+        String trimmed = raw.strip();
+        if (trimmed.startsWith("@")) {
+            trimmed = trimmed.substring(1).strip();
+        }
+        return trimmed.isBlank() ? null : trimmed;
     }
 }

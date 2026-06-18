@@ -68,7 +68,8 @@ public class IndependentMasterController {
                         request.districtId(),
                         request.street(),
                         request.buildingNo(),
-                        request.locationNote()
+                        request.locationNote(),
+                        null                // instagram — not updated here (locality-only path)
                 )
         );
         return ResponseEntity.ok(ApiResponse.ok(updated));

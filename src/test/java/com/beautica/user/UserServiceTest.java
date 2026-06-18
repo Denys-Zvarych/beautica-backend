@@ -98,7 +98,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest("Robert", "New", null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -117,7 +117,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -137,7 +137,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, "+380991234567",
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -163,7 +163,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, "Lesi Ukrainky", "7", "Blue door");
+                cityId, districtId, "Lesi Ukrainky", "7", "Blue door", null);
 
         userService.updateProfile(userId, request);
 
@@ -195,7 +195,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, "Shevchenka", "12A", "ring twice");
+                cityId, districtId, "Shevchenka", "12A", "ring twice", null);
 
         userService.updateProfile(userId, request);
 
@@ -225,7 +225,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, "вул. Дерибасівська", "5", "yellow building");
+                cityId, null, "вул. Дерибасівська", "5", "yellow building", null);
 
         userService.updateProfile(userId, request);
 
@@ -250,7 +250,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -276,7 +276,7 @@ class UserServiceTest {
 
         // PATCH sends only cityId — street, buildingNo, locationNote all null.
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -296,7 +296,7 @@ class UserServiceTest {
 
         // PATCH sends cityId and street but omits buildingNo — null-guard must retain the pre-existing value.
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, "Lesi Ukrainky", null, null);
+                cityId, null, "Lesi Ukrainky", null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -312,7 +312,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Sal", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
 
         userService.updateProfile(userId, request);
 
@@ -330,7 +330,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("No", "Loc", null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -353,7 +353,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -376,7 +376,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -397,7 +397,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Own", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
 
         userService.updateProfile(userId, request);
 
@@ -418,7 +418,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Adm", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
 
         userService.updateProfile(userId, request);
 
@@ -630,6 +630,130 @@ class UserServiceTest {
         assertThat(user.getPhoneNumber()).isEqualTo("+380670000000");
     }
 
+    // ── updateProfile — Phase 19.6 instagram normalisation ────────────────────
+    // The service mutates the real User entity in place (no save() — Hibernate
+    // dirty-checking flushes on commit), so user.getInstagram() reflects the exact
+    // value handed to User#setInstagram. That is a stronger assertion than an
+    // ArgumentCaptor on a mocked setter: it pins the normalised form actually stored.
+
+    @Test
+    @DisplayName("updateProfile persists a valid instagram handle verbatim when no leading at-sign")
+    void should_persistInstagramHandle_when_validHandleWithoutAtSign() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig1@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "beauty_studio");
+
+        UserProfileResponse response = userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a bare handle is stored verbatim (already canonical)")
+                .isEqualTo("beauty_studio");
+        assertThat(response.instagram())
+                .as("the response echoes the persisted handle")
+                .isEqualTo("beauty_studio");
+    }
+
+    @Test
+    @DisplayName("updateProfile normalises an at-prefixed instagram handle by stripping the leading at-sign and trimming")
+    void should_normaliseInstagram_when_handleHasLeadingAtSignAndSpaces() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig2@example.com", Role.INDEPENDENT_MASTER, "Iga", "Han", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // Surrounding spaces + a single leading @ — normalizeInstagram strips both.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "  @beauty.master  ");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("leading @ stripped and surrounding whitespace trimmed → canonical handle")
+                .isEqualTo("beauty.master");
+    }
+
+    @Test
+    @DisplayName("updateProfile leaves an existing instagram unchanged when instagram is null in the patch")
+    void should_notOverwriteInstagram_when_instagramIsNullInPatch() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig3@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+        user.setInstagram("kept_handle");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a null instagram in the patch must leave the stored handle untouched")
+                .isEqualTo("kept_handle");
+    }
+
+    @Test
+    @DisplayName("updateProfile clears instagram to null when the patch supplies a blank value")
+    void should_clearInstagram_when_blankValueSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig4@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+        user.setInstagram("old_handle");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // Blank (whitespace-only) is the mobile client's CLEAR signal — normalises to null.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "   ");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a blank instagram normalises to null and clears the stored column")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile clears instagram to null when the patch supplies an at-sign-only value")
+    void should_clearInstagram_when_atSignOnlyValueSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig5@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+        user.setInstagram("old_handle");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // "@" alone → strip the @ → blank → null. This is the boundary between
+        // "clear" and a one-char handle, and the V61 CHECK never sees an empty string.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "@");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("an @-only instagram normalises to null (strip @ → blank → null)")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile persists a full instagram.com URL verbatim (URL arm of the pattern)")
+    void should_persistInstagramUrl_when_fullUrlSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig6@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "https://www.instagram.com/beauty.studio/");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a full instagram.com URL has no leading @ — stored verbatim")
+                .isEqualTo("https://www.instagram.com/beauty.studio/");
+    }
+
     // ── updateProfile — propagate from validator ──────────────────────────────
 
     @Test
@@ -641,7 +765,7 @@ class UserServiceTest {
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
         doThrow(new BusinessException("District is required for the selected city"))
                 .when(localityWriteValidator).validateProviderLocality(new LocalityWriteInput(cityId, null));
 
