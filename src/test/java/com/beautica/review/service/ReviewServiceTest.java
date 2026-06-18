@@ -7,7 +7,9 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
+import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
@@ -31,6 +33,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -409,6 +412,109 @@ class ReviewServiceTest {
 
         assertThatThrownBy(() -> reviewService.getReview(REVIEW_ID))
                 .isInstanceOf(NotFoundException.class);
+    }
+
+    // ── getMyReviews (Phase 19.4 — GET /reviews/me) ───────────────────────────
+
+    @Test
+    @DisplayName("getMyReviews — queries the repository keyed on the passed principal client id, not a parameter")
+    void should_scopeQueryToPrincipalClientId_when_gettingMyReviews() {
+        UUID principalClientId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        ArgumentCaptor<UUID> clientIdCaptor = ArgumentCaptor.forClass(UUID.class);
+
+        MyReviewResponse row = new MyReviewResponse(
+                REVIEW_ID, MASTER_ID, "Anna", "Smith", "Manicure",
+                5, "Great service", Instant.parse("2026-06-01T10:00:00Z"), BOOKING_ID);
+        Page<MyReviewResponse> repoPage = new PageImpl<>(List.of(row), pageable, 1);
+        when(reviewRepository.findMyReviews(eq(principalClientId), any(Pageable.class)))
+                .thenReturn(repoPage);
+
+        PageResponse<MyReviewResponse> result = reviewService.getMyReviews(principalClientId, pageable);
+
+        verify(reviewRepository).findMyReviews(clientIdCaptor.capture(), any(Pageable.class));
+        assertThat(clientIdCaptor.getValue())
+                .as("repository must be queried with the exact principal client id supplied by the controller")
+                .isEqualTo(principalClientId);
+        assertThat(result.data())
+                .as("a single-row repository page must map to one MyReviewResponse")
+                .hasSize(1);
+        assertThat(result.totalElements()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("getMyReviews — maps every projection field through to the PageResponse row")
+    void should_mapAllProjectionFields_when_gettingMyReviews() {
+        UUID clientId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        Instant createdAt = Instant.parse("2026-05-20T08:30:00Z");
+
+        MyReviewResponse row = new MyReviewResponse(
+                REVIEW_ID, MASTER_ID, "Anna", "Smith", "Manicure",
+                4, "Loved it", createdAt, BOOKING_ID);
+        when(reviewRepository.findMyReviews(eq(clientId), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(row), pageable, 1));
+
+        PageResponse<MyReviewResponse> result = reviewService.getMyReviews(clientId, pageable);
+
+        MyReviewResponse mapped = result.data().get(0);
+        assertThat(mapped)
+                .extracting(
+                        MyReviewResponse::id, MyReviewResponse::masterId,
+                        MyReviewResponse::masterFirstName, MyReviewResponse::masterLastName,
+                        MyReviewResponse::serviceName, MyReviewResponse::rating,
+                        MyReviewResponse::comment, MyReviewResponse::createdAt,
+                        MyReviewResponse::bookingId)
+                .containsExactly(
+                        REVIEW_ID, MASTER_ID, "Anna", "Smith", "Manicure",
+                        4, "Loved it", createdAt, BOOKING_ID);
+    }
+
+    @Test
+    @DisplayName("getMyReviews — returns an empty PageResponse when the client has authored no reviews")
+    void should_returnEmptyPageResponse_when_clientHasNoReviews() {
+        UUID clientId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        when(reviewRepository.findMyReviews(eq(clientId), any(Pageable.class)))
+                .thenReturn(Page.empty(pageable));
+
+        PageResponse<MyReviewResponse> result = reviewService.getMyReviews(clientId, pageable);
+
+        assertThat(result.data())
+                .as("an empty repository page must yield an empty data list")
+                .isEmpty();
+        assertThat(result.totalElements()).isZero();
+    }
+
+    @Test
+    @DisplayName("getMyReviews — strips caller-supplied sort so the repository receives Sort.unsorted()")
+    void should_stripCallerSort_when_gettingMyReviews() {
+        UUID clientId = UUID.randomUUID();
+        Pageable callerPageable = PageRequest.of(0, 20, Sort.by("comment"));
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        when(reviewRepository.findMyReviews(eq(clientId), any(Pageable.class)))
+                .thenReturn(Page.empty(PageRequest.of(0, 20)));
+
+        reviewService.getMyReviews(clientId, callerPageable);
+
+        verify(reviewRepository).findMyReviews(eq(clientId), pageableCaptor.capture());
+        assertThat(pageableCaptor.getValue().getSort())
+                .as("repository must receive Sort.unsorted() — JPQL hardcodes ORDER BY createdAt DESC")
+                .isEqualTo(Sort.unsorted());
+    }
+
+    @Test
+    @DisplayName("getMyReviews — throws 400 when the page number exceeds the MAX_PAGE_NUMBER guard")
+    void should_throw400_when_myReviewsPageNumberExceedsMaximum() {
+        UUID clientId = UUID.randomUUID();
+        Pageable overLimit = PageRequest.of(10_001, 20);
+
+        assertThatThrownBy(() -> reviewService.getMyReviews(clientId, overLimit))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(reviewRepository, never()).findMyReviews(any(), any());
     }
 
     // ── getReviewsForMaster — timing oracle (FIX 5) ──────────────────────────

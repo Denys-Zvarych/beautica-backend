@@ -4,6 +4,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.service.ReviewService;
 import jakarta.validation.Valid;
@@ -54,6 +55,17 @@ public class ReviewController {
                 page.getTotalElements(),
                 page.getTotalPages()
         ));
+    }
+
+    // Declared before /reviews/{reviewId}; Spring's PathPattern matching also favours the literal
+    // "me" segment over the {reviewId} variable, so the routes are unambiguous in either order.
+    // clientUserId comes only from the authenticated principal — never a query/path parameter.
+    @PreAuthorize("hasRole('CLIENT')")
+    @GetMapping("/reviews/me")
+    public ApiResponse<PageResponse<MyReviewResponse>> getMyReviews(
+            Authentication auth,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ApiResponse.ok(reviewService.getMyReviews(principalId(auth), pageable));
     }
 
     @GetMapping("/reviews/{reviewId}")

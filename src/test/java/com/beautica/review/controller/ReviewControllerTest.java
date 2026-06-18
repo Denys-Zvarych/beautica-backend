@@ -7,7 +7,9 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
+import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.service.ReviewService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -41,14 +43,20 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
+import org.mockito.ArgumentCaptor;
+
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -390,6 +398,110 @@ class ReviewControllerTest {
                         .param("page", "2147483647")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest());
+    }
+
+    // ── GET /reviews/me (Phase 19.4) ──────────────────────────────────────────
+
+    private MyReviewResponse stubMyReviewResponse() {
+        return new MyReviewResponse(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                "Anna",
+                "Smith",
+                "Manicure",
+                5,
+                "Great service",
+                Instant.parse("2026-06-01T10:00:00Z"),
+                UUID.randomUUID());
+    }
+
+    private PageResponse<MyReviewResponse> stubMyReviewsPage(MyReviewResponse row) {
+        return PageResponse.of(List.of(row), 0, 20, 1, 1);
+    }
+
+    @Test
+    @DisplayName("GET /reviews/me — 200 with the principal's reviews when caller is a CLIENT")
+    void should_return200_when_clientGetsOwnReviews() throws Exception {
+        var clientId = UUID.randomUUID();
+        var row = stubMyReviewResponse();
+        when(reviewService.getMyReviews(eq(clientId), any())).thenReturn(stubMyReviewsPage(row));
+
+        mockMvc.perform(get(REVIEWS_URL + "/me")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.data").isArray())
+                .andExpect(jsonPath("$.data.totalElements").value(1))
+                .andExpect(jsonPath("$.data.data[0].masterFirstName").value("Anna"))
+                .andExpect(jsonPath("$.data.data[0].serviceName").value("Manicure"))
+                .andExpect(jsonPath("$.data.data[0].rating").value(5));
+    }
+
+    @Test
+    @DisplayName("GET /reviews/me — passes the principal id (not a parameter) to the service")
+    void should_passPrincipalIdToService_when_gettingOwnReviews() throws Exception {
+        var principalId = UUID.randomUUID();
+        // A query param that an attacker might use to impersonate another client must be ignored:
+        // the controller derives clientUserId solely from the authenticated principal.
+        var attackerSuppliedId = UUID.randomUUID();
+        ArgumentCaptor<UUID> idCaptor = ArgumentCaptor.forClass(UUID.class);
+        when(reviewService.getMyReviews(any(), any()))
+                .thenReturn(stubMyReviewsPage(stubMyReviewResponse()));
+
+        mockMvc.perform(get(REVIEWS_URL + "/me")
+                        .param("clientId", attackerSuppliedId.toString())
+                        .with(authenticatedAs(principalId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verify(reviewService).getMyReviews(idCaptor.capture(), any());
+        assertThat(idCaptor.getValue())
+                .as("service must receive the principal id, never the attacker-supplied clientId query param")
+                .isEqualTo(principalId)
+                .isNotEqualTo(attackerSuppliedId);
+    }
+
+    @Test
+    @DisplayName("GET /reviews/me — 401 when no authentication is present")
+    void should_return401_when_noAuthOnGetMyReviews() throws Exception {
+        mockMvc.perform(get(REVIEWS_URL + "/me")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+
+        // The authorization gate fires before the service is reached.
+        verifyNoInteractions(reviewService);
+    }
+
+    @ParameterizedTest(name = "{0} → 403")
+    @EnumSource(value = Role.class, names = "CLIENT", mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("GET /reviews/me — 403 when an authenticated non-CLIENT role attempts to read own reviews")
+    void should_return403_when_nonClientGetsMyReviews(Role role) throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(get(REVIEWS_URL + "/me")
+                        .with(authenticatedAs(userId, role.name().toLowerCase() + "@beautica.test", role))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(reviewService);
+    }
+
+    @Test
+    @DisplayName("GET /reviews/me — routes to getMyReviews, NOT getReview({reviewId}) (literal 'me' wins over the path variable)")
+    void should_routeToGetMyReviews_when_pathIsMe() throws Exception {
+        var clientId = UUID.randomUUID();
+        when(reviewService.getMyReviews(any(), any()))
+                .thenReturn(stubMyReviewsPage(stubMyReviewResponse()));
+
+        mockMvc.perform(get(REVIEWS_URL + "/me")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        // "me" must not be interpreted as a {reviewId} path variable.
+        verify(reviewService).getMyReviews(eq(clientId), any());
+        verifyNoMoreInteractions(reviewService);
     }
 
     // ── GET /reviews/{reviewId} ───────────────────────────────────────────────

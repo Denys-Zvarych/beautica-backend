@@ -1,5 +1,6 @@
 package com.beautica.review.repository;
 
+import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.entity.Review;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -54,6 +55,45 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     @EntityGraph(attributePaths = {"booking", "client", "master"})
     @Query("SELECT r FROM Review r WHERE r.id IN :ids")
     List<Review> findByIdsWithGraph(@Param("ids") List<UUID> ids);
+
+    /**
+     * Principal-scoped list of the reviews authored by one client, backing
+     * {@code GET /reviews/me} (Phase 19.4). Single constructor-expression query: joins
+     * {@code review.master.user} (master name) and {@code review.booking.masterService
+     * .serviceDefinition} (service name) so the whole {@link MyReviewResponse} row is built in
+     * ONE SQL statement — no N+1, no lazy traversal at mapping time.
+     *
+     * <p>Filters strictly on {@code r.client.id = :clientId}: the caller-supplied id always
+     * originates from the authenticated principal, never a request parameter (principal scoping).
+     * {@code ORDER BY r.createdAt DESC} is hardcoded; the service strips any caller-supplied
+     * sort to avoid a {@code PropertyReferenceException} leaking entity property names.
+     */
+    @Query(value = """
+            SELECT new com.beautica.review.dto.MyReviewResponse(
+                r.id,
+                m.id,
+                mu.firstName,
+                mu.lastName,
+                sd.name,
+                CAST(r.rating AS integer),
+                r.comment,
+                r.createdAt,
+                b.id
+            )
+            FROM Review r
+            JOIN r.master m
+            JOIN m.user mu
+            JOIN r.booking b
+            JOIN b.masterService ms
+            JOIN ms.serviceDefinition sd
+            WHERE r.client.id = :clientId
+            ORDER BY r.createdAt DESC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.client.id = :clientId
+            """)
+    Page<MyReviewResponse> findMyReviews(@Param("clientId") UUID clientId, Pageable pageable);
 
     // Named to distinguish from the inherited JpaRepository.findById (which is lazy).
     // Use this method whenever ReviewResponse.from() will be called on the result.
