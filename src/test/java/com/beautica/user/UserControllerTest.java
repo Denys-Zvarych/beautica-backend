@@ -471,6 +471,28 @@ class UserControllerTest {
     }
 
     @Test
+    @DisplayName("PATCH /me — 400 when instagram violates the @Pattern (illegal angle-bracket char); service never reached")
+    void should_return400_when_instagramViolatesPattern() throws Exception {
+        var userId = UUID.randomUUID();
+        // '<' is outside the handle char class [A-Za-z0-9._] and does not begin a valid
+        // URL form either; the @Pattern rejects it at the controller boundary → clean 400.
+        var body = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "beauty<studio");
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.instagram").isNotEmpty());
+
+        org.mockito.Mockito.verify(userService, org.mockito.Mockito.never())
+                .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
+    }
+
+    @Test
     @DisplayName("PATCH /me — 400 when instagram exceeds 100 characters (over the @Size/@Column bound)")
     void should_return400_when_instagramExceeds100Chars() throws Exception {
         var userId = UUID.randomUUID();

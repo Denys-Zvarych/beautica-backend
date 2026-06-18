@@ -12,6 +12,9 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
+import jakarta.persistence.EntityManagerFactory;
+import org.hibernate.SessionFactory;
+import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -49,6 +52,9 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
 
     @Autowired
     private TestEntityManager em;
+
+    @Autowired
+    private EntityManagerFactory emf;
 
     private static final Pageable TOP_3 = PageRequest.of(0, 3);
 
@@ -363,5 +369,43 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
 
         assertThat(page.getTotalElements()).isZero();
         assertThat(page.getContent()).isEmpty();
+    }
+
+    // ── findTimeline — no N+1 (bounded statement count) ──────────────────────────
+
+    @Test
+    @DisplayName("findTimeline — bounded statement count (content + count), independent of the number of rows; "
+            + "no per-row hydration")
+    void should_runBoundedQuery_when_findingTimeline() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment manicure = persistService(master, "Classic Manicure", "MANICURE", "300");
+        MasterServiceAssignment pedicure = persistService(master, "Spa Pedicure", "PEDICURE", "450");
+
+        // N >= 3 COMPLETED bookings on unique, non-overlapping slots so the timeline
+        // projection has many rows to (potentially) hydrate per-row.
+        int n = 6;
+        for (int i = 0; i < n; i++) {
+            MasterServiceAssignment service = (i % 2 == 0) ? manicure : pedicure;
+            persistBooking(client, master, service, BookingStatus.COMPLETED, "300", slot());
+        }
+        em.flush();
+        em.clear();
+
+        SessionFactory sessionFactory = emf.unwrap(SessionFactory.class);
+        Statistics statistics = sessionFactory.getStatistics();
+        statistics.setStatisticsEnabled(true);
+        statistics.clear();
+
+        Page<TimelineItemProjection> page = repository.findTimeline(client.getId(), PageRequest.of(0, 20));
+        long statementCount = statistics.getPrepareStatementCount();
+
+        assertThat(page.getContent()).hasSize(n);
+        // A single bounded SELECT for the content plus the COUNT for the page total —
+        // never one statement per row. If a per-row master/service/category hydration
+        // leaked into the projection, this count would scale with the six rows.
+        assertThat(statementCount)
+                .as("findTimeline must run a bounded statement count (content + count), "
+                        + "not one-per-row; got %s for %s rows", statementCount, n)
+                .isLessThanOrEqualTo(2);
     }
 }
