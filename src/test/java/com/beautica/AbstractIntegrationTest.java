@@ -58,6 +58,9 @@ public abstract class AbstractIntegrationTest {
     @AfterEach
     void cleanDb() {
         jdbcTemplate.execute("DELETE FROM notification_outbox");
+        // favorites FK → users ON DELETE CASCADE, but §O-7 forbids relying on CASCADE
+        // here; delete explicitly (no child tables reference favorites).
+        jdbcTemplate.execute("DELETE FROM favorites");
         jdbcTemplate.execute("DELETE FROM reviews");
         jdbcTemplate.execute("DELETE FROM bookings");
         jdbcTemplate.execute("DELETE FROM media_files");

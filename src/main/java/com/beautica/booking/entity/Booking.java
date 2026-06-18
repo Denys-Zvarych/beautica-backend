@@ -49,7 +49,12 @@ import java.util.UUID;
                 // partial index (V89): hourly guest-reminder sweep.
                 // JPA cannot encode WHERE booking_source='LINK' AND reminder_sent=FALSE —
                 // predicate lives in V89 only; do NOT treat this annotation as authoritative.
-                @Index(name = "idx_bookings_reminder", columnList = "starts_at")
+                @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
+                // composite index (V93): per-client "latest booking" LATERAL subquery in
+                // FavoriteRepository.findFavoriteMasterRows. JPA cannot encode the DESC sort
+                // direction — V93 declares starts_at DESC; this annotation mirrors the columns
+                // only so ddl-auto=validate sees the index exists.
+                @Index(name = "idx_bookings_master_client_starts_at", columnList = "master_id, client_id, starts_at")
         }
 )
 @Getter
