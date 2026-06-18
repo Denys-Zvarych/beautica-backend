@@ -1,5 +1,6 @@
 package com.beautica.salon.repository;
 
+import java.math.BigDecimal;
 import java.util.UUID;
 
 /**
@@ -30,6 +31,14 @@ import java.util.UUID;
  *   <li>{@code getCityId()} → {@code s.cityId} ({@code city_id} column)</li>
  *   <li>{@code getDistrictId()} → {@code s.districtId} ({@code district_id} column)</li>
  *   <li>{@code getAvatarUrl()} → {@code s.avatarUrl} ({@code avatar_url} column)</li>
+ *   <li>{@code getPriceMin()} / {@code getPriceMax()} → price-range aggregates
+ *       over the salon's masters' active services (Phase 19.7, decision 5).
+ *       Computed in a single {@code LEFT JOIN LATERAL} pass per salon (both
+ *       aggregates in one nested-loop probe — Phase 19.7 PERF MEDIUM, replacing
+ *       the earlier two byte-identical correlated sub-queries), not columns on
+ *       the {@code salons} table; both are {@code null} when the salon has no
+ *       active, priced services (LATERAL over an empty set yields NULL
+ *       aggregates).</li>
  * </ul>
  */
 public interface SalonSearchProjection {
@@ -43,4 +52,19 @@ public interface SalonSearchProjection {
     UUID getDistrictId();
 
     String getAvatarUrl();
+
+    /**
+     * Lowest service-price floor ({@code MIN(base_price)}) across the salon's
+     * masters' active services, scoped to the searched category when present.
+     * {@code null} when the salon has no active, priced services.
+     */
+    BigDecimal getPriceMin();
+
+    /**
+     * Highest service-price ceiling across the salon's masters' active services
+     * ({@code MAX(price_max)} for {@code RANGE} services, else {@code base_price}
+     * for {@code FIXED}), scoped to the searched category when present.
+     * {@code null} when the salon has no active, priced services.
+     */
+    BigDecimal getPriceMax();
 }

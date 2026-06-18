@@ -94,12 +94,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     void should_filterByCategory_when_masterHasServiceInCategory() throws Exception {
         ensureHttpClient();
         UUID m1 = seedMaster("Київ", "4.00");
-        UUID salon1 = jdbcTemplate.queryForObject("SELECT salon_id FROM masters WHERE id = ?", UUID.class, m1);
-        seedServiceWithCategory(m1, salon1, "MANICURE", new BigDecimal("250.00"), true, true);
+        seedServiceWithCategory(m1, m1, "MANICURE", new BigDecimal("250.00"), true, true);
 
         UUID m2 = seedMaster("Київ", "4.00");
-        UUID salon2 = jdbcTemplate.queryForObject("SELECT salon_id FROM masters WHERE id = ?", UUID.class, m2);
-        seedServiceWithCategory(m2, salon2, "HAIRCUT", new BigDecimal("400.00"), true, true);
+        seedServiceWithCategory(m2, m2, "HAIRCUT", new BigDecimal("400.00"), true, true);
 
         log.debug("Act: GET {}?category=MANICURE — must return 1 master", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -258,12 +256,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     void should_excludeInactiveMasterServices_when_priceFiltered() throws Exception {
         ensureHttpClient();
         UUID master = seedMaster("Київ", "4.00");
-        UUID salon = jdbcTemplate.queryForObject("SELECT salon_id FROM masters WHERE id = ?", UUID.class, master);
 
         // Active row: price 600 (above filter ceiling)
-        seedServiceWithCategory(master, salon, "MANICURE", new BigDecimal("600.00"), true, true);
+        seedServiceWithCategory(master, master, "MANICURE", new BigDecimal("600.00"), true, true);
         // Inactive row: price 250 (would be in range if it counted)
-        seedServiceWithCategory(master, salon, "MANICURE", new BigDecimal("250.00"), true, false);
+        seedServiceWithCategory(master, master, "MANICURE", new BigDecimal("250.00"), true, false);
 
         log.debug("Act: GET {}?minPrice=200&maxPrice=300 — inactive master_services must NOT contribute to MIN aggregate", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -332,9 +329,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     void should_returnAggregatedMinEffectivePrice_when_categoryFilterSet() throws Exception {
         ensureHttpClient();
         UUID master = seedMaster("Київ", "4.20");
-        UUID salon = jdbcTemplate.queryForObject("SELECT salon_id FROM masters WHERE id = ?", UUID.class, master);
-        seedServiceWithCategory(master, salon, "MANICURE", new BigDecimal("180.00"), true, true);
-        seedServiceWithCategory(master, salon, "MANICURE", new BigDecimal("320.00"), true, true);
+        seedServiceWithCategory(master, master, "MANICURE", new BigDecimal("180.00"), true, true);
+        seedServiceWithCategory(master, master, "MANICURE", new BigDecimal("320.00"), true, true);
 
         log.debug("Act: GET {}?category=MANICURE — JOIN must be active, MIN must return 180.00", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -697,8 +693,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         ensureHttpClient();
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
-        UUID inDistrictA = seedMasterInDistrict("Київ", districtA, "4.30");
-        seedMasterInDistrict("Київ", districtB, "4.70");
+        UUID inDistrictA = seedIndependentMasterInDistrict("Київ", districtA, "4.30");
+        seedIndependentMasterInDistrict("Київ", districtB, "4.70");
 
         log.debug("Act: GET {}?location.cityId=Київ&location.districtId=A — district wins, only district-A master", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -722,8 +718,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         ensureHttpClient();
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
-        seedMasterInDistrict("Київ", districtA, "4.30");
-        seedMasterInDistrict("Київ", districtB, "4.70");
+        seedIndependentMasterInDistrict("Київ", districtA, "4.30");
+        seedIndependentMasterInDistrict("Київ", districtB, "4.70");
 
         log.debug("Act: GET {}?location.cityId=Київ (no districtId) — read side widens to whole city", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -765,36 +761,40 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     // ── Phase 10.5 — SALON_MASTER salon-link locality (multi-salon 2.11–2.14) ─
 
     @Test
-    @DisplayName("GET /search/masters — an employed SALON_MASTER is discovered at its SALON's district (salon link resolved at query time, not denormalised)")
-    void should_resolveSalonMasterLocalityViaSalonLink_when_searchedByDistrict() throws Exception {
+    @DisplayName("GET /search/masters — Phase 19.7: an employed SALON_MASTER is NEVER returned (reachable only via the salon page); an INDEPENDENT_MASTER in the same district IS returned")
+    void should_excludeSalonMasterButReturnIndependent_when_searchedByDistrict() throws Exception {
         ensureHttpClient();
-        UUID salonDistrict = districtIdInCity("Київ", 0);
-        UUID otherDistrict = districtIdInCity("Київ", 1);
-        // Master's USER row carries a different (stale) district than its salon.
-        // The COALESCE(sal.*, u.*) salon link must win — the master is found
-        // under the SALON's district, never the user-row district.
-        UUID masterId = seedSalonMasterWithSalonDistrictAndUserDistrict(
-                "Київ", salonDistrict, otherDistrict, "4.60");
+        UUID district = districtIdInCity("Київ", 0);
 
-        log.debug("Act: GET {} filtered by the SALON's district — salon-link locality must win over the user row", MASTERS_URL);
-        ResponseEntity<String> bySalonDistrict = restTemplate.exchange(
+        // An employed SALON_MASTER whose salon sits in the searched district.
+        // Pre-19.7 the salon-link COALESCE locality made this master discoverable
+        // here; Phase 19.7 (decision 7) restricts /search/masters to
+        // INDEPENDENT_MASTER only, so this row must be absent from data AND count.
+        UUID salonMasterId = seedSalonMasterWithSalonDistrictAndUserDistrict(
+                "Київ", district, district, "4.95");
+        // An independent master in the same district — still discoverable.
+        UUID independentId = seedIndependentMasterInDistrict("Київ", district, "4.10");
+
+        log.debug("Act: GET {} by district — SALON_MASTER must be excluded (salon-page only), INDEPENDENT_MASTER returned", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
-                        + "&location.districtId=" + salonDistrict + "&page=0&size=20",
-                HttpMethod.GET, anonymous(), String.class);
-        ResponseEntity<String> byUserDistrict = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
-                        + "&location.districtId=" + otherDistrict + "&page=0&size=20",
+                        + "&location.districtId=" + district + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
-        JsonNode bySalon = objectMapper.readTree(bySalonDistrict.getBody()).path("data");
-        assertThat(bySalon.path("totalElements").asLong())
-                .as("SALON_MASTER discovered under its salon's district (link resolved per request)")
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("Phase 19.7: only the INDEPENDENT_MASTER is counted — SALON_MASTER excluded from the count path (no pagination existence-oracle)")
                 .isEqualTo(1L);
-        assertThat(bySalon.path("data").get(0).path("masterId").asText())
-                .isEqualTo(masterId.toString());
-        assertThat(objectMapper.readTree(byUserDistrict.getBody()).path("data").path("totalElements").asLong())
-                .as("the stale user-row district must NOT discover the master — no denormalised address")
-                .isZero();
+        assertThat(data.path("data").get(0).path("masterId").asText())
+                .as("the single returned row is the independent master")
+                .isEqualTo(independentId.toString());
+        // Explicit Q6 verify-not-present: the SALON_MASTER id must never surface.
+        for (JsonNode row : data.path("data")) {
+            assertThat(row.path("masterId").asText())
+                    .as("the employed SALON_MASTER must never appear in /search/masters")
+                    .isNotEqualTo(salonMasterId.toString());
+        }
     }
 
     @Test
@@ -824,7 +824,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     void should_stampBothLabels_when_masterIsInADistrict() throws Exception {
         ensureHttpClient();
         UUID district = districtIdInCity("Київ", 0);
-        seedSalonMasterWithSalonDistrictAndUserDistrict("Київ", district, district, "4.80");
+        seedIndependentMasterInDistrict("Київ", district, "4.80");
 
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
@@ -863,6 +863,194 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isTrue();
     }
 
+    // ── Phase 19.7 — master role scope (decision 7) ──────────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters — Phase 19.7: SALON_MASTER absent, INDEPENDENT_MASTER present with its minEffectivePrice")
+    void should_returnOnlyIndependentMaster_when_salonMasterAlsoInCity() throws Exception {
+        ensureHttpClient();
+        // One employed SALON_MASTER and one INDEPENDENT_MASTER in the same city.
+        UUID salonMasterId = seedEmployedSalonMaster("Київ", "4.90");
+        UUID independentId = seedMaster("Київ", "4.10");
+        seedServiceWithCategory(independentId, independentId, "MANICURE",
+                new BigDecimal("250.00"), true, true);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("only the INDEPENDENT_MASTER is discoverable; the SALON_MASTER is reachable only via the salon page")
+                .isEqualTo(1L);
+        JsonNode row = data.path("data").get(0);
+        assertThat(row.path("masterId").asText())
+                .as("the single returned master is the independent one")
+                .isEqualTo(independentId.toString());
+        assertThat(new BigDecimal(row.path("minEffectivePrice").asText()))
+                .as("the independent master surfaces with its pre-computed minEffectivePrice")
+                .isEqualByComparingTo(new BigDecimal("250.00"));
+        for (JsonNode r : data.path("data")) {
+            assertThat(r.path("masterId").asText())
+                    .as("the SALON_MASTER id must never surface in /search/masters")
+                    .isNotEqualTo(salonMasterId.toString());
+        }
+    }
+
+    // ── Phase 19.7 — salon price range (decision 5) ───────────────────────────
+
+    @Test
+    @DisplayName("GET /search/salons — priceMin = lowest base_price, priceMax = highest (price_max for RANGE, base_price for FIXED) across the salon's masters' active services")
+    void should_returnSalonPriceRange_acrossFixedAndRangeServices() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        // FIXED 200 (floor & ceiling 200); RANGE 150..600 (floor 150, ceiling 600).
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                new BigDecimal("200.00"), null, true, true);
+        seedSalonServiceForMaster(masterId, salonId, "HAIRCUT", "RANGE",
+                new BigDecimal("150.00"), new BigDecimal("600.00"), true, true);
+
+        JsonNode row = singleSalonRow("Київ", null);
+        assertThat(new BigDecimal(row.path("priceMin").asText()))
+                .as("priceMin = MIN(base_price) across active services = 150.00")
+                .isEqualByComparingTo(new BigDecimal("150.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("priceMax = MAX(price_max for RANGE, base_price for FIXED) = 600.00")
+                .isEqualByComparingTo(new BigDecimal("600.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — category filter scopes the price range to matching services only")
+    void should_scopeSalonPriceRange_toCategoryFilter() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                new BigDecimal("200.00"), null, true, true);
+        seedSalonServiceForMaster(masterId, salonId, "HAIRCUT", "RANGE",
+                new BigDecimal("150.00"), new BigDecimal("600.00"), true, true);
+
+        // Scope to MANICURE only — the HAIRCUT 150..600 service must not count.
+        JsonNode row = singleSalonRow("Київ", "MANICURE");
+        assertThat(new BigDecimal(row.path("priceMin").asText()))
+                .as("category-scoped priceMin = the MANICURE FIXED floor 200.00")
+                .isEqualByComparingTo(new BigDecimal("200.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("category-scoped priceMax = the MANICURE FIXED ceiling 200.00")
+                .isEqualByComparingTo(new BigDecimal("200.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — priceMin AND priceMax both null when the salon has no active priced services")
+    void should_returnNullPriceRange_when_salonHasNoActiveServices() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        // Only an INACTIVE service exists — it must not contribute to the band.
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                new BigDecimal("300.00"), null, true, false);
+
+        JsonNode row = singleSalonRow("Київ", null);
+        assertThat(row.path("priceMin").isNull())
+                .as("no active priced service → priceMin is JSON null")
+                .isTrue();
+        assertThat(row.path("priceMax").isNull())
+                .as("no active priced service → priceMax is JSON null")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — priceMin == priceMax (equal values, not collapsed) when a single FIXED service prices the salon")
+    void should_returnEqualPriceMinMax_when_singleFixedService() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                new BigDecimal("350.00"), null, true, true);
+
+        JsonNode row = singleSalonRow("Київ", null);
+        // The backend returns both values; it does NOT collapse equal endpoints
+        // (that is a mobile-rendering concern). Assert both equal 350.00.
+        assertThat(new BigDecimal(row.path("priceMin").asText()))
+                .isEqualByComparingTo(new BigDecimal("350.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("priceMax equals priceMin for a lone FIXED service — both present, not collapsed")
+                .isEqualByComparingTo(new BigDecimal("350.00"));
+    }
+
+    /**
+     * Fetches the single salon row for a city (optionally category-scoped) and
+     * returns its JSON node. Asserts exactly one salon is returned so the price
+     * assertions are unambiguous.
+     */
+    private JsonNode singleSalonRow(String city, String category) throws Exception {
+        String url = SALONS_URL + "?location.cityId=" + cityIdByName(city)
+                + (category == null ? "" : "&category=" + category)
+                + "&page=0&size=20";
+        ResponseEntity<String> response = restTemplate.exchange(
+                url, HttpMethod.GET, anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("exactly one salon expected for the price-range assertion")
+                .isEqualTo(1L);
+        return data.path("data").get(0);
+    }
+
+    /**
+     * Seeds an employed SALON_MASTER (+ masters row) attached to an existing
+     * {@code salonId} in the given city. Used by the salon-price-range tests:
+     * the salon aggregation joins the master's active services via
+     * {@code mm.salon.id = s.id}, so the master must carry {@code salon_id}.
+     */
+    private UUID seedSalonMasterFor(UUID salonId, String city, String avgRating) {
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true, true)",
+                masterUserId, "price-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, masterUserId, salonId, avgRating);
+        return masterId;
+    }
+
+    /**
+     * Seeds a SALON-owned service definition (FIXED or RANGE) plus a
+     * {@code master_services} link for the given master. Honours the V67
+     * {@code chk_service_def_price_mode} CHECK: FIXED → {@code price_max} NULL;
+     * RANGE → {@code price_max} >= {@code base_price}.
+     *
+     * @param priceType "FIXED" or "RANGE"
+     * @param basePrice the floor (FIXED amount / RANGE minimum)
+     * @param priceMax  the RANGE ceiling, or {@code null} for FIXED
+     * @param defActive service_definitions.is_active
+     * @param msActive  master_services.is_active
+     */
+    private void seedSalonServiceForMaster(UUID masterId, UUID salonId, String category,
+                                           String priceType, BigDecimal basePrice,
+                                           BigDecimal priceMax, boolean defActive, boolean msActive) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
+                serviceDefId, salonId, "Priced Service " + serviceDefId, category,
+                basePrice, priceType, priceMax, defActive);
+
+        UUID msId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                msId, masterId, serviceDefId, msActive);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /**
@@ -883,9 +1071,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     /**
      * Seeds a {@code SALON_ADMIN} user with a backing {@code masters} row in
      * the given city. A SALON_ADMIN must never surface in public master
-     * discovery regardless of having a masters row — the
-     * {@code AND u.role <> 'SALON_ADMIN'} predicate (data + count) is what
-     * enforces it.
+     * discovery regardless of having a masters row — the Phase 19.7
+     * {@code AND u.role = 'INDEPENDENT_MASTER'} equality predicate (data + count)
+     * is what enforces it (it replaced the earlier {@code <> 'SALON_ADMIN'}
+     * exclusion that still let SALON_MASTER leak in).
      */
     private UUID seedSalonAdminMaster(String city, String avgRating) {
         UUID cityId = cityIdByName(city);
@@ -915,15 +1104,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                         "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, adminUserId, salonId, avgRating);
         return masterId;
-    }
-
-    /**
-     * Seeds a SALON_MASTER whose SALON carries {@code district_id}. The
-     * master's discovery locality resolves through the salon link
-     * ({@code COALESCE(sal.district_id, u.district_id)}) at query time.
-     */
-    private UUID seedMasterInDistrict(String city, UUID districtId, String avgRating) {
-        return seedSalonMasterWithSalonDistrictAndUserDistrict(city, districtId, null, avgRating);
     }
 
     /**
@@ -1017,35 +1197,68 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Creates a SALON_OWNER, a salon under that owner, a SALON_MASTER user,
-     * and a {@code masters} row — all rows active by default. Returns the
-     * masters.id for downstream wiring.
+     * Creates an {@code INDEPENDENT_MASTER} user (no salon) and a {@code masters}
+     * row stamped with the city FK on the USER row — all rows active by default.
+     * Returns the masters.id for downstream wiring.
+     *
+     * <p><b>Phase 19.7 (decision 7):</b> {@code /search/masters} returns
+     * {@code INDEPENDENT_MASTER} only. The generic master-discovery scenarios in
+     * this class (locality / category / price / rating / active-flag / dynamic
+     * SQL / label resolution) are role-agnostic mechanics; they are seeded as
+     * independent masters so they exercise the discovery pipeline rather than
+     * being blanket-excluded by the new role predicate. An independent master's
+     * discovery locality is its own user-row {@code city_id}
+     * (the {@code COALESCE(sal.city_id, u.city_id)} salon branch is NULL — no
+     * salon link). SALON_MASTER salon-link locality + the new exclusion are
+     * covered by their own dedicated tests below.
      */
     private UUID seedMaster(String city, String avgRating) {
         UUID cityId = cityIdByName(city);
 
+        UUID masterUserId = UUID.randomUUID();
+        String masterEmail = "search-master-" + UUID.randomUUID() + "@beautica.test";
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, city, city_id, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', ?, ?, true, true)",
+                masterUserId, masterEmail, "$2a$04$placeholdervaluefortestonlydigest", city, cityId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, masterUserId, avgRating);
+
+        return masterId;
+    }
+
+    /**
+     * Seeds a SALON_OWNER + salon + an employed SALON_MASTER (+ masters row)
+     * in the given city. Used by the dedicated Phase 19.7 exclusion test that
+     * asserts a SALON_MASTER never surfaces in {@code /search/masters} (it is
+     * reachable only via the salon page). The master's discovery locality
+     * resolves through the salon link at query time.
+     */
+    private UUID seedEmployedSalonMaster(String city, String avgRating) {
+        UUID cityId = cityIdByName(city);
+
         UUID ownerId = UUID.randomUUID();
-        String ownerEmail = "search-owner-" + UUID.randomUUID() + "@beautica.test";
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
-                ownerId, ownerEmail, "$2a$04$placeholdervaluefortestonlydigest");
+                ownerId, "search-emp-owner-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest");
 
-        // Phase 10.5: the salon carries the FK locality. An employed
-        // SALON_MASTER's discovery locality resolves through this salon link
-        // at query time (COALESCE(sal.city_id, u.city_id)) — never copied onto
-        // the master/user row.
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId, city, cityId);
+                salonId, ownerId, "EmpSalon-" + salonId, city, cityId);
 
         UUID masterUserId = UUID.randomUUID();
-        String masterEmail = "search-master-" + UUID.randomUUID() + "@beautica.test";
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) " +
                         "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true, true)",
-                masterUserId, masterEmail, "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
+                masterUserId, "search-emp-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
 
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -1067,9 +1280,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      */
     private UUID seedMasterWithService(String city, String avgRating, BigDecimal basePrice) {
         UUID masterId = seedMaster(city, avgRating);
-        UUID salonId = jdbcTemplate.queryForObject(
-                "SELECT salon_id FROM masters WHERE id = ?", UUID.class, masterId);
-        seedServiceWithCategory(masterId, salonId, "MANICURE", basePrice, true, true);
+        seedServiceWithCategory(masterId, masterId, "MANICURE", basePrice, true, true);
         return masterId;
     }
 
@@ -1083,9 +1294,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     private UUID seedMasterWithServiceCategoryAndPrice(String city, String avgRating,
                                                        String category, BigDecimal basePrice) {
         UUID masterId = seedMaster(city, avgRating);
-        UUID salonId = jdbcTemplate.queryForObject(
-                "SELECT salon_id FROM masters WHERE id = ?", UUID.class, masterId);
-        seedServiceWithCategory(masterId, salonId, category, basePrice, true, true);
+        seedServiceWithCategory(masterId, masterId, category, basePrice, true, true);
         return masterId;
     }
 
@@ -1151,14 +1360,19 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * @param defActive   {@code service_definitions.is_active}
      * @param msActive    {@code master_services.is_active}
      */
-    private void seedServiceWithCategory(UUID masterId, UUID salonId, String category,
+    private void seedServiceWithCategory(UUID masterId, UUID ownerId, String category,
                                          BigDecimal basePrice, boolean defActive, boolean msActive) {
+        // Phase 19.7: independent masters own their service definitions directly
+        // (owner_type='INDEPENDENT_MASTER', owner_id = the masters.id). The
+        // master-search query joins master_services on master_id regardless of
+        // service ownership, so the owner_type does not affect discovery — only
+        // the master_services link + the active flags + base_price do.
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
                         "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'SALON', ?, ?, ?, 60, ?, 0, ?, NOW(), NOW())",
-                serviceDefId, salonId, "Test Service " + serviceDefId, category, basePrice, defActive);
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 0, ?, NOW(), NOW())",
+                serviceDefId, ownerId, "Test Service " + serviceDefId, category, basePrice, defActive);
 
         UUID msId = UUID.randomUUID();
         jdbcTemplate.update(

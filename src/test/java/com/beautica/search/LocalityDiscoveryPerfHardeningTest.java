@@ -204,7 +204,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         // in prod, captured verbatim by the StatementInspector (no
         // hand-written proxy query).
         String productionSql = captureSalonSearchSelect(
-                new SalonSearchRequest(new LocationFilter(kyivCityId, null), 0, 20));
+                new SalonSearchRequest(new LocationFilter(kyivCityId, null), null, 0, 20));
 
         // EXPLAIN the captured SQL verbatim via PREPARE/EXECUTE with the real
         // bound UUID and the NATURAL planner (seq scan ENABLED — no crutch).
@@ -215,7 +215,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         assertThat(productionSql)
                 .as("captured SQL must be the salons SELECT (city_id equality), not the count")
                 .containsIgnoringCase("from salons")
-                .containsIgnoringCase("city_id=")
+                .containsIgnoringWhitespaces("city_id =")
                 .doesNotContainIgnoringCase("count(");
         assertThat(naturalPlan)
                 .as("the natural cost-based plan for the real production city-filter "
@@ -230,11 +230,24 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @DisplayName("AC1 — the REAL production salon DISTRICT-filter SQL (Hibernate-emitted) uses idx_salons_district_id on the NATURAL cost-based plan (seq scan NOT disabled)")
     void should_useDistrictIndex_when_salonSearchFiltersByDistrict() {
         seedSalonsAcrossManyCities();
-        UUID districtId = districtIdInCity("Київ", 0);
+        UUID targetDistrict = districtIdInCity("Київ", 0);
+        UUID otherDistrict = districtIdInCity("Київ", 1);
+        // Phase 19.7: the salon projection SELECT widened with two correlated
+        // price-range sub-queries. Make the target district a genuinely TINY
+        // fraction of a large districted population: seed a big cluster in a
+        // DIFFERENT district and only a few salons in the target district, then
+        // re-ANALYZE. With high selectivity the natural cost-based planner
+        // prefers idx_salons_district_id over a seq scan — the production shape
+        // the AC asserts (a seq-scan regression would still scan the whole big
+        // table and blow past the index path).
+        seedActiveSalonsInDistrict(otherDistrict, 400);
+        seedActiveSalonsInDistrict(targetDistrict, 3);
+        jdbcTemplate.execute("ANALYZE salons");
+        UUID districtId = targetDistrict;
 
         String productionSql = captureSalonSearchSelect(
                 new SalonSearchRequest(
-                        new LocationFilter(cityIdByName("Київ"), districtId), 0, 20));
+                        new LocationFilter(cityIdByName("Київ"), districtId), null, 0, 20));
 
         String naturalPlan = explainNaturalWithLiterals(productionSql, districtId);
         log.info("AC1 salon district-filter REAL production SQL:\n{}\n\nNATURAL "
@@ -243,7 +256,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         assertThat(productionSql)
                 .as("captured SQL must be the salons SELECT (district_id equality)")
                 .containsIgnoringCase("from salons")
-                .containsIgnoringCase("district_id=")
+                .containsIgnoringWhitespaces("district_id =")
                 .doesNotContainIgnoringCase("count(");
         assertThat(naturalPlan)
                 .as("the natural cost-based plan for the real production district-filter "
@@ -261,24 +274,32 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
 
         // Seed a non-trivial population so the planner has real statistics and
         // a lost-ON-clause cartesian product would explode the row estimate
-        // past 5 digits (this seeds ~200 masters + ~400 users — a cross join
-        // is ≈80 000 rows; the correct PK/FK join stays in the hundreds).
+        // past 5 digits (this seeds ~200 masters + ~200 users — a cross join
+        // is ≈40 000 rows; the correct PK/FK join stays in the hundreds).
+        // Phase 19.7: the production master query is INDEPENDENT_MASTER-only, so
+        // seed independent masters whose locality is their own user-row district
+        // — exactly the rows the reworked predicate flows through.
         for (int i = 0; i < 200; i++) {
-            seedSalonMasterInDistrict("Київ", districtId, "4." + (i % 10));
+            seedIndependentMasterInDistrict("Київ", districtId, "4." + (i % 10));
         }
         jdbcTemplate.execute("ANALYZE masters");
         jdbcTemplate.execute("ANALYZE users");
         jdbcTemplate.execute("ANALYZE salons");
 
         // The exact reworked master-search shape for a district filter with no
-        // service join (the common "all masters in district X" query).
+        // service join (the common "all masters in district X" query). Phase
+        // 19.7 replaced the stale `u.role <> 'SALON_ADMIN'` exclusion with the
+        // equality predicate `u.role = 'INDEPENDENT_MASTER'` — this perf-guard
+        // now mirrors the production WHERE clause byte-for-byte. The salons
+        // LEFT JOIN is retained (production keeps it; for an independent master
+        // sal.* is NULL and the COALESCE falls through to the user row).
         String plan = explain("""
                 SELECT m.id
                 FROM masters m
                 JOIN users u ON u.id = m.user_id
                 LEFT JOIN salons sal ON sal.id = m.salon_id
                 WHERE m.is_active = true AND u.is_active = true
-                  AND u.role <> 'SALON_ADMIN'
+                  AND u.role = 'INDEPENDENT_MASTER'
                   AND COALESCE(sal.district_id, u.district_id) = ?
                 """, districtId);
 
@@ -549,37 +570,74 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * is the captured production text byte-for-byte; only the {@code ?} tokens
      * become literals, which is exactly what the JDBC driver would send.
      *
+     * <p><b>Phase 19.7 bind-arity (single-LATERAL form).</b> The salon
+     * projection SELECT computes priceMin / priceMax in ONE
+     * {@code LEFT JOIN LATERAL} pass (Phase 19.7 PERF MEDIUM — replacing the
+     * earlier two byte-identical correlated sub-queries that bound
+     * {@code :category} four times). The single LATERAL guards its category
+     * filter once with {@code (CAST(:category AS text) IS NULL OR sd.category =
+     * CAST(:category AS text))} — so {@code :category} is bound TWICE, and those
+     * binds appear in the {@code FROM … LATERAL} clause BEFORE the WHERE-clause
+     * locality bind. The full positional order Hibernate emits is therefore:
+     * {@code [category ×2, localityId, (offset?), fetch]}. The category filter is
+     * {@code null} for these AC1 tests (no category supplied), so each category
+     * {@code ?} substitutes to a typed {@code NULL}; the locality UUID and the
+     * pagination integers follow. (The {@code 'RANGE'} price-type literal in the
+     * {@code CASE} is a string literal, not a bind param.)
+     *
      * @param capturedSql the verbatim Hibernate-emitted salon SELECT
-     * @param localityId  the bound discovery city/district UUID (1st {@code ?})
+     * @param localityId  the bound discovery city/district UUID
      */
     private String explainNaturalWithLiterals(String capturedSql, UUID localityId) {
-        // Ordered replacements for the positional '?' tokens, in the order
-        // Hibernate binds them for `SELECT s FROM Salon s WHERE s.isActive=true
-        // AND s.<col>=:id` + PageRequest.of(0, 20): [localityId, offset=0,
-        // fetch=20]. (is_active is emitted as a `true` literal, not a param.)
-        List<String> literals = List.of(
-                "'" + localityId + "'::uuid",   // city_id / district_id = ?
-                "0",                            // offset ? rows
-                "20"                            // fetch first ? rows only
-        );
+        // Positional '?' layout Hibernate emits for the Phase 19.7 salon
+        // projection SELECT (single-LATERAL form), in textual order:
+        //   [0..1] two :category binds (in the one LEFT JOIN LATERAL price pass)
+        //   [2]    the WHERE-clause locality bind (city_id / district_id = ?)
+        //   [3..]  pagination — `offset ? rows` is ELIDED when the offset is 0
+        //          (PageRequest.of(0, …)), so only `fetch first ? rows only`
+        //          remains. We therefore build the pagination literals from the
+        //          END: the final '?' is the fetch limit; any pagination '?'
+        //          before it is the offset.
+        int categoryBinds = 2;
+        int total = 0;
+        for (int i = 0; i < capturedSql.length(); i++) {
+            if (capturedSql.charAt(i) == '?') {
+                total++;
+            }
+        }
+        if (total < categoryBinds + 2) {
+            throw new IllegalStateException(
+                    "Captured salon SQL has fewer '?' than the expected "
+                            + (categoryBinds + 1) + " (4 category + 1 locality + pagination); SQL="
+                            + capturedSql);
+        }
+        // Build the ordered literal list: 4 category NULLs, the locality UUID,
+        // then the pagination tail (offset=0 for any leading pagination slot,
+        // a large fetch limit for the final slot — so the plan returns the real
+        // matching rows rather than a truncated/zero page).
+        int paginationCount = total - categoryBinds - 1;
+        List<String> literals = new ArrayList<>();
+        for (int i = 0; i < categoryBinds; i++) {
+            literals.add("CAST(NULL AS VARCHAR)");
+        }
+        literals.add("'" + localityId + "'::uuid");
+        for (int i = 0; i < paginationCount; i++) {
+            // Mirror the captured request's pagination (PageRequest.of(0, 20)):
+            // any leading slot is the offset (0); the final slot is the fetch
+            // limit (20). Preserving the real LIMIT lets the planner stop early
+            // on the index path — exactly the production execution shape.
+            literals.add(i == paginationCount - 1 ? "20" : "0");
+        }
+
         StringBuilder filled = new StringBuilder(capturedSql.length() + 64);
         int paramIdx = 0;
         for (int i = 0; i < capturedSql.length(); i++) {
             char c = capturedSql.charAt(i);
             if (c == '?') {
-                if (paramIdx >= literals.size()) {
-                    throw new IllegalStateException(
-                            "Captured salon SQL has more '?' than expected ("
-                                    + (paramIdx + 1) + "); SQL=" + capturedSql);
-                }
                 filled.append(literals.get(paramIdx++));
             } else {
                 filled.append(c);
             }
-        }
-        if (paramIdx == 0) {
-            throw new IllegalStateException(
-                    "Captured salon SQL had no '?' placeholder; SQL=" + capturedSql);
         }
         List<String> lines = jdbcTemplate.queryForList(
                 "EXPLAIN (ANALYZE, BUFFERS) " + filled, String.class);
@@ -636,31 +694,47 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     private void seedMaster(String city, String avgRating) {
         UUID cityId = cityIdByName(city);
 
+        // Phase 19.7: /search/masters returns INDEPENDENT_MASTER only. The AC2
+        // N+1 label-resolution contract is role-agnostic — it only needs N
+        // discoverable masters on one page — so seed independent masters whose
+        // discovery locality is their own user-row city_id.
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, city, city_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', ?, ?, true, true)",
+                masterUserId, "perf-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", city, cityId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, masterUserId, avgRating);
+    }
+
+    /**
+     * Seeds {@code count} active salons all stamped with the given Kyiv
+     * {@code districtId}. Used by the district AC1 test to guarantee the target
+     * district has a real, but still selective, matching set against the
+     * larger {@code seedSalonsAcrossManyCities()} population — so the natural
+     * cost-based planner has a reason to prefer {@code idx_salons_district_id}
+     * over a seq scan of the (Phase 19.7) wider projection rows.
+     */
+    private void seedActiveSalonsInDistrict(UUID districtId, int count) {
+        UUID kyivCityId = cityIdByName("Київ");
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
                         + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
-                ownerId, "perf-owner-" + UUID.randomUUID() + "@beautica.test",
+                ownerId, "perf-dcluster-owner-" + UUID.randomUUID() + "@beautica.test",
                 "$2a$04$placeholdervaluefortestonlydigest");
-
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "PerfSalon-" + salonId, city, cityId);
-
-        UUID masterUserId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true, true)",
-                masterUserId, "perf-master-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
-
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
-                masterId, masterUserId, salonId, avgRating);
+        for (int i = 0; i < count; i++) {
+            UUID salonId = UUID.randomUUID();
+            jdbcTemplate.update(
+                    "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) "
+                            + "VALUES (?, ?, ?, 'City', ?, ?, true, NOW(), NOW())",
+                    salonId, ownerId, "DClusterSalon-" + salonId, kyivCityId, districtId);
+        }
     }
 
     /**
@@ -706,40 +780,29 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Seeds a SALON_OWNER, an active salon stamped with the city FK <em>and</em>
-     * a {@code district_id}, an employed SALON_MASTER, and a {@code masters}
+     * Seeds an {@code INDEPENDENT_MASTER} (no salon) whose own user row carries
+     * the city FK <em>and</em> a {@code district_id}, plus a {@code masters}
      * row. The master's discovery district resolves through
-     * {@code COALESCE(sal.district_id, u.district_id)} via the salon link —
-     * the exact shape the AC1 master-spine plan exercises.
+     * {@code COALESCE(sal.district_id, u.district_id)} — with no salon link the
+     * expression falls through to the user row. This is the exact row shape the
+     * Phase 19.7 INDEPENDENT_MASTER-only master query flows through, so the AC1
+     * master-spine plan exercises the production predicate.
      */
-    private void seedSalonMasterInDistrict(String city, UUID districtId, String avgRating) {
+    private void seedIndependentMasterInDistrict(String city, UUID districtId, String avgRating) {
         UUID cityId = cityIdByName(city);
-
-        UUID ownerId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
-                ownerId, "perf-downer-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$04$placeholdervaluefortestonlydigest");
-
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "PerfDSalon-" + salonId, city, cityId, districtId);
 
         UUID masterUserId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true, true)",
+                "INSERT INTO users (id, email, password_hash, role, city, city_id, district_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', ?, ?, ?, true, true)",
                 masterUserId, "perf-dmaster-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
+                "$2a$04$placeholdervaluefortestonlydigest", city, cityId, districtId);
 
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
-                masterId, masterUserId, salonId, avgRating);
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, masterUserId, avgRating);
     }
 
     // ── SQL capture infra (real production-path EXPLAIN, AC1 HIGH-1) ──────────

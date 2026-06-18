@@ -126,7 +126,9 @@ class SearchControllerTest {
                 "Salon Beautica",
                 "Львів",
                 null,
-                null
+                null,
+                new BigDecimal("150.00"),
+                new BigDecimal("600.00")
         );
     }
 

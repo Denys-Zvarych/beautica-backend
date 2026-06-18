@@ -1,5 +1,6 @@
 package com.beautica.search.dto;
 
+import java.math.BigDecimal;
 import java.util.UUID;
 
 /**
@@ -19,6 +20,19 @@ import java.util.UUID;
  * non-districted cities or unset locality. The internal city/district UUIDs
  * are intentionally NOT exposed (§I — {@code permitAll} endpoint).</p>
  *
+ * <p><b>Phase 19.7 — salon price range (decision 5):</b> {@code priceMin} /
+ * {@code priceMax} carry the price band across the salon's masters' active
+ * services. {@code priceMin} is the lowest service floor
+ * ({@code MIN(base_price)}); {@code priceMax} is the highest ceiling
+ * ({@code MAX(price_max)} for {@code RANGE} services, else {@code base_price}
+ * for {@code FIXED}) — mirroring the per-service pricing model used by
+ * {@code masters.min_effective_price}. When the search carries a category
+ * filter the aggregation is scoped to matching services; otherwise it is
+ * salon-wide. <b>Both are {@code null}</b> when the salon has no active,
+ * priced services (mobile renders no price). The two values are equal when the
+ * band collapses to a single number — collapsing to one display value is a
+ * mobile-rendering concern; the backend always returns both.</p>
+ *
  * <p>This is a response DTO only — no Bean Validation annotations
  * apply. Assembled by the search service from a projection query;
  * the JPA entity is never exposed directly.</p>
@@ -28,6 +42,8 @@ public record SalonSearchResult(
         String name,
         String cityLabel,
         String districtLabel,
-        String avatarUrl
+        String avatarUrl,
+        BigDecimal priceMin,
+        BigDecimal priceMax
 ) {
 }

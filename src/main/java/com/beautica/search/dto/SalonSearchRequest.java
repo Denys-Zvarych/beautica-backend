@@ -2,8 +2,10 @@ package com.beautica.search.dto;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
+import jakarta.validation.constraints.Size;
 
 /**
  * Inbound request DTO for {@code GET /api/v1/search/salons}.
@@ -30,6 +32,15 @@ import jakarta.validation.constraints.PositiveOrZero;
  *       {@link LocationFilter}. {@code @Valid} cascades Bean Validation into
  *       the nested record. Optional: a {@code null} location means "no
  *       location filter".</li>
+ *   <li>{@code category} — optional service-category filter (Phase 19.7,
+ *       decision 5). When supplied it scopes the salon price-range aggregation
+ *       ({@code priceMin}/{@code priceMax}) to matching active services;
+ *       otherwise the range spans every active service across the salon's
+ *       masters. Kept as a free {@code String} (max 100, mirroring
+ *       {@code service_definitions.category VARCHAR(100)} from V6 and
+ *       {@link MasterSearchRequest#category()}) rather than the
+ *       {@code ServiceCategory} enum — enum binding fails with an opaque 400
+ *       that leaks the full enum surface.</li>
  *   <li>{@code page} — boxed {@code Integer}; {@code null} = use server default (0).
  *       Capped at 500 to bound offset-pagination memory usage: at the {@code size=100}
  *       ceiling that means at most ~50 000 results reachable via offset pagination.
@@ -52,6 +63,11 @@ public record SalonSearchRequest(
 
         @Valid
         LocationFilter location,
+
+        @Size(max = 100, message = "category must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+                 message = "category must not contain control characters or HTML special characters")
+        String category,
 
         @PositiveOrZero(message = "page must be zero or positive")
         @Max(value = 500, message = "page must be at most 500")

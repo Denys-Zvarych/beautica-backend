@@ -73,10 +73,22 @@ import java.util.UUID;
  * The {@code salons} LEFT JOIN is a single-row PK join (no fan-out), unlike
  * the conditional {@code master_services} join.</p>
  *
- * <p><b>{@code SALON_ADMIN} exclusion:</b> the master query carries an
- * explicit {@code AND u.role <> 'SALON_ADMIN'} predicate on the
- * {@code masters m JOIN users u} join so an admin account can never surface in
- * public master discovery, independent of any future data shape.</p>
+ * <p><b>Master-role scope (Phase 19.7, decision 7):</b> the master query
+ * carries an explicit {@code AND u.role = 'INDEPENDENT_MASTER'} predicate on
+ * the {@code masters m JOIN users u} join, so {@code /search/masters} returns
+ * independent masters only. Employed {@code SALON_MASTER} accounts are reached
+ * exclusively through the public salon page; {@code SALON_ADMIN} /
+ * {@code SALON_OWNER} are not bookable masters. This equality predicate
+ * replaces the earlier {@code <> 'SALON_ADMIN'} exclusion that let
+ * {@code SALON_MASTER} leak onto the public grid.</p>
+ *
+ * <p>With the {@code INDEPENDENT_MASTER}-only filter, the salon side of the
+ * {@code COALESCE(sal.*, u.*)} discovery-locality expression is effectively
+ * dead for this query (an independent master has no {@code salon_id}, so
+ * {@code sal.*} is always {@code NULL} and the user-row locality always wins).
+ * The {@code salons} LEFT JOIN and the COALESCE are left intact: they remain
+ * correct (harmless NULL-coalescing) and the salon-locality resolution is
+ * still required by the unchanged salon-discovery path.</p>
  *
  * <h3>SQL is built dynamically per request</h3>
  * The native SQL is assembled by {@link #buildMasterSearchSql} at request time
@@ -120,8 +132,17 @@ public class SearchService {
     /** Scale of {@code masters.min_effective_price} (NUMERIC(10,2)) — matches column precision. */
     private static final int PRICE_SCALE = 2;
 
-    /** Role value (stored via {@code EnumType.STRING}) excluded from master discovery. */
-    private static final String ROLE_SALON_ADMIN = "SALON_ADMIN";
+    /**
+     * Role value (stored via {@code EnumType.STRING}) that master discovery is
+     * restricted to. Phase 19.7 (decision 7): {@code /search/masters} returns
+     * {@code INDEPENDENT_MASTER} only. Employed {@code SALON_MASTER} accounts
+     * are reached exclusively through the public salon page, and
+     * {@code SALON_ADMIN} / {@code SALON_OWNER} are never bookable masters —
+     * an equality predicate on this single role keeps all three off the public
+     * master grid regardless of future data shape (replaces the earlier
+     * {@code <> 'SALON_ADMIN'} exclusion that let {@code SALON_MASTER} leak in).
+     */
+    private static final String ROLE_INDEPENDENT_MASTER = "INDEPENDENT_MASTER";
 
     /**
      * Discovery-locality SQL expressions. A {@code SALON_MASTER}'s locality is
@@ -212,7 +233,7 @@ public class SearchService {
     @Cacheable(
             value = "search:salons",
             key = "{#request.location?.cityId, #request.location?.districtId, " +
-                  "#pageable.pageNumber, #pageable.pageSize}",
+                  "#request.category, #pageable.pageNumber, #pageable.pageSize}",
             condition = "#pageable.pageNumber < 5",
             sync = true
     )
@@ -221,8 +242,13 @@ public class SearchService {
         DiscoveryLocationKey key = resolveLocation(request.location());
         UUID cityId = key == null ? null : key.cityId();
         UUID districtId = key == null ? null : key.districtId();
+        // Phase 19.7: scope the salon price-range aggregation to the searched
+        // category when present (salon-wide when null). Normalised to upper-case
+        // so the bound value matches what EnumType.STRING wrote to
+        // service_definitions.category — mirrors the masters-search path.
+        String category = normalizeCategory(request.category());
 
-        Page<SalonSearchProjection> page = findSalonsByLocation(cityId, districtId, pageable);
+        Page<SalonSearchProjection> page = findSalonsByLocation(cityId, districtId, category, pageable);
 
         List<SalonSearchProjection> projections = page.getContent();
         DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
@@ -251,14 +277,15 @@ public class SearchService {
      *       {@link SalonRepository#findByIsActiveTrueAsProjection}.</li>
      * </ol>
      */
-    private Page<SalonSearchProjection> findSalonsByLocation(UUID cityId, UUID districtId, Pageable pageable) {
+    private Page<SalonSearchProjection> findSalonsByLocation(
+            UUID cityId, UUID districtId, String category, Pageable pageable) {
         if (districtId != null) {
-            return salonRepository.findActiveByDistrictIdAsProjection(districtId, pageable);
+            return salonRepository.findActiveByDistrictIdAsProjection(districtId, category, pageable);
         }
         if (cityId != null) {
-            return salonRepository.findActiveByCityIdAsProjection(cityId, pageable);
+            return salonRepository.findActiveByCityIdAsProjection(cityId, category, pageable);
         }
-        return salonRepository.findByIsActiveTrueAsProjection(pageable);
+        return salonRepository.findByIsActiveTrueAsProjection(category, pageable);
     }
 
     // ── location seam (M2) ────────────────────────────────────────────────────
@@ -443,8 +470,12 @@ public class SearchService {
             Map<String, Object> params
     ) {
         sb.append("WHERE m.is_active = true AND u.is_active = true ");
-        sb.append("AND u.role <> :excludedRole ");
-        params.put("excludedRole", ROLE_SALON_ADMIN);
+        // Phase 19.7: restrict the public master grid to INDEPENDENT_MASTER only.
+        // SALON_MASTER is reachable solely via the salon page; SALON_ADMIN /
+        // SALON_OWNER are not bookable masters. Equality (not <>) keeps all
+        // non-independent roles out regardless of future data shape.
+        sb.append("AND u.role = :includedRole ");
+        params.put("includedRole", ROLE_INDEPENDENT_MASTER);
 
         if (filters.hasDistrictFilter()) {
             sb.append("AND ").append(DISCOVERY_DISTRICT_EXPR).append(" = :districtId ");
@@ -616,7 +647,13 @@ public class SearchService {
                 proj.getName(),
                 labels.cityLabel(proj.getCityId()),
                 labels.districtLabel(proj.getDistrictId()),
-                proj.getAvatarUrl()
+                proj.getAvatarUrl(),
+                // Phase 19.7: price band across the salon's masters' active
+                // services (category-scoped when present). Both null when the
+                // salon has no active, priced services — passed through as-is;
+                // the backend never collapses priceMin == priceMax (mobile concern).
+                proj.getPriceMin(),
+                proj.getPriceMax()
         );
     }
 }
