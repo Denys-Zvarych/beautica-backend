@@ -1,10 +1,12 @@
 package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -49,6 +51,7 @@ import org.springframework.data.domain.PageImpl;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -827,6 +830,264 @@ class BookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    // ── rescheduleBooking (Phase 19.2) ─────────────────────────────────────────
+
+    /**
+     * Stubs the working-hours oracle so {@code newStartsAt} resolves to an on-schedule slot,
+     * and the advisory lock acquires successfully. Mirrors the create-path critical section.
+     */
+    private void stubRescheduleSlotAvailable(OffsetDateTime newStartsAt) {
+        AvailableSlotResponse slot = new AvailableSlotResponse(
+                newStartsAt.atZoneSameInstant(KYIV),
+                newStartsAt.plusMinutes(60).atZoneSameInstant(KYIV));
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId)))
+                .thenReturn(List.of(slot));
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+    }
+
+    @Test
+    @DisplayName("CONFIRMED reschedule reverts the booking to PENDING, moves the time, and notifies the provider")
+    void should_revertToPending_when_clientReschedulesConfirmedBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        BookingDetailResponse result = bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.PENDING);
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+        assertThat(result.status()).isEqualTo(BookingStatus.PENDING);
+        verify(outboxService).enqueueBookingRescheduled(bookingId);
+    }
+
+    @Test
+    @DisplayName("PENDING reschedule keeps the booking PENDING, moves the time, and notifies the provider")
+    void should_stayPending_when_clientReschedulesPendingBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.PENDING);
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+        verify(outboxService).enqueueBookingRescheduled(bookingId);
+    }
+
+    @Test
+    @DisplayName("403 ForbiddenException is thrown when a different client attempts to reschedule another client's booking")
+    void should_throwForbidden_when_nonOwnerClientReschedules() {
+        UUID otherClientId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(otherClientId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        // Guard fires before any slot lookup / lock / persistence
+        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any());
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any());
+    }
+
+    @Test
+    @DisplayName("403 ForbiddenException is thrown when the booking has no client (guest booking) so no actor can own it")
+    void should_throwForbidden_when_reschedulingGuestBooking() {
+        Booking guestBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        setField(guestBooking, "client", null);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("409 is thrown when rescheduling a COMPLETED booking (terminal source state)")
+    void should_throw409_when_reschedulingCompletedBooking() {
+        assertRescheduleRejectsTerminalState(BookingStatus.COMPLETED);
+    }
+
+    @Test
+    @DisplayName("409 is thrown when rescheduling a CANCELLED booking (terminal source state)")
+    void should_throw409_when_reschedulingCancelledBooking() {
+        assertRescheduleRejectsTerminalState(BookingStatus.CANCELLED);
+    }
+
+    @Test
+    @DisplayName("409 is thrown when rescheduling a DECLINED booking (terminal source state)")
+    void should_throw409_when_reschedulingDeclinedBooking() {
+        assertRescheduleRejectsTerminalState(BookingStatus.DECLINED);
+    }
+
+    @Test
+    @DisplayName("409 is thrown when rescheduling a NOT_COMPLETED booking (terminal source state)")
+    void should_throw409_when_reschedulingNotCompletedBooking() {
+        assertRescheduleRejectsTerminalState(BookingStatus.NOT_COMPLETED);
+    }
+
+    private void assertRescheduleRejectsTerminalState(BookingStatus terminal) {
+        Booking booking = buildBooking(bookingId, client, master, msa, terminal);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+        assertThat(booking.getStatus()).isEqualTo(terminal);
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any());
+    }
+
+    @Test
+    @DisplayName("400 is thrown when the new start time is below the 15-minute lead-time floor")
+    void should_throw400_when_rescheduleNewTimeBelowLeadTime() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(
+                ZonedDateTime.now(clock).plusMinutes(14).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+        verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("400 is thrown when the new start time is more than 180 days ahead")
+    void should_throw400_when_rescheduleNewTimeMoreThan180DaysAhead() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(
+                ZonedDateTime.now(clock).plusDays(181).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    @Test
+    @DisplayName("409 'Slot not available' is thrown when the new time is off the master's schedule")
+    void should_throw409_when_rescheduleNewTimeOffSchedule() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // No slot matches newStartsAt → off-schedule
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId)))
+                .thenReturn(List.of());
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+        // Off-schedule rejected before the advisory lock / overlap check
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("409 is thrown when the new time overlaps another booking, with the booking's own row excluded via existsOverlapExcluding")
+    void should_throw409_when_rescheduleOverlapsAnotherBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(true);
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+        // Self-exclusion: overlap is checked excluding this booking's own id
+        verify(bookingRepository).existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId));
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any());
+    }
+
+    @Test
+    @DisplayName("price and frozen duration are preserved on reschedule; endsAt = newStartsAt + durationMinutesAtBooking + buffer")
+    void should_freezePriceAndDuration_when_rescheduling() {
+        // Original booking: price 200.00, duration 60, buffer 0. Build with a 90-min frozen
+        // duration to prove endsAt derives from the frozen value, not a recomputed one.
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        setField(booking, "durationMinutesAtBooking", 90);
+        setField(booking, "bufferMinutesAtBooking", 0);
+        BigDecimal frozenPrice = booking.getPriceAtBooking();
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getPriceAtBooking()).isEqualByComparingTo(frozenPrice);
+        assertThat(booking.getDurationMinutesAtBooking()).isEqualTo(90);
+        assertThat(booking.getEndsAt()).isEqualTo(newStartsAt.plusMinutes(90));
+    }
+
+    @Test
+    @DisplayName("confirm after reschedule moves the booking to CONFIRMED at the new time (standard transition, unchanged)")
+    void should_confirmAtNewTime_when_providerConfirmsAfterReschedule() {
+        // Reschedule a CONFIRMED booking → reverts to PENDING at the new time.
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+        bookingService.rescheduleBooking(clientId, bookingId, new RescheduleBookingRequest(newStartsAt));
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.PENDING);
+
+        // Provider confirms → CONFIRMED at the (new) time, via the unchanged confirm path.
+        UUID providerId = UUID.randomUUID();
+        when(bookingRepository.save(any())).thenReturn(booking);
+        bookingService.confirmBooking(providerId, bookingId);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+    }
+
+    @Test
+    @DisplayName("decline after reschedule moves the booking to DECLINED (standard transition, unchanged)")
+    void should_declineAfterReschedule_when_providerDeclines() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+        bookingService.rescheduleBooking(clientId, bookingId, new RescheduleBookingRequest(newStartsAt));
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.PENDING);
+
+        // Provider declines → DECLINED, via the unchanged decline path.
+        UUID providerId = UUID.randomUUID();
+        StatusUpdateRequest declineReq = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Unavailable");
+        when(bookingRepository.save(any())).thenReturn(booking);
+        bookingService.declineBooking(providerId, bookingId, declineReq);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.DECLINED);
     }
 
     // ── listBookings ───────────────────────────────────────────────────────────

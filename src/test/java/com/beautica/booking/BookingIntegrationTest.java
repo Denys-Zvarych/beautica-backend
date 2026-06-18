@@ -467,6 +467,156 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
+    // ── PATCH /bookings/{id}/reschedule (Phase 19.2) ─────────────────────────
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/reschedule then /confirm — CONFIRMED booking reverts to PENDING at the new time, then provider confirm ⇒ CONFIRMED at the new time")
+    void should_rescheduleThenConfirm_when_clientMovesConfirmedBooking() throws Exception {
+        String ownerEmail = "integ-resched-confirm-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-resched-confirm-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        // Provider confirms the original booking → CONFIRMED.
+        restTemplate.exchange(BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(ownerToken)), Void.class);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .isEqualTo("CONFIRMED");
+
+        // Client reschedules to a new on-schedule slot the next day.
+        ZonedDateTime newStartsAt = startsAt.plusDays(1).withHour(11);
+        String body = "{\"newStartsAt\":\"" + newStartsAt.toOffsetDateTime() + "\"}";
+        log.debug("Act: PATCH {}/{}/reschedule as CLIENT to {}", BOOKINGS_URL, bookingId, newStartsAt);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("client rescheduling own CONFIRMED booking must return 200")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .as("CONFIRMED booking must revert to PENDING after reschedule")
+                .isEqualTo("PENDING");
+        String dbStartsAfterReschedule = jdbcTemplate.queryForObject(
+                "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
+                String.class, bookingId);
+        assertThat(dbStartsAfterReschedule)
+                .as("starts_at must move to the new 11:00 Kyiv time")
+                .isEqualTo("11:00");
+
+        // Provider re-confirms at the new time → CONFIRMED at the new time.
+        ResponseEntity<Void> confirmResponse = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(ownerToken)), Void.class);
+        assertThat(confirmResponse.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .as("re-confirm after reschedule must yield CONFIRMED")
+                .isEqualTo("CONFIRMED");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
+                String.class, bookingId))
+                .as("confirmed time must still be the new 11:00 slot")
+                .isEqualTo("11:00");
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/reschedule then /decline — rescheduled booking is PENDING, then provider decline ⇒ DECLINED (standard path)")
+    void should_rescheduleThenDecline_when_providerRejectsNewTime() throws Exception {
+        String ownerEmail = "integ-resched-decline-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-resched-decline-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2).withHour(12).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        ZonedDateTime newStartsAt = startsAt.plusDays(1).withHour(13);
+        String body = "{\"newStartsAt\":\"" + newStartsAt.toOffsetDateTime() + "\"}";
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .as("PENDING booking stays PENDING after reschedule")
+                .isEqualTo("PENDING");
+
+        // Provider declines the rescheduled (PENDING) booking → DECLINED via the unchanged path.
+        ResponseEntity<Void> declineResponse = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(ownerToken)),
+                Void.class);
+        assertThat(declineResponse.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .as("decline after reschedule must yield the standard DECLINED state")
+                .isEqualTo("DECLINED");
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/reschedule — 409 when the new time overlaps another booking on the same master (own row excluded under the advisory lock)")
+    void should_return409_when_rescheduleOverlapsAnotherBooking() throws Exception {
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-resched-overlap-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientAToken = createClientAndGetToken("integ-resched-overlap-a-" + System.nanoTime() + "@beautica.test");
+        String clientBToken = createClientAndGetToken("integ-resched-overlap-b-" + System.nanoTime() + "@beautica.test");
+
+        ZonedDateTime slotA = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2).withHour(9).withMinute(0).withSecond(0).withNano(0);
+        ZonedDateTime slotB = slotA.withHour(15);
+        UUID bookingA = createBooking(clientAToken, masterId, masterServiceId, slotA);
+        createBooking(clientBToken, masterId, masterServiceId, slotB);
+
+        // Client A tries to move booking A onto B's occupied 15:00 slot → 409.
+        String body = "{\"newStartsAt\":\"" + slotB.toOffsetDateTime() + "\"}";
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingA + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientAToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("reschedule onto an occupied slot must return 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+        // Booking A is unchanged — still on its original 09:00 slot.
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
+                String.class, bookingA))
+                .as("booking A must remain on its original slot after a rejected reschedule")
+                .isEqualTo("09:00");
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/reschedule — booking's own row is excluded so it can move to an adjacent free slot")
+    void should_reschedule_when_targetSlotFreeAndOwnRowExcluded() throws Exception {
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-resched-self-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-resched-self-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2).withHour(16).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        // Move to an adjacent free slot — overlap check excludes the booking's own row.
+        ZonedDateTime newStartsAt = startsAt.withHour(17);
+        String body = "{\"newStartsAt\":\"" + newStartsAt.toOffsetDateTime() + "\"}";
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("rescheduling to a free slot must return 200 (own row excluded from overlap)")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
+                String.class, bookingId))
+                .isEqualTo("17:00");
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String createClientAndGetToken(String email) throws Exception {

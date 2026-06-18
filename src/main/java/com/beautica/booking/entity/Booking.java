@@ -205,4 +205,29 @@ public class Booking extends AuditableEntity {
                 .reminderSent(false)
                 .build();
     }
+
+    /**
+     * Moves this booking to a new time window and re-enters the approval queue.
+     *
+     * <p>Per the Phase 19.2 locked decision a {@code CONFIRMED} booking reverts to
+     * {@code PENDING} on reschedule (the provider must re-approve at the new time);
+     * a {@code PENDING} booking stays {@code PENDING}. {@code priceAtBooking} and
+     * {@code durationMinutesAtBooking} are frozen at the original booking and are
+     * deliberately NOT recomputed here — the caller computes {@code newEndsAt} from
+     * the frozen duration (+ buffer) before invoking this method.
+     *
+     * <p>Allowed source-state and slot/overlap validation are the caller's
+     * responsibility (see {@code BookingService.rescheduleBooking}); this method only
+     * applies the state transition once those checks have passed.
+     *
+     * @param newStartsAt the new start instant (already validated by the service)
+     * @param newEndsAt   the new end instant ({@code newStartsAt + duration + buffer})
+     */
+    public void reschedule(OffsetDateTime newStartsAt, OffsetDateTime newEndsAt) {
+        this.startsAt = newStartsAt;
+        this.endsAt = newEndsAt;
+        if (this.status == BookingStatus.CONFIRMED) {
+            this.status = BookingStatus.PENDING;
+        }
+    }
 }

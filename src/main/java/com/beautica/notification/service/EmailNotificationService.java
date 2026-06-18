@@ -116,6 +116,15 @@ public class EmailNotificationService {
         send(to, "Нове бронювання", "email/new-booking", ctx);
     }
 
+    public void sendBookingRescheduledEmail(String to, Booking booking) {
+        var ctx = new Context();
+        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        send(to, "Запит на перенесення", "email/booking-rescheduled-provider", ctx);
+    }
+
     public void sendBookingConfirmedEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));

@@ -74,6 +74,26 @@ public class NotificationService {
         }
     }
 
+    /**
+     * Notifies the provider (master / salon-admin) that the client rescheduled the booking
+     * to a new time and it is awaiting re-approval (Phase 19.2). Targets the master's user —
+     * the same recipient as {@link #notifyNewBooking(Booking)} — with «Запит на перенесення» copy.
+     */
+    public void notifyBookingRescheduled(Booking booking) {
+        String masterEmail = booking.getMaster().getUser().getEmail();
+        UUID masterUserId = booking.getMaster().getUser().getId();
+        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
+        String bookingId = booking.getId().toString();
+
+        emailService.sendBookingRescheduledEmail(masterEmail, booking);
+        pushService.sendToUser(
+                masterUserId,
+                "Запит на перенесення",
+                truncate("Клієнт попросив перенести бронювання на " + serviceName),
+                Map.of("type", "BOOKING_RESCHEDULED", "bookingId", bookingId)
+        );
+    }
+
     public void notifyClientCancelled(Booking booking) {
         String masterEmail = booking.getMaster().getUser().getEmail();
         UUID masterUserId = booking.getMaster().getUser().getId();

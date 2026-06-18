@@ -280,6 +280,51 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
         assertThat(union).hasSize(2);
     }
 
+    @Test
+    @DisplayName("PATCH /bookings/{id}/reschedule — one BOOKING_RESCHEDULED/PENDING outbox row is written, then drains to the provider as SENT")
+    void should_enqueueAndDrainBookingRescheduled_when_clientReschedules() throws Exception {
+        String clientToken = createClientAndGetToken("integ-resched-outbox-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-resched-outbox-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        // Create the booking via the real path (writes a NEW_BOOKING row), then drop it so the
+        // assertion targets only the reschedule event.
+        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        var createReq = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        ResponseEntity<String> createResp = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(createReq, bearerHeaders(clientToken)), String.class);
+        assertThat(createResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID bookingId = objectMapper.readValue(createResp.getBody(),
+                new TypeReference<ApiResponse<BookingResponse>>() {}).data().id();
+        outboxRepository.deleteAll();
+        outboxRepository.flush();
+
+        // Reschedule to a new on-schedule slot — must enqueue exactly one BOOKING_RESCHEDULED row.
+        ZonedDateTime newStartsAt = startsAt.withHour(11);
+        String body = "{\"newStartsAt\":\"" + newStartsAt.toOffsetDateTime() + "\"}";
+        ResponseEntity<String> reschedResp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
+        assertThat(reschedResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        List<NotificationOutboxEntry> rows = outboxRepository.findAll();
+        assertThat(rows).hasSize(1);
+        NotificationOutboxEntry only = rows.get(0);
+        assertThat(only.getEventType()).isEqualTo(OutboxEventType.BOOKING_RESCHEDULED);
+        assertThat(only.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(only.getAggregateId()).isEqualTo(bookingId);
+
+        // Drain → the entry advances to SENT and the provider-targeted dispatch fires.
+        drainWorker.drain();
+
+        NotificationOutboxEntry reloaded = outboxRepository.findById(only.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(reloaded.getLastError()).isNull();
+        verify(notificationService, times(1)).notifyBookingRescheduled(any(Booking.class));
+    }
+
     // ── helpers (copied verbatim from BookingIntegrationTest — extraction is a
     //    backlog follow-up flagged by the QA audit) ──────────────────────────────
 
@@ -346,10 +391,18 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
     }
 
     private void addWorkingHoursForEveryDay(UUID masterId) {
+        // Phase 15.5: SlotCalculationService reads ONLY the new schedule model
+        // (weekly_schedules / working_intervals). The reschedule path validates the new time
+        // against getAvailableSlots, so the new-model rows are required (the legacy working_hours
+        // table no longer feeds slot generation). Mirror BookingIntegrationTest.
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to) VALUES (?, ?, DATE '2020-01-01', NULL)",
+                scheduleId, masterId);
         for (int day = 1; day <= 7; day++) {
             jdbcTemplate.update(
-                    "INSERT INTO working_hours (id, master_id, day_of_week, start_time, end_time, is_active) VALUES (?, ?, ?, '08:00', '20:00', true)",
-                    UUID.randomUUID(), masterId, day);
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) VALUES (?, ?, ?, '08:00', '20:00')",
+                    UUID.randomUUID(), scheduleId, day);
         }
     }
 

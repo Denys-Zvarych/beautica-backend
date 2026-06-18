@@ -5,6 +5,7 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.enums.BookingStatus;
@@ -803,6 +804,155 @@ class BookingControllerTest {
                 .when(bookingService).cancelBooking(any(), any(), any());
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/cancel")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
+    // ── PATCH /{bookingId}/reschedule (Phase 19.2) ───────────────────────────
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 200 when CLIENT reschedules and the principal id (not the body) is the actor")
+    void should_return200_andUsePrincipalAsActor_when_clientReschedules() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var newStartsAt = ZonedDateTime.now().plusDays(2).toOffsetDateTime();
+        var body = objectMapper.writeValueAsString(new RescheduleBookingRequest(newStartsAt));
+        when(bookingService.rescheduleBooking(eq(clientId), eq(bookingId), any()))
+                .thenReturn(stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.id").value(bookingId.toString()));
+
+        // Actor id handed to the service is the security principal's id — never derived from the body.
+        var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
+        org.mockito.Mockito.verify(bookingService)
+                .rescheduleBooking(actorCaptor.capture(), eq(bookingId), any());
+        org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(clientId);
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when SALON_OWNER attempts to reschedule (role guard)")
+    void should_return403_when_ownerAttemptsToReschedule() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .rescheduleBooking(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when INDEPENDENT_MASTER attempts to reschedule (role guard)")
+    void should_return403_when_masterAttemptsToReschedule() throws Exception {
+        var masterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .rescheduleBooking(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 401 when no Authorization header")
+    void should_return401_when_noTokenOnReschedule() throws Exception {
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 400 when newStartsAt is in the past (@Future constraint)")
+    void should_return400_when_rescheduleNewStartsAtInPast() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = "{\"newStartsAt\":\"2000-01-01T10:00:00+02:00\"}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .rescheduleBooking(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 400 when newStartsAt is absent (@NotNull constraint)")
+    void should_return400_when_rescheduleNewStartsAtMissing() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = "{}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 409 when the service reports a conflicting slot or invalid state")
+    void should_return409_when_rescheduleConflicts() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(bookingService.rescheduleBooking(any(), eq(bookingId), any()))
+                .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Slot not available"));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isConflict());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when CLIENT reschedules another client's booking (service ownership guard)")
+    void should_return403_when_clientReschedulesAnotherClientsBooking() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(bookingService.rescheduleBooking(any(), eq(bookingId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)

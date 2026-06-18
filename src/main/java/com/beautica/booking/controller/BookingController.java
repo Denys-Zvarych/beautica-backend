@@ -4,6 +4,7 @@ import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingService;
@@ -140,6 +141,24 @@ public class BookingController {
     ) {
         bookingService.notCompleteBooking(principalId(auth), bookingId, req);
         return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * Moves the authenticated client's own booking to a new future time.
+     *
+     * <p>Actor is resolved from the security principal — never from the body. Returns the
+     * existing {@link BookingDetailResponse} shape (the same view {@code GET /bookings/{id}}
+     * returns); Phase 19.3 will enrich this DTO. Errors: {@code 409} on a conflicting slot or
+     * a non-PENDING/CONFIRMED source state, {@code 403} for a non-owner, {@code 400} for a bad time.
+     */
+    @PatchMapping("/{bookingId}/reschedule")
+    @PreAuthorize("hasRole('CLIENT')")
+    public ApiResponse<BookingDetailResponse> rescheduleBooking(
+            @PathVariable UUID bookingId,
+            @Valid @RequestBody RescheduleBookingRequest req,
+            Authentication auth
+    ) {
+        return ApiResponse.ok(bookingService.rescheduleBooking(principalId(auth), bookingId, req));
     }
 
     @PatchMapping("/{bookingId}/cancel")

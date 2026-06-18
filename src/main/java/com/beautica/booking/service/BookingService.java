@@ -5,6 +5,7 @@ import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -224,6 +225,98 @@ public class BookingService {
         return BookingResponse.from(saved);
     }
 
+    /**
+     * Moves a client's own {@code PENDING}/{@code CONFIRMED} booking to a new future time.
+     *
+     * <p>Reuses the create-path validation: {@link #validateStartsAt(OffsetDateTime)}
+     * (≥15 min ahead, ≤180 days), the same working-hours / effective-day check via
+     * {@link #assertStartsOnAvailableSlot} (the master must actually work the requested slot),
+     * the per-master advisory lock, and the overlap check — here excluding the booking's own row
+     * ({@link BookingRepository#existsOverlapExcluding}).
+     * A {@code CONFIRMED} booking reverts to {@code PENDING} (re-enters the approval queue);
+     * a {@code PENDING} booking stays {@code PENDING}. Either way the provider is re-notified
+     * via a {@code BOOKING_RESCHEDULED} outbox event. {@code priceAtBooking} and
+     * {@code durationMinutesAtBooking} are frozen and are NOT recomputed.
+     *
+     * <p>No change to {@code confirmBooking}/{@code declineBooking}: a rescheduled booking is
+     * an ordinary {@code PENDING} booking, so a later decline → {@code DECLINED} and a later
+     * confirm → {@code CONFIRMED} at the new time, via the existing transition logic.
+     *
+     * @param actorUserId the authenticated CLIENT (from the security principal, never the body)
+     * @param bookingId   the booking to move
+     * @param req         the new start time
+     * @return the updated booking
+     * @throws ForbiddenException if the actor is not the owning client (403)
+     * @throws BusinessException  if the source state is not PENDING/CONFIRMED (409) or the new
+     *                            slot conflicts (409); {@link #validateStartsAt} rejects bad times (400)
+     */
+    @Transactional
+    public BookingDetailResponse rescheduleBooking(UUID actorUserId, UUID bookingId, RescheduleBookingRequest req) {
+        Booking booking = loadBookingOrThrow(bookingId);
+
+        // Ownership: only the owning registered client may reschedule. A guest (LINK)
+        // booking has no client account, so getClient() is null and the actor can never match.
+        if (booking.getClient() == null || !booking.getClient().getId().equals(actorUserId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        BookingStatus current = booking.getStatus();
+        if (current != BookingStatus.PENDING && current != BookingStatus.CONFIRMED) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Cannot reschedule a booking in status %s".formatted(current));
+        }
+
+        OffsetDateTime newStartsAt = req.newStartsAt();
+        validateStartsAt(newStartsAt);
+
+        UUID masterId = booking.getMaster().getId();
+        UUID masterServiceId = booking.getMasterService().getId();
+
+        // Same working-hours / effective-day validation create relies on: the requested start
+        // must fall on a slot the master actually works (Phase 15.4 effective-day resolver +
+        // service/master liveness + duration bounds, via SlotCalculationService.getAvailableSlots).
+        // Run BEFORE the advisory lock to keep the lock window tight (backend-perf). An
+        // off-schedule time yields no matching slot → 409 "Slot not available", the same status
+        // the create/overlap path returns for an unbookable time. The authoritative overlap check
+        // (excluding this booking's own row) still runs under the lock below.
+        assertStartsOnAvailableSlot(masterId, masterServiceId, newStartsAt);
+
+        // Duration + buffer are frozen at the original booking; mirror the create-path
+        // end-time formula (duration + buffer) rather than recomputing from master_services.
+        OffsetDateTime newEndsAt = newStartsAt.plusMinutes(
+                (long) booking.getDurationMinutesAtBooking() + booking.getBufferMinutesAtBooking());
+
+        LocalDate oldDate = booking.getStartsAt().toLocalDate();
+
+        // Same critical section as doCreateBooking: serialize per-master, then overlap-check
+        // (excluding this booking's own row so it cannot collide with itself).
+        Integer lockResult = bookingRepository.acquireAdvisoryLock(masterId);
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
+        if (bookingRepository.existsOverlapExcluding(masterId, newStartsAt, newEndsAt, bookingId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        booking.reschedule(newStartsAt, newEndsAt);
+        Booking saved;
+        try {
+            saved = bookingRepository.saveAndFlush(booking);
+        } catch (DataIntegrityViolationException e) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        outboxService.enqueueBookingRescheduled(saved.getId());
+        // Evict the freed old-day slots and the now-occupied new-day slots, plus the
+        // provider calendar — after commit, so a parallel reader cannot repopulate stale data.
+        registerSlotEviction(masterId, oldDate, saved.getMasterService().getId());
+        if (!oldDate.equals(newStartsAt.toLocalDate())) {
+            registerSlotEviction(masterId, newStartsAt.toLocalDate(), saved.getMasterService().getId());
+        }
+        evictMasterCalendarAfterCommit(masterId);
+        return BookingDetailResponse.from(saved);
+    }
+
     private BookingResponse doCreateBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
         // Master kind is irrelevant to bookability — SALON_MASTER, INDEPENDENT_MASTER,
         // and SALON_OWNER masters are all bookable when active with working hours + a
@@ -295,6 +388,27 @@ public class BookingService {
         outboxService.enqueueNewBooking(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved);
+    }
+
+    /**
+     * Reuses the create-path effective-day / working-hours oracle: a start is bookable only
+     * if it matches a slot returned by {@link SlotCalculationService#getAvailableSlots} for the
+     * master + service on that date. That resolver applies the Phase 15.4 effective-day model
+     * (weekly templates, per-date overrides, day-offs), master/service liveness, and duration
+     * bounds — so a request to a time the master does not work resolves to no matching slot.
+     *
+     * <p>Compared by {@link OffsetDateTime#isEqual} on the slot start instant (the slot list is
+     * generated on {@code SLOT_STEP} boundaries in Kyiv time; {@code isEqual} ignores the
+     * offset/zone representation). A non-matching start throws {@code 409 "Slot not available"} —
+     * the same status the create/overlap path returns for an unbookable time.
+     */
+    private void assertStartsOnAvailableSlot(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
+        boolean onSchedule = slotCalculationService.getAvailableSlots(masterId, startsAt.toLocalDate(), masterServiceId)
+                .stream()
+                .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
+        if (!onSchedule) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
     }
 
     private void validateStartsAt(OffsetDateTime startsAt) {

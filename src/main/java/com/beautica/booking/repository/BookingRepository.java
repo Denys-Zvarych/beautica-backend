@@ -293,6 +293,32 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt
     );
 
+    /**
+     * Overlap check that excludes a single booking's own row — used by the reschedule
+     * flow so a booking does not collide with itself when only its time changes.
+     *
+     * <p>Same predicate as {@link #existsOverlap(UUID, OffsetDateTime, OffsetDateTime)}
+     * (PENDING/CONFIRMED rows only, half-open interval overlap) plus
+     * {@code id <> :excludeBookingId}. Callers must hold the per-master advisory lock
+     * (see {@link #acquireAdvisoryLock(UUID)}) before invoking, identical to create.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+              SELECT 1 FROM bookings
+               WHERE master_id = :masterId
+                 AND id <> :excludeBookingId
+                 AND status IN ('PENDING','CONFIRMED')
+                 AND starts_at < :requestedEndsAt
+                 AND ends_at   > :requestedStartsAt
+            )
+            """, nativeQuery = true)
+    boolean existsOverlapExcluding(
+            @Param("masterId") UUID masterId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("excludeBookingId") UUID excludeBookingId
+    );
+
     // ── View-access projection — ownership-only, role from SecurityContext ───────
     /**
      * Returns booking ownership data for {@code canViewBooking} in one round-trip.
