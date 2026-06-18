@@ -54,7 +54,12 @@ import java.util.UUID;
                 // FavoriteRepository.findFavoriteMasterRows. JPA cannot encode the DESC sort
                 // direction — V93 declares starts_at DESC; this annotation mirrors the columns
                 // only so ddl-auto=validate sees the index exists.
-                @Index(name = "idx_bookings_master_client_starts_at", columnList = "master_id, client_id, starts_at")
+                @Index(name = "idx_bookings_master_client_starts_at", columnList = "master_id, client_id, starts_at"),
+                // composite index (V95): BookingRepository.findClientBookingDetails unfiltered
+                // shape — WHERE client_id = ? ORDER BY starts_at DESC. JPA cannot encode the DESC
+                // sort direction — V95 declares starts_at DESC; this annotation mirrors the columns
+                // only so ddl-auto=validate sees the index exists.
+                @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at")
         }
 )
 @Getter

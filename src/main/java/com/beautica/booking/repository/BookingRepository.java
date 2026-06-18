@@ -217,6 +217,81 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """)
     List<Booking> findAllByIdsWithGraph(@Param("ids") List<UUID> ids);
 
+    // ── Client booking-detail projection (Phase 19.3) ─────────────────────────
+    /**
+     * One-query, N+1-free projection for {@code GET /bookings/me}: every field
+     * {@link com.beautica.booking.dto.BookingDetailResponse} needs for a client row,
+     * plus a {@code reviewExists} flag via {@code LEFT JOIN Review}.
+     *
+     * <p>{@code statusFilter} is optional: when {@code null} the
+     * {@code (:statusFilter IS NULL OR b.status = :statusFilter)} idiom matches all rows
+     * (one method covers both the filtered and unfiltered list paths).
+     *
+     * <p><b>Discovery locality is district-primary via the salon link</b> — the salon's
+     * city/district/address wins when the master is salon-employed, else the master's own
+     * user row. This mirrors {@code SearchService}'s {@code COALESCE(salon, user)} rule so
+     * the booking detail and search results agree on a provider's locality. The projection
+     * returns the FK ids only; {@code BookingService} resolves the {@code name_uk} labels
+     * through the {@code DiscoveryLocationResolver} M2 seam (§E: batched, not per row).
+     *
+     * <p>Pagination is safe to apply directly here: the query projects scalar columns (no
+     * JOIN FETCH on a collection), so Hibernate emits a correct SQL {@code LIMIT/OFFSET}
+     * and the HHH90003004 in-memory-pagination trap does not apply.
+     *
+     * <p>Scope: callers MUST pass the authenticated client's own user id — the predicate
+     * {@code b.client.id = :clientId} is the ownership boundary (Anti-Bug §E-4).
+     */
+    @Query(value = """
+            SELECT new com.beautica.booking.repository.ClientBookingDetailProjection(
+                b.id,
+                b.client.id,
+                m.id,
+                ms.id,
+                sd.name,
+                b.status,
+                b.startsAt,
+                b.endsAt,
+                b.priceAtBooking,
+                b.durationMinutesAtBooking,
+                b.createdAt,
+                b.client.firstName,
+                b.client.lastName,
+                mu.firstName,
+                mu.lastName,
+                b.clientComment,
+                b.providerComment,
+                mu.avatarUrl,
+                mu.role,
+                s.name,
+                COALESCE(s.cityId, mu.cityId),
+                COALESCE(s.districtId, mu.districtId),
+                COALESCE(s.street, mu.street),
+                COALESCE(s.buildingNo, mu.buildingNo),
+                sd.category,
+                CASE WHEN r.id IS NOT NULL THEN true ELSE false END
+            )
+            FROM Booking b
+            JOIN b.client
+            JOIN b.master m
+            JOIN m.user mu
+            LEFT JOIN m.salon s
+            JOIN b.masterService ms
+            JOIN ms.serviceDefinition sd
+            LEFT JOIN Review r ON r.booking = b
+            WHERE b.client.id = :clientId
+              AND (:statusFilter IS NULL OR b.status = :statusFilter)
+            ORDER BY b.startsAt DESC
+            """,
+            countQuery = """
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.client.id = :clientId
+              AND (:statusFilter IS NULL OR b.status = :statusFilter)
+            """)
+    Page<ClientBookingDetailProjection> findClientBookingDetails(
+            @Param("clientId") UUID clientId,
+            @Param("statusFilter") BookingStatus statusFilter,
+            Pageable pageable);
+
     // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────
 
     @Query("""

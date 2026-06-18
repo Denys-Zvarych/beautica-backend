@@ -12,7 +12,6 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
@@ -82,7 +81,7 @@ public class BookingController {
 
     @GetMapping("/me")
     @PreAuthorize("isAuthenticated()")
-    public ApiResponse<PageResponse<BookingResponse>> listMyBookings(
+    public ApiResponse<PageResponse<BookingDetailResponse>> listMyBookings(
             @RequestParam(required = false) BookingStatus status,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
@@ -91,14 +90,7 @@ public class BookingController {
         if (pageable.getPageNumber() > 1000) {
             pageable = PageRequest.of(1000, pageable.getPageSize(), pageable.getSort());
         }
-        Page<BookingResponse> page = bookingService.listBookings(principalId(auth), auth, status, pageable);
-        return ApiResponse.ok(PageResponse.of(
-                page.getContent(),
-                page.getNumber(),
-                page.getSize(),
-                page.getTotalElements(),
-                page.getTotalPages()
-        ));
+        return ApiResponse.ok(bookingService.getMyBookings(principalId(auth), auth, status, pageable));
     }
 
     @PatchMapping("/{bookingId}/confirm")

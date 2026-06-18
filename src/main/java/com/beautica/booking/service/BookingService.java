@@ -10,12 +10,18 @@ import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.ClientBookingDetailProjection;
+import com.beautica.common.PageResponse;
+import com.beautica.location.DiscoveryLocationResolver;
+import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
+import com.beautica.review.repository.ReviewRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.salon.entity.Salon;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -36,14 +42,19 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import com.beautica.common.TimeZones;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -60,6 +71,8 @@ public class BookingService {
     private final AuthorizationService authz;
     private final NotificationOutboxService outboxService;
     private final SlotCalculationService slotCalculationService;
+    private final ReviewRepository reviewRepository;
+    private final DiscoveryLocationResolver discoveryLocationResolver;
     private final Clock clock;
     private final CacheManager cacheManager;
 
@@ -80,11 +93,128 @@ public class BookingService {
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new NotFoundException("Booking not found"));
         authz.enforceCanViewBooking(actorUserId, booking);
-        return BookingDetailResponse.from(booking);
+        boolean canReview = canReview(booking.getStatus(), reviewRepository.existsByBookingId(bookingId));
+        return enrichSingle(booking, canReview);
     }
 
+    /**
+     * Builds the enriched {@link BookingDetailResponse} for a fully-hydrated booking,
+     * resolving the district-primary discovery locality labels through the M2 seam.
+     * Salon-employed masters resolve to the salon's locality; independent masters to the
+     * master's own user-row locality — mirroring {@code SearchService}'s COALESCE rule.
+     */
+    private BookingDetailResponse enrichSingle(Booking booking, boolean canReview) {
+        Salon salon = booking.getMaster().getSalon();
+        User masterUser = booking.getMaster().getUser();
+        UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
+        UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
+
+        DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
+                cityId == null ? List.of() : List.of(cityId),
+                districtId == null ? List.of() : List.of(districtId));
+
+        return BookingDetailResponse.from(
+                booking, canReview, labels.cityLabel(cityId), labels.districtLabel(districtId));
+    }
+
+    /** {@code canReview = COMPLETED && no existing review} — single source of the truth table. */
+    private static boolean canReview(BookingStatus status, boolean reviewExists) {
+        return status == BookingStatus.COMPLETED && !reviewExists;
+    }
+
+    /** Discovery city id: salon's when salon-employed, else the master's own user row. */
+    private static UUID discoveryCityId(Booking booking) {
+        Salon salon = booking.getMaster().getSalon();
+        return salon != null ? salon.getCityId() : booking.getMaster().getUser().getCityId();
+    }
+
+    /** Discovery district id: salon's when salon-employed, else the master's own user row. */
+    private static UUID discoveryDistrictId(Booking booking) {
+        Salon salon = booking.getMaster().getSalon();
+        return salon != null ? salon.getDistrictId() : booking.getMaster().getUser().getDistrictId();
+    }
+
+    /** Batch-resolves locality labels for a page of projections (M2 seam — fixed two queries). */
+    private DiscoveryLabels resolveProjectionLabels(List<ClientBookingDetailProjection> rows) {
+        Set<UUID> cityIds = new LinkedHashSet<>();
+        Set<UUID> districtIds = new LinkedHashSet<>();
+        for (ClientBookingDetailProjection r : rows) {
+            if (r.discoveryCityId() != null) {
+                cityIds.add(r.discoveryCityId());
+            }
+            if (r.discoveryDistrictId() != null) {
+                districtIds.add(r.discoveryDistrictId());
+            }
+        }
+        return discoveryLocationResolver.resolveLabels(cityIds, districtIds);
+    }
+
+    /** Batch-resolves locality labels for a page of hydrated bookings (M2 seam — fixed two queries). */
+    private DiscoveryLabels resolveBookingLabels(List<Booking> bookings) {
+        Set<UUID> cityIds = new LinkedHashSet<>();
+        Set<UUID> districtIds = new LinkedHashSet<>();
+        for (Booking b : bookings) {
+            UUID cityId = discoveryCityId(b);
+            UUID districtId = discoveryDistrictId(b);
+            if (cityId != null) {
+                cityIds.add(cityId);
+            }
+            if (districtId != null) {
+                districtIds.add(districtId);
+            }
+        }
+        return discoveryLocationResolver.resolveLabels(cityIds, districtIds);
+    }
+
+    /** Maps a CLIENT projection row to the enriched response, stamping resolved labels. */
+    private static BookingDetailResponse toDetailResponse(
+            ClientBookingDetailProjection p, DiscoveryLabels labels) {
+        return new BookingDetailResponse(
+                p.id(),
+                p.clientId(),
+                p.masterId(),
+                p.masterServiceId(),
+                p.serviceName(),
+                p.status(),
+                p.startsAt().atZoneSameInstant(TimeZones.KYIV),
+                p.endsAt().atZoneSameInstant(TimeZones.KYIV),
+                p.priceAtBooking(),
+                p.durationMinutesAtBooking(),
+                p.createdAt().atOffset(ZoneOffset.UTC),
+                p.clientFirstName(),
+                p.clientLastName(),
+                p.masterFirstName(),
+                p.masterLastName(),
+                p.clientComment(),
+                p.providerComment(),
+                p.masterAvatarUrl(),
+                p.masterType(),
+                p.salonName(),
+                labels.cityLabel(p.discoveryCityId()),
+                labels.districtLabel(p.discoveryDistrictId()),
+                p.street(),
+                p.buildingNo(),
+                p.categoryName(),
+                canReview(p.status(), p.reviewExists()));
+    }
+
+    /**
+     * Lists the actor's bookings as the enriched {@link BookingDetailResponse} (Phase 19.3 —
+     * {@code GET /bookings/me} switched from the lean {@code BookingResponse} per locked
+     * Option A). {@code canReview} is true only for a {@code COMPLETED} booking with no review.
+     *
+     * <p><b>CLIENT</b> uses the single-query {@code findClientBookingDetails} projection —
+     * {@code reviewExists} arrives inline via a {@code LEFT JOIN Review}, and the locality FK
+     * ids are batch-resolved to labels in a fixed two queries through the M2 seam (no N+1).
+     *
+     * <p><b>Provider roles</b> (master / salon-owner) reuse the established two-query ID-page +
+     * graph-hydrate pattern (Fix H1), then add exactly two bounded follow-ups for the page:
+     * one batched {@code findReviewedBookingIds} and the two-query label resolution — never a
+     * per-row lookup.
+     */
     @Transactional(readOnly = true)
-    public Page<BookingResponse> listBookings(UUID actorUserId, Authentication auth, BookingStatus status, Pageable pageable) {
+    public PageResponse<BookingDetailResponse> getMyBookings(
+            UUID actorUserId, Authentication auth, BookingStatus status, Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
         Role role = auth.getAuthorities().stream()
@@ -92,13 +222,46 @@ public class BookingService {
                 .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
 
+        Page<BookingDetailResponse> page = role == Role.CLIENT
+                ? listClientBookings(actorUserId, status, pageable)
+                : listProviderBookings(role, actorUserId, status, pageable);
+
+        return PageResponse.of(
+                page.getContent(),
+                page.getNumber(),
+                page.getSize(),
+                page.getTotalElements(),
+                page.getTotalPages());
+    }
+
+    /**
+     * CLIENT path — one projection query (reviewExists inline) + batched label resolution.
+     */
+    private Page<BookingDetailResponse> listClientBookings(
+            UUID clientId, BookingStatus status, Pageable pageable) {
+        Page<ClientBookingDetailProjection> page =
+                bookingRepository.findClientBookingDetails(clientId, status, pageable);
+        if (page.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, page.getTotalElements());
+        }
+
+        DiscoveryLabels labels = resolveProjectionLabels(page.getContent());
+        List<BookingDetailResponse> content = page.getContent().stream()
+                .map(p -> toDetailResponse(p, labels))
+                .toList();
+        return new PageImpl<>(content, pageable, page.getTotalElements());
+    }
+
+    /**
+     * Provider path — ID-page + graph hydrate (Fix H1), then one batched review-existence
+     * query and the two-query label resolution for the whole page.
+     */
+    private Page<BookingDetailResponse> listProviderBookings(
+            Role role, UUID actorUserId, BookingStatus status, Pageable pageable) {
         // Two-query pattern (Fix H1 — HHH90003004): first fetch a page of IDs using
         // plain JPQL with no JOIN FETCH (so the DB applies LIMIT/OFFSET correctly), then
         // batch-hydrate only those IDs with the full association graph in a second query.
         Page<UUID> idPage = switch (role) {
-            case CLIENT -> status == null
-                    ? bookingRepository.findIdsByClientId(actorUserId, pageable)
-                    : bookingRepository.findIdsByClientIdAndStatus(actorUserId, status, pageable);
             case SALON_MASTER, INDEPENDENT_MASTER -> {
                 Master master = masterRepository.findByUserId(actorUserId)
                         .orElseThrow(() -> new NotFoundException("Master profile not found"));
@@ -131,14 +294,25 @@ public class BookingService {
         }
 
         List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        // Batched review-existence for the whole page (one query), so canReview is correct
+        // without a per-row existsByBookingId (§E: no N+1).
+        Set<UUID> reviewed = new HashSet<>(reviewRepository.findReviewedBookingIds(idPage.getContent()));
+        DiscoveryLabels labels = resolveBookingLabels(hydrated);
+
         // Restore the original ordering dictated by the pageable sort — the IN clause
         // does not guarantee ordering from the database.
         Map<UUID, Booking> byId = hydrated.stream()
                 .collect(Collectors.toMap(Booking::getId, Function.identity()));
-        List<BookingResponse> ordered = idPage.getContent().stream()
+        List<BookingDetailResponse> ordered = idPage.getContent().stream()
                 .map(byId::get)
                 .filter(Objects::nonNull)
-                .map(BookingResponse::from)
+                .map(b -> {
+                    UUID cityId = discoveryCityId(b);
+                    UUID districtId = discoveryDistrictId(b);
+                    boolean canReview = canReview(b.getStatus(), reviewed.contains(b.getId()));
+                    return BookingDetailResponse.from(
+                            b, canReview, labels.cityLabel(cityId), labels.districtLabel(districtId));
+                })
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
@@ -314,7 +488,9 @@ public class BookingService {
             registerSlotEviction(masterId, newStartsAt.toLocalDate(), saved.getMasterService().getId());
         }
         evictMasterCalendarAfterCommit(masterId);
-        return BookingDetailResponse.from(saved);
+        // A rescheduled booking is always PENDING/CONFIRMED, so canReview is false by the
+        // COMPLETED predicate — no review-existence query needed on this path.
+        return enrichSingle(saved, canReview(saved.getStatus(), false));
     }
 
     private BookingResponse doCreateBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {

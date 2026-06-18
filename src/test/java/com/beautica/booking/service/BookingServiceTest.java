@@ -55,6 +55,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -88,6 +89,10 @@ class BookingServiceTest {
     @Mock
     private SlotCalculationService slotCalculationService;
     @Mock
+    private com.beautica.review.repository.ReviewRepository reviewRepository;
+    @Mock
+    private com.beautica.location.DiscoveryLocationResolver discoveryLocationResolver;
+    @Mock
     private CacheManager cacheManager;
 
     private Clock clock;
@@ -119,6 +124,8 @@ class BookingServiceTest {
                 authz,
                 outboxService,
                 slotCalculationService,
+                reviewRepository,
+                discoveryLocationResolver,
                 clock,
                 cacheManager
         );
@@ -845,6 +852,10 @@ class BookingServiceTest {
         when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId)))
                 .thenReturn(List.of(slot));
         when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        // Reschedule success builds the enriched BookingDetailResponse via the label seam.
+        // lenient: the 409-overlap test stubs the slot/lock but throws before enrichment.
+        org.mockito.Mockito.lenient()
+                .when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
     }
 
     @Test
@@ -1090,7 +1101,11 @@ class BookingServiceTest {
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.DECLINED);
     }
 
-    // ── listBookings ───────────────────────────────────────────────────────────
+    // ── getMyBookings (Phase 19.3 — enriched BookingDetailResponse) ──────────────
+
+    private com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels emptyLabels() {
+        return new com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels(Map.of(), Map.of());
+    }
 
     @Test
     @DisplayName("filtered bookings page is returned when salon owner queries with a specific status")
@@ -1103,10 +1118,10 @@ class BookingServiceTest {
         when(bookingRepository.findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.PENDING, pageable))
                 .thenReturn(Page.empty());
 
-        Page<BookingResponse> result =
-                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.PENDING, pageable);
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.PENDING, pageable);
 
-        assertThat(result.getTotalElements()).isZero();
+        assertThat(result.totalElements()).isZero();
         verify(bookingRepository).findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.PENDING, pageable);
         verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
     }
@@ -1122,8 +1137,8 @@ class BookingServiceTest {
         when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
                 .thenReturn(Page.empty());
 
-        Page<BookingResponse> result =
-                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findIdsBySalonIds(List.of(salonId), pageable);
@@ -1131,7 +1146,7 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("mapped BookingResponse page is returned when salon owner lists with a non-empty page")
+    @DisplayName("mapped detail page is returned when salon owner lists with a non-empty page")
     void should_returnMappedBookings_when_salonOwnerListsWithNonEmptyPage() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -1143,12 +1158,14 @@ class BookingServiceTest {
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
+        when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        Page<BookingResponse> result =
-                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
-        assertThat(result.getTotalElements()).isEqualTo(1);
-        assertThat(result.getContent()).hasSize(1);
+        assertThat(result.totalElements()).isEqualTo(1);
+        assertThat(result.data()).hasSize(1);
     }
 
     @Test
@@ -1159,15 +1176,15 @@ class BookingServiceTest {
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
 
-        Page<BookingResponse> result =
-                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
-        assertThat(result).isEmpty();
+        assertThat(result.data()).isEmpty();
         verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
         verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
     }
 
-    // ── Finding 1: new SALON_OWNER multi-salon tests ───────────────────────────
+    // ── Finding 1: SALON_OWNER multi-salon tests ───────────────────────────────
 
     @Test
     @DisplayName("salon owner with multiple salons receives bookings from all owned salons")
@@ -1184,11 +1201,13 @@ class BookingServiceTest {
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
+        when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        Page<BookingResponse> result =
-                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
-        assertThat(result.getTotalElements()).isEqualTo(1);
+        assertThat(result.totalElements()).isEqualTo(1);
         verify(salonRepository).findIdsByOwnerIdAndIsActiveTrue(actorId);
         verify(bookingRepository).findIdsBySalonIds(salonIds, pageable);
     }
@@ -1201,41 +1220,40 @@ class BookingServiceTest {
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
 
-        Page<BookingResponse> result =
-                bookingService.listBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
-        assertThat(result).isEmpty();
+        assertThat(result.data()).isEmpty();
         verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
         verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
     }
 
     @Test
-    @DisplayName("CLIENT with no status filter receives bookings from the client-scoped repository method")
+    @DisplayName("CLIENT with no status filter queries the enriched client projection")
     void should_returnClientBookings_when_clientListsWithoutStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findIdsByClientId(clientId, pageable)).thenReturn(Page.empty());
+        when(bookingRepository.findClientBookingDetails(clientId, null, pageable)).thenReturn(Page.empty());
 
-        Page<BookingResponse> result = bookingService.listBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsByClientId(clientId, pageable);
-        verify(bookingRepository, never()).findIdsByClientIdAndStatus(any(), any(), any());
+        verify(bookingRepository).findClientBookingDetails(clientId, null, pageable);
+        verify(bookingRepository, never()).findIdsByClientId(any(), any());
     }
 
     @Test
-    @DisplayName("CLIENT with PENDING status filter receives bookings from the status-scoped repository method")
+    @DisplayName("CLIENT with PENDING status filter passes the status to the enriched client projection")
     void should_returnClientBookings_when_clientListsWithStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findIdsByClientIdAndStatus(clientId, BookingStatus.PENDING, pageable))
+        when(bookingRepository.findClientBookingDetails(clientId, BookingStatus.PENDING, pageable))
                 .thenReturn(Page.empty());
 
-        Page<BookingResponse> result = bookingService.listBookings(clientId, buildAuth(Role.CLIENT), BookingStatus.PENDING, pageable);
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), BookingStatus.PENDING, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsByClientIdAndStatus(clientId, BookingStatus.PENDING, pageable);
-        verify(bookingRepository, never()).findIdsByClientId(any(), any());
+        verify(bookingRepository).findClientBookingDetails(clientId, BookingStatus.PENDING, pageable);
     }
 
     @Test
@@ -1248,7 +1266,7 @@ class BookingServiceTest {
         when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
         when(bookingRepository.findIdsByMasterId(masterId, pageable)).thenReturn(Page.empty());
 
-        Page<BookingResponse> result = bookingService.listBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER), null, pageable);
+        var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER), null, pageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findIdsByMasterId(masterId, pageable);
@@ -1265,7 +1283,7 @@ class BookingServiceTest {
         when(bookingRepository.findIdsByMasterIdAndStatus(masterId, BookingStatus.CONFIRMED, pageable))
                 .thenReturn(Page.empty());
 
-        Page<BookingResponse> result = bookingService.listBookings(
+        var result = bookingService.getMyBookings(
                 salonMasterUserId, buildAuth(Role.SALON_MASTER), BookingStatus.CONFIRMED, pageable);
 
         assertThat(result).isNotNull();
@@ -1274,13 +1292,13 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("ForbiddenException is thrown when SALON_ADMIN calls listBookings")
+    @DisplayName("ForbiddenException is thrown when SALON_ADMIN calls getMyBookings")
     void should_throwForbidden_when_salonAdminListsBookings() {
         UUID salonAdminId = UUID.randomUUID();
         User salonAdmin = buildUser(salonAdminId, Role.SALON_ADMIN);
         Pageable pageable = Pageable.unpaged();
 
-        assertThatThrownBy(() -> bookingService.listBookings(salonAdminId, buildAuth(Role.SALON_ADMIN), null, pageable))
+        assertThatThrownBy(() -> bookingService.getMyBookings(salonAdminId, buildAuth(Role.SALON_ADMIN), null, pageable))
                 .isInstanceOf(ForbiddenException.class);
     }
 
@@ -1291,12 +1309,15 @@ class BookingServiceTest {
     void should_returnBooking_when_getBookingCalledByOwner() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
         assertThat(result).isNotNull();
         assertThat(result.id()).isEqualTo(bookingId);
         assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(result.canReview()).isFalse();
         verify(authz).enforceCanViewBooking(clientId, booking);
     }
 
@@ -1313,5 +1334,146 @@ class BookingServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verify(authz).enforceCanViewBooking(clientBId, booking);
+    }
+
+    // ── getBooking — canReview truth table (Phase 19.3) ──────────────────────────
+    //
+    // canReview = (status == COMPLETED) && no existing Review for the booking.
+    // Each row of the truth table stubs reviewRepository.existsByBookingId and the
+    // status, then asserts the single observable predicate on the response.
+
+    private BookingDetailResponse getBookingWith(BookingStatus status, boolean reviewExists) {
+        Booking booking = buildBooking(bookingId, client, master, msa, status);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(reviewExists);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        return bookingService.getBooking(clientId, bookingId);
+    }
+
+    @Test
+    @DisplayName("canReview is false for a PENDING booking (not COMPLETED)")
+    void should_returnCanReviewFalse_when_bookingPending() {
+        assertThat(getBookingWith(BookingStatus.PENDING, false).canReview()).isFalse();
+        // A PENDING booking is never review-eligible, so the existence check is irrelevant
+        // to the outcome — but the predicate must still short-circuit to false on status.
+    }
+
+    @Test
+    @DisplayName("canReview is false for a CONFIRMED booking (not COMPLETED)")
+    void should_returnCanReviewFalse_when_bookingConfirmed() {
+        assertThat(getBookingWith(BookingStatus.CONFIRMED, false).canReview()).isFalse();
+    }
+
+    @Test
+    @DisplayName("canReview is true for a COMPLETED booking with no existing review")
+    void should_returnCanReviewTrue_when_bookingCompletedAndNoReview() {
+        assertThat(getBookingWith(BookingStatus.COMPLETED, false).canReview()).isTrue();
+    }
+
+    @Test
+    @DisplayName("canReview is false for a COMPLETED booking that already has a review")
+    void should_returnCanReviewFalse_when_bookingCompletedAndReviewExists() {
+        assertThat(getBookingWith(BookingStatus.COMPLETED, true).canReview()).isFalse();
+    }
+
+    // ── getBooking — enriched fields (Phase 19.3) ────────────────────────────────
+
+    /** Builds a master whose own User row carries an avatar + address + role. */
+    private Master buildEnrichedMaster(MasterType type, Role userRole, String avatarUrl,
+                                       UUID cityId, UUID districtId, String street, String buildingNo) {
+        User masterUser = new User("master@example.com", "hash", userRole, "Olena", "Koval", "+380509999999");
+        setField(masterUser, "id", UUID.randomUUID());
+        masterUser.setAvatarUrl(avatarUrl);
+        masterUser.setCityId(cityId);
+        masterUser.setDistrictId(districtId);
+        masterUser.setStreet(street);
+        masterUser.setBuildingNo(buildingNo);
+        Master m = Master.builder().user(masterUser).masterType(type).isActive(true).build();
+        setField(m, "id", masterId);
+        return m;
+    }
+
+    @Test
+    @DisplayName("getBooking populates the master avatar, type, own-locality address, category and a null salonName for an independent-master booking")
+    void should_populateEnrichedFields_when_independentMasterBooking() {
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        Master enriched = buildEnrichedMaster(
+                MasterType.INDEPENDENT_MASTER, Role.INDEPENDENT_MASTER,
+                "https://cdn.test/avatar.png", cityId, districtId, "Khreschatyk", "10");
+        MasterServiceAssignment enrichedMsa = buildMsa(masterServiceId, enriched, serviceDef, null, null);
+        Booking booking = buildBooking(bookingId, client, enriched, enrichedMsa, BookingStatus.COMPLETED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(
+                new com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels(
+                        Map.of(cityId, "Kyiv"), Map.of(districtId, "Shevchenkivskyi")));
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result)
+                .extracting(
+                        BookingDetailResponse::masterAvatarUrl,
+                        BookingDetailResponse::masterType,
+                        BookingDetailResponse::salonName,
+                        BookingDetailResponse::cityLabel,
+                        BookingDetailResponse::districtLabel,
+                        BookingDetailResponse::street,
+                        BookingDetailResponse::buildingNo,
+                        BookingDetailResponse::canReview)
+                .containsExactly(
+                        "https://cdn.test/avatar.png",
+                        Role.INDEPENDENT_MASTER,
+                        null,
+                        "Kyiv",
+                        "Shevchenkivskyi",
+                        "Khreschatyk",
+                        "10",
+                        true);
+    }
+
+    @Test
+    @DisplayName("getBooking surfaces the salon name and salon-primary address/labels for a salon-employed master")
+    void should_populateSalonFields_when_salonEmployedMasterBooking() {
+        UUID salonCityId = UUID.randomUUID();
+        UUID salonDistrictId = UUID.randomUUID();
+        // Master's own user row carries DIFFERENT locality to prove the salon link wins.
+        Master enriched = buildEnrichedMaster(
+                MasterType.SALON_MASTER, Role.SALON_MASTER,
+                "https://cdn.test/salon-master.png", UUID.randomUUID(), UUID.randomUUID(), "OwnStreet", "99");
+        com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder()
+                .name("Glamour Studio")
+                .cityId(salonCityId)
+                .districtId(salonDistrictId)
+                .street("Volodymyrska")
+                .buildingNo("55")
+                .isActive(true)
+                .build();
+        setField(enriched, "salon", salon);
+        MasterServiceAssignment enrichedMsa = buildMsa(masterServiceId, enriched, serviceDef, null, null);
+        Booking booking = buildBooking(bookingId, client, enriched, enrichedMsa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(
+                new com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels(
+                        Map.of(salonCityId, "Lviv"), Map.of(salonDistrictId, "Halytskyi")));
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result)
+                .extracting(
+                        BookingDetailResponse::salonName,
+                        BookingDetailResponse::masterType,
+                        BookingDetailResponse::cityLabel,
+                        BookingDetailResponse::districtLabel,
+                        BookingDetailResponse::street,
+                        BookingDetailResponse::buildingNo)
+                .containsExactly(
+                        "Glamour Studio",
+                        Role.SALON_MASTER,
+                        "Lviv",
+                        "Halytskyi",
+                        "Volodymyrska",
+                        "55");
     }
 }

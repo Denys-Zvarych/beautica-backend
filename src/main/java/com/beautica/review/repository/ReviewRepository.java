@@ -18,6 +18,16 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     // Cheaper than findByBookingId(...).isPresent() — derived as SELECT COUNT(*) > 0.
     boolean existsByBookingId(UUID bookingId);
 
+    /**
+     * Batch existence check: returns the subset of the supplied booking ids that already
+     * have a review. Used by {@code BookingService} to compute {@code canReview} for a page
+     * of provider-scoped bookings in ONE query (§E: no per-row {@code existsByBookingId}).
+     * The CLIENT list path does not use this — its projection carries {@code reviewExists}
+     * inline via a {@code LEFT JOIN}.
+     */
+    @Query("SELECT r.booking.id FROM Review r WHERE r.booking.id IN :bookingIds")
+    java.util.List<UUID> findReviewedBookingIds(@Param("bookingIds") java.util.List<UUID> bookingIds);
+
     // Two-query pattern — avoids HHH90003004 (Hibernate in-memory pagination warning).
     // Step 1: paginate on IDs only — SQL LIMIT/OFFSET, no JOIN FETCH.
     @Query(value = """
