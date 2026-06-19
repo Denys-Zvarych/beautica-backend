@@ -7,6 +7,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -125,4 +126,22 @@ public interface CityDistrictRepository extends JpaRepository<CityDistrict, UUID
      */
     @Query("SELECT d.id, d.nameUk FROM CityDistrict d WHERE d.id IN :ids")
     List<Object[]> findNameUkByIdIn(@Param("ids") Collection<UUID> ids);
+
+    /**
+     * Resolves a single urban-district {@code name_uk} label by its id.
+     *
+     * <p>Single-key sibling of {@link #findNameUkByIdIn(Collection)}: used by
+     * the {@code GET /users/me} read path to stamp the {@code districtName}
+     * onto {@link com.beautica.user.UserProfileResponse} when the account owner
+     * has a {@code districtId} set. Scalar projection ({@code name_uk} only)
+     * avoids hydrating the {@link CityDistrict} entity and its LAZY
+     * {@code city}. Single-row by PK, so this is not a §E "non-graph variant"
+     * concern — it is the per-row read for a one-off profile lookup, never a
+     * page-level loop (the batch path uses {@link #findNameUkByIdIn} instead).
+     *
+     * @param id surrogate PK of the district to resolve
+     * @return the district's {@code name_uk}, or empty when the id is unknown
+     */
+    @Query("SELECT d.nameUk FROM CityDistrict d WHERE d.id = :id")
+    Optional<String> findNameUkById(@Param("id") UUID id);
 }

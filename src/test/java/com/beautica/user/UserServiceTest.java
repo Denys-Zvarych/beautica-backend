@@ -8,6 +8,7 @@ import com.beautica.location.LocalityWriteInput;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
@@ -30,6 +31,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -47,13 +49,17 @@ class UserServiceTest {
     private CityRepository cityRepository;
 
     @Mock
+    private CityDistrictRepository cityDistrictRepository;
+
+    @Mock
     private CacheManager cacheManager;
 
     private UserService userService;
 
     @BeforeEach
     void setUp() {
-        userService = new UserService(userRepository, localityWriteValidator, cityRepository, cacheManager);
+        userService = new UserService(
+                userRepository, localityWriteValidator, cityRepository, cityDistrictRepository, cacheManager);
     }
 
     @Test
@@ -73,6 +79,73 @@ class UserServiceTest {
         assertThat(response.lastName()).isEqualTo("Smith");
         assertThat(response.phoneNumber()).isEqualTo("+380671234567");
         assertThat(response.isActive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("getProfile resolves districtName and never queries the district repo when districtId is null")
+    void should_notQueryDistrict_when_districtIdNull() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "noloc@example.com", Role.CLIENT, "No", "District", "+380501111111");
+        // districtId left null; cityName/oblastName read off denormalised columns.
+        user.setCity("Київ");
+        user.setRegion("Київська область");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.cityName())
+                .as("cityName is read off the denormalised users.city column (zero query)")
+                .isEqualTo("Київ");
+        assertThat(response.oblastName())
+                .as("oblastName is read off the denormalised users.region column (zero query)")
+                .isEqualTo("Київська область");
+        assertThat(response.districtName())
+                .as("no districtId set → districtName stays null")
+                .isNull();
+        verify(cityDistrictRepository, never()).findNameUkById(any());
+    }
+
+    @Test
+    @DisplayName("getProfile resolves districtName via findNameUkById exactly once when districtId is set")
+    void should_resolveDistrictName_when_districtIdSet() {
+        UUID userId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User user = buildUser(userId, "withdist@example.com", Role.CLIENT, "Has", "District", "+380501111111");
+        user.setCity("Дніпро");
+        user.setRegion("Дніпропетровська область");
+        user.setDistrictId(districtId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityDistrictRepository.findNameUkById(districtId)).thenReturn(Optional.of("Соборний район"));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.cityName()).isEqualTo("Дніпро");
+        assertThat(response.oblastName()).isEqualTo("Дніпропетровська область");
+        assertThat(response.districtName())
+                .as("districtName is the name_uk resolved by findNameUkById for the set districtId")
+                .isEqualTo("Соборний район");
+        verify(cityDistrictRepository, times(1)).findNameUkById(districtId);
+    }
+
+    @Test
+    @DisplayName("getProfile returns null districtName when the district lookup resolves empty (orElse(null) arm)")
+    void should_returnNullDistrictName_when_lookupEmpty() {
+        UUID userId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User user = buildUser(userId, "staledist@example.com", Role.CLIENT, "Stale", "District", "+380501111111");
+        user.setDistrictId(districtId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityDistrictRepository.findNameUkById(districtId)).thenReturn(Optional.empty());
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.districtName())
+                .as("an unresolved districtId falls back to null via orElse(null), never throws")
+                .isNull();
+        verify(cityDistrictRepository, times(1)).findNameUkById(districtId);
     }
 
     @Test

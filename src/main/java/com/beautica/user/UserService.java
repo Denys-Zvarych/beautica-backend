@@ -8,6 +8,7 @@ import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
@@ -27,15 +28,18 @@ public class UserService {
     private final UserRepository userRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final CityRepository cityRepository;
+    private final CityDistrictRepository cityDistrictRepository;
     private final CacheManager cacheManager;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
                        CityRepository cityRepository,
+                       CityDistrictRepository cityDistrictRepository,
                        CacheManager cacheManager) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
         this.cityRepository = cityRepository;
+        this.cityDistrictRepository = cityDistrictRepository;
         this.cacheManager = cacheManager;
     }
 
@@ -43,7 +47,13 @@ public class UserService {
     public UserProfileResponse getProfile(UUID userId) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
-        return UserProfileResponse.from(user);
+        // cityName/oblastName are read off the denormalised users.city/users.region columns
+        // by UserProfileResponse.from (zero query). districtName is resolved on demand only
+        // when a district is set — most users (CLIENTs, districtless cities) skip the query.
+        String districtName = user.getDistrictId() == null
+                ? null
+                : cityDistrictRepository.findNameUkById(user.getDistrictId()).orElse(null);
+        return UserProfileResponse.from(user, districtName);
     }
 
     @Transactional

@@ -174,6 +174,9 @@ class IndependentMasterControllerTest {
                 null,         // phoneNumber
                 cityId,
                 null,         // districtId
+                null,         // cityName
+                null,         // oblastName
+                null,         // districtName
                 "вулиця Хрещатик, 1",
                 null,         // buildingNo
                 null,         // locationNote
