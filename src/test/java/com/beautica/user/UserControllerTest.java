@@ -114,6 +114,7 @@ class UserControllerTest {
                 userId, "jane@example.com", "CLIENT",
                 "Jane", "Doe", "+380671234567",
                 null, null,                   // cityId, districtId
+                null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
                 null, null,                   // bio, instagram
@@ -151,6 +152,7 @@ class UserControllerTest {
                 userId, "jane@example.com", "CLIENT",
                 "Oksana", "Kovalenko", null,
                 null, null,                   // cityId, districtId
+                null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
                 null, null,                   // bio, instagram
@@ -337,6 +339,7 @@ class UserControllerTest {
                 userId, "jane@example.com", "CLIENT",
                 "Анна-Марія", "О’Коннор", null,
                 null, null,                   // cityId, districtId
+                null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
                 null, null,                   // bio, instagram
@@ -367,6 +370,7 @@ class UserControllerTest {
                 userId, "jane@example.com", "CLIENT",
                 "Jane", "Doe", "+380671234567",
                 null, null,                   // cityId, districtId
+                null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
                 null, null,                   // bio, instagram
@@ -406,6 +410,7 @@ class UserControllerTest {
                 userId, "jane@example.com", "CLIENT",
                 "Jane", "Doe", null,
                 null, null,                   // cityId, districtId
+                null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
                 null, "beauty_studio",        // bio, instagram (normalized — @ stripped by the service)
@@ -437,6 +442,7 @@ class UserControllerTest {
                 userId, "jane@example.com", "CLIENT",
                 "Jane", "Doe", null,
                 null, null,                   // cityId, districtId
+                null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
                 null, null,                   // instagram cleared by the service (blank → null)

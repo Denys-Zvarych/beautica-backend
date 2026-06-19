@@ -53,7 +53,15 @@ public class UserService {
         String districtName = user.getDistrictId() == null
                 ? null
                 : cityDistrictRepository.findNameUkById(user.getDistrictId()).orElse(null);
-        return UserProfileResponse.from(user, districtName);
+        // oblastId lets the mobile Location-edit screen pre-select the oblast tier without
+        // scanning every oblast's cities. Resolved on demand only when a city is set — one
+        // scalar FK lookup (cities.oblast_id, no JOIN to oblasts); null otherwise. No City is
+        // loaded on this read path (cityName/oblastName come from denormalised columns), so
+        // there is nothing to reuse — this is the minimal extra query.
+        UUID oblastId = user.getCityId() == null
+                ? null
+                : cityRepository.findOblastIdById(user.getCityId()).orElse(null);
+        return UserProfileResponse.from(user, districtName, oblastId);
     }
 
     @Transactional

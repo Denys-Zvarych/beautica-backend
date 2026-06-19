@@ -174,6 +174,7 @@ class IndependentMasterControllerTest {
                 null,         // phoneNumber
                 cityId,
                 null,         // districtId
+                null,         // oblastId
                 null,         // cityName
                 null,         // oblastName
                 null,         // districtName

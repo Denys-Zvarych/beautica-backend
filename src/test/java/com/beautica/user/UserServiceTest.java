@@ -149,6 +149,62 @@ class UserServiceTest {
     }
 
     @Test
+    @DisplayName("getProfile resolves oblastId via findOblastIdById exactly once when cityId is set")
+    void should_resolveOblastId_when_cityIdSet() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User user = buildUser(userId, "withcity@example.com", Role.CLIENT, "Has", "City", "+380501111111");
+        user.setCityId(cityId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.of(oblastId));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.oblastId())
+                .as("oblastId is the parent oblast id resolved by findOblastIdById for the set cityId")
+                .isEqualTo(oblastId);
+        verify(cityRepository, times(1)).findOblastIdById(cityId);
+    }
+
+    @Test
+    @DisplayName("getProfile returns null oblastId and never queries the city repo when cityId is null")
+    void should_notQueryOblast_when_cityIdNull() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "nocity@example.com", Role.CLIENT, "No", "City", "+380501111111");
+        // cityId left null — the home-hub/Location-edit pre-select has nothing to resolve.
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.oblastId())
+                .as("no cityId set → oblastId stays null and no query is issued")
+                .isNull();
+        verify(cityRepository, never()).findOblastIdById(any());
+    }
+
+    @Test
+    @DisplayName("getProfile returns null oblastId when the city lookup resolves empty (orElse(null) arm)")
+    void should_returnNullOblastId_when_lookupEmpty() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "stalecity@example.com", Role.CLIENT, "Stale", "City", "+380501111111");
+        user.setCityId(cityId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.empty());
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.oblastId())
+                .as("an unresolved cityId falls back to null via orElse(null), never throws")
+                .isNull();
+        verify(cityRepository, times(1)).findOblastIdById(cityId);
+    }
+
+    @Test
     @DisplayName("getProfile throws NotFoundException when user does not exist")
     void should_throwNotFoundException_when_userNotFound() {
         UUID userId = UUID.randomUUID();

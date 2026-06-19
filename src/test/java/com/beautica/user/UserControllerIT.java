@@ -477,6 +477,9 @@ class UserControllerIT extends AbstractIntegrationTest {
         assertThat(apiResponse.data().districtName())
                 .as("districtName is resolved via CityDistrictRepository.findNameUkById when a district is set")
                 .isNotBlank();
+        assertThat(apiResponse.data().oblastId())
+                .as("oblastId is resolved via CityRepository.findOblastIdById and must equal the city's parent oblast")
+                .isEqualTo(oblastIdOfCity(cityId));
     }
 
     @Test
@@ -498,6 +501,9 @@ class UserControllerIT extends AbstractIntegrationTest {
         var apiResponse = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
         assertThat(apiResponse.data().cityId()).isNull();
+        assertThat(apiResponse.data().oblastId())
+                .as("no city set → oblastId is never resolved (no query) and stays null")
+                .isNull();
         assertThat(apiResponse.data().cityName())
                 .as("no city set → cityName is null (no denormalised value)")
                 .isNull();
@@ -784,6 +790,16 @@ class UserControllerIT extends AbstractIntegrationTest {
     private UUID anyDistrictOfCity(UUID cityId) {
         return jdbcTemplate.queryForObject(
                 "SELECT id FROM city_districts WHERE city_id = ? LIMIT 1", UUID.class, cityId);
+    }
+
+    /**
+     * Resolves the parent oblast id of a seeded city from the live seed (ids are
+     * assigned via {@code gen_random_uuid()}), so the GET /me oblastId assertion
+     * never hardcodes a UUID and stays correct if the snapshot changes.
+     */
+    private UUID oblastIdOfCity(UUID cityId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT oblast_id FROM cities WHERE id = ?", UUID.class, cityId);
     }
 
     /**
