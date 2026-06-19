@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Read-only aggregation repository backing the BEAUTI PASSPORT + BEAUTY TIMELINE
+ * Read-only aggregation repository backing the BEAUTY PASSPORT + BEAUTY TIMELINE
  * (Phase 19.5). Owns a concern distinct from {@code BookingRepository}'s booking
  * management — passport/timeline projections over the signed-in client's history —
  * so per the feature-packaging + SRP rules it lives in the {@code client} package

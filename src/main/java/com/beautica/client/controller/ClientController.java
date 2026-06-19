@@ -21,7 +21,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.UUID;
 
 /**
- * Read-only, principal-scoped BEAUTI PASSPORT + BEAUTY TIMELINE endpoints (Phase 19.5).
+ * Read-only, principal-scoped BEAUTY PASSPORT + BEAUTY TIMELINE endpoints (Phase 19.5).
  *
  * <p>Both endpoints derive everything from the authenticated client's own COMPLETED
  * booking history. The client id always comes from the security principal — there is no

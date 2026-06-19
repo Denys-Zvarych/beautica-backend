@@ -3,7 +3,7 @@ package com.beautica.client.dto;
 import java.util.List;
 
 /**
- * Auto-derived BEAUTI PASSPORT for the signed-in client (Phase 19.5).
+ * Auto-derived BEAUTY PASSPORT for the signed-in client (Phase 19.5).
  *
  * <p>Read-only aggregation over the client's <b>COMPLETED</b> bookings only; there is
  * no preferences entity and nothing here is user-editable. Empty-state contract:
