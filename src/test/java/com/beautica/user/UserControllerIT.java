@@ -443,6 +443,55 @@ class UserControllerIT extends AbstractIntegrationTest {
                 .isNull();
     }
 
+    @Test
+    @DisplayName("PATCH /me (CLIENT) — a later street-only PATCH (cityId null) RETAINS the saved city; GET /me still resolves cityId/oblastId/cityName (regression: FK-wipe bug)")
+    void should_retainCity_when_clientPatchesStreetOnlyAfterSettingCity() throws Exception {
+        log.debug("Arrange: register a CLIENT and set a real seeded city via a first PATCH");
+        String accessToken = registerAndGetToken(
+                "client-fkwipe@beautica.com", "Str0ngP@ss1!", "Anna", "Klient", null);
+        UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
+        UUID districtId = anyDistrictOfCity(cityId);
+
+        // First PATCH: persist the city (and a child district) — the saved discovery default.
+        var setCity = new UpdateProfileRequest(null, null, null,
+                cityId, districtId, null, null, null, null);
+        restTemplate.exchange("/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(setCity, bearerHeaders(accessToken)), String.class);
+
+        // Second PATCH: the mobile Location screen edits ONLY the street. cityId is null because a
+        // CLIENT city is optional. Pre-fix this wiped users.city_id; post-fix it must be retained.
+        log.debug("Act: PATCH /api/v1/users/me with street only and cityId=null — must NOT wipe the saved city FK");
+        var streetOnly = new UpdateProfileRequest(null, null, null,
+                null, null, "вул. Нова", null, null, null);
+        ResponseEntity<String> patchResponse = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(streetOnly, bearerHeaders(accessToken)), String.class);
+
+        assertThat(patchResponse.getStatusCode())
+                .as("a street-only CLIENT PATCH with null cityId must be a clean 200")
+                .isEqualTo(HttpStatus.OK);
+
+        log.debug("Act: GET /api/v1/users/me — the saved city must still resolve (mobile read keys off cityId/oblastId)");
+        ResponseEntity<String> getResponse = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(accessToken)), String.class);
+
+        var apiResponse = objectMapper.readValue(
+                getResponse.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().cityId())
+                .as("the city FK must survive a street-only edit — the original FK-wipe bug")
+                .isEqualTo(cityId);
+        assertThat(apiResponse.data().oblastId())
+                .as("oblastId still resolves from the retained cityId (the mobile read key)")
+                .isEqualTo(oblastIdOfCity(cityId));
+        assertThat(apiResponse.data().cityName())
+                .as("the denormalized cityName is unchanged and still rendered")
+                .isNotBlank();
+        assertThat(apiResponse.data().street())
+                .as("the street edit DID land")
+                .isEqualTo("вул. Нова");
+    }
+
     // ── Client home hub — resolved locality NAMES on GET /me ─────────────────
 
     @Test

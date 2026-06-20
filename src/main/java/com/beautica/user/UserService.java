@@ -262,12 +262,22 @@ public class UserService {
      * here only — callers are unchanged.
      */
     private void writeLocalityFields(User user, UpdateProfileRequest request) {
-        user.setCityId(request.cityId());
-        user.setDistrictId(request.districtId());
+        // PATCH semantics: a null cityId means "locality not included in this update",
+        // NOT "clear my city". Assigning unconditionally let a street/note-only edit
+        // (cityId omitted) wipe a previously-saved city FK while leaving the denormalized
+        // city/region text behind — the mobile read keys off cityId/oblastId, so location
+        // then rendered empty. Only (re)write the FK + display strings when a city is supplied.
+        // A city-with-no-districts case is still handled correctly: when a real cityId is
+        // sent, setDistrictId(request.districtId()) runs with the supplied (possibly null)
+        // districtId, so districtless cities persist district_id = NULL as before.
+        if (request.cityId() != null) {
+            user.setCityId(request.cityId());
+            user.setDistrictId(request.districtId());
+            writeCityDisplayStrings(user, request.cityId());
+        }
         Optional.ofNullable(request.street()).ifPresent(user::setStreet);
         Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
         Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
-        writeCityDisplayStrings(user, request.cityId());
     }
 
     /**

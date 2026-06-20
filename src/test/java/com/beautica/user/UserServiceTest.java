@@ -364,32 +364,193 @@ class UserServiceTest {
     }
 
     @Test
-    @DisplayName("updateProfile (CLIENT) with null cityId clears cityId/districtId but retains pre-existing street fields")
-    void should_clearAllLocalityFields_when_clientSendsNullCityId() {
+    @DisplayName("updateProfile (CLIENT) — a null cityId in the PATCH RETAINS the pre-existing city/district FK and denorm strings (regression: writeLocalityFields FK-wipe bug)")
+    void should_retainCityId_when_clientPatchesWithNullCityId() {
+        // REGRESSION GUARD for the writeLocalityFields FK-wipe bug (V97 self-heals affected rows).
+        // OLD behaviour: cityId was assigned UNCONDITIONALLY, so a street/note-only edit with a
+        // null cityId wiped a previously-saved users.city_id FK to NULL while leaving the
+        // denormalized users.city / users.region text intact — the mobile read keys off cityId/
+        // oblastId, so location rendered empty. FIXED: a null cityId means "locality not part of
+        // this update" → the existing FK + denorm strings are RETAINED. This test asserts retention.
         UUID userId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID existingDistrictId = UUID.randomUUID();
         User user = buildUser(userId, "c3@example.com", Role.CLIENT, "Null", "City", "+380501111111");
-        // Pre-populate locality so we can confirm referential IDs are cleared while
-        // free-text fields (street/buildingNo/locationNote) are retained via the null-guard.
-        user.setCityId(UUID.randomUUID());
-        user.setDistrictId(UUID.randomUUID());
+        user.setCityId(existingCityId);
+        user.setDistrictId(existingDistrictId);
+        user.setCity("Гнівань");
+        user.setRegion("Вінницька область");
         user.setStreet("Old Street");
         user.setBuildingNo("1");
         user.setLocationNote("old note");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
+        // PATCH carries NO cityId (CLIENT city is optional) — only the locality validator runs;
+        // the FK write path is skipped entirely.
         var request = new UpdateProfileRequest(null, null, null,
                 null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
         verify(localityWriteValidator).validateClientLocality(new LocalityWriteInput(null, null));
-        assertThat(user.getCityId()).isNull();
-        assertThat(user.getDistrictId()).isNull();
-        // street/buildingNo/locationNote are null in the request — null-guard skips them → retained.
+        // null cityId → guard skips the FK + display-string writes → existing values RETAINED.
+        assertThat(user.getCityId())
+                .as("a null cityId must NOT wipe the previously-saved city FK")
+                .isEqualTo(existingCityId);
+        assertThat(user.getDistrictId())
+                .as("a null cityId must NOT wipe the previously-saved district FK")
+                .isEqualTo(existingDistrictId);
+        assertThat(user.getCity())
+                .as("denormalized city text is left untouched when cityId is omitted")
+                .isEqualTo("Гнівань");
+        assertThat(user.getRegion())
+                .as("denormalized region text is left untouched when cityId is omitted")
+                .isEqualTo("Вінницька область");
+        // writeCityDisplayStrings is reached ONLY when cityId is non-null — never queried here.
+        verify(cityRepository, never()).findByIdWithOblast(any());
+        // street/buildingNo/locationNote are null in the request — Optional.ifPresent skips them → retained.
         assertThat(user.getStreet()).isEqualTo("Old Street");
         assertThat(user.getBuildingNo()).isEqualTo("1");
         assertThat(user.getLocationNote()).isEqualTo("old note");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) — the exact reported bug: city 'Гнівань' saved, PATCH with null cityId + new street keeps the city FK and updates only the street")
+    void should_keepCityFkAndUpdateStreet_when_clientPatchesNewStreetWithoutCity() {
+        // The exact user@gmail.com scenario. A client whose city 'Гнівань' is saved (cityId set)
+        // edits ONLY the street in the mobile Location screen. The PATCH carries cityId=null +
+        // a new street. The city FK must survive; the street must change.
+        UUID userId = UUID.randomUUID();
+        UUID hnivanCityId = UUID.randomUUID();
+        User user = buildUser(userId, "user@gmail.com", Role.CLIENT, "Real", "User", "+380501234567");
+        user.setCityId(hnivanCityId);
+        user.setCity("Гнівань");
+        user.setRegion("Вінницька область");
+        user.setStreet("вул. Стара");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // cityId omitted (null); only a new street is supplied.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, "вул. Нова", null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCityId())
+                .as("the previously-saved Гнівань city FK must be preserved through a street-only edit")
+                .isEqualTo(hnivanCityId);
+        assertThat(user.getCity())
+                .as("denormalized city stays Гнівань")
+                .isEqualTo("Гнівань");
+        assertThat(user.getStreet())
+                .as("the street IS updated by the PATCH")
+                .isEqualTo("вул. Нова");
+        verify(cityRepository, never()).findByIdWithOblast(any());
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) — a real cityId writes the city/district FK and writeCityDisplayStrings populates city/region (happy path)")
+    void should_writeCityFkAndDenormStrings_when_clientPatchesRealCityId() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User user = buildUser(userId, "happy@example.com", Role.CLIENT, "Happy", "Path", "+380501111111");
+
+        City mockCity = mock(City.class);
+        Oblast mockOblast = mock(Oblast.class);
+        when(mockOblast.getNameUk()).thenReturn("Львівська область");
+        when(mockCity.getNameUk()).thenReturn("Львів");
+        when(mockCity.getOblast()).thenReturn(mockOblast);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, districtId, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCityId())
+                .as("a real cityId is written to the FK")
+                .isEqualTo(cityId);
+        assertThat(user.getDistrictId())
+                .as("the supplied districtId is written alongside the cityId")
+                .isEqualTo(districtId);
+        assertThat(user.getCity())
+                .as("writeCityDisplayStrings denormalizes the city name")
+                .isEqualTo("Львів");
+        assertThat(user.getRegion())
+                .as("writeCityDisplayStrings denormalizes the oblast name")
+                .isEqualTo("Львівська область");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) — a real cityId with null districtId persists the city FK and a null district (districtless-city happy path)")
+    void should_persistNullDistrict_when_clientPatchesCityWithNullDistrict() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "leaf@example.com", Role.CLIENT, "Leaf", "City", "+380501111111");
+        // Pre-existing district must be OVERWRITTEN to null when a real cityId carries a null district.
+        user.setDistrictId(UUID.randomUUID());
+
+        City mockCity = mock(City.class);
+        Oblast mockOblast = mock(Oblast.class);
+        when(mockOblast.getNameUk()).thenReturn("Одеська область");
+        when(mockCity.getNameUk()).thenReturn("Одеса");
+        when(mockCity.getOblast()).thenReturn(mockOblast);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, null, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCityId())
+                .as("the real cityId is written")
+                .isEqualTo(cityId);
+        assertThat(user.getDistrictId())
+                .as("a districtless city persists district_id = NULL (the FK write runs with the supplied null district)")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile (INDEPENDENT_MASTER) — a null cityId in the PATCH RETAINS the pre-existing city FK (shared guard is a no-op, not a wipe)")
+    void should_retainCityId_when_independentMasterPatchesWithNullCityId() {
+        // The FK-wipe guard is shared by both the CLIENT and INDEPENDENT_MASTER branches of
+        // writeLocalityFields. A provider editing only the street (cityId omitted) must not lose
+        // its city FK either. validateProviderLocality(null, null) is still invoked — the guard
+        // sits AFTER validation, so a provider who explicitly clears its city is still rejected by
+        // the validator; here the validator is a no-op mock, so we assert the retention path.
+        UUID userId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID existingDistrictId = UUID.randomUUID();
+        User user = buildUser(userId, "im-retain@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
+        user.setCityId(existingCityId);
+        user.setDistrictId(existingDistrictId);
+        user.setCity("Київ");
+        user.setRegion("Київська область");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, "вул. Хрещатик", null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        verify(localityWriteValidator).validateProviderLocality(new LocalityWriteInput(null, null));
+        assertThat(user.getCityId())
+                .as("INDEPENDENT_MASTER null cityId must NOT wipe the pre-existing city FK")
+                .isEqualTo(existingCityId);
+        assertThat(user.getDistrictId())
+                .as("INDEPENDENT_MASTER null cityId must NOT wipe the pre-existing district FK")
+                .isEqualTo(existingDistrictId);
+        assertThat(user.getStreet())
+                .as("the street IS updated")
+                .isEqualTo("вул. Хрещатик");
+        verify(cityRepository, never()).findByIdWithOblast(any());
     }
 
     @Test
