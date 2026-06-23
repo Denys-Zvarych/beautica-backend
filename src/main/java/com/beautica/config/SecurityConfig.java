@@ -3,6 +3,8 @@ package com.beautica.config;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.filter.AuthRateLimitFilter;
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -16,21 +18,28 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.AccessDeniedHandler;
+import org.springframework.security.web.access.AccessDeniedHandlerImpl;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import java.util.List;
+import java.util.UUID;
 
 @Configuration
 @EnableWebSecurity
 @EnableMethodSecurity
 public class SecurityConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(SecurityConfig.class);
 
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
@@ -60,7 +69,8 @@ public class SecurityConfig {
                 .sessionManagement(session ->
                         session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .exceptionHandling(ex -> ex
-                        .authenticationEntryPoint(unauthorizedEntryPoint()))
+                        .authenticationEntryPoint(unauthorizedEntryPoint())
+                        .accessDeniedHandler(accessDeniedHandler()))
                 .authorizeHttpRequests(auth -> {
                     auth.requestMatchers(
                             "/api/v1/auth/register",
@@ -196,6 +206,35 @@ public class SecurityConfig {
     public AuthenticationEntryPoint unauthorizedEntryPoint() {
         return (request, response, authException) ->
                 response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Unauthorized");
+    }
+
+    /**
+     * Filter-chain (pre-controller) access-denied handler for already-authenticated
+     * principals whose request is rejected by {@code ExceptionTranslationFilter} (e.g. a
+     * URL-matcher authorization rule). Method-security ({@code @PreAuthorize}) denials are
+     * handled by {@code GlobalExceptionHandler#handleAuthorizationDenied} instead.
+     *
+     * <p>Logs the same self-diagnosing line — HTTP method + request URI + the principal's
+     * authorities + the non-PII subject (the user id in {@link Authentication#getDetails()},
+     * set by {@code JwtAuthenticationFilter}) — then delegates to the default 403 response so
+     * the wire contract is unchanged. Never logs the email ({@code getName()}), the JWT, or
+     * the query string.
+     */
+    @Bean
+    public AccessDeniedHandler accessDeniedHandler() {
+        AccessDeniedHandlerImpl delegate = new AccessDeniedHandlerImpl();
+        return (request, response, accessDeniedException) -> {
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+            Object subject = (auth != null && auth.getDetails() instanceof UUID userId)
+                    ? userId
+                    : "[unknown]";
+            log.warn("Access denied: {} {} for authorities={} (subject={})",
+                    request.getMethod(),
+                    request.getRequestURI(),
+                    auth != null ? auth.getAuthorities() : "[none]",
+                    subject);
+            delegate.handle(request, response, accessDeniedException);
+        };
     }
 
     @Bean
