@@ -116,7 +116,8 @@ class SearchControllerTest {
                 4.6,
                 17,
                 null,
-                new BigDecimal("250.00")
+                new BigDecimal("250.00"),
+                List.of("Манікюр", "Педикюр")
         );
     }
 
@@ -592,5 +593,120 @@ class SearchControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── q / sort / serviceNames (Phase — search contract additions) ──────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when q and a valid sort are supplied (binds q + enum)")
+    void should_return200_when_qAndSortProvided() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "Olena")
+                        .param("sort", "PRICE_ASC")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when sort is not in the allow-list (enum bind fails → generic 400)")
+    void should_return400_when_unknownSort() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("sort", "DROP_TABLE")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when q contains a control character (@Pattern)")
+    void should_return400_when_qHasControlChar() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "<script>")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when q exceeds 100 characters (@Size)")
+    void should_return400_when_qTooLong() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "a".repeat(101))
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — serviceNames array is present in the result DTO")
+    void should_exposeServiceNames_inMasterSearchResponse() throws Exception {
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].serviceNames").isArray())
+                .andExpect(jsonPath("$.data.data[0].serviceNames[0]").value("Манікюр"));
+    }
+
+    // ── salon q / sort / price filter binding ────────────────────────────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when q, sort and price band are supplied")
+    void should_return200_when_salonQSortPriceProvided() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("q", "Glow")
+                        .param("sort", "PRICE_DESC")
+                        .param("minPrice", "100.00")
+                        .param("maxPrice", "500.00")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when minPrice exceeds maxPrice (@AssertTrue)")
+    void should_return400_when_salonMinPriceExceedsMaxPrice() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "500.00")
+                        .param("maxPrice", "100.00")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when minPrice is negative (@DecimalMin)")
+    void should_return400_when_salonMinPriceNegative() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "-1")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
     }
 }

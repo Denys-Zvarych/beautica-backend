@@ -11,6 +11,7 @@ import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
+import com.beautica.search.dto.SearchSort;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.Query;
 import org.junit.jupiter.api.BeforeEach;
@@ -100,11 +101,14 @@ class SearchServiceTest {
 
     private void stubNativeQueries(List<Object[]> rows, long total) {
         // PERF-M1: a single native query replaces the old data+count two-query pattern.
-        // COUNT(*) OVER() total is embedded as row[9] of every result row.
+        // Column layout is now 11-wide: service_names at index 9, COUNT(*) OVER()
+        // total at index 10. Test rows are authored with 9 columns (0–8); this
+        // extends them so service_names defaults to null (empty list) and the
+        // window-function total lands at index 10.
         List<Object[]> rowsWithCount = rows.stream()
                 .map(row -> {
-                    Object[] extended = java.util.Arrays.copyOf(row, 10);
-                    extended[9] = total;
+                    Object[] extended = java.util.Arrays.copyOf(row, 11);
+                    extended[10] = total;
                     return extended;
                 })
                 .toList();
@@ -120,24 +124,27 @@ class SearchServiceTest {
     private static final UUID CITY_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final UUID DISTRICT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
 
+    // MasterSearchRequest field order: (location, q, category, sort, minPrice, maxPrice, minRating, page, size)
     private static MasterSearchRequest emptyRequest() {
-        return new MasterSearchRequest(null, null, null, null, null, 0, 20);
+        return new MasterSearchRequest(null, null, null, null, null, null, null, 0, 20);
     }
 
     private static MasterSearchRequest cityRequest() {
         return new MasterSearchRequest(
-                new LocationFilter(CITY_ID, null), null, null, null, null, 0, 20);
+                new LocationFilter(CITY_ID, null), null, null, null, null, null, null, 0, 20);
     }
 
     private static MasterSearchRequest districtRequest() {
         return new MasterSearchRequest(
-                new LocationFilter(CITY_ID, DISTRICT_ID), null, null, null, null, 0, 20);
+                new LocationFilter(CITY_ID, DISTRICT_ID), null, null, null, null, null, null, 0, 20);
     }
 
     private static MasterSearchRequest fullRequest() {
         return new MasterSearchRequest(
                 new LocationFilter(CITY_ID, DISTRICT_ID),
+                null,
                 "manicure",
+                null,
                 new BigDecimal("100.00"),
                 new BigDecimal("500.00"),
                 new BigDecimal("4.5"),
@@ -282,7 +289,8 @@ class SearchServiceTest {
     private static SalonSearchRequest salonRequest(UUID cityId, UUID districtId) {
         LocationFilter filter =
                 (cityId == null && districtId == null) ? null : new LocationFilter(cityId, districtId);
-        return new SalonSearchRequest(filter, null, 0, 20);
+        // SalonSearchRequest: (location, q, category, sort, minPrice, maxPrice, page, size)
+        return new SalonSearchRequest(filter, null, null, null, null, null, 0, 20);
     }
 
     /**
@@ -306,20 +314,24 @@ class SearchServiceTest {
     }
 
     @Test
-    @DisplayName("salon search dispatches to findActiveByDistrictIdAsProjection when a district is resolved (district-primary — projection path, LOW PERF fix)")
+    @DisplayName("salon search dispatches to the no-price district variant when a district is resolved and no price bounds are supplied (HIGH PERF gate: plain COUNT(*), no lateral)")
     void should_dispatchToDistrictRepoMethod_when_districtResolved() {
         // Build the stub page BEFORE the when(...) call — stubProjection calls
         // when(mock.getX()) internally, which Mockito would misread as an
         // unfinished stub if nested inside when(salonRepository...).
         Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
-        when(salonRepository.findActiveByDistrictIdAsProjection(eq(DISTRICT_ID), any(), any(Pageable.class)))
+        when(salonRepository.findActiveByDistrictIdNoPriceAsProjection(
+                eq(DISTRICT_ID), any(), any(), any(Pageable.class)))
                 .thenReturn(stubPage);
 
         service.searchSalons(salonRequest(CITY_ID, DISTRICT_ID), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findActiveByDistrictIdAsProjection(eq(DISTRICT_ID), any(), any(Pageable.class));
-        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any());
-        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any());
+        // No price bounds → no-price variant (no COUNT lateral).
+        verify(salonRepository, times(1)).findActiveByDistrictIdNoPriceAsProjection(
+                eq(DISTRICT_ID), any(), any(), any(Pageable.class));
+        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any(), any(), any(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any());
         // Must NOT touch the full-entity variants — they hydrate unnecessary columns.
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
@@ -327,37 +339,59 @@ class SearchServiceTest {
     }
 
     @Test
-    @DisplayName("salon search dispatches to findActiveByCityIdAsProjection when only a city is resolved (projection path, LOW PERF fix)")
+    @DisplayName("salon search dispatches to the no-price city variant when only a city is resolved and no price bounds are supplied (HIGH PERF gate)")
     void should_dispatchToCityRepoMethod_when_onlyCityResolved() {
         Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
-        when(salonRepository.findActiveByCityIdAsProjection(eq(CITY_ID), any(), any(Pageable.class)))
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(Pageable.class)))
                 .thenReturn(stubPage);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findActiveByCityIdAsProjection(eq(CITY_ID), any(), any(Pageable.class));
-        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any());
-        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any());
+        verify(salonRepository, times(1)).findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(Pageable.class));
+        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any(), any(), any(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
     }
 
     @Test
-    @DisplayName("salon search dispatches to findByIsActiveTrueAsProjection when no locality filter is supplied (projection path, LOW PERF fix)")
+    @DisplayName("salon search dispatches to the no-price active-only variant when no locality filter and no price bounds are supplied (HIGH PERF gate)")
     void should_dispatchToActiveOnlyRepoMethod_when_noLocalityFilter() {
         Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
-        when(salonRepository.findByIsActiveTrueAsProjection(any(), any(Pageable.class)))
+        when(salonRepository.findByIsActiveTrueNoPriceAsProjection(any(), any(), any(Pageable.class)))
                 .thenReturn(stubPage);
 
         service.searchSalons(salonRequest(null, null), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findByIsActiveTrueAsProjection(any(), any(Pageable.class));
-        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any());
-        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any());
+        verify(salonRepository, times(1)).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(Pageable.class));
+        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any(), any(), any(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
+    }
+
+    @Test
+    @DisplayName("salon search with a price bound keeps the price-lateral variant (no-price gate applies only when both bounds are null)")
+    void should_dispatchToPriceVariant_when_priceBoundSupplied() {
+        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        when(salonRepository.findActiveByCityIdAsProjection(
+                eq(CITY_ID), any(), any(), any(), any(), any(Pageable.class)))
+                .thenReturn(stubPage);
+        SalonSearchRequest request = new SalonSearchRequest(
+                new LocationFilter(CITY_ID, null), null, null, null,
+                new BigDecimal("100.00"), null, 0, 20);
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        verify(salonRepository, times(1)).findActiveByCityIdAsProjection(
+                eq(CITY_ID), any(), any(), any(), any(), any(Pageable.class));
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any());
     }
 
     @Test
@@ -367,7 +401,8 @@ class SearchServiceTest {
         SalonSearchProjection proj = stubProjection(salonId, "Glow Studio", CITY_ID, DISTRICT_ID);
         when(proj.getAvatarUrl()).thenReturn("https://cdn.example.com/avatar.jpg");
 
-        when(salonRepository.findActiveByCityIdAsProjection(eq(CITY_ID), any(), any(Pageable.class)))
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(proj), PageRequest.of(0, 20), 1));
         when(discoveryLocationResolver.resolveLabels(any(), any()))
                 .thenReturn(new DiscoveryLabels(
@@ -391,7 +426,8 @@ class SearchServiceTest {
         SalonSearchProjection a = stubProjection(UUID.randomUUID(), "A", CITY_ID, DISTRICT_ID);
         SalonSearchProjection b = stubProjection(UUID.randomUUID(), "B", CITY_ID, DISTRICT_ID);
         SalonSearchProjection c = stubProjection(UUID.randomUUID(), "C", CITY_ID, DISTRICT_ID);
-        when(salonRepository.findActiveByCityIdAsProjection(eq(CITY_ID), any(), any(Pageable.class)))
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(a, b, c), PageRequest.of(0, 20), 3));
 
         Page<SalonSearchResult> page =
@@ -409,7 +445,7 @@ class SearchServiceTest {
     @DisplayName("throws BusinessException without hitting the DB when minPrice exceeds maxPrice")
     void should_throwBusinessException_when_minPriceExceedsMaxPrice() {
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null,
+                null, null, null, null,
                 new BigDecimal("500.00"),
                 new BigDecimal("100.00"),
                 null, 0, 20
@@ -427,7 +463,7 @@ class SearchServiceTest {
     void should_normalizeCategoryCase_before_bindingParameter() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, "manicure", null, null, null, 0, 20);
+                null, null, "manicure", null, null, null, null, 0, 20);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -440,7 +476,7 @@ class SearchServiceTest {
     void should_convertMinRatingToScaleTwo_before_binding() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null, null, new BigDecimal("4.5"), 0, 20);
+                null, null, null, null, null, null, new BigDecimal("4.5"), 0, 20);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -457,7 +493,7 @@ class SearchServiceTest {
     void should_normalizeMinPriceAndMaxPrice_to_scale2_before_binding() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null,
+                null, null, null, null,
                 new BigDecimal("1.0"),      // scale 1 — must become 1.00
                 new BigDecimal("500"),       // scale 0 — must become 500.00
                 null, 0, 20);
@@ -498,36 +534,48 @@ class SearchServiceTest {
                 .contains("u.is_active = true");
     }
 
-    // ── Phase 6.5 dynamic SQL — JOIN elision and count branching ─────────────
+    // ── dynamic SQL — Top-N main query + post-LIMIT serviceNames lateral ─────
 
     @Test
-    @DisplayName("omits master_services / service_definitions JOIN when no category or price filter")
-    void should_omitServiceJoin_when_noCategoryOrPriceFilter() {
+    @DisplayName("the MAIN master query carries NO service join and NO GROUP BY; serviceNames comes from a post-LIMIT lateral (index-ordered Top-N preserved)")
+    void should_keepMainQueryServiceJoinFreeAndUngrouped_with_serviceNamesLateral() {
         stubNativeQueries(List.of(), 0L);
 
         service.searchMasters(cityRequest(), PageRequest.of(0, 20));
 
-        for (String sql : sqlCaptor.getAllValues()) {
-            assertThat(sql)
-                    .doesNotContain("master_services")
-                    .doesNotContain("service_definitions");
-        }
+        String sql = sqlCaptor.getAllValues().get(0);
+        // No GROUP BY anywhere — the refactor removed the district-wide grouping
+        // that pipeline-broke the index-ordered Top-N.
+        assertThat(sql)
+                .as("no GROUP BY in the master query — it would break the index-ordered LIMIT")
+                .doesNotContain("GROUP BY");
+        // serviceNames is still populated on EVERY card — via a post-LIMIT
+        // correlated lateral, not a main-query join.
+        assertThat(sql)
+                .as("serviceNames is computed by a post-LIMIT correlated lateral")
+                .contains("LEFT JOIN LATERAL")
+                .contains("array_agg(x.name) AS service_names")
+                .contains("WHERE ms.master_id = t.master_id");
+        // Inner Top-N is bounded by LIMIT/OFFSET so the lateral runs over the
+        // paged rows only, not the whole district.
+        assertThat(sql).contains("LIMIT :limit OFFSET :offset");
     }
 
     @Test
-    @DisplayName("includes master_services / service_definitions JOIN when category filter is set")
-    void should_includeServiceJoin_when_categoryFilterSet() {
+    @DisplayName("category filter is a correlated EXISTS over active services (no main-query service join)")
+    void should_includeCategoryExists_when_categoryFilterSet() {
         stubNativeQueries(List.of(), 0L);
 
         service.searchMasters(
-                new MasterSearchRequest(null, "MANICURE", null, null, null, 0, 20),
+                new MasterSearchRequest(null, null, "MANICURE", null, null, null, null, 0, 20),
                 PageRequest.of(0, 20));
 
         String dataSql = sqlCaptor.getAllValues().get(0);
         assertThat(dataSql)
-                .contains("master_services")
-                .contains("service_definitions")
-                .contains("sd.category = :category");
+                .as("category is an EXISTS predicate, not a fan-out join + GROUP BY")
+                .contains("AND EXISTS (")
+                .contains("sd.category = :category")
+                .doesNotContain("GROUP BY");
     }
 
     @Test
@@ -560,26 +608,28 @@ class SearchServiceTest {
         verify(entityManager, times(1)).createNativeQuery(anyString());
     }
 
-    // ── LOW portability fix — JPA-portable pagination (setMaxResults/setFirstResult) ──
+    // ── inner-Top-N pagination — LIMIT/OFFSET bound on the inner derived table ──
 
     @Test
-    @DisplayName("uses setMaxResults/setFirstResult for pagination, not :limit/:offset named params (portable API)")
-    void should_usePortablePaginationApi_not_namedParams() {
+    @DisplayName("binds :limit/:offset on the inner Top-N so the serviceNames lateral runs above the LIMIT (paged rows only)")
+    void should_bindLimitOffsetOnInnerTopN_for_postLimitLateral() {
         stubNativeQueries(List.of(), 0L);
         Pageable page = PageRequest.of(2, 15);
 
         service.searchMasters(emptyRequest(), page);
 
-        // The SQL must not carry :limit or :offset — Hibernate applies pagination
-        // at the JDBC layer via setMaxResults/setFirstResult instead.
+        // The LIMIT/OFFSET must sit on the INNER derived table (bound as named
+        // params) so the post-LIMIT serviceNames lateral never expands over the
+        // whole district. Hibernate's setMaxResults/setFirstResult would wrap the
+        // OUTER lateral and re-expand the work, so they are NOT used here.
         String dataSql = sqlCaptor.getAllValues().get(0);
         assertThat(dataSql)
-                .as("SQL must not contain :limit or :offset named params — portable API is used")
-                .doesNotContain(":limit")
-                .doesNotContain(":offset");
-        // Verify the JPA-portable API is actually invoked with correct values.
-        verify(dataQuery).setMaxResults(15);
-        verify(dataQuery).setFirstResult(30); // offset = page * size = 2 * 15
+                .as("inner Top-N carries the LIMIT/OFFSET named params")
+                .contains("LIMIT :limit OFFSET :offset");
+        verify(dataQuery).setParameter("limit", 15);
+        verify(dataQuery).setParameter("offset", 30L); // offset = page * size = 2 * 15
+        verify(dataQuery, never()).setMaxResults(anyInt());
+        verify(dataQuery, never()).setFirstResult(anyInt());
     }
 
     @Test
@@ -603,5 +653,193 @@ class SearchServiceTest {
 
         String dataSql = sqlCaptor.getAllValues().get(0);
         assertThat(dataSql).contains("ORDER BY m.avg_rating DESC NULLS LAST, m.id");
+    }
+
+    // ── name / service-name search (q) ───────────────────────────────────────
+
+    @Test
+    @DisplayName("adds a case-insensitive ILIKE over first/last name plus a service-name EXISTS when q is supplied (each index-served, no join fan-out)")
+    void should_addIlikePredicate_when_qProvided() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "olena", null, null, null, null, null, 0, 20);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String dataSql = sqlCaptor.getAllValues().get(0);
+        // Name predicates hit u.first_name/u.last_name directly; the service-name
+        // match is a correlated EXISTS on sd.name (not a main-query join), so each
+        // ILIKE is served by its own trigram index with no fan-out / GROUP BY.
+        assertThat(dataSql)
+                .contains("u.first_name ILIKE :q OR u.last_name ILIKE :q OR EXISTS (")
+                .contains("sd.name ILIKE :q")
+                .doesNotContain("GROUP BY");
+    }
+
+    @Test
+    @DisplayName("binds :q as an escaped %term% pattern (LIKE wildcards in the term are neutralised)")
+    void should_bindEscapedContainsPattern_when_qHasLikeWildcards() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "50%_off", null, null, null, null, null, 0, 20);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        verify(dataQuery).setParameter("q", "%50\\%\\_off%");
+    }
+
+    @Test
+    @DisplayName("serviceNames is populated on EVERY card via a post-LIMIT lateral, never gated behind q/category — and the main query has no service join / GROUP BY")
+    void should_populateServiceNamesViaPostLimitLateral_onEveryCard() {
+        stubNativeQueries(List.of(), 0L);
+
+        // Location-only search: no q, no category. serviceNames must STILL be
+        // computed (the product constraint — every master card shows its
+        // procedure name), and it must come from the post-LIMIT lateral.
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        String dataSql = sqlCaptor.getAllValues().get(0);
+        assertThat(dataSql)
+                .as("serviceNames lateral present even with no q/category filter")
+                .contains("LEFT JOIN LATERAL")
+                .contains("SELECT DISTINCT sd.name")
+                .contains("array_agg(x.name) AS service_names")
+                .contains("ORDER BY sd.name LIMIT 3");
+        assertThat(dataSql)
+                .as("main query is service-join-free and ungrouped — index-ordered Top-N preserved")
+                .doesNotContain("GROUP BY")
+                .doesNotContain("LEFT JOIN master_services ms ON")
+                .doesNotContain("LEFT JOIN service_definitions sd ON");
+    }
+
+    // ── custom-preferred procedure names (serviceNames) ──────────────────────
+
+    @Test
+    @DisplayName("maps the SQL service_names array to a List<String> on the result")
+    void should_mapServiceNamesArray_toList() {
+        UUID masterId = UUID.randomUUID();
+        Object[] row = new Object[]{
+                masterId, "Olena", "Kovalenko",
+                new BigDecimal("4.85"), 42, null,
+                CITY_ID, DISTRICT_ID, new BigDecimal("250.00"),
+                new String[]{"Манікюр", "Педикюр"}   // service_names at index 9
+        };
+        stubNativeQueries(List.<Object[]>of(row), 1L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(result.getContent().get(0).serviceNames())
+                .containsExactly("Манікюр", "Педикюр");
+    }
+
+    @Test
+    @DisplayName("maps a null service_names array to an empty list (never null) for service-less masters")
+    void should_mapNullServiceNames_toEmptyList() {
+        UUID masterId = UUID.randomUUID();
+        Object[] row = new Object[]{
+                masterId, "Ivan", "Petrenko",
+                new BigDecimal("4.00"), 1, null,
+                CITY_ID, null, null   // 9-wide → service_names index 9 left null by stub extension
+        };
+        stubNativeQueries(List.<Object[]>of(row), 1L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(result.getContent().get(0).serviceNames()).isEmpty();
+    }
+
+    // ── allow-listed sort (master) ───────────────────────────────────────────
+
+    @Test
+    @DisplayName("PRICE_ASC maps to ORDER BY m.min_effective_price ASC NULLS LAST, m.id")
+    void should_orderByPriceAsc_when_sortPriceAsc() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, null, null, SearchSort.PRICE_ASC, null, null, null, 0, 20);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("ORDER BY m.min_effective_price ASC NULLS LAST, m.id");
+    }
+
+    @Test
+    @DisplayName("PRICE_DESC maps to ORDER BY m.min_effective_price DESC NULLS LAST, m.id")
+    void should_orderByPriceDesc_when_sortPriceDesc() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, null, null, SearchSort.PRICE_DESC, null, null, null, 0, 20);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("ORDER BY m.min_effective_price DESC NULLS LAST, m.id");
+    }
+
+    @Test
+    @DisplayName("REVIEWS_DESC maps to ORDER BY m.review_count DESC NULLS LAST, m.id")
+    void should_orderByReviewsDesc_when_sortReviewsDesc() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, null, null, SearchSort.REVIEWS_DESC, null, null, null, 0, 20);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("ORDER BY m.review_count DESC NULLS LAST, m.id");
+    }
+
+    @Test
+    @DisplayName("a null sort falls back to the rating-descending default")
+    void should_defaultToRatingDesc_when_sortNull() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("ORDER BY m.avg_rating DESC NULLS LAST, m.id");
+    }
+
+    // ── salon price filter + q forwarding ────────────────────────────────────
+
+    @Test
+    @DisplayName("forwards q (escaped) and price bounds to the salon projection query")
+    void should_forwardQAndPriceBounds_toSalonRepo() {
+        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        when(salonRepository.findActiveByCityIdAsProjection(
+                eq(CITY_ID), any(), any(), any(), any(), any(Pageable.class)))
+                .thenReturn(stubPage);
+        SalonSearchRequest request = new SalonSearchRequest(
+                new LocationFilter(CITY_ID, null), "glow", null, null,
+                new BigDecimal("100.00"), new BigDecimal("500.00"), 0, 20);
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        verify(salonRepository).findActiveByCityIdAsProjection(
+                eq(CITY_ID), any(),
+                eq("%glow%"),
+                eq(new BigDecimal("100.00")),
+                eq(new BigDecimal("500.00")),
+                any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("salon PRICE_ASC builds a Sort on the price_min select alias (caller text never reaches ORDER BY)")
+    void should_buildPriceMinSort_when_salonSortPriceAsc() {
+        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        // No price bounds → no-price city variant (HIGH PERF gate).
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), pageableCaptor.capture()))
+                .thenReturn(stubPage);
+        SalonSearchRequest request = new SalonSearchRequest(
+                new LocationFilter(CITY_ID, null), null, null, SearchSort.PRICE_ASC,
+                null, null, 0, 20);
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        org.springframework.data.domain.Sort sort = pageableCaptor.getValue().getSort();
+        assertThat(sort.getOrderFor("price_min")).isNotNull();
+        assertThat(sort.getOrderFor("price_min").isAscending()).isTrue();
     }
 }

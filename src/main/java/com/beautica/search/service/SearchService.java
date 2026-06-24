@@ -11,6 +11,7 @@ import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
+import com.beautica.search.dto.SearchSort;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
@@ -18,7 +19,9 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -101,12 +104,16 @@ import java.util.UUID;
  *       restores the planner's ability to use the
  *       {@code idx_users_district_id} / {@code idx_users_city_id} indexes
  *       (V54).</li>
- *   <li><b>JOIN avoidance</b>. The {@code master_services} /
- *       {@code service_definitions} LEFT JOINs are only emitted when the
- *       caller filters by category. Price filtering uses the pre-computed
- *       {@code m.min_effective_price} column (PERF-M2, V58), so the common
- *       "all masters in district X with min price Y" query avoids the
- *       two-table fan-out entirely.</li>
+ *   <li><b>JOIN avoidance</b>. The main master query never joins
+ *       {@code master_services} / {@code service_definitions}. Category and
+ *       service-name ({@code q}) filters are correlated {@code EXISTS}
+ *       sub-selects, and the {@code serviceNames} contract field is a
+ *       post-LIMIT correlated lateral computed for only the paged rows. Price
+ *       filtering uses the pre-computed {@code m.min_effective_price} column
+ *       (PERF-M2, V58). So the main query stays a clean filter + index-ordered
+ *       {@code ORDER BY} + {@code LIMIT} that the rating/review/price indexes
+ *       serve as a true Top-N — no district-wide {@code GROUP BY} before the
+ *       {@code LIMIT}.</li>
  * </ol>
  *
  * <h3>Single-query pagination (PERF-M1)</h3>
@@ -131,6 +138,20 @@ public class SearchService {
 
     /** Scale of {@code masters.min_effective_price} (NUMERIC(10,2)) — matches column precision. */
     private static final int PRICE_SCALE = 2;
+
+    /**
+     * Max distinct service names surfaced per master in
+     * {@link MasterSearchResult#serviceNames()}. Bounds the response payload —
+     * a master may carry dozens of services; the result card only previews a
+     * few. Applied as a Postgres {@code array_agg(...)[1:N]} slice.
+     */
+    private static final int SERVICE_NAME_CAP = 3;
+
+    /** Projection index of the {@code service_names} {@code array_agg} column. */
+    private static final int SERVICE_NAMES_IDX = 9;
+
+    /** Projection index of the {@code COUNT(*) OVER()} total-count column (PERF-M1). */
+    private static final int TOTAL_COUNT_IDX = 10;
 
     /**
      * Role value (stored via {@code EnumType.STRING}) that master discovery is
@@ -178,7 +199,8 @@ public class SearchService {
     @Cacheable(
             value = "search:masters",
             key = "{#request.location?.cityId, #request.location?.districtId, " +
-                  "#request.category, #request.minPrice, #request.maxPrice, " +
+                  "#request.q, #request.category, #request.sort, " +
+                  "#request.minPrice, #request.maxPrice, " +
                   "#request.minRating, #pageable.pageNumber, #pageable.pageSize}",
             condition = "#pageable.pageNumber < 5",
             sync = true
@@ -189,17 +211,20 @@ public class SearchService {
 
         MasterSearchFilters filters = normalize(request);
 
-        // PERF-M1: single query — COUNT(*) OVER() is column index 9.
+        // PERF-M1: single query — COUNT(*) OVER() is column index 10.
         // No separate count round-trip on cache miss.
+        //
+        // PERF (service-join refactor): the Top-N filter/ORDER BY/LIMIT lives in
+        // an inner derived table that the index-ordered indexes can drive, and
+        // the serviceNames aggregate runs as a post-LIMIT correlated lateral over
+        // only the paged rows. Because the LIMIT/OFFSET must sit on the INNER
+        // derived table (so the lateral never sees the whole district), they are
+        // bound as named :limit/:offset params on that subquery rather than via
+        // Hibernate's setMaxResults/setFirstResult (which would wrap the outer
+        // lateral and re-expand the work).
         SqlAndParams dataSql = buildMasterSearchSql(filters, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
         bind(dataQuery, dataSql.params());
-        // JPA-portable pagination: setMaxResults/setFirstResult let Hibernate
-        // apply LIMIT/OFFSET at the JDBC layer, independent of SQL dialect.
-        // Previously bound via :limit/:offset named params — non-standard and
-        // Hibernate-only. (LOW portability fix — backlog.md §PERF)
-        dataQuery.setMaxResults(pageable.getPageSize());
-        dataQuery.setFirstResult((int) pageable.getOffset());
 
         @SuppressWarnings("unchecked")
         List<Object[]> rawRows = dataQuery.getResultList();
@@ -208,7 +233,7 @@ public class SearchService {
             return new PageImpl<>(List.of(), pageable, 0L);
         }
 
-        long total = ((Number) rawRows.get(0)[9]).longValue();
+        long total = ((Number) rawRows.get(0)[TOTAL_COUNT_IDX]).longValue();
 
         DiscoveryLabels labels = resolveLabelsForRows(rawRows, 6, 7);
         List<MasterSearchResult> results = new ArrayList<>(rawRows.size());
@@ -233,7 +258,9 @@ public class SearchService {
     @Cacheable(
             value = "search:salons",
             key = "{#request.location?.cityId, #request.location?.districtId, " +
-                  "#request.category, #pageable.pageNumber, #pageable.pageSize}",
+                  "#request.q, #request.category, #request.sort, " +
+                  "#request.minPrice, #request.maxPrice, " +
+                  "#pageable.pageNumber, #pageable.pageSize}",
             condition = "#pageable.pageNumber < 5",
             sync = true
     )
@@ -247,8 +274,16 @@ public class SearchService {
         // so the bound value matches what EnumType.STRING wrote to
         // service_definitions.category — mirrors the masters-search path.
         String category = normalizeCategory(request.category());
+        String q = normalizeQuery(request.q());
+        String likePattern = q == null ? null : likeContains(q);
+        BigDecimal minPrice = normalizePrice(request.minPrice());
+        BigDecimal maxPrice = normalizePrice(request.maxPrice());
+        // Re-page with an allow-listed Sort built from the enum — caller text
+        // never reaches the ORDER BY (native query applies Sort by select alias).
+        Pageable sortedPageable = withSalonSort(pageable, SearchSort.orDefault(request.sort()));
 
-        Page<SalonSearchProjection> page = findSalonsByLocation(cityId, districtId, category, pageable);
+        Page<SalonSearchProjection> page = findSalonsByLocation(
+                cityId, districtId, category, likePattern, minPrice, maxPrice, sortedPageable);
 
         List<SalonSearchProjection> projections = page.getContent();
         DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
@@ -256,6 +291,28 @@ public class SearchService {
                 distinct(projections, SalonSearchProjection::getDistrictId));
 
         return page.map(proj -> toSalonSearchResult(proj, labels));
+    }
+
+    /**
+     * Re-pages with an allow-listed {@link Sort} mapped from {@link SearchSort}.
+     * The sort properties are the <em>select aliases</em> of the salon
+     * projection query ({@code price_min}, {@code price_max}, {@code name}) —
+     * Spring Data appends them to the native {@code ORDER BY}; the caller's raw
+     * text is never used.
+     *
+     * <p>Salons carry no per-row rating or review-count column in the projection,
+     * so {@link SearchSort#RATING_DESC} and {@link SearchSort#REVIEWS_DESC} fall
+     * back to a stable {@code name} ordering rather than failing — documented
+     * divergence from the master endpoint. {@code name} is always appended as the
+     * deterministic tiebreaker so paging is stable.
+     */
+    private static Pageable withSalonSort(Pageable pageable, SearchSort sort) {
+        Sort resolved = switch (sort) {
+            case PRICE_ASC -> Sort.by(Sort.Order.asc("price_min"), Sort.Order.asc("name"));
+            case PRICE_DESC -> Sort.by(Sort.Order.desc("price_max"), Sort.Order.asc("name"));
+            case RATING_DESC, REVIEWS_DESC -> Sort.by(Sort.Order.asc("name"));
+        };
+        return PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(), resolved);
     }
 
     /**
@@ -276,16 +333,34 @@ public class SearchService {
      *   <li>else no locality filter →
      *       {@link SalonRepository#findByIsActiveTrueAsProjection}.</li>
      * </ol>
+     *
+     * <p><b>HIGH PERF gate</b>: when both price bounds are null the no-price
+     * {@code *NoPriceAsProjection} overload is chosen instead. Its
+     * {@code countQuery} is a plain {@code COUNT(*)} with no price-range LATERAL,
+     * so the common (no-price-filter) search no longer pays the per-salon price
+     * aggregate twice (once for data, once for an irrelevant count). The data
+     * query still runs the LATERAL because {@code priceMin}/{@code priceMax} are
+     * display columns on every salon card.
      */
     private Page<SalonSearchProjection> findSalonsByLocation(
-            UUID cityId, UUID districtId, String category, Pageable pageable) {
+            UUID cityId, UUID districtId, String category, String q,
+            BigDecimal minPrice, BigDecimal maxPrice, Pageable pageable) {
+        boolean noPriceFilter = minPrice == null && maxPrice == null;
         if (districtId != null) {
-            return salonRepository.findActiveByDistrictIdAsProjection(districtId, category, pageable);
+            return noPriceFilter
+                    ? salonRepository.findActiveByDistrictIdNoPriceAsProjection(districtId, category, q, pageable)
+                    : salonRepository.findActiveByDistrictIdAsProjection(
+                            districtId, category, q, minPrice, maxPrice, pageable);
         }
         if (cityId != null) {
-            return salonRepository.findActiveByCityIdAsProjection(cityId, category, pageable);
+            return noPriceFilter
+                    ? salonRepository.findActiveByCityIdNoPriceAsProjection(cityId, category, q, pageable)
+                    : salonRepository.findActiveByCityIdAsProjection(
+                            cityId, category, q, minPrice, maxPrice, pageable);
         }
-        return salonRepository.findByIsActiveTrueAsProjection(category, pageable);
+        return noPriceFilter
+                ? salonRepository.findByIsActiveTrueNoPriceAsProjection(q, category, pageable)
+                : salonRepository.findByIsActiveTrueAsProjection(q, minPrice, maxPrice, category, pageable);
     }
 
     // ── location seam (M2) ────────────────────────────────────────────────────
@@ -306,30 +381,20 @@ public class SearchService {
 
     /**
      * Normalised filter bag. {@code cityId}/{@code districtId} are the resolved
-     * discovery-locality FK ids (from the M2 seam), not free text.
+     * discovery-locality FK ids (from the M2 seam), not free text. {@code q} is
+     * the normalised free-text term (trimmed, null-if-blank); {@code sort} is
+     * the resolved ordering (never null after {@link #normalize}).
      */
     private record MasterSearchFilters(
             UUID cityId,
             UUID districtId,
+            String q,
             String category,
+            SearchSort sort,
             BigDecimal minRating,
             BigDecimal minPrice,
             BigDecimal maxPrice
     ) {
-        boolean hasPriceFilter() {
-            return minPrice != null || maxPrice != null;
-        }
-
-        /**
-         * The {@code master_services} / {@code service_definitions} fan-out join is
-         * only needed when filtering by category. Price filtering is now a simple
-         * {@code WHERE m.min_effective_price} predicate on the pre-computed column
-         * (PERF-M2, V58) — no join required.
-         */
-        boolean needsServiceJoin() {
-            return category != null;
-        }
-
         boolean hasDistrictFilter() {
             return districtId != null;
         }
@@ -347,7 +412,9 @@ public class SearchService {
         return new MasterSearchFilters(
                 key == null ? null : key.cityId(),
                 key == null ? null : key.districtId(),
+                normalizeQuery(request.q()),
                 normalizeCategory(request.category()),
+                SearchSort.orDefault(request.sort()),
                 normalizeRating(request.minRating()),
                 normalizePrice(request.minPrice()),
                 normalizePrice(request.maxPrice())
@@ -355,63 +422,153 @@ public class SearchService {
     }
 
     /**
-     * Builds the single data+count SQL for master search (PERF-M1).
+     * Builds the single data+count SQL for master search (PERF-M1) as a
+     * <em>Top-N inner query + post-LIMIT serviceNames lateral</em>.
      *
-     * <p>The SELECT includes {@code COUNT(*) OVER() AS total_count} as the last
-     * column (index 9) so the caller can read the full result-set size from the
-     * first row without issuing a second query.
+     * <h4>Why this shape</h4>
+     * The earlier version emitted the {@code master_services}/
+     * {@code service_definitions} join, a {@code GROUP BY m.id}, and an inline
+     * {@code array_agg(DISTINCT sd.name)} in the <em>main</em> query. That
+     * grouped the entire district before {@code LIMIT}, pipeline-breaking the
+     * {@code idx_masters_active_rating} (V36) / {@code idx_masters_active_review_count}
+     * (V99) index-ordered Top-N. This refactor splits the work in two:
      *
-     * <p>Price filtering is a {@code WHERE m.min_effective_price} predicate on the
-     * pre-computed column (PERF-M2, V58) — no {@code GROUP BY / HAVING} needed
-     * for price. A {@code GROUP BY} is still emitted when the category filter
-     * triggers the {@code master_services} fan-out join.
+     * <ol>
+     *   <li><b>Inner derived table {@code t}</b> — a clean
+     *       {@code masters JOIN users} (+ {@code salons} LEFT JOIN for the
+     *       discovery-locality COALESCE) filter + {@code ORDER BY} +
+     *       {@code LIMIT/OFFSET}. No service join, no {@code GROUP BY}, so the
+     *       rating/review/price indexes can serve it as a true index-ordered
+     *       Top-N. {@code COUNT(*) OVER()} rides along (PERF-M1) and — because
+     *       Postgres applies {@code LIMIT} after window functions — still
+     *       reports the full filtered count in every paged row.</li>
+     *   <li><b>Category / {@code q} predicates → {@code EXISTS}</b> — a
+     *       category or service-name filter is expressed as a correlated
+     *       {@code EXISTS} sub-select (see {@link #appendWhereClause}). Each
+     *       {@code ILIKE} is then served by its own trigram index (V98) with no
+     *       join fan-out and no {@code GROUP BY} (also fixes the
+     *       OR-across-relations / single-index-defeat finding).</li>
+     *   <li><b>serviceNames → post-LIMIT correlated lateral {@code sn}</b> — the
+     *       capped, distinct, custom-preferred service names are computed for
+     *       <em>only the paged rows</em> (~20), never the whole district. The
+     *       {@code serviceNames} contract field is therefore populated on
+     *       <em>every</em> card (empty array when none), including location-only
+     *       searches — it is not gated behind any filter.</li>
+     * </ol>
+     *
+     * <p>Price filtering still uses the pre-computed {@code m.min_effective_price}
+     * column (PERF-M2, V58) — never a {@code HAVING} aggregate.
+     *
+     * <p>{@code LIMIT}/{@code OFFSET} are bound as named {@code :limit}/
+     * {@code :offset} params on the inner derived table specifically so the
+     * lateral sits <em>above</em> the LIMIT; binding them via Hibernate's
+     * {@code setMaxResults}/{@code setFirstResult} would wrap the outer lateral
+     * and re-expand it over the full district.
      */
     private static SqlAndParams buildMasterSearchSql(MasterSearchFilters filters, Pageable pageable) {
-        boolean needsServiceJoin = filters.needsServiceJoin();
-
-        StringBuilder sb = new StringBuilder();
+        StringBuilder inner = new StringBuilder();
         Map<String, Object> params = new LinkedHashMap<>();
 
-        appendDataSelect(sb, needsServiceJoin);
-        appendFromClause(sb, needsServiceJoin);
-        appendWhereClause(sb, filters, params);
+        appendDataSelect(inner);
+        appendFromClause(inner);
+        appendWhereClause(inner, filters, params);
+        appendOrderBy(inner, filters.sort());
+        // Inner Top-N: LIMIT/OFFSET bound here so the index-ordered scan feeds a
+        // bounded ~pageSize row set into the serviceNames lateral above.
+        inner.append(" LIMIT :limit OFFSET :offset");
+        params.put("limit", pageable.getPageSize());
+        params.put("offset", pageable.getOffset());
 
-        if (needsServiceJoin) {
-            sb.append("GROUP BY m.id, u.first_name, u.last_name, ")
-                    .append(DISCOVERY_CITY_EXPR).append(", ")
-                    .append(DISCOVERY_DISTRICT_EXPR).append(", ")
-                    .append("m.avg_rating, m.review_count, m.min_effective_price ");
-        }
-
-        sb.append("ORDER BY m.avg_rating DESC NULLS LAST, m.id");
-
-        return new SqlAndParams(sb.toString(), params);
+        String sql = wrapWithServiceNamesLateral(inner.toString(), filters.sort());
+        return new SqlAndParams(sql, params);
     }
 
     /**
-     * Builds the SELECT clause for the master data query.
+     * Wraps the index-ordered Top-N derived table with the post-LIMIT
+     * correlated lateral that computes {@link MasterSearchResult#serviceNames()}
+     * for only the paged rows.
      *
-     * <p>Column layout (stable — index-matched in {@link #mapMasterRow}):
-     * <ol start="0">
-     *   <li>master_id</li>
-     *   <li>first_name</li>
-     *   <li>last_name</li>
-     *   <li>avg_rating</li>
-     *   <li>review_count</li>
-     *   <li>avatar_url</li>
-     *   <li>discovery_city_id</li>
-     *   <li>discovery_district_id</li>
-     *   <li>min_effective_price (pre-computed column, PERF-M2 / V58)</li>
-     *   <li>total_count (window function COUNT(*) OVER(), PERF-M1)</li>
-     * </ol>
+     * <p>The lateral selects the DISTINCT active service names of each paged
+     * master, ordered by {@code sd.name} and capped to {@code SERVICE_NAME_CAP},
+     * then {@code array_agg}s them. {@code sd.name} is the owner-set custom name
+     * ({@code NOT NULL} by column constraint). A master with no active services
+     * yields {@code NULL} from {@code array_agg} → mapped to an empty list. The
+     * outer {@code ORDER BY} is re-applied on the derived-table aliases so paging
+     * order survives the lateral join (which is otherwise unordered).
      *
-     * <p>When the category filter triggers the service join, a surrounding
-     * {@code GROUP BY} is applied — but {@code min_effective_price} is a plain
-     * column, not an aggregate, so the GROUP BY simply adds it to the list.
-     * {@code COUNT(*) OVER()} is evaluated over the grouped result set,
-     * which is correct: it counts distinct master rows, not raw join rows.
+     * <p>Column layout is preserved (indices 0–10) so {@link #mapMasterRow} and
+     * {@link #TOTAL_COUNT_IDX}/{@link #SERVICE_NAMES_IDX} are unchanged.
      */
-    private static void appendDataSelect(StringBuilder sb, boolean needsServiceJoin) {
+    private static String wrapWithServiceNamesLateral(String innerSql, SearchSort sort) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("SELECT t.master_id, t.first_name, t.last_name, ")
+                .append("t.avg_rating, t.review_count, t.avatar_url, ")
+                .append("t.discovery_city_id, t.discovery_district_id, ")
+                .append("t.min_effective_price, sn.service_names, t.total_count ")
+                .append("FROM (").append(innerSql).append(") t ")
+                .append("LEFT JOIN LATERAL (")
+                .append("SELECT array_agg(x.name) AS service_names FROM (")
+                .append("SELECT DISTINCT sd.name ")
+                .append("FROM master_services ms ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ")
+                .append("ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
+                .append(") x) sn ON true ");
+        appendOuterOrderBy(sb, sort);
+        return sb.toString();
+    }
+
+    /**
+     * Appends the allow-listed {@code ORDER BY} for the resolved {@link SearchSort}.
+     *
+     * <p>The {@code switch} is exhaustive over the {@link SearchSort} enum — the
+     * caller's text never reaches the SQL, so this is injection-safe. Every
+     * branch ends with {@code m.id} as a deterministic tiebreaker so paging is
+     * stable when the primary key collides (equal ratings/prices/review counts).
+     */
+    private static void appendOrderBy(StringBuilder sb, SearchSort sort) {
+        sb.append(switch (sort) {
+            case PRICE_ASC -> "ORDER BY m.min_effective_price ASC NULLS LAST, m.id";
+            case PRICE_DESC -> "ORDER BY m.min_effective_price DESC NULLS LAST, m.id";
+            case REVIEWS_DESC -> "ORDER BY m.review_count DESC NULLS LAST, m.id";
+            case RATING_DESC -> "ORDER BY m.avg_rating DESC NULLS LAST, m.id";
+        });
+    }
+
+    /**
+     * Outer {@code ORDER BY} re-applied on the derived-table aliases ({@code t.*})
+     * after the serviceNames lateral join. A {@code LEFT JOIN LATERAL} does not
+     * preserve the inner {@code ORDER BY}, so the paging order is restated here
+     * over the already-bounded ~pageSize rows (a cheap final sort, not a
+     * district-wide one). Mirrors {@link #appendOrderBy} column-for-column with
+     * {@code m.} → {@code t.} and {@code m.id} → {@code t.master_id}.
+     */
+    private static void appendOuterOrderBy(StringBuilder sb, SearchSort sort) {
+        sb.append(switch (sort) {
+            case PRICE_ASC -> "ORDER BY t.min_effective_price ASC NULLS LAST, t.master_id";
+            case PRICE_DESC -> "ORDER BY t.min_effective_price DESC NULLS LAST, t.master_id";
+            case REVIEWS_DESC -> "ORDER BY t.review_count DESC NULLS LAST, t.master_id";
+            case RATING_DESC -> "ORDER BY t.avg_rating DESC NULLS LAST, t.master_id";
+        });
+    }
+
+    /**
+     * Builds the SELECT clause for the master data <em>inner derived table</em>.
+     *
+     * <p>This is the index-ordered Top-N core: NO service join, NO
+     * {@code array_agg}, NO {@code GROUP BY}. {@code serviceNames} is added one
+     * level up by {@link #wrapWithServiceNamesLateral} as a post-LIMIT lateral,
+     * so it stays out of the way of the rating/review/price index ordering here.
+     *
+     * <p>Inner aliases (referenced by name from the outer SELECT — index order
+     * within the inner is irrelevant since the outer projects explicitly):
+     * {@code master_id, first_name, last_name, avg_rating, review_count,
+     * avatar_url, discovery_city_id, discovery_district_id, min_effective_price,
+     * total_count}. The outer SELECT re-orders them to the stable 0–10 layout
+     * that {@link #mapMasterRow} expects (with {@code service_names} at index 9
+     * and {@code total_count} at index 10).
+     */
+    private static void appendDataSelect(StringBuilder sb) {
         sb.append("SELECT m.id AS master_id, ")
                 .append("u.first_name AS first_name, u.last_name AS last_name, ")
                 .append("m.avg_rating AS avg_rating, m.review_count AS review_count, ")
@@ -421,32 +578,33 @@ public class SearchService {
                 .append("CAST(NULL AS TEXT) AS avatar_url, ")
                 // Discovery-locality FK ids (district-primary via salon link
                 // for SALON_MASTER, else the user's own). Labels are resolved
-                // through the M2 seam; columns 6/7 carry the ids only.
+                // through the M2 seam; these carry the ids only.
                 .append(DISCOVERY_CITY_EXPR).append(" AS discovery_city_id, ")
                 .append(DISCOVERY_DISTRICT_EXPR).append(" AS discovery_district_id, ")
                 // PERF-M2: pre-computed column from V58 — avoids the per-request
                 // MIN(COALESCE(ms.price_override, sd.base_price)) aggregate.
                 .append("m.min_effective_price AS min_effective_price, ")
                 // PERF-M1: window function replaces the second COUNT(*) query.
-                // Postgres evaluates COUNT(*) OVER() after GROUP BY (if any),
-                // so it counts master rows, not raw join rows.
+                // Postgres applies LIMIT after window functions, so this reports
+                // the full filtered count in every paged row of the Top-N.
                 .append("COUNT(*) OVER() AS total_count ");
     }
 
     /**
-     * {@code masters m JOIN users u} is the spine. The {@code salons sal}
-     * LEFT JOIN on {@code m.salon_id} is always present (single-row PK join,
-     * no fan-out) so an employed {@code SALON_MASTER}'s discovery locality
-     * resolves through its salon at query time. The {@code master_services} /
-     * {@code service_definitions} joins remain conditional (fan-out).
+     * {@code masters m JOIN users u} is the spine of the inner Top-N. The
+     * {@code salons sal} LEFT JOIN on {@code m.salon_id} is always present
+     * (single-row PK join, no fan-out) so an employed {@code SALON_MASTER}'s
+     * discovery locality resolves through its salon at query time.
+     *
+     * <p><b>No service join here.</b> The {@code master_services} /
+     * {@code service_definitions} tables are reached only via the correlated
+     * {@code EXISTS} predicates ({@link #appendWhereClause}) and the post-LIMIT
+     * serviceNames lateral ({@link #wrapWithServiceNamesLateral}) — never as a
+     * main-query join, so they cannot pipeline-break the index-ordered Top-N.
      */
-    private static void appendFromClause(StringBuilder sb, boolean needsServiceJoin) {
+    private static void appendFromClause(StringBuilder sb) {
         sb.append("FROM masters m JOIN users u ON u.id = m.user_id ");
         sb.append("LEFT JOIN salons sal ON sal.id = m.salon_id ");
-        if (needsServiceJoin) {
-            sb.append("LEFT JOIN master_services ms ON ms.master_id = m.id AND ms.is_active = true ");
-            sb.append("LEFT JOIN service_definitions sd ON sd.id = ms.service_def_id ");
-        }
     }
 
     /**
@@ -484,8 +642,31 @@ public class SearchService {
             sb.append("AND ").append(DISCOVERY_CITY_EXPR).append(" = :cityId ");
             params.put("cityId", filters.cityId());
         }
+        // Free-text name / service-name match. ILIKE is the Postgres
+        // case-insensitive LIKE; the bound value is a pre-escaped %term% pattern
+        // (LIKE wildcards in the user term are neutralised in normalizeQuery, so
+        // ":q" is bound as a plain String, never interpolated into the SQL).
+        //
+        // The user-name predicates hit u.first_name / u.last_name directly (each
+        // served by its own partial trigram index, V98). The service-name match
+        // is a correlated EXISTS rather than a main-query join: this keeps the
+        // index-ordered Top-N intact (no fan-out, no GROUP BY) and lets the
+        // sd.name trigram index (V98) serve the inner ILIKE independently — also
+        // fixing the OR-across-relations / single-index-defeat finding.
+        if (filters.q() != null) {
+            sb.append("AND (u.first_name ILIKE :q OR u.last_name ILIKE :q OR EXISTS (")
+                    .append("SELECT 1 FROM master_services ms ")
+                    .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                    .append("WHERE ms.master_id = m.id AND ms.is_active = true AND sd.name ILIKE :q)) ");
+            params.put("q", likeContains(filters.q()));
+        }
+        // Category filter as a correlated EXISTS over the master's active
+        // services — no main-query service join, so the Top-N stays index-ordered.
         if (filters.category() != null) {
-            sb.append("AND sd.category = :category ");
+            sb.append("AND EXISTS (")
+                    .append("SELECT 1 FROM master_services ms ")
+                    .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                    .append("WHERE ms.master_id = m.id AND ms.is_active = true AND sd.category = :category) ");
             params.put("category", filters.category());
         }
         if (filters.minRating() != null) {
@@ -535,6 +716,54 @@ public class SearchService {
             return null;
         }
         return category.trim().toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * Minimum trigram-effective query length. A pg_trgm GIN index needs at least
+     * one full 3-gram to serve a containment {@code ILIKE}; a 1–2 char term
+     * matches no trigram and degrades into a full-table sequential scan. Terms
+     * shorter than this are normalised to {@code null} (the predicate is dropped
+     * and the location-scoped result set is returned) rather than running a
+     * trigram-defeating {@code %ab%} scan.
+     */
+    private static final int MIN_QUERY_LENGTH = 3;
+
+    /**
+     * Trims the free-text query and collapses blank to {@code null} (mirrors the
+     * {@code category} treatment). A trimmed term shorter than
+     * {@link #MIN_QUERY_LENGTH} is also normalised to {@code null}: pg_trgm
+     * cannot serve a 1–2 char containment {@code ILIKE}, so dropping the
+     * predicate (returning the location-scoped set) is strictly better than a
+     * full-table seq-scan on {@code %ab%}. Case-folding is unnecessary — the SQL
+     * uses {@code ILIKE} (case-insensitive). The returned term is the raw user
+     * text; {@link #likeContains} applies the {@code LIKE}-wildcard escaping when
+     * the {@code %term%} pattern is built, so the escaping lives in one place.
+     */
+    private static String normalizeQuery(String q) {
+        if (q == null || q.isBlank()) {
+            return null;
+        }
+        String trimmed = q.trim();
+        if (trimmed.length() < MIN_QUERY_LENGTH) {
+            return null;
+        }
+        return trimmed;
+    }
+
+    /**
+     * Builds a {@code %term%} {@code LIKE}/{@code ILIKE} containment pattern with
+     * the term's own {@code LIKE} metacharacters escaped, so a user-typed
+     * {@code %}, {@code _} or {@code \} matches that literal character instead of
+     * acting as a wildcard. Escaping uses the default backslash escape character
+     * (Postgres {@code ILIKE} honours {@code \} as the escape by default), and
+     * {@code \} itself is escaped first to avoid double-translation.
+     */
+    private static String likeContains(String term) {
+        String escaped = term
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_");
+        return "%" + escaped + "%";
     }
 
     /**
@@ -608,13 +837,13 @@ public class SearchService {
      * Maps a raw native-query row to {@link MasterSearchResult}, stamping the
      * resolved locality labels from the batched M2-seam result.
      *
-     * <p>10-column projection (indices 0–9):
+     * <p>11-column projection (indices 0–10):
      * {@code [master_id, first_name, last_name, avg_rating, review_count,
      * avatar_url, discovery_city_id, discovery_district_id,
-     * min_effective_price, total_count]}.
+     * min_effective_price, service_names, total_count]}.
      * The internal city/district UUIDs (6, 7) are consumed here for label
      * resolution and are NOT placed on the public DTO (§I).
-     * {@code total_count} (9) is read by the caller before this method is
+     * {@code total_count} (10) is read by the caller before this method is
      * invoked and is not mapped to the DTO.
      */
     private static MasterSearchResult mapMasterRow(Object[] row, DiscoveryLabels labels) {
@@ -627,6 +856,7 @@ public class SearchService {
         UUID cityId = (UUID) row[6];
         UUID districtId = (UUID) row[7];
         BigDecimal minEffectivePrice = (BigDecimal) row[8];
+        List<String> serviceNames = toServiceNames(row[SERVICE_NAMES_IDX]);
 
         return new MasterSearchResult(
                 masterId,
@@ -637,8 +867,42 @@ public class SearchService {
                 avgRating,
                 reviewCount,
                 avatarUrl,
-                minEffectivePrice
+                minEffectivePrice,
+                serviceNames
         );
+    }
+
+    /**
+     * Converts the JDBC representation of the {@code service_names} SQL array to
+     * an immutable {@code List<String>}. A master with no active services
+     * yields {@code null} or an empty array from Postgres — both map to an
+     * empty list (never {@code null}), so the DTO field serialises as
+     * {@code []}. The Postgres array slice already capped and de-duplicated the
+     * names; any residual {@code null} elements are dropped defensively.
+     */
+    private static List<String> toServiceNames(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        Object[] elements;
+        if (raw instanceof java.sql.Array sqlArray) {
+            try {
+                elements = (Object[]) sqlArray.getArray();
+            } catch (java.sql.SQLException e) {
+                throw new BusinessException("Failed to read service names array");
+            }
+        } else if (raw instanceof Object[] objectArray) {
+            elements = objectArray;
+        } else {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>(elements.length);
+        for (Object element : elements) {
+            if (element != null) {
+                names.add(element.toString());
+            }
+        }
+        return List.copyOf(names);
     }
 
     private static SalonSearchResult toSalonSearchResult(SalonSearchProjection proj, DiscoveryLabels labels) {

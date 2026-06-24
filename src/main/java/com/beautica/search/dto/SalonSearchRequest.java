@@ -1,11 +1,16 @@
 package com.beautica.search.dto;
 
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.AssertTrue;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
+
+import java.math.BigDecimal;
 
 /**
  * Inbound request DTO for {@code GET /api/v1/search/salons}.
@@ -41,6 +46,24 @@ import jakarta.validation.constraints.Size;
  *       {@link MasterSearchRequest#category()}) rather than the
  *       {@code ServiceCategory} enum — enum binding fails with an opaque 400
  *       that leaks the full enum surface.</li>
+ *   <li>{@code q} — free-text query matched case-insensitively
+ *       ({@code ILIKE %term%}) against the salon name. Same cap / control-char
+ *       {@code @Pattern} as {@code category}; the service escapes the
+ *       {@code LIKE} wildcards in the term. Optional.</li>
+ *   <li>{@code sort} — allow-listed ordering; see {@link SearchSort}. Bound to
+ *       an enum so caller text never reaches the {@code ORDER BY}. Salons have
+ *       no per-row price/review column to sort by cheaply, so {@code PRICE_*}
+ *       and {@code REVIEWS_DESC} fall back to the default name ordering on this
+ *       endpoint (documented in {@code SearchService}); {@code null} also
+ *       defaults.</li>
+ *   <li>{@code minPrice}, {@code maxPrice} — optional price-band filter against
+ *       the salon's aggregate price range ({@code priceMin}/{@code priceMax}
+ *       across the salon's masters' active services). A salon matches when its
+ *       band overlaps the requested band ({@code priceMin <= maxPrice AND
+ *       priceMax >= minPrice}); salons with no active priced service (both
+ *       aggregates NULL) are excluded once either bound is supplied. Precision
+ *       matches {@link MasterSearchRequest#minPrice()}. Cross-field min ≤ max is
+ *       enforced by {@link #isPriceRangeValid()}.</li>
  *   <li>{@code page} — boxed {@code Integer}; {@code null} = use server default (0).
  *       Capped at 500 to bound offset-pagination memory usage: at the {@code size=100}
  *       ceiling that means at most ~50 000 results reachable via offset pagination.
@@ -64,10 +87,25 @@ public record SalonSearchRequest(
         @Valid
         LocationFilter location,
 
+        @Size(max = 100, message = "q must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+                 message = "q must not contain control characters or HTML special characters")
+        String q,
+
         @Size(max = 100, message = "category must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
                  message = "category must not contain control characters or HTML special characters")
         String category,
+
+        SearchSort sort,
+
+        @DecimalMin(value = "0", message = "minPrice must be at least 0")
+        @Digits(integer = 8, fraction = 2, message = "minPrice must have at most 8 integer digits and 2 decimal places")
+        BigDecimal minPrice,
+
+        @DecimalMin(value = "0", message = "maxPrice must be at least 0")
+        @Digits(integer = 8, fraction = 2, message = "maxPrice must have at most 8 integer digits and 2 decimal places")
+        BigDecimal maxPrice,
 
         @PositiveOrZero(message = "page must be zero or positive")
         @Max(value = 500, message = "page must be at most 500")
@@ -77,4 +115,20 @@ public record SalonSearchRequest(
         @Max(value = 100, message = "size must be at most 100")
         Integer size
 ) {
+
+    /**
+     * Cross-field price-range guard mirroring
+     * {@link MasterSearchRequest#isPriceRangeValid()} — evaluated at Spring MVC
+     * argument-resolution time, before any {@code @Cacheable} proxy intercepts.
+     * Returns {@code true} (valid) when either bound is absent: a null on either
+     * side simply means "no lower/upper bound" and is not a cross-field
+     * violation (the per-field {@code @DecimalMin} already rejects negatives).
+     */
+    @AssertTrue(message = "minPrice must be less than or equal to maxPrice")
+    public boolean isPriceRangeValid() {
+        if (minPrice == null || maxPrice == null) {
+            return true;
+        }
+        return minPrice.compareTo(maxPrice) <= 0;
+    }
 }

@@ -71,7 +71,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>§E — search path MUST use the projection overload.</b>
      * {@link SearchService} must call
-     * {@link #findActiveByDistrictIdAsProjection(UUID, String, Pageable)} so
+     * {@link #findActiveByDistrictIdAsProjection(UUID, String, String, java.math.BigDecimal, java.math.BigDecimal, Pageable)} so
      * only the columns needed by {@link SalonSearchProjection} are fetched.
      * This full-entity overload remains for non-search callers that genuinely
      * need the full {@code Salon} graph.
@@ -125,17 +125,92 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
+              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
+            """,
+            countQuery = """
+            SELECT COUNT(*)
+            FROM salons s
+            LEFT JOIN LATERAL (
+                SELECT MIN(sd.base_price) AS pmin,
+                       MAX(CASE WHEN sd.price_type = 'RANGE'
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                FROM master_services ms
+                JOIN masters mm ON mm.id = ms.master_id
+                JOIN service_definitions sd ON sd.id = ms.service_def_id
+                WHERE mm.salon_id = s.id
+                  AND mm.is_active = true
+                  AND ms.is_active = true
+                  AND sd.is_active = true
+                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
+            ) pr ON true
+            WHERE s.is_active = true
+              AND s.district_id = :districtId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
+              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
+            """,
+            nativeQuery = true)
+    Page<SalonSearchProjection> findActiveByDistrictIdAsProjection(
+            @Param("districtId") UUID districtId,
+            @Param("category") String category,
+            @Param("q") String q,
+            @Param("minPrice") java.math.BigDecimal minPrice,
+            @Param("maxPrice") java.math.BigDecimal maxPrice,
+            Pageable pageable
+    );
+
+    /**
+     * No-price-bound variant of {@link #findActiveByDistrictIdAsProjection}
+     * (HIGH PERF gate). The data query is identical (the price-range LATERAL
+     * still runs because {@code priceMin}/{@code priceMax} are display columns on
+     * {@link SalonSearchProjection}), but the {@code countQuery} is a plain
+     * {@code COUNT(*)} with <b>no LATERAL</b>: when both price bounds are null
+     * the per-salon price aggregate is irrelevant to the count, and paying for it
+     * on every search was a pure regression. {@link SearchService} dispatches
+     * here when {@code minPrice == null && maxPrice == null}.
+     *
+     * @param districtId resolved discovery district id (never {@code null})
+     */
+    @Query(value = """
+            SELECT s.id           AS id,
+                   s.name         AS name,
+                   s.city_id      AS city_id,
+                   s.district_id  AS district_id,
+                   s.avatar_url   AS avatar_url,
+                   pr.pmin        AS price_min,
+                   pr.pmax        AS price_max
+            FROM salons s
+            LEFT JOIN LATERAL (
+                SELECT MIN(sd.base_price) AS pmin,
+                       MAX(CASE WHEN sd.price_type = 'RANGE'
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                FROM master_services ms
+                JOIN masters mm ON mm.id = ms.master_id
+                JOIN service_definitions sd ON sd.id = ms.service_def_id
+                WHERE mm.salon_id = s.id
+                  AND mm.is_active = true
+                  AND ms.is_active = true
+                  AND sd.is_active = true
+                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
+            ) pr ON true
+            WHERE s.is_active = true
+              AND s.district_id = :districtId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
             """,
             countQuery = """
             SELECT COUNT(*)
             FROM salons s
             WHERE s.is_active = true
               AND s.district_id = :districtId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
             """,
             nativeQuery = true)
-    Page<SalonSearchProjection> findActiveByDistrictIdAsProjection(
+    Page<SalonSearchProjection> findActiveByDistrictIdNoPriceAsProjection(
             @Param("districtId") UUID districtId,
             @Param("category") String category,
+            @Param("q") String q,
             Pageable pageable
     );
 
@@ -152,7 +227,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>§E — search path MUST use the projection overload.</b>
      * {@link SearchService} must call
-     * {@link #findActiveByCityIdAsProjection(UUID, String, Pageable)}.
+     * {@link #findActiveByCityIdAsProjection(UUID, String, String, java.math.BigDecimal, java.math.BigDecimal, Pageable)}.
      * This full-entity overload remains for non-search callers.
      *
      * @param cityId resolved discovery city id (never {@code null})
@@ -200,17 +275,89 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
+              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
+            """,
+            countQuery = """
+            SELECT COUNT(*)
+            FROM salons s
+            LEFT JOIN LATERAL (
+                SELECT MIN(sd.base_price) AS pmin,
+                       MAX(CASE WHEN sd.price_type = 'RANGE'
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                FROM master_services ms
+                JOIN masters mm ON mm.id = ms.master_id
+                JOIN service_definitions sd ON sd.id = ms.service_def_id
+                WHERE mm.salon_id = s.id
+                  AND mm.is_active = true
+                  AND ms.is_active = true
+                  AND sd.is_active = true
+                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
+            ) pr ON true
+            WHERE s.is_active = true
+              AND s.city_id = :cityId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
+              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
+            """,
+            nativeQuery = true)
+    Page<SalonSearchProjection> findActiveByCityIdAsProjection(
+            @Param("cityId") UUID cityId,
+            @Param("category") String category,
+            @Param("q") String q,
+            @Param("minPrice") java.math.BigDecimal minPrice,
+            @Param("maxPrice") java.math.BigDecimal maxPrice,
+            Pageable pageable
+    );
+
+    /**
+     * No-price-bound variant of {@link #findActiveByCityIdAsProjection}
+     * (HIGH PERF gate). Plain {@code COUNT(*)} count query (no LATERAL) for the
+     * common no-price-filter path; the data query keeps the LATERAL because the
+     * price band is a display column. {@link SearchService} dispatches here when
+     * both price bounds are null.
+     *
+     * @param cityId resolved discovery city id (never {@code null})
+     */
+    @Query(value = """
+            SELECT s.id           AS id,
+                   s.name         AS name,
+                   s.city_id      AS city_id,
+                   s.district_id  AS district_id,
+                   s.avatar_url   AS avatar_url,
+                   pr.pmin        AS price_min,
+                   pr.pmax        AS price_max
+            FROM salons s
+            LEFT JOIN LATERAL (
+                SELECT MIN(sd.base_price) AS pmin,
+                       MAX(CASE WHEN sd.price_type = 'RANGE'
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                FROM master_services ms
+                JOIN masters mm ON mm.id = ms.master_id
+                JOIN service_definitions sd ON sd.id = ms.service_def_id
+                WHERE mm.salon_id = s.id
+                  AND mm.is_active = true
+                  AND ms.is_active = true
+                  AND sd.is_active = true
+                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
+            ) pr ON true
+            WHERE s.is_active = true
+              AND s.city_id = :cityId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
             """,
             countQuery = """
             SELECT COUNT(*)
             FROM salons s
             WHERE s.is_active = true
               AND s.city_id = :cityId
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
             """,
             nativeQuery = true)
-    Page<SalonSearchProjection> findActiveByCityIdAsProjection(
+    Page<SalonSearchProjection> findActiveByCityIdNoPriceAsProjection(
             @Param("cityId") UUID cityId,
             @Param("category") String category,
+            @Param("q") String q,
             Pageable pageable
     );
 
@@ -226,7 +373,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>§E — search path MUST use the projection overload.</b>
      * {@link SearchService} must call
-     * {@link #findByIsActiveTrueAsProjection(String, Pageable)}.
+     * {@link #findByIsActiveTrueAsProjection(String, java.math.BigDecimal, java.math.BigDecimal, String, Pageable)}.
      * This full-entity overload remains for non-search callers.
      */
     Page<Salon> findByIsActiveTrue(Pageable pageable);
@@ -261,14 +408,81 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
+              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
+            """,
+            countQuery = """
+            SELECT COUNT(*)
+            FROM salons s
+            LEFT JOIN LATERAL (
+                SELECT MIN(sd.base_price) AS pmin,
+                       MAX(CASE WHEN sd.price_type = 'RANGE'
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                FROM master_services ms
+                JOIN masters mm ON mm.id = ms.master_id
+                JOIN service_definitions sd ON sd.id = ms.service_def_id
+                WHERE mm.salon_id = s.id
+                  AND mm.is_active = true
+                  AND ms.is_active = true
+                  AND sd.is_active = true
+                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
+            ) pr ON true
+            WHERE s.is_active = true
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
+              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
+            """,
+            nativeQuery = true)
+    Page<SalonSearchProjection> findByIsActiveTrueAsProjection(
+            @Param("q") String q,
+            @Param("minPrice") java.math.BigDecimal minPrice,
+            @Param("maxPrice") java.math.BigDecimal maxPrice,
+            @Param("category") String category,
+            Pageable pageable
+    );
+
+    /**
+     * No-price-bound variant of {@link #findByIsActiveTrueAsProjection}
+     * (HIGH PERF gate). Plain {@code COUNT(*)} count query (no LATERAL) for the
+     * common no-price-filter path; the data query keeps the LATERAL because the
+     * price band is a display column. {@link SearchService} dispatches here when
+     * both price bounds are null and no locality filter was supplied.
+     */
+    @Query(value = """
+            SELECT s.id           AS id,
+                   s.name         AS name,
+                   s.city_id      AS city_id,
+                   s.district_id  AS district_id,
+                   s.avatar_url   AS avatar_url,
+                   pr.pmin        AS price_min,
+                   pr.pmax        AS price_max
+            FROM salons s
+            LEFT JOIN LATERAL (
+                SELECT MIN(sd.base_price) AS pmin,
+                       MAX(CASE WHEN sd.price_type = 'RANGE'
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                FROM master_services ms
+                JOIN masters mm ON mm.id = ms.master_id
+                JOIN service_definitions sd ON sd.id = ms.service_def_id
+                WHERE mm.salon_id = s.id
+                  AND mm.is_active = true
+                  AND ms.is_active = true
+                  AND sd.is_active = true
+                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
+            ) pr ON true
+            WHERE s.is_active = true
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
             """,
             countQuery = """
             SELECT COUNT(*)
             FROM salons s
             WHERE s.is_active = true
+              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
             """,
             nativeQuery = true)
-    Page<SalonSearchProjection> findByIsActiveTrueAsProjection(
+    Page<SalonSearchProjection> findByIsActiveTrueNoPriceAsProjection(
+            @Param("q") String q,
             @Param("category") String category,
             Pageable pageable
     );

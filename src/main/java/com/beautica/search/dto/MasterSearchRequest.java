@@ -43,6 +43,19 @@ import java.math.BigDecimal;
  *       {@link LocationFilter}. {@code @Valid} cascades Bean Validation into
  *       the nested record. Optional: a {@code null} location means "no
  *       location filter".</li>
+ *   <li>{@code q} — free-text name / service-name query. Matched
+ *       case-insensitively ({@code ILIKE %term%}) against the master's first
+ *       name, last name, and the (custom-preferred) service-definition names.
+ *       Capped at 100 chars; the same control-char / HTML-special
+ *       {@code @Pattern} as {@code category} blocks injection on this
+ *       {@code permitAll} endpoint. The service escapes the {@code LIKE}
+ *       wildcards ({@code %}, {@code _}, {@code \}) in the supplied term, so a
+ *       literal {@code %} matches a literal {@code %}. Optional: {@code null} /
+ *       blank means "no text filter".</li>
+ *   <li>{@code sort} — allow-listed ordering; see {@link SearchSort}. Bound to
+ *       an enum so caller text never reaches the {@code ORDER BY}. A
+ *       {@code null} (or unbindable) value falls back to
+ *       {@link SearchSort#RATING_DESC} — the historical default.</li>
  *   <li>{@code category} — kept as a free {@code String} (max 100, mirroring
  *       {@code service_definitions.category VARCHAR(100)} from V6) rather than
  *       binding straight to the {@code ServiceCategory} enum. Enum binding
@@ -76,10 +89,17 @@ public record MasterSearchRequest(
         @Valid
         LocationFilter location,
 
+        @Size(max = 100, message = "q must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+                 message = "q must not contain control characters or HTML special characters")
+        String q,
+
         @Size(max = 100, message = "category must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
                  message = "category must not contain control characters or HTML special characters")
         String category,
+
+        SearchSort sort,
 
         @DecimalMin(value = "0", message = "minPrice must be at least 0")
         @Digits(integer = 8, fraction = 2, message = "minPrice must have at most 8 integer digits and 2 decimal places")

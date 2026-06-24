@@ -44,6 +44,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     private static final String MASTERS_URL = "/api/v1/search/masters";
     private static final String SALONS_URL = "/api/v1/search/salons";
 
+    @org.springframework.boot.test.web.server.LocalServerPort
+    private int port;
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -1051,7 +1054,532 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 msId, masterId, serviceDefId, msActive);
     }
 
+    // ── Phase — name / service-name search, serviceNames, sort, salon price ──
+
+    @Test
+    @DisplayName("GET /search/masters — ?q matches the master's last name case-insensitively")
+    void should_matchMasterByName_caseInsensitively_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
+        seedNamedIndependentMaster("Київ", "4.50", "Ivan", "Petrenko");
+
+        // Lower-case query must still hit "Kovalenko" (ILIKE, case-insensitive).
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?q=kovalenko&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — ?q matches a master via the (custom) service-definition name")
+    void should_matchMasterByServiceName_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Anna", "Koval");
+        seedNamedServiceForMaster(match, "Французький манікюр", "MANICURE", new BigDecimal("300.00"));
+        seedNamedIndependentMaster("Київ", "4.50", "Boris", "Tkach");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?q=французький&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — serviceNames carries the custom service-definition names (custom-over-default automatic)")
+    void should_populateServiceNames_withCustomNames() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Master");
+        seedNamedServiceForMaster(master, "Авторський манікюр", "MANICURE", new BigDecimal("250.00"));
+        seedNamedServiceForMaster(master, "Педикюр SPA", "PEDICURE", new BigDecimal("350.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        JsonNode names = row.path("serviceNames");
+        assertThat(names.isArray()).isTrue();
+        java.util.List<String> values = new java.util.ArrayList<>();
+        names.forEach(n -> values.add(n.asText()));
+        assertThat(values).containsExactlyInAnyOrder("Авторський манікюр", "Педикюр SPA");
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — serviceNames is an empty array (not null) for a master with no active services")
+    void should_returnEmptyServiceNames_when_masterHasNoServices() throws Exception {
+        ensureHttpClient();
+        seedNamedIndependentMaster("Київ", "4.50", "Solo", "Master");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        assertThat(row.path("serviceNames").isArray()).isTrue();
+        assertThat(row.path("serviceNames").size())
+                .as("service-less master → empty array, never null")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — ?sort=PRICE_ASC orders by ascending minEffectivePrice")
+    void should_orderByPriceAscending_when_sortPriceAsc() throws Exception {
+        ensureHttpClient();
+        seedMasterWithService("Київ", "4.00", new BigDecimal("500.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(new BigDecimal(rows.get(0).path("minEffectivePrice").asText()))
+                .isEqualByComparingTo(new BigDecimal("100.00"));
+        assertThat(new BigDecimal(rows.get(2).path("minEffectivePrice").asText()))
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — min_effective_price NULL masters are excluded by a price filter")
+    void should_excludeNullPriceMasters_when_priceFilterApplied() throws Exception {
+        ensureHttpClient();
+        seedNamedIndependentMaster("Київ", "4.00", "No", "Price");   // no services → NULL price
+        seedMasterWithService("Київ", "4.00", new BigDecimal("250.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=100&maxPrice=400&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("NULL min_effective_price fails the range predicate naturally")
+                .isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?minPrice/?maxPrice narrows to salons whose price band overlaps the requested band")
+    void should_narrowSalonsByPriceBand_when_priceFilterApplied() throws Exception {
+        ensureHttpClient();
+        // Salon A: band 150..200 (overlaps [250,400]? no)
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
+        seedSalonServiceForMaster(masterA, salonA, "MANICURE", "FIXED",
+                new BigDecimal("150.00"), null, true, true);
+        // Salon B: band 300..300 (overlaps [250,400]? yes)
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        seedSalonServiceForMaster(masterB, salonB, "MANICURE", "FIXED",
+                new BigDecimal("300.00"), null, true, true);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&minPrice=250&maxPrice=400&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("only salon B's 300 band overlaps [250,400]")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(salonB.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — a salon with no active priced service is excluded once a price bound is supplied")
+    void should_excludeUnpricedSalon_when_priceFilterApplied() throws Exception {
+        ensureHttpClient();
+        seedActiveSalon("Київ", null);   // no master / no services → NULL band
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&minPrice=100&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("NULL price band fails the overlap predicate once a bound is set")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?q matches the salon name case-insensitively")
+    void should_matchSalonByName_caseInsensitively_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID glow = seedNamedSalon("Київ", "Glow Studio");
+        seedNamedSalon("Київ", "Shine Bar");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=glow&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(glow.toString());
+    }
+
+    // ── Item A — server-side location filtering proof ────────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters — location.cityId narrows masters to that city and excludes others (server-side filter proof)")
+    void should_narrowMastersByCity_andExcludeOtherCities() throws Exception {
+        ensureHttpClient();
+        UUID inKyiv = seedNamedIndependentMaster("Київ", "4.50", "Kyiv", "Master");
+        seedNamedIndependentMaster("Львів", "4.90", "Lviv", "Master");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("server-side city FK filter narrows to Київ only")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(inKyiv.toString());
+    }
+
+    // ── QA additions — name-search behavioural gaps (Cyrillic, first-name, literal escape) ─
+
+    @Test
+    @DisplayName("GET /search/masters — ?q matches the master's FIRST name case-insensitively (Cyrillic фолд: q=олена matches 'Олена')")
+    void should_matchMasterByFirstName_caseInsensitively_cyrillic_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Олена", "Коваленко");
+        seedNamedIndependentMaster("Київ", "4.50", "Іван", "Петренко");
+
+        // Lower-case Cyrillic query must still hit the capitalised first name
+        // "Олена" — proves ILIKE case-folds Ukrainian letters, not just ASCII.
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?q=олена&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("Cyrillic ILIKE must case-fold: q=олена matches first name 'Олена'")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — a literal '%' in ?q is escaped (matches a literal percent, NOT used as a wildcard)")
+    void should_treatPercentInQ_asLiteral_notWildcard() throws Exception {
+        ensureHttpClient();
+        // One master whose last name literally contains '%', one that does not.
+        UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "50%off");
+        seedNamedIndependentMaster("Київ", "4.50", "Boris", "Plainname");
+
+        // q="%off" — if '%' were treated as a SQL wildcard, the pattern would be
+        // %%off% and match anything ending in "off"; escaped, it matches only the
+        // literal "%off" substring, so exactly the one master is returned.
+        // Build a concrete URI (not a String template) so RestTemplate does not
+        // re-encode the already-encoded '%25' into '%2525' (double-encoding would
+        // deliver a literal "%25off" to the server and match nothing).
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(MASTERS_URL + "?q=" + enc("%off") + "&page=0&size=20"),
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("escaped '%' matches a literal percent — only the '50%off' master, not every '...off'")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(literal.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — a literal '_' in ?q is escaped (single-underscore is not the any-char wildcard)")
+    void should_treatUnderscoreInQ_asLiteral_notWildcard() throws Exception {
+        ensureHttpClient();
+        UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "a_b");
+        // "axb" would be matched by an UNescaped '_' wildcard (a<any>b) — it must NOT match.
+        seedNamedIndependentMaster("Київ", "4.50", "Boris", "axb");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(MASTERS_URL + "?q=" + enc("a_b") + "&page=0&size=20"),
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("escaped '_' matches a literal underscore — 'a_b' only, never 'axb' via wildcard")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(literal.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — a literal '%' in ?q is escaped against the salon name (not a wildcard)")
+    void should_treatPercentInSalonQ_asLiteral_notWildcard() throws Exception {
+        ensureHttpClient();
+        UUID literal = seedNamedSalon("Київ", "Glow 50%");
+        seedNamedSalon("Київ", "Shine Bar 50 off");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(SALONS_URL + "?q=" + enc("50%") + "&page=0&size=20"),
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("salon ?q '%' is a literal — only 'Glow 50%' matches")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(literal.toString());
+    }
+
+    // ── QA additions — serviceNames DISTINCT + cap-at-3 ──────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters — serviceNames is DISTINCT and capped at 3 even when the master has 5 distinct active services")
+    void should_capServiceNamesAtThree_andDeduplicate_when_masterHasManyServices() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Many", "Services");
+        // Five DISTINCT names + one duplicate of the first → 5 distinct, 6 rows.
+        seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("200.00"));
+        seedNamedServiceForMaster(master, "Педикюр SPA", "PEDICURE", new BigDecimal("300.00"));
+        seedNamedServiceForMaster(master, "Стрижка", "HAIRCUT", new BigDecimal("400.00"));
+        seedNamedServiceForMaster(master, "Фарбування", "HAIRCUT", new BigDecimal("500.00"));
+        seedNamedServiceForMaster(master, "Брови", "BROWS", new BigDecimal("150.00"));
+        seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("210.00")); // duplicate name
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        JsonNode names = row.path("serviceNames");
+        assertThat(names.isArray()).isTrue();
+        java.util.List<String> values = new java.util.ArrayList<>();
+        names.forEach(n -> values.add(n.asText()));
+        // Cap: at most 3 names surface. DISTINCT: no value repeats. Membership:
+        // every surfaced name is one of the seeded distinct names (ordering is a
+        // deterministic array_agg(... ORDER BY sd.name) slice, but we assert the
+        // observable contract — size<=3 + distinct + subset — which survives the
+        // post-LIMIT-lateral perf refactor).
+        assertThat(values)
+                .as("serviceNames is capped at SERVICE_NAME_CAP=3")
+                .hasSize(3);
+        assertThat(values)
+                .as("serviceNames is DISTINCT — no duplicate display string")
+                .doesNotHaveDuplicates();
+        assertThat(values)
+                .as("each surfaced name is one of the master's seeded distinct service names")
+                .isSubsetOf("Брови", "Манікюр класичний", "Педикюр SPA", "Стрижка", "Фарбування");
+    }
+
+    // ── QA additions — master sort ordering for every enum value ─────────────
+
+    @Test
+    @DisplayName("GET /search/masters — ?sort=PRICE_DESC orders by descending minEffectivePrice")
+    void should_orderByPriceDescending_when_sortPriceDesc() throws Exception {
+        ensureHttpClient();
+        seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("500.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(new BigDecimal(rows.get(0).path("minEffectivePrice").asText()))
+                .as("PRICE_DESC: highest price first")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(rows.get(2).path("minEffectivePrice").asText()))
+                .as("PRICE_DESC: lowest price last")
+                .isEqualByComparingTo(new BigDecimal("100.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — ?sort=REVIEWS_DESC orders by descending review_count")
+    void should_orderByReviewsDescending_when_sortReviewsDesc() throws Exception {
+        ensureHttpClient();
+        seedMasterWithReviewCount("Київ", "4.00", 2);
+        seedMasterWithReviewCount("Київ", "4.00", 50);
+        seedMasterWithReviewCount("Київ", "4.00", 17);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=REVIEWS_DESC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.get(0).path("reviewCount").asInt())
+                .as("REVIEWS_DESC: most-reviewed first")
+                .isEqualTo(50);
+        assertThat(rows.get(2).path("reviewCount").asInt())
+                .as("REVIEWS_DESC: least-reviewed last")
+                .isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — default sort (no ?sort) orders by descending avg_rating")
+    void should_orderByRatingDescending_when_sortOmitted() throws Exception {
+        ensureHttpClient();
+        seedMasterWithCity("Київ", "3.80");
+        seedMasterWithCity("Київ", "4.90");
+        seedMasterWithCity("Київ", "4.20");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.get(0).path("avgRating").asDouble())
+                .as("RATING_DESC default: highest rating first")
+                .isEqualTo(4.90);
+        assertThat(rows.get(2).path("avgRating").asDouble())
+                .as("RATING_DESC default: lowest rating last")
+                .isEqualTo(3.80);
+    }
+
+    // ── QA additions — salon sort (PRICE_ASC / PRICE_DESC by band) ───────────
+
+    @Test
+    @DisplayName("GET /search/salons — ?sort=PRICE_ASC orders salons by ascending priceMin band floor")
+    void should_orderSalonsByPriceAscending_when_sortPriceAsc() throws Exception {
+        ensureHttpClient();
+        UUID cheap = seedSalonWithFixedService("Київ", new BigDecimal("100.00"));
+        UUID mid = seedSalonWithFixedService("Київ", new BigDecimal("300.00"));
+        UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.size()).isEqualTo(3);
+        assertThat(rows.get(0).path("salonId").asText())
+                .as("PRICE_ASC: cheapest band floor first")
+                .isEqualTo(cheap.toString());
+        assertThat(rows.get(2).path("salonId").asText())
+                .as("PRICE_ASC: dearest band floor last")
+                .isEqualTo(dear.toString());
+        // mid sits between — pin it so a stable, total ordering is proven.
+        assertThat(rows.get(1).path("salonId").asText()).isEqualTo(mid.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?sort=PRICE_DESC orders salons by descending priceMax band ceiling")
+    void should_orderSalonsByPriceDescending_when_sortPriceDesc() throws Exception {
+        ensureHttpClient();
+        UUID cheap = seedSalonWithFixedService("Київ", new BigDecimal("100.00"));
+        UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.get(0).path("salonId").asText())
+                .as("PRICE_DESC: dearest band ceiling first")
+                .isEqualTo(dear.toString());
+        assertThat(rows.get(rows.size() - 1).path("salonId").asText())
+                .as("PRICE_DESC: cheapest band ceiling last")
+                .isEqualTo(cheap.toString());
+    }
+
+    // ── QA additions — short ?q normalize-to-null (coordinate with perf fix) ──
+
+    @Test
+    @DisplayName("GET /search/masters — a 1-2 char ?q normalises to null and returns the full location-scoped result set (not an ILIKE on the short term)")
+    void should_normalizeShortQToNull_andReturnLocationScopedResults() throws Exception {
+        ensureHttpClient();
+        // Master in Київ whose name does NOT contain the short term "zz".
+        UUID inKyiv = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&q=zz&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("short q is normalised to null → the city-scoped master is returned despite its name not containing 'zz'")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(inKyiv.toString());
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Seeds an INDEPENDENT_MASTER with explicit first/last name on the user row
+     * (the generic {@link #seedMaster} leaves names null, which the name-search
+     * tests need populated). City FK lives on the user row.
+     */
+    private UUID seedNamedIndependentMaster(String city, String avgRating,
+                                            String firstName, String lastName) {
+        UUID cityId = cityIdByName(city);
+
+        UUID userId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, first_name, last_name, city, city_id, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, true, true)",
+                userId, "named-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", firstName, lastName, city, cityId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, userId, avgRating);
+        return masterId;
+    }
+
+    /**
+     * Seeds an active, priced service definition with an explicit (custom)
+     * {@code name} plus an active {@code master_services} link, then refreshes
+     * {@code masters.min_effective_price}. Used by the service-name search and
+     * {@code serviceNames}-population tests where the name must be deterministic.
+     */
+    private void seedNamedServiceForMaster(UUID masterId, String serviceName,
+                                           String category, BigDecimal basePrice) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 0, true, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, basePrice);
+
+        UUID msId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, true, NOW(), NOW())",
+                msId, masterId, serviceDefId);
+
+        jdbcTemplate.update(
+                "UPDATE masters SET min_effective_price = (" +
+                "  SELECT MIN(COALESCE(ms2.price_override, sd2.base_price))" +
+                "  FROM master_services ms2" +
+                "  JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id" +
+                "  WHERE ms2.master_id = ? AND ms2.is_active = true AND sd2.is_active = true" +
+                ") WHERE id = ?",
+                masterId, masterId);
+    }
+
+    /** Seeds a SALON_OWNER + an active salon with an explicit name in the given city. */
+    private UUID seedNamedSalon(String city, String name) {
+        UUID cityId = cityIdByName(city);
+
+        UUID ownerId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
+                ownerId, "named-salon-owner-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest");
+
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, name, city, cityId);
+        return salonId;
+    }
 
     /**
      * Resolves the Nth Flyway-seeded {@code city_districts.id} of a city by the
@@ -1186,6 +1714,26 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         return salonId;
     }
 
+    /** Percent-encodes a query-parameter value (UTF-8). */
+    private static String enc(String raw) {
+        return java.net.URLEncoder.encode(raw, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Builds a concrete {@link java.net.URI} from an already-encoded path+query
+     * string so {@link TestRestTemplate} treats it as a final URI and does NOT
+     * re-expand/re-encode it as a URI template (which would double-encode a
+     * pre-encoded {@code %25} into {@code %2525}). Required by the literal-{@code %}
+     * escaping tests where the query value carries percent-encoded metacharacters.
+     *
+     * <p>The URI is built absolute (against the random server port) because
+     * {@link TestRestTemplate} only prepends its root URI for String templates,
+     * not for a concrete {@link java.net.URI} argument.
+     */
+    private java.net.URI rawUri(String encodedPathAndQuery) {
+        return java.net.URI.create("http://localhost:" + port + encodedPathAndQuery);
+    }
+
     private static HttpHeaders anonymousHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(java.util.List.of(MediaType.APPLICATION_JSON));
@@ -1272,6 +1820,32 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     /** Convenience: seeds a master without any services. */
     private UUID seedMasterWithCity(String city, String avgRating) {
         return seedMaster(city, avgRating);
+    }
+
+    /**
+     * Seeds an INDEPENDENT_MASTER in the given city with an explicit
+     * {@code review_count} (overriding the {@code seedMaster} default of 1) so
+     * the {@code sort=REVIEWS_DESC} ordering test has a deterministic spread.
+     */
+    private UUID seedMasterWithReviewCount(String city, String avgRating, int reviewCount) {
+        UUID masterId = seedMaster(city, avgRating);
+        jdbcTemplate.update(
+                "UPDATE masters SET review_count = ? WHERE id = ?", reviewCount, masterId);
+        return masterId;
+    }
+
+    /**
+     * Seeds an active salon in the given city priced by a single FIXED service
+     * at {@code fixedPrice}, so its aggregate band collapses to
+     * {@code priceMin == priceMax == fixedPrice}. Used by the salon sort tests
+     * where each salon must carry a deterministic, distinct price band.
+     */
+    private UUID seedSalonWithFixedService(String city, BigDecimal fixedPrice) {
+        UUID salonId = seedActiveSalon(city, null);
+        UUID masterId = seedSalonMasterFor(salonId, city, "4.00");
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                fixedPrice, null, true, true);
+        return salonId;
     }
 
     /**

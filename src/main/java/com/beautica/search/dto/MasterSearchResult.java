@@ -1,6 +1,7 @@
 package com.beautica.search.dto;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -31,6 +32,16 @@ import java.util.UUID;
  * <p>{@code userId} is intentionally absent: this record is returned from
  * a {@code permitAll} endpoint, and exposing internal user UUIDs would
  * enable enumeration of the user table by anonymous callers.</p>
+ *
+ * <p><b>{@code serviceNames} — custom-preferred procedure names:</b> a short,
+ * capped ({@code SERVICE_NAME_CAP}) list of the master's distinct active
+ * service names, surfaced so the result card can preview what the master does.
+ * Each name is the {@code service_definitions.name} the owner set, which IS the
+ * custom name (the platform never overwrites it), so custom-over-default is
+ * automatic. The list is never {@code null}: a master with no active, priced
+ * services yields an empty list, which serialises as {@code []}. It carries no
+ * internal IDs — only the display strings — so it is safe on this
+ * {@code permitAll} endpoint (§I).</p>
  */
 public record MasterSearchResult(
         UUID masterId,
@@ -41,6 +52,7 @@ public record MasterSearchResult(
         Double avgRating,
         Integer reviewCount,
         String avatarUrl,
-        BigDecimal minEffectivePrice
+        BigDecimal minEffectivePrice,
+        List<String> serviceNames
 ) {
 }
