@@ -4,6 +4,8 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.service.MasterService;
+import com.beautica.search.dto.MasterSearchRequest;
+import com.beautica.search.service.SearchService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -11,6 +13,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -60,6 +64,9 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
 
     @Autowired
     private MasterService masterService;
+
+    @Autowired
+    private SearchService searchService;
 
     @Autowired
     private CacheManager cacheManager;
@@ -114,6 +121,52 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
                 .as("second read MUST return the FRESH bio (%s); the stale cached bio (%s) would mean afterCommit eviction did not fire",
                         NEW_BIO, OLD_BIO)
                 .isEqualTo(NEW_BIO);
+    }
+
+    @Test
+    @DisplayName("clears the entire search:masters cache after a name change commits for an INDEPENDENT_MASTER — the discovery eviction branch fired")
+    void should_clearSearchMastersCache_when_independentMasterNameChangeCommits() {
+        log.debug("Arrange: seed an active INDEPENDENT_MASTER who is searchable in the discovery cache");
+        UUID userId = UUID.randomUUID();
+        seedIndependentMaster(userId, "search-evict@beautica.test", "Iryna", "Bondarenko", OLD_BIO);
+
+        // ── 1. Warm the discovery cache — an unfiltered page-0 search stores one
+        //        entry under the real @Cacheable key in search:masters ──────────────
+        log.debug("Arrange: run an unfiltered discovery search to populate search:masters");
+        MasterSearchRequest searchRequest =
+                new MasterSearchRequest(null, null, null, null, null, null, null, null, null);
+        transactionTemplate.execute(status ->
+                searchService.searchMasters(searchRequest, PageRequest.of(0, 20)));
+
+        Cache searchCache = cacheManager.getCache("search:masters");
+        assertThat(searchCache)
+                .as("the search:masters cache must be registered by the real CacheConfig")
+                .isNotNull();
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeSearch =
+                ((CaffeineCache) searchCache).getNativeCache();
+        nativeSearch.cleanUp();
+        assertThat(nativeSearch.estimatedSize())
+                .as("after the warm search the discovery cache must hold at least one entry — otherwise the eviction assertion would be vacuous")
+                .isPositive();
+
+        // ── 2. Change the master's DISPLAY NAME in a COMMITTED transaction. firstName
+        //        is a searchAffected field (UserService.updateMasterProfile:162), so the
+        //        afterCommit callback hits the `searchAffected && INDEPENDENT_MASTER`
+        //        branch (UserService.evictUserCachesAfterCommit:215) and calls clear(). ──
+        log.debug("Act: update firstName (a searchAffected field) inside a committed transaction — registers the afterCommit search:masters clear()");
+        transactionTemplate.executeWithoutResult(status ->
+                userService.updateMasterProfile(
+                        userId,
+                        new MasterProfileUpdateRequest("Iryna-Renamed", null, null, null, null)));
+
+        // ── 3. The whole discovery cache must now be empty. If the eviction branch were
+        //        removed (or its role/searchAffected gate broke), this entry would survive
+        //        and estimatedSize() would still be positive → the test fails. ───────────
+        log.debug("Assert: search:masters is empty after commit — proves the discovery-cache eviction branch fired");
+        nativeSearch.cleanUp();
+        assertThat(nativeSearch.estimatedSize())
+                .as("search:masters MUST be cleared after an INDEPENDENT_MASTER name change commits; a surviving entry means the searchAffected eviction branch did not fire")
+                .isZero();
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
