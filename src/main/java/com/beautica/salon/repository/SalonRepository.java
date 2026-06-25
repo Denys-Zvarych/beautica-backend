@@ -111,7 +111,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    pr.pmax        AS price_max,
                    pr.pnames      AS service_names,
                    s.street       AS street,
-                   s.building_no  AS building_no
+                   s.building_no  AS building_no,
+                   s.location_note AS location_note
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
@@ -198,7 +199,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    pr.pmax        AS price_max,
                    pr.pnames      AS service_names,
                    s.street       AS street,
-                   s.building_no  AS building_no
+                   s.building_no  AS building_no,
+                   s.location_note AS location_note
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
@@ -291,7 +293,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    pr.pmax        AS price_max,
                    pr.pnames      AS service_names,
                    s.street       AS street,
-                   s.building_no  AS building_no
+                   s.building_no  AS building_no,
+                   s.location_note AS location_note
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
@@ -375,7 +378,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    pr.pmax        AS price_max,
                    pr.pnames      AS service_names,
                    s.street       AS street,
-                   s.building_no  AS building_no
+                   s.building_no  AS building_no,
+                   s.location_note AS location_note
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
@@ -455,7 +459,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    pr.pmax        AS price_max,
                    pr.pnames      AS service_names,
                    s.street       AS street,
-                   s.building_no  AS building_no
+                   s.building_no  AS building_no,
+                   s.location_note AS location_note
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
@@ -534,7 +539,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    pr.pmax        AS price_max,
                    pr.pnames      AS service_names,
                    s.street       AS street,
-                   s.building_no  AS building_no
+                   s.building_no  AS building_no,
+                   s.location_note AS location_note
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,

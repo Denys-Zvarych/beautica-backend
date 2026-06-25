@@ -70,7 +70,7 @@ class SearchServiceTest {
     private Query dataQuery;
 
     // countQuery mock removed — PERF-M1 replaced the two-query pattern with a single
-    // native query that embeds COUNT(*) OVER() as row[13] (TOTAL_COUNT_IDX) of every result row.
+    // native query that embeds COUNT(*) OVER() as row[14] (TOTAL_COUNT_IDX) of every result row.
 
     @Mock
     private SalonRepository salonRepository;
@@ -102,18 +102,19 @@ class SearchServiceTest {
     private void stubNativeQueries(List<Object[]> rows, long total) {
         // PERF-M1: a single native query replaces the old data+count two-query pattern.
         // Phase 19.x record-component additions widened the final wrapped projection to
-        // 14 columns (indices 0–13):
+        // 15 columns (indices 0–14):
         //   0 master_id, 1 first_name, 2 last_name, 3 avg_rating, 4 review_count,
         //   5 avatar_url, 6 discovery_city_id, 7 discovery_district_id,
         //   8 min_effective_price, 9 price_max, 10 service_names, 11 street,
-        //   12 building_no, 13 total_count (COUNT(*) OVER()).
+        //   12 building_no, 13 location_note, 14 total_count (COUNT(*) OVER()).
         // Test rows are authored short (9–10 columns); this extends them so the
-        // not-explicitly-set columns (price_max, service_names, street, building_no)
-        // default to null and the window-function total lands at TOTAL_COUNT_IDX (13).
+        // not-explicitly-set columns (price_max, service_names, street, building_no,
+        // location_note) default to null and the window-function total lands at
+        // TOTAL_COUNT_IDX (14).
         List<Object[]> rowsWithCount = rows.stream()
                 .map(row -> {
-                    Object[] extended = java.util.Arrays.copyOf(row, 14);
-                    extended[13] = total;   // TOTAL_COUNT_IDX in SearchService
+                    Object[] extended = java.util.Arrays.copyOf(row, 15);
+                    extended[14] = total;   // TOTAL_COUNT_IDX in SearchService
                     return extended;
                 })
                 .toList();
@@ -597,14 +598,14 @@ class SearchServiceTest {
     }
 
     @Test
-    @DisplayName("total count is read from COUNT(*) OVER() in row[13], not a separate query (PERF-M1)")
+    @DisplayName("total count is read from COUNT(*) OVER() in row[14], not a separate query (PERF-M1)")
     void should_readTotalFromWindowFunction_when_rowsReturned() {
         Object[] row = new Object[]{
                 UUID.randomUUID(), "Anna", "Koval",
                 new BigDecimal("4.20"), 5, null,
                 CITY_ID, null, new BigDecimal("350.00")
         };
-        stubNativeQueries(List.<Object[]>of(row), 7L);  // total=7, embedded as row[13] by stubNativeQueries
+        stubNativeQueries(List.<Object[]>of(row), 7L);  // total=7, embedded as row[14] by stubNativeQueries
 
         // Use pageSize=5 so Spring Data's PageImpl last-page adjustment doesn't fire.
         // PageImpl adjusts total when offset+pageSize > total (last-page heuristic):

@@ -54,17 +54,19 @@ import java.util.UUID;
  * only when {@code priceMax != minEffectivePrice} (a genuine range). The
  * backend never collapses the two values — that is a rendering concern.</p>
  *
- * <p><b>{@code street} / {@code buildingNo} — AUTH-GATED street address:</b>
- * the master's full street-level address ({@code users.street} /
- * {@code users.building_no}). These are <b>privacy-sensitive</b> (an
- * independent master's home address) and are returned <b>only to an
- * authenticated caller</b>. For an anonymous request both are {@code null};
- * the public {@code cityLabel}/{@code districtLabel} remain visible to
- * everyone. The values are always computed in SQL and cached on the full
- * object; the auth-gate (nulling for anon) happens per-request <em>after</em>
- * the cache read in the controller, so a warm cache populated by an
- * authenticated caller can never leak addresses to an anonymous one (and
- * vice-versa). See {@code SearchController} for the strip.</p>
+ * <p><b>{@code street} / {@code buildingNo} / {@code locationNote} — AUTH-GATED
+ * street address:</b> the master's full street-level address
+ * ({@code users.street} / {@code users.building_no} / {@code users.location_note}).
+ * These are <b>privacy-sensitive</b> (an independent master's home address) and
+ * are returned <b>only to an authenticated caller</b>. For an anonymous request
+ * all three are {@code null}; the public {@code cityLabel}/{@code districtLabel}
+ * remain visible to everyone. {@code locationNote} is a free-text arrival hint
+ * ("3rd floor, ring twice") and may be {@code null} even for an authenticated
+ * caller when the master recorded none. The values are always computed in SQL
+ * and cached on the full object; the auth-gate (nulling for anon) happens
+ * per-request <em>after</em> the cache read in the controller, so a warm cache
+ * populated by an authenticated caller can never leak addresses to an anonymous
+ * one (and vice-versa). See {@code SearchController} for the strip.</p>
  */
 public record MasterSearchResult(
         UUID masterId,
@@ -79,13 +81,15 @@ public record MasterSearchResult(
         BigDecimal priceMax,
         List<String> serviceNames,
         String street,
-        String buildingNo
+        String buildingNo,
+        String locationNote
 ) {
 
     /**
      * Returns a copy with the auth-gated street-level fields ({@code street},
-     * {@code buildingNo}) nulled out, for serving to anonymous callers. All
-     * other fields — including the public locality labels — are preserved.
+     * {@code buildingNo}, {@code locationNote}) nulled out, for serving to
+     * anonymous callers. All other fields — including the public locality
+     * labels — are preserved.
      *
      * <p>Applied per-request in the controller <em>after</em> the
      * {@code @Cacheable} read so the cache always holds the full object and
@@ -95,7 +99,7 @@ public record MasterSearchResult(
         return new MasterSearchResult(
                 masterId, firstName, lastName, cityLabel, districtLabel,
                 avgRating, reviewCount, avatarUrl, minEffectivePrice, priceMax,
-                serviceNames, null, null
+                serviceNames, null, null, null
         );
     }
 }

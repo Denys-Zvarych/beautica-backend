@@ -109,6 +109,7 @@ class SearchControllerTest {
 
     private static final String SAMPLE_STREET = "вул. Хрещатик";
     private static final String SAMPLE_BUILDING_NO = "22А";
+    private static final String SAMPLE_LOCATION_NOTE = "Дзвоніть за 10 хв";
 
     private static MasterSearchResult sampleMasterResult() {
         return new MasterSearchResult(
@@ -124,7 +125,8 @@ class SearchControllerTest {
                 new BigDecimal("400.00"),           // priceMax (a genuine range: > min)
                 List.of("Манікюр", "Педикюр"),      // serviceNames
                 SAMPLE_STREET,                       // street (auth-gated)
-                SAMPLE_BUILDING_NO                   // buildingNo (auth-gated)
+                SAMPLE_BUILDING_NO,                  // buildingNo (auth-gated)
+                SAMPLE_LOCATION_NOTE                 // locationNote (auth-gated)
         );
     }
 
@@ -139,7 +141,8 @@ class SearchControllerTest {
                 new BigDecimal("600.00"),           // priceMax
                 List.of("Стрижка", "Фарбування"),   // serviceNames (never null)
                 SAMPLE_STREET,                       // street (auth-gated)
-                SAMPLE_BUILDING_NO                   // buildingNo (auth-gated)
+                SAMPLE_BUILDING_NO,                  // buildingNo (auth-gated)
+                SAMPLE_LOCATION_NOTE                 // locationNote (auth-gated)
         );
     }
 
@@ -702,7 +705,7 @@ class SearchControllerTest {
                 new BigDecimal("300.00"),   // minEffectivePrice
                 new BigDecimal("300.00"),   // priceMax == min → FIXED single price
                 List.of("Манікюр"),
-                SAMPLE_STREET, SAMPLE_BUILDING_NO);
+                SAMPLE_STREET, SAMPLE_BUILDING_NO, SAMPLE_LOCATION_NOTE);
         Page<MasterSearchResult> page = new PageImpl<>(List.of(fixed), PageRequest.of(0, 20), 1L);
         when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
 
@@ -725,7 +728,7 @@ class SearchControllerTest {
     // can never silently start leaking masters'/salons' home addresses to anon.
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — ANONYMOUS caller gets street AND buildingNo nulled (no address leak)")
+    @DisplayName("GET /api/v1/search/masters — ANONYMOUS caller gets street, buildingNo AND locationNote nulled (no address leak)")
     void should_stripStreetAddress_forMasters_when_anonymous() throws Exception {
         Page<MasterSearchResult> page = new PageImpl<>(
                 List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
@@ -740,12 +743,13 @@ class SearchControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.data[0].street").value((Object) null))
                 .andExpect(jsonPath("$.data.data[0].buildingNo").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value((Object) null))
                 // public locality labels must still be visible to anonymous callers
                 .andExpect(jsonPath("$.data.data[0].cityLabel").value("Київ"));
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — AUTHENTICATED caller gets street AND buildingNo populated")
+    @DisplayName("GET /api/v1/search/masters — AUTHENTICATED caller gets street, buildingNo AND locationNote populated")
     void should_returnStreetAddress_forMasters_when_authenticated() throws Exception {
         Page<MasterSearchResult> page = new PageImpl<>(
                 List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
@@ -758,11 +762,12 @@ class SearchControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.data[0].street").value(SAMPLE_STREET))
-                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO));
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value(SAMPLE_LOCATION_NOTE));
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/salons — ANONYMOUS caller gets street AND buildingNo nulled (no address leak)")
+    @DisplayName("GET /api/v1/search/salons — ANONYMOUS caller gets street, buildingNo AND locationNote nulled (no address leak)")
     void should_stripStreetAddress_forSalons_when_anonymous() throws Exception {
         Page<SalonSearchResult> page = new PageImpl<>(
                 List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
@@ -775,11 +780,12 @@ class SearchControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.data[0].street").value((Object) null))
                 .andExpect(jsonPath("$.data.data[0].buildingNo").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value((Object) null))
                 .andExpect(jsonPath("$.data.data[0].cityLabel").value("Львів"));
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/salons — AUTHENTICATED caller gets street AND buildingNo populated")
+    @DisplayName("GET /api/v1/search/salons — AUTHENTICATED caller gets street, buildingNo AND locationNote populated")
     void should_returnStreetAddress_forSalons_when_authenticated() throws Exception {
         Page<SalonSearchResult> page = new PageImpl<>(
                 List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
@@ -792,7 +798,8 @@ class SearchControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.data[0].street").value(SAMPLE_STREET))
-                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO));
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value(SAMPLE_LOCATION_NOTE));
     }
 
     // ── salon serviceNames contract (never null) ─────────────────────────────
@@ -821,7 +828,7 @@ class SearchControllerTest {
                 UUID.randomUUID(), "Empty Salon", "Київ", null, null,
                 null, null,                 // priceMin / priceMax null
                 List.of(),                  // serviceNames empty (never null per the contract)
-                null, null);
+                null, null, null);          // street / buildingNo / locationNote
         Page<SalonSearchResult> page = new PageImpl<>(List.of(noServices), PageRequest.of(0, 20), 1L);
         when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
 

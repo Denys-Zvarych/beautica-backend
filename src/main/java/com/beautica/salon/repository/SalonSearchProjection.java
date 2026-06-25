@@ -92,4 +92,13 @@ public interface SalonSearchProjection {
      * handling as {@link #getStreet()}. May be {@code null}.
      */
     String getBuildingNo();
+
+    /**
+     * The salon's free-text arrival note ({@code salons.location_note}).
+     * AUTH-GATED, same handling as {@link #getStreet()} — always fetched in SQL,
+     * nulled out per-request for anonymous callers after the {@code @Cacheable}
+     * read (privacy — see {@code SalonSearchResult}). May be {@code null} when
+     * the salon recorded no note.
+     */
+    String getLocationNote();
 }

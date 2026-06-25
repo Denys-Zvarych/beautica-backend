@@ -151,7 +151,7 @@ public class SearchService {
     private static final int SERVICE_NAMES_IDX = 10;
 
     /** Projection index of the {@code COUNT(*) OVER()} total-count column (PERF-M1). */
-    private static final int TOTAL_COUNT_IDX = 13;
+    private static final int TOTAL_COUNT_IDX = 14;
 
     /**
      * Role value (stored via {@code EnumType.STRING}) that master discovery is
@@ -511,10 +511,11 @@ public class SearchService {
      * single override) still yields {@code price_max == min_effective_price}.
      * {@code NULL} when the master has no active, priced services.
      *
-     * <p>Column layout is preserved (indices 0–13) so {@link #mapMasterRow},
-     * {@link #TOTAL_COUNT_IDX} and {@link #SERVICE_NAMES_IDX} are unchanged —
-     * {@code price_max} stays at projection index 9, only its SOURCE moves from
-     * {@code t.price_max} to {@code sn.price_max}.
+     * <p>Column layout (indices 0–14): {@code price_max} stays at projection
+     * index 9 and {@link #SERVICE_NAMES_IDX} (10) is unchanged — only its SOURCE
+     * moves from {@code t.price_max} to {@code sn.price_max}. The auth-gated
+     * address trio {@code street} (11) / {@code building_no} (12) /
+     * {@code location_note} (13) precedes {@link #TOTAL_COUNT_IDX} (14).
      */
     private static String wrapWithServiceNamesLateral(
             String innerSql, SearchSort sort, boolean hasCategoryFilter) {
@@ -523,7 +524,7 @@ public class SearchService {
                 .append("t.avg_rating, t.review_count, t.avatar_url, ")
                 .append("t.discovery_city_id, t.discovery_district_id, ")
                 .append("t.min_effective_price, sn.price_max, sn.service_names, ")
-                .append("t.street, t.building_no, t.total_count ")
+                .append("t.street, t.building_no, t.location_note, t.total_count ")
                 .append("FROM (").append(innerSql).append(") t ")
                 .append("LEFT JOIN LATERAL (")
                 .append("SELECT ")
@@ -630,10 +631,12 @@ public class SearchService {
                 // of the same join. It is now folded INTO that post-LIMIT lateral
                 // (see wrapWithServiceNamesLateral) so ONE lateral returns both
                 // service_names and price_max — a single pass per paged master.
-                // AUTH-GATED street address (users.street / users.building_no).
-                // Always selected; nulled for anonymous callers post-cache in the
-                // controller — privacy for independent masters' home addresses.
+                // AUTH-GATED street address (users.street / users.building_no /
+                // users.location_note). Always selected; nulled for anonymous
+                // callers post-cache in the controller — privacy for independent
+                // masters' home addresses.
                 .append("u.street AS street, u.building_no AS building_no, ")
+                .append("u.location_note AS location_note, ")
                 // PERF-M1: window function replaces the second COUNT(*) query.
                 // Postgres applies LIMIT after window functions, so this reports
                 // the full filtered count in every paged row of the Top-N.
@@ -891,20 +894,21 @@ public class SearchService {
      * Maps a raw native-query row to {@link MasterSearchResult}, stamping the
      * resolved locality labels from the batched M2-seam result.
      *
-     * <p>14-column projection (indices 0–13):
+     * <p>15-column projection (indices 0–14):
      * {@code [master_id, first_name, last_name, avg_rating, review_count,
      * avatar_url, discovery_city_id, discovery_district_id,
      * min_effective_price, price_max, service_names, street, building_no,
-     * total_count]}.
+     * location_note, total_count]}.
      * The internal city/district UUIDs (6, 7) are consumed here for label
      * resolution and are NOT placed on the public DTO (§I).
-     * {@code total_count} (13) is read by the caller before this method is
+     * {@code total_count} (14) is read by the caller before this method is
      * invoked and is not mapped to the DTO.
      *
-     * <p>{@code street} (11) / {@code building_no} (12) are mapped through as-is
-     * here; the per-request auth-gate (nulling them for anonymous callers) is
-     * applied in the controller AFTER the {@code @Cacheable} read so the cache
-     * never leaks addresses across the anon/authenticated boundary.
+     * <p>{@code street} (11) / {@code building_no} (12) / {@code location_note}
+     * (13) are mapped through as-is here; the per-request auth-gate (nulling them
+     * for anonymous callers) is applied in the controller AFTER the
+     * {@code @Cacheable} read so the cache never leaks addresses across the
+     * anon/authenticated boundary.
      */
     private static MasterSearchResult mapMasterRow(Object[] row, DiscoveryLabels labels) {
         UUID masterId = (UUID) row[0];
@@ -920,6 +924,7 @@ public class SearchService {
         List<String> serviceNames = toServiceNames(row[SERVICE_NAMES_IDX]);
         String street = (String) row[11];
         String buildingNo = (String) row[12];
+        String locationNote = (String) row[13];
 
         return new MasterSearchResult(
                 masterId,
@@ -934,7 +939,8 @@ public class SearchService {
                 priceMax,
                 serviceNames,
                 street,
-                buildingNo
+                buildingNo,
+                locationNote
         );
     }
 
@@ -991,7 +997,8 @@ public class SearchService {
                 // the full object; nulled for anonymous callers in the controller
                 // AFTER the @Cacheable read so the cache never leaks addresses.
                 proj.getStreet(),
-                proj.getBuildingNo()
+                proj.getBuildingNo(),
+                proj.getLocationNote()
         );
     }
 }
