@@ -479,7 +479,8 @@ public class SearchService {
         params.put("limit", pageable.getPageSize());
         params.put("offset", pageable.getOffset());
 
-        String sql = wrapWithServiceNamesLateral(inner.toString(), filters.sort());
+        String sql = wrapWithServiceNamesLateral(
+                inner.toString(), filters.sort(), filters.category() != null);
         return new SqlAndParams(sql, params);
     }
 
@@ -515,7 +516,8 @@ public class SearchService {
      * {@code price_max} stays at projection index 9, only its SOURCE moves from
      * {@code t.price_max} to {@code sn.price_max}.
      */
-    private static String wrapWithServiceNamesLateral(String innerSql, SearchSort sort) {
+    private static String wrapWithServiceNamesLateral(
+            String innerSql, SearchSort sort, boolean hasCategoryFilter) {
         StringBuilder sb = new StringBuilder();
         sb.append("SELECT t.master_id, t.first_name, t.last_name, ")
                 .append("t.avg_rating, t.review_count, t.avatar_url, ")
@@ -531,8 +533,18 @@ public class SearchService {
                 .append("SELECT DISTINCT sd.name ")
                 .append("FROM master_services ms ")
                 .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
-                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ")
-                .append("ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
+                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ");
+        // Phase 19.7 fix (Option B): scope the names preview to the searched category
+        // (catalogue-wide when null) so a category-filtered card never leaks names
+        // from a master's services in OTHER categories. Mirrors the salon path.
+        // Appended as a plain equality predicate ONLY when a category filter is
+        // active — so :category is referenced solely where it is bound (conditional
+        // bind, see appendWhereClause) — avoiding the CAST(:...) idiom forbidden by
+        // SearchServiceTest's generated-SQL guard.
+        if (hasCategoryFilter) {
+            sb.append("AND sd.category = :category ");
+        }
+        sb.append("ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") x) AS service_names, ")
                 // Price ceiling: unbounded MAX over ALL active services (no LIMIT).
                 .append("MAX(COALESCE(ms2.price_override, "
@@ -705,6 +717,10 @@ public class SearchService {
                     .append("SELECT 1 FROM master_services ms ")
                     .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
                     .append("WHERE ms.master_id = m.id AND ms.is_active = true AND sd.category = :category) ");
+            // :category bound conditionally (Option B) — only when a category filter
+            // is active, so it is always bound wherever it is referenced. The
+            // post-LIMIT serviceNames lateral applies the SAME predicate conditionally
+            // (plain equality, no CAST) — see wrapWithServiceNamesLateral.
             params.put("category", filters.category());
         }
         if (filters.minRating() != null) {

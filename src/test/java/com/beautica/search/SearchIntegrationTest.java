@@ -1205,6 +1205,89 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isZero();
     }
 
+    // ── Phase 19.7 regression — category-scoped serviceNames preview ──────────
+
+    @Test
+    @DisplayName("GET /search/masters?category=EYELASH — serviceNames lists ONLY the filtered-category names (no foreign-category leak)")
+    void should_scopeServiceNamesToFilteredCategory_when_masterHasMultiCategoryServices() throws Exception {
+        ensureHttpClient();
+        // ONE master carrying services in TWO categories: 2 in EYELASH, 1 in MAKEUP.
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Lash", "Master");
+        seedNamedServiceForMaster(master, "Ламінування вій №3", "EYELASH", new BigDecimal("400.00"));
+        seedNamedServiceForMaster(master, "Ламінування вій №4", "EYELASH", new BigDecimal("450.00"));
+        seedNamedServiceForMaster(master, "Макіяж №1", "MAKEUP", new BigDecimal("700.00"));
+
+        // Search the EYELASH category in the seed's city — the WHERE EXISTS keeps the
+        // master in (it has an EYELASH service), and the names preview must be scoped.
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&category=EYELASH&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("category filter keeps the master with an EYELASH service")
+                .isEqualTo(1L);
+        JsonNode row = data.path("data").get(0);
+        assertThat(row.path("masterId").asText()).isEqualTo(master.toString());
+
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("category-filtered card lists ONLY EYELASH names — exactly the two seeded")
+                .containsExactlyInAnyOrder("Ламінування вій №3", "Ламінування вій №4");
+        assertThat(names)
+                .as("the MAKEUP name from another category must NOT leak into an EYELASH-filtered card")
+                .doesNotContain("Макіяж №1");
+    }
+
+    @Test
+    @DisplayName("GET /search/masters (no category) — serviceNames spans ALL categories (no-filter branch stays catalogue-wide)")
+    void should_returnAllCategoryServiceNames_when_noCategoryFilter() throws Exception {
+        ensureHttpClient();
+        // Same multi-category master; with NO category filter the preview is
+        // catalogue-wide and capped at SERVICE_NAME_CAP=3 → all three names surface.
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Multi", "Master");
+        seedNamedServiceForMaster(master, "Ламінування вій №3", "EYELASH", new BigDecimal("400.00"));
+        seedNamedServiceForMaster(master, "Ламінування вій №4", "EYELASH", new BigDecimal("450.00"));
+        seedNamedServiceForMaster(master, "Макіяж №1", "MAKEUP", new BigDecimal("700.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("no-filter branch is catalogue-wide — all three names across both categories surface (cap=3)")
+                .containsExactlyInAnyOrder("Ламінування вій №3", "Ламінування вій №4", "Макіяж №1");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?category=EYELASH — serviceNames is category-scoped (salon-side parity guard)")
+    void should_scopeSalonServiceNamesToFilteredCategory_when_salonHasMultiCategoryServices() throws Exception {
+        ensureHttpClient();
+        // ONE salon, ONE master carrying services in TWO categories: 2 EYELASH, 1 MAKEUP.
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(masterId, salonId, "Ламінування вій №3", "EYELASH", new BigDecimal("400.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Ламінування вій №4", "EYELASH", new BigDecimal("450.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Макіяж №1", "MAKEUP", new BigDecimal("700.00"));
+
+        JsonNode row = singleSalonRow("Київ", "EYELASH");
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("salon category-filtered card lists ONLY EYELASH names — exactly the two seeded")
+                .containsExactlyInAnyOrder("Ламінування вій №3", "Ламінування вій №4");
+        assertThat(names)
+                .as("the MAKEUP name from another category must NOT leak into an EYELASH-filtered salon card")
+                .doesNotContain("Макіяж №1");
+    }
+
     // ── Phase 19.x — master priceMax (FIXED vs RANGE discriminator) ───────────
 
     @Test
