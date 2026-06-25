@@ -63,6 +63,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // exact paths (/book/otp/send, /book/otp/verify), and the GET cancel-info read is excluded
     // by the POST-method guard, so only the cancel POST consumes this bucket.
     private static final String CANCEL_POST_PATH_PREFIX = "/api/v1/book/cancel/";
+    // Discovery search read paths (all GET, all permitAll): /api/v1/search/masters and
+    // /api/v1/search/salons. Matched by prefix so any future /search/* read inherits the
+    // same throttle. These endpoints now surface authed-only street addresses for
+    // independent masters, so an unthrottled crawler could bulk-harvest home addresses;
+    // this is the IP-layer defence against that scraping.
+    private static final String SEARCH_PATH_PREFIX = "/api/v1/search/";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
@@ -110,6 +116,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // this filter directly.
     private static final long CANCEL_POST_CAPACITY = 10;
     private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for GET /api/v1/search/** (40 / 60 s). These permitAll() discovery reads
+    // now expose authed-only street addresses for independent masters, so without a throttle
+    // a single IP could page through every district/city and bulk-harvest home addresses.
+    // 40/min is a paging-friendly ceiling — a human filtering + paginating discovery results
+    // (each page is one request) stays well under it, while a scripted crawler sweeping the
+    // catalogue is capped. IP-keyed for consistency with every other bucket in this filter
+    // (JWT is parsed in JwtAuthenticationFilter, which runs AFTER this filter; and the search
+    // endpoints are permitAll anyway, so anonymous callers carry no principal). Built
+    // internally (not an injected @Qualifier bean) so the public 16-arg constructor — depended
+    // on by several slice/regression tests — stays unchanged.
+    private static final long SEARCH_CAPACITY = 40;
+    private static final Duration SEARCH_WINDOW = Duration.ofMinutes(1);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -166,6 +184,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rather than injected so the public 16-arg constructor stays stable for the slice/regression
     // tests that construct this filter directly.
     private final LoadingCache<String, Bucket> cancelPostBuckets;
+    // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
+    // discovery reads (which now surface authed-only independent-master street addresses).
+    // Built internally rather than injected so the public 16-arg constructor stays stable for
+    // the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> searchBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -218,6 +241,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(cancelPostBandwidth())
                         .build());
+        this.searchBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SEARCH_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(searchBandwidth())
+                        .build());
     }
 
     private static Bandwidth otpVerifyBandwidth() {
@@ -238,6 +267,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(CANCEL_POST_CAPACITY)
                 .refillIntervally(CANCEL_POST_CAPACITY, CANCEL_POST_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth searchBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SEARCH_CAPACITY)
+                .refillIntervally(SEARCH_CAPACITY, SEARCH_WINDOW)
                 .build();
     }
 
@@ -272,6 +308,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(SLOTS_PATH_PREFIX)
                 && path.endsWith(SLOTS_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, slotsBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
+        // before the POST-only guard so these GET reads are covered. These permitAll() paths
+        // expose authed-only independent-master street addresses, so the throttle is the
+        // IP-layer defence against bulk home-address harvesting. Cap: 40 / 60 s per IP.
+        if (HttpMethod.GET.matches(method)
+                && path.startsWith(SEARCH_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 

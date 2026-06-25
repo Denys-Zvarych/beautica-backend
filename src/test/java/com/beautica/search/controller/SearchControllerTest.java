@@ -40,6 +40,7 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -106,6 +107,9 @@ class SearchControllerTest {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    private static final String SAMPLE_STREET = "вул. Хрещатик";
+    private static final String SAMPLE_BUILDING_NO = "22А";
+
     private static MasterSearchResult sampleMasterResult() {
         return new MasterSearchResult(
                 UUID.randomUUID(),
@@ -115,9 +119,12 @@ class SearchControllerTest {
                 "Голосіївський район",
                 4.6,
                 17,
-                null,
-                new BigDecimal("250.00"),
-                List.of("Манікюр", "Педикюр")
+                null,                               // avatarUrl
+                new BigDecimal("250.00"),           // minEffectivePrice
+                new BigDecimal("400.00"),           // priceMax (a genuine range: > min)
+                List.of("Манікюр", "Педикюр"),      // serviceNames
+                SAMPLE_STREET,                       // street (auth-gated)
+                SAMPLE_BUILDING_NO                   // buildingNo (auth-gated)
         );
     }
 
@@ -126,10 +133,13 @@ class SearchControllerTest {
                 UUID.randomUUID(),
                 "Salon Beautica",
                 "Львів",
-                null,
-                null,
-                new BigDecimal("150.00"),
-                new BigDecimal("600.00")
+                null,                               // districtLabel
+                null,                               // avatarUrl
+                new BigDecimal("150.00"),           // priceMin
+                new BigDecimal("600.00"),           // priceMax
+                List.of("Стрижка", "Фарбування"),   // serviceNames (never null)
+                SAMPLE_STREET,                       // street (auth-gated)
+                SAMPLE_BUILDING_NO                   // buildingNo (auth-gated)
         );
     }
 
@@ -662,6 +672,182 @@ class SearchControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.data[0].serviceNames").isArray())
                 .andExpect(jsonPath("$.data.data[0].serviceNames[0]").value("Манікюр"));
+    }
+
+    // ── priceMax semantics (FIXED vs RANGE discriminator) ────────────────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — priceMax is present in the result DTO and exceeds minEffectivePrice for a range master")
+    void should_exposePriceMax_aboveMin_forRangeMaster() throws Exception {
+        // sampleMasterResult() seeds min=250.00, priceMax=400.00 — a genuine range.
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].minEffectivePrice").value(250.00))
+                .andExpect(jsonPath("$.data.data[0].priceMax").value(400.00));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — priceMax equals minEffectivePrice for a single FIXED-price master")
+    void should_returnEqualPriceMaxAndMin_forFixedPriceMaster() throws Exception {
+        MasterSearchResult fixed = new MasterSearchResult(
+                UUID.randomUUID(), "Iryna", "Fixed", "Київ", null,
+                4.9, 5, null,
+                new BigDecimal("300.00"),   // minEffectivePrice
+                new BigDecimal("300.00"),   // priceMax == min → FIXED single price
+                List.of("Манікюр"),
+                SAMPLE_STREET, SAMPLE_BUILDING_NO);
+        Page<MasterSearchResult> page = new PageImpl<>(List.of(fixed), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].minEffectivePrice").value(300.00))
+                .andExpect(jsonPath("$.data.data[0].priceMax").value(300.00));
+    }
+
+    // ── AUTH-GATE street address (security regression guard, pins SearchController.java:157) ─
+    //
+    // The mocked SearchService always returns a result WITH street + buildingNo
+    // populated (the cache always holds the full object). The controller's
+    // isAuthenticated() gate decides whether the per-request strip runs. These
+    // four tests pin the exact behaviour so a future refactor to
+    // `auth.isAuthenticated()` (which is TRUE for an AnonymousAuthenticationToken)
+    // can never silently start leaking masters'/salons' home addresses to anon.
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — ANONYMOUS caller gets street AND buildingNo nulled (no address leak)")
+    void should_stripStreetAddress_forMasters_when_anonymous() throws Exception {
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        // No authentication() post-processor → the test SecurityFilterChain admits
+        // the request as anonymous (AnonymousAuthenticationToken), so the strip fires.
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value((Object) null))
+                // public locality labels must still be visible to anonymous callers
+                .andExpect(jsonPath("$.data.data[0].cityLabel").value("Київ"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — AUTHENTICATED caller gets street AND buildingNo populated")
+    void should_returnStreetAddress_forMasters_when_authenticated() throws Exception {
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .with(authentication(authenticatedClient()))
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value(SAMPLE_STREET))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — ANONYMOUS caller gets street AND buildingNo nulled (no address leak)")
+    void should_stripStreetAddress_forSalons_when_anonymous() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].cityLabel").value("Львів"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — AUTHENTICATED caller gets street AND buildingNo populated")
+    void should_returnStreetAddress_forSalons_when_authenticated() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .with(authentication(authenticatedClient()))
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value(SAMPLE_STREET))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO));
+    }
+
+    // ── salon serviceNames contract (never null) ─────────────────────────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — serviceNames is a present array for a salon with priced services")
+    void should_exposeServiceNames_inSalonSearchResponse() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].serviceNames").isArray())
+                .andExpect(jsonPath("$.data.data[0].serviceNames.length()").value(2))
+                .andExpect(jsonPath("$.data.data[0].serviceNames[0]").value("Стрижка"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — serviceNames serialises as [] (never null) for a salon with no services")
+    void should_serialiseEmptyServiceNames_asArray_forSalonWithNoServices() throws Exception {
+        SalonSearchResult noServices = new SalonSearchResult(
+                UUID.randomUUID(), "Empty Salon", "Київ", null, null,
+                null, null,                 // priceMin / priceMax null
+                List.of(),                  // serviceNames empty (never null per the contract)
+                null, null);
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(noServices), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].serviceNames").isArray())
+                .andExpect(jsonPath("$.data.data[0].serviceNames.length()").value(0));
+    }
+
+    /**
+     * Builds a non-anonymous {@link org.springframework.security.core.Authentication}
+     * for the authenticated-caller auth-gate tests. A
+     * {@link org.springframework.security.authentication.UsernamePasswordAuthenticationToken}
+     * with authorities is authenticated AND is NOT an
+     * {@link org.springframework.security.authentication.AnonymousAuthenticationToken},
+     * so {@code SearchController.isAuthenticated()} returns {@code true} and the
+     * street-address strip is skipped.
+     */
+    private static org.springframework.security.core.Authentication authenticatedClient() {
+        return new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                "client@test.com",
+                "n/a",
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority("ROLE_CLIENT")));
     }
 
     // ── salon q / sort / price filter binding ────────────────────────────────

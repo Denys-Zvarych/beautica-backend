@@ -42,6 +42,29 @@ import java.util.UUID;
  * services yields an empty list, which serialises as {@code []}. It carries no
  * internal IDs — only the display strings — so it is safe on this
  * {@code permitAll} endpoint (§I).</p>
+ *
+ * <p><b>{@code priceMax} — FIXED vs RANGE discriminator:</b> the highest
+ * effective price across the master's active services ({@code MAX(price_max)}
+ * for {@code RANGE} services, else {@code base_price} for {@code FIXED}),
+ * mirroring the salon price band. It is {@code null} only when the master has
+ * no active, priced services (the same condition under which
+ * {@code minEffectivePrice} is {@code null}). When the master effectively
+ * carries a single fixed price, {@code priceMax} equals
+ * {@code minEffectivePrice}; the mobile card renders the "від" (from) prefix
+ * only when {@code priceMax != minEffectivePrice} (a genuine range). The
+ * backend never collapses the two values — that is a rendering concern.</p>
+ *
+ * <p><b>{@code street} / {@code buildingNo} — AUTH-GATED street address:</b>
+ * the master's full street-level address ({@code users.street} /
+ * {@code users.building_no}). These are <b>privacy-sensitive</b> (an
+ * independent master's home address) and are returned <b>only to an
+ * authenticated caller</b>. For an anonymous request both are {@code null};
+ * the public {@code cityLabel}/{@code districtLabel} remain visible to
+ * everyone. The values are always computed in SQL and cached on the full
+ * object; the auth-gate (nulling for anon) happens per-request <em>after</em>
+ * the cache read in the controller, so a warm cache populated by an
+ * authenticated caller can never leak addresses to an anonymous one (and
+ * vice-versa). See {@code SearchController} for the strip.</p>
  */
 public record MasterSearchResult(
         UUID masterId,
@@ -53,6 +76,26 @@ public record MasterSearchResult(
         Integer reviewCount,
         String avatarUrl,
         BigDecimal minEffectivePrice,
-        List<String> serviceNames
+        BigDecimal priceMax,
+        List<String> serviceNames,
+        String street,
+        String buildingNo
 ) {
+
+    /**
+     * Returns a copy with the auth-gated street-level fields ({@code street},
+     * {@code buildingNo}) nulled out, for serving to anonymous callers. All
+     * other fields — including the public locality labels — are preserved.
+     *
+     * <p>Applied per-request in the controller <em>after</em> the
+     * {@code @Cacheable} read so the cache always holds the full object and
+     * never leaks addresses across the anon/authenticated boundary.</p>
+     */
+    public MasterSearchResult withoutStreetAddress() {
+        return new MasterSearchResult(
+                masterId, firstName, lastName, cityLabel, districtLabel,
+                avgRating, reviewCount, avatarUrl, minEffectivePrice, priceMax,
+                serviceNames, null, null
+        );
+    }
 }

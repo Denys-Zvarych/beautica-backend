@@ -174,9 +174,21 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
     }
 
+    // Per-request unique source IP — same rationale as SearchIntegrationTest:
+    // the GET /api/v1/search/** rate-limiter (40/60 s per IP) plus Apache HC5's
+    // Retry-After-honoring retry would otherwise sleep 60 s once the loopback
+    // bucket is exhausted. A fresh X-Forwarded-For per call keeps each request in
+    // its own bucket (and keeps AC5's warm-latency median honest — no hidden
+    // 60 s retry stall).
+    private static final java.util.concurrent.atomic.AtomicInteger IP_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     private static HttpEntity<Void> anonymous() {
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
+        int n = IP_SEQ.incrementAndGet();
+        headers.set("X-Forwarded-For",
+                "10." + ((n >> 16) & 0xFF) + "." + ((n >> 8) & 0xFF) + "." + (n & 0xFF));
         return new HttpEntity<>(headers);
     }
 
@@ -572,69 +584,66 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * is the captured production text byte-for-byte; only the {@code ?} tokens
      * become literals, which is exactly what the JDBC driver would send.
      *
-     * <p><b>Phase 19.7 bind-arity (single-LATERAL form).</b> The salon
-     * projection SELECT computes priceMin / priceMax in ONE
-     * {@code LEFT JOIN LATERAL} pass (Phase 19.7 PERF MEDIUM — replacing the
-     * earlier two byte-identical correlated sub-queries that bound
-     * {@code :category} four times). The single LATERAL guards its category
-     * filter once with {@code (CAST(:category AS text) IS NULL OR sd.category =
-     * CAST(:category AS text))} — so {@code :category} is bound TWICE, and those
-     * binds appear in the {@code FROM … LATERAL} clause BEFORE the WHERE-clause
-     * locality bind. The full positional order Hibernate emits is therefore:
-     * {@code [category ×2, localityId, (offset?), fetch]}. The category filter is
-     * {@code null} for these AC1 tests (no category supplied), so each category
-     * {@code ?} substitutes to a typed {@code NULL}; the locality UUID and the
-     * pagination integers follow. (The {@code 'RANGE'} price-type literal in the
-     * {@code CASE} is a string literal, not a bind param.)
+     * <p><b>Context-aware substitution (resilient to bind-arity drift).</b> The
+     * salon projection SELECT binds {@code :category} and {@code :q} as
+     * {@code CAST(? AS text)} string params, and the number of those binds has
+     * changed over time (Phase 19.7 folded the price band into one LATERAL;
+     * a later phase added an {@code array_agg(DISTINCT sd.name)} service-name
+     * sub-query inside that LATERAL with its OWN category guard, and the
+     * {@code :q} name filter adds two more). Rather than hard-code a positional
+     * count — which silently mis-binds a UUID into an integer slot the moment a
+     * {@code ?} is added (the {@code uuid = integer} planner error) — this helper
+     * is <em>context-aware</em>: every {@code ?} that Hibernate renders inside a
+     * {@code cast(? as text)} wrapper is a string/category/q bind and is replaced
+     * with a typed {@code NULL} (the {@code … IS NULL OR …} guards short-circuit,
+     * so NULL exercises the no-filter branch — exactly the AC1 case with no
+     * category / no q). The locality {@code ?} (compared to the {@code uuid}
+     * column {@code city_id}/{@code district_id}) gets the bound UUID literal, and
+     * the trailing pagination {@code ?}s become integers. This survives any
+     * future add/remove of a {@code CAST(? AS text)} bind without edits.
      *
      * @param capturedSql the verbatim Hibernate-emitted salon SELECT
      * @param localityId  the bound discovery city/district UUID
      */
     private String explainNaturalWithLiterals(String capturedSql, UUID localityId) {
-        // Positional '?' layout Hibernate emits for the Phase 19.7 salon
-        // projection SELECT (single-LATERAL form), in textual order:
-        //   [0..1] two :category binds (in the one LEFT JOIN LATERAL price pass)
-        //   [2]    the WHERE-clause locality bind (city_id / district_id = ?)
-        //   [3..]  pagination — `offset ? rows` is ELIDED when the offset is 0
-        //          (PageRequest.of(0, …)), so only `fetch first ? rows only`
-        //          remains. We therefore build the pagination literals from the
-        //          END: the final '?' is the fetch limit; any pagination '?'
-        //          before it is the offset.
-        int categoryBinds = 2;
+        // Step 1: neutralise every string-typed bind. Hibernate renders each
+        // :category / :q bind as `cast(? as text)` (case-insensitive). Replacing
+        // the whole wrapper with a typed NULL means these `?` no longer count
+        // toward the positional pass below — only the locality UUID and the
+        // pagination integers remain as bare `?`.
+        String stringBindsNeutralised =
+                capturedSql.replaceAll("(?i)cast\\(\\s*\\?\\s+as\\s+text\\)", "CAST(NULL AS text)");
+
         int total = 0;
-        for (int i = 0; i < capturedSql.length(); i++) {
-            if (capturedSql.charAt(i) == '?') {
+        for (int i = 0; i < stringBindsNeutralised.length(); i++) {
+            if (stringBindsNeutralised.charAt(i) == '?') {
                 total++;
             }
         }
-        if (total < categoryBinds + 2) {
+        if (total < 1) {
             throw new IllegalStateException(
-                    "Captured salon SQL has fewer '?' than the expected "
-                            + (categoryBinds + 1) + " (4 category + 1 locality + pagination); SQL="
-                            + capturedSql);
+                    "Captured salon SQL has no positional locality bind after neutralising the "
+                            + "string (cast(? as text)) binds; SQL=" + capturedSql);
         }
-        // Build the ordered literal list: 4 category NULLs, the locality UUID,
-        // then the pagination tail (offset=0 for any leading pagination slot,
-        // a large fetch limit for the final slot — so the plan returns the real
-        // matching rows rather than a truncated/zero page).
-        int paginationCount = total - categoryBinds - 1;
+        // Remaining bare `?` order: [0] the WHERE-clause locality bind
+        // (city_id / district_id = ?), then [1..] pagination — `offset ? rows`
+        // is ELIDED when the offset is 0 (PageRequest.of(0, …)), so typically
+        // only `fetch first ? rows only` remains. Build from the front: slot 0 is
+        // the locality UUID; the LAST slot is the fetch limit (20); any middle
+        // slot is the offset (0).
+        int paginationCount = total - 1;
         List<String> literals = new ArrayList<>();
-        for (int i = 0; i < categoryBinds; i++) {
-            literals.add("CAST(NULL AS VARCHAR)");
-        }
         literals.add("'" + localityId + "'::uuid");
         for (int i = 0; i < paginationCount; i++) {
-            // Mirror the captured request's pagination (PageRequest.of(0, 20)):
-            // any leading slot is the offset (0); the final slot is the fetch
-            // limit (20). Preserving the real LIMIT lets the planner stop early
-            // on the index path — exactly the production execution shape.
+            // Preserving the real LIMIT lets the planner stop early on the index
+            // path — exactly the production execution shape.
             literals.add(i == paginationCount - 1 ? "20" : "0");
         }
 
-        StringBuilder filled = new StringBuilder(capturedSql.length() + 64);
+        StringBuilder filled = new StringBuilder(stringBindsNeutralised.length() + 64);
         int paramIdx = 0;
-        for (int i = 0; i < capturedSql.length(); i++) {
-            char c = capturedSql.charAt(i);
+        for (int i = 0; i < stringBindsNeutralised.length(); i++) {
+            char c = stringBindsNeutralised.charAt(i);
             if (c == '?') {
                 filled.append(literals.get(paramIdx++));
             } else {

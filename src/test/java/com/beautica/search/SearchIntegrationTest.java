@@ -983,6 +983,81 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isEqualByComparingTo(new BigDecimal("350.00"));
     }
 
+    // ── Phase 19.7 — salon serviceNames (never null, DISTINCT, capped at 3) ───
+
+    @Test
+    @DisplayName("GET /search/salons — serviceNames carries the salon's distinct active service names, capped at 3")
+    void should_populateSalonServiceNames_distinctAndCapped() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        // Five distinct names + one duplicate → 5 distinct, 6 rows; cap is 3.
+        seedNamedSalonServiceForMaster(masterId, salonId, "Манікюр", "MANICURE", new BigDecimal("200.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Педикюр", "PEDICURE", new BigDecimal("300.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Стрижка", "HAIRCUT", new BigDecimal("400.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Фарбування", "HAIRCUT", new BigDecimal("500.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Брови", "BROWS", new BigDecimal("150.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Манікюр", "MANICURE", new BigDecimal("210.00")); // dup name
+
+        JsonNode row = singleSalonRow("Київ", null);
+        JsonNode names = row.path("serviceNames");
+        assertThat(names.isArray())
+                .as("salon serviceNames must be a JSON array")
+                .isTrue();
+        java.util.List<String> values = new java.util.ArrayList<>();
+        names.forEach(n -> values.add(n.asText()));
+        assertThat(values)
+                .as("salon serviceNames is capped at SERVICE_NAME_CAP=3")
+                .hasSize(3);
+        assertThat(values)
+                .as("salon serviceNames is DISTINCT — no duplicate display string")
+                .doesNotHaveDuplicates();
+        assertThat(values)
+                .as("each surfaced name is one of the salon's seeded distinct service names")
+                .isSubsetOf("Брови", "Манікюр", "Педикюр", "Стрижка", "Фарбування");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — serviceNames is an empty array (never null) for a salon with no active priced services")
+    void should_returnEmptySalonServiceNames_when_salonHasNoActiveServices() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        // Only an INACTIVE service — it must not contribute to serviceNames.
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                new BigDecimal("300.00"), null, true, false);
+
+        JsonNode row = singleSalonRow("Київ", null);
+        assertThat(row.path("serviceNames").isArray())
+                .as("service-less salon → empty array")
+                .isTrue();
+        assertThat(row.path("serviceNames").size())
+                .as("service-less salon → serviceNames is [] (never null)")
+                .isZero();
+    }
+
+    /**
+     * Seeds an active, FIXED-priced SALON-owned service definition with an
+     * explicit (custom) {@code name} plus an active {@code master_services} link
+     * for the given salon master. Used by the salon serviceNames test where the
+     * surfaced names must be deterministic.
+     */
+    private void seedNamedSalonServiceForMaster(UUID masterId, UUID salonId, String serviceName,
+                                                String category, BigDecimal basePrice) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, 60, ?, 'FIXED', 0, true, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, category, basePrice);
+
+        UUID msId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, true, NOW(), NOW())",
+                msId, masterId, serviceDefId);
+    }
+
     /**
      * Fetches the single salon row for a city (optionally category-scoped) and
      * returns its JSON node. Asserts exactly one salon is returned so the price
@@ -1128,6 +1203,58 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(row.path("serviceNames").size())
                 .as("service-less master → empty array, never null")
                 .isZero();
+    }
+
+    // ── Phase 19.x — master priceMax (FIXED vs RANGE discriminator) ───────────
+
+    @Test
+    @DisplayName("GET /search/masters — priceMax == minEffectivePrice for a single FIXED-price master")
+    void should_returnPriceMaxEqualToMin_forSingleFixedPriceMaster() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Fixed", "Master");
+        // A single FIXED service at 300.00 → both floor and ceiling are 300.00.
+        seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        assertThat(new BigDecimal(row.path("minEffectivePrice").asText()))
+                .as("FIXED master: minEffectivePrice = 300.00")
+                .isEqualByComparingTo(new BigDecimal("300.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("FIXED master: priceMax collapses to minEffectivePrice (MAX(base_price) = 300.00)")
+                .isEqualByComparingTo(new BigDecimal("300.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — priceMax > minEffectivePrice for a master carrying a RANGE service")
+    void should_returnPriceMaxAboveMin_forRangeMaster() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Range", "Master");
+        // A RANGE service 200..650 → floor 200.00, ceiling 650.00 (a genuine range).
+        seedRangeServiceForMaster(master, "Авторський манікюр", "MANICURE",
+                new BigDecimal("200.00"), new BigDecimal("650.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        BigDecimal min = new BigDecimal(row.path("minEffectivePrice").asText());
+        BigDecimal max = new BigDecimal(row.path("priceMax").asText());
+        assertThat(min)
+                .as("RANGE master: minEffectivePrice = the floor 200.00")
+                .isEqualByComparingTo(new BigDecimal("200.00"));
+        assertThat(max)
+                .as("RANGE master: priceMax = the ceiling 650.00")
+                .isEqualByComparingTo(new BigDecimal("650.00"));
+        assertThat(max)
+                .as("RANGE master: priceMax must strictly exceed minEffectivePrice")
+                .isGreaterThan(min);
     }
 
     @Test
@@ -1563,6 +1690,40 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 masterId, masterId);
     }
 
+    /**
+     * Seeds an active, priced RANGE service definition (floor {@code basePrice},
+     * ceiling {@code priceMax}) owned by the independent master, plus an active
+     * {@code master_services} link, then refreshes
+     * {@code masters.min_effective_price}. Honours the V67
+     * {@code chk_service_def_price_mode} CHECK: RANGE requires
+     * {@code price_max >= base_price}. Used by the master priceMax discriminator
+     * test where the ceiling must strictly exceed the floor.
+     */
+    private void seedRangeServiceForMaster(UUID masterId, String serviceName,
+                                           String category, BigDecimal basePrice, BigDecimal priceMax) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 'RANGE', ?, 0, true, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, basePrice, priceMax);
+
+        UUID msId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, true, NOW(), NOW())",
+                msId, masterId, serviceDefId);
+
+        jdbcTemplate.update(
+                "UPDATE masters SET min_effective_price = (" +
+                "  SELECT MIN(COALESCE(ms2.price_override, sd2.base_price))" +
+                "  FROM master_services ms2" +
+                "  JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id" +
+                "  WHERE ms2.master_id = ? AND ms2.is_active = true AND sd2.is_active = true" +
+                ") WHERE id = ?",
+                masterId, masterId);
+    }
+
     /** Seeds a SALON_OWNER + an active salon with an explicit name in the given city. */
     private UUID seedNamedSalon(String city, String name) {
         UUID cityId = cityIdByName(city);
@@ -1734,9 +1895,26 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         return java.net.URI.create("http://localhost:" + port + encodedPathAndQuery);
     }
 
+    // Per-request unique source IP. The new AuthRateLimitFilter throttles
+    // GET /api/v1/search/** at 40 req/60 s PER IP (searchBuckets). This class
+    // fires 60+ search GETs which, from a single loopback IP, would exhaust that
+    // bucket mid-suite — and Apache HC5's DefaultHttpRequestRetryStrategy HONORS
+    // the 429 `Retry-After: 60` header, sleeping 60 s and timing the test out
+    // (the SlowTestExtension 10 s ceiling). Stamping a fresh X-Forwarded-For per
+    // request gives each call its own per-IP bucket (resolveClientIp reads the
+    // rightmost, trusted-proxy entry), so the real throttle stays active in prod
+    // while these high-volume same-host ITs never trip it. The dedicated
+    // SearchGetRateLimitRegressionTest exercises the throttle itself.
+    private static final java.util.concurrent.atomic.AtomicInteger IP_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     private static HttpHeaders anonymousHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(java.util.List.of(MediaType.APPLICATION_JSON));
+        // Unique synthetic client IP per request — 10.x.x.x, distinct each call.
+        int n = IP_SEQ.incrementAndGet();
+        headers.set("X-Forwarded-For",
+                "10." + ((n >> 16) & 0xFF) + "." + ((n >> 8) & 0xFF) + "." + (n & 0xFF));
         return headers;
     }
 

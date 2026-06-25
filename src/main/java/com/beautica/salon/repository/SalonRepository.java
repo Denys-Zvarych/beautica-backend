@@ -108,12 +108,27 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    s.district_id  AS district_id,
                    s.avatar_url   AS avatar_url,
                    pr.pmin        AS price_min,
-                   pr.pmax        AS price_max
+                   pr.pmax        AS price_max,
+                   pr.pnames      AS service_names,
+                   s.street       AS street,
+                   s.building_no  AS building_no
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
-                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax,
+                       (SELECT array_agg(z.name)
+                          FROM (SELECT DISTINCT sd2.name AS name
+                                FROM master_services ms2
+                                JOIN masters mm2 ON mm2.id = ms2.master_id
+                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
+                                WHERE mm2.salon_id = s.id
+                                  AND mm2.is_active = true
+                                  AND ms2.is_active = true
+                                  AND sd2.is_active = true
+                                  AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
+                                ORDER BY sd2.name
+                                LIMIT 3) z) AS pnames
                 FROM master_services ms
                 JOIN masters mm ON mm.id = ms.master_id
                 JOIN service_definitions sd ON sd.id = ms.service_def_id
@@ -180,12 +195,27 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    s.district_id  AS district_id,
                    s.avatar_url   AS avatar_url,
                    pr.pmin        AS price_min,
-                   pr.pmax        AS price_max
+                   pr.pmax        AS price_max,
+                   pr.pnames      AS service_names,
+                   s.street       AS street,
+                   s.building_no  AS building_no
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
-                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax,
+                       (SELECT array_agg(z.name)
+                          FROM (SELECT DISTINCT sd2.name AS name
+                                FROM master_services ms2
+                                JOIN masters mm2 ON mm2.id = ms2.master_id
+                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
+                                WHERE mm2.salon_id = s.id
+                                  AND mm2.is_active = true
+                                  AND ms2.is_active = true
+                                  AND sd2.is_active = true
+                                  AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
+                                ORDER BY sd2.name
+                                LIMIT 3) z) AS pnames
                 FROM master_services ms
                 JOIN masters mm ON mm.id = ms.master_id
                 JOIN service_definitions sd ON sd.id = ms.service_def_id
@@ -258,12 +288,27 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    s.district_id  AS district_id,
                    s.avatar_url   AS avatar_url,
                    pr.pmin        AS price_min,
-                   pr.pmax        AS price_max
+                   pr.pmax        AS price_max,
+                   pr.pnames      AS service_names,
+                   s.street       AS street,
+                   s.building_no  AS building_no
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
-                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax,
+                       (SELECT array_agg(z.name)
+                          FROM (SELECT DISTINCT sd2.name AS name
+                                FROM master_services ms2
+                                JOIN masters mm2 ON mm2.id = ms2.master_id
+                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
+                                WHERE mm2.salon_id = s.id
+                                  AND mm2.is_active = true
+                                  AND ms2.is_active = true
+                                  AND sd2.is_active = true
+                                  AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
+                                ORDER BY sd2.name
+                                LIMIT 3) z) AS pnames
                 FROM master_services ms
                 JOIN masters mm ON mm.id = ms.master_id
                 JOIN service_definitions sd ON sd.id = ms.service_def_id
@@ -327,12 +372,27 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    s.district_id  AS district_id,
                    s.avatar_url   AS avatar_url,
                    pr.pmin        AS price_min,
-                   pr.pmax        AS price_max
+                   pr.pmax        AS price_max,
+                   pr.pnames      AS service_names,
+                   s.street       AS street,
+                   s.building_no  AS building_no
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
-                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax,
+                       (SELECT array_agg(z.name)
+                          FROM (SELECT DISTINCT sd2.name AS name
+                                FROM master_services ms2
+                                JOIN masters mm2 ON mm2.id = ms2.master_id
+                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
+                                WHERE mm2.salon_id = s.id
+                                  AND mm2.is_active = true
+                                  AND ms2.is_active = true
+                                  AND sd2.is_active = true
+                                  AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
+                                ORDER BY sd2.name
+                                LIMIT 3) z) AS pnames
                 FROM master_services ms
                 JOIN masters mm ON mm.id = ms.master_id
                 JOIN service_definitions sd ON sd.id = ms.service_def_id
@@ -392,12 +452,27 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    s.district_id  AS district_id,
                    s.avatar_url   AS avatar_url,
                    pr.pmin        AS price_min,
-                   pr.pmax        AS price_max
+                   pr.pmax        AS price_max,
+                   pr.pnames      AS service_names,
+                   s.street       AS street,
+                   s.building_no  AS building_no
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
-                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax,
+                       (SELECT array_agg(z.name)
+                          FROM (SELECT DISTINCT sd2.name AS name
+                                FROM master_services ms2
+                                JOIN masters mm2 ON mm2.id = ms2.master_id
+                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
+                                WHERE mm2.salon_id = s.id
+                                  AND mm2.is_active = true
+                                  AND ms2.is_active = true
+                                  AND sd2.is_active = true
+                                  AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
+                                ORDER BY sd2.name
+                                LIMIT 3) z) AS pnames
                 FROM master_services ms
                 JOIN masters mm ON mm.id = ms.master_id
                 JOIN service_definitions sd ON sd.id = ms.service_def_id
@@ -456,12 +531,27 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                    s.district_id  AS district_id,
                    s.avatar_url   AS avatar_url,
                    pr.pmin        AS price_min,
-                   pr.pmax        AS price_max
+                   pr.pmax        AS price_max,
+                   pr.pnames      AS service_names,
+                   s.street       AS street,
+                   s.building_no  AS building_no
             FROM salons s
             LEFT JOIN LATERAL (
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
-                                THEN sd.price_max ELSE sd.base_price END) AS pmax
+                                THEN sd.price_max ELSE sd.base_price END) AS pmax,
+                       (SELECT array_agg(z.name)
+                          FROM (SELECT DISTINCT sd2.name AS name
+                                FROM master_services ms2
+                                JOIN masters mm2 ON mm2.id = ms2.master_id
+                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
+                                WHERE mm2.salon_id = s.id
+                                  AND mm2.is_active = true
+                                  AND ms2.is_active = true
+                                  AND sd2.is_active = true
+                                  AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
+                                ORDER BY sd2.name
+                                LIMIT 3) z) AS pnames
                 FROM master_services ms
                 JOIN masters mm ON mm.id = ms.master_id
                 JOIN service_definitions sd ON sd.id = ms.service_def_id

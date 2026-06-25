@@ -148,10 +148,10 @@ public class SearchService {
     private static final int SERVICE_NAME_CAP = 3;
 
     /** Projection index of the {@code service_names} {@code array_agg} column. */
-    private static final int SERVICE_NAMES_IDX = 9;
+    private static final int SERVICE_NAMES_IDX = 10;
 
     /** Projection index of the {@code COUNT(*) OVER()} total-count column (PERF-M1). */
-    private static final int TOTAL_COUNT_IDX = 10;
+    private static final int TOTAL_COUNT_IDX = 13;
 
     /**
      * Role value (stored via {@code EnumType.STRING}) that master discovery is
@@ -496,24 +496,52 @@ public class SearchService {
      * outer {@code ORDER BY} is re-applied on the derived-table aliases so paging
      * order survives the lateral join (which is otherwise unordered).
      *
-     * <p>Column layout is preserved (indices 0–10) so {@link #mapMasterRow} and
-     * {@link #TOTAL_COUNT_IDX}/{@link #SERVICE_NAMES_IDX} are unchanged.
+     * <p>PERF-M1 (Phase 19.x audit): {@code price_max} is computed HERE too,
+     * folded into this single lateral instead of the former separate correlated
+     * scalar sub-select in {@link #appendDataSelect} — both walked the same
+     * {@code master_services ⋈ service_definitions} join, so the second pass was
+     * pure waste. The names sub-query is DISTINCT + ORDER + LIMIT (capped
+     * preview); the price ceiling is an unbounded {@code MAX} over ALL the
+     * master's active services, so it cannot share the LIMIT-ed inner derived
+     * table — it is a sibling aggregate over the same {@code FROM} in the lateral
+     * body. Semantics are byte-for-byte the prior formula:
+     * {@code MAX(COALESCE(ms.price_override, CASE WHEN sd.price_type='RANGE'
+     * THEN sd.price_max ELSE sd.base_price END))}, so a single fixed price (or a
+     * single override) still yields {@code price_max == min_effective_price}.
+     * {@code NULL} when the master has no active, priced services.
+     *
+     * <p>Column layout is preserved (indices 0–13) so {@link #mapMasterRow},
+     * {@link #TOTAL_COUNT_IDX} and {@link #SERVICE_NAMES_IDX} are unchanged —
+     * {@code price_max} stays at projection index 9, only its SOURCE moves from
+     * {@code t.price_max} to {@code sn.price_max}.
      */
     private static String wrapWithServiceNamesLateral(String innerSql, SearchSort sort) {
         StringBuilder sb = new StringBuilder();
         sb.append("SELECT t.master_id, t.first_name, t.last_name, ")
                 .append("t.avg_rating, t.review_count, t.avatar_url, ")
                 .append("t.discovery_city_id, t.discovery_district_id, ")
-                .append("t.min_effective_price, sn.service_names, t.total_count ")
+                .append("t.min_effective_price, sn.price_max, sn.service_names, ")
+                .append("t.street, t.building_no, t.total_count ")
                 .append("FROM (").append(innerSql).append(") t ")
                 .append("LEFT JOIN LATERAL (")
-                .append("SELECT array_agg(x.name) AS service_names FROM (")
+                .append("SELECT ")
+                // Capped DISTINCT-name preview: array_agg over the LIMIT-ed inner
+                // name sub-query (names need ORDER + LIMIT, prices do not).
+                .append("(SELECT array_agg(x.name) FROM (")
                 .append("SELECT DISTINCT sd.name ")
                 .append("FROM master_services ms ")
                 .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
                 .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ")
                 .append("ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
-                .append(") x) sn ON true ");
+                .append(") x) AS service_names, ")
+                // Price ceiling: unbounded MAX over ALL active services (no LIMIT).
+                .append("MAX(COALESCE(ms2.price_override, "
+                        + "CASE WHEN sd2.price_type = 'RANGE' "
+                        + "THEN sd2.price_max ELSE sd2.base_price END)) AS price_max ")
+                .append("FROM master_services ms2 ")
+                .append("JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id AND sd2.is_active = true ")
+                .append("WHERE ms2.master_id = t.master_id AND ms2.is_active = true ")
+                .append(") sn ON true ");
         appendOuterOrderBy(sb, sort);
         return sb.toString();
     }
@@ -584,6 +612,16 @@ public class SearchService {
                 // PERF-M2: pre-computed column from V58 — avoids the per-request
                 // MIN(COALESCE(ms.price_override, sd.base_price)) aggregate.
                 .append("m.min_effective_price AS min_effective_price, ")
+                // priceMax is NO LONGER computed here. PERF-M1 (Phase 19.x audit):
+                // it was a SECOND correlated pass over master_services ⋈
+                // service_definitions, duplicating the serviceNames lateral's walk
+                // of the same join. It is now folded INTO that post-LIMIT lateral
+                // (see wrapWithServiceNamesLateral) so ONE lateral returns both
+                // service_names and price_max — a single pass per paged master.
+                // AUTH-GATED street address (users.street / users.building_no).
+                // Always selected; nulled for anonymous callers post-cache in the
+                // controller — privacy for independent masters' home addresses.
+                .append("u.street AS street, u.building_no AS building_no, ")
                 // PERF-M1: window function replaces the second COUNT(*) query.
                 // Postgres applies LIMIT after window functions, so this reports
                 // the full filtered count in every paged row of the Top-N.
@@ -837,14 +875,20 @@ public class SearchService {
      * Maps a raw native-query row to {@link MasterSearchResult}, stamping the
      * resolved locality labels from the batched M2-seam result.
      *
-     * <p>11-column projection (indices 0–10):
+     * <p>14-column projection (indices 0–13):
      * {@code [master_id, first_name, last_name, avg_rating, review_count,
      * avatar_url, discovery_city_id, discovery_district_id,
-     * min_effective_price, service_names, total_count]}.
+     * min_effective_price, price_max, service_names, street, building_no,
+     * total_count]}.
      * The internal city/district UUIDs (6, 7) are consumed here for label
      * resolution and are NOT placed on the public DTO (§I).
-     * {@code total_count} (10) is read by the caller before this method is
+     * {@code total_count} (13) is read by the caller before this method is
      * invoked and is not mapped to the DTO.
+     *
+     * <p>{@code street} (11) / {@code building_no} (12) are mapped through as-is
+     * here; the per-request auth-gate (nulling them for anonymous callers) is
+     * applied in the controller AFTER the {@code @Cacheable} read so the cache
+     * never leaks addresses across the anon/authenticated boundary.
      */
     private static MasterSearchResult mapMasterRow(Object[] row, DiscoveryLabels labels) {
         UUID masterId = (UUID) row[0];
@@ -856,7 +900,10 @@ public class SearchService {
         UUID cityId = (UUID) row[6];
         UUID districtId = (UUID) row[7];
         BigDecimal minEffectivePrice = (BigDecimal) row[8];
+        BigDecimal priceMax = (BigDecimal) row[9];
         List<String> serviceNames = toServiceNames(row[SERVICE_NAMES_IDX]);
+        String street = (String) row[11];
+        String buildingNo = (String) row[12];
 
         return new MasterSearchResult(
                 masterId,
@@ -868,7 +915,10 @@ public class SearchService {
                 reviewCount,
                 avatarUrl,
                 minEffectivePrice,
-                serviceNames
+                priceMax,
+                serviceNames,
+                street,
+                buildingNo
         );
     }
 
@@ -917,7 +967,15 @@ public class SearchService {
                 // salon has no active, priced services — passed through as-is;
                 // the backend never collapses priceMin == priceMax (mobile concern).
                 proj.getPriceMin(),
-                proj.getPriceMax()
+                proj.getPriceMax(),
+                // Capped, distinct service-name preview (array_agg in the price
+                // lateral) — empty list when none, never null (mirrors master).
+                toServiceNames(proj.getServiceNames()),
+                // AUTH-GATED street address: always selected in SQL and cached on
+                // the full object; nulled for anonymous callers in the controller
+                // AFTER the @Cacheable read so the cache never leaks addresses.
+                proj.getStreet(),
+                proj.getBuildingNo()
         );
     }
 }

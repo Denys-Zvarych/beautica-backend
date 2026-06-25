@@ -70,7 +70,7 @@ class SearchServiceTest {
     private Query dataQuery;
 
     // countQuery mock removed — PERF-M1 replaced the two-query pattern with a single
-    // native query that embeds COUNT(*) OVER() as row[9] of every result row.
+    // native query that embeds COUNT(*) OVER() as row[13] (TOTAL_COUNT_IDX) of every result row.
 
     @Mock
     private SalonRepository salonRepository;
@@ -101,14 +101,19 @@ class SearchServiceTest {
 
     private void stubNativeQueries(List<Object[]> rows, long total) {
         // PERF-M1: a single native query replaces the old data+count two-query pattern.
-        // Column layout is now 11-wide: service_names at index 9, COUNT(*) OVER()
-        // total at index 10. Test rows are authored with 9 columns (0–8); this
-        // extends them so service_names defaults to null (empty list) and the
-        // window-function total lands at index 10.
+        // Phase 19.x record-component additions widened the final wrapped projection to
+        // 14 columns (indices 0–13):
+        //   0 master_id, 1 first_name, 2 last_name, 3 avg_rating, 4 review_count,
+        //   5 avatar_url, 6 discovery_city_id, 7 discovery_district_id,
+        //   8 min_effective_price, 9 price_max, 10 service_names, 11 street,
+        //   12 building_no, 13 total_count (COUNT(*) OVER()).
+        // Test rows are authored short (9–10 columns); this extends them so the
+        // not-explicitly-set columns (price_max, service_names, street, building_no)
+        // default to null and the window-function total lands at TOTAL_COUNT_IDX (13).
         List<Object[]> rowsWithCount = rows.stream()
                 .map(row -> {
-                    Object[] extended = java.util.Arrays.copyOf(row, 11);
-                    extended[10] = total;
+                    Object[] extended = java.util.Arrays.copyOf(row, 14);
+                    extended[13] = total;   // TOTAL_COUNT_IDX in SearchService
                     return extended;
                 })
                 .toList();
@@ -554,7 +559,10 @@ class SearchServiceTest {
         assertThat(sql)
                 .as("serviceNames is computed by a post-LIMIT correlated lateral")
                 .contains("LEFT JOIN LATERAL")
-                .contains("array_agg(x.name) AS service_names")
+                // PERF-M1: array_agg now wraps a DISTINCT+ORDER+LIMIT derived table,
+                // so "array_agg(x.name)" and "AS service_names" are no longer contiguous.
+                .contains("array_agg(x.name)")
+                .contains(") AS service_names")
                 .contains("WHERE ms.master_id = t.master_id");
         // Inner Top-N is bounded by LIMIT/OFFSET so the lateral runs over the
         // paged rows only, not the whole district.
@@ -589,14 +597,14 @@ class SearchServiceTest {
     }
 
     @Test
-    @DisplayName("total count is read from COUNT(*) OVER() in row[9], not a separate query (PERF-M1)")
+    @DisplayName("total count is read from COUNT(*) OVER() in row[13], not a separate query (PERF-M1)")
     void should_readTotalFromWindowFunction_when_rowsReturned() {
         Object[] row = new Object[]{
                 UUID.randomUUID(), "Anna", "Koval",
                 new BigDecimal("4.20"), 5, null,
                 CITY_ID, null, new BigDecimal("350.00")
         };
-        stubNativeQueries(List.<Object[]>of(row), 7L);  // total=7, embedded as row[9] by stubNativeQueries
+        stubNativeQueries(List.<Object[]>of(row), 7L);  // total=7, embedded as row[13] by stubNativeQueries
 
         // Use pageSize=5 so Spring Data's PageImpl last-page adjustment doesn't fire.
         // PageImpl adjusts total when offset+pageSize > total (last-page heuristic):
@@ -703,7 +711,10 @@ class SearchServiceTest {
                 .as("serviceNames lateral present even with no q/category filter")
                 .contains("LEFT JOIN LATERAL")
                 .contains("SELECT DISTINCT sd.name")
-                .contains("array_agg(x.name) AS service_names")
+                // PERF-M1: array_agg wraps a DISTINCT+ORDER+LIMIT derived table, so
+                // "array_agg(x.name)" and "AS service_names" are no longer contiguous.
+                .contains("array_agg(x.name)")
+                .contains(") AS service_names")
                 .contains("ORDER BY sd.name LIMIT 3");
         assertThat(dataSql)
                 .as("main query is service-join-free and ungrouped — index-ordered Top-N preserved")
@@ -722,7 +733,8 @@ class SearchServiceTest {
                 masterId, "Olena", "Kovalenko",
                 new BigDecimal("4.85"), 42, null,
                 CITY_ID, DISTRICT_ID, new BigDecimal("250.00"),
-                new String[]{"Манікюр", "Педикюр"}   // service_names at index 9
+                new BigDecimal("250.00"),             // price_max at index 9
+                new String[]{"Манікюр", "Педикюр"}    // service_names at index 10
         };
         stubNativeQueries(List.<Object[]>of(row), 1L);
 
@@ -739,7 +751,7 @@ class SearchServiceTest {
         Object[] row = new Object[]{
                 masterId, "Ivan", "Petrenko",
                 new BigDecimal("4.00"), 1, null,
-                CITY_ID, null, null   // 9-wide → service_names index 9 left null by stub extension
+                CITY_ID, null, null   // 9-wide → price_max (9) + service_names (10) left null by stub extension
         };
         stubNativeQueries(List.<Object[]>of(row), 1L);
 
