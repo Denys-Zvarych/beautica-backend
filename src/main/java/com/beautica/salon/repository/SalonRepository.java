@@ -141,7 +141,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
               AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
             """,
@@ -163,7 +173,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
               AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
             """,
@@ -229,14 +249,34 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
             """,
             countQuery = """
             SELECT COUNT(*)
             FROM salons s
             WHERE s.is_active = true
               AND s.district_id = :districtId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
             """,
             nativeQuery = true)
     Page<SalonSearchProjection> findActiveByDistrictIdNoPriceAsProjection(
@@ -323,7 +363,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
               AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
             """,
@@ -345,7 +395,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
               AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
             """,
@@ -408,14 +468,34 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
             """,
             countQuery = """
             SELECT COUNT(*)
             FROM salons s
             WHERE s.is_active = true
               AND s.city_id = :cityId
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
             """,
             nativeQuery = true)
     Page<SalonSearchProjection> findActiveByCityIdNoPriceAsProjection(
@@ -488,7 +568,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
               AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
             """,
@@ -509,7 +599,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
               AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
             """,
@@ -568,13 +668,33 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
             """,
             countQuery = """
             SELECT COUNT(*)
             FROM salons s
             WHERE s.is_active = true
-              AND (CAST(:q AS text) IS NULL OR s.name ILIKE CAST(:q AS text))
+              AND (CAST(:q AS text) IS NULL
+                   OR s.name ILIKE CAST(:q AS text)
+                   OR EXISTS (SELECT 1
+                              FROM master_services msq
+                              JOIN masters mmq ON mmq.id = msq.master_id
+                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
+                              WHERE mmq.salon_id = s.id
+                                AND mmq.is_active = true
+                                AND msq.is_active = true
+                                AND sdq.is_active = true
+                                AND sdq.name ILIKE CAST(:q AS text)))
             """,
             nativeQuery = true)
     Page<SalonSearchProjection> findByIsActiveTrueNoPriceAsProjection(

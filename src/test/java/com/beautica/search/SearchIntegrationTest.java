@@ -1436,6 +1436,91 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(glow.toString());
     }
 
+    // ── Regression — salon ?q matches an OFFERED service name (not just s.name) ─
+    //
+    // Bug: the salon `q` predicate was `s.name ILIKE :q` only. A salon whose
+    // business name did NOT contain the typed term, but which offered a service
+    // named with that term, was never returned. The fix widened the predicate to
+    // `s.name ILIKE :q OR EXISTS(<active master_services → masters →
+    // service_definitions WHERE sdq.name ILIKE :q>)`. These tests fail against
+    // the pre-fix name-only predicate and pass on the widened query.
+
+    @Test
+    @DisplayName("GET /search/salons — regression: ?q matches a salon via an OFFERED service-definition name even when the salon NAME does not contain the term (pre-fix name-only predicate returned 0)")
+    void should_matchSalonByServiceName_when_salonNameDoesNotContainTerm() throws Exception {
+        ensureHttpClient();
+        // Salon name has NO "balayage"; its offered service does. Pre-fix this
+        // salon was invisible for q=balayage (s.name ILIKE only).
+        UUID match = seedNamedSalon("Київ", "Downtown Studio");
+        UUID matchMaster = seedSalonMasterFor(match, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(matchMaster, match, "Balayage Coloring",
+                "HAIRCUT", new BigDecimal("900.00"));
+        // Control: a salon that matches neither by name nor by service name.
+        UUID other = seedNamedSalon("Київ", "Plain Salon");
+        UUID otherMaster = seedSalonMasterFor(other, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(otherMaster, other, "Classic Haircut",
+                "HAIRCUT", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=balayage&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("a salon offering a service named like the query is discoverable "
+                        + "even though its business name does not contain the term — "
+                        + "the widened q EXISTS(service-name) predicate")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?q matches a salon's offered service name case-insensitively and partially (Cyrillic: service 'Манікюр', q='манік')")
+    void should_matchSalonByServiceName_caseInsensitivePartialCyrillic_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedSalon("Київ", "Beauty Hub");
+        UUID matchMaster = seedSalonMasterFor(match, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(matchMaster, match, "Манікюр",
+                "MANICURE", new BigDecimal("250.00"));
+        seedNamedSalon("Київ", "Shine Bar");   // no matching service, no matching name
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=манік&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("lower-case partial Cyrillic 'манік' must hit the offered service "
+                        + "'Манікюр' via ILIKE (case-insensitive, partial, Ukrainian)")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?q does NOT match a salon when ONLY an inactive master / master_service / service_definition carries the term (each is_active conjunct in the EXISTS clause)")
+    void should_notMatchSalonByServiceName_when_onlyInactiveLayerCarriesTerm() throws Exception {
+        ensureHttpClient();
+        // Each salon breaks on exactly one of the three is_active conjuncts.
+        seedSalonWithNamedService("Київ", "Inactive Master Salon", "Microblading",
+                false, true, true);     // master inactive
+        seedSalonWithNamedService("Київ", "Inactive Link Salon", "Microblading",
+                true, false, true);     // master_services link inactive
+        seedSalonWithNamedService("Київ", "Inactive Def Salon", "Microblading",
+                true, true, false);     // service_definition inactive
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=microblading&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("the widened q EXISTS clause requires the master, the "
+                        + "master_services link AND the service_definition to all be "
+                        + "active — a term carried only by an inactive layer must not "
+                        + "surface the salon")
+                .isZero();
+    }
+
     // ── Item A — server-side location filtering proof ────────────────────────
 
     @Test
@@ -1822,6 +1907,47 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
                 salonId, ownerId, name, city, cityId);
+        return salonId;
+    }
+
+    /**
+     * Seeds an active, named salon in {@code city} plus one SALON_MASTER, one
+     * named SALON-owned service definition and the {@code master_services} link
+     * — with the three discovery {@code is_active} flags individually
+     * controllable. Backs the salon service-name search active-only guard: the
+     * widened {@code q} EXISTS clause requires the master, the link AND the
+     * definition to all be active, so a term carried only by an inactive layer
+     * must not surface the salon. The salon itself is always active (the term is
+     * not in its name).
+     */
+    private UUID seedSalonWithNamedService(String city, String salonName, String serviceName,
+                                           boolean masterActive, boolean msActive, boolean defActive) {
+        UUID salonId = seedNamedSalon(city, salonName);
+
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true, true)",
+                masterUserId, "svc-name-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', 4.0::numeric, 1, ?, NOW(), NOW())",
+                masterId, masterUserId, salonId, masterActive);
+
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, 'EYEBROW', 60, 300.00, 'FIXED', 0, ?, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, defActive);
+
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, msActive);
         return salonId;
     }
 
