@@ -217,7 +217,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         // hand-written proxy query).
         String productionSql = captureSalonSearchSelect(
                 new SalonSearchRequest(new LocationFilter(kyivCityId, null),
-                        null, null, null, null, null, 0, 20));
+                        null, null, null, null, null, 0, 20, null));
 
         // EXPLAIN the captured SQL verbatim via PREPARE/EXECUTE with the real
         // bound UUID and the NATURAL planner (seq scan ENABLED — no crutch).
@@ -261,7 +261,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         String productionSql = captureSalonSearchSelect(
                 new SalonSearchRequest(
                         new LocationFilter(cityIdByName("Київ"), districtId),
-                        null, null, null, null, null, 0, 20));
+                        null, null, null, null, null, 0, 20, null));
 
         String naturalPlan = explainNaturalWithLiterals(productionSql, districtId);
         log.info("AC1 salon district-filter REAL production SQL:\n{}\n\nNATURAL "

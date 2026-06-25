@@ -12,6 +12,8 @@ import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
 import com.beautica.search.dto.SearchSort;
+import com.beautica.service.service.ServiceTypeMatch;
+import com.beautica.service.service.ServiceTypeSlugResolver;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
@@ -32,6 +34,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -147,11 +150,32 @@ public class SearchService {
      */
     private static final int SERVICE_NAME_CAP = 3;
 
+    /** Named-parameter prefix for the resolved {@code service_type_id} of slug {@code n}. */
+    private static final String SERVICE_TYPE_ID_PARAM = "stId";
+
+    /** Named-parameter prefix for the resolved {@code %nameUk%} ILIKE pattern of slug {@code n}. */
+    private static final String SERVICE_TYPE_NAME_PARAM = "stName";
+
     /** Projection index of the {@code service_names} {@code array_agg} column. */
     private static final int SERVICE_NAMES_IDX = 10;
 
+    /**
+     * Projection index of the {@code matched_names} {@code array_agg} column
+     * (Phase 20.3) — the distinct active service names that matched the
+     * {@code serviceTypeSlugs} filter. Empty when no service filter is active.
+     */
+    private static final int MATCHED_SERVICE_NAMES_IDX = 14;
+
     /** Projection index of the {@code COUNT(*) OVER()} total-count column (PERF-M1). */
-    private static final int TOTAL_COUNT_IDX = 14;
+    private static final int TOTAL_COUNT_IDX = 15;
+
+    // ── salon dynamic-projection layout (Phase 20.2 per-service filter path) ──
+    /** Salon projection index of the discovery {@code city_id}. */
+    private static final int SALON_CITY_ID_IDX = 2;
+    /** Salon projection index of the discovery {@code district_id}. */
+    private static final int SALON_DISTRICT_ID_IDX = 3;
+    /** Salon projection index of the {@code COUNT(*) OVER()} total-count column. */
+    private static final int SALON_TOTAL_COUNT_IDX = 12;
 
     /**
      * Role value (stored via {@code EnumType.STRING}) that master discovery is
@@ -184,6 +208,7 @@ public class SearchService {
 
     private final SalonRepository salonRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
+    private final ServiceTypeSlugResolver serviceTypeSlugResolver;
 
     /**
      * Discover masters matching optional location (FK, district-primary),
@@ -201,7 +226,8 @@ public class SearchService {
             key = "{#request.location?.cityId, #request.location?.districtId, " +
                   "#request.q, #request.category, #request.sort, " +
                   "#request.minPrice, #request.maxPrice, " +
-                  "#request.minRating, #pageable.pageNumber, #pageable.pageSize}",
+                  "#request.minRating, #request.normalizedServiceTypeSlugs(), " +
+                  "#pageable.pageNumber, #pageable.pageSize}",
             condition = "#pageable.pageNumber < 5",
             sync = true
     )
@@ -209,7 +235,17 @@ public class SearchService {
     public Page<MasterSearchResult> searchMasters(MasterSearchRequest request, Pageable pageable) {
         validatePriceRange(request.minPrice(), request.maxPrice());
 
-        MasterSearchFilters filters = normalize(request);
+        // Phase 20.1: resolve the per-service filter. An empty Optional means at
+        // least one selected slug resolves to no active service-type — under AND
+        // semantics no master can satisfy the filter, so short-circuit to an
+        // empty page rather than running a query that is guaranteed to be empty.
+        Optional<List<ResolvedServiceType>> resolved =
+                resolveServiceTypes(request.normalizedServiceTypeSlugs());
+        if (resolved.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+
+        MasterSearchFilters filters = normalize(request, resolved.get());
 
         // PERF-M1: single query — COUNT(*) OVER() is column index 10.
         // No separate count round-trip on cache miss.
@@ -260,6 +296,7 @@ public class SearchService {
             key = "{#request.location?.cityId, #request.location?.districtId, " +
                   "#request.q, #request.category, #request.sort, " +
                   "#request.minPrice, #request.maxPrice, " +
+                  "#request.normalizedServiceTypeSlugs(), " +
                   "#pageable.pageNumber, #pageable.pageSize}",
             condition = "#pageable.pageNumber < 5",
             sync = true
@@ -278,9 +315,33 @@ public class SearchService {
         String likePattern = q == null ? null : likeContains(q);
         BigDecimal minPrice = normalizePrice(request.minPrice());
         BigDecimal maxPrice = normalizePrice(request.maxPrice());
+        SearchSort sort = SearchSort.orDefault(request.sort());
+
+        // Phase 20.2: resolve the per-service filter (see searchMasters). An empty
+        // Optional → an unresolvable slug → empty page under AND semantics.
+        Optional<List<ResolvedServiceType>> resolved =
+                resolveServiceTypes(request.normalizedServiceTypeSlugs());
+        if (resolved.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+        List<ResolvedServiceType> serviceTypes = resolved.get();
+
+        // Phase 20.2: when a per-service filter is active the static repository
+        // projection queries cannot express N dynamic, ANDed correlated EXISTS
+        // predicates (one per slug — locked decision 3 forbids a single IN/ANY),
+        // so the filtered path is assembled dynamically here via the EntityManager
+        // — mirroring the master path and the DashboardService array-binding
+        // precedent. The unfiltered path keeps the tuned repository overloads
+        // (with their no-price COUNT gate) untouched.
+        if (!serviceTypes.isEmpty()) {
+            return searchSalonsWithServiceFilter(
+                    cityId, districtId, category, likePattern, minPrice, maxPrice,
+                    sort, serviceTypes, pageable);
+        }
+
         // Re-page with an allow-listed Sort built from the enum — caller text
         // never reaches the ORDER BY (native query applies Sort by select alias).
-        Pageable sortedPageable = withSalonSort(pageable, SearchSort.orDefault(request.sort()));
+        Pageable sortedPageable = withSalonSort(pageable, sort);
 
         Page<SalonSearchProjection> page = findSalonsByLocation(
                 cityId, districtId, category, likePattern, minPrice, maxPrice, sortedPageable);
@@ -291,6 +352,43 @@ public class SearchService {
                 distinct(projections, SalonSearchProjection::getDistrictId));
 
         return page.map(proj -> toSalonSearchResult(proj, labels));
+    }
+
+    /**
+     * Dynamic per-service-filtered salon search (Phase 20.2). Assembles a single
+     * native query — locality dispatch, optional {@code q} / price / category
+     * predicates, and <b>one correlated {@code EXISTS} per selected slug</b>
+     * (AND semantics) reaching into the salon's active masters' active services
+     * via the hybrid {@code service_type_id = :id OR name ILIKE :name} match —
+     * plus a {@code COUNT(*) OVER()} window for single-query pagination
+     * (PERF-M1) and the {@code matchedServiceNames} lateral (Phase 20.3). Bound
+     * params are typed objects (UUID / BigDecimal) so no {@code CAST(:p …)} idiom
+     * is emitted ({@code SearchServiceTest} guard).
+     */
+    private Page<SalonSearchResult> searchSalonsWithServiceFilter(
+            UUID cityId, UUID districtId, String category, String likePattern,
+            BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
+            List<ResolvedServiceType> serviceTypes, Pageable pageable) {
+        SqlAndParams dataSql = buildSalonSearchSql(
+                cityId, districtId, category, likePattern, minPrice, maxPrice,
+                sort, serviceTypes, pageable);
+        Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
+        bind(dataQuery, dataSql.params());
+
+        @SuppressWarnings("unchecked")
+        List<Object[]> rawRows = dataQuery.getResultList();
+
+        if (rawRows.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+
+        long total = ((Number) rawRows.get(0)[SALON_TOTAL_COUNT_IDX]).longValue();
+        DiscoveryLabels labels = resolveLabelsForRows(rawRows, SALON_CITY_ID_IDX, SALON_DISTRICT_ID_IDX);
+        List<SalonSearchResult> results = new ArrayList<>(rawRows.size());
+        for (Object[] row : rawRows) {
+            results.add(mapSalonRow(row, labels));
+        }
+        return new PageImpl<>(results, pageable, total);
     }
 
     /**
@@ -393,7 +491,8 @@ public class SearchService {
             SearchSort sort,
             BigDecimal minRating,
             BigDecimal minPrice,
-            BigDecimal maxPrice
+            BigDecimal maxPrice,
+            List<ResolvedServiceType> serviceTypes
     ) {
         boolean hasDistrictFilter() {
             return districtId != null;
@@ -404,10 +503,49 @@ public class SearchService {
         }
     }
 
+    /**
+     * A selected {@code serviceTypeSlug} resolved to its hybrid match operands:
+     * the {@code service_type_id} FK target and the pre-escaped {@code %nameUk%}
+     * containment pattern. Both branches are ORed in the per-slug predicate
+     * ({@code sd.service_type_id = :id OR sd.name ILIKE :name}) so legacy /
+     * single-create rows whose FK is still {@code NULL} are recovered by name
+     * (Phase 20.x; FK backfill is the deferred Phase 20.4). Only ever built for
+     * a slug that resolved to an active service-type, so {@code serviceTypeId}
+     * is non-null and bound as a plain {@code UUID} (no {@code CAST}).
+     */
+    private record ResolvedServiceType(UUID serviceTypeId, String namePattern) {}
+
     /** Carrier for {@code (sql, params)} pairs returned by {@link #buildMasterSearchSql}. */
     private record SqlAndParams(String sql, Map<String, Object> params) {}
 
-    private MasterSearchFilters normalize(MasterSearchRequest request) {
+    /**
+     * Resolves the normalized {@code serviceTypeSlugs} to their hybrid match
+     * operands through the cached {@link ServiceTypeSlugResolver}.
+     *
+     * <ul>
+     *   <li>empty input → present, empty list (no service filter);</li>
+     *   <li>every slug resolves → present list of {@link ResolvedServiceType};</li>
+     *   <li>any slug unresolved → {@link Optional#empty()} signalling the caller
+     *       to short-circuit to an empty page (AND-of-all can never match).</li>
+     * </ul>
+     */
+    private Optional<List<ResolvedServiceType>> resolveServiceTypes(List<String> slugs) {
+        if (slugs.isEmpty()) {
+            return Optional.of(List.of());
+        }
+        List<Optional<ServiceTypeMatch>> matches = serviceTypeSlugResolver.resolve(slugs);
+        List<ResolvedServiceType> resolved = new ArrayList<>(matches.size());
+        for (Optional<ServiceTypeMatch> match : matches) {
+            if (match.isEmpty()) {
+                return Optional.empty();
+            }
+            ServiceTypeMatch type = match.get();
+            resolved.add(new ResolvedServiceType(type.serviceTypeId(), likeContains(type.nameUk())));
+        }
+        return Optional.of(List.copyOf(resolved));
+    }
+
+    private MasterSearchFilters normalize(MasterSearchRequest request, List<ResolvedServiceType> serviceTypes) {
         DiscoveryLocationKey key = resolveLocation(request.location());
         return new MasterSearchFilters(
                 key == null ? null : key.cityId(),
@@ -417,7 +555,8 @@ public class SearchService {
                 SearchSort.orDefault(request.sort()),
                 normalizeRating(request.minRating()),
                 normalizePrice(request.minPrice()),
-                normalizePrice(request.maxPrice())
+                normalizePrice(request.maxPrice()),
+                serviceTypes
         );
     }
 
@@ -480,7 +619,8 @@ public class SearchService {
         params.put("offset", pageable.getOffset());
 
         String sql = wrapWithServiceNamesLateral(
-                inner.toString(), filters.sort(), filters.category() != null);
+                inner.toString(), filters.sort(), filters.category() != null,
+                filters.serviceTypes());
         return new SqlAndParams(sql, params);
     }
 
@@ -511,20 +651,29 @@ public class SearchService {
      * single override) still yields {@code price_max == min_effective_price}.
      * {@code NULL} when the master has no active, priced services.
      *
-     * <p>Column layout (indices 0–14): {@code price_max} stays at projection
-     * index 9 and {@link #SERVICE_NAMES_IDX} (10) is unchanged — only its SOURCE
-     * moves from {@code t.price_max} to {@code sn.price_max}. The auth-gated
-     * address trio {@code street} (11) / {@code building_no} (12) /
-     * {@code location_note} (13) precedes {@link #TOTAL_COUNT_IDX} (14).
+     * <p>Column layout (indices 0–15, Phase 20.3): {@code price_max} stays at
+     * projection index 9 and {@link #SERVICE_NAMES_IDX} (10) is unchanged — only
+     * its SOURCE moves from {@code t.price_max} to {@code sn.price_max}. The
+     * auth-gated address trio {@code street} (11) / {@code building_no} (12) /
+     * {@code location_note} (13) is followed by
+     * {@link #MATCHED_SERVICE_NAMES_IDX matched_names} (14) and finally
+     * {@link #TOTAL_COUNT_IDX} (15).
      */
     private static String wrapWithServiceNamesLateral(
-            String innerSql, SearchSort sort, boolean hasCategoryFilter) {
+            String innerSql, SearchSort sort, boolean hasCategoryFilter,
+            List<ResolvedServiceType> serviceTypes) {
+        boolean hasServiceFilter = !serviceTypes.isEmpty();
+        // Phase 20.3: matched_names is sourced from the slug-scoped lateral when a
+        // per-service filter is active, else a typed empty array literal (mapped
+        // to []). A typed-NULL literal (not CAST(:p …)) is permitted by the guard.
+        String matchedNamesExpr = hasServiceFilter ? "mn.matched_names" : "CAST(NULL AS text[])";
         StringBuilder sb = new StringBuilder();
         sb.append("SELECT t.master_id, t.first_name, t.last_name, ")
                 .append("t.avg_rating, t.review_count, t.avatar_url, ")
                 .append("t.discovery_city_id, t.discovery_district_id, ")
                 .append("t.min_effective_price, sn.price_max, sn.service_names, ")
-                .append("t.street, t.building_no, t.location_note, t.total_count ")
+                .append("t.street, t.building_no, t.location_note, ")
+                .append(matchedNamesExpr).append(" AS matched_names, t.total_count ")
                 .append("FROM (").append(innerSql).append(") t ")
                 .append("LEFT JOIN LATERAL (")
                 .append("SELECT ")
@@ -555,6 +704,15 @@ public class SearchService {
                 .append("JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id AND sd2.is_active = true ")
                 .append("WHERE ms2.master_id = t.master_id AND ms2.is_active = true ")
                 .append(") sn ON true ");
+        // Phase 20.3 — matched_names: a second post-LIMIT correlated lateral over
+        // ONLY the paged masters, mirroring the serviceNames lateral's shape (no
+        // GROUP BY/HAVING). DISTINCT active service names matching ANY selected
+        // slug (OR across slugs — the card shows what matched), capped to
+        // SERVICE_NAME_CAP. Reuses the :stId{n}/:stName{n} params already bound by
+        // appendWhereClause. Only emitted when a per-service filter is active.
+        if (hasServiceFilter) {
+            appendMatchedNamesLateral(sb, serviceTypes);
+        }
         appendOuterOrderBy(sb, sort);
         return sb.toString();
     }
@@ -726,6 +884,14 @@ public class SearchService {
             // (plain equality, no CAST) — see wrapWithServiceNamesLateral.
             params.put("category", filters.category());
         }
+        // Phase 20.1 — per-service filter: ONE correlated EXISTS per selected slug
+        // (AND semantics — a master must offer a service matching EVERY slug;
+        // locked decision 3 forbids a single IN/ANY). Each EXISTS hybrid-matches
+        // on the FK (sd.service_type_id = :stId{n}) OR the resolved name
+        // (sd.name ILIKE :stName{n}), recovering legacy rows whose FK is NULL. The
+        // :stId{n} param is bound as a plain UUID object (no CAST). Independent
+        // sub-selects reuse the ms/sd aliases — each EXISTS is its own scope.
+        appendServiceTypeExists(sb, filters.serviceTypes(), params);
         if (filters.minRating() != null) {
             sb.append("AND m.avg_rating >= :minRating ");
             params.put("minRating", filters.minRating());
@@ -743,8 +909,310 @@ public class SearchService {
         }
     }
 
+    /**
+     * Appends one correlated {@code EXISTS} per selected slug to the master WHERE
+     * clause (AND semantics) and binds each slug's {@code service_type_id} (plain
+     * UUID, no CAST) + {@code %nameUk%} pattern. Each sub-select is its own scope,
+     * so the {@code ms}/{@code sd} aliases are reused across slugs.
+     */
+    private static void appendServiceTypeExists(
+            StringBuilder sb, List<ResolvedServiceType> serviceTypes, Map<String, Object> params) {
+        for (int i = 0; i < serviceTypes.size(); i++) {
+            ResolvedServiceType st = serviceTypes.get(i);
+            String idParam = SERVICE_TYPE_ID_PARAM + i;
+            String nameParam = SERVICE_TYPE_NAME_PARAM + i;
+            sb.append("AND EXISTS (")
+                    .append("SELECT 1 FROM master_services ms ")
+                    .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                    .append("WHERE ms.master_id = m.id AND ms.is_active = true ")
+                    .append("AND (sd.service_type_id = :").append(idParam)
+                    .append(" OR sd.name ILIKE :").append(nameParam).append(")) ");
+            params.put(idParam, st.serviceTypeId());
+            params.put(nameParam, st.namePattern());
+        }
+    }
+
+    /**
+     * Appends the master matched-names lateral (Phase 20.3): DISTINCT active
+     * service names matching ANY selected slug (OR across slugs), capped, over
+     * only the paged masters ({@code t.master_id}). Reuses the already-bound
+     * {@code :stId{n}}/{@code :stName{n}} params.
+     */
+    private static void appendMatchedNamesLateral(StringBuilder sb, List<ResolvedServiceType> serviceTypes) {
+        sb.append("LEFT JOIN LATERAL (")
+                .append("SELECT array_agg(xm.name) AS matched_names FROM (")
+                .append("SELECT DISTINCT sd.name ")
+                .append("FROM master_services ms ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true AND (");
+        appendServiceTypeMatchDisjunction(sb, "sd", serviceTypes.size());
+        sb.append(") ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
+                .append(") xm) mn ON true ");
+    }
+
+    /**
+     * Appends the OR-chain of per-slug hybrid match predicates
+     * ({@code (alias.service_type_id = :stId{n} OR alias.name ILIKE :stName{n}) OR …})
+     * used by the matched-names laterals. {@code count} is always {@code >= 1}
+     * (callers only invoke this with an active filter).
+     */
+    private static void appendServiceTypeMatchDisjunction(StringBuilder sb, String alias, int count) {
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                sb.append("OR ");
+            }
+            sb.append("(").append(alias).append(".service_type_id = :").append(SERVICE_TYPE_ID_PARAM).append(i)
+                    .append(" OR ").append(alias).append(".name ILIKE :")
+                    .append(SERVICE_TYPE_NAME_PARAM).append(i).append(") ");
+        }
+    }
+
     private static void bind(Query query, Map<String, Object> params) {
         params.forEach(query::setParameter);
+    }
+
+    // ── salon per-service-filtered SQL builder (Phase 20.2/20.3) ───────────────
+
+    /**
+     * Builds the single data+count native SQL for the per-service-filtered salon
+     * search as a <em>Top-N inner derived table + post-LIMIT name laterals</em>
+     * — mirroring the master path's {@link #wrapWithServiceNamesLateral} shape.
+     *
+     * <h4>Why this shape (HIGH PERF fix)</h4>
+     * The earlier version emitted a flat query with the {@code matched_names}
+     * ({@code mn}) lateral and the {@code pnames} name-preview sub-select attached
+     * directly to {@code salons s} <em>below</em> the {@code ORDER BY}/{@code LIMIT}.
+     * Because both are referenced only in the SELECT list yet sit under an
+     * {@code ORDER BY}, Postgres evaluated each for <em>every</em> matched salon
+     * (the full candidate set) before applying {@code LIMIT 20} — and both fan out
+     * salon → active masters → active services with an N-slug OR disjunction, so
+     * this was a large wasted scan. This refactor splits the work in two:
+     *
+     * <ol>
+     *   <li><b>Inner derived table {@code t}</b> — location + {@code q} + price +
+     *       the N service-type {@code EXISTS} filters + {@code ORDER BY} +
+     *       {@code LIMIT/OFFSET}. The {@code pr} price-aggregate lateral
+     *       (pmin/pmax) <em>stays here</em> because it feeds the price WHERE and
+     *       the {@code ORDER BY}. {@code COUNT(*) OVER()} rides along (PERF-M1) —
+     *       Postgres applies {@code LIMIT} after window functions, so it still
+     *       reports the full filtered count in every paged row.</li>
+     *   <li><b>Name laterals → post-LIMIT</b> — the {@code pnames} name preview
+     *       ({@code pn}) and the slug-scoped {@code matched_names} ({@code mn})
+     *       laterals are attached in the OUTER block, correlated to {@code t.id},
+     *       so they run for <em>only the ~pageSize paged rows</em>, never the whole
+     *       candidate set.</li>
+     * </ol>
+     *
+     * <p>One correlated {@code EXISTS} per selected slug (AND semantics,
+     * salon→active masters→active services hybrid match) lives in the inner WHERE.
+     * All params are typed objects — no {@code CAST(:p …)} idiom (guard).
+     */
+    private static SqlAndParams buildSalonSearchSql(
+            UUID cityId, UUID districtId, String category, String likePattern,
+            BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
+            List<ResolvedServiceType> serviceTypes, Pageable pageable) {
+        StringBuilder inner = new StringBuilder();
+        Map<String, Object> params = new LinkedHashMap<>();
+        boolean hasCategory = category != null;
+
+        // Inner Top-N: only the columns + price aggregates needed for WHERE /
+        // ORDER BY / LIMIT. Name previews are deferred to the outer block.
+        inner.append("SELECT s.id AS id, s.name AS name, s.city_id AS city_id, ")
+                .append("s.district_id AS district_id, s.avatar_url AS avatar_url, ")
+                .append("s.street AS street, s.building_no AS building_no, ")
+                .append("s.location_note AS location_note, ")
+                .append("pr.pmin AS pmin, pr.pmax AS pmax, ")
+                .append("COUNT(*) OVER() AS total_count ")
+                .append("FROM salons s ");
+        appendSalonPriceAggregateLateral(inner, hasCategory);
+
+        inner.append("WHERE s.is_active = true ");
+        if (districtId != null) {
+            inner.append("AND s.district_id = :districtId ");
+            params.put("districtId", districtId);
+        } else if (cityId != null) {
+            inner.append("AND s.city_id = :cityId ");
+            params.put("cityId", cityId);
+        }
+        if (likePattern != null) {
+            inner.append("AND (s.name ILIKE :q OR EXISTS (")
+                    .append("SELECT 1 FROM master_services msq ")
+                    .append("JOIN masters mmq ON mmq.id = msq.master_id ")
+                    .append("JOIN service_definitions sdq ON sdq.id = msq.service_def_id ")
+                    .append("WHERE mmq.salon_id = s.id AND mmq.is_active = true ")
+                    .append("AND msq.is_active = true AND sdq.is_active = true ")
+                    .append("AND sdq.name ILIKE :q)) ");
+            params.put("q", likePattern);
+        }
+        if (hasCategory) {
+            params.put("category", category);
+        }
+        if (minPrice != null) {
+            inner.append("AND pr.pmax >= :minPrice ");
+            params.put("minPrice", minPrice);
+        }
+        if (maxPrice != null) {
+            inner.append("AND pr.pmin <= :maxPrice ");
+            params.put("maxPrice", maxPrice);
+        }
+        appendSalonServiceTypeExists(inner, serviceTypes, params);
+
+        appendSalonOrderBy(inner, sort);
+        inner.append(" LIMIT :limit OFFSET :offset");
+        params.put("limit", pageable.getPageSize());
+        params.put("offset", pageable.getOffset());
+
+        String sql = wrapSalonWithNameLaterals(inner.toString(), hasCategory, sort, serviceTypes);
+        return new SqlAndParams(sql, params);
+    }
+
+    /**
+     * Wraps the index-ordered Top-N inner derived table {@code t} with the two
+     * post-LIMIT correlated name laterals — the {@code pnames} preview ({@code pn})
+     * and the slug-scoped {@code matched_names} ({@code mn}) — computed for only
+     * the paged rows. Mirrors {@link #wrapWithServiceNamesLateral}.
+     *
+     * <p>The outer SELECT restores the stable 0–12 projection layout that
+     * {@link #mapSalonRow} expects: id, name, city_id (2), district_id (3),
+     * avatar_url, pmin (5), pmax (6), pnames (7), street, building_no,
+     * location_note, matched_names (11), total_count (12). The price band
+     * (pmin/pmax) and address trio are projected straight from {@code t}; only the
+     * two name-preview columns come from the outer laterals.
+     */
+    private static String wrapSalonWithNameLaterals(
+            String innerSql, boolean hasCategory, SearchSort sort,
+            List<ResolvedServiceType> serviceTypes) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("SELECT t.id, t.name, t.city_id, t.district_id, t.avatar_url, ")
+                .append("t.pmin, t.pmax, pn.pnames, ")
+                .append("t.street, t.building_no, t.location_note, ")
+                .append("mn.matched_names, t.total_count ")
+                .append("FROM (").append(innerSql).append(") t ");
+        appendSalonNamePreviewLateral(sb, hasCategory);
+        appendSalonMatchedNamesLateral(sb, serviceTypes);
+        appendSalonOuterOrderBy(sb, sort);
+        return sb.toString();
+    }
+
+    /**
+     * Category-scoped price-band aggregate lateral — MIN floor + RANGE-aware MAX
+     * ceiling over the salon's active masters' active services. Stays in the inner
+     * derived table because {@code pmin}/{@code pmax} feed the price WHERE and the
+     * {@code ORDER BY}. Category is bound conditionally (plain equality, no CAST).
+     */
+    private static void appendSalonPriceAggregateLateral(StringBuilder sb, boolean hasCategory) {
+        sb.append("LEFT JOIN LATERAL (")
+                .append("SELECT MIN(sd.base_price) AS pmin, ")
+                .append("MAX(CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END) AS pmax ")
+                .append("FROM master_services ms ")
+                .append("JOIN masters mm ON mm.id = ms.master_id ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id ")
+                .append("WHERE mm.salon_id = s.id AND mm.is_active = true ")
+                .append("AND ms.is_active = true AND sd.is_active = true ");
+        if (hasCategory) {
+            sb.append("AND sd.category = :category ");
+        }
+        sb.append(") pr ON true ");
+    }
+
+    /**
+     * Post-LIMIT {@code pnames} name-preview lateral (capped DISTINCT name
+     * {@code array_agg}) correlated to {@code t.id} — runs over only the paged
+     * salon rows. Byte-for-byte the prior name-preview sub-select formerly bundled
+     * inside the {@code pr} price lateral, lifted out so it no longer scans the
+     * full candidate set. Category is bound conditionally (plain equality, no CAST).
+     */
+    private static void appendSalonNamePreviewLateral(StringBuilder sb, boolean hasCategory) {
+        sb.append("LEFT JOIN LATERAL (")
+                .append("SELECT array_agg(z.name) AS pnames FROM (")
+                .append("SELECT DISTINCT sd2.name AS name ")
+                .append("FROM master_services ms2 ")
+                .append("JOIN masters mm2 ON mm2.id = ms2.master_id ")
+                .append("JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id ")
+                .append("WHERE mm2.salon_id = t.id AND mm2.is_active = true ")
+                .append("AND ms2.is_active = true AND sd2.is_active = true ");
+        if (hasCategory) {
+            sb.append("AND sd2.category = :category ");
+        }
+        sb.append("ORDER BY sd2.name LIMIT ").append(SERVICE_NAME_CAP)
+                .append(") z) pn ON true ");
+    }
+
+    /**
+     * Slug-scoped matched-names lateral (Phase 20.3): DISTINCT active service
+     * names offered across the salon's active masters that match ANY selected
+     * slug (OR across slugs), capped. Correlated to {@code t.id} — sits in the
+     * OUTER block over only the paged rows (HIGH PERF fix). Reuses the
+     * {@code :stId{n}}/{@code :stName{n}} params bound by
+     * {@link #appendSalonServiceTypeExists}.
+     */
+    private static void appendSalonMatchedNamesLateral(StringBuilder sb, List<ResolvedServiceType> serviceTypes) {
+        sb.append("LEFT JOIN LATERAL (")
+                .append("SELECT array_agg(zm.name) AS matched_names FROM (")
+                .append("SELECT DISTINCT sd3.name AS name ")
+                .append("FROM master_services ms3 ")
+                .append("JOIN masters mm3 ON mm3.id = ms3.master_id ")
+                .append("JOIN service_definitions sd3 ON sd3.id = ms3.service_def_id ")
+                .append("WHERE mm3.salon_id = t.id AND mm3.is_active = true ")
+                .append("AND ms3.is_active = true AND sd3.is_active = true AND (");
+        appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
+        sb.append(") ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
+                .append(") zm) mn ON true ");
+    }
+
+    /**
+     * One correlated {@code EXISTS} per selected slug (AND semantics) reaching the
+     * salon's active masters' active services, hybrid-matching FK OR name. Binds
+     * each slug's {@code service_type_id} (plain UUID) + {@code %nameUk%} pattern.
+     */
+    private static void appendSalonServiceTypeExists(
+            StringBuilder sb, List<ResolvedServiceType> serviceTypes, Map<String, Object> params) {
+        for (int i = 0; i < serviceTypes.size(); i++) {
+            ResolvedServiceType st = serviceTypes.get(i);
+            String idParam = SERVICE_TYPE_ID_PARAM + i;
+            String nameParam = SERVICE_TYPE_NAME_PARAM + i;
+            sb.append("AND EXISTS (")
+                    .append("SELECT 1 FROM master_services msf ")
+                    .append("JOIN masters mmf ON mmf.id = msf.master_id ")
+                    .append("JOIN service_definitions sdf ON sdf.id = msf.service_def_id ")
+                    .append("WHERE mmf.salon_id = s.id AND mmf.is_active = true ")
+                    .append("AND msf.is_active = true AND sdf.is_active = true ")
+                    .append("AND (sdf.service_type_id = :").append(idParam)
+                    .append(" OR sdf.name ILIKE :").append(nameParam).append(")) ");
+            params.put(idParam, st.serviceTypeId());
+            params.put(nameParam, st.namePattern());
+        }
+    }
+
+    /**
+     * Allow-listed salon {@code ORDER BY} over the lateral price aliases. Price
+     * sorts use {@code pr.pmin}/{@code pr.pmax}; rating/reviews fall back to name
+     * (salons carry no per-row rating in this projection — documented divergence,
+     * mirrors {@link #withSalonSort}). {@code s.id} is the stable tiebreaker.
+     */
+    private static void appendSalonOrderBy(StringBuilder sb, SearchSort sort) {
+        sb.append(switch (sort) {
+            case PRICE_ASC -> "ORDER BY pr.pmin ASC NULLS LAST, s.name, s.id";
+            case PRICE_DESC -> "ORDER BY pr.pmax DESC NULLS LAST, s.name, s.id";
+            case RATING_DESC, REVIEWS_DESC -> "ORDER BY s.name, s.id";
+        });
+    }
+
+    /**
+     * Outer {@code ORDER BY} re-applied on the derived-table aliases ({@code t.*})
+     * after the post-LIMIT name laterals. A {@code LEFT JOIN LATERAL} does not
+     * preserve the inner {@code ORDER BY}, so the paging order is restated over the
+     * already-bounded ~pageSize rows (a cheap final sort, not a candidate-wide
+     * one). Mirrors {@link #appendSalonOrderBy} with {@code pr.}/{@code s.} →
+     * {@code t.} — and the price columns are projected onto {@code t} so the sort
+     * resolves without re-touching the price lateral.
+     */
+    private static void appendSalonOuterOrderBy(StringBuilder sb, SearchSort sort) {
+        sb.append(switch (sort) {
+            case PRICE_ASC -> "ORDER BY t.pmin ASC NULLS LAST, t.name, t.id";
+            case PRICE_DESC -> "ORDER BY t.pmax DESC NULLS LAST, t.name, t.id";
+            case RATING_DESC, REVIEWS_DESC -> "ORDER BY t.name, t.id";
+        });
     }
 
     // ── parameter normalisation ───────────────────────────────────────────────
@@ -894,14 +1362,14 @@ public class SearchService {
      * Maps a raw native-query row to {@link MasterSearchResult}, stamping the
      * resolved locality labels from the batched M2-seam result.
      *
-     * <p>15-column projection (indices 0–14):
+     * <p>16-column projection (indices 0–15, Phase 20.3):
      * {@code [master_id, first_name, last_name, avg_rating, review_count,
      * avatar_url, discovery_city_id, discovery_district_id,
      * min_effective_price, price_max, service_names, street, building_no,
-     * location_note, total_count]}.
+     * location_note, matched_names, total_count]}.
      * The internal city/district UUIDs (6, 7) are consumed here for label
      * resolution and are NOT placed on the public DTO (§I).
-     * {@code total_count} (14) is read by the caller before this method is
+     * {@code total_count} (15) is read by the caller before this method is
      * invoked and is not mapped to the DTO.
      *
      * <p>{@code street} (11) / {@code building_no} (12) / {@code location_note}
@@ -925,6 +1393,7 @@ public class SearchService {
         String street = (String) row[11];
         String buildingNo = (String) row[12];
         String locationNote = (String) row[13];
+        List<String> matchedServiceNames = toServiceNames(row[MATCHED_SERVICE_NAMES_IDX]);
 
         return new MasterSearchResult(
                 masterId,
@@ -940,7 +1409,8 @@ public class SearchService {
                 serviceNames,
                 street,
                 buildingNo,
-                locationNote
+                locationNote,
+                matchedServiceNames
         );
     }
 
@@ -998,7 +1468,51 @@ public class SearchService {
                 // AFTER the @Cacheable read so the cache never leaks addresses.
                 proj.getStreet(),
                 proj.getBuildingNo(),
-                proj.getLocationNote()
+                proj.getLocationNote(),
+                // Phase 20.3: no per-service filter on this (unfiltered) path, so
+                // matchedServiceNames is empty — the card falls back to serviceNames.
+                List.of()
+        );
+    }
+
+    /**
+     * Maps a raw native-query row from the per-service-filtered salon path
+     * ({@link #searchSalonsWithServiceFilter}) to {@link SalonSearchResult}.
+     *
+     * <p>13-column projection (indices 0–12):
+     * {@code [id, name, city_id, district_id, avatar_url, price_min, price_max,
+     * service_names, street, building_no, location_note, matched_names,
+     * total_count]}. The internal city/district UUIDs (2, 3) drive label
+     * resolution and are not placed on the public DTO (§I); {@code total_count}
+     * (12) is read by the caller, not mapped.
+     */
+    private static SalonSearchResult mapSalonRow(Object[] row, DiscoveryLabels labels) {
+        UUID salonId = (UUID) row[0];
+        String name = (String) row[1];
+        UUID cityId = (UUID) row[SALON_CITY_ID_IDX];
+        UUID districtId = (UUID) row[SALON_DISTRICT_ID_IDX];
+        String avatarUrl = (String) row[4];
+        BigDecimal priceMin = (BigDecimal) row[5];
+        BigDecimal priceMax = (BigDecimal) row[6];
+        List<String> serviceNames = toServiceNames(row[7]);
+        String street = (String) row[8];
+        String buildingNo = (String) row[9];
+        String locationNote = (String) row[10];
+        List<String> matchedServiceNames = toServiceNames(row[11]);
+
+        return new SalonSearchResult(
+                salonId,
+                name,
+                labels.cityLabel(cityId),
+                labels.districtLabel(districtId),
+                avatarUrl,
+                priceMin,
+                priceMax,
+                serviceNames,
+                street,
+                buildingNo,
+                locationNote,
+                matchedServiceNames
         );
     }
 }

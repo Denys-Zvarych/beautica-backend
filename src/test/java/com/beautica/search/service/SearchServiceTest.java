@@ -12,6 +12,8 @@ import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
 import com.beautica.search.dto.SearchSort;
+import com.beautica.service.service.ServiceTypeMatch;
+import com.beautica.service.service.ServiceTypeSlugResolver;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.Query;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,6 +32,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -78,13 +81,16 @@ class SearchServiceTest {
     @Mock
     private DiscoveryLocationResolver discoveryLocationResolver;
 
+    @Mock
+    private ServiceTypeSlugResolver serviceTypeSlugResolver;
+
     private SearchService service;
 
     private ArgumentCaptor<String> sqlCaptor;
 
     @BeforeEach
     void setUp() {
-        service = new SearchService(salonRepository, discoveryLocationResolver);
+        service = new SearchService(salonRepository, discoveryLocationResolver, serviceTypeSlugResolver);
         ReflectionTestUtils.setField(service, "entityManager", entityManager);
         sqlCaptor = ArgumentCaptor.forClass(String.class);
         // The seam passes through the (cityId, districtId) pair by default;
@@ -111,10 +117,13 @@ class SearchServiceTest {
         // not-explicitly-set columns (price_max, service_names, street, building_no,
         // location_note) default to null and the window-function total lands at
         // TOTAL_COUNT_IDX (14).
+        // Phase 20.3 widened the wrapped master projection to 16 columns (indices
+        // 0–15): matched_names landed at index 14 (empty here — no service filter)
+        // and total_count (COUNT(*) OVER()) moved to index 15 (TOTAL_COUNT_IDX).
         List<Object[]> rowsWithCount = rows.stream()
                 .map(row -> {
-                    Object[] extended = java.util.Arrays.copyOf(row, 15);
-                    extended[14] = total;   // TOTAL_COUNT_IDX in SearchService
+                    Object[] extended = java.util.Arrays.copyOf(row, 16);
+                    extended[15] = total;   // TOTAL_COUNT_IDX in SearchService
                     return extended;
                 })
                 .toList();
@@ -130,19 +139,19 @@ class SearchServiceTest {
     private static final UUID CITY_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final UUID DISTRICT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
 
-    // MasterSearchRequest field order: (location, q, category, sort, minPrice, maxPrice, minRating, page, size)
+    // MasterSearchRequest field order: (location, q, category, sort, minPrice, maxPrice, minRating, page, size, serviceTypeSlugs)
     private static MasterSearchRequest emptyRequest() {
-        return new MasterSearchRequest(null, null, null, null, null, null, null, 0, 20);
+        return new MasterSearchRequest(null, null, null, null, null, null, null, 0, 20, null);
     }
 
     private static MasterSearchRequest cityRequest() {
         return new MasterSearchRequest(
-                new LocationFilter(CITY_ID, null), null, null, null, null, null, null, 0, 20);
+                new LocationFilter(CITY_ID, null), null, null, null, null, null, null, 0, 20, null);
     }
 
     private static MasterSearchRequest districtRequest() {
         return new MasterSearchRequest(
-                new LocationFilter(CITY_ID, DISTRICT_ID), null, null, null, null, null, null, 0, 20);
+                new LocationFilter(CITY_ID, DISTRICT_ID), null, null, null, null, null, null, 0, 20, null);
     }
 
     private static MasterSearchRequest fullRequest() {
@@ -155,7 +164,8 @@ class SearchServiceTest {
                 new BigDecimal("500.00"),
                 new BigDecimal("4.5"),
                 0,
-                20
+                20,
+                null
         );
     }
 
@@ -295,8 +305,8 @@ class SearchServiceTest {
     private static SalonSearchRequest salonRequest(UUID cityId, UUID districtId) {
         LocationFilter filter =
                 (cityId == null && districtId == null) ? null : new LocationFilter(cityId, districtId);
-        // SalonSearchRequest: (location, q, category, sort, minPrice, maxPrice, page, size)
-        return new SalonSearchRequest(filter, null, null, null, null, null, 0, 20);
+        // SalonSearchRequest: (location, q, category, sort, minPrice, maxPrice, page, size, serviceTypeSlugs)
+        return new SalonSearchRequest(filter, null, null, null, null, null, 0, 20, null);
     }
 
     /**
@@ -391,7 +401,7 @@ class SearchServiceTest {
                 .thenReturn(stubPage);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, null,
-                new BigDecimal("100.00"), null, 0, 20);
+                new BigDecimal("100.00"), null, 0, 20, null);
 
         service.searchSalons(request, PageRequest.of(0, 20));
 
@@ -454,7 +464,7 @@ class SearchServiceTest {
                 null, null, null, null,
                 new BigDecimal("500.00"),
                 new BigDecimal("100.00"),
-                null, 0, 20
+                null, 0, 20, null
         );
 
         assertThatThrownBy(() -> service.searchMasters(request, PageRequest.of(0, 20)))
@@ -469,7 +479,7 @@ class SearchServiceTest {
     void should_normalizeCategoryCase_before_bindingParameter() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, "manicure", null, null, null, null, 0, 20);
+                null, null, "manicure", null, null, null, null, 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -482,7 +492,7 @@ class SearchServiceTest {
     void should_convertMinRatingToScaleTwo_before_binding() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null, null, null, null, new BigDecimal("4.5"), 0, 20);
+                null, null, null, null, null, null, new BigDecimal("4.5"), 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -502,7 +512,7 @@ class SearchServiceTest {
                 null, null, null, null,
                 new BigDecimal("1.0"),      // scale 1 — must become 1.00
                 new BigDecimal("500"),       // scale 0 — must become 500.00
-                null, 0, 20);
+                null, 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -576,7 +586,7 @@ class SearchServiceTest {
         stubNativeQueries(List.of(), 0L);
 
         service.searchMasters(
-                new MasterSearchRequest(null, null, "MANICURE", null, null, null, null, 0, 20),
+                new MasterSearchRequest(null, null, "MANICURE", null, null, null, null, 0, 20, null),
                 PageRequest.of(0, 20));
 
         String dataSql = sqlCaptor.getAllValues().get(0);
@@ -653,6 +663,33 @@ class SearchServiceTest {
         }
     }
 
+    // ── Phase 20.2 — salon per-service-filter SQL shape guard ────────────────
+
+    @Test
+    @DisplayName("salon per-service-filter SQL binds :stId0/:stName0 as typed params and uses no CAST(: workaround (mirrors the master guard)")
+    void should_notUseCastWorkaround_inSalonServiceFilterSql() {
+        // A non-empty serviceTypeSlugs routes searchSalons into the dynamically-
+        // assembled native query (buildSalonSearchSql via EntityManager). Stub the
+        // resolver so the slug resolves to a typed (id, nameUk) match.
+        stubNativeQueries(List.of(), 0L);
+        UUID typeId = UUID.fromString("33333333-3333-3333-3333-333333333333");
+        when(serviceTypeSlugResolver.resolve(List.of("nail-service-manicure")))
+                .thenReturn(List.of(Optional.of(new ServiceTypeMatch(typeId, "Манікюр"))));
+        SalonSearchRequest request = new SalonSearchRequest(
+                null, null, null, null, null, null, 0, 20, List.of("nail-service-manicure"));
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        String salonSql = sqlCaptor.getAllValues().get(0);
+        assertThat(salonSql)
+                .as("the salon per-service EXISTS binds a typed UUID/text pair — no CAST(:p …) idiom")
+                .doesNotContain("CAST(:")
+                .contains(":stId0")
+                .contains(":stName0");
+        // The FK target binds as a plain UUID object (no CAST), mirroring the master path.
+        verify(dataQuery).setParameter("stId0", typeId);
+    }
+
     @Test
     @DisplayName("ORDER BY includes m.id as the deterministic tie-breaker")
     void should_orderByRatingThenId_when_dataQueryIssued() {
@@ -671,7 +708,7 @@ class SearchServiceTest {
     void should_addIlikePredicate_when_qProvided() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, "olena", null, null, null, null, null, 0, 20);
+                null, "olena", null, null, null, null, null, 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -690,7 +727,7 @@ class SearchServiceTest {
     void should_bindEscapedContainsPattern_when_qHasLikeWildcards() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, "50%_off", null, null, null, null, null, 0, 20);
+                null, "50%_off", null, null, null, null, null, 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -768,7 +805,7 @@ class SearchServiceTest {
     void should_orderByPriceAsc_when_sortPriceAsc() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null, SearchSort.PRICE_ASC, null, null, null, 0, 20);
+                null, null, null, SearchSort.PRICE_ASC, null, null, null, 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -781,7 +818,7 @@ class SearchServiceTest {
     void should_orderByPriceDesc_when_sortPriceDesc() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null, SearchSort.PRICE_DESC, null, null, null, 0, 20);
+                null, null, null, SearchSort.PRICE_DESC, null, null, null, 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -794,7 +831,7 @@ class SearchServiceTest {
     void should_orderByReviewsDesc_when_sortReviewsDesc() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
-                null, null, null, SearchSort.REVIEWS_DESC, null, null, null, 0, 20);
+                null, null, null, SearchSort.REVIEWS_DESC, null, null, null, 0, 20, null);
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
@@ -824,7 +861,7 @@ class SearchServiceTest {
                 .thenReturn(stubPage);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), "glow", null, null,
-                new BigDecimal("100.00"), new BigDecimal("500.00"), 0, 20);
+                new BigDecimal("100.00"), new BigDecimal("500.00"), 0, 20, null);
 
         service.searchSalons(request, PageRequest.of(0, 20));
 
@@ -847,7 +884,7 @@ class SearchServiceTest {
                 .thenReturn(stubPage);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, SearchSort.PRICE_ASC,
-                null, null, 0, 20);
+                null, null, 0, 20, null);
 
         service.searchSalons(request, PageRequest.of(0, 20));
 

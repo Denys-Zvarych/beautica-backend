@@ -67,6 +67,16 @@ import java.util.UUID;
  * per-request <em>after</em> the cache read in the controller, so a warm cache
  * populated by an authenticated caller can never leak addresses to an anonymous
  * one (and vice-versa). See {@code SearchController} for the strip.</p>
+ *
+ * <p><b>{@code matchedServiceNames} — per-service-filter match preview
+ * (Phase 20.3):</b> when the request carries {@code serviceTypeSlugs}, this is
+ * the capped ({@code SERVICE_NAME_CAP}), distinct list of the master's active
+ * service names that actually matched the selected services, so the result card
+ * can show <em>what</em> matched rather than the generic top-3
+ * {@code serviceNames}. It is <b>empty</b> (never {@code null}) whenever no
+ * service filter is active — the card then falls back to {@code serviceNames}.
+ * Carries display strings only — safe on this {@code permitAll} endpoint
+ * (§I).</p>
  */
 public record MasterSearchResult(
         UUID masterId,
@@ -82,7 +92,8 @@ public record MasterSearchResult(
         List<String> serviceNames,
         String street,
         String buildingNo,
-        String locationNote
+        String locationNote,
+        List<String> matchedServiceNames
 ) {
 
     /**
@@ -99,7 +110,7 @@ public record MasterSearchResult(
         return new MasterSearchResult(
                 masterId, firstName, lastName, cityLabel, districtLabel,
                 avgRating, reviewCount, avatarUrl, minEffectivePrice, priceMax,
-                serviceNames, null, null, null
+                serviceNames, null, null, null, matchedServiceNames
         );
     }
 }

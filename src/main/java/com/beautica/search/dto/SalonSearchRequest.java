@@ -11,6 +11,9 @@ import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
 import java.math.BigDecimal;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 
 /**
  * Inbound request DTO for {@code GET /api/v1/search/salons}.
@@ -113,7 +116,14 @@ public record SalonSearchRequest(
 
         @Positive(message = "size must be a positive number")
         @Max(value = 100, message = "size must be at most 100")
-        Integer size
+        Integer size,
+
+        @Size(max = 20, message = "serviceTypeSlugs must contain at most 20 entries")
+        List<
+                @Size(max = 255, message = "each serviceTypeSlug must be at most 255 characters")
+                @Pattern(regexp = "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                         message = "each serviceTypeSlug must be a lowercase hyphenated slug")
+                String> serviceTypeSlugs
 ) {
 
     /**
@@ -130,5 +140,27 @@ public record SalonSearchRequest(
             return true;
         }
         return minPrice.compareTo(maxPrice) <= 0;
+    }
+
+    /**
+     * Canonical {@code serviceTypeSlugs} view used for BOTH the {@code @Cacheable}
+     * key and the service-layer filter (Phase 20.2): {@code null}-safe, trimmed,
+     * lower-cased, blank-dropped, de-duplicated, and sorted — mirrors
+     * {@link MasterSearchRequest#normalizedServiceTypeSlugs()}. Lower-casing
+     * collapses casing variants onto one cache key (slugs are a fixed lowercase
+     * vocabulary). Never {@code null}.
+     */
+    public List<String> normalizedServiceTypeSlugs() {
+        if (serviceTypeSlugs == null) {
+            return List.of();
+        }
+        return serviceTypeSlugs.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .map(slug -> slug.toLowerCase(Locale.ROOT))
+                .filter(slug -> !slug.isEmpty())
+                .distinct()
+                .sorted()
+                .toList();
     }
 }

@@ -12,6 +12,9 @@ import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
 import java.math.BigDecimal;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 
 /**
  * Inbound request DTO for {@code GET /api/v1/masters/search}.
@@ -120,7 +123,14 @@ public record MasterSearchRequest(
 
         @Positive(message = "size must be a positive number")
         @Max(value = 100, message = "size must be at most 100")
-        Integer size
+        Integer size,
+
+        @Size(max = 20, message = "serviceTypeSlugs must contain at most 20 entries")
+        List<
+                @Size(max = 255, message = "each serviceTypeSlug must be at most 255 characters")
+                @Pattern(regexp = "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                         message = "each serviceTypeSlug must be a lowercase hyphenated slug")
+                String> serviceTypeSlugs
 ) {
 
     /**
@@ -145,5 +155,32 @@ public record MasterSearchRequest(
             return true;
         }
         return minPrice.compareTo(maxPrice) <= 0;
+    }
+
+    /**
+     * Canonical {@code serviceTypeSlugs} view used for BOTH the {@code @Cacheable}
+     * key and the service-layer filter (Phase 20.1): {@code null}-safe, trimmed,
+     * lower-cased, blank-dropped, de-duplicated, and sorted. Lower-casing collapses
+     * casing variants ({@code "Hair"} / {@code "hair"}) onto one cache key —
+     * service-type slugs are a fixed lowercase vocabulary (the {@code @Pattern}
+     * enforces lowercase at validation; this is defence-in-depth so the resolver
+     * lookup and the cache key stay consistent on any uncached path). Sorting +
+     * dedup keep the key stable regardless of caller ordering or repeats, bounding
+     * key cardinality; the service resolves and filters off this same list so the
+     * cached result always matches the executed query. Never {@code null} — an
+     * absent or empty param yields an empty list (no service filter).
+     */
+    public List<String> normalizedServiceTypeSlugs() {
+        if (serviceTypeSlugs == null) {
+            return List.of();
+        }
+        return serviceTypeSlugs.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .map(slug -> slug.toLowerCase(Locale.ROOT))
+                .filter(slug -> !slug.isEmpty())
+                .distinct()
+                .sorted()
+                .toList();
     }
 }

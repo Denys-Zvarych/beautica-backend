@@ -134,7 +134,7 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
         //        entry under the real @Cacheable key in search:masters ──────────────
         log.debug("Arrange: run an unfiltered discovery search to populate search:masters");
         MasterSearchRequest searchRequest =
-                new MasterSearchRequest(null, null, null, null, null, null, null, null, null);
+                new MasterSearchRequest(null, null, null, null, null, null, null, null, null, null);
         transactionTemplate.execute(status ->
                 searchService.searchMasters(searchRequest, PageRequest.of(0, 20)));
 

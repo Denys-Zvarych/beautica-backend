@@ -44,6 +44,16 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     private static final String MASTERS_URL = "/api/v1/search/masters";
     private static final String SALONS_URL = "/api/v1/search/salons";
 
+    // ── Phase 20.1–20.3 — per-service filter fixtures ────────────────────────
+    // Two real, Flyway-seeded (V75/V81) platform service-type slugs with
+    // distinctive, collision-free Ukrainian display names. The hybrid match
+    // resolves a slug to (service_type_id, name_uk); the name branch wraps name_uk
+    // in %…% so a service_definition whose NAME contains it matches even when its
+    // service_type_id FK is NULL (the legacy-recovery branch).
+    private static final String SLUG_A = "hair-treatment-keratin";   // name_uk "Кератин"
+    private static final String NAME_UK_A = "Кератин";
+    private static final String SLUG_B = "injection-mesotherapy";    // name_uk "Мезотерапія"
+
     @org.springframework.boot.test.web.server.LocalServerPort
     private int port;
 
@@ -1801,7 +1811,394 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(inKyiv.toString());
     }
 
+    // ── Phase 20.1 — master per-service filter (hybrid FK-or-name, AND) ──────
+
+    @Test
+    @DisplayName("GET /search/masters — FK-only match: a master whose service has service_type_id set (NAME does NOT contain the type name) is returned for that slug")
+    void should_returnMaster_when_serviceMatchesByServiceTypeIdFk() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Match purely via the FK — the service name deliberately omits "Кератин".
+        UUID fkMaster = seedNamedIndependentMaster("Київ", "4.50", "Fk", "Master");
+        seedTypedServiceForMaster(fkMaster, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Control: a master with a service that matches NEITHER the FK nor the name.
+        // It WOULD be returned without the filter — proving the predicate narrows.
+        UUID other = seedNamedIndependentMaster("Київ", "4.50", "Other", "Master");
+        seedTypedServiceForMaster(other, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("FK branch matches: only the master whose service_type_id = keratin is returned")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(fkMaster.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — name-only match (legacy recovery): a master whose service has NULL service_type_id but a NAME matching name_uk is returned")
+    void should_returnMaster_when_serviceMatchesByNameOnly_withNullFk() throws Exception {
+        ensureHttpClient();
+        // FK is NULL (legacy / single-create row) — recovery is via the name branch.
+        UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
+        seedTypedServiceForMaster(nameMaster, NAME_UK_A + " преміум", "HAIRCUT",
+                new BigDecimal("300.00"), null, true, true);
+        UUID other = seedNamedIndependentMaster("Київ", "4.50", "Other", "Master");
+        seedTypedServiceForMaster(other, "Педикюр SPA", "PEDICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("name branch recovers a NULL-FK row whose name contains the resolved name_uk")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(nameMaster.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — both branches: one master matched via FK, another via NAME for the same slug — BOTH returned")
+    void should_returnBothMasters_when_oneMatchesByFk_andOneByName() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID fkMaster = seedNamedIndependentMaster("Київ", "4.50", "Fk", "Master");
+        seedTypedServiceForMaster(fkMaster, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);   // FK only (no name match)
+        UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
+        seedTypedServiceForMaster(nameMaster, NAME_UK_A + " класичний", "HAIRCUT",
+                new BigDecimal("320.00"), null, true, true);      // name only (NULL FK)
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(2L);
+        assertThat(masterIds(data))
+                .as("the hybrid OR matches FK rows AND legacy name rows for the same slug")
+                .containsExactlyInAnyOrder(fkMaster.toString(), nameMaster.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — AND-of-two slugs: master offering BOTH selected services returned; master offering only one excluded")
+    void should_returnOnlyMasterOfferingBothSlugs_when_andOfTwoSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        // Master A offers BOTH service types.
+        UUID both = seedNamedIndependentMaster("Київ", "4.50", "Both", "Master");
+        seedTypedServiceForMaster(both, "Послуга A1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(both, "Послуга A2", "INJECTION",
+                new BigDecimal("400.00"), typeIdB, true, true);
+        // Master B offers only the first — must be excluded under AND semantics.
+        UUID one = seedNamedIndependentMaster("Київ", "4.50", "One", "Master");
+        seedTypedServiceForMaster(one, "Послуга B1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        JsonNode data = masterSearch(
+                "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("AND semantics: a master must offer a service matching EVERY selected slug")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(both.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — unknown/unresolvable slug short-circuits to an empty result (no error)")
+    void should_returnEmpty_when_serviceTypeSlugUnresolvable() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Real", "Master");
+        seedTypedServiceForMaster(master, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        // Pattern-valid but not present in the taxonomy → AND-of-all can never match.
+        JsonNode data = masterSearch("?serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("an unresolvable slug yields an empty page, not a 500")
+                .isZero();
+        assertThat(data.path("data").size()).isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — matchedServiceNames present (distinct, capped at 3) when filtering; EMPTY when no serviceTypeSlugs")
+    void should_populateMatchedServiceNames_whenFiltering_andEmptyOtherwise() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Matched", "Master");
+        // Four DISTINCT matching service names (all via FK A) → cap to 3, distinct.
+        seedTypedServiceForMaster(master, "Догляд Альфа", "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(master, "Догляд Бета", "HAIRCUT", new BigDecimal("310.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(master, "Догляд Гамма", "HAIRCUT", new BigDecimal("320.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(master, "Догляд Дельта", "HAIRCUT", new BigDecimal("330.00"), typeIdA, true, true);
+
+        // Filtering → matchedServiceNames populated.
+        JsonNode filtered = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        JsonNode matched = filtered.path("data").get(0).path("matchedServiceNames");
+        assertThat(matched.isArray()).as("matchedServiceNames is a JSON array").isTrue();
+        java.util.List<String> matchedNames = new java.util.ArrayList<>();
+        matched.forEach(n -> matchedNames.add(n.asText()));
+        assertThat(matchedNames)
+                .as("matchedServiceNames is capped at SERVICE_NAME_CAP=3 and distinct")
+                .hasSize(3)
+                .doesNotHaveDuplicates()
+                .isSubsetOf("Догляд Альфа", "Догляд Бета", "Догляд Гамма", "Догляд Дельта");
+
+        // No serviceTypeSlugs → matchedServiceNames empty (card falls back to serviceNames).
+        JsonNode unfiltered = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
+                .as("matchedServiceNames is empty when no service filter is active")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — inactive exclusion: a master matched only via an inactive master_service or inactive service_definition is NOT returned")
+    void should_excludeMaster_when_onlyInactiveLayerMatchesSlug() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Master 1: service_definition inactive (FK matches but def is_active = false).
+        UUID inactiveDef = seedNamedIndependentMaster("Київ", "4.50", "InactiveDef", "Master");
+        seedTypedServiceForMaster(inactiveDef, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, false, true);
+        // Master 2: master_services link inactive (FK matches but link is_active = false).
+        UUID inactiveLink = seedNamedIndependentMaster("Київ", "4.50", "InactiveLink", "Master");
+        seedTypedServiceForMaster(inactiveLink, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, false);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("the per-slug EXISTS requires master_services.is_active AND service_definitions.is_active")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — composition: serviceTypeSlugs + category + price together narrow to the single fully-matching master")
+    void should_narrowByServiceTypeSlugsCategoryAndPrice_when_combined() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // m1 — matches every predicate.
+        UUID m1 = seedNamedIndependentMaster("Київ", "4.50", "Full", "Match");
+        seedTypedServiceForMaster(m1, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // m2 — right slug + price, WRONG category (MANICURE) → fails category EXISTS.
+        UUID m2 = seedNamedIndependentMaster("Київ", "4.50", "Wrong", "Category");
+        seedTypedServiceForMaster(m2, "Догляд інший", "MANICURE",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // m3 — right slug + category, price 50 BELOW the floor → fails price.
+        UUID m3 = seedNamedIndependentMaster("Київ", "4.50", "Too", "Cheap");
+        seedTypedServiceForMaster(m3, "Догляд дешевий", "HAIRCUT",
+                new BigDecimal("50.00"), typeIdA, true, true);
+        // m4 — right category + price, NO slug match (NULL FK, neutral name).
+        UUID m4 = seedNamedIndependentMaster("Київ", "4.50", "No", "Slug");
+        seedTypedServiceForMaster(m4, "Стрижка проста", "HAIRCUT",
+                new BigDecimal("300.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A
+                + "&category=HAIRCUT&minPrice=100.00&maxPrice=500.00&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("only the master matching slug AND category AND price survives all three predicates")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(m1.toString());
+    }
+
+    // ── Phase 20.2/20.3 — salon per-service filter ───────────────────────────
+
+    @Test
+    @DisplayName("GET /search/salons — a salon whose active master offers a matching service (FK or name) is returned")
+    void should_returnSalon_when_activeMasterOffersMatchingService() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Salon matched via FK (name omits "Кератин").
+        UUID salonFk = seedActiveSalon("Київ", null);
+        UUID masterFk = seedSalonMasterFor(salonFk, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterFk, salonFk, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Salon matched via name only (NULL FK).
+        UUID salonName = seedActiveSalon("Київ", null);
+        UUID masterName = seedSalonMasterFor(salonName, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterName, salonName, NAME_UK_A + " Lux", "HAIRCUT",
+                new BigDecimal("320.00"), null, true, true);
+        // Control salon offering nothing matching — would appear without the filter.
+        UUID other = seedActiveSalon("Київ", null);
+        UUID otherMaster = seedSalonMasterFor(other, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(otherMaster, other, "Манікюр", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("salon filter matches via the master's service FK OR name; the control salon is excluded")
+                .isEqualTo(2L);
+        assertThat(salonIds(data)).containsExactlyInAnyOrder(salonFk.toString(), salonName.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — AND-of-two slugs at salon granularity: only the salon offering BOTH services is returned")
+    void should_returnOnlySalonOfferingBothSlugs_when_andOfTwoSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        UUID salonBoth = seedActiveSalon("Київ", null);
+        UUID masterBoth = seedSalonMasterFor(salonBoth, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterBoth, salonBoth, "Послуга A1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedSalonServiceForMaster(masterBoth, salonBoth, "Послуга A2", "INJECTION",
+                new BigDecimal("400.00"), typeIdB, true, true);
+        UUID salonOne = seedActiveSalon("Київ", null);
+        UUID masterOne = seedSalonMasterFor(salonOne, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterOne, salonOne, "Послуга B1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        JsonNode data = salonSearch(
+                "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("AND-of-two at salon granularity: the salon must offer a service for EVERY slug")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(salonBoth.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — inactive-layer exclusion: an inactive master / master_service / service_definition does NOT surface the salon")
+    void should_excludeSalon_when_onlyInactiveLayerMatchesSlug() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Salon 1 — master inactive.
+        UUID salonInactiveMaster = seedActiveSalon("Київ", null);
+        UUID inactiveMaster = seedSalonMasterFor(salonInactiveMaster, "Київ", "4.00");
+        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactiveMaster);
+        seedTypedSalonServiceForMaster(inactiveMaster, salonInactiveMaster, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, true);
+        // Salon 2 — master_services link inactive.
+        UUID salonInactiveLink = seedActiveSalon("Київ", null);
+        UUID linkMaster = seedSalonMasterFor(salonInactiveLink, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(linkMaster, salonInactiveLink, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, false);
+        // Salon 3 — service_definition inactive.
+        UUID salonInactiveDef = seedActiveSalon("Київ", null);
+        UUID defMaster = seedSalonMasterFor(salonInactiveDef, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(defMaster, salonInactiveDef, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, false, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("the salon per-slug EXISTS requires master, master_services AND service_definitions all active")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — matchedServiceNames is aggregated across the salon's masters when filtering, and empty when unfiltered")
+    void should_aggregateSalonMatchedServiceNames_acrossMasters_whenFiltering() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID salon = seedActiveSalon("Київ", null);
+        UUID master1 = seedSalonMasterFor(salon, "Київ", "4.00");
+        UUID master2 = seedSalonMasterFor(salon, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(master1, salon, "Догляд М1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedSalonServiceForMaster(master2, salon, "Догляд М2", "HAIRCUT",
+                new BigDecimal("310.00"), typeIdA, true, true);
+
+        JsonNode filtered = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(filtered.path("totalElements").asLong()).isEqualTo(1L);
+        JsonNode matched = filtered.path("data").get(0).path("matchedServiceNames");
+        java.util.List<String> matchedNames = new java.util.ArrayList<>();
+        matched.forEach(n -> matchedNames.add(n.asText()));
+        assertThat(matchedNames)
+                .as("matched names span BOTH masters of the salon, distinct and capped at 3")
+                .containsExactlyInAnyOrder("Догляд М1", "Догляд М2");
+
+        JsonNode unfiltered = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
+                .as("matchedServiceNames is empty when no service filter is active")
+                .isZero();
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /** Issues an anonymous master search and returns the {@code data} (PageResponse) node. */
+    private JsonNode masterSearch(String query) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + query, HttpMethod.GET, anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    /** Issues an anonymous salon search and returns the {@code data} (PageResponse) node. */
+    private JsonNode salonSearch(String query) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + query, HttpMethod.GET, anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    /** Collects the {@code masterId} strings of a search PageResponse data node. */
+    private static java.util.List<String> masterIds(JsonNode data) {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        data.path("data").forEach(row -> ids.add(row.path("masterId").asText()));
+        return ids;
+    }
+
+    /** Collects the {@code salonId} strings of a search PageResponse data node. */
+    private static java.util.List<String> salonIds(JsonNode data) {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        data.path("data").forEach(row -> ids.add(row.path("salonId").asText()));
+        return ids;
+    }
+
+    /** Resolves a Flyway-seeded {@code service_types.id} by its globally-unique slug. */
+    private UUID serviceTypeIdBySlug(String slug) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM service_types WHERE slug = ?", UUID.class, slug);
+    }
+
+    /**
+     * Seeds an active (or inactive) INDEPENDENT_MASTER-owned service definition
+     * with a controllable {@code service_type_id} (nullable — pass {@code null}
+     * for the legacy/name-only path) plus a {@code master_services} link, then
+     * refreshes {@code masters.min_effective_price} so per-service + price
+     * composition tests see the pre-computed column.
+     */
+    private void seedTypedServiceForMaster(UUID masterId, String serviceName, String category,
+                                           BigDecimal basePrice, UUID serviceTypeId,
+                                           boolean defActive, boolean msActive) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, 0, ?, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, serviceTypeId, basePrice, defActive);
+
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, msActive);
+
+        jdbcTemplate.update(
+                "UPDATE masters SET min_effective_price = (" +
+                "  SELECT MIN(COALESCE(ms2.price_override, sd2.base_price))" +
+                "  FROM master_services ms2" +
+                "  JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id" +
+                "  WHERE ms2.master_id = ? AND ms2.is_active = true AND sd2.is_active = true" +
+                ") WHERE id = ?",
+                masterId, masterId);
+    }
+
+    /**
+     * Seeds a SALON-owned FIXED-priced service definition with a controllable
+     * {@code service_type_id} (nullable) and {@code is_active} flags, plus a
+     * {@code master_services} link for the given salon master. Backs the salon
+     * per-service-filter tests (the salon EXISTS reaches active masters' active
+     * services).
+     */
+    private void seedTypedSalonServiceForMaster(UUID masterId, UUID salonId, String serviceName,
+                                                String category, BigDecimal basePrice, UUID serviceTypeId,
+                                                boolean defActive, boolean msActive) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, 'FIXED', 0, ?, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, category, serviceTypeId, basePrice, defActive);
+
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, msActive);
+    }
 
     /**
      * Seeds an INDEPENDENT_MASTER with explicit first/last name on the user row

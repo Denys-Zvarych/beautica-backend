@@ -72,7 +72,8 @@ public record SalonSearchResult(
         List<String> serviceNames,
         String street,
         String buildingNo,
-        String locationNote
+        String locationNote,
+        List<String> matchedServiceNames
 ) {
 
     /**
@@ -88,7 +89,7 @@ public record SalonSearchResult(
     public SalonSearchResult withoutStreetAddress() {
         return new SalonSearchResult(
                 salonId, name, cityLabel, districtLabel, avatarUrl,
-                priceMin, priceMax, serviceNames, null, null, null
+                priceMin, priceMax, serviceNames, null, null, null, matchedServiceNames
         );
     }
 }

@@ -126,7 +126,8 @@ class SearchControllerTest {
                 List.of("Манікюр", "Педикюр"),      // serviceNames
                 SAMPLE_STREET,                       // street (auth-gated)
                 SAMPLE_BUILDING_NO,                  // buildingNo (auth-gated)
-                SAMPLE_LOCATION_NOTE                 // locationNote (auth-gated)
+                SAMPLE_LOCATION_NOTE,                // locationNote (auth-gated)
+                List.of()                            // matchedServiceNames (no service filter)
         );
     }
 
@@ -142,7 +143,8 @@ class SearchControllerTest {
                 List.of("Стрижка", "Фарбування"),   // serviceNames (never null)
                 SAMPLE_STREET,                       // street (auth-gated)
                 SAMPLE_BUILDING_NO,                  // buildingNo (auth-gated)
-                SAMPLE_LOCATION_NOTE                 // locationNote (auth-gated)
+                SAMPLE_LOCATION_NOTE,                // locationNote (auth-gated)
+                List.of()                            // matchedServiceNames (no service filter)
         );
     }
 
@@ -705,7 +707,8 @@ class SearchControllerTest {
                 new BigDecimal("300.00"),   // minEffectivePrice
                 new BigDecimal("300.00"),   // priceMax == min → FIXED single price
                 List.of("Манікюр"),
-                SAMPLE_STREET, SAMPLE_BUILDING_NO, SAMPLE_LOCATION_NOTE);
+                SAMPLE_STREET, SAMPLE_BUILDING_NO, SAMPLE_LOCATION_NOTE,
+                List.of());
         Page<MasterSearchResult> page = new PageImpl<>(List.of(fixed), PageRequest.of(0, 20), 1L);
         when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
 
@@ -828,7 +831,8 @@ class SearchControllerTest {
                 UUID.randomUUID(), "Empty Salon", "Київ", null, null,
                 null, null,                 // priceMin / priceMax null
                 List.of(),                  // serviceNames empty (never null per the contract)
-                null, null, null);          // street / buildingNo / locationNote
+                null, null, null,           // street / buildingNo / locationNote
+                List.of());                 // matchedServiceNames (no service filter)
         Page<SalonSearchResult> page = new PageImpl<>(List.of(noServices), PageRequest.of(0, 20), 1L);
         when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
 
@@ -901,5 +905,64 @@ class SearchControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── serviceTypeSlugs validation (Phase 20.1–20.2 — @Size limit + @Pattern) ─
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when serviceTypeSlugs exceeds the 20-entry limit (@Size(max=20))")
+    void should_return400_when_serviceTypeSlugsExceedLimit() throws Exception {
+        String[] slugs = new String[21];
+        for (int i = 0; i < slugs.length; i++) {
+            slugs[i] = "slug-" + i;   // each individually pattern-valid; the LIST size is the violation
+        }
+        log.debug("Act: GET {} with 21 serviceTypeSlugs — must fail @Size(max=20) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("serviceTypeSlugs", slugs)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when a serviceTypeSlug violates the lowercase-hyphenated @Pattern")
+    void should_return400_when_serviceTypeSlugViolatesPattern() throws Exception {
+        log.debug("Act: GET {} with serviceTypeSlugs=Not_A_Slug — must fail the slug @Pattern and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("serviceTypeSlugs", "Not_A_Slug")   // upper-case + underscore → invalid
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when a serviceTypeSlug violates the lowercase-hyphenated @Pattern (salon parity)")
+    void should_return400_when_salonServiceTypeSlugViolatesPattern() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("serviceTypeSlugs", "Bad Slug!")   // space + bang → invalid
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when serviceTypeSlugs holds valid lowercase-hyphenated slugs (binds the list)")
+    void should_return200_when_serviceTypeSlugsValid() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("serviceTypeSlugs", "hair-treatment-keratin", "injection-mesotherapy")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
     }
 }
