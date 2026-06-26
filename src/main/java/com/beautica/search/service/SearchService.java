@@ -235,10 +235,11 @@ public class SearchService {
     public Page<MasterSearchResult> searchMasters(MasterSearchRequest request, Pageable pageable) {
         validatePriceRange(request.minPrice(), request.maxPrice());
 
-        // Phase 20.1: resolve the per-service filter. An empty Optional means at
-        // least one selected slug resolves to no active service-type — under AND
-        // semantics no master can satisfy the filter, so short-circuit to an
-        // empty page rather than running a query that is guaranteed to be empty.
+        // Phase 20.1: resolve the per-service filter under OR/union semantics.
+        // Unknown slugs are dropped; the OR EXISTS is built over the survivors.
+        // An empty Optional means EVERY selected slug was unknown/inactive — the
+        // user filtered by service types that do not exist, so no master can
+        // match: return an explicit empty page (distinct from "no filter").
         Optional<List<ResolvedServiceType>> resolved =
                 resolveServiceTypes(request.normalizedServiceTypeSlugs());
         if (resolved.isEmpty()) {
@@ -317,8 +318,10 @@ public class SearchService {
         BigDecimal maxPrice = normalizePrice(request.maxPrice());
         SearchSort sort = SearchSort.orDefault(request.sort());
 
-        // Phase 20.2: resolve the per-service filter (see searchMasters). An empty
-        // Optional → an unresolvable slug → empty page under AND semantics.
+        // Phase 20.2: resolve the per-service filter under OR/union semantics
+        // (see searchMasters). Unknown slugs are dropped; an empty Optional means
+        // EVERY selected slug was unknown/inactive → explicit empty page (distinct
+        // from "no filter", which the empty-input case returns as everything).
         Optional<List<ResolvedServiceType>> resolved =
                 resolveServiceTypes(request.normalizedServiceTypeSlugs());
         if (resolved.isEmpty()) {
@@ -520,28 +523,53 @@ public class SearchService {
 
     /**
      * Resolves the normalized {@code serviceTypeSlugs} to their hybrid match
-     * operands through the cached {@link ServiceTypeSlugResolver}.
+     * operands through the cached {@link ServiceTypeSlugResolver}, under the
+     * <b>OR / union</b> per-service filter semantics (Phase 20.x): a provider
+     * matches if it offers <em>any</em> selected service type.
+     *
+     * <p>Each slug is resolved independently. An unknown / inactive slug is
+     * <em>dropped</em> (not fatal) so the surviving disjunction still matches
+     * providers offering the slugs that did resolve. The {@link Optional} return
+     * distinguishes the three caller outcomes:</p>
      *
      * <ul>
-     *   <li>empty input → present, empty list (no service filter);</li>
-     *   <li>every slug resolves → present list of {@link ResolvedServiceType};</li>
-     *   <li>any slug unresolved → {@link Optional#empty()} signalling the caller
-     *       to short-circuit to an empty page (AND-of-all can never match).</li>
+     *   <li><b>empty input</b> (no slugs selected) → {@code Optional.of(List.of())}:
+     *       no service-type filter is applied (the caller runs the unfiltered
+     *       query);</li>
+     *   <li><b>at least one slug resolves</b> (all valid, or a valid+unknown mix)
+     *       → {@code Optional.of([resolved subset])}: the caller ORs an
+     *       {@code EXISTS} disjunction over exactly the slugs that resolved;</li>
+     *   <li><b>non-empty input, but every slug is unknown/inactive</b> →
+     *       {@link Optional#empty()}: the user explicitly filtered by service
+     *       types and none of them exist, so no provider can match. This is an
+     *       <em>intentional</em> empty page — distinct from the empty-input case,
+     *       which would otherwise return everything.</li>
      * </ul>
      */
     private Optional<List<ResolvedServiceType>> resolveServiceTypes(List<String> slugs) {
         if (slugs.isEmpty()) {
+            // Case 1: no service-type filter selected → unfiltered query.
             return Optional.of(List.of());
         }
         List<Optional<ServiceTypeMatch>> matches = serviceTypeSlugResolver.resolve(slugs);
         List<ResolvedServiceType> resolved = new ArrayList<>(matches.size());
         for (Optional<ServiceTypeMatch> match : matches) {
+            // OR semantics: silently drop a slug that resolves to no active
+            // service-type; the remaining disjunction still matches providers
+            // offering the slugs that did resolve.
             if (match.isEmpty()) {
-                return Optional.empty();
+                continue;
             }
             ServiceTypeMatch type = match.get();
             resolved.add(new ResolvedServiceType(type.serviceTypeId(), likeContains(type.nameUk())));
         }
+        if (resolved.isEmpty()) {
+            // Case 4: every selected slug is unknown/inactive. The user DID filter
+            // by service types; none exist, so no provider can match. Signal the
+            // caller to return an explicit empty page (NOT "no filter").
+            return Optional.empty();
+        }
+        // Cases 2 & 3: all-valid, or valid+unknown mix → OR over the resolved subset.
         return Optional.of(List.copyOf(resolved));
     }
 
@@ -884,13 +912,13 @@ public class SearchService {
             // (plain equality, no CAST) — see wrapWithServiceNamesLateral.
             params.put("category", filters.category());
         }
-        // Phase 20.1 — per-service filter: ONE correlated EXISTS per selected slug
-        // (AND semantics — a master must offer a service matching EVERY slug;
-        // locked decision 3 forbids a single IN/ANY). Each EXISTS hybrid-matches
-        // on the FK (sd.service_type_id = :stId{n}) OR the resolved name
-        // (sd.name ILIKE :stName{n}), recovering legacy rows whose FK is NULL. The
-        // :stId{n} param is bound as a plain UUID object (no CAST). Independent
-        // sub-selects reuse the ms/sd aliases — each EXISTS is its own scope.
+        // Phase 20.1 — per-service filter: ONE correlated EXISTS whose inner WHERE
+        // OR-matches ANY selected slug (OR/union semantics — a master qualifies if
+        // it offers a service matching AT LEAST ONE of the selected slugs). The
+        // per-slug branch hybrid-matches on the FK (sd.service_type_id = :stId{n})
+        // OR the resolved name (sd.name ILIKE :stName{n}), recovering legacy rows
+        // whose FK is NULL. The :stId{n} param is bound as a plain UUID object
+        // (no CAST). The OR disjunction mirrors the matched-names lateral exactly.
         appendServiceTypeExists(sb, filters.serviceTypes(), params);
         if (filters.minRating() != null) {
             sb.append("AND m.avg_rating >= :minRating ");
@@ -910,25 +938,41 @@ public class SearchService {
     }
 
     /**
-     * Appends one correlated {@code EXISTS} per selected slug to the master WHERE
-     * clause (AND semantics) and binds each slug's {@code service_type_id} (plain
-     * UUID, no CAST) + {@code %nameUk%} pattern. Each sub-select is its own scope,
-     * so the {@code ms}/{@code sd} aliases are reused across slugs.
+     * Appends a SINGLE correlated {@code EXISTS} to the master WHERE clause whose
+     * inner WHERE OR-matches ANY selected slug (OR/union semantics — the master
+     * qualifies if it offers a service matching at least one selected slug) and
+     * binds each slug's {@code service_type_id} (plain UUID, no CAST) +
+     * {@code %nameUk%} pattern. The inner OR disjunction reuses
+     * {@link #appendServiceTypeMatchDisjunction} so the per-slug match clause is
+     * identical to the matched-names lateral. Emits nothing when no slug is
+     * selected; the single-slug case produces one OR branch.
      */
     private static void appendServiceTypeExists(
             StringBuilder sb, List<ResolvedServiceType> serviceTypes, Map<String, Object> params) {
+        if (serviceTypes.isEmpty()) {
+            return;
+        }
+        sb.append("AND EXISTS (")
+                .append("SELECT 1 FROM master_services ms ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                .append("WHERE ms.master_id = m.id AND ms.is_active = true AND (");
+        appendServiceTypeMatchDisjunction(sb, "sd", serviceTypes.size());
+        sb.append(")) ");
+        bindServiceTypeParams(serviceTypes, params);
+    }
+
+    /**
+     * Binds each selected slug's {@code :stId{n}} (plain UUID, no CAST) and
+     * {@code :stName{n}} ({@code %nameUk%}) params. Shared by the master and salon
+     * service-type {@code EXISTS} builders; the matched-names laterals reuse the
+     * already-bound params without rebinding.
+     */
+    private static void bindServiceTypeParams(
+            List<ResolvedServiceType> serviceTypes, Map<String, Object> params) {
         for (int i = 0; i < serviceTypes.size(); i++) {
             ResolvedServiceType st = serviceTypes.get(i);
-            String idParam = SERVICE_TYPE_ID_PARAM + i;
-            String nameParam = SERVICE_TYPE_NAME_PARAM + i;
-            sb.append("AND EXISTS (")
-                    .append("SELECT 1 FROM master_services ms ")
-                    .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
-                    .append("WHERE ms.master_id = m.id AND ms.is_active = true ")
-                    .append("AND (sd.service_type_id = :").append(idParam)
-                    .append(" OR sd.name ILIKE :").append(nameParam).append(")) ");
-            params.put(idParam, st.serviceTypeId());
-            params.put(nameParam, st.namePattern());
+            params.put(SERVICE_TYPE_ID_PARAM + i, st.serviceTypeId());
+            params.put(SERVICE_TYPE_NAME_PARAM + i, st.namePattern());
         }
     }
 
@@ -1003,9 +1047,10 @@ public class SearchService {
      *       candidate set.</li>
      * </ol>
      *
-     * <p>One correlated {@code EXISTS} per selected slug (AND semantics,
-     * salon→active masters→active services hybrid match) lives in the inner WHERE.
-     * All params are typed objects — no {@code CAST(:p …)} idiom (guard).
+     * <p>A single correlated {@code EXISTS} (OR/union semantics — inner WHERE
+     * OR-matches ANY selected slug, salon→active masters→active services hybrid
+     * match) lives in the inner WHERE. All params are typed objects — no
+     * {@code CAST(:p …)} idiom (guard).
      */
     private static SqlAndParams buildSalonSearchSql(
             UUID cityId, UUID districtId, String category, String likePattern,
@@ -1161,27 +1206,28 @@ public class SearchService {
     }
 
     /**
-     * One correlated {@code EXISTS} per selected slug (AND semantics) reaching the
-     * salon's active masters' active services, hybrid-matching FK OR name. Binds
-     * each slug's {@code service_type_id} (plain UUID) + {@code %nameUk%} pattern.
+     * A SINGLE correlated {@code EXISTS} (OR/union semantics) reaching the salon's
+     * active masters' active services, whose inner WHERE OR-matches ANY selected
+     * slug (FK OR name) — the salon qualifies if any active master offers a service
+     * matching at least one selected slug. Reuses
+     * {@link #appendServiceTypeMatchDisjunction} for the inner OR and binds each
+     * slug's {@code service_type_id} (plain UUID) + {@code %nameUk%} pattern. Emits
+     * nothing when no slug is selected; the single-slug case produces one OR branch.
      */
     private static void appendSalonServiceTypeExists(
             StringBuilder sb, List<ResolvedServiceType> serviceTypes, Map<String, Object> params) {
-        for (int i = 0; i < serviceTypes.size(); i++) {
-            ResolvedServiceType st = serviceTypes.get(i);
-            String idParam = SERVICE_TYPE_ID_PARAM + i;
-            String nameParam = SERVICE_TYPE_NAME_PARAM + i;
-            sb.append("AND EXISTS (")
-                    .append("SELECT 1 FROM master_services msf ")
-                    .append("JOIN masters mmf ON mmf.id = msf.master_id ")
-                    .append("JOIN service_definitions sdf ON sdf.id = msf.service_def_id ")
-                    .append("WHERE mmf.salon_id = s.id AND mmf.is_active = true ")
-                    .append("AND msf.is_active = true AND sdf.is_active = true ")
-                    .append("AND (sdf.service_type_id = :").append(idParam)
-                    .append(" OR sdf.name ILIKE :").append(nameParam).append(")) ");
-            params.put(idParam, st.serviceTypeId());
-            params.put(nameParam, st.namePattern());
+        if (serviceTypes.isEmpty()) {
+            return;
         }
+        sb.append("AND EXISTS (")
+                .append("SELECT 1 FROM master_services msf ")
+                .append("JOIN masters mmf ON mmf.id = msf.master_id ")
+                .append("JOIN service_definitions sdf ON sdf.id = msf.service_def_id ")
+                .append("WHERE mmf.salon_id = s.id AND mmf.is_active = true ")
+                .append("AND msf.is_active = true AND sdf.is_active = true AND (");
+        appendServiceTypeMatchDisjunction(sb, "sdf", serviceTypes.size());
+        sb.append(")) ");
+        bindServiceTypeParams(serviceTypes, params);
     }
 
     /**

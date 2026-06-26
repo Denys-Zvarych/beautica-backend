@@ -37,9 +37,11 @@ public class ServiceTypeSlugResolver {
 
     /**
      * Resolves each slug to its {@link ServiceTypeMatch}, preserving input order.
-     * An unknown / inactive slug yields an empty {@link Optional} at its position
-     * so the caller can short-circuit an AND-of-all-slugs filter to an empty
-     * result set rather than erroring (Phase 20.x locked decision 3).
+     * An unknown / inactive slug yields an empty {@link Optional} at its position;
+     * under the OR/union per-service filter semantics (Phase 20.x) the caller
+     * drops those positions and ORs the survivors, rather than erroring or
+     * collapsing the whole query. Position is preserved (rather than pre-dropping)
+     * so callers retain the freedom to distinguish per-slug outcomes.
      *
      * @param slugs normalized, deduped slug list (may be empty; never {@code null})
      * @return one {@link Optional} per input slug, in order

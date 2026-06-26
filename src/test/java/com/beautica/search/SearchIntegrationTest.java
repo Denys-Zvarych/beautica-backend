@@ -1874,8 +1874,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/masters — AND-of-two slugs: master offering BOTH selected services returned; master offering only one excluded")
-    void should_returnOnlyMasterOfferingBothSlugs_when_andOfTwoSlugs() throws Exception {
+    @DisplayName("GET /search/masters — OR/union of two slugs: master offering BOTH returned AND master offering only one also returned")
+    void should_returnMastersOfferingAnySlug_when_unionOfTwoSlugs() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
@@ -1885,7 +1885,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 new BigDecimal("300.00"), typeIdA, true, true);
         seedTypedServiceForMaster(both, "Послуга A2", "INJECTION",
                 new BigDecimal("400.00"), typeIdB, true, true);
-        // Master B offers only the first — must be excluded under AND semantics.
+        // Master B offers only the first — under OR/union it is ALSO returned.
         UUID one = seedNamedIndependentMaster("Київ", "4.50", "One", "Master");
         seedTypedServiceForMaster(one, "Послуга B1", "HAIRCUT",
                 new BigDecimal("300.00"), typeIdA, true, true);
@@ -1893,26 +1893,54 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         JsonNode data = masterSearch(
                 "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("AND semantics: a master must offer a service matching EVERY selected slug")
-                .isEqualTo(1L);
-        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(both.toString());
+                .as("OR/union semantics: a master matching ANY selected slug is returned (both the both-offering and the one-offering master)")
+                .isEqualTo(2L);
+        assertThat(masterIds(data))
+                .as("both the master offering both slugs and the master offering only one are returned")
+                .containsExactlyInAnyOrder(both.toString(), one.toString());
     }
 
     @Test
-    @DisplayName("GET /search/masters — unknown/unresolvable slug short-circuits to an empty result (no error)")
-    void should_returnEmpty_when_serviceTypeSlugUnresolvable() throws Exception {
+    @DisplayName("GET /search/masters — all-unknown: the only selected slug is unresolvable → explicit empty page (NOT unfiltered everything)")
+    void should_returnEmpty_when_allSelectedSlugsUnresolvable() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Real", "Master");
         seedTypedServiceForMaster(master, "Догляд за волоссям", "HAIRCUT",
                 new BigDecimal("300.00"), typeIdA, true, true);
 
-        // Pattern-valid but not present in the taxonomy → AND-of-all can never match.
+        // Pattern-valid but absent from the taxonomy. Under OR/union resolveServiceTypes
+        // drops it; ALL slugs unknown → Optional.empty() → explicit empty page. It must
+        // NOT fall through to the unfiltered "everything" path (the seeded master proves
+        // an unfiltered query would return >= 1 row).
         JsonNode data = masterSearch("?serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("an unresolvable slug yields an empty page, not a 500")
+                .as("every selected slug unknown → empty page, not a 500 and not unfiltered everything")
                 .isZero();
         assertThat(data.path("data").size()).isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — mix valid + unknown: the unknown slug is dropped; masters offering the VALID slug are returned")
+    void should_returnMastersOfferingValidSlug_when_mixOfValidAndUnknownSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Master offers the valid slug A — must survive once the unknown slug is dropped.
+        UUID valid = seedNamedIndependentMaster("Київ", "4.50", "Valid", "Master");
+        seedTypedServiceForMaster(valid, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Control: matches NEITHER the valid slug FK nor its name → excluded (proves the
+        // surviving slug still narrows; the unknown slug neither errors nor widens).
+        UUID other = seedNamedIndependentMaster("Київ", "4.50", "Other", "Master");
+        seedTypedServiceForMaster(other, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A
+                + "&serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("unknown slug dropped; the valid-slug disjunction still matches the offering master only")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(valid.toString());
     }
 
     @Test
@@ -2027,8 +2055,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — AND-of-two slugs at salon granularity: only the salon offering BOTH services is returned")
-    void should_returnOnlySalonOfferingBothSlugs_when_andOfTwoSlugs() throws Exception {
+    @DisplayName("GET /search/salons — OR/union of two slugs at salon granularity: salon offering BOTH AND salon offering only one are both returned")
+    void should_returnSalonsOfferingAnySlug_when_unionOfTwoSlugs() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
@@ -2046,9 +2074,54 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         JsonNode data = salonSearch(
                 "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("AND-of-two at salon granularity: the salon must offer a service for EVERY slug")
+                .as("OR/union at salon granularity: a salon offering a service for ANY selected slug is returned")
+                .isEqualTo(2L);
+        assertThat(salonIds(data))
+                .as("both the salon offering both slugs and the salon offering only one are returned")
+                .containsExactlyInAnyOrder(salonBoth.toString(), salonOne.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — mix valid + unknown: the unknown slug is dropped; salons offering the VALID slug are returned")
+    void should_returnSalonsOfferingValidSlug_when_mixOfValidAndUnknownSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Salon whose active master offers the valid slug A — survives after the drop.
+        UUID validSalon = seedActiveSalon("Київ", null);
+        UUID validMaster = seedSalonMasterFor(validSalon, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(validMaster, validSalon, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Control salon offering nothing matching the valid slug → excluded.
+        UUID other = seedActiveSalon("Київ", null);
+        UUID otherMaster = seedSalonMasterFor(other, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(otherMaster, other, "Манікюр", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A
+                + "&serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("unknown slug dropped; the valid-slug disjunction still matches the offering salon only")
                 .isEqualTo(1L);
-        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(salonBoth.toString());
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(validSalon.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — all-unknown: the only selected slug is unresolvable → explicit empty page (NOT unfiltered everything)")
+    void should_returnEmpty_when_allSelectedSalonSlugsUnresolvable() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // A real, matching salon exists — an unfiltered query would return it, proving
+        // the empty result is the explicit empty page, not "no rows seeded".
+        UUID salon = seedActiveSalon("Київ", null);
+        UUID master = seedSalonMasterFor(salon, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(master, salon, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("every selected slug unknown → empty page, not unfiltered everything")
+                .isZero();
+        assertThat(data.path("data").size()).isZero();
     }
 
     @Test
