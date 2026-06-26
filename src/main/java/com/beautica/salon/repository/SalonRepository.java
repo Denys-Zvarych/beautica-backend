@@ -141,6 +141,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -173,6 +182,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -249,6 +267,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -266,6 +293,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             FROM salons s
             WHERE s.is_active = true
               AND s.district_id = :districtId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -363,6 +399,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -395,6 +440,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -468,6 +522,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -485,6 +548,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             FROM salons s
             WHERE s.is_active = true
               AND s.city_id = :cityId
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -568,6 +640,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -599,6 +680,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -668,6 +758,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
@@ -684,6 +783,15 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             SELECT COUNT(*)
             FROM salons s
             WHERE s.is_active = true
+              AND (CAST(:category AS text) IS NULL OR EXISTS (
+                  SELECT 1 FROM master_services msc
+                  JOIN masters mmc ON mmc.id = msc.master_id
+                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
+                  WHERE mmc.salon_id = s.id
+                    AND mmc.is_active = true
+                    AND msc.is_active = true
+                    AND sdc.is_active = true
+                    AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1

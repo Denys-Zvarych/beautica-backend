@@ -2180,6 +2180,114 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isZero();
     }
 
+    // ── Regression — salon CATEGORY-only filter excludes foreign-category salons ─
+    //
+    // Bug: the salon category predicate lived ONLY inside the price/name preview
+    // LATERAL, never on the outer WHERE. Because that LATERAL is a LEFT JOIN it
+    // never removes the salon row, so a salon offering NOTHING in the selected
+    // category was still returned — as an empty-name / null-price card. The fix
+    // adds a null-gated salon-level `AND (CAST(:category AS text) IS NULL OR
+    // EXISTS(... AND sdc.category = :category))` to the outer WHERE of all six
+    // salon projection overloads AND their countQueries. These tests fail against
+    // the pre-fix query (the foreign-category salon leaks in / inflates the count)
+    // and pass on the gated WHERE.
+
+    @Test
+    @DisplayName("GET /search/salons?category=HAIRCUT — regression: a salon whose ONLY active services are in a DIFFERENT category is EXCLUDED (pre-fix it leaked in as an empty-name card)")
+    void should_excludeSalon_when_offersNothingInFilteredCategory() throws Exception {
+        ensureHttpClient();
+        // Salon A — an active master offering two ACTIVE services in category HAIRCUT.
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterA, salonA, "Стрижка жіноча", "HAIRCUT",
+                new BigDecimal("400.00"), null, true, true);
+        seedTypedSalonServiceForMaster(masterA, salonA, "Фарбування волосся", "HAIRCUT",
+                new BigDecimal("900.00"), null, true, true);
+        // Salon B — an active master offering ONLY a service in category MANICURE.
+        // Pre-fix this salon surfaced for ?category=HAIRCUT with a null price band
+        // and empty serviceNames because the category lived only inside the
+        // LEFT-JOIN LATERAL, never on the salon's outer WHERE.
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterB, salonB, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+                + "&category=HAIRCUT&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("only salon A offers a HAIRCUT service — salon B (MANICURE-only) must be excluded by the outer-WHERE EXISTS gate")
+                .isEqualTo(1L);
+        assertThat(salonIds(data))
+                .as("the single returned salon is salon A; salon B never leaks in as an empty-name card")
+                .containsExactly(salonA.toString());
+
+        JsonNode row = data.path("data").get(0);
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("the category-scoped preview lists ONLY salon A's HAIRCUT names — no foreign-category leak")
+                .containsExactlyInAnyOrder("Стрижка жіноча", "Фарбування волосся");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons (no category) — null-gate no-op: BOTH salons returned regardless of which single category each offers")
+    void should_returnBothSalons_when_noCategoryFilter() throws Exception {
+        ensureHttpClient();
+        // Same two salons as the exclusion test — one HAIRCUT-only, one MANICURE-only.
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterA, salonA, "Стрижка жіноча", "HAIRCUT",
+                new BigDecimal("400.00"), null, true, true);
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterB, salonB, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("with no category the EXISTS gate is short-circuited by `:category IS NULL` — both salons returned (the null-gate no-op)")
+                .isEqualTo(2L);
+        assertThat(salonIds(data))
+                .as("both the HAIRCUT salon and the MANICURE salon are present when no category narrows the result")
+                .containsExactlyInAnyOrder(salonA.toString(), salonB.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?category=HAIRCUT&size=2 — countQuery parity: totalElements counts ONLY category-matching salons (the foreign-category salon is absent from the count too — no phantom page)")
+    void should_matchCountQueryToFilteredRows_when_categoryFilterPaginated() throws Exception {
+        ensureHttpClient();
+        // Three salons each offering an active HAIRCUT service ...
+        UUID s1 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 1");
+        UUID s2 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 2");
+        UUID s3 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 3");
+        // ... and one offering ONLY a MANICURE service — it must be excluded from
+        // BOTH the page content AND the countQuery. A pre-fix count (EXISTS gate
+        // only in the data query) would return 4 and hand an anonymous caller a
+        // phantom HAIRCUT page populated by the MANICURE salon.
+        UUID manicureOnly = seedSalonOfferingCategory("Київ", "MANICURE", "Манікюр класичний");
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+                + "&category=HAIRCUT&page=0&size=2");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("countQuery EXISTS-gate parity: exactly the three HAIRCUT salons are counted, not four")
+                .isEqualTo(3L);
+        assertThat(data.path("totalPages").asInt())
+                .as("3 matching rows / size 2 → 2 pages, no phantom page from the foreign-category salon")
+                .isEqualTo(2);
+        assertThat(data.path("data").size())
+                .as("page 0 holds exactly size=2 rows")
+                .isEqualTo(2);
+        assertThat(salonIds(data))
+                .as("every row on the HAIRCUT page is one of the three HAIRCUT salons")
+                .isSubsetOf(s1.toString(), s2.toString(), s3.toString());
+        assertThat(salonIds(data))
+                .as("the MANICURE-only salon must never appear in the HAIRCUT page content")
+                .doesNotContain(manicureOnly.toString());
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /** Issues an anonymous master search and returns the {@code data} (PageResponse) node. */
@@ -2271,6 +2379,21 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, ?, NOW(), NOW())",
                 UUID.randomUUID(), masterId, serviceDefId, msActive);
+    }
+
+    /**
+     * Seeds an active salon in {@code city} whose active SALON_MASTER offers a
+     * single active FIXED service in {@code category} (service_type_id NULL —
+     * category-only). Backs the salon category-filter regression tests where each
+     * salon's discovery eligibility hinges solely on the category of its one
+     * offered service.
+     */
+    private UUID seedSalonOfferingCategory(String city, String category, String serviceName) {
+        UUID salonId = seedActiveSalon(city, null);
+        UUID masterId = seedSalonMasterFor(salonId, city, "4.00");
+        seedTypedSalonServiceForMaster(masterId, salonId, serviceName, category,
+                new BigDecimal("300.00"), null, true, true);
+        return salonId;
     }
 
     /**
