@@ -1081,11 +1081,9 @@ public class SearchService {
         }
         if (likePattern != null) {
             inner.append("AND (s.name ILIKE :q OR EXISTS (")
-                    .append("SELECT 1 FROM master_services msq ")
-                    .append("JOIN masters mmq ON mmq.id = msq.master_id ")
-                    .append("JOIN service_definitions sdq ON sdq.id = msq.service_def_id ")
-                    .append("WHERE mmq.salon_id = s.id AND mmq.is_active = true ")
-                    .append("AND msq.is_active = true AND sdq.is_active = true ")
+                    .append("SELECT 1 FROM service_definitions sdq ")
+                    .append("WHERE sdq.owner_type = 'SALON' AND sdq.owner_id = s.id ")
+                    .append("AND sdq.is_active = true ")
                     .append("AND sdq.name ILIKE :q)) ");
             params.put("q", likePattern);
         }
@@ -1149,11 +1147,9 @@ public class SearchService {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT MIN(sd.base_price) AS pmin, ")
                 .append("MAX(CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END) AS pmax ")
-                .append("FROM master_services ms ")
-                .append("JOIN masters mm ON mm.id = ms.master_id ")
-                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id ")
-                .append("WHERE mm.salon_id = s.id AND mm.is_active = true ")
-                .append("AND ms.is_active = true AND sd.is_active = true ");
+                .append("FROM service_definitions sd ")
+                .append("WHERE sd.owner_type = 'SALON' AND sd.owner_id = s.id ")
+                .append("AND sd.is_active = true ");
         if (hasCategory) {
             sb.append("AND sd.category = :category ");
         }
@@ -1171,11 +1167,9 @@ public class SearchService {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT array_agg(z.name) AS pnames FROM (")
                 .append("SELECT DISTINCT sd2.name AS name ")
-                .append("FROM master_services ms2 ")
-                .append("JOIN masters mm2 ON mm2.id = ms2.master_id ")
-                .append("JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id ")
-                .append("WHERE mm2.salon_id = t.id AND mm2.is_active = true ")
-                .append("AND ms2.is_active = true AND sd2.is_active = true ");
+                .append("FROM service_definitions sd2 ")
+                .append("WHERE sd2.owner_type = 'SALON' AND sd2.owner_id = t.id ")
+                .append("AND sd2.is_active = true ");
         if (hasCategory) {
             sb.append("AND sd2.category = :category ");
         }
@@ -1195,11 +1189,9 @@ public class SearchService {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT array_agg(zm.name) AS matched_names FROM (")
                 .append("SELECT DISTINCT sd3.name AS name ")
-                .append("FROM master_services ms3 ")
-                .append("JOIN masters mm3 ON mm3.id = ms3.master_id ")
-                .append("JOIN service_definitions sd3 ON sd3.id = ms3.service_def_id ")
-                .append("WHERE mm3.salon_id = t.id AND mm3.is_active = true ")
-                .append("AND ms3.is_active = true AND sd3.is_active = true AND (");
+                .append("FROM service_definitions sd3 ")
+                .append("WHERE sd3.owner_type = 'SALON' AND sd3.owner_id = t.id ")
+                .append("AND sd3.is_active = true AND (");
         appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
         sb.append(") ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") zm) mn ON true ");
@@ -1220,11 +1212,9 @@ public class SearchService {
             return;
         }
         sb.append("AND EXISTS (")
-                .append("SELECT 1 FROM master_services msf ")
-                .append("JOIN masters mmf ON mmf.id = msf.master_id ")
-                .append("JOIN service_definitions sdf ON sdf.id = msf.service_def_id ")
-                .append("WHERE mmf.salon_id = s.id AND mmf.is_active = true ")
-                .append("AND msf.is_active = true AND sdf.is_active = true AND (");
+                .append("SELECT 1 FROM service_definitions sdf ")
+                .append("WHERE sdf.owner_type = 'SALON' AND sdf.owner_id = s.id ")
+                .append("AND sdf.is_active = true AND (");
         appendServiceTypeMatchDisjunction(sb, "sdf", serviceTypes.size());
         sb.append(")) ");
         bindServiceTypeParams(serviceTypes, params);

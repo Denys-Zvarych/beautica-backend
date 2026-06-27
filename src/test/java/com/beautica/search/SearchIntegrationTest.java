@@ -962,8 +962,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Only an INACTIVE service exists — it must not contribute to the band.
+        // Salon-owned def is itself inactive (is_active = false) → it must not
+        // contribute to the salon's price band / serviceNames. (master_services
+        // is no longer consulted for salon search; the def's own is_active is the
+        // gate — see SalonRepository salon row-source fix.)
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
-                new BigDecimal("300.00"), null, true, false);
+                new BigDecimal("300.00"), null, false, false);
 
         JsonNode row = singleSalonRow("Київ", null);
         assertThat(row.path("priceMin").isNull())
@@ -1034,8 +1038,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Only an INACTIVE service — it must not contribute to serviceNames.
+        // Salon-owned def is itself inactive (is_active = false) → it must not
+        // contribute to the salon's price band / serviceNames. (master_services
+        // is no longer consulted for salon search; the def's own is_active is the
+        // gate — see SalonRepository salon row-source fix.)
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
-                new BigDecimal("300.00"), null, true, false);
+                new BigDecimal("300.00"), null, false, false);
 
         JsonNode row = singleSalonRow("Київ", null);
         assertThat(row.path("serviceNames").isArray())
@@ -1507,16 +1515,18 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — ?q does NOT match a salon when ONLY an inactive master / master_service / service_definition carries the term (each is_active conjunct in the EXISTS clause)")
-    void should_notMatchSalonByServiceName_when_onlyInactiveLayerCarriesTerm() throws Exception {
+    @DisplayName("GET /search/salons — ?q matches a salon via its ACTIVE salon-owned service_definition regardless of master/master_services state; an inactive def never surfaces (def is_active is the sole gate)")
+    void should_matchSalonByServiceName_onActiveDefOnly_ignoringMasterLayers() throws Exception {
         ensureHttpClient();
-        // Each salon breaks on exactly one of the three is_active conjuncts.
-        seedSalonWithNamedService("Київ", "Inactive Master Salon", "Microblading",
-                false, true, true);     // master inactive
-        seedSalonWithNamedService("Київ", "Inactive Link Salon", "Microblading",
-                true, false, true);     // master_services link inactive
+        // Salon search resolves a salon's catalog through its owner-scoped
+        // service_definitions (owner_type='SALON'); master / master_services are
+        // NOT consulted. The sole gate is the def's own is_active:
+        //   • active def + inactive master + inactive link → MUST surface
+        //   • inactive def + active master + active link    → MUST NOT surface
+        UUID active = seedSalonWithNamedService("Київ", "Active Def Salon", "Microblading",
+                false, false, true);    // def active (master & link inactive — irrelevant)
         seedSalonWithNamedService("Київ", "Inactive Def Salon", "Microblading",
-                true, true, false);     // service_definition inactive
+                true, true, false);     // def inactive → excluded
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?q=microblading&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
@@ -1524,11 +1534,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
         assertThat(data.path("totalElements").asLong())
-                .as("the widened q EXISTS clause requires the master, the "
-                        + "master_services link AND the service_definition to all be "
-                        + "active — a term carried only by an inactive layer must not "
-                        + "surface the salon")
-                .isZero();
+                .as("only the salon with an ACTIVE owner-scoped service_definition "
+                        + "surfaces via ?q; master/master_services activity is irrelevant")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText())
+                .as("the surfaced salon is the active-def one")
+                .isEqualTo(active.toString());
     }
 
     // ── Item A — server-side location filtering proof ────────────────────────
@@ -2125,31 +2136,32 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — inactive-layer exclusion: an inactive master / master_service / service_definition does NOT surface the salon")
-    void should_excludeSalon_when_onlyInactiveLayerMatchesSlug() throws Exception {
+    @DisplayName("GET /search/salons — per-slug EXISTS surfaces a salon via its ACTIVE salon-owned service_definition regardless of master/master_services state; an inactive def is excluded (def is_active is the sole gate)")
+    void should_surfaceSalonBySlug_onActiveDefOnly_ignoringMasterLayers() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
-        // Salon 1 — master inactive.
-        UUID salonInactiveMaster = seedActiveSalon("Київ", null);
-        UUID inactiveMaster = seedSalonMasterFor(salonInactiveMaster, "Київ", "4.00");
+        // Active def, but master inactive + link inactive → MUST surface (salon
+        // search reads owner-scoped defs directly; master/master_services are not
+        // consulted — only the def's own is_active gates).
+        UUID salonActiveDef = seedActiveSalon("Київ", null);
+        UUID inactiveMaster = seedSalonMasterFor(salonActiveDef, "Київ", "4.00");
         jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactiveMaster);
-        seedTypedSalonServiceForMaster(inactiveMaster, salonInactiveMaster, "Догляд за волоссям",
-                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, true);
-        // Salon 2 — master_services link inactive.
-        UUID salonInactiveLink = seedActiveSalon("Київ", null);
-        UUID linkMaster = seedSalonMasterFor(salonInactiveLink, "Київ", "4.00");
-        seedTypedSalonServiceForMaster(linkMaster, salonInactiveLink, "Догляд за волоссям",
-                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, false);
-        // Salon 3 — service_definition inactive.
+        seedTypedSalonServiceForMaster(inactiveMaster, salonActiveDef, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, false); // defActive=true, msActive=false
+        // Inactive def, master active + link active → MUST NOT surface.
         UUID salonInactiveDef = seedActiveSalon("Київ", null);
-        UUID defMaster = seedSalonMasterFor(salonInactiveDef, "Київ", "4.00");
-        seedTypedSalonServiceForMaster(defMaster, salonInactiveDef, "Догляд за волоссям",
-                "HAIRCUT", new BigDecimal("300.00"), typeIdA, false, true);
+        UUID activeMaster = seedSalonMasterFor(salonInactiveDef, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(activeMaster, salonInactiveDef, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, false, true); // defActive=false
 
         JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("the salon per-slug EXISTS requires master, master_services AND service_definitions all active")
-                .isZero();
+                .as("only the salon with an ACTIVE owner-scoped service_definition "
+                        + "surfaces via the per-slug EXISTS; master/master_services "
+                        + "activity is irrelevant")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText())
+                .isEqualTo(salonActiveDef.toString());
     }
 
     @Test
@@ -2288,7 +2300,144 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .doesNotContain(manicureOnly.toString());
     }
 
+    // ── Regression — salon-owned def with NO master_services row surfaces ─────
+    //
+    // Bug (just fixed): salon search resolved each salon's offered services via
+    // `master_services → masters → service_definitions` (the salon's MASTERS'
+    // assignments). But a salon's catalog is `service_definitions WHERE
+    // owner_type='SALON' AND owner_id = salonId` — created via
+    // `POST /salons/{id}/services` — which are NOT necessarily assigned to any
+    // master. A salon whose owned def has NO `master_services` row therefore
+    // matched 0 under a category filter, returned null priceMin/priceMax, and
+    // an empty serviceNames card. Fixed by switching the row-source of the 6
+    // SalonRepository projection queries + the 5 SearchService salon laterals to
+    // `service_definitions WHERE owner_type='SALON' AND owner_id = s.id AND
+    // is_active = true` (no master_services hop).
+    //
+    // These tests PIN that row-source: they seed an ACTIVE salon-owned def with
+    // NO `master_services` row whatsoever (no salon master) — the exact gap the
+    // pre-existing helpers (seedSalonServiceForMaster / seedTypedSalonServiceForMaster /
+    // seedSalonWithNamedService) could never express, because they ALWAYS insert
+    // a master_services link alongside the def. They FAIL against the old
+    // master_services-join logic (salon invisible / null band / empty names) and
+    // PASS against the owner-scoped fix.
+
+    @Test
+    @DisplayName("GET /search/salons?category=NAIL_SERVICE — regression: a salon whose ACTIVE owned def has NO master_services row STILL surfaces with the owned def's price band + category-scoped names; a different-category owned salon is excluded (pins owner-scoped row-source, not the master_services join)")
+    void should_surfaceSalonByOwnedDef_when_noMasterServicesRowExists() throws Exception {
+        ensureHttpClient();
+        // Salon A — an active salon with NO master at all. Two ACTIVE salon-owned
+        // defs created directly (as POST /salons/{id}/services would): a
+        // NAIL_SERVICE RANGE 150..600 and an off-category HAIRCUT FIXED 900.
+        // NO master_services row exists for either → the pre-fix master_services
+        // join finds nothing and the salon vanishes from a category search.
+        UUID salonA = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonA, "Манікюр гель-лак", "NAIL_SERVICE",
+                "RANGE", new BigDecimal("150.00"), new BigDecimal("600.00"), null, true);
+        seedSalonOwnedServiceNoMaster(salonA, "Стрижка жіноча", "HAIRCUT",
+                "FIXED", new BigDecimal("900.00"), null, null, true);
+        // Salon B — an active salon whose ONLY active owned def is in a DIFFERENT
+        // category (HAIRCUT), also with NO master_services row. It must be
+        // EXCLUDED under ?category=NAIL_SERVICE (negative guard).
+        UUID salonB = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonB, "Фарбування волосся", "HAIRCUT",
+                "FIXED", new BigDecimal("700.00"), null, null, true);
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+                + "&category=NAIL_SERVICE&page=0&size=20");
+
+        // (1) The masterless salon-owned def surfaces — totalElements must NOT be 0.
+        assertThat(data.path("totalElements").asLong())
+                .as("salon A surfaces via its ACTIVE owner-scoped NAIL_SERVICE def despite having NO master_services row; pre-fix the master_services join returned 0")
+                .isEqualTo(1L);
+        assertThat(salonIds(data))
+                .as("the single returned salon is salon A; salon B (HAIRCUT-only owned def) is excluded under category=NAIL_SERVICE")
+                .containsExactly(salonA.toString());
+
+        JsonNode row = data.path("data").get(0);
+        // (2) Non-null priceMin/priceMax derived from the owned def's RANGE pricing,
+        // category-scoped to NAIL_SERVICE (the off-category HAIRCUT 900 must not leak).
+        assertThat(row.path("priceMin").isNull())
+                .as("priceMin is derived from the owned def — never null when an active NAIL_SERVICE def exists")
+                .isFalse();
+        assertThat(new BigDecimal(row.path("priceMin").asText()))
+                .as("category-scoped priceMin = the NAIL_SERVICE RANGE floor 150.00 (NOT the off-category HAIRCUT 900)")
+                .isEqualByComparingTo(new BigDecimal("150.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("category-scoped priceMax = the NAIL_SERVICE RANGE ceiling 600.00")
+                .isEqualByComparingTo(new BigDecimal("600.00"));
+
+        // (3)/(4) serviceNames is non-empty and lists ONLY the NAIL_SERVICE name —
+        // the off-category HAIRCUT owned def on the same salon never leaks in.
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("serviceNames is non-empty and category-scoped to the owned NAIL_SERVICE def only — no different-category leak")
+                .containsExactly("Манікюр гель-лак");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — regression: the per-slug EntityManager lateral surfaces a salon via its ACTIVE owned def carrying the slug's service_type_id even with NO master_services row; matchedServiceNames carries the owned def's name (pins owner-scoped row-source on the SearchService salon path)")
+    void should_surfaceSalonBySlug_when_ownedDefHasNoMasterServicesRow() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Salon with an ACTIVE owned def carrying SLUG_A's service_type_id and NO
+        // master_services row. The SearchService EntityManager builder's salon
+        // per-slug EXISTS must read owner-scoped defs directly.
+        UUID salonWithType = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonWithType, "Кератинове відновлення", "HAIRCUT",
+                "FIXED", new BigDecimal("800.00"), null, typeIdA, true);
+        // A second salon whose owned def is type-less (legacy NULL service_type_id)
+        // and NO master link → must NOT surface under the typed slug filter.
+        UUID salonNoType = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonNoType, "Звичайна стрижка", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, null, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("the masterless salon surfaces via the owner-scoped per-slug EXISTS; pre-fix the master_services join returned 0")
+                .isEqualTo(1L);
+        assertThat(salonIds(data))
+                .as("only the salon whose owned def carries SLUG_A's service_type_id is returned")
+                .containsExactly(salonWithType.toString());
+
+        java.util.List<String> matched = new java.util.ArrayList<>();
+        data.path("data").get(0).path("matchedServiceNames").forEach(n -> matched.add(n.asText()));
+        assertThat(matched)
+                .as("matchedServiceNames carries the owned def's name even with no master_services row")
+                .containsExactly("Кератинове відновлення");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Seeds an ACTIVE-or-inactive SALON-owned {@code service_definitions} row
+     * (FIXED or RANGE) created directly under the salon's catalog — exactly as
+     * {@code POST /salons/{id}/services} does — with <b>NO {@code master_services}
+     * row at all</b>. This is the production shape that the pre-fix
+     * master_services-join salon search could never see; it is the row-source
+     * the fix pins. Distinct from {@link #seedSalonServiceForMaster} /
+     * {@link #seedTypedSalonServiceForMaster}, which always attach a master link.
+     *
+     * <p>Honours the V67 {@code chk_service_def_price_mode} CHECK: FIXED →
+     * {@code price_max} NULL; RANGE → {@code price_max} >= {@code base_price}.</p>
+     *
+     * @param serviceTypeId optional platform service-type FK (nullable for the
+     *                      category-only / legacy path)
+     */
+    private void seedSalonOwnedServiceNoMaster(UUID salonId, String serviceName, String category,
+                                               String priceType, BigDecimal basePrice,
+                                               BigDecimal priceMax, UUID serviceTypeId,
+                                               boolean defActive) {
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
+                UUID.randomUUID(), salonId, serviceName, category, serviceTypeId,
+                basePrice, priceType, priceMax, defActive);
+        // Deliberately NO master_services INSERT — that absence is the test fixture.
+    }
 
     /** Issues an anonymous master search and returns the {@code data} (PageResponse) node. */
     private JsonNode masterSearch(String query) throws Exception {

@@ -120,45 +120,33 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax,
                        (SELECT array_agg(z.name)
                           FROM (SELECT DISTINCT sd2.name AS name
-                                FROM master_services ms2
-                                JOIN masters mm2 ON mm2.id = ms2.master_id
-                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
-                                WHERE mm2.salon_id = s.id
-                                  AND mm2.is_active = true
-                                  AND ms2.is_active = true
+                                FROM service_definitions sd2
+                                WHERE sd2.owner_type = 'SALON'
+                                  AND sd2.owner_id = s.id
                                   AND sd2.is_active = true
                                   AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                                 ORDER BY sd2.name
                                 LIMIT 3) z) AS pnames
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
@@ -171,35 +159,26 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
@@ -246,45 +225,33 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax,
                        (SELECT array_agg(z.name)
                           FROM (SELECT DISTINCT sd2.name AS name
-                                FROM master_services ms2
-                                JOIN masters mm2 ON mm2.id = ms2.master_id
-                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
-                                WHERE mm2.salon_id = s.id
-                                  AND mm2.is_active = true
-                                  AND ms2.is_active = true
+                                FROM service_definitions sd2
+                                WHERE sd2.owner_type = 'SALON'
+                                  AND sd2.owner_id = s.id
                                   AND sd2.is_active = true
                                   AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                                 ORDER BY sd2.name
                                 LIMIT 3) z) AS pnames
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND s.district_id = :districtId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
             """,
@@ -294,23 +261,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             WHERE s.is_active = true
               AND s.district_id = :districtId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
             """,
@@ -378,45 +339,33 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax,
                        (SELECT array_agg(z.name)
                           FROM (SELECT DISTINCT sd2.name AS name
-                                FROM master_services ms2
-                                JOIN masters mm2 ON mm2.id = ms2.master_id
-                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
-                                WHERE mm2.salon_id = s.id
-                                  AND mm2.is_active = true
-                                  AND ms2.is_active = true
+                                FROM service_definitions sd2
+                                WHERE sd2.owner_type = 'SALON'
+                                  AND sd2.owner_id = s.id
                                   AND sd2.is_active = true
                                   AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                                 ORDER BY sd2.name
                                 LIMIT 3) z) AS pnames
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
@@ -429,35 +378,26 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
@@ -501,45 +441,33 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax,
                        (SELECT array_agg(z.name)
                           FROM (SELECT DISTINCT sd2.name AS name
-                                FROM master_services ms2
-                                JOIN masters mm2 ON mm2.id = ms2.master_id
-                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
-                                WHERE mm2.salon_id = s.id
-                                  AND mm2.is_active = true
-                                  AND ms2.is_active = true
+                                FROM service_definitions sd2
+                                WHERE sd2.owner_type = 'SALON'
+                                  AND sd2.owner_id = s.id
                                   AND sd2.is_active = true
                                   AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                                 ORDER BY sd2.name
                                 LIMIT 3) z) AS pnames
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND s.city_id = :cityId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
             """,
@@ -549,23 +477,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             WHERE s.is_active = true
               AND s.city_id = :cityId
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
             """,
@@ -620,44 +542,32 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax,
                        (SELECT array_agg(z.name)
                           FROM (SELECT DISTINCT sd2.name AS name
-                                FROM master_services ms2
-                                JOIN masters mm2 ON mm2.id = ms2.master_id
-                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
-                                WHERE mm2.salon_id = s.id
-                                  AND mm2.is_active = true
-                                  AND ms2.is_active = true
+                                FROM service_definitions sd2
+                                WHERE sd2.owner_type = 'SALON'
+                                  AND sd2.owner_id = s.id
                                   AND sd2.is_active = true
                                   AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                                 ORDER BY sd2.name
                                 LIMIT 3) z) AS pnames
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
@@ -670,34 +580,25 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                 SELECT MIN(sd.base_price) AS pmin,
                        MAX(CASE WHEN sd.price_type = 'RANGE'
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
               AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
@@ -738,44 +639,32 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
                                 THEN sd.price_max ELSE sd.base_price END) AS pmax,
                        (SELECT array_agg(z.name)
                           FROM (SELECT DISTINCT sd2.name AS name
-                                FROM master_services ms2
-                                JOIN masters mm2 ON mm2.id = ms2.master_id
-                                JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id
-                                WHERE mm2.salon_id = s.id
-                                  AND mm2.is_active = true
-                                  AND ms2.is_active = true
+                                FROM service_definitions sd2
+                                WHERE sd2.owner_type = 'SALON'
+                                  AND sd2.owner_id = s.id
                                   AND sd2.is_active = true
                                   AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                                 ORDER BY sd2.name
                                 LIMIT 3) z) AS pnames
-                FROM master_services ms
-                JOIN masters mm ON mm.id = ms.master_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE mm.salon_id = s.id
-                  AND mm.is_active = true
-                  AND ms.is_active = true
+                FROM service_definitions sd
+                WHERE sd.owner_type = 'SALON'
+                  AND sd.owner_id = s.id
                   AND sd.is_active = true
                   AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
             ) pr ON true
             WHERE s.is_active = true
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
             """,
@@ -784,23 +673,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             FROM salons s
             WHERE s.is_active = true
               AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM master_services msc
-                  JOIN masters mmc ON mmc.id = msc.master_id
-                  JOIN service_definitions sdc ON sdc.id = msc.service_def_id
-                  WHERE mmc.salon_id = s.id
-                    AND mmc.is_active = true
-                    AND msc.is_active = true
+                  SELECT 1 FROM service_definitions sdc
+                  WHERE sdc.owner_type = 'SALON'
+                    AND sdc.owner_id = s.id
                     AND sdc.is_active = true
                     AND sdc.category = CAST(:category AS text)))
               AND (CAST(:q AS text) IS NULL
                    OR s.name ILIKE CAST(:q AS text)
                    OR EXISTS (SELECT 1
-                              FROM master_services msq
-                              JOIN masters mmq ON mmq.id = msq.master_id
-                              JOIN service_definitions sdq ON sdq.id = msq.service_def_id
-                              WHERE mmq.salon_id = s.id
-                                AND mmq.is_active = true
-                                AND msq.is_active = true
+                              FROM service_definitions sdq
+                              WHERE sdq.owner_type = 'SALON'
+                                AND sdq.owner_id = s.id
                                 AND sdq.is_active = true
                                 AND sdq.name ILIKE CAST(:q AS text)))
             """,
