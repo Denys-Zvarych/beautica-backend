@@ -2035,6 +2035,67 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(m1.toString());
     }
 
+    // ── Regression — per-slug scoped price band (FIXED vs RANGE) ─────────────
+    //
+    // Bug: search returned the master's WHOLE-CATALOGUE price band instead of the
+    // band scoped to the active serviceTypeSlugs filter. A master with a FIXED 500
+    // service on slug A and a RANGE 800..4000 service on slug B returned
+    // minEffectivePrice=500 / priceMax=4000 for BOTH slug filters (and for A the
+    // floor leaked the 500 FIXED while the ceiling leaked the 4000 RANGE).
+    //
+    // This test FAILS against the old whole-catalogue logic (slug A would project
+    // priceMax=4000, slug B would project minEffectivePrice=500) and PASSES against
+    // the SearchService fix, where the `sn` price lateral computes a slug-scoped
+    // MIN + MAX and minEffectivePrice sources from sn.price_min when a filter is
+    // active. No existing price test exercised a master holding BOTH a FIXED and a
+    // RANGE service under DIFFERENT slugs, so the suite missed it.
+
+    @Test
+    @DisplayName("GET /search/masters?serviceTypeSlugs=… — regression: the displayed price band is scoped to the matched service-type — a master with a FIXED 500 on slug A and a RANGE 800..4000 on slug B shows 500/500 for A, 800/4000 for B, and the 500/4000 whole-catalogue band only when unfiltered")
+    void should_scopeMasterPriceBand_toActiveServiceTypeSlug_acrossFixedAndRange() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Scoped", "Band");
+        // Slug A: FIXED 500 (floor == ceiling == 500). Neutral name → FK-only match,
+        // never the other slug's name_uk.
+        seedTypedServiceForMaster(master, "Послуга Фікс A", "HAIRCUT",
+                "FIXED", new BigDecimal("500.00"), null, typeIdA, true, true);
+        // Slug B: RANGE 800..4000 (floor 800, ceiling 4000).
+        seedTypedServiceForMaster(master, "Послуга Діапазон B", "INJECTION",
+                "RANGE", new BigDecimal("800.00"), new BigDecimal("4000.00"), typeIdB, true, true);
+
+        // ── slug A → the FIXED service's single price: 500 / 500 ─────────────
+        JsonNode aRow = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(aRow.path("minEffectivePrice").asText()))
+                .as("slug A floor = the matched FIXED 500 (pre-fix this was the catalogue MIN, also 500 — but the ceiling leaked)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(aRow.path("priceMax").asText()))
+                .as("slug A ceiling = the matched FIXED 500, NOT the off-slug RANGE 4000 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+
+        // ── slug B → the RANGE service's band: 800 / 4000 ────────────────────
+        JsonNode bRow = masterSearch("?serviceTypeSlugs=" + SLUG_B + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(bRow.path("minEffectivePrice").asText()))
+                .as("slug B floor = the matched RANGE floor 800, NOT the off-slug FIXED 500 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("800.00"));
+        assertThat(new BigDecimal(bRow.path("priceMax").asText()))
+                .as("slug B ceiling = the matched RANGE ceiling 4000")
+                .isEqualByComparingTo(new BigDecimal("4000.00"));
+
+        // ── no filter → whole-catalogue band 500 / 4000 (preserved) ──────────
+        JsonNode allRow = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(allRow.path("minEffectivePrice").asText()))
+                .as("unfiltered floor = catalogue MIN(500, 800) = 500 (whole-catalogue behaviour preserved)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(allRow.path("priceMax").asText()))
+                .as("unfiltered ceiling = catalogue MAX(FIXED 500, RANGE 4000) = 4000")
+                .isEqualByComparingTo(new BigDecimal("4000.00"));
+    }
+
     // ── Phase 20.2/20.3 — salon per-service filter ───────────────────────────
 
     @Test
@@ -2190,6 +2251,42 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
                 .as("matchedServiceNames is empty when no service filter is active")
                 .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — regression (salon analog): the salon price band is scoped to the matched service-type — a salon owning a FIXED 500 on slug A and a RANGE 800..4000 on slug B shows priceMin/priceMax 500/500 for A and 800/4000 for B (pre-fix the slug-filtered band leaked the whole-catalogue 500/4000)")
+    void should_scopeSalonPriceBand_toActiveServiceTypeSlug_acrossFixedAndRange() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        // ONE salon owning two ACTIVE owner-scoped defs under two distinct slugs:
+        // a FIXED 500 (slug A) and a RANGE 800..4000 (slug B). The appendSalonPrice
+        // AggregateLateral got the same slug-scoping fix as the master path.
+        UUID salon = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salon, "Салон Фікс A", "HAIRCUT",
+                "FIXED", new BigDecimal("500.00"), null, typeIdA, true);
+        seedSalonOwnedServiceNoMaster(salon, "Салон Діапазон B", "INJECTION",
+                "RANGE", new BigDecimal("800.00"), new BigDecimal("4000.00"), typeIdB, true);
+
+        // ── slug A → the FIXED service band: 500 / 500 ───────────────────────
+        JsonNode aRow = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(aRow.path("priceMin").asText()))
+                .as("slug A salon floor = the matched FIXED 500")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(aRow.path("priceMax").asText()))
+                .as("slug A salon ceiling = the matched FIXED 500, NOT the off-slug RANGE 4000 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+
+        // ── slug B → the RANGE service band: 800 / 4000 ──────────────────────
+        JsonNode bRow = salonSearch("?serviceTypeSlugs=" + SLUG_B + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(bRow.path("priceMin").asText()))
+                .as("slug B salon floor = the matched RANGE floor 800, NOT the off-slug FIXED 500 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("800.00"));
+        assertThat(new BigDecimal(bRow.path("priceMax").asText()))
+                .as("slug B salon ceiling = the matched RANGE ceiling 4000")
+                .isEqualByComparingTo(new BigDecimal("4000.00"));
     }
 
     // ── Regression — salon CATEGORY-only filter excludes foreign-category salons ─
@@ -2485,12 +2582,33 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     private void seedTypedServiceForMaster(UUID masterId, String serviceName, String category,
                                            BigDecimal basePrice, UUID serviceTypeId,
                                            boolean defActive, boolean msActive) {
+        // FIXED-only delegation (price_max NULL) — preserves the historical shape
+        // that all category/slug-membership callers rely on.
+        seedTypedServiceForMaster(masterId, serviceName, category, "FIXED",
+                basePrice, null, serviceTypeId, defActive, msActive);
+    }
+
+    /**
+     * RANGE-capable overload of {@link #seedTypedServiceForMaster}: seeds an
+     * INDEPENDENT_MASTER-owned typed service definition with an explicit
+     * {@code priceType} ("FIXED" or "RANGE") and {@code priceMax} ceiling, plus a
+     * {@code master_services} link, then refreshes
+     * {@code masters.min_effective_price}. Honours the V67
+     * {@code chk_service_def_price_mode} CHECK: FIXED → {@code price_max} NULL;
+     * RANGE → {@code price_max} >= {@code base_price}. Backs the per-slug
+     * scoped-price regression where a master carries BOTH a FIXED service on one
+     * service-type and a RANGE service on another.
+     */
+    private void seedTypedServiceForMaster(UUID masterId, String serviceName, String category,
+                                           String priceType, BigDecimal basePrice, BigDecimal priceMax,
+                                           UUID serviceTypeId, boolean defActive, boolean msActive) {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, 0, ?, NOW(), NOW())",
-                serviceDefId, masterId, serviceName, category, serviceTypeId, basePrice, defActive);
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, serviceTypeId,
+                basePrice, priceType, priceMax, defActive);
 
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +

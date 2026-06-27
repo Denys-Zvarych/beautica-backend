@@ -665,19 +665,30 @@ public class SearchService {
      * outer {@code ORDER BY} is re-applied on the derived-table aliases so paging
      * order survives the lateral join (which is otherwise unordered).
      *
-     * <p>PERF-M1 (Phase 19.x audit): {@code price_max} is computed HERE too,
-     * folded into this single lateral instead of the former separate correlated
-     * scalar sub-select in {@link #appendDataSelect} — both walked the same
-     * {@code master_services ⋈ service_definitions} join, so the second pass was
-     * pure waste. The names sub-query is DISTINCT + ORDER + LIMIT (capped
-     * preview); the price ceiling is an unbounded {@code MAX} over ALL the
-     * master's active services, so it cannot share the LIMIT-ed inner derived
-     * table — it is a sibling aggregate over the same {@code FROM} in the lateral
-     * body. Semantics are byte-for-byte the prior formula:
-     * {@code MAX(COALESCE(ms.price_override, CASE WHEN sd.price_type='RANGE'
-     * THEN sd.price_max ELSE sd.base_price END))}, so a single fixed price (or a
-     * single override) still yields {@code price_max == min_effective_price}.
-     * {@code NULL} when the master has no active, priced services.
+     * <p>PERF-M1 (Phase 19.x audit): the price band ({@code price_min} +
+     * {@code price_max}) is computed HERE too, folded into this single lateral
+     * instead of a separate correlated scalar sub-select — both would walk the
+     * same {@code master_services ⋈ service_definitions} join, so a second pass
+     * is pure waste. The names sub-query is DISTINCT + ORDER + LIMIT (capped
+     * preview); the price band is a pair of unbounded aggregates over the
+     * (filter-scoped) active services, so it cannot share the LIMIT-ed inner
+     * name sub-query — it is a sibling aggregate over the same {@code FROM} in
+     * the lateral body.
+     *
+     * <p><b>Search-price bug fix — the band is scoped to the active filter.</b>
+     * When a {@code serviceTypeSlugs} (slug-precedence) or {@code category}
+     * filter is active the lateral's {@code WHERE} restricts the aggregate to the
+     * matched services (same predicate {@code matched_names} uses), so a card for
+     * the «2д» slug shows the 2д price, not the whole-catalogue band. With NO
+     * filter the band is whole-catalogue and {@code price_min} equals the indexed
+     * {@code min_effective_price}; the outer SELECT sources the floor from the
+     * indexed column in that case ({@code hasPriceScope == false}) and from
+     * {@code sn.price_min} otherwise. {@code price_min} mirrors the denormalised
+     * formula {@code MIN(COALESCE(ms.price_override, sd.base_price))}; the ceiling
+     * is {@code MAX(COALESCE(ms.price_override, CASE WHEN sd.price_type='RANGE'
+     * THEN sd.price_max ELSE sd.base_price END))}. A single FIXED price still
+     * yields {@code price_min == price_max} → the card collapses to one value.
+     * {@code NULL} when the master has no active, priced services in scope.
      *
      * <p>Column layout (indices 0–15, Phase 20.3): {@code price_max} stays at
      * projection index 9 and {@link #SERVICE_NAMES_IDX} (10) is unchanged — only
@@ -691,15 +702,27 @@ public class SearchService {
             String innerSql, SearchSort sort, boolean hasCategoryFilter,
             List<ResolvedServiceType> serviceTypes) {
         boolean hasServiceFilter = !serviceTypes.isEmpty();
+        // Search-price bug fix: the displayed price band must be scoped to the
+        // active service-type / category filter, not the master's whole catalogue.
+        // When a slug OR category filter is active, BOTH bounds come from the
+        // slug/category-scoped sn lateral (price_min/price_max). With no filter the
+        // band is whole-catalogue: the floor is the indexed denormalised column
+        // (t.min_effective_price) and the ceiling is the unscoped sn MAX.
+        boolean hasPriceScope = hasServiceFilter || hasCategoryFilter;
         // Phase 20.3: matched_names is sourced from the slug-scoped lateral when a
         // per-service filter is active, else a typed empty array literal (mapped
         // to []). A typed-NULL literal (not CAST(:p …)) is permitted by the guard.
         String matchedNamesExpr = hasServiceFilter ? "mn.matched_names" : "CAST(NULL AS text[])";
+        // Displayed floor: scoped lateral MIN when filtering, else the indexed
+        // denormalised column. The price WHERE/ORDER BY keep using the indexed
+        // m./t.min_effective_price column (appendOrderBy/appendWhereClause) — only
+        // this DISPLAYED projection column switches source.
+        String minPriceExpr = hasPriceScope ? "sn.price_min" : "t.min_effective_price";
         StringBuilder sb = new StringBuilder();
         sb.append("SELECT t.master_id, t.first_name, t.last_name, ")
                 .append("t.avg_rating, t.review_count, t.avatar_url, ")
                 .append("t.discovery_city_id, t.discovery_district_id, ")
-                .append("t.min_effective_price, sn.price_max, sn.service_names, ")
+                .append(minPriceExpr).append(", sn.price_max, sn.service_names, ")
                 .append("t.street, t.building_no, t.location_note, ")
                 .append(matchedNamesExpr).append(" AS matched_names, t.total_count ")
                 .append("FROM (").append(innerSql).append(") t ")
@@ -724,14 +747,31 @@ public class SearchService {
         }
         sb.append("ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") x) AS service_names, ")
-                // Price ceiling: unbounded MAX over ALL active services (no LIMIT).
+                // Search-price bug fix — price band scoped by the WHERE below.
+                // price_min mirrors the denormalised min_effective_price formula
+                // (MIN(COALESCE(override, base_price)) — base_price is the RANGE
+                // floor) so a no-filter band still equals the indexed column.
+                .append("MIN(COALESCE(ms2.price_override, sd2.base_price)) AS price_min, ")
+                // Price ceiling: MAX over the scoped active services (no LIMIT).
                 .append("MAX(COALESCE(ms2.price_override, "
                         + "CASE WHEN sd2.price_type = 'RANGE' "
                         + "THEN sd2.price_max ELSE sd2.base_price END)) AS price_max ")
                 .append("FROM master_services ms2 ")
                 .append("JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id AND sd2.is_active = true ")
-                .append("WHERE ms2.master_id = t.master_id AND ms2.is_active = true ")
-                .append(") sn ON true ");
+                .append("WHERE ms2.master_id = t.master_id AND ms2.is_active = true ");
+        // Search-price bug fix: scope the price aggregate to the active filter so
+        // the card shows the MATCHED service's price, not the whole catalogue.
+        // Slug takes precedence over category (mirrors matched_names). Reuses
+        // :stId{n}/:stName{n} / :category already bound by appendWhereClause — no
+        // new params, no CAST idiom. Whole-catalogue (no filter) = no predicate.
+        if (hasServiceFilter) {
+            sb.append("AND (");
+            appendServiceTypeMatchDisjunction(sb, "sd2", serviceTypes.size());
+            sb.append(") ");
+        } else if (hasCategoryFilter) {
+            sb.append("AND sd2.category = :category ");
+        }
+        sb.append(") sn ON true ");
         // Phase 20.3 — matched_names: a second post-LIMIT correlated lateral over
         // ONLY the paged masters, mirroring the serviceNames lateral's shape (no
         // GROUP BY/HAVING). DISTINCT active service names matching ANY selected
@@ -1069,7 +1109,7 @@ public class SearchService {
                 .append("pr.pmin AS pmin, pr.pmax AS pmax, ")
                 .append("COUNT(*) OVER() AS total_count ")
                 .append("FROM salons s ");
-        appendSalonPriceAggregateLateral(inner, hasCategory);
+        appendSalonPriceAggregateLateral(inner, hasCategory, serviceTypes);
 
         inner.append("WHERE s.is_active = true ");
         if (districtId != null) {
@@ -1138,19 +1178,36 @@ public class SearchService {
     }
 
     /**
-     * Category-scoped price-band aggregate lateral — MIN floor + RANGE-aware MAX
-     * ceiling over the salon's active masters' active services. Stays in the inner
+     * Slug- and category-scoped price-band aggregate lateral — MIN floor +
+     * RANGE-aware MAX ceiling over the salon's active services. Stays in the inner
      * derived table because {@code pmin}/{@code pmax} feed the price WHERE and the
-     * {@code ORDER BY}. Category is bound conditionally (plain equality, no CAST).
+     * {@code ORDER BY}.
+     *
+     * <p><b>Search-price bug fix:</b> this builder is only reached with a
+     * non-empty slug list (the per-service-filtered salon path), so the band is
+     * scoped to the matched services via the same slug disjunction
+     * {@code matched_names} uses — slug precedence over the category predicate, so
+     * a «2д»-filtered salon card shows the 2д band, not its whole catalogue. The
+     * {@code :stId{n}}/{@code :stName{n}} params are already bound by
+     * {@link #appendSalonServiceTypeExists}; {@code :category} is bound
+     * conditionally (plain equality, no CAST).
      */
-    private static void appendSalonPriceAggregateLateral(StringBuilder sb, boolean hasCategory) {
+    private static void appendSalonPriceAggregateLateral(
+            StringBuilder sb, boolean hasCategory, List<ResolvedServiceType> serviceTypes) {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT MIN(sd.base_price) AS pmin, ")
                 .append("MAX(CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END) AS pmax ")
                 .append("FROM service_definitions sd ")
                 .append("WHERE sd.owner_type = 'SALON' AND sd.owner_id = s.id ")
                 .append("AND sd.is_active = true ");
-        if (hasCategory) {
+        // Slug precedence: scope the price band to the matched services. Category
+        // narrows only when no slug filter is active (defensive — this path always
+        // carries slugs).
+        if (!serviceTypes.isEmpty()) {
+            sb.append("AND (");
+            appendServiceTypeMatchDisjunction(sb, "sd", serviceTypes.size());
+            sb.append(") ");
+        } else if (hasCategory) {
             sb.append("AND sd.category = :category ");
         }
         sb.append(") pr ON true ");
