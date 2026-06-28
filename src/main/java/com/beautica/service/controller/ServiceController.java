@@ -1,7 +1,7 @@
 package com.beautica.service.controller;
 
 import com.beautica.common.ApiResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
@@ -15,7 +15,6 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -94,7 +93,7 @@ public class ServiceController {
     @GetMapping("/independent-masters/me/services")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     public ApiResponse<List<MasterServiceResponse>> getMyServices(Authentication authentication) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(serviceCatalogService.getMyServices(userId));
     }
 
@@ -104,7 +103,7 @@ public class ServiceController {
             @Valid @RequestBody CreateServiceDefinitionRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         MasterServiceResponse response = serviceCatalogService.addIndependentMasterService(userId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
@@ -128,7 +127,7 @@ public class ServiceController {
             @Valid @RequestBody BulkCreateServicesRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         List<MasterServiceResponse> response =
                 serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
@@ -172,7 +171,7 @@ public class ServiceController {
             @PathVariable UUID serviceDefId,
             Authentication authentication
     ) {
-        serviceCatalogService.deactivateServiceDefinition(extractUserId(authentication), serviceDefId);
+        serviceCatalogService.deactivateServiceDefinition(AuthenticationUtils.userId(authentication), serviceDefId);
         return ResponseEntity.noContent().build();
     }
 
@@ -214,13 +213,5 @@ public class ServiceController {
         ServiceDefinitionResponse response =
                 serviceCatalogService.updateServicePhoto(serviceDefId, request.photoUrl());
         return ResponseEntity.ok(ApiResponse.ok(response));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID userId) {
-            return userId;
-        }
-        throw new ForbiddenException("Not authenticated");
     }
 }

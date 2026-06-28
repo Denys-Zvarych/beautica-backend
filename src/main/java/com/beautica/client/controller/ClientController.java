@@ -5,14 +5,13 @@ import com.beautica.client.dto.TimelineItemResponse;
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -43,7 +42,7 @@ public class ClientController {
     @GetMapping("/passport")
     @PreAuthorize("hasRole('CLIENT')")
     public ApiResponse<PassportResponse> getPassport(Authentication auth) {
-        return ApiResponse.ok(clientPassportService.getPassport(principalId(auth)));
+        return ApiResponse.ok(clientPassportService.getPassport(AuthenticationUtils.userId(auth)));
     }
 
     @GetMapping("/timeline")
@@ -55,14 +54,6 @@ public class ClientController {
         if (pageable.getPageNumber() > MAX_PAGE_NUMBER) {
             pageable = PageRequest.of(MAX_PAGE_NUMBER, pageable.getPageSize(), pageable.getSort());
         }
-        return ApiResponse.ok(clientPassportService.getTimeline(principalId(auth), pageable));
-    }
-
-    private UUID principalId(Authentication auth) {
-        if (auth instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Not authenticated");
+        return ApiResponse.ok(clientPassportService.getTimeline(AuthenticationUtils.userId(auth), pageable));
     }
 }

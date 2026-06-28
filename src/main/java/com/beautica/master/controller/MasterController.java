@@ -7,7 +7,7 @@ import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
@@ -33,7 +33,6 @@ import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.validation.annotation.Validated;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -65,7 +64,7 @@ public class MasterController {
     @GetMapping("/me")
     @PreAuthorize("hasAnyRole('SALON_MASTER', 'INDEPENDENT_MASTER')")
     public ApiResponse<MasterDetailResponse> getMyProfile(Authentication authentication) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(masterService.getMyMasterDetail(userId));
     }
 
@@ -112,7 +111,7 @@ public class MasterController {
             List<WorkingHoursRequest> requests,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(masterService.upsertWorkingHours(actorId, masterId, requests));
     }
 
@@ -133,7 +132,7 @@ public class MasterController {
             @Valid @RequestBody WeeklyScheduleRequest request,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         WeeklyScheduleResponse created =
                 masterScheduleService.upsertWeeklySchedule(actorId, masterId, null, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(created));
@@ -147,7 +146,7 @@ public class MasterController {
             @Valid @RequestBody WeeklyScheduleRequest request,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(
                 masterScheduleService.upsertWeeklySchedule(actorId, masterId, scheduleId, request));
     }
@@ -159,7 +158,7 @@ public class MasterController {
             @PathVariable UUID scheduleId,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         masterScheduleService.deleteWeeklySchedule(actorId, masterId, scheduleId);
         return ResponseEntity.noContent().build();
     }
@@ -191,7 +190,7 @@ public class MasterController {
         if (!date.equals(request.date())) {
             throw new BusinessException("Path date must match the override body date");
         }
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(masterScheduleService.upsertOverride(actorId, masterId, request));
     }
 
@@ -202,7 +201,7 @@ public class MasterController {
             @PathVariable @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         masterScheduleService.clearOverride(actorId, masterId, date);
         return ResponseEntity.noContent().build();
     }
@@ -230,7 +229,7 @@ public class MasterController {
             @PathVariable UUID masterId,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         masterService.deactivateMaster(actorId, masterId);
         return ResponseEntity.noContent().build();
     }
@@ -258,7 +257,7 @@ public class MasterController {
         if (to.isAfter(LocalDate.now().plusYears(2))) {
             throw new BusinessException("Date range out of allowed bounds");
         }
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         Master actor = masterService.getMasterByUserId(actorId);
         Page<BookingResponse> page = masterService.getMasterCalendar(actor.getId(), from, to, pageable);
         return ApiResponse.ok(PageResponse.of(
@@ -304,16 +303,8 @@ public class MasterController {
             @Valid @RequestBody MasterProfileUpdateRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         MasterPublicProfileResponse updated = userService.updateMasterProfile(userId, request);
         return ResponseEntity.ok(ApiResponse.ok(updated));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Access denied");
     }
 }

@@ -15,13 +15,13 @@ import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.security.AuthenticationUtils;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -135,7 +135,7 @@ public class AuthController {
 
     @PostMapping("/logout")
     public ResponseEntity<Void> logout(Authentication authentication) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         authService.logout(userId);
         return ResponseEntity.noContent().build();
     }
@@ -146,7 +146,7 @@ public class AuthController {
             @Valid @RequestBody InviteRequest request,
             Authentication authentication
     ) {
-        UUID callerId = extractUserId(authentication);
+        UUID callerId = AuthenticationUtils.userId(authentication);
         InviteResponse response = inviteService.sendInvite(request, callerId);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(response));
     }
@@ -165,13 +165,5 @@ public class AuthController {
     ) {
         AuthResponse response = inviteService.acceptInvite(request);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(response));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new com.beautica.common.exception.ForbiddenException("Not authenticated");
     }
 }

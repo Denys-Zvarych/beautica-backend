@@ -1,7 +1,7 @@
 package com.beautica.service.controller;
 
 import com.beautica.common.ApiResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.service.dto.ApprovedCategoryResponse;
 import com.beautica.service.dto.CategoryRequestResponse;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
@@ -11,7 +11,6 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -47,7 +46,7 @@ public class CategoryRequestController {
     public ResponseEntity<ApiResponse<CategoryRequestResponse>> submitRequest(
             @Valid @RequestBody CreateCategoryRequestRequest request,
             Authentication authentication) {
-        UUID requesterId = extractUserId(authentication);
+        UUID requesterId = AuthenticationUtils.userId(authentication);
         CategoryRequestResponse created = categoryRequestService.submitRequest(request, requesterId);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(created));
     }
@@ -56,13 +55,5 @@ public class CategoryRequestController {
     public ResponseEntity<ApiResponse<List<ApprovedCategoryResponse>>> listApproved() {
         List<ApprovedCategoryResponse> categories = categoryRequestService.listApproved();
         return ResponseEntity.ok(ApiResponse.ok(categories));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID userId) {
-            return userId;
-        }
-        throw new ForbiddenException("Not authenticated");
     }
 }

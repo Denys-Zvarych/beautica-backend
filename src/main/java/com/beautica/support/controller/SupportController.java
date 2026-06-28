@@ -2,6 +2,7 @@ package com.beautica.support.controller;
 
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.support.dto.ContactSupportRequest;
 import com.beautica.support.dto.ContactSupportResponse;
 import com.beautica.support.service.SupportService;
@@ -13,7 +14,6 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -57,20 +57,12 @@ public class SupportController {
             @RequestPart(value = "attachments", required = false) List<MultipartFile> attachments,
             Authentication authentication) {
 
-        UUID senderUserId = extractUserId(authentication);
+        UUID senderUserId = AuthenticationUtils.userId(authentication);
         String senderEmail = extractEmail(authentication);
 
         ContactSupportResponse response =
                 supportService.contact(senderUserId, senderEmail, request, attachments);
         return ResponseEntity.accepted().body(ApiResponse.ok(response));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID userId) {
-            return userId;
-        }
-        throw new ForbiddenException("Not authenticated");
     }
 
     private String extractEmail(Authentication authentication) {

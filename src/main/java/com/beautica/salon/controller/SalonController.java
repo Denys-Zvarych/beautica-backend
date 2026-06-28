@@ -3,6 +3,7 @@ package com.beautica.salon.controller;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.InviteRequest;
@@ -16,7 +17,6 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.web.PageableDefault;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -43,7 +43,7 @@ public class SalonController {
             @Valid @RequestBody CreateSalonRequest request,
             Authentication authentication
     ) {
-        UUID ownerId = extractUserId(authentication);
+        UUID ownerId = AuthenticationUtils.userId(authentication);
         SalonResponse response = salonService.createSalon(ownerId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
@@ -51,7 +51,7 @@ public class SalonController {
     @GetMapping("/mine")
     @PreAuthorize("hasRole('SALON_OWNER')")
     public ApiResponse<List<SalonResponse>> getOwnedSalons(Authentication authentication) {
-        UUID ownerId = extractUserId(authentication);
+        UUID ownerId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(salonService.getOwnerSalons(ownerId));
     }
 
@@ -67,7 +67,7 @@ public class SalonController {
             @Valid @RequestBody UpdateSalonRequest request,
             Authentication authentication
     ) {
-        UUID ownerId = extractUserId(authentication);
+        UUID ownerId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(salonService.updateSalon(ownerId, salonId, request));
     }
 
@@ -80,7 +80,7 @@ public class SalonController {
             @Valid @RequestBody InviteRequest request,
             Authentication authentication
     ) {
-        UUID ownerId = extractUserId(authentication);
+        UUID ownerId = AuthenticationUtils.userId(authentication);
         InviteResponse response = salonService.inviteMaster(ownerId, salonId, request.email(), request.effectiveRole());
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
@@ -106,16 +106,8 @@ public class SalonController {
             @PathVariable UUID salonId,
             Authentication authentication
     ) {
-        UUID ownerId = extractUserId(authentication);
+        UUID ownerId = AuthenticationUtils.userId(authentication);
         salonService.deactivateSalon(ownerId, salonId);
         return ResponseEntity.noContent().build();
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new com.beautica.common.exception.ForbiddenException("Not authenticated");
     }
 }

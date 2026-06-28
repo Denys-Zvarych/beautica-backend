@@ -1,6 +1,6 @@
 package com.beautica.notification.controller;
 
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.notification.dto.RegisterDeviceTokenRequest;
 import com.beautica.notification.dto.UnregisterDeviceTokenRequest;
 import com.beautica.notification.entity.DeviceToken;
@@ -11,7 +11,6 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -37,7 +36,7 @@ public class DeviceController {
             @Valid @RequestBody RegisterDeviceTokenRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
 
         // Idempotency pre-check: avoids the rollback-only transaction state caused by
         // catching DataIntegrityViolationException after a UNIQUE-collision save().
@@ -65,16 +64,8 @@ public class DeviceController {
             @Valid @RequestBody UnregisterDeviceTokenRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         deviceTokenRepository.deleteByUserIdAndToken(userId, request.token());
         return ResponseEntity.noContent().build();
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID userId) {
-            return userId;
-        }
-        throw new ForbiddenException("Not authenticated");
     }
 }

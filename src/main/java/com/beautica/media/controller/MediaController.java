@@ -2,7 +2,7 @@ package com.beautica.media.controller;
 
 import com.beautica.auth.Role;
 import com.beautica.common.ApiResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.media.dto.AvatarResponse;
 import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
@@ -10,9 +10,7 @@ import com.beautica.media.service.MediaService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.GrantedAuthority;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -65,7 +63,7 @@ public class MediaController {
             @RequestParam("file") MultipartFile file,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         return ApiResponse.ok(mediaService.uploadAvatar(userId, file));
     }
 
@@ -73,7 +71,7 @@ public class MediaController {
     @PreAuthorize("isAuthenticated()")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deleteAvatar(Authentication authentication) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         mediaService.deleteAvatar(userId);
     }
 
@@ -86,8 +84,8 @@ public class MediaController {
             @RequestParam("file") MultipartFile file,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
-        Role actorRole = extractRole(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        Role actorRole = AuthenticationUtils.role(authentication);
         return ApiResponse.ok(mediaService.uploadPortfolioPhoto(actorId, actorRole, file));
     }
 
@@ -98,7 +96,7 @@ public class MediaController {
             @PathVariable UUID mediaId,
             Authentication authentication
     ) {
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         mediaService.deletePortfolioPhoto(actorId, mediaId);
     }
 
@@ -127,43 +125,4 @@ public class MediaController {
         return ApiResponse.ok(mediaService.getPortfolio(EntityType.MASTER, masterId, PORTFOLIO_PAGE));
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-
-    /**
-     * Resolve the authenticated user's UUID from the principal. Uses the safer
-     * {@code instanceof UUID id} pattern (Anti-Bug Playbook § B) so a malformed
-     * authentication object surfaces as 403, not a {@link ClassCastException}
-     * 500.
-     */
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Not authenticated");
-    }
-
-    /**
-     * Resolve the authenticated user's {@link Role} from the granted authority
-     * (e.g. {@code ROLE_SALON_OWNER} → {@link Role#SALON_OWNER}).
-     *
-     * <p>Each principal carries exactly one role in this project — pick the
-     * first granted authority that has the {@code ROLE_} prefix and translate.
-     */
-    private Role extractRole(Authentication authentication) {
-        if (authentication == null) {
-            throw new ForbiddenException("Not authenticated");
-        }
-        for (GrantedAuthority authority : authentication.getAuthorities()) {
-            String name = authority.getAuthority();
-            if (name != null && name.startsWith("ROLE_")) {
-                try {
-                    return Role.valueOf(name.substring("ROLE_".length()));
-                } catch (IllegalArgumentException ignored) {
-                    // fall through — another authority might be a valid role
-                }
-            }
-        }
-        throw new ForbiddenException("No role assigned");
-    }
 }
