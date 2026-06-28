@@ -106,7 +106,9 @@ public class SecurityConfig {
                     // approve/reject mutate. POST /requests (provider role-gated)
                     // and GET /approved (any authenticated user) are NOT listed
                     // here and fall through to anyRequest().authenticated().
-                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review").permitAll();
+                    // Token rides as the trailing path segment (review/{token}) to keep
+                    // it out of the email-link query string (proxy/Referer log exposure).
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review/*").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/approve").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/reject").permitAll();
                     // Phase 16.8 service-type suggestion review pages — token-authenticated

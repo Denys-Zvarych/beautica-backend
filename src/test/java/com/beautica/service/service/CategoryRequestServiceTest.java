@@ -116,7 +116,7 @@ class CategoryRequestServiceTest {
         assertThat(response.status()).isEqualTo("PENDING");
         verify(emailService).sendCategoryRequestNotification(
                 eq(ADMIN_EMAIL), eq(requester.toString()), eq("NAIL_ART"), eq("Нейл-арт"),
-                eq("https://api.beautica.app/api/v1/service-categories/requests/review?token=" + RAW_TOKEN));
+                eq("https://api.beautica.app/api/v1/service-categories/requests/review/" + RAW_TOKEN));
     }
 
     @Test
