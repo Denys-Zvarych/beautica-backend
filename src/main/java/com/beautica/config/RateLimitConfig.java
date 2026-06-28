@@ -14,6 +14,16 @@ import java.time.Duration;
 @Configuration
 public class RateLimitConfig {
 
+    // Caffeine eviction caps — how many distinct per-IP buckets are retained, NOT the
+    // per-IP rate limit. The default covers the high-fan-out auth/write endpoints; the
+    // verify/resend one-time flows see far fewer distinct IPs, so a smaller cap is plenty.
+    private static final long DEFAULT_BUCKET_CACHE_SIZE = 100_000;
+    private static final long VERIFY_EMAIL_BUCKET_CACHE_SIZE = 50_000;
+    private static final long RESEND_VERIFICATION_BUCKET_CACHE_SIZE = 10_000;
+
+    private static final Duration STANDARD_EVICTION = Duration.ofHours(1);
+    private static final Duration ONE_MINUTE = Duration.ofMinutes(1);
+
     @Value("${app.rate-limit.register-capacity:3}")
     private long registerCapacity;
 
@@ -51,6 +61,8 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.resend-verification-capacity:3}")
     private long resendVerificationCapacity;
 
+    private static final Duration RESEND_VERIFICATION_WINDOW = Duration.ofSeconds(60);
+
     // Per-IP cap for POST /api/v1/auth/forgot-password (60-minute window).
     // forgot-password is the email-bomb surface — keep it low (3/hr). The 60-minute
     // window matches the token TTL so a user who exhausts their budget at the start of
@@ -68,6 +80,8 @@ public class RateLimitConfig {
     // Configurable so integration tests can raise the cap.
     @Value("${app.rate-limit.reset-password-capacity:10}")
     private long resetPasswordCapacity;
+
+    private static final Duration PASSWORD_RESET_WINDOW = Duration.ofMinutes(60);
 
     // Per-IP cap for PATCH /api/v1/independent-masters/me/profile (60-second window).
     // 10/min prevents unbounded DB writes and cache churn from a token-holding client
@@ -133,88 +147,66 @@ public class RateLimitConfig {
 
     private static final Duration OTP_SEND_WINDOW = Duration.ofMinutes(15);
 
+    // 5-minute eviction grace past the rate-limit window so a bucket entry is not
+    // evicted the instant its window rolls over (avoids a false-start on the very
+    // next request). Shared by every windowed bucket below.
+    private static final Duration EVICTION_GRACE = Duration.ofMinutes(5);
+
     @Bean
     public LoadingCache<String, Bucket> registerBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(registerCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, registerCapacity, ONE_MINUTE);
     }
 
     @Bean
     public LoadingCache<String, Bucket> loginBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(loginCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, loginCapacity, ONE_MINUTE);
     }
 
     @Bean
     public LoadingCache<String, Bucket> refreshBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(refreshCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, refreshCapacity, ONE_MINUTE);
     }
 
     @Bean
     public LoadingCache<String, Bucket> slotsBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(slotsCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, slotsCapacity, ONE_MINUTE);
     }
 
     @Bean
     public LoadingCache<String, Bucket> deviceTokenBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(deviceTokenCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, deviceTokenCapacity, ONE_MINUTE);
     }
 
     @Bean
     public LoadingCache<String, Bucket> mediaUploadBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(mediaUploadCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, mediaUploadCapacity, ONE_MINUTE);
     }
 
     @Bean
     public LoadingCache<String, Bucket> verifyEmailBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(VERIFY_EMAIL_WINDOW.plusMinutes(5))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(verifyEmailCapacity, VERIFY_EMAIL_WINDOW))
-                        .build());
+        return bucketCache(
+                VERIFY_EMAIL_BUCKET_CACHE_SIZE,
+                VERIFY_EMAIL_WINDOW.plus(EVICTION_GRACE),
+                verifyEmailCapacity,
+                VERIFY_EMAIL_WINDOW);
     }
 
-    // Per-IP cap for POST /api/v1/auth/resend-verification (60-second window).
-    // 3 requests per minute matches the per-account RESEND_COOLDOWN (60 s) and
-    // is generous enough for a legitimate retry (network hiccup, paste error)
-    // while blocking rapid volumetric abuse from a single IP.
+    /**
+     * Per-IP bucket for {@code POST /api/v1/auth/resend-verification}.
+     *
+     * <p>3 requests per 60-second window matches the per-account RESEND_COOLDOWN (60 s)
+     * and is generous enough for a legitimate retry (network hiccup, paste error) while
+     * blocking rapid volumetric abuse from a single IP. {@code expireAfterAccess(90 s)}
+     * gives a 30-second grace past the window so the entry is not evicted the instant the
+     * window rolls over.
+     */
     @Bean
     public LoadingCache<String, Bucket> resendVerificationBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(90, java.util.concurrent.TimeUnit.SECONDS)
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(resendVerificationCapacity, Duration.ofSeconds(60)))
-                        .build());
+        return bucketCache(
+                RESEND_VERIFICATION_BUCKET_CACHE_SIZE,
+                Duration.ofSeconds(90),
+                resendVerificationCapacity,
+                RESEND_VERIFICATION_WINDOW);
     }
 
     /**
@@ -234,12 +226,11 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> forgotPasswordBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofMinutes(65))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(forgotPasswordCapacity, Duration.ofMinutes(60)))
-                        .build());
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                PASSWORD_RESET_WINDOW.plus(EVICTION_GRACE),
+                forgotPasswordCapacity,
+                PASSWORD_RESET_WINDOW);
     }
 
     /**
@@ -257,12 +248,7 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> profileUpdateBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(profileUpdateCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, profileUpdateCapacity, ONE_MINUTE);
     }
 
     /**
@@ -278,12 +264,11 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> resetPasswordBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofMinutes(65))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(resetPasswordCapacity, Duration.ofMinutes(60)))
-                        .build());
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                PASSWORD_RESET_WINDOW.plus(EVICTION_GRACE),
+                resetPasswordCapacity,
+                PASSWORD_RESET_WINDOW);
     }
 
     /**
@@ -297,12 +282,11 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> categoryRequestBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(CATEGORY_REQUEST_WINDOW.plusMinutes(5))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(categoryRequestCapacity, CATEGORY_REQUEST_WINDOW))
-                        .build());
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                CATEGORY_REQUEST_WINDOW.plus(EVICTION_GRACE),
+                categoryRequestCapacity,
+                CATEGORY_REQUEST_WINDOW);
     }
 
     /**
@@ -316,12 +300,11 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> suggestServiceTypeBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(SUGGEST_SERVICE_TYPE_WINDOW.plusMinutes(5))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(suggestServiceTypeCapacity, SUGGEST_SERVICE_TYPE_WINDOW))
-                        .build());
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                SUGGEST_SERVICE_TYPE_WINDOW.plus(EVICTION_GRACE),
+                suggestServiceTypeCapacity,
+                SUGGEST_SERVICE_TYPE_WINDOW);
     }
 
     /**
@@ -342,12 +325,7 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> bulkServiceSetupBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(Duration.ofHours(1))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(bulkServiceSetupCapacity, Duration.ofMinutes(1)))
-                        .build());
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, bulkServiceSetupCapacity, ONE_MINUTE);
     }
 
     /**
@@ -362,12 +340,11 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> supportContactBuckets() {
-        return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(SUPPORT_CONTACT_WINDOW.plusMinutes(5))
-                .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(supportContactCapacity, SUPPORT_CONTACT_WINDOW))
-                        .build());
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                SUPPORT_CONTACT_WINDOW.plus(EVICTION_GRACE),
+                supportContactCapacity,
+                SUPPORT_CONTACT_WINDOW);
     }
 
     /**
@@ -383,11 +360,26 @@ public class RateLimitConfig {
      */
     @Bean
     public LoadingCache<String, Bucket> otpSendBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                OTP_SEND_WINDOW.plus(EVICTION_GRACE),
+                otpSendCapacity,
+                OTP_SEND_WINDOW);
+    }
+
+    /**
+     * Shared builder for every per-IP {@link Bucket} cache in this filter. Each bean
+     * keeps its OWN security-critical {@code capacity} / {@code refillPeriod} (the rate
+     * limit) and its OWN {@code maxSize} / {@code evictAfterAccess} (Caffeine eviction
+     * tuning); only the Caffeine + Bucket4j construction boilerplate is shared here.
+     */
+    private LoadingCache<String, Bucket> bucketCache(
+            long maxSize, Duration evictAfterAccess, long capacity, Duration refillPeriod) {
         return Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(OTP_SEND_WINDOW.plusMinutes(5))
+                .maximumSize(maxSize)
+                .expireAfterAccess(evictAfterAccess)
                 .build(key -> Bucket.builder()
-                        .addLimit(bandwidthOf(otpSendCapacity, OTP_SEND_WINDOW))
+                        .addLimit(bandwidthOf(capacity, refillPeriod))
                         .build());
     }
 
