@@ -3,7 +3,6 @@ package com.beautica.auth;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InviteRequest;
-import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.service.MasterService;
@@ -32,6 +31,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -161,19 +161,30 @@ class InviteServiceAdminTest {
     // ── sendInvite — email conflict guard ─────────────────────────────────────
 
     @Test
-    @DisplayName("sendInvite throws BusinessException when email is already registered")
-    void should_throwConflict_when_emailAlreadyRegistered() {
+    @DisplayName("sendInvite returns generic success (no token, no email) when email is already registered — enumeration hardening")
+    void should_returnGenericSuccessNoToken_when_emailAlreadyRegistered() {
+        // New contract: already-registered is no longer a distinguishing 409 (enumeration oracle).
+        // Authorization + ownership run first, then the already-registered branch returns the same
+        // generic InviteResponse with no token saved and no e-mail enqueued.
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
+        var owner = buildOwner(callerId, salonId);
         var request = new InviteRequest("existing@example.com", salonId, Role.SALON_MASTER);
 
         when(userRepository.existsByEmail("existing@example.com")).thenReturn(true);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId))
+                .thenReturn(Optional.of(mock(com.beautica.salon.entity.Salon.class)));
 
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("already registered");
+        var response = inviteService.sendInvite(request, callerId);
+
+        assertThat(response.invitedEmail())
+                .as("already-registered target must still echo the same generic invited email")
+                .isEqualTo("existing@example.com");
+        assertThat(response.expiresAt()).isAfter(Instant.now());
 
         verify(inviteTokenRepository, never()).save(any());
+        verify(outboxService, never()).enqueueInvite(any(), anyString(), anyString(), anyString());
     }
 
     // ── sendInvite — caller-ownership guard ───────────────────────────────────

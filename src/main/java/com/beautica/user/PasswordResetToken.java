@@ -40,6 +40,10 @@ public class PasswordResetToken extends AuditableEntity {
     @Column(name = "user_id", nullable = false)
     private UUID userId;
 
+    // Indexed in DB by idx_password_reset_tokens_expires_at (Flyway V100) to back the
+    // daily cleanup sweep (DELETE WHERE expires_at < cutoff). Not mirrored as a JPA
+    // @Index here to stay consistent with the table's other indexes (token/user_id),
+    // which are likewise declared only in Flyway.
     @Column(name = "expires_at", nullable = false)
     private Instant expiresAt;
 

@@ -32,6 +32,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String RESEND_VERIFICATION_PATH = "/api/v1/auth/resend-verification";
     private static final String FORGOT_PASSWORD_PATH = "/api/v1/auth/forgot-password";
     private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
+    private static final String INVITE_PATH = "/api/v1/auth/invite";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
@@ -128,6 +129,20 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // on by several slice/regression tests — stays unchanged.
     private static final long SEARCH_CAPACITY = 40;
     private static final Duration SEARCH_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
+    // unthrottled surface. This is both the residual enumeration/timing surface left after the
+    // InviteService 409->idempotent fix (the already-registered and active-invite branches do
+    // measurably less work — no token gen, hash, persist or outbox encrypt — so an unthrottled
+    // authenticated SALON_OWNER could gather enough timing samples to infer registration
+    // status) AND an invite-email surface (the happy path enqueues an outbox e-mail). 15/min
+    // is generous for a human onboarding their team one invite at a time while bounding both
+    // automated probing and e-mail abuse; any abuse is still attributable to the authenticated
+    // SALON_OWNER principal. IP-keyed for consistency with every other bucket here (JWT is
+    // parsed in JwtAuthenticationFilter, which runs AFTER this filter). Built internally (not
+    // an injected @Qualifier bean) so the public 16-arg constructor — depended on by several
+    // slice/regression tests — stays unchanged.
+    private static final long INVITE_CAPACITY = 15;
+    private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -189,6 +204,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Built internally rather than injected so the public 16-arg constructor stays stable for
     // the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> searchBuckets;
+    // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
+    // timing oracle in InviteService.sendInvite (the already-registered / active-invite
+    // branches return fast). Built internally rather than injected so the public 16-arg
+    // constructor stays stable for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> inviteBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -247,6 +267,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(searchBandwidth())
                         .build());
+        this.inviteBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(inviteBandwidth())
+                        .build());
     }
 
     private static Bandwidth otpVerifyBandwidth() {
@@ -274,6 +300,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(SEARCH_CAPACITY)
                 .refillIntervally(SEARCH_CAPACITY, SEARCH_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth inviteBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(INVITE_CAPACITY)
+                .refillIntervally(INVITE_CAPACITY, INVITE_WINDOW)
                 .build();
     }
 
@@ -402,6 +435,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (RESET_PASSWORD_PATH.equals(path)) {
             cache = resetPasswordBuckets;
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
+        } else if (INVITE_PATH.equals(path)) {
+            cache = inviteBuckets;
         } else if (CATEGORY_REQUEST_PATH.equals(path)) {
             cache = categoryRequestBuckets;
             retryAfterSeconds = CATEGORY_REQUEST_RETRY_AFTER_SECONDS;
