@@ -192,20 +192,30 @@ public class PasswordResetService {
     // -------------------------------------------------------------------------
 
     /**
-     * Performs a throwaway token hash on the no-op (unknown / unverified / inactive)
-     * branch so the per-request crypto cost is symmetric with the verified-account
-     * path, which mints + hashes a real token. Without this, response latency would
-     * distinguish a real verified account (extra hash + DB save + email schedule)
-     * from a phantom, opening a timing-based enumeration side-channel.
+     * Performs throwaway work on the no-op (unknown / unverified / inactive) branch so the
+     * per-request cost better tracks the verified-account path, which mints + hashes a real
+     * token and performs an UPDATE + INSERT against {@code password_reset_tokens}.
      *
-     * <p>Mirrors the existing unknown-email defense pattern: the HTTP body is already
-     * identical across branches; this closes the latency channel. The discarded result
-     * is intentional — the cost, not the value, is what matters. (The email-bounce
-     * channel is inherent and accepted; only the latency channel is closed here.)
+     * <p>This is <em>best-effort latency narrowing, not perfect symmetry</em>: the decoy runs
+     * the same token hash plus a single read-only DB round-trip against the same table, whereas
+     * the real path issues writes (which are typically costlier than the read). The discarded
+     * results are intentional — the cost, not the value, is what matters.
+     *
+     * <p>The primary enumeration defenses remain the byte-identical generic 200 response (the
+     * HTTP body is the same across all branches) and the per-IP rate limit on {@code /auth/*};
+     * this method only shrinks the residual timing side-channel. (The email-bounce channel is
+     * inherent and accepted.)
      */
     private void performDecoyWork() {
         String decoyToken = tokenGenerator.generateToken();
-        tokenGenerator.hash(decoyToken);
+        String decoyHash = tokenGenerator.hash(decoyToken);
+        // INTENTIONAL anti-timing-oracle DB round-trip — DO NOT remove or "optimize away".
+        // The real path hits the DB (markAllUsedByUserId UPDATE + save INSERT); without a
+        // representative DB read here this no-op branch would only burn CPU on the hash above,
+        // letting response latency distinguish a phantom account from an eligible one. This is
+        // a read-only probe by the (essentially never-matching) hashed token: no mutation, the
+        // Optional result is deliberately discarded, and the response stays an identical 200.
+        passwordResetTokenRepository.findByToken(decoyHash);
     }
 
     /**
