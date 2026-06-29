@@ -964,17 +964,85 @@ public class SearchService {
             sb.append("AND m.avg_rating >= :minRating ");
             params.put("minRating", filters.minRating());
         }
-        // PERF-M2: price predicates on the pre-computed column — plain WHERE,
-        // no GROUP BY / HAVING needed. NULL min_effective_price means no active
-        // services; such masters are excluded by the range predicate naturally.
-        if (filters.minPrice() != null) {
-            sb.append("AND m.min_effective_price >= :minPrice ");
+        // Phase 20.x — price band-overlap, SCOPED to the SAME active filter the rest
+        // of the query uses, mirroring the salon LATERAL band-overlap (the reference
+        // semantics in SalonRepository: pr.pmax >= :minPrice AND pr.pmin <= :maxPrice).
+        // Replaces the previous predicates on the denormalized whole-catalogue column
+        // m.min_effective_price (V58), which had two defects: (1) the min bound tested
+        // pmin >= :minPrice instead of pmax >= :minPrice — band-overlap requires the
+        // master's HIGH price to clear the floor, so a master with a cheap + an
+        // expensive service was wrongly excluded; (2) both bounds used the
+        // whole-catalogue column while the result card shows a FILTER-SCOPED band, so
+        // under a category / serviceType filter the predicate disagreed with the card
+        // and the salon endpoint. See appendPriceBandExists.
+        appendPriceBandExists(sb, filters, params);
+    }
+
+    /**
+     * Appends the scoped price band-overlap as a SINGLE correlated {@code EXISTS}
+     * over the master's active services, emitted only when a price bound is set.
+     *
+     * <p>The inner WHERE reuses the SAME active filter as the surrounding query so
+     * the price band matches the displayed (scoped) card band: the serviceTypes
+     * disjunction ({@link #appendServiceTypeMatchDisjunction}) takes precedence,
+     * else the {@code sd.category = :category} equality. Both reuse params already
+     * bound by {@link #appendWhereClause} ({@code :stId{n}}/{@code :stName{n}} or
+     * {@code :category}) — no new scope params, no {@code CAST(:p AS ...)} idiom.
+     *
+     * <p>{@code HAVING} without {@code GROUP BY} aggregates the whole correlated set
+     * → returns a row iff the band-overlap holds. The {@code MAX(...) >= :minPrice}
+     * line is emitted only when {@code minPrice != null} and {@code MIN(...) <=
+     * :maxPrice} only when {@code maxPrice != null} (joined with {@code AND} when
+     * both present). A master with no matching active services yields NULL aggregates
+     * → {@code EXISTS} false → excluded, preserving V58's NULL-exclusion behaviour.
+     */
+    private static void appendPriceBandExists(
+            StringBuilder sb, MasterSearchFilters filters, Map<String, Object> params) {
+        boolean hasMin = filters.minPrice() != null;
+        boolean hasMax = filters.maxPrice() != null;
+        if (!hasMin && !hasMax) {
+            return;
+        }
+        // Phase 20.x perf — coarse, index-friendly pre-filter on the ORDERING column,
+        // emitted ONLY for the max bound (no symmetric max_effective_price column
+        // exists for the min bound — that residual stays in the EXISTS). It is
+        // logically REDUNDANT with the exact EXISTS max bound below and so changes no
+        // result: scoping to a category / serviceType can only RAISE the minimum, so
+        //   unscoped m.min_effective_price <= scoped MIN(...) <= :maxPrice
+        // holds whenever the EXISTS max condition passes — it can never exclude a
+        // master the EXISTS includes. Its sole purpose is to let the planner
+        // range-bound the PRICE_ASC/PRICE_DESC ordering index
+        // (idx_masters_min_effective_price) and stop the scan once LIMIT is filled,
+        // instead of walking extra index rows. Reuses the :maxPrice param bound by the
+        // EXISTS below — no new param, no CAST(:p) idiom.
+        if (hasMax) {
+            sb.append("AND m.min_effective_price <= :maxPrice ");
+        }
+        sb.append("AND EXISTS (")
+                .append("SELECT 1 FROM master_services ms ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                .append("WHERE ms.master_id = m.id AND ms.is_active = true ");
+        if (!filters.serviceTypes().isEmpty()) {
+            sb.append("AND (");
+            appendServiceTypeMatchDisjunction(sb, "sd", filters.serviceTypes().size());
+            sb.append(") ");
+        } else if (filters.category() != null) {
+            sb.append("AND sd.category = :category ");
+        }
+        sb.append("HAVING ");
+        if (hasMin) {
+            sb.append("MAX(COALESCE(ms.price_override, ")
+                    .append("CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END)) >= :minPrice ");
             params.put("minPrice", filters.minPrice());
         }
-        if (filters.maxPrice() != null) {
-            sb.append("AND m.min_effective_price <= :maxPrice ");
+        if (hasMax) {
+            if (hasMin) {
+                sb.append("AND ");
+            }
+            sb.append("MIN(COALESCE(ms.price_override, sd.base_price)) <= :maxPrice ");
             params.put("maxPrice", filters.maxPrice());
         }
+        sb.append(") ");
     }
 
     /**

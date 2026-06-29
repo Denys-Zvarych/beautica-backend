@@ -311,6 +311,176 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(1L);
     }
 
+    // ── Price band-overlap fix — MULTI-service masters (regression net) ───────
+    // The earlier predicate filtered on the whole-catalogue floor column
+    // (m.min_effective_price): min bound tested floor >= :minPrice (should be
+    // CEILING >= :minPrice) and the band was never scoped to the active filter.
+    // Every case below seeds a master with TWO services so floor != ceiling —
+    // exactly what the old single-service tests (floor == ceiling) could not catch.
+    // Band semantics mirror the salon path: ceiling >= :minPrice AND floor <= :maxPrice.
+
+    @Test
+    @DisplayName("GET /search/masters — maxPrice excludes an expensive-only master and keeps a master whose floor clears the ceiling")
+    void should_excludeExpensiveOnlyMaster_when_maxPriceBelowEntireBand() throws Exception {
+        ensureHttpClient();
+        // A band [100,800] — its cheapest 100 sits under the ceiling.
+        UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+        // B band [1000,1200] — every service above the ceiling.
+        seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("1000.00"), new BigDecimal("1200.00"));
+
+        log.debug("Act: GET {}?maxPrice=300 — A(floor 100) in, B(floor 1000) out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?maxPrice=300&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("only A (floor 100 <= 300) survives; B (floor 1000 > 300) is excluded")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(a.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — minPrice above a master's ENTIRE band (ceiling 800 < 900) excludes it (min-bound correctness lock; ceiling-vs-floor discrimination lives in the min-only band test)")
+    void should_excludeMaster_when_minPriceAboveEntireBand() throws Exception {
+        ensureHttpClient();
+        // A band [100,800] — ceiling 800 < 900 → A must NOT match even though its
+        // cheap 100 would pass a (wrong) floor-driven predicate inversion.
+        UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+        // B band [1000,1200] — ceiling 1200 >= 900 → B matches.
+        UUID b = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("1000.00"), new BigDecimal("1200.00"));
+
+        log.debug("Act: GET {}?minPrice=900 — B(ceiling 1200) in, A(ceiling 800) out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=900&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("only B (ceiling 1200 >= 900) survives; A (ceiling 800 < 900) is excluded")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(b.toString());
+        for (JsonNode row : data.path("data")) {
+            assertThat(row.path("masterId").asText())
+                    .as("A's cheap 100 must NOT drive inclusion under minPrice=900")
+                    .isNotEqualTo(a.toString());
+        }
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — both bounds: a master is included when its band overlaps [min,max], not when a single service falls inside")
+    void should_includeMaster_when_bandOverlapsBothBounds() throws Exception {
+        ensureHttpClient();
+        // A band [100,800] overlaps [400,500] (ceiling 800 >= 400 AND floor 100 <= 500)
+        // even though NEITHER seeded service price (100, 800) lands inside [400,500].
+        UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+
+        log.debug("Act: GET {}?minPrice=400&maxPrice=500 — band [100,800] overlaps the window", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=400&maxPrice=500&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("band-overlap inclusion: [100,800] overlaps [400,500] despite no service price in range")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(a.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — min-only band test: master included iff its ceiling clears minPrice")
+    void should_applyMinOnlyBand_usingCeiling() throws Exception {
+        ensureHttpClient();
+        // [100,800] — ceiling 800 >= 500 → included.
+        UUID included = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+        // [100,200] — ceiling 200 < 500 → excluded.
+        seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("200.00"));
+
+        log.debug("Act: GET {}?minPrice=500 — [100,800] in, [100,200] out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=500&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("min-only: ceiling 800 clears 500; ceiling 200 does not")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(included.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — max-only band test: master included iff its floor is at or below maxPrice")
+    void should_applyMaxOnlyBand_usingFloor() throws Exception {
+        ensureHttpClient();
+        // [1000,1200] — floor 1000 > 500 → excluded.
+        seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("1000.00"), new BigDecimal("1200.00"));
+        // [100,800] — floor 100 <= 500 → included.
+        UUID included = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+
+        log.debug("Act: GET {}?maxPrice=500 — [100,800] in, [1000,1200] out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?maxPrice=500&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("max-only: floor 100 is within 500; floor 1000 is not")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(included.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — price band is SCOPED to the category filter (a cheap service in another category must not rescue a master)")
+    void should_scopePriceBandToCategory_when_categoryAndMaxSet() throws Exception {
+        ensureHttpClient();
+        // Trap: cheap HAIRCUT 100 + expensive MANICURE 900. The whole-catalogue
+        // cheapest is 100, but the MANICURE-scoped band is [900,900]. Under the old
+        // unscoped predicate (floor 100 <= 300) this master wrongly survived.
+        UUID trap = seedMaster("Київ", "4.00");
+        seedServiceWithCategory(trap, trap, "HAIRCUT", new BigDecimal("100.00"), true, true);
+        seedServiceWithCategory(trap, trap, "MANICURE", new BigDecimal("900.00"), true, true);
+        // Control: a genuine MANICURE 200 inside the window.
+        UUID control = seedMaster("Київ", "4.00");
+        seedServiceWithCategory(control, control, "MANICURE", new BigDecimal("200.00"), true, true);
+
+        log.debug("Act: GET {}?category=MANICURE&maxPrice=300 — scoped band [900,900] excludes the trap", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?category=MANICURE&maxPrice=300&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("MANICURE-scoped band [900,900] > 300 excludes the trap; only the control survives")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(control.toString());
+        for (JsonNode row : data.path("data")) {
+            assertThat(row.path("masterId").asText())
+                    .as("the trap's cheap HAIRCUT 100 must not rescue it under a MANICURE filter")
+                    .isNotEqualTo(trap.toString());
+        }
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
     // ── Phase 6.5 — dynamic SQL branches ─────────────────────────────────────
 
     @Test
@@ -3102,6 +3272,23 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     private UUID seedMasterWithService(String city, String avgRating, BigDecimal basePrice) {
         UUID masterId = seedMaster(city, avgRating);
         seedServiceWithCategory(masterId, masterId, "MANICURE", basePrice, true, true);
+        return masterId;
+    }
+
+    /**
+     * Seeds an INDEPENDENT_MASTER with TWO active FIXED services in the same
+     * {@code category}, priced {@code price1} and {@code price2}, so the master's
+     * effective price BAND ({@code [min, max]}) is genuinely wider than a single
+     * point. This is the fixture the price band-overlap regression net needs: the
+     * pre-fix predicate filtered on the whole-catalogue floor only, so a band
+     * {@code floor != ceiling} was the precise shape that single-service tests
+     * (where {@code floor == ceiling}) could not exercise.
+     */
+    private UUID seedMasterWithTwoServices(String city, String avgRating, String category,
+                                           BigDecimal price1, BigDecimal price2) {
+        UUID masterId = seedMaster(city, avgRating);
+        seedServiceWithCategory(masterId, masterId, category, price1, true, true);
+        seedServiceWithCategory(masterId, masterId, category, price2, true, true);
         return masterId;
     }
 

@@ -533,6 +533,78 @@ class SearchServiceTest {
                 .isEqualByComparingTo(new BigDecimal("500.00"));
     }
 
+    // ── price band-overlap EXISTS (scoped) — generated-SQL guards ────────────
+
+    @Test
+    @DisplayName("price filter emits a correlated EXISTS with HAVING (ceiling >= :minPrice, floor <= :maxPrice); the min bound is NEVER a bare column predicate, but the max bound ALSO emits a coarse index-friendly m.min_effective_price <= :maxPrice pre-filter")
+    void should_emitScopedPriceBandExists_when_priceBoundsSet() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, null, null, null,
+                new BigDecimal("200.00"), new BigDecimal("500.00"), null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        assertThat(sql)
+                .as("price band-overlap is a correlated EXISTS over the master's active services")
+                .contains("AND EXISTS (")
+                .contains("WHERE ms.master_id = m.id AND ms.is_active = true HAVING ")
+                // min bound drives off the CEILING (RANGE-aware MAX), not the floor —
+                // this is the inverted-min defect the fix corrects.
+                .contains("MAX(COALESCE(ms.price_override, "
+                        + "CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END)) >= :minPrice")
+                // max bound drives off the FLOOR.
+                .contains("MIN(COALESCE(ms.price_override, sd.base_price)) <= :maxPrice");
+        assertThat(sql)
+                .as("the inverted-min defect must stay gone — the min bound is ONLY the scoped EXISTS ceiling, never a bare whole-catalogue column predicate")
+                .doesNotContain("m.min_effective_price >= :minPrice")
+                .doesNotContain("CAST(:");
+        assertThat(sql)
+                .as("the max bound ALSO emits a coarse, index-friendly pre-filter on the ordering "
+                        + "column (logically redundant with the EXISTS, range-bounds the PRICE_* sort index)")
+                .contains("AND m.min_effective_price <= :maxPrice");
+        verify(dataQuery).setParameter("minPrice", new BigDecimal("200.00"));
+        verify(dataQuery).setParameter("maxPrice", new BigDecimal("500.00"));
+    }
+
+    @Test
+    @DisplayName("with a category filter the price EXISTS is scoped to sd.category = :category (band agrees with the displayed scoped card)")
+    void should_scopePriceBandExistsToCategory_when_categoryAndPriceSet() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, null, "MANICURE", null,
+                new BigDecimal("100.00"), new BigDecimal("300.00"), null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        // The trailing "HAVING" disambiguates the price-band EXISTS from the
+        // standalone category-filter EXISTS (which ends "= :category) ").
+        assertThat(sql)
+                .as("the price-band EXISTS narrows to the searched category before aggregating the band")
+                .contains("AND sd.category = :category HAVING ")
+                .doesNotContain("CAST(:");
+        verify(dataQuery).setParameter("category", "MANICURE");
+        verify(dataQuery).setParameter("minPrice", new BigDecimal("100.00"));
+        verify(dataQuery).setParameter("maxPrice", new BigDecimal("300.00"));
+    }
+
+    @Test
+    @DisplayName("no price EXISTS / HAVING is emitted when neither price bound is supplied")
+    void should_omitPriceBandExists_when_noPriceBounds() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        assertThat(sql)
+                .as("the price band predicate must not appear without a price bound")
+                .doesNotContain("HAVING ");
+        verify(dataQuery, never()).setParameter(eq("minPrice"), any());
+        verify(dataQuery, never()).setParameter(eq("maxPrice"), any());
+    }
+
     // ── Phase 6.3 active-flag filtering ──────────────────────────────────────
 
     @Test
