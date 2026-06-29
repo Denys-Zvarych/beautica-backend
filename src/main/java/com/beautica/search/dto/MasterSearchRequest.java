@@ -12,6 +12,7 @@ import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -132,6 +133,32 @@ public record MasterSearchRequest(
                          message = "each serviceTypeSlug must be a lowercase hyphenated slug")
                 String> serviceTypeSlugs
 ) {
+
+    /**
+     * Compact constructor — normalizes the scale of every {@code @Digits}-bound
+     * decimal to scale 2 ({@link RoundingMode#HALF_UP}) <b>before</b> Jakarta Bean
+     * Validation runs. Records bind via the canonical constructor, so this body
+     * executes ahead of the {@code @Digits(fraction = 2)} check. Without it, a
+     * float-precision artifact from the mobile price slider (e.g.
+     * {@code maxPrice=1700.0000000000002}, 13 fraction digits) trips
+     * {@code @Digits} and returns a spurious 400.
+     *
+     * <p>Rounding only collapses excess <em>fraction</em> digits — it never
+     * relaxes the integer-digit cap ({@code @Digits(integer = 8/1)}) or the
+     * lower/upper bounds ({@code @DecimalMin}/{@code @DecimalMax}): a genuinely
+     * too-large value (9+ integer digits) or a negative value still fails
+     * validation after rounding. Idempotent with the service-layer
+     * {@code SearchService.normalizePrice}, which harmlessly re-normalizes.</p>
+     */
+    public MasterSearchRequest {
+        minPrice = roundToPriceScale(minPrice);
+        maxPrice = roundToPriceScale(maxPrice);
+        minRating = roundToPriceScale(minRating);
+    }
+
+    private static BigDecimal roundToPriceScale(BigDecimal value) {
+        return value == null ? null : value.setScale(2, RoundingMode.HALF_UP);
+    }
 
     /**
      * Cross-field price-range guard evaluated at Spring MVC argument-resolution

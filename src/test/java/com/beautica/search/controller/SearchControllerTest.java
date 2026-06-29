@@ -309,16 +309,19 @@ class SearchControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — 400 when minPrice has 3 decimal places (@Digits fraction=2)")
-    void should_return400_when_minPriceExceedsFractionPrecision() throws Exception {
-        log.debug("Act: GET {} with minPrice=10.123 — must fail @Digits(fraction=2) and return 400", MASTERS_URL);
+    @DisplayName("GET /api/v1/search/masters — 200 when minPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_minPriceFractionRoundedToScale2() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with minPrice=1700.0000000000002 — float-slider artifact, must round to 1700.00 and return 200", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
-                        .param("minPrice", "10.123")
+                        .param("minPrice", "1700.0000000000002")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false));
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
     }
 
     @Test
@@ -343,6 +346,83 @@ class SearchControllerTest {
         log.debug("Act: GET {} with minPrice=12345678.90 — exactly NUMERIC(10,2), must be accepted (200)", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
                         .param("minPrice", "12345678.90")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when maxPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_maxPriceFractionRoundedToScale2() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // The exact prod artifact from the mobile float price slider, mirrored on the
+        // MAX bound. Pre-fix (no compact ctor) the 13-fraction-digit value trips
+        // @Digits(fraction=2) → spurious 400; post-fix it rounds to 1700.00 → 200.
+        log.debug("Act: GET {} with maxPrice=1700.0000000000002 — float-slider artifact, must round to 1700.00 and return 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("maxPrice", "1700.0000000000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when both price bounds round HALF_UP into the same scale-2 bucket (cross-field guard not tripped by raw values)")
+    void should_return200_when_priceBoundsRoundHalfUpAndRangeStaysValid() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // RAW minPrice (99.014) > RAW maxPrice (99.006): a pre-fix DTO would 400 on
+        // @AssertTrue (min > max) AND on @Digits (3 fraction digits). The compact ctor
+        // rounds BOTH HALF_UP into 99.01 (99.006 rounds UP, 99.014 rounds down), so the
+        // cross-field guard sees 99.01 <= 99.01 → valid → 200. This pins ordering:
+        // rounding happens before @Digits AND before @AssertTrue.
+        log.debug("Act: GET {} with minPrice=99.014 & maxPrice=99.006 — both round HALF_UP to 99.01, range must stay valid → 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "99.014")
+                        .param("maxPrice", "99.006")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when maxPrice rounds to 9 integer digits (magnitude guard survives rounding)")
+    void should_return400_when_maxPriceRoundsToNineIntegerDigits() throws Exception {
+        // Rounding collapses only excess FRACTION digits — it must never relax the
+        // 8-integer-digit cap. 123456789.0000002 rounds to 123456789.00 (9 integer
+        // digits) and still fails @Digits(integer=8) → 400.
+        log.debug("Act: GET {} with maxPrice=123456789.0000002 — rounds to 9 int digits, must still fail @Digits(integer=8) → 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("maxPrice", "123456789.0000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when sub-half-cent negative minPrice rounds to 0.00 (intended benign edge)")
+    void should_return200_when_subHalfCentNegativeMinPriceRoundsToZero() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // Documented benign edge (accepted by security): a sub-half-cent negative
+        // (|value| < 0.005) rounds HALF_UP to 0.00, which satisfies @DecimalMin(0) → 200.
+        // This is NOT a negative-bypass: -0.01 (>= half a cent) still rounds to -0.01
+        // and is rejected by should_return400_when_minPriceNegative.
+        log.debug("Act: GET {} with minPrice=-0.001 — rounds to 0.00, intended benign edge → 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "-0.001")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
@@ -377,6 +457,25 @@ class SearchControllerTest {
         log.debug("Act: GET {} with minRating=5.0 — exactly at @DecimalMax(5.0), must be accepted (200)", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
                         .param("minRating", "5.0")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when minRating has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_minRatingFractionRoundedToScale2() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // Rating slider artifact mirroring the price case: 4.7000000000001 (13 fraction
+        // digits) would trip @Digits(integer=1, fraction=2) pre-fix; the compact ctor
+        // rounds it to 4.70 (still within 0.00–5.00) → 200.
+        log.debug("Act: GET {} with minRating=4.7000000000001 — float artifact, must round to 4.70 and return 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minRating", "4.7000000000001")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
@@ -900,6 +999,73 @@ class SearchControllerTest {
     void should_return400_when_salonMinPriceNegative() throws Exception {
         mockMvc.perform(get(SALONS_URL)
                         .param("minPrice", "-1")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when minPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_salonMinPriceFractionRoundedToScale2() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        // Salon parity for the prod float-slider artifact on the MIN bound.
+        log.debug("Act: GET {} with minPrice=1700.0000000000002 — must round to 1700.00 and return 200", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "1700.0000000000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when maxPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_salonMaxPriceFractionRoundedToScale2() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        // The exact prod artifact, mirrored on the salon MAX bound.
+        log.debug("Act: GET {} with maxPrice=1700.0000000000002 — must round to 1700.00 and return 200", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("maxPrice", "1700.0000000000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when both price bounds round HALF_UP into the same scale-2 bucket (cross-field guard not tripped by raw values)")
+    void should_return200_when_salonPriceBoundsRoundHalfUpAndRangeStaysValid() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        // RAW minPrice (99.014) > RAW maxPrice (99.006) — both round HALF_UP to 99.01,
+        // so the cross-field @AssertTrue sees a valid range. Pre-fix this 400s on both
+        // @Digits (3 fraction digits) and @AssertTrue (raw min > raw max).
+        log.debug("Act: GET {} with minPrice=99.014 & maxPrice=99.006 — both round HALF_UP to 99.01, range must stay valid → 200", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "99.014")
+                        .param("maxPrice", "99.006")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when maxPrice rounds to 9 integer digits (magnitude guard survives rounding)")
+    void should_return400_when_salonMaxPriceRoundsToNineIntegerDigits() throws Exception {
+        log.debug("Act: GET {} with maxPrice=123456789.0000002 — rounds to 9 int digits, must still fail @Digits(integer=8) → 400", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("maxPrice", "123456789.0000002")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))

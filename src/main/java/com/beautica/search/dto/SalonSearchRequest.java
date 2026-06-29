@@ -11,6 +11,7 @@ import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -125,6 +126,31 @@ public record SalonSearchRequest(
                          message = "each serviceTypeSlug must be a lowercase hyphenated slug")
                 String> serviceTypeSlugs
 ) {
+
+    /**
+     * Compact constructor — normalizes the scale of both {@code @Digits}-bound
+     * price bounds to scale 2 ({@link RoundingMode#HALF_UP}) <b>before</b> Jakarta
+     * Bean Validation runs. Records bind via the canonical constructor, so this
+     * body executes ahead of the {@code @Digits(fraction = 2)} check. Without it, a
+     * float-precision artifact from the mobile price slider (e.g.
+     * {@code maxPrice=1700.0000000000002}, 13 fraction digits) trips
+     * {@code @Digits} and returns a spurious 400. (Salon search has no rating
+     * filter, so only the two price bounds are normalized.)
+     *
+     * <p>Rounding only collapses excess <em>fraction</em> digits — it never
+     * relaxes the 8-integer-digit cap ({@code @Digits(integer = 8)}) or the
+     * lower bound ({@code @DecimalMin("0")}): a genuinely too-large value (9+
+     * integer digits) or a negative value still fails validation after rounding.
+     * Idempotent with the service-layer {@code SearchService.normalizePrice}.</p>
+     */
+    public SalonSearchRequest {
+        minPrice = roundToPriceScale(minPrice);
+        maxPrice = roundToPriceScale(maxPrice);
+    }
+
+    private static BigDecimal roundToPriceScale(BigDecimal value) {
+        return value == null ? null : value.setScale(2, RoundingMode.HALF_UP);
+    }
 
     /**
      * Cross-field price-range guard mirroring
