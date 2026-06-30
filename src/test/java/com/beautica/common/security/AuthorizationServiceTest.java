@@ -905,6 +905,36 @@ class AuthorizationServiceTest {
                 .doesNotThrowAnyException();
     }
 
+    // ── canManageMaster — role fast-path (no DB hit) ──────────────────────────
+
+    @Test
+    @DisplayName("canManageMaster returns false without DB hit when actor has ROLE_CLIENT")
+    void should_returnFalseWithoutDbHit_when_clientTriesToManageMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Authentication auth = mockAuth(actorId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result).isFalse();
+        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+    }
+
+    @Test
+    @DisplayName("canManageMaster returns false without DB hit when actor has ROLE_SALON_MASTER")
+    void should_returnFalseWithoutDbHit_when_salonMasterTriesToManageMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result).isFalse();
+        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+    }
+
     // ── canManageMaster — SALON_OWNER branch (Phase 12.1) ─────────────────────
 
     @Test

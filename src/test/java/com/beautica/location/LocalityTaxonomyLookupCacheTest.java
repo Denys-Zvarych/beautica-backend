@@ -11,7 +11,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.Cacheable;
 
+import java.lang.reflect.Method;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -59,6 +61,16 @@ class LocalityTaxonomyLookupCacheTest {
     @BeforeEach
     void clearCache() {
         cacheManager.getCache("localityTaxonomyFacts").clear();
+    }
+
+    @Test
+    @DisplayName("resolve @Cacheable carries sync=true (thundering-herd guard, Anti-Bug §F-7)")
+    void should_declareSyncTrue_on_resolve() throws Exception {
+        Method m = LocalityTaxonomyLookup.class.getMethod("resolve", UUID.class, UUID.class);
+        Cacheable cacheable = m.getAnnotation(Cacheable.class);
+
+        assertThat(cacheable).isNotNull();
+        assertThat(cacheable.sync()).isTrue();
     }
 
     @Test
