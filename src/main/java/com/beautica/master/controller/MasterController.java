@@ -70,8 +70,11 @@ public class MasterController {
 
     /**
      * Public master profile — no authentication required.
-     * Address fields (street, buildingNo, locationNote) are masked on this endpoint.
-     * The authenticated GET /independent-masters/me endpoint returns the full address.
+     * Address fields (street, buildingNo, locationNote, cityId, oblastId, districtId) are masked
+     * for {@code SALON_MASTER} / {@code SALON_OWNER}, but returned in full for
+     * {@code INDEPENDENT_MASTER} — an independent master's address is their discoverable
+     * business location, matching what {@code GET /masters/me} / {@code GET /independent-masters/me}
+     * return to the master themselves. {@code phoneNumber} is always masked on this endpoint.
      */
     @GetMapping("/{masterId}")
     public ApiResponse<MasterDetailResponse> getMasterDetail(@PathVariable UUID masterId) {

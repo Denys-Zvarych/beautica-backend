@@ -65,20 +65,31 @@ public record MasterDetailResponse(
     }
 
     /**
-     * Returns a copy of {@code full} with PII and internal IDs masked for unauthenticated callers.
-     * Masked: phoneNumber, street, buildingNo, locationNote, cityId, oblastId, districtId.
-     * Retained: city display name (non-precise locality), all other public fields.
+     * Returns a copy of {@code full} with PII masked for unauthenticated callers.
+     * {@code phoneNumber} is always masked, regardless of master type.
+     * <p>
+     * Address fields (street, buildingNo, locationNote, cityId, oblastId, districtId) are masked
+     * for {@link MasterType#SALON_MASTER} / {@link MasterType#SALON_OWNER} — a salon master's
+     * precise address is the salon's business address and is not surfaced on this public-by-id
+     * path. For {@link MasterType#INDEPENDENT_MASTER}, the full address is returned unmasked,
+     * matching what the master sees on their own {@code /masters/me} profile — an independent
+     * master's home/work address IS the discoverable location clients need to find them.
      */
     public static MasterDetailResponse fromPublic(MasterDetailResponse full) {
+        boolean isIndependent = full.masterType() == MasterType.INDEPENDENT_MASTER;
         return new MasterDetailResponse(
                 full.masterId(), full.firstName(), full.lastName(),
-                null,             // phoneNumber — masked for public access
+                null,             // phoneNumber — masked for public access, all master types
                 full.city(),
-                null, null, null, // street, buildingNo, locationNote — masked for public access
+                isIndependent ? full.street() : null,
+                isIndependent ? full.buildingNo() : null,
+                isIndependent ? full.locationNote() : null,
                 full.bio(), full.instagram(),
                 full.avatarUrl(), full.avgRating(), full.reviewCount(),
                 full.masterType(), full.salon(), full.workingHours(),
-                null, null, null  // cityId, oblastId, districtId — masked for public access
+                isIndependent ? full.cityId() : null,
+                isIndependent ? full.oblastId() : null,
+                isIndependent ? full.districtId() : null
         );
     }
 }
