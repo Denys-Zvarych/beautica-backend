@@ -95,20 +95,29 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         UUID oblastId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
         UUID districtId = UUID.randomUUID();
-        String suffix = UUID.randomUUID().toString().substring(0, 8);
         em.getEntityManager().createNativeQuery(
                 "INSERT INTO oblasts (id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?)")
-                .setParameter(1, oblastId).setParameter(2, "OB-" + suffix)
+                .setParameter(1, oblastId).setParameter(2, randomKatotthCode())
                 .setParameter(3, "Oblast").setParameter(4, "Oblast").executeUpdate();
         em.getEntityManager().createNativeQuery(
                 "INSERT INTO cities (id, oblast_id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?, ?)")
-                .setParameter(1, cityId).setParameter(2, oblastId).setParameter(3, "CT-" + suffix)
+                .setParameter(1, cityId).setParameter(2, oblastId).setParameter(3, randomKatotthCode())
                 .setParameter(4, "City").setParameter(5, "City").executeUpdate();
         em.getEntityManager().createNativeQuery(
                 "INSERT INTO city_districts (id, city_id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?, ?)")
-                .setParameter(1, districtId).setParameter(2, cityId).setParameter(3, "DT-" + suffix)
+                .setParameter(1, districtId).setParameter(2, cityId).setParameter(3, randomKatotthCode())
                 .setParameter(4, "District").setParameter(5, "District").executeUpdate();
         return new UUID[]{cityId, districtId};
+    }
+
+    /**
+     * V102 added {@code chk_*_katotth_code_format} (^UA[0-9]{17}$) on oblasts/cities/
+     * city_districts — this generates a conforming-but-fake code per row (random 17-digit
+     * suffix), distinct from any real V53-seeded code and unique enough across rows/tests.
+     */
+    private static String randomKatotthCode() {
+        long n = Math.abs(UUID.randomUUID().getMostSignificantBits()) % 100_000_000_000_000_000L;
+        return "UA" + String.format("%017d", n);
     }
 
     private User persistMasterUser(UUID cityId, UUID districtId, String street, String buildingNo, String avatarUrl) {
