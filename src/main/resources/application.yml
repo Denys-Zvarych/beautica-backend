@@ -136,7 +136,49 @@ app:
   invite:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
+  booking:
+    # Phase 13.3 — guest booking. How many days ahead the public availability
+    # endpoint (GET /book/{slug}/availability) will serve slots.
+    availability-max-days: ${BOOKING_AVAILABILITY_MAX_DAYS:60}
+    # Phase 13.4 — guest cancel by link. Minimum lead time (hours) before the
+    # appointment during which a guest may still cancel via the cancel link.
+    # A cancel request inside this window returns 422.
+    cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
+    sms:
+      # Ukrainian SMS copy with {placeholder} tokens substituted at send time
+      # (GuestBookingService / BookingReminderJob). Multiline via YAML block scalar.
+      # Rendered text (a guest's appointment details) is never logged.
+      confirmation: |-
+        Beautica: Запис підтверджено!
+        {masterName}, {serviceName}
+        {date} о {time}
+
+        Скасувати: {cancelUrl}
+      reminder: |-
+        Beautica: Нагадуємо!
+        {serviceName} у {masterName}
+        Завтра о {time}
+      cancellation: |-
+        Beautica: Ваш запис скасовано.
+        {serviceName} у {masterName}
+        {date} о {time}
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
+  support:
+    # Fixed destination inbox for the Help / Contact-us feature
+    # (POST /api/v1/support/contact). Env-driven; blank default does NOT fail
+    # startup — when unset, the contact endpoint returns a clean 503 business
+    # error instead of crashing the app or emailing an empty recipient.
+    email: ${SUPPORT_EMAIL:}
+  sms:
+    # Turbosms SMS provider (Phase 13.1) — cheapest UA provider, shared SMS layer
+    # for Phase 13 OTP + notifications. Env-driven token; blank default does NOT
+    # fail startup (graceful degradation like app.support / R2 / Firebase) — a send
+    # attempt with no token throws a clean SmsDeliveryException. The token is a
+    # secret and is never logged.
+    turbosms:
+      token: ${TURBOSMS_TOKEN:}
+      sender-name: ${TURBOSMS_SENDER_NAME:Beautica}
+      base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB

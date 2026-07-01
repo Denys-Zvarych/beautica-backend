@@ -187,8 +187,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_OWNER invites already-registered email → 409")
-    void should_return409_when_invitedEmailAlreadyRegistered() throws Exception {
+    @DisplayName("SALON_OWNER invites already-registered email → 201 generic success (no enumeration oracle)")
+    void should_return201GenericSuccess_when_invitedEmailAlreadyRegistered() throws Exception {
         String ownerEmail = uniqueEmail("owner2");
         String alreadyRegistered = uniqueEmail("existing");
         createdEmails.add(ownerEmail);
@@ -211,13 +211,65 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 String.class
         );
 
+        // Enumeration hardening: an already-registered target must return the SAME generic 201
+        // and body shape as a normal invite — never a distinguishing 409 — so an authenticated
+        // caller cannot probe registration status.
         assertThat(response.getStatusCode())
-                .as("status must be 409 when invited email is already registered")
-                .isEqualTo(HttpStatus.CONFLICT);
+                .as("already-registered must return the same generic 201 as a normal invite")
+                .isEqualTo(HttpStatus.CREATED);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<Void>>() {});
-        assertThat(body.success()).isFalse();
+                response.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().invitedEmail()).isEqualTo(alreadyRegistered);
+        assertThat(body.data().expiresAt()).isAfter(Instant.now());
+
+        // No invite token is created and no e-mail enqueued for an already-registered target —
+        // the distinguishing side effect is absent, not merely hidden.
+        assertThat(inviteTokenRepository.findByEmailAndIsUsedFalse(alreadyRegistered))
+                .as("no invite token must be persisted for an already-registered email")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("Repeated invite for a pending (not-yet-registered) email is idempotent → 201 both times (no residual 409 oracle)")
+    void should_return201Idempotently_when_inviteSentTwiceForPendingEmail() throws Exception {
+        String ownerEmail = uniqueEmail("owner3");
+        String pendingEmail = uniqueEmail("pending");
+        createdEmails.add(ownerEmail);
+        createdEmails.add(pendingEmail);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: register SALON_OWNER email={}", ownerEmail);
+
+        String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
+
+        HttpHeaders headers = bearerHeaders(ownerAccessToken);
+        var request = new InviteRequest(pendingEmail, salonId, null);
+        HttpEntity<InviteRequest> entity = new HttpEntity<>(request, headers);
+
+        log.debug("Act: POST /auth/invite twice for the same pending email={}", pendingEmail);
+        ResponseEntity<String> first = restTemplate.exchange(
+                "/api/v1/auth/invite", HttpMethod.POST, entity, String.class);
+        ResponseEntity<String> second = restTemplate.exchange(
+                "/api/v1/auth/invite", HttpMethod.POST, entity, String.class);
+
+        // The residual oracle being closed: previously the SECOND call returned 409 for a
+        // pending (not-registered) email while a registered email kept returning 200 — that
+        // 200-vs-409 split revealed registration status. Both calls must now return 201.
+        assertThat(first.getStatusCode())
+                .as("first invite must return 201")
+                .isEqualTo(HttpStatus.CREATED);
+        assertThat(second.getStatusCode())
+                .as("second (idempotent) invite must also return 201 — no residual 409 oracle")
+                .isEqualTo(HttpStatus.CREATED);
+
+        var firstBody = objectMapper.readValue(
+                first.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
+        var secondBody = objectMapper.readValue(
+                second.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
+        assertThat(secondBody.success()).isTrue();
+        assertThat(secondBody.data().invitedEmail()).isEqualTo(firstBody.data().invitedEmail());
     }
 
     @Test

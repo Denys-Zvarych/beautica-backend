@@ -5,8 +5,10 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.PageResponse;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
@@ -105,6 +107,30 @@ public class ReviewService {
                 .map(id -> ReviewResponse.from(byId.get(id)))
                 .toList();
         return new PageImpl<>(content, pageable, idPage.getTotalElements());
+    }
+
+    /**
+     * Principal-scoped list of reviews authored by the signed-in client ({@code GET /reviews/me}).
+     * Not cached: a client's own short history is low-traffic and per-principal, so a cache would
+     * add eviction surface (new reviews) for little gain.
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<MyReviewResponse> getMyReviews(UUID clientUserId, Pageable pageable) {
+        if (pageable.getPageNumber() > MAX_PAGE_NUMBER) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Page number must not exceed " + MAX_PAGE_NUMBER);
+        }
+        // Strip caller-supplied sort: the JPQL has ORDER BY r.createdAt DESC hardcoded.
+        // An arbitrary sort field would trigger PropertyReferenceException, leaking property names.
+        Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
+        Page<MyReviewResponse> page = reviewRepository.findMyReviews(clientUserId, unsortedPage);
+        return PageResponse.of(
+                page.getContent(),
+                page.getNumber(),
+                page.getSize(),
+                page.getTotalElements(),
+                page.getTotalPages()
+        );
     }
 
     // Reviews are immutable after creation — no @CacheEvict path needed.

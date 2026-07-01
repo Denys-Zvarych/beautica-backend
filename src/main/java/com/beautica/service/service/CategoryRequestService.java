@@ -52,7 +52,10 @@ import java.util.UUID;
 public class CategoryRequestService {
 
     private static final Duration TOKEN_TTL = Duration.ofDays(7);
-    private static final String REVIEW_PATH = "/api/v1/service-categories/requests/review?token=";
+    // Token is carried as the trailing PATH SEGMENT (not a query param) so it is not
+    // exposed in proxy access logs or leaked via the Referer header of assets loaded
+    // on the review page. The base64url token charset (A-Za-z0-9-_) is path-safe.
+    private static final String REVIEW_PATH = "/api/v1/service-categories/requests/review/";
     /** Named cache for the global APPROVED+active category list. */
     static final String APPROVED_CATEGORIES_CACHE = "approved-categories";
     /** Constant key — the approved list is platform-wide, not per-user. */

@@ -53,7 +53,7 @@ public final class PriceDisplayFormatter {
      * keeps two decimal places otherwise.
      */
     static String formatAmount(BigDecimal amount) {
-        BigDecimal scaled = amount.setScale(2, RoundingMode.UNNECESSARY);
+        BigDecimal scaled = amount.setScale(2, RoundingMode.HALF_UP);
         if (scaled.scale() == 2 && scaled.stripTrailingZeros().scale() <= 0) {
             // Whole number — display without decimal part
             return scaled.toBigInteger().toString();

@@ -73,6 +73,20 @@ public class NotificationOutboxService {
     }
 
     /**
+     * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2).
+     *
+     * <p>The drained event notifies the provider (master / salon-admin) that the client
+     * moved the booking and it is awaiting re-approval at the new time.
+     *
+     * @param bookingId the UUID of the rescheduled booking
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueBookingRescheduled(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.BOOKING_RESCHEDULED, bookingId, null);
+    }
+
+    /**
      * Enqueues a {@code CLIENT_CANCELLED} notification entry.
      *
      * <p><strong>Phase 5 wire-up note:</strong> Wire this in

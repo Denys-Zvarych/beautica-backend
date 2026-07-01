@@ -17,6 +17,10 @@ import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import com.beautica.review.dto.MyReviewResponse;
+import jakarta.persistence.EntityManagerFactory;
+import org.hibernate.SessionFactory;
+import org.hibernate.stat.Statistics;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import jakarta.persistence.PersistenceException;
@@ -44,6 +48,9 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
 
     @Autowired
     private TestEntityManager em;
+
+    @Autowired
+    private EntityManagerFactory emf;
 
     private User clientUser;
     private Master master;
@@ -347,6 +354,198 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
                 .isInstanceOf(PersistenceException.class)
                 .cause()
                 .isInstanceOf(java.sql.BatchUpdateException.class);
+    }
+
+    // ── findMyReviews (Phase 19.4 — GET /reviews/me) ──────────────────────────
+
+    @Test
+    @DisplayName("findMyReviews — populates master first/last name, service name and bookingId from the projection joins")
+    void should_populateProjectionFields_when_findingMyReviews() {
+        Review review = Review.builder()
+                .booking(completedBooking)
+                .client(clientUser)
+                .master(master)
+                .rating((short) 5)
+                .comment("Loved the manicure")
+                .build();
+        em.persist(review);
+        em.flush();
+        em.clear();
+
+        Page<MyReviewResponse> page = reviewRepository.findMyReviews(
+                clientUser.getId(), PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements()).isEqualTo(1);
+        MyReviewResponse row = page.getContent().get(0);
+        assertThat(row)
+                .extracting(
+                        MyReviewResponse::id, MyReviewResponse::masterId,
+                        MyReviewResponse::masterFirstName, MyReviewResponse::masterLastName,
+                        MyReviewResponse::serviceName, MyReviewResponse::rating,
+                        MyReviewResponse::comment, MyReviewResponse::bookingId)
+                .containsExactly(
+                        review.getId(), master.getId(),
+                        "Master", "User",
+                        "Manicure", 5,
+                        "Loved the manicure", completedBooking.getId());
+        assertThat(row.createdAt())
+                .as("createdAt must be carried through from the review audit timestamp")
+                .isNotNull();
+    }
+
+    @Test
+    @DisplayName("findMyReviews — returns ONLY the requested client's reviews (cross-client isolation)")
+    void should_returnOnlyRequestedClientReviews_when_findingMyReviews() {
+        // Review authored by the seeded clientUser.
+        Review myReview = Review.builder()
+                .booking(completedBooking)
+                .client(clientUser)
+                .master(master)
+                .rating((short) 5)
+                .comment("Mine")
+                .build();
+        em.persist(myReview);
+
+        // A second client with their own booking + review against the same master.
+        User otherClient = new User(
+                "other-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+                Role.CLIENT,
+                "Other",
+                "Client",
+                "+380509999999"
+        );
+        em.persist(otherClient);
+
+        Booking otherBooking = Booking.builder()
+                .client(otherClient)
+                .master(master)
+                .masterService(completedBooking.getMasterService())
+                .status(BookingStatus.COMPLETED)
+                .startsAt(OffsetDateTime.of(2026, 9, 1, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 9, 1, 11, 0, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(otherBooking);
+
+        Review otherReview = Review.builder()
+                .booking(otherBooking)
+                .client(otherClient)
+                .master(master)
+                .rating((short) 1)
+                .comment("Theirs")
+                .build();
+        em.persist(otherReview);
+        em.flush();
+        em.clear();
+
+        Page<MyReviewResponse> page = reviewRepository.findMyReviews(
+                clientUser.getId(), PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements())
+                .as("only the requested client's single review must be returned")
+                .isEqualTo(1);
+        assertThat(page.getContent())
+                .extracting(MyReviewResponse::id, MyReviewResponse::comment)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(myReview.getId(), "Mine"));
+        assertThat(page.getContent())
+                .as("the other client's review must never appear")
+                .noneMatch(r -> r.id().equals(otherReview.getId()));
+    }
+
+    @Test
+    @DisplayName("findMyReviews — orders the client's reviews by createdAt DESC")
+    void should_orderByCreatedAtDesc_when_findingMyReviews() {
+        Booking secondBooking = Booking.builder()
+                .client(clientUser)
+                .master(master)
+                .masterService(completedBooking.getMasterService())
+                .status(BookingStatus.COMPLETED)
+                .startsAt(OffsetDateTime.of(2026, 10, 1, 10, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 10, 1, 11, 0, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(secondBooking);
+        em.flush();
+
+        Review olderReview = Review.builder()
+                .booking(completedBooking)
+                .client(clientUser)
+                .master(master)
+                .rating((short) 3)
+                .comment("Older")
+                .build();
+        em.persist(olderReview);
+        em.flush();
+
+        Review newerReview = Review.builder()
+                .booking(secondBooking)
+                .client(clientUser)
+                .master(master)
+                .rating((short) 5)
+                .comment("Newer")
+                .build();
+        em.persist(newerReview);
+        em.flush();
+        em.clear();
+
+        Page<MyReviewResponse> page = reviewRepository.findMyReviews(
+                clientUser.getId(), PageRequest.of(0, 20));
+
+        assertThat(page.getContent())
+                .extracting(MyReviewResponse::id)
+                .as("newest review must come first (createdAt DESC)")
+                .containsExactly(newerReview.getId(), olderReview.getId());
+    }
+
+    @Test
+    @DisplayName("findMyReviews — runs a bounded, single-statement query regardless of row count (no N+1)")
+    void should_runBoundedQuery_when_findingMyReviews() {
+        // Seed three reviews for the same client across three distinct bookings.
+        int rows = 3;
+        for (int i = 0; i < rows; i++) {
+            Booking booking = Booking.builder()
+                    .client(clientUser)
+                    .master(master)
+                    .masterService(completedBooking.getMasterService())
+                    .status(BookingStatus.COMPLETED)
+                    .startsAt(OffsetDateTime.of(2026, 11, 1 + i, 10, 0, 0, 0, ZoneOffset.UTC))
+                    .endsAt(OffsetDateTime.of(2026, 11, 1 + i, 11, 0, 0, 0, ZoneOffset.UTC))
+                    .priceAtBooking(new BigDecimal("450.00"))
+                    .durationMinutesAtBooking(60)
+                    .bufferMinutesAtBooking(0)
+                    .build();
+            em.persist(booking);
+            Review review = Review.builder()
+                    .booking(booking)
+                    .client(clientUser)
+                    .master(master)
+                    .rating((short) 4)
+                    .comment("Comment " + i)
+                    .build();
+            em.persist(review);
+        }
+        em.flush();
+        em.clear();
+
+        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+        statistics.setStatisticsEnabled(true);
+        statistics.clear();
+
+        Page<MyReviewResponse> page = reviewRepository.findMyReviews(
+                clientUser.getId(), PageRequest.of(0, 20));
+
+        // Constructor-expression projection builds the whole row in one SELECT — no lazy
+        // traversal at mapping time. Page adds a single COUNT statement. Total: 2, independent
+        // of row count. A per-row (N+1) hydration would scale the count with `rows`.
+        assertThat(page.getContent()).hasSize(rows);
+        assertThat(statistics.getPrepareStatementCount())
+                .as("findMyReviews must issue a bounded statement count (SELECT + COUNT), not one per row")
+                .isLessThanOrEqualTo(2);
     }
 
     @Test

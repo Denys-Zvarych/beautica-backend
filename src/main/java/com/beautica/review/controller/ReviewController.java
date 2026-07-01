@@ -2,8 +2,9 @@ package com.beautica.review.controller;
 
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.service.ReviewService;
 import jakarta.validation.Valid;
@@ -14,7 +15,6 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.web.PageableDefault;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -38,7 +38,7 @@ public class ReviewController {
     public ResponseEntity<ApiResponse<ReviewResponse>> createReview(
             @Valid @RequestBody CreateReviewRequest request,
             Authentication auth) {
-        ReviewResponse response = reviewService.createReview(principalId(auth), request);
+        ReviewResponse response = reviewService.createReview(AuthenticationUtils.userId(auth), request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
@@ -56,16 +56,19 @@ public class ReviewController {
         ));
     }
 
+    // Declared before /reviews/{reviewId}; Spring's PathPattern matching also favours the literal
+    // "me" segment over the {reviewId} variable, so the routes are unambiguous in either order.
+    // clientUserId comes only from the authenticated principal — never a query/path parameter.
+    @PreAuthorize("hasRole('CLIENT')")
+    @GetMapping("/reviews/me")
+    public ApiResponse<PageResponse<MyReviewResponse>> getMyReviews(
+            Authentication auth,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ApiResponse.ok(reviewService.getMyReviews(AuthenticationUtils.userId(auth), pageable));
+    }
+
     @GetMapping("/reviews/{reviewId}")
     public ApiResponse<ReviewResponse> getReview(@PathVariable UUID reviewId) {
         return ApiResponse.ok(reviewService.getReview(reviewId));
-    }
-
-    private UUID principalId(Authentication auth) {
-        if (auth instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Access denied");
     }
 }

@@ -3,7 +3,7 @@ package com.beautica.dashboard.controller;
 import com.beautica.auth.Role;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.dashboard.dto.RevenueResponse;
 import com.beautica.dashboard.service.DashboardService;
 import lombok.RequiredArgsConstructor;
@@ -13,7 +13,6 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.GrantedAuthority;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -78,8 +77,8 @@ public class DashboardController {
     ) {
         validateDateBounds(from, to);
 
-        UUID actorId = extractUserId(authentication);
-        Role actorRole = extractRole(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        Role actorRole = AuthenticationUtils.role(authentication);
 
         RevenueResponse result = dashboardService.getRevenueSummary(
                 actorId, actorRole, from, to, filterMasterId, serviceDefId,
@@ -110,49 +109,4 @@ public class DashboardController {
         }
     }
 
-    // ── auth helpers (§ B — instanceof UUID id pattern) ───────────────────────
-
-    /**
-     * Resolves the authenticated user's UUID from the token details.
-     *
-     * <p>Uses the {@code instanceof UUID id} pattern (Anti-Bug Playbook § B): a type mismatch
-     * throws {@link ForbiddenException} (→ 403) rather than a raw {@link ClassCastException}
-     * (→ 500).
-     */
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Not authenticated");
-    }
-
-    /**
-     * Resolves the authenticated user's {@link Role} from the granted authorities.
-     *
-     * <p>Uses the {@code instanceof UsernamePasswordAuthenticationToken} guard (Anti-Bug
-     * Playbook § B), mirroring {@link #extractUserId}: a non-{@code UsernamePasswordAuthentication}
-     * principal (e.g. {@code AnonymousAuthenticationToken} if the security config ever changes)
-     * surfaces as 403 instead of a potential NPE on {@code getAuthorities()}.
-     *
-     * <p>Each principal carries exactly one {@code ROLE_*} authority. The first matching entry is
-     * translated; unrecognised authority strings are skipped rather than thrown — the loop
-     * exhausts and then throws {@link ForbiddenException} with "No role assigned".
-     */
-    private Role extractRole(Authentication authentication) {
-        if (!(authentication instanceof UsernamePasswordAuthenticationToken token)) {
-            throw new ForbiddenException("Not authenticated");
-        }
-        for (GrantedAuthority authority : token.getAuthorities()) {
-            String name = authority.getAuthority();
-            if (name != null && name.startsWith("ROLE_")) {
-                try {
-                    return Role.valueOf(name.substring("ROLE_".length()));
-                } catch (IllegalArgumentException ignored) {
-                    // fall through — another authority might be a valid role
-                }
-            }
-        }
-        throw new ForbiddenException("No role assigned");
-    }
 }

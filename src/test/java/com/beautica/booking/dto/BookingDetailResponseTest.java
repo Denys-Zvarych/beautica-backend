@@ -85,7 +85,7 @@ class BookingDetailResponseTest {
     @Test
     @DisplayName("maps every field correctly when booking is fully populated, including PII traversal")
     void should_mapAllFields_when_bookingIsValid() {
-        var response = BookingDetailResponse.from(booking);
+        var response = BookingDetailResponse.from(booking, true, "Київ", "Шевченківський");
 
         // shared fields
         assertThat(response.id()).isEqualTo(bookingId);
@@ -118,6 +118,12 @@ class BookingDetailResponseTest {
         // comments
         assertThat(response.clientComment()).isEqualTo("great service");
         assertThat(response.providerComment()).isEqualTo("punctual");
+
+        // Phase 19.3 enrichment — passed-in canReview + resolved labels, category from service def
+        assertThat(response.canReview()).isTrue();
+        assertThat(response.cityLabel()).isEqualTo("Київ");
+        assertThat(response.districtLabel()).isEqualTo("Шевченківський");
+        assertThat(response.salonName()).isNull();
     }
 
     @Test
@@ -126,7 +132,7 @@ class BookingDetailResponseTest {
         when(booking.getClientComment()).thenReturn(null);
         when(booking.getProviderComment()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking);
+        var response = BookingDetailResponse.from(booking, false, null, null);
 
         assertThat(response.clientComment()).isNull();
         assertThat(response.providerComment()).isNull();

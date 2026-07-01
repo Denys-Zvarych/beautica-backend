@@ -69,6 +69,10 @@ class MasterServiceTest {
     // parameter — without it the field receives null and resolveOblastId throws NPE whenever
     // getCityId() returns a non-null value.
     @Mock private CityRepository cityRepository;
+    // Phase 13.1: declared so @InjectMocks satisfies the BookingSlugService constructor
+    // parameter. The creation paths call getOrCreateSlug(...) after save — a no-op stub
+    // (default mock) is sufficient; its return value is ignored by MasterService.
+    @Mock private com.beautica.booking.service.BookingSlugService bookingSlugService;
 
     @InjectMocks
     private MasterService masterService;
@@ -96,6 +100,31 @@ class MasterServiceTest {
         assertThat(result.isActive()).isTrue();
         assertThat(result.getSalon()).isNull();
         verify(masterRepository).save(any(Master.class));
+    }
+
+    @Test
+    @DisplayName("should_allocateBookingSlugForSavedMaster_when_createMasterForIndependentUser")
+    void should_allocateBookingSlugForSavedMaster_when_createMasterForIndependentUser() {
+        UUID userId = UUID.randomUUID();
+        UUID savedMasterId = UUID.randomUUID();
+        User user = mock(User.class);
+
+        Master saved = Master.builder()
+                .id(savedMasterId)
+                .user(user)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(true)
+                .build();
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(masterRepository.save(any(Master.class))).thenReturn(saved);
+
+        masterService.createMasterForIndependentUser(userId);
+
+        // Phase 13.1 side-effect contract: the public booking slug MUST be allocated for
+        // the just-saved master id. Without this verify, dropping the getOrCreateSlug call
+        // would leave the master with a null slug (no booking page) yet keep tests green.
+        verify(bookingSlugService).getOrCreateSlug(savedMasterId);
     }
 
     @Test
@@ -137,6 +166,33 @@ class MasterServiceTest {
         assertThat(result.getSalon()).isEqualTo(salon);
         assertThat(result.isActive()).isTrue();
         verify(masterRepository).save(any(Master.class));
+    }
+
+    @Test
+    @DisplayName("should_allocateBookingSlugForSavedMaster_when_createMasterFromInvite")
+    void should_allocateBookingSlugForSavedMaster_when_createMasterFromInvite() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID savedMasterId = UUID.randomUUID();
+        User user = mock(User.class);
+        Salon salon = mock(Salon.class);
+
+        Master saved = Master.builder()
+                .id(savedMasterId)
+                .user(user)
+                .salon(salon)
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(masterRepository.save(any(Master.class))).thenReturn(saved);
+
+        masterService.createMasterFromInvite(userId, salonId);
+
+        // Phase 13.1 side-effect contract: invited salon masters also get a booking slug.
+        verify(bookingSlugService).getOrCreateSlug(savedMasterId);
     }
 
     @Test
@@ -712,6 +768,69 @@ class MasterServiceTest {
         verify(masterRepository).save(any(Master.class));
         verify(userRepository, never()).findById(any());
         verify(salonRepository, never()).findById(any());
+    }
+
+    @Test
+    @DisplayName("should_allocateBookingSlugForSavedMaster_when_createOwnerMaster")
+    void should_allocateBookingSlugForSavedMaster_when_createOwnerMaster() {
+        UUID userId = UUID.randomUUID();
+        UUID savedMasterId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(user);
+
+        Master saved = Master.builder()
+                .id(savedMasterId)
+                .user(user)
+                .salon(salon)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(true)
+                .build();
+
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.empty());
+        when(masterRepository.save(any(Master.class))).thenReturn(saved);
+
+        masterService.createMasterForOwner(user, salon);
+
+        // Phase 13.1 side-effect contract: a newly created owner master gets a booking slug.
+        verify(bookingSlugService).getOrCreateSlug(savedMasterId);
+    }
+
+    @Test
+    @DisplayName("should_notAllocateBookingSlug_when_ownerMasterAlreadyExistsIdempotent")
+    void should_notAllocateBookingSlug_when_ownerMasterAlreadyExistsIdempotent() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(user);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master existing = Master.builder()
+                .user(user)
+                .salon(salon)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(true)
+                .build();
+
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(existing));
+
+        masterService.createMasterForOwner(user, salon);
+
+        // Idempotent early-return path: no save, and crucially no slug allocation — the
+        // existing master keeps its slug, the generator is never re-invoked.
+        verify(masterRepository, never()).save(any());
+        verifyNoInteractions(bookingSlugService);
     }
 
     @Test

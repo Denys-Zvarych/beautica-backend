@@ -22,6 +22,13 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.authorization.AuthorizationDeniedException;
+import org.springframework.security.authorization.AuthorizationDecision;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -31,6 +38,7 @@ import org.springframework.web.multipart.support.MissingServletRequestPartExcept
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -64,6 +72,9 @@ class GlobalExceptionHandlerTest {
         handlerLogger.detachAppender(listAppender);
         handlerLogger.setLevel(null);
         listAppender.stop();
+        // handleAuthorizationDenied reads SecurityContextHolder — always clear it so a
+        // populated context never bleeds into the next test (isolation, no order coupling).
+        SecurityContextHolder.clearContext();
     }
 
     @Test
@@ -240,6 +251,150 @@ class GlobalExceptionHandlerTest {
                 .doesNotContain(piiMessage);
     }
 
+    // ── AuthorizationDeniedException — enriched 403 WARN (method-security path) ────
+    // Regression guard for the access-denied logging enrichment: when a wrong-role
+    // principal is denied, the WARN line MUST carry the HTTP method + request URI +
+    // authorities (so a future 403 is self-diagnosing) and the non-PII subject (the
+    // user id from Authentication.getDetails()), while the 403/401 body stays unchanged.
+    //
+    // Against the PRE-enrichment code (which logged nothing — Spring's opaque
+    // "Resolved [AuthorizationDeniedException: Access Denied]" carried no path/principal)
+    // every "log must contain method/uri/authorities" assertion below FAILS, because no
+    // WARN event is emitted by the handler at all. That is the regression these pin.
+
+    /** A wrong-role authentication: CLIENT principal carrying the user id in getDetails(). */
+    private static UsernamePasswordAuthenticationToken clientAuth(UUID userId, String email) {
+        var auth = new UsernamePasswordAuthenticationToken(
+                email, "N/A", List.of(new SimpleGrantedAuthority("ROLE_CLIENT")));
+        auth.setDetails(userId); // mirrors JwtAuthenticationFilter.setDetails(userId)
+        return auth;
+    }
+
+    private static AuthorizationDeniedException accessDenied() {
+        return new AuthorizationDeniedException("Access Denied", new AuthorizationDecision(false));
+    }
+
+    @Test
+    @DisplayName("handleAuthorizationDenied — 403 unchanged body + WARN carries method, URI, authorities, non-PII subject")
+    void should_logEnrichedWarnAndReturn403_when_clientDeniedByMethodSecurity() {
+        // Arrange — a CLIENT principal denied at a SALON_MASTER/INDEPENDENT_MASTER-only
+        // endpoint (e.g. GET /api/v1/masters/me). The email is PII and must NEVER be logged;
+        // the user id (getDetails()) is the non-PII subject that MUST be logged.
+        UUID userId = UUID.randomUUID();
+        String email = "pii-canary-deny-9c1f@beautica.test";
+        SecurityContextHolder.getContext().setAuthentication(clientAuth(userId, email));
+
+        var request = new MockHttpServletRequest("GET", "/api/v1/masters/me");
+        request.setQueryString("secretToken=leak-me"); // query string must NOT be logged
+        listAppender.list.clear();
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response =
+                handler.handleAuthorizationDenied(accessDenied(), request);
+
+        // Assert — HTTP contract unchanged: 403 with the generic "Access denied" body
+        assertThat(response.getStatusCode())
+                .as("an authenticated wrong-role caller must get 403")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+        assertThat(response.getBody().message())
+                .as("body must remain the generic 'Access denied' string")
+                .isEqualTo("Access denied");
+
+        // Assert — exactly one WARN event was emitted (pre-enrichment: zero → FAILS here)
+        List<ILoggingEvent> warnEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warnEvents)
+                .as("handleAuthorizationDenied must emit exactly one enriched WARN for triage")
+                .hasSize(1);
+
+        String logLine = warnEvents.get(0).getFormattedMessage();
+        // The three diagnostic anchors that make a 403 self-diagnosing.
+        assertThat(logLine)
+                .as("WARN must carry the HTTP method so the denied request is identifiable")
+                .contains("GET");
+        assertThat(logLine)
+                .as("WARN must carry the request URI so the denied endpoint is identifiable")
+                .contains("/api/v1/masters/me");
+        assertThat(logLine)
+                .as("WARN must carry the principal's authorities so the missing role is obvious")
+                .contains("ROLE_CLIENT");
+        // Non-PII subject present (the user id), PII (email) absent.
+        assertThat(logLine)
+                .as("WARN must carry the non-PII subject (user id from getDetails())")
+                .contains(userId.toString());
+
+        // PII / secret guard — neither the email nor the query string may appear anywhere.
+        assertThat(logLine)
+                .as("WARN must NOT log the email (PII) — getName() is the email")
+                .doesNotContain(email);
+        assertThat(logLine)
+                .as("WARN must NOT log the query string (may carry tokens/secrets)")
+                .doesNotContain("secretToken")
+                .doesNotContain("leak-me");
+
+        // No JWT-shaped substring may leak into the log (three dot-separated base64 segments).
+        boolean jwtShaped = listAppender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(m -> m.matches(".*[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}.*"));
+        assertThat(jwtShaped)
+                .as("no log event may contain a JWT-shaped token")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("handleAuthorizationDenied — 401 + WARN authorities=[none], subject=[anonymous] for an unauthenticated caller")
+    void should_logEnrichedWarnAndReturn401_when_unauthenticatedCallerDenied() {
+        // Arrange — an anonymous principal (filter-chain / pre-auth denial). The body must
+        // be 401 "Authentication required" (NOT 403), and the WARN must still carry the
+        // method + URI but redact authorities/subject to safe placeholders.
+        var anon = new AnonymousAuthenticationToken(
+                "key", "anonymousUser",
+                List.of(new SimpleGrantedAuthority("ROLE_ANONYMOUS")));
+        SecurityContextHolder.getContext().setAuthentication(anon);
+
+        var request = new MockHttpServletRequest("DELETE", "/api/v1/masters/me");
+        listAppender.list.clear();
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response =
+                handler.handleAuthorizationDenied(accessDenied(), request);
+
+        // Assert — unauthenticated callers get 401, not 403
+        assertThat(response.getStatusCode())
+                .as("an unauthenticated caller must get 401, not 403")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getBody().message())
+                .as("401 body must be the generic 'Authentication required' string")
+                .isEqualTo("Authentication required");
+
+        // Assert — WARN still carries method + URI, with redacted principal fields
+        List<ILoggingEvent> warnEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warnEvents)
+                .as("an unauthenticated denial must still emit exactly one WARN for triage")
+                .hasSize(1);
+
+        String logLine = warnEvents.get(0).getFormattedMessage();
+        assertThat(logLine)
+                .as("WARN must carry the HTTP method even for anonymous denials")
+                .contains("DELETE");
+        assertThat(logLine)
+                .as("WARN must carry the request URI even for anonymous denials")
+                .contains("/api/v1/masters/me");
+        assertThat(logLine)
+                .as("authorities must be redacted to [none] for an unauthenticated caller")
+                .contains("[none]");
+        assertThat(logLine)
+                .as("subject must be redacted to [anonymous] — the real ROLE_ANONYMOUS authority must not leak")
+                .contains("[anonymous]")
+                .doesNotContain("ROLE_ANONYMOUS");
+    }
+
     @Test
     @DisplayName("Should return 409 with generic message and NOT echo internal message when CONFLICT BusinessException")
     void should_return409_when_conflictExceptionThrown() {
@@ -288,6 +443,28 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody().message())
                 .as("internal salon-state detail must not reach the caller")
                 .doesNotContain("Salon is not active");
+    }
+
+    @Test
+    @DisplayName("Should return 422 and SURFACE the user-facing message when UNPROCESSABLE_ENTITY BusinessException")
+    void should_return422_with_message_when_unprocessableEntityBusinessException() {
+        // Arrange — 422 carries deliberate, user-facing domain copy (Phase 13.4 cancel
+        // window). Unlike CONFLICT/BAD_REQUEST, this message must reach the client verbatim.
+        var ex = new BusinessException(
+                HttpStatus.UNPROCESSABLE_ENTITY,
+                "Скасування недоступне — менше ніж 2 год до запису");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleBusiness(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("status must be 422")
+                .isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        assertThat(response.getBody().message())
+                .as("422 user-facing copy must be surfaced verbatim")
+                .isEqualTo("Скасування недоступне — менше ніж 2 год до запису");
     }
 
     @Test

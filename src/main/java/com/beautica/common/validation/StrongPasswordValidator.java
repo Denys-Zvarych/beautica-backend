@@ -33,11 +33,11 @@ public class StrongPasswordValidator implements ConstraintValidator<StrongPasswo
     static final int MIN_LENGTH = 8;
     static final int MAX_LENGTH = 128;
 
-    /** Precompiled once — matches a string containing at least one ASCII digit. */
-    private static final Pattern HAS_DIGIT = Pattern.compile(".*[0-9].*", Pattern.DOTALL);
+    /** Precompiled once — finds at least one ASCII digit anywhere in the string. */
+    private static final Pattern HAS_DIGIT = Pattern.compile("[0-9]");
 
-    /** Precompiled once — matches a string containing at least one uppercase ASCII letter. */
-    private static final Pattern HAS_UPPERCASE = Pattern.compile(".*[A-Z].*", Pattern.DOTALL);
+    /** Precompiled once — finds at least one uppercase ASCII letter anywhere in the string. */
+    private static final Pattern HAS_UPPERCASE = Pattern.compile("[A-Z]");
 
     /**
      * Lower-cased denylist of trivially-weak passwords. Compared case-insensitively, so
@@ -72,7 +72,7 @@ public class StrongPasswordValidator implements ConstraintValidator<StrongPasswo
         if (value.length() < MIN_LENGTH || value.length() > MAX_LENGTH) {
             return false;
         }
-        if (!HAS_DIGIT.matcher(value).matches() || !HAS_UPPERCASE.matcher(value).matches()) {
+        if (!HAS_DIGIT.matcher(value).find() || !HAS_UPPERCASE.matcher(value).find()) {
             return false;
         }
         return !COMMON_PASSWORDS.contains(value.toLowerCase(Locale.ROOT));

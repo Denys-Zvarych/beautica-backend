@@ -5,6 +5,7 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.enums.BookingStatus;
@@ -124,7 +125,10 @@ class BookingControllerTest {
                 ZonedDateTime.now().plusDays(1).plusMinutes(60),
                 new BigDecimal("500.00"), 60,
                 OffsetDateTime.now(ZoneOffset.UTC),
-                "Oksana", "Kovalenko", "Natalia", "Lysenko", null, null
+                "Oksana", "Kovalenko", "Natalia", "Lysenko", null, null,
+                // Phase 19.3 enrichment fields
+                null, com.beautica.auth.Role.INDEPENDENT_MASTER, null,
+                "Kyiv", null, null, null, "MANICURE", false
         );
     }
 
@@ -810,13 +814,163 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    // ── PATCH /{bookingId}/reschedule (Phase 19.2) ───────────────────────────
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 200 when CLIENT reschedules and the principal id (not the body) is the actor")
+    void should_return200_andUsePrincipalAsActor_when_clientReschedules() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var newStartsAt = ZonedDateTime.now().plusDays(2).toOffsetDateTime();
+        var body = objectMapper.writeValueAsString(new RescheduleBookingRequest(newStartsAt));
+        when(bookingService.rescheduleBooking(eq(clientId), eq(bookingId), any()))
+                .thenReturn(stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.id").value(bookingId.toString()));
+
+        // Actor id handed to the service is the security principal's id — never derived from the body.
+        var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
+        org.mockito.Mockito.verify(bookingService)
+                .rescheduleBooking(actorCaptor.capture(), eq(bookingId), any());
+        org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(clientId);
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when SALON_OWNER attempts to reschedule (role guard)")
+    void should_return403_when_ownerAttemptsToReschedule() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .rescheduleBooking(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when INDEPENDENT_MASTER attempts to reschedule (role guard)")
+    void should_return403_when_masterAttemptsToReschedule() throws Exception {
+        var masterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .rescheduleBooking(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 401 when no Authorization header")
+    void should_return401_when_noTokenOnReschedule() throws Exception {
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 400 when newStartsAt is in the past (@Future constraint)")
+    void should_return400_when_rescheduleNewStartsAtInPast() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = "{\"newStartsAt\":\"2000-01-01T10:00:00+02:00\"}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .rescheduleBooking(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 400 when newStartsAt is absent (@NotNull constraint)")
+    void should_return400_when_rescheduleNewStartsAtMissing() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = "{}";
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 409 when the service reports a conflicting slot or invalid state")
+    void should_return409_when_rescheduleConflicts() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(bookingService.rescheduleBooking(any(), eq(bookingId), any()))
+                .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Slot not available"));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isConflict());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when CLIENT reschedules another client's booking (service ownership guard)")
+    void should_return403_when_clientReschedulesAnotherClientsBooking() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(bookingService.rescheduleBooking(any(), eq(bookingId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+    }
+
     // ── GET /me ───────────────────────────────────────────────────────────────
 
     @Test
     @DisplayName("GET /me — 200 when authenticated CLIENT lists their bookings")
     void should_return200_when_authenticatedListMyBookings() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.listBookings(any(), any(), any(), any())).thenReturn(Page.empty());
+        when(bookingService.getMyBookings(any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -829,7 +983,8 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 and status param is forwarded to the service when ?status=PENDING is supplied")
     void should_return200_and_passStatusParam_when_statusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.listBookings(any(), any(), eq(BookingStatus.PENDING), any())).thenReturn(Page.empty());
+        when(bookingService.getMyBookings(any(), any(), eq(BookingStatus.PENDING), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
                         .param("status", "PENDING")
@@ -838,7 +993,48 @@ class BookingControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
 
-        org.mockito.Mockito.verify(bookingService).listBookings(any(), any(), eq(BookingStatus.PENDING), any());
+        org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(), eq(BookingStatus.PENDING), any());
+    }
+
+    @Test
+    @DisplayName("GET /me — the actor id passed to the service is the security principal, never a client-supplied value")
+    void should_usePrincipalAsActor_when_listingMyBookings() throws Exception {
+        var principalId = UUID.randomUUID();
+        when(bookingService.getMyBookings(eq(principalId), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
+
+        // An attacker-controlled "clientId" query param must be ignored — the actor is the principal.
+        mockMvc.perform(get(BOOKINGS_URL + "/me")
+                        .param("clientId", UUID.randomUUID().toString())
+                        .with(authenticatedAs(principalId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
+        org.mockito.Mockito.verify(bookingService)
+                .getMyBookings(actorCaptor.capture(), any(), any(), any());
+        org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(principalId);
+    }
+
+    @Test
+    @DisplayName("GET /me — 200 returns a PageResponse of enriched BookingDetailResponse rows (canReview + salonName + masterType in the body)")
+    void should_returnEnrichedDetailRows_when_listMyBookingsNonEmpty() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var row = stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID());
+        when(bookingService.getMyBookings(eq(clientId), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(row), 0, 20, 1L, 1));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalElements").value(1))
+                .andExpect(jsonPath("$.data.data[0].id").value(bookingId.toString()))
+                .andExpect(jsonPath("$.data.data[0].status").value("PENDING"))
+                .andExpect(jsonPath("$.data.data[0].masterType").value("INDEPENDENT_MASTER"))
+                .andExpect(jsonPath("$.data.data[0].cityLabel").value("Kyiv"))
+                .andExpect(jsonPath("$.data.data[0].canReview").value(false));
     }
 
     @Test
@@ -853,7 +1049,8 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when SALON_OWNER lists their bookings")
     void should_return200_when_salonOwnerListsBookings() throws Exception {
         var ownerId = UUID.randomUUID();
-        when(bookingService.listBookings(any(), any(), any(), any())).thenReturn(Page.empty());
+        when(bookingService.getMyBookings(any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
@@ -866,7 +1063,8 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when INDEPENDENT_MASTER lists their bookings")
     void should_return200_when_independentMasterListsBookings() throws Exception {
         var masterId = UUID.randomUUID();
-        when(bookingService.listBookings(any(), any(), any(), any())).thenReturn(Page.empty());
+        when(bookingService.getMyBookings(any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))

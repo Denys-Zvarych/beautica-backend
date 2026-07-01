@@ -164,7 +164,8 @@ class SalonServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.createSalon(userId, request))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Only SALON_OWNER may create a salon");
 
         verify(salonRepository, never()).save(any());
     }
@@ -177,7 +178,8 @@ class SalonServiceTest {
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.getSalonEntity(salonId))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Salon not found");
     }
 
     @Test
@@ -195,7 +197,8 @@ class SalonServiceTest {
                 cityId, districtId, "Shevchenka St", "12", "Near the park", null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub: `salon` is a managed entity in-tx; dirty-checking flushes on commit,
+        // so updateSalon no longer calls salonRepository.save() (PERF-LOW redundant-write drop).
         // localityWriteValidator is a mock — validateProviderLocality is a no-op (valid input).
 
         SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
@@ -222,7 +225,7 @@ class SalonServiceTest {
                 UUID.randomUUID(), null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(salon)).thenReturn(salon);
+        // No save() stub: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         SalonResponse response = salonService.updateSalon(actorId, salonId, request);
 
@@ -247,7 +250,8 @@ class SalonServiceTest {
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
         assertThatThrownBy(() -> salonService.updateSalon(ownerId, salonId, request))
-                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                .hasMessageContaining("City is required");
 
         verify(salonRepository, never()).save(any());
     }
@@ -271,7 +275,8 @@ class SalonServiceTest {
 
         // Act + Assert
         assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
-                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                .hasMessageContaining("City is required");
 
         verify(userRepository, never()).save(any(User.class));
     }
@@ -297,7 +302,8 @@ class SalonServiceTest {
 
         // Act + Assert — same exception type updateSalon throws for the same case.
         assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
-                .isInstanceOf(com.beautica.common.exception.BusinessException.class);
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                .hasMessageContaining("City is required");
 
         // No salon persisted, no owner location sync, no master auto-creation on rejection.
         verify(salonRepository, never()).save(any());
@@ -333,7 +339,7 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("deactivateSalon — sets isActive to false and saves when owner requests")
+    @DisplayName("deactivateSalon — sets isActive to false on the managed entity when owner requests")
     void should_deactivateSalon_when_ownerRequests() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -342,12 +348,14 @@ class SalonServiceTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
+        // No save() stub: `salon` is a managed entity in-tx; the isActive mutation flushes via
+        // Hibernate dirty-checking on commit, so deactivateSalon no longer calls save()
+        // (PERF-LOW redundant-write drop). The behavioural contract is the isActive flip below.
 
         salonService.deactivateSalon(ownerId, salonId);
 
         assertThat(salon.isActive()).isFalse();
-        verify(salonRepository).save(salon);
+        verify(salonRepository, never()).save(any());
         verify(userRepository).findById(ownerId);
     }
 
@@ -362,14 +370,15 @@ class SalonServiceTest {
         when(salonRepository.findByIdAndOwnerId(salonId, attackerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Salon not found or access denied");
 
         verify(salonRepository, never()).save(any());
         verify(userRepository).findById(attackerId);
     }
 
     @Test
-    @DisplayName("deactivateSalon — calls findByIdAndOwnerId, save, and findById(user) but no other repository methods")
+    @DisplayName("deactivateSalon — loads via findByIdAndOwnerId and findById(user), uses no other salon-repository methods (no save: dirty-checking flushes)")
     void should_makeExactlyOneRepositoryCall_when_deactivateSalon() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -378,12 +387,13 @@ class SalonServiceTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
-        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
+        // No save() stub: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         salonService.deactivateSalon(ownerId, salonId);
 
         verify(userRepository).findById(ownerId);
         verify(salonRepository).findByIdAndOwnerId(salonId, ownerId);
+        verify(salonRepository, never()).save(any());
         verify(salonRepository, never()).findById(any());
         verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
     }
@@ -398,7 +408,8 @@ class SalonServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.deactivateSalon(userId, salonId))
-                .isInstanceOf(ForbiddenException.class);
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Only SALON_OWNER may deactivate a salon");
 
         verify(salonRepository, never()).save(any());
     }
@@ -411,7 +422,8 @@ class SalonServiceTest {
         when(userRepository.findById(ownerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(ownerId, salonId))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("User not found");
 
         verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
     }
@@ -427,7 +439,8 @@ class SalonServiceTest {
         when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER))
-                .isInstanceOf(NotFoundException.class);
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Salon not found");
 
         verify(inviteService, never()).sendInvite(any(), any());
     }

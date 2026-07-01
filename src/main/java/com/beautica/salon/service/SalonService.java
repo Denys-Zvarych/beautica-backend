@@ -201,7 +201,11 @@ public class SalonService {
             salon.setInstagramUrl(request.instagramUrl());
         }
 
-        SalonResponse result = SalonResponse.from(salonRepository.save(salon));
+        // `salon` was loaded via findById in THIS @Transactional, so it is a managed entity —
+        // Hibernate dirty-checking flushes the setter mutations on commit. The explicit save()
+        // was a redundant no-op write (PERF-LOW); save() returned the same managed instance, so
+        // mapping the in-memory `salon` is equivalent. The findById load is retained (existence).
+        SalonResponse result = SalonResponse.from(salon);
 
         // Evict after commit so a concurrent reader cannot repopulate stale data within the
         // commit window. Replaces the @CacheEvict annotations that fired pre-commit (PERF-MEDIUM-2).
@@ -256,8 +260,11 @@ public class SalonService {
         var salon = salonRepository.findByIdAndOwnerId(salonId, ownerId)
                 .orElseThrow(() -> new NotFoundException("Salon not found or access denied"));
 
+        // `salon` was loaded via findByIdAndOwnerId in THIS @Transactional, so it is a managed
+        // entity — Hibernate dirty-checking flushes the isActive mutation on commit. The explicit
+        // save() was a redundant no-op write (PERF-LOW). The findByIdAndOwnerId load is retained:
+        // it enforces existence + ownership scoping and cannot be dropped.
         salon.setActive(false);
-        salonRepository.save(salon);
 
         // Evict after commit — replaces pre-commit @CacheEvict annotations (PERF-MEDIUM-2).
         // Also evicts search:salons because a deactivated salon must not appear in discovery

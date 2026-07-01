@@ -32,7 +32,7 @@ import java.util.UUID;
         name = "reviews",
         indexes = {
                 @Index(name = "idx_reviews_master_created", columnList = "master_id, created_at DESC"),
-                @Index(name = "idx_reviews_client_id",      columnList = "client_id"),
+                @Index(name = "idx_reviews_client_created", columnList = "client_id, created_at DESC"),
                 // idx_reviews_salon_created and idx_reviews_independent_master are partial indexes
                 // (WHERE salon_id IS NOT NULL / IS NULL) — defined in V40/V41, not expressible in JPA @Index
         }

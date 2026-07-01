@@ -12,6 +12,10 @@ import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 
 /**
  * Inbound request DTO for {@code GET /api/v1/masters/search}.
@@ -43,6 +47,19 @@ import java.math.BigDecimal;
  *       {@link LocationFilter}. {@code @Valid} cascades Bean Validation into
  *       the nested record. Optional: a {@code null} location means "no
  *       location filter".</li>
+ *   <li>{@code q} — free-text name / service-name query. Matched
+ *       case-insensitively ({@code ILIKE %term%}) against the master's first
+ *       name, last name, and the (custom-preferred) service-definition names.
+ *       Capped at 100 chars; the same control-char / HTML-special
+ *       {@code @Pattern} as {@code category} blocks injection on this
+ *       {@code permitAll} endpoint. The service escapes the {@code LIKE}
+ *       wildcards ({@code %}, {@code _}, {@code \}) in the supplied term, so a
+ *       literal {@code %} matches a literal {@code %}. Optional: {@code null} /
+ *       blank means "no text filter".</li>
+ *   <li>{@code sort} — allow-listed ordering; see {@link SearchSort}. Bound to
+ *       an enum so caller text never reaches the {@code ORDER BY}. A
+ *       {@code null} (or unbindable) value falls back to
+ *       {@link SearchSort#RATING_DESC} — the historical default.</li>
  *   <li>{@code category} — kept as a free {@code String} (max 100, mirroring
  *       {@code service_definitions.category VARCHAR(100)} from V6) rather than
  *       binding straight to the {@code ServiceCategory} enum. Enum binding
@@ -76,10 +93,17 @@ public record MasterSearchRequest(
         @Valid
         LocationFilter location,
 
+        @Size(max = 100, message = "q must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+                 message = "q must not contain control characters or HTML special characters")
+        String q,
+
         @Size(max = 100, message = "category must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
                  message = "category must not contain control characters or HTML special characters")
         String category,
+
+        SearchSort sort,
 
         @DecimalMin(value = "0", message = "minPrice must be at least 0")
         @Digits(integer = 8, fraction = 2, message = "minPrice must have at most 8 integer digits and 2 decimal places")
@@ -100,8 +124,41 @@ public record MasterSearchRequest(
 
         @Positive(message = "size must be a positive number")
         @Max(value = 100, message = "size must be at most 100")
-        Integer size
+        Integer size,
+
+        @Size(max = 20, message = "serviceTypeSlugs must contain at most 20 entries")
+        List<
+                @Size(max = 255, message = "each serviceTypeSlug must be at most 255 characters")
+                @Pattern(regexp = "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                         message = "each serviceTypeSlug must be a lowercase hyphenated slug")
+                String> serviceTypeSlugs
 ) {
+
+    /**
+     * Compact constructor — normalizes the scale of every {@code @Digits}-bound
+     * decimal to scale 2 ({@link RoundingMode#HALF_UP}) <b>before</b> Jakarta Bean
+     * Validation runs. Records bind via the canonical constructor, so this body
+     * executes ahead of the {@code @Digits(fraction = 2)} check. Without it, a
+     * float-precision artifact from the mobile price slider (e.g.
+     * {@code maxPrice=1700.0000000000002}, 13 fraction digits) trips
+     * {@code @Digits} and returns a spurious 400.
+     *
+     * <p>Rounding only collapses excess <em>fraction</em> digits — it never
+     * relaxes the integer-digit cap ({@code @Digits(integer = 8/1)}) or the
+     * lower/upper bounds ({@code @DecimalMin}/{@code @DecimalMax}): a genuinely
+     * too-large value (9+ integer digits) or a negative value still fails
+     * validation after rounding. Idempotent with the service-layer
+     * {@code SearchService.normalizePrice}, which harmlessly re-normalizes.</p>
+     */
+    public MasterSearchRequest {
+        minPrice = roundToPriceScale(minPrice);
+        maxPrice = roundToPriceScale(maxPrice);
+        minRating = roundToPriceScale(minRating);
+    }
+
+    private static BigDecimal roundToPriceScale(BigDecimal value) {
+        return value == null ? null : value.setScale(2, RoundingMode.HALF_UP);
+    }
 
     /**
      * Cross-field price-range guard evaluated at Spring MVC argument-resolution
@@ -125,5 +182,32 @@ public record MasterSearchRequest(
             return true;
         }
         return minPrice.compareTo(maxPrice) <= 0;
+    }
+
+    /**
+     * Canonical {@code serviceTypeSlugs} view used for BOTH the {@code @Cacheable}
+     * key and the service-layer filter (Phase 20.1): {@code null}-safe, trimmed,
+     * lower-cased, blank-dropped, de-duplicated, and sorted. Lower-casing collapses
+     * casing variants ({@code "Hair"} / {@code "hair"}) onto one cache key —
+     * service-type slugs are a fixed lowercase vocabulary (the {@code @Pattern}
+     * enforces lowercase at validation; this is defence-in-depth so the resolver
+     * lookup and the cache key stay consistent on any uncached path). Sorting +
+     * dedup keep the key stable regardless of caller ordering or repeats, bounding
+     * key cardinality; the service resolves and filters off this same list so the
+     * cached result always matches the executed query. Never {@code null} — an
+     * absent or empty param yields an empty list (no service filter).
+     */
+    public List<String> normalizedServiceTypeSlugs() {
+        if (serviceTypeSlugs == null) {
+            return List.of();
+        }
+        return serviceTypeSlugs.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .map(slug -> slug.toLowerCase(Locale.ROOT))
+                .filter(slug -> !slug.isEmpty())
+                .distinct()
+                .sorted()
+                .toList();
     }
 }

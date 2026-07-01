@@ -1,6 +1,9 @@
 package com.beautica.auth.filter;
 
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.BandwidthBuilder;
 import io.github.bucket4j.Bucket;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -13,6 +16,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 @Component
 public class AuthRateLimitFilter extends OncePerRequestFilter {
@@ -28,6 +32,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String RESEND_VERIFICATION_PATH = "/api/v1/auth/resend-verification";
     private static final String FORGOT_PASSWORD_PATH = "/api/v1/auth/forgot-password";
     private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
+    private static final String INVITE_PATH = "/api/v1/auth/invite";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
@@ -44,16 +49,100 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String BULK_IM_SERVICES_PATH = "/api/v1/independent-masters/me/services/bulk";
     private static final String BULK_SALON_SERVICES_PREFIX = "/api/v1/salons/";
     private static final String BULK_SALON_SERVICES_SUFFIX = "/services/bulk";
+    private static final String SUPPORT_CONTACT_PATH = "/api/v1/support/contact";
+    private static final String OTP_SEND_PATH = "/api/v1/book/otp/send";
+    private static final String OTP_VERIFY_PATH = "/api/v1/book/otp/verify";
+    // Guest-booking POST carries the {slug} variable, so it is matched by prefix + suffix
+    // (same technique as BULK_SALON_SERVICES / SLOTS): /api/v1/book/{slug}/booking. The suffix
+    // /booking does not collide with the OTP paths (/send, /verify) nor with the public GET
+    // availability read, so only the booking POST consumes this bucket.
+    private static final String GUEST_BOOKING_PATH_PREFIX = "/api/v1/book/";
+    private static final String GUEST_BOOKING_PATH_SUFFIX = "/booking";
+    // Guest cancel-by-link POST carries the {token} variable as a single path segment, so it
+    // is matched by prefix only: /api/v1/book/cancel/{token}. The prefix /api/v1/book/cancel/
+    // does not collide with the guest-booking POST (which ends in /booking) nor with the OTP
+    // exact paths (/book/otp/send, /book/otp/verify), and the GET cancel-info read is excluded
+    // by the POST-method guard, so only the cancel POST consumes this bucket.
+    private static final String CANCEL_POST_PATH_PREFIX = "/api/v1/book/cancel/";
+    // Discovery search read paths (all GET, all permitAll): /api/v1/search/masters and
+    // /api/v1/search/salons. Matched by prefix so any future /search/* read inherits the
+    // same throttle. These endpoints now surface authed-only street addresses for
+    // independent masters, so an unthrottled crawler could bulk-harvest home addresses;
+    // this is the IP-layer defence against that scraping.
+    private static final String SEARCH_PATH_PREFIX = "/api/v1/search/";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
     // suggest-service-type bucket window is 60 minutes — Retry-After reflects the window.
     private static final int SUGGEST_SERVICE_TYPE_RETRY_AFTER_SECONDS = 3600;
+    // support-contact bucket window is 60 minutes — Retry-After reflects the window.
+    private static final int SUPPORT_CONTACT_RETRY_AFTER_SECONDS = 3600;
     // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
     // so clients do not spin-retry every 60 s and waste their remaining IP quota.
     private static final int VERIFY_EMAIL_RETRY_AFTER_SECONDS = 900;
     // forgot-password / reset-password bucket window is 60 minutes.
     private static final int FORGOT_PASSWORD_RETRY_AFTER_SECONDS = 3600;
+    // otp-send bucket window is 15 minutes — Retry-After reflects the actual window.
+    private static final int OTP_SEND_RETRY_AFTER_SECONDS = 900;
+    // otp-verify bucket window is 15 minutes — Retry-After reflects the actual window.
+    private static final int OTP_VERIFY_RETRY_AFTER_SECONDS = 900;
+    // guest-booking-POST bucket window is 15 minutes — Retry-After reflects the actual window.
+    private static final int GUEST_BOOKING_RETRY_AFTER_SECONDS = 900;
+    // cancel-POST bucket window is 15 minutes — Retry-After reflects the actual window.
+    private static final int CANCEL_POST_RETRY_AFTER_SECONDS = 900;
+    // Per-IP cap for POST /api/v1/book/otp/verify (10 / 15 min). Higher than /send (3)
+    // since a legitimate guest may retype a code, but bounded so a single IP cannot pour
+    // unlimited verify attempts at freshly-sent OTPs and defeat the per-OTP attempt cap by
+    // re-sending. This bucket is built internally (not an injected @Qualifier bean) so the
+    // existing 16-arg constructor — depended on by several slice/regression tests — is
+    // unchanged.
+    private static final long OTP_VERIFY_CAPACITY = 10;
+    private static final Duration OTP_VERIFY_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for POST /api/v1/book/{slug}/booking (5 / 15 min). The endpoint is
+    // permitAll() — the guest JWT is validated inside GuestBookingService, not the Spring
+    // filter chain — so without this an attacker holding (or replaying) one valid guest token
+    // could pour unlimited CONFIRMED bookings + billable confirmation SMS at a master. Built
+    // internally (not an injected @Qualifier bean) so the public 16-arg constructor stays stable
+    // for the slice/regression tests that construct this filter directly.
+    private static final long GUEST_BOOKING_CAPACITY = 5;
+    private static final Duration GUEST_BOOKING_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for POST /api/v1/book/cancel/{token} (10 / 15 min). The endpoint is
+    // permitAll() — the guest holds only the one-time cancel token, validated inside the
+    // booking service, not the Spring filter chain — so without this a single source IP can
+    // pour cancel attempts: each accepted POST runs a findByCancelTokenWithGraph JOIN-FETCH +
+    // conditional UPDATE, and a successful cancel dispatches a billable SMS. The token is
+    // 122-bit (not brute-forceable), so the cap is generous enough for a legitimate guest
+    // retrying their own cancel. Built internally (not an injected @Qualifier bean) so the
+    // public 16-arg constructor stays stable for the slice/regression tests that construct
+    // this filter directly.
+    private static final long CANCEL_POST_CAPACITY = 10;
+    private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for GET /api/v1/search/** (40 / 60 s). These permitAll() discovery reads
+    // now expose authed-only street addresses for independent masters, so without a throttle
+    // a single IP could page through every district/city and bulk-harvest home addresses.
+    // 40/min is a paging-friendly ceiling — a human filtering + paginating discovery results
+    // (each page is one request) stays well under it, while a scripted crawler sweeping the
+    // catalogue is capped. IP-keyed for consistency with every other bucket in this filter
+    // (JWT is parsed in JwtAuthenticationFilter, which runs AFTER this filter; and the search
+    // endpoints are permitAll anyway, so anonymous callers carry no principal). Built
+    // internally (not an injected @Qualifier bean) so the public 16-arg constructor — depended
+    // on by several slice/regression tests — stays unchanged.
+    private static final long SEARCH_CAPACITY = 40;
+    private static final Duration SEARCH_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
+    // unthrottled surface. This is both the residual enumeration/timing surface left after the
+    // InviteService 409->idempotent fix (the already-registered and active-invite branches do
+    // measurably less work — no token gen, hash, persist or outbox encrypt — so an unthrottled
+    // authenticated SALON_OWNER could gather enough timing samples to infer registration
+    // status) AND an invite-email surface (the happy path enqueues an outbox e-mail). 15/min
+    // is generous for a human onboarding their team one invite at a time while bounding both
+    // automated probing and e-mail abuse; any abuse is still attributable to the authenticated
+    // SALON_OWNER principal. IP-keyed for consistency with every other bucket here (JWT is
+    // parsed in JwtAuthenticationFilter, which runs AFTER this filter). Built internally (not
+    // an injected @Qualifier bean) so the public 16-arg constructor — depended on by several
+    // slice/regression tests — stays unchanged.
+    private static final long INVITE_CAPACITY = 15;
+    private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -87,6 +176,39 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // first-time-only path runs full 100-item validation, so an authenticated token-holder
     // is a DoS amplifier without this guard (10/min).
     private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
+    // Per-IP bucket for POST /api/v1/support/contact — every successful request emails
+    // the support inbox, so this is an email-bomb / outbound-quota surface (5/hr).
+    private final LoadingCache<String, Bucket> supportContactBuckets;
+    // Per-IP bucket for POST /api/v1/book/otp/send — every successful request sends a
+    // billable SMS, so this is an SMS-bomb / outbound-quota surface (3 / 15 min). This is
+    // the IP-layer defence complementing the per-phone rate limit in PhoneOtpService.
+    private final LoadingCache<String, Bucket> otpSendBuckets;
+    // Per-IP bucket for POST /api/v1/book/otp/verify — the IP-layer half of the CRITICAL
+    // brute-force fix (the per-OTP attempt counter in PhoneOtpService is the other half).
+    // Built internally rather than injected so the public 16-arg constructor stays stable
+    // for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> otpVerifyBuckets;
+    // Per-IP bucket for POST /api/v1/book/{slug}/booking — the HIGH-fix flood guard for the
+    // permitAll() guest-booking endpoint (each accepted POST persists a CONFIRMED booking and
+    // sends a billable SMS). Built internally rather than injected so the public 16-arg
+    // constructor stays stable for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> guestBookingBuckets;
+    // Per-IP bucket for POST /api/v1/book/cancel/{token} — the LOW-fix flood guard for the
+    // permitAll() guest cancel-by-link endpoint (each accepted POST runs a JOIN-FETCH graph
+    // load + conditional UPDATE and a successful cancel sends a billable SMS). Built internally
+    // rather than injected so the public 16-arg constructor stays stable for the slice/regression
+    // tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> cancelPostBuckets;
+    // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
+    // discovery reads (which now surface authed-only independent-master street addresses).
+    // Built internally rather than injected so the public 16-arg constructor stays stable for
+    // the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> searchBuckets;
+    // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
+    // timing oracle in InviteService.sendInvite (the already-registered / active-invite
+    // branches return fast). Built internally rather than injected so the public 16-arg
+    // constructor stays stable for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> inviteBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -102,7 +224,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
             @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
             @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
-            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets) {
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -117,6 +241,73 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.categoryRequestBuckets = categoryRequestBuckets;
         this.suggestServiceTypeBuckets = suggestServiceTypeBuckets;
         this.bulkServiceSetupBuckets = bulkServiceSetupBuckets;
+        this.supportContactBuckets = supportContactBuckets;
+        this.otpSendBuckets = otpSendBuckets;
+        this.otpVerifyBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(otpVerifyBandwidth())
+                        .build());
+        this.guestBookingBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(GUEST_BOOKING_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(guestBookingBandwidth())
+                        .build());
+        this.cancelPostBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(CANCEL_POST_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(cancelPostBandwidth())
+                        .build());
+        this.searchBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SEARCH_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(searchBandwidth())
+                        .build());
+        this.inviteBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(inviteBandwidth())
+                        .build());
+    }
+
+    private static Bandwidth otpVerifyBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(OTP_VERIFY_CAPACITY)
+                .refillIntervally(OTP_VERIFY_CAPACITY, OTP_VERIFY_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth guestBookingBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(GUEST_BOOKING_CAPACITY)
+                .refillIntervally(GUEST_BOOKING_CAPACITY, GUEST_BOOKING_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth cancelPostBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(CANCEL_POST_CAPACITY)
+                .refillIntervally(CANCEL_POST_CAPACITY, CANCEL_POST_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth searchBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SEARCH_CAPACITY)
+                .refillIntervally(SEARCH_CAPACITY, SEARCH_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth inviteBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(INVITE_CAPACITY)
+                .refillIntervally(INVITE_CAPACITY, INVITE_WINDOW)
+                .build();
     }
 
     @Override
@@ -153,6 +344,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
+        // before the POST-only guard so these GET reads are covered. These permitAll() paths
+        // expose authed-only independent-master street addresses, so the throttle is the
+        // IP-layer defence against bulk home-address harvesting. Cap: 40 / 60 s per IP.
+        if (HttpMethod.GET.matches(method)
+                && path.startsWith(SEARCH_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         // Profile-update rate-limit: PATCH /me endpoints — checked before the POST-only
         // guard so PATCH is covered. Cap: 10 requests/min per IP (shared profileUpdateBuckets).
         // JWT is not yet parsed at this point; rate limiting is IP-keyed for consistency
@@ -182,6 +383,32 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Cancel-POST rate-limit: POST /api/v1/book/cancel/{token} — matched by prefix only
+        // (the {token} is one path segment). Placed before the guest-booking and exact-path POST
+        // branches below. The /book/cancel/ prefix does not match the guest-booking suffix
+        // (/booking) nor the OTP exact paths (/send, /verify), and the GET cancel-info read is
+        // excluded by the POST-method guard, so only the cancel POST consumes this bucket.
+        // Cap: 10 / 15 min per IP.
+        if (HttpMethod.POST.matches(method)
+                && path.startsWith(CANCEL_POST_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, cancelPostBuckets,
+                    CANCEL_POST_RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Guest-booking-POST rate-limit: POST /api/v1/book/{slug}/booking — matched by
+        // prefix + suffix (the {slug} is one path segment). Placed before the exact-path POST
+        // branch below. The /booking suffix does not match the OTP exact paths (/send, /verify),
+        // and the GET availability read is excluded by the POST-method guard, so only the
+        // booking POST consumes this bucket. Cap: 5 / 15 min per IP.
+        if (HttpMethod.POST.matches(method)
+                && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
+                && path.endsWith(GUEST_BOOKING_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, guestBookingBuckets,
+                    GUEST_BOOKING_RETRY_AFTER_SECONDS);
+            return;
+        }
+
         if (!HttpMethod.POST.matches(method)) {
             filterChain.doFilter(request, response);
             return;
@@ -208,12 +435,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (RESET_PASSWORD_PATH.equals(path)) {
             cache = resetPasswordBuckets;
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
+        } else if (INVITE_PATH.equals(path)) {
+            cache = inviteBuckets;
         } else if (CATEGORY_REQUEST_PATH.equals(path)) {
             cache = categoryRequestBuckets;
             retryAfterSeconds = CATEGORY_REQUEST_RETRY_AFTER_SECONDS;
         } else if (SUGGEST_SERVICE_TYPE_PATH.equals(path)) {
             cache = suggestServiceTypeBuckets;
             retryAfterSeconds = SUGGEST_SERVICE_TYPE_RETRY_AFTER_SECONDS;
+        } else if (SUPPORT_CONTACT_PATH.equals(path)) {
+            cache = supportContactBuckets;
+            retryAfterSeconds = SUPPORT_CONTACT_RETRY_AFTER_SECONDS;
+        } else if (OTP_SEND_PATH.equals(path)) {
+            cache = otpSendBuckets;
+            retryAfterSeconds = OTP_SEND_RETRY_AFTER_SECONDS;
+        } else if (OTP_VERIFY_PATH.equals(path)) {
+            cache = otpVerifyBuckets;
+            retryAfterSeconds = OTP_VERIFY_RETRY_AFTER_SECONDS;
         } else {
             filterChain.doFilter(request, response);
             return;

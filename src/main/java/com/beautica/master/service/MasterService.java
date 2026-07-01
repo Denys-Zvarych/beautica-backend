@@ -61,6 +61,7 @@ public class MasterService {
     private final BookingRepository bookingRepository;
     private final CacheManager cacheManager;
     private final CityRepository cityRepository;
+    private final com.beautica.booking.service.BookingSlugService bookingSlugService;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -76,7 +77,11 @@ public class MasterService {
                 .isActive(true)
                 .build();
 
-        return masterRepository.save(master);
+        Master saved = masterRepository.save(master);
+        // Phase 13.1: allocate the public booking slug on creation (one extra UPDATE
+        // per registration — acceptable). getOrCreateSlug sets it on the managed entity.
+        bookingSlugService.getOrCreateSlug(saved.getId());
+        return saved;
     }
 
     @Transactional
@@ -96,7 +101,10 @@ public class MasterService {
                 .isActive(true)
                 .build();
 
-        return masterRepository.save(master);
+        Master saved = masterRepository.save(master);
+        // Phase 13.1: allocate the public booking slug on creation.
+        bookingSlugService.getOrCreateSlug(saved.getId());
+        return saved;
     }
 
     /**
@@ -207,7 +215,10 @@ public class MasterService {
                 .reviewCount(0)
                 .isActive(true)
                 .build();
-        return masterRepository.save(master);
+        Master saved = masterRepository.save(master);
+        // Phase 13.1: allocate the public booking slug on creation.
+        bookingSlugService.getOrCreateSlug(saved.getId());
+        return saved;
     }
 
     /**

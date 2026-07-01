@@ -60,7 +60,9 @@ import static org.mockito.Mockito.verify;
 class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
 
     private static final String CATEGORY_NAME = "ITWORKFLOW_NAILART";
-    private static final String TOKEN_QUERY_PARAM = "token=";
+    // Token now rides as the trailing path segment (.../review/{token}); extract
+    // it as the substring after this separator.
+    private static final String REVIEW_TOKEN_SEPARATOR = "/review/";
 
     @Autowired private CategoryRequestService categoryRequestService;
     @Autowired private ServiceCatalogService serviceCatalogService;
@@ -118,7 +120,7 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
                 anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
                 urlCaptor.capture());
         String rawToken = urlCaptor.getValue()
-                .substring(urlCaptor.getValue().indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
+                .substring(urlCaptor.getValue().indexOf(REVIEW_TOKEN_SEPARATOR) + REVIEW_TOKEN_SEPARATOR.length());
 
         PlatformCategory persisted = platformCategoryRepository
                 .findByTokenHash(tokenGenerator.hash(rawToken))
@@ -187,7 +189,7 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
                 anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
                 urlCaptor.capture());
         String rawToken = urlCaptor.getValue()
-                .substring(urlCaptor.getValue().indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
+                .substring(urlCaptor.getValue().indexOf(REVIEW_TOKEN_SEPARATOR) + REVIEW_TOKEN_SEPARATOR.length());
 
         // Act — approve the category.
         DecisionOutcome outcome = categoryRequestService.approve(rawToken);
@@ -228,7 +230,7 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
                 anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
                 urlCaptor.capture());
         String rawToken = urlCaptor.getValue()
-                .substring(urlCaptor.getValue().indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
+                .substring(urlCaptor.getValue().indexOf(REVIEW_TOKEN_SEPARATOR) + REVIEW_TOKEN_SEPARATOR.length());
 
         categoryRequestService.approve(rawToken);
 

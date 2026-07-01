@@ -22,5 +22,12 @@ public enum OutboxEventType {
     CLIENT_CANCELLED,
 
     /** A salon owner or admin sent an invite to a new master or admin. */
-    INVITE
+    INVITE,
+
+    /**
+     * A client moved an existing PENDING/CONFIRMED booking to a new time (Phase 19.2).
+     * The booking is back in PENDING awaiting the provider's re-approval; the provider
+     * (master / salon-admin) is notified to re-confirm or decline at the new time.
+     */
+    BOOKING_RESCHEDULED
 }

@@ -109,7 +109,7 @@ class InternalApiKeyFilterTest {
         AuthRateLimitFilter authRateLimitFilter() {
             LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
             return new AuthRateLimitFilter(
-                    dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
+                    dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
                                                 HttpServletResponse res,

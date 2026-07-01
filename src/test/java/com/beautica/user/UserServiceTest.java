@@ -8,6 +8,7 @@ import com.beautica.location.LocalityWriteInput;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
@@ -30,6 +31,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -47,13 +49,17 @@ class UserServiceTest {
     private CityRepository cityRepository;
 
     @Mock
+    private CityDistrictRepository cityDistrictRepository;
+
+    @Mock
     private CacheManager cacheManager;
 
     private UserService userService;
 
     @BeforeEach
     void setUp() {
-        userService = new UserService(userRepository, localityWriteValidator, cityRepository, cacheManager);
+        userService = new UserService(
+                userRepository, localityWriteValidator, cityRepository, cityDistrictRepository, cacheManager);
     }
 
     @Test
@@ -73,6 +79,129 @@ class UserServiceTest {
         assertThat(response.lastName()).isEqualTo("Smith");
         assertThat(response.phoneNumber()).isEqualTo("+380671234567");
         assertThat(response.isActive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("getProfile resolves districtName and never queries the district repo when districtId is null")
+    void should_notQueryDistrict_when_districtIdNull() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "noloc@example.com", Role.CLIENT, "No", "District", "+380501111111");
+        // districtId left null; cityName/oblastName read off denormalised columns.
+        user.setCity("Київ");
+        user.setRegion("Київська область");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.cityName())
+                .as("cityName is read off the denormalised users.city column (zero query)")
+                .isEqualTo("Київ");
+        assertThat(response.oblastName())
+                .as("oblastName is read off the denormalised users.region column (zero query)")
+                .isEqualTo("Київська область");
+        assertThat(response.districtName())
+                .as("no districtId set → districtName stays null")
+                .isNull();
+        verify(cityDistrictRepository, never()).findNameUkById(any());
+    }
+
+    @Test
+    @DisplayName("getProfile resolves districtName via findNameUkById exactly once when districtId is set")
+    void should_resolveDistrictName_when_districtIdSet() {
+        UUID userId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User user = buildUser(userId, "withdist@example.com", Role.CLIENT, "Has", "District", "+380501111111");
+        user.setCity("Дніпро");
+        user.setRegion("Дніпропетровська область");
+        user.setDistrictId(districtId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityDistrictRepository.findNameUkById(districtId)).thenReturn(Optional.of("Соборний район"));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.cityName()).isEqualTo("Дніпро");
+        assertThat(response.oblastName()).isEqualTo("Дніпропетровська область");
+        assertThat(response.districtName())
+                .as("districtName is the name_uk resolved by findNameUkById for the set districtId")
+                .isEqualTo("Соборний район");
+        verify(cityDistrictRepository, times(1)).findNameUkById(districtId);
+    }
+
+    @Test
+    @DisplayName("getProfile returns null districtName when the district lookup resolves empty (orElse(null) arm)")
+    void should_returnNullDistrictName_when_lookupEmpty() {
+        UUID userId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User user = buildUser(userId, "staledist@example.com", Role.CLIENT, "Stale", "District", "+380501111111");
+        user.setDistrictId(districtId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityDistrictRepository.findNameUkById(districtId)).thenReturn(Optional.empty());
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.districtName())
+                .as("an unresolved districtId falls back to null via orElse(null), never throws")
+                .isNull();
+        verify(cityDistrictRepository, times(1)).findNameUkById(districtId);
+    }
+
+    @Test
+    @DisplayName("getProfile resolves oblastId via findOblastIdById exactly once when cityId is set")
+    void should_resolveOblastId_when_cityIdSet() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User user = buildUser(userId, "withcity@example.com", Role.CLIENT, "Has", "City", "+380501111111");
+        user.setCityId(cityId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.of(oblastId));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.oblastId())
+                .as("oblastId is the parent oblast id resolved by findOblastIdById for the set cityId")
+                .isEqualTo(oblastId);
+        verify(cityRepository, times(1)).findOblastIdById(cityId);
+    }
+
+    @Test
+    @DisplayName("getProfile returns null oblastId and never queries the city repo when cityId is null")
+    void should_notQueryOblast_when_cityIdNull() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "nocity@example.com", Role.CLIENT, "No", "City", "+380501111111");
+        // cityId left null — the home-hub/Location-edit pre-select has nothing to resolve.
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.oblastId())
+                .as("no cityId set → oblastId stays null and no query is issued")
+                .isNull();
+        verify(cityRepository, never()).findOblastIdById(any());
+    }
+
+    @Test
+    @DisplayName("getProfile returns null oblastId when the city lookup resolves empty (orElse(null) arm)")
+    void should_returnNullOblastId_when_lookupEmpty() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "stalecity@example.com", Role.CLIENT, "Stale", "City", "+380501111111");
+        user.setCityId(cityId);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.empty());
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.oblastId())
+                .as("an unresolved cityId falls back to null via orElse(null), never throws")
+                .isNull();
+        verify(cityRepository, times(1)).findOblastIdById(cityId);
     }
 
     @Test
@@ -98,7 +227,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest("Robert", "New", null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -117,7 +246,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -137,7 +266,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, "+380991234567",
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -163,7 +292,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, "Lesi Ukrainky", "7", "Blue door");
+                cityId, districtId, "Lesi Ukrainky", "7", "Blue door", null);
 
         userService.updateProfile(userId, request);
 
@@ -195,7 +324,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, "Shevchenka", "12A", "ring twice");
+                cityId, districtId, "Shevchenka", "12A", "ring twice", null);
 
         userService.updateProfile(userId, request);
 
@@ -225,7 +354,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, "вул. Дерибасівська", "5", "yellow building");
+                cityId, null, "вул. Дерибасівська", "5", "yellow building", null);
 
         userService.updateProfile(userId, request);
 
@@ -235,32 +364,193 @@ class UserServiceTest {
     }
 
     @Test
-    @DisplayName("updateProfile (CLIENT) with null cityId clears cityId/districtId but retains pre-existing street fields")
-    void should_clearAllLocalityFields_when_clientSendsNullCityId() {
+    @DisplayName("updateProfile (CLIENT) — a null cityId in the PATCH RETAINS the pre-existing city/district FK and denorm strings (regression: writeLocalityFields FK-wipe bug)")
+    void should_retainCityId_when_clientPatchesWithNullCityId() {
+        // REGRESSION GUARD for the writeLocalityFields FK-wipe bug (V97 self-heals affected rows).
+        // OLD behaviour: cityId was assigned UNCONDITIONALLY, so a street/note-only edit with a
+        // null cityId wiped a previously-saved users.city_id FK to NULL while leaving the
+        // denormalized users.city / users.region text intact — the mobile read keys off cityId/
+        // oblastId, so location rendered empty. FIXED: a null cityId means "locality not part of
+        // this update" → the existing FK + denorm strings are RETAINED. This test asserts retention.
         UUID userId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID existingDistrictId = UUID.randomUUID();
         User user = buildUser(userId, "c3@example.com", Role.CLIENT, "Null", "City", "+380501111111");
-        // Pre-populate locality so we can confirm referential IDs are cleared while
-        // free-text fields (street/buildingNo/locationNote) are retained via the null-guard.
-        user.setCityId(UUID.randomUUID());
-        user.setDistrictId(UUID.randomUUID());
+        user.setCityId(existingCityId);
+        user.setDistrictId(existingDistrictId);
+        user.setCity("Гнівань");
+        user.setRegion("Вінницька область");
         user.setStreet("Old Street");
         user.setBuildingNo("1");
         user.setLocationNote("old note");
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
+        // PATCH carries NO cityId (CLIENT city is optional) — only the locality validator runs;
+        // the FK write path is skipped entirely.
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
         verify(localityWriteValidator).validateClientLocality(new LocalityWriteInput(null, null));
-        assertThat(user.getCityId()).isNull();
-        assertThat(user.getDistrictId()).isNull();
-        // street/buildingNo/locationNote are null in the request — null-guard skips them → retained.
+        // null cityId → guard skips the FK + display-string writes → existing values RETAINED.
+        assertThat(user.getCityId())
+                .as("a null cityId must NOT wipe the previously-saved city FK")
+                .isEqualTo(existingCityId);
+        assertThat(user.getDistrictId())
+                .as("a null cityId must NOT wipe the previously-saved district FK")
+                .isEqualTo(existingDistrictId);
+        assertThat(user.getCity())
+                .as("denormalized city text is left untouched when cityId is omitted")
+                .isEqualTo("Гнівань");
+        assertThat(user.getRegion())
+                .as("denormalized region text is left untouched when cityId is omitted")
+                .isEqualTo("Вінницька область");
+        // writeCityDisplayStrings is reached ONLY when cityId is non-null — never queried here.
+        verify(cityRepository, never()).findByIdWithOblast(any());
+        // street/buildingNo/locationNote are null in the request — Optional.ifPresent skips them → retained.
         assertThat(user.getStreet()).isEqualTo("Old Street");
         assertThat(user.getBuildingNo()).isEqualTo("1");
         assertThat(user.getLocationNote()).isEqualTo("old note");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) — the exact reported bug: city 'Гнівань' saved, PATCH with null cityId + new street keeps the city FK and updates only the street")
+    void should_keepCityFkAndUpdateStreet_when_clientPatchesNewStreetWithoutCity() {
+        // The exact user@gmail.com scenario. A client whose city 'Гнівань' is saved (cityId set)
+        // edits ONLY the street in the mobile Location screen. The PATCH carries cityId=null +
+        // a new street. The city FK must survive; the street must change.
+        UUID userId = UUID.randomUUID();
+        UUID hnivanCityId = UUID.randomUUID();
+        User user = buildUser(userId, "user@gmail.com", Role.CLIENT, "Real", "User", "+380501234567");
+        user.setCityId(hnivanCityId);
+        user.setCity("Гнівань");
+        user.setRegion("Вінницька область");
+        user.setStreet("вул. Стара");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // cityId omitted (null); only a new street is supplied.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, "вул. Нова", null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCityId())
+                .as("the previously-saved Гнівань city FK must be preserved through a street-only edit")
+                .isEqualTo(hnivanCityId);
+        assertThat(user.getCity())
+                .as("denormalized city stays Гнівань")
+                .isEqualTo("Гнівань");
+        assertThat(user.getStreet())
+                .as("the street IS updated by the PATCH")
+                .isEqualTo("вул. Нова");
+        verify(cityRepository, never()).findByIdWithOblast(any());
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) — a real cityId writes the city/district FK and writeCityDisplayStrings populates city/region (happy path)")
+    void should_writeCityFkAndDenormStrings_when_clientPatchesRealCityId() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        User user = buildUser(userId, "happy@example.com", Role.CLIENT, "Happy", "Path", "+380501111111");
+
+        City mockCity = mock(City.class);
+        Oblast mockOblast = mock(Oblast.class);
+        when(mockOblast.getNameUk()).thenReturn("Львівська область");
+        when(mockCity.getNameUk()).thenReturn("Львів");
+        when(mockCity.getOblast()).thenReturn(mockOblast);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, districtId, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCityId())
+                .as("a real cityId is written to the FK")
+                .isEqualTo(cityId);
+        assertThat(user.getDistrictId())
+                .as("the supplied districtId is written alongside the cityId")
+                .isEqualTo(districtId);
+        assertThat(user.getCity())
+                .as("writeCityDisplayStrings denormalizes the city name")
+                .isEqualTo("Львів");
+        assertThat(user.getRegion())
+                .as("writeCityDisplayStrings denormalizes the oblast name")
+                .isEqualTo("Львівська область");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) — a real cityId with null districtId persists the city FK and a null district (districtless-city happy path)")
+    void should_persistNullDistrict_when_clientPatchesCityWithNullDistrict() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "leaf@example.com", Role.CLIENT, "Leaf", "City", "+380501111111");
+        // Pre-existing district must be OVERWRITTEN to null when a real cityId carries a null district.
+        user.setDistrictId(UUID.randomUUID());
+
+        City mockCity = mock(City.class);
+        Oblast mockOblast = mock(Oblast.class);
+        when(mockOblast.getNameUk()).thenReturn("Одеська область");
+        when(mockCity.getNameUk()).thenReturn("Одеса");
+        when(mockCity.getOblast()).thenReturn(mockOblast);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                cityId, null, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getCityId())
+                .as("the real cityId is written")
+                .isEqualTo(cityId);
+        assertThat(user.getDistrictId())
+                .as("a districtless city persists district_id = NULL (the FK write runs with the supplied null district)")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile (INDEPENDENT_MASTER) — a null cityId in the PATCH RETAINS the pre-existing city FK (shared guard is a no-op, not a wipe)")
+    void should_retainCityId_when_independentMasterPatchesWithNullCityId() {
+        // The FK-wipe guard is shared by both the CLIENT and INDEPENDENT_MASTER branches of
+        // writeLocalityFields. A provider editing only the street (cityId omitted) must not lose
+        // its city FK either. validateProviderLocality(null, null) is still invoked — the guard
+        // sits AFTER validation, so a provider who explicitly clears its city is still rejected by
+        // the validator; here the validator is a no-op mock, so we assert the retention path.
+        UUID userId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID existingDistrictId = UUID.randomUUID();
+        User user = buildUser(userId, "im-retain@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
+        user.setCityId(existingCityId);
+        user.setDistrictId(existingDistrictId);
+        user.setCity("Київ");
+        user.setRegion("Київська область");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, "вул. Хрещатик", null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        verify(localityWriteValidator).validateProviderLocality(new LocalityWriteInput(null, null));
+        assertThat(user.getCityId())
+                .as("INDEPENDENT_MASTER null cityId must NOT wipe the pre-existing city FK")
+                .isEqualTo(existingCityId);
+        assertThat(user.getDistrictId())
+                .as("INDEPENDENT_MASTER null cityId must NOT wipe the pre-existing district FK")
+                .isEqualTo(existingDistrictId);
+        assertThat(user.getStreet())
+                .as("the street IS updated")
+                .isEqualTo("вул. Хрещатик");
+        verify(cityRepository, never()).findByIdWithOblast(any());
     }
 
     @Test
@@ -276,7 +566,7 @@ class UserServiceTest {
 
         // PATCH sends only cityId — street, buildingNo, locationNote all null.
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -296,7 +586,7 @@ class UserServiceTest {
 
         // PATCH sends cityId and street but omits buildingNo — null-guard must retain the pre-existing value.
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, "Lesi Ukrainky", null, null);
+                cityId, null, "Lesi Ukrainky", null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -312,7 +602,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Sal", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
 
         userService.updateProfile(userId, request);
 
@@ -330,7 +620,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("No", "Loc", null,
-                null, null, null, null, null);
+                null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -353,7 +643,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -376,7 +666,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -397,7 +687,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Own", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
 
         userService.updateProfile(userId, request);
 
@@ -418,7 +708,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Adm", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note");
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
 
         userService.updateProfile(userId, request);
 
@@ -630,6 +920,130 @@ class UserServiceTest {
         assertThat(user.getPhoneNumber()).isEqualTo("+380670000000");
     }
 
+    // ── updateProfile — Phase 19.6 instagram normalisation ────────────────────
+    // The service mutates the real User entity in place (no save() — Hibernate
+    // dirty-checking flushes on commit), so user.getInstagram() reflects the exact
+    // value handed to User#setInstagram. That is a stronger assertion than an
+    // ArgumentCaptor on a mocked setter: it pins the normalised form actually stored.
+
+    @Test
+    @DisplayName("updateProfile persists a valid instagram handle verbatim when no leading at-sign")
+    void should_persistInstagramHandle_when_validHandleWithoutAtSign() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig1@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "beauty_studio");
+
+        UserProfileResponse response = userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a bare handle is stored verbatim (already canonical)")
+                .isEqualTo("beauty_studio");
+        assertThat(response.instagram())
+                .as("the response echoes the persisted handle")
+                .isEqualTo("beauty_studio");
+    }
+
+    @Test
+    @DisplayName("updateProfile normalises an at-prefixed instagram handle by stripping the leading at-sign and trimming")
+    void should_normaliseInstagram_when_handleHasLeadingAtSignAndSpaces() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig2@example.com", Role.INDEPENDENT_MASTER, "Iga", "Han", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // Surrounding spaces + a single leading @ — normalizeInstagram strips both.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "  @beauty.master  ");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("leading @ stripped and surrounding whitespace trimmed → canonical handle")
+                .isEqualTo("beauty.master");
+    }
+
+    @Test
+    @DisplayName("updateProfile leaves an existing instagram unchanged when instagram is null in the patch")
+    void should_notOverwriteInstagram_when_instagramIsNullInPatch() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig3@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+        user.setInstagram("kept_handle");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a null instagram in the patch must leave the stored handle untouched")
+                .isEqualTo("kept_handle");
+    }
+
+    @Test
+    @DisplayName("updateProfile clears instagram to null when the patch supplies a blank value")
+    void should_clearInstagram_when_blankValueSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig4@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+        user.setInstagram("old_handle");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // Blank (whitespace-only) is the mobile client's CLEAR signal — normalises to null.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "   ");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a blank instagram normalises to null and clears the stored column")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile clears instagram to null when the patch supplies an at-sign-only value")
+    void should_clearInstagram_when_atSignOnlyValueSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig5@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+        user.setInstagram("old_handle");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // "@" alone → strip the @ → blank → null. This is the boundary between
+        // "clear" and a one-char handle, and the V61 CHECK never sees an empty string.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "@");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("an @-only instagram normalises to null (strip @ → blank → null)")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile persists a full instagram.com URL verbatim (URL arm of the pattern)")
+    void should_persistInstagramUrl_when_fullUrlSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "ig6@example.com", Role.CLIENT, "Iga", "Han", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, "https://www.instagram.com/beauty.studio/");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getInstagram())
+                .as("a full instagram.com URL has no leading @ — stored verbatim")
+                .isEqualTo("https://www.instagram.com/beauty.studio/");
+    }
+
     // ── updateProfile — propagate from validator ──────────────────────────────
 
     @Test
@@ -641,7 +1055,7 @@ class UserServiceTest {
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null);
+                cityId, null, null, null, null, null);
         doThrow(new BusinessException("District is required for the selected city"))
                 .when(localityWriteValidator).validateProviderLocality(new LocalityWriteInput(cityId, null));
 

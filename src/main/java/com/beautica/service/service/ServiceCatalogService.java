@@ -422,7 +422,10 @@ public class ServiceCatalogService {
     }
 
     @Transactional(readOnly = true)
-    @Cacheable(value = "masterServices", key = "#masterId")
+    // sync = true collapses the thundering herd: when a popular master's entry expires
+    // (10-min TTL) only ONE thread runs the JOIN-FETCH graph query while concurrent callers
+    // wait for it, instead of N identical queries firing on this public read (Anti-Bug §F-7).
+    @Cacheable(value = "masterServices", key = "#masterId", sync = true)
     public List<MasterServiceResponse> getMasterServices(UUID masterId) {
         // An unknown masterId produces an empty list — the existsById check was a
         // redundant DB round-trip because the JOIN FETCH graph query already returns
@@ -580,6 +583,16 @@ public class ServiceCatalogService {
         if (request.serviceTypeId() != null) {
             ServiceType serviceType = resolveServiceType(request.serviceTypeId(), definition.getCategory());
             definition.setServiceType(serviceType);
+        } else if (request.category() != null && definition.getServiceType() != null) {
+            // Category-only PATCH: the existing service type is not re-resolved, so re-check
+            // that it still belongs to the just-applied category. Without this guard a
+            // category change silently orphans the existing service type (effective pair
+            // inconsistent: definition.category != serviceType.platformCategoryName).
+            ServiceType existing = definition.getServiceType();
+            if (!Objects.equals(existing.getPlatformCategoryName(), definition.getCategory())) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "service type does not belong to the selected category");
+            }
         }
 
         applyNamePatch(definition, request);

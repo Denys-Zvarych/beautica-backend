@@ -1,9 +1,20 @@
 package com.beautica.search.dto;
 
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.AssertTrue;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
+import jakarta.validation.constraints.Size;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 
 /**
  * Inbound request DTO for {@code GET /api/v1/search/salons}.
@@ -30,6 +41,33 @@ import jakarta.validation.constraints.PositiveOrZero;
  *       {@link LocationFilter}. {@code @Valid} cascades Bean Validation into
  *       the nested record. Optional: a {@code null} location means "no
  *       location filter".</li>
+ *   <li>{@code category} — optional service-category filter (Phase 19.7,
+ *       decision 5). When supplied it scopes the salon price-range aggregation
+ *       ({@code priceMin}/{@code priceMax}) to matching active services;
+ *       otherwise the range spans every active service across the salon's
+ *       masters. Kept as a free {@code String} (max 100, mirroring
+ *       {@code service_definitions.category VARCHAR(100)} from V6 and
+ *       {@link MasterSearchRequest#category()}) rather than the
+ *       {@code ServiceCategory} enum — enum binding fails with an opaque 400
+ *       that leaks the full enum surface.</li>
+ *   <li>{@code q} — free-text query matched case-insensitively
+ *       ({@code ILIKE %term%}) against the salon name. Same cap / control-char
+ *       {@code @Pattern} as {@code category}; the service escapes the
+ *       {@code LIKE} wildcards in the term. Optional.</li>
+ *   <li>{@code sort} — allow-listed ordering; see {@link SearchSort}. Bound to
+ *       an enum so caller text never reaches the {@code ORDER BY}. Salons have
+ *       no per-row price/review column to sort by cheaply, so {@code PRICE_*}
+ *       and {@code REVIEWS_DESC} fall back to the default name ordering on this
+ *       endpoint (documented in {@code SearchService}); {@code null} also
+ *       defaults.</li>
+ *   <li>{@code minPrice}, {@code maxPrice} — optional price-band filter against
+ *       the salon's aggregate price range ({@code priceMin}/{@code priceMax}
+ *       across the salon's masters' active services). A salon matches when its
+ *       band overlaps the requested band ({@code priceMin <= maxPrice AND
+ *       priceMax >= minPrice}); salons with no active priced service (both
+ *       aggregates NULL) are excluded once either bound is supplied. Precision
+ *       matches {@link MasterSearchRequest#minPrice()}. Cross-field min ≤ max is
+ *       enforced by {@link #isPriceRangeValid()}.</li>
  *   <li>{@code page} — boxed {@code Integer}; {@code null} = use server default (0).
  *       Capped at 500 to bound offset-pagination memory usage: at the {@code size=100}
  *       ceiling that means at most ~50 000 results reachable via offset pagination.
@@ -53,12 +91,102 @@ public record SalonSearchRequest(
         @Valid
         LocationFilter location,
 
+        @Size(max = 100, message = "q must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+                 message = "q must not contain control characters or HTML special characters")
+        String q,
+
+        @Size(max = 100, message = "category must be at most 100 characters")
+        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+                 message = "category must not contain control characters or HTML special characters")
+        String category,
+
+        SearchSort sort,
+
+        @DecimalMin(value = "0", message = "minPrice must be at least 0")
+        @Digits(integer = 8, fraction = 2, message = "minPrice must have at most 8 integer digits and 2 decimal places")
+        BigDecimal minPrice,
+
+        @DecimalMin(value = "0", message = "maxPrice must be at least 0")
+        @Digits(integer = 8, fraction = 2, message = "maxPrice must have at most 8 integer digits and 2 decimal places")
+        BigDecimal maxPrice,
+
         @PositiveOrZero(message = "page must be zero or positive")
         @Max(value = 500, message = "page must be at most 500")
         Integer page,
 
         @Positive(message = "size must be a positive number")
         @Max(value = 100, message = "size must be at most 100")
-        Integer size
+        Integer size,
+
+        @Size(max = 20, message = "serviceTypeSlugs must contain at most 20 entries")
+        List<
+                @Size(max = 255, message = "each serviceTypeSlug must be at most 255 characters")
+                @Pattern(regexp = "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                         message = "each serviceTypeSlug must be a lowercase hyphenated slug")
+                String> serviceTypeSlugs
 ) {
+
+    /**
+     * Compact constructor — normalizes the scale of both {@code @Digits}-bound
+     * price bounds to scale 2 ({@link RoundingMode#HALF_UP}) <b>before</b> Jakarta
+     * Bean Validation runs. Records bind via the canonical constructor, so this
+     * body executes ahead of the {@code @Digits(fraction = 2)} check. Without it, a
+     * float-precision artifact from the mobile price slider (e.g.
+     * {@code maxPrice=1700.0000000000002}, 13 fraction digits) trips
+     * {@code @Digits} and returns a spurious 400. (Salon search has no rating
+     * filter, so only the two price bounds are normalized.)
+     *
+     * <p>Rounding only collapses excess <em>fraction</em> digits — it never
+     * relaxes the 8-integer-digit cap ({@code @Digits(integer = 8)}) or the
+     * lower bound ({@code @DecimalMin("0")}): a genuinely too-large value (9+
+     * integer digits) or a negative value still fails validation after rounding.
+     * Idempotent with the service-layer {@code SearchService.normalizePrice}.</p>
+     */
+    public SalonSearchRequest {
+        minPrice = roundToPriceScale(minPrice);
+        maxPrice = roundToPriceScale(maxPrice);
+    }
+
+    private static BigDecimal roundToPriceScale(BigDecimal value) {
+        return value == null ? null : value.setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * Cross-field price-range guard mirroring
+     * {@link MasterSearchRequest#isPriceRangeValid()} — evaluated at Spring MVC
+     * argument-resolution time, before any {@code @Cacheable} proxy intercepts.
+     * Returns {@code true} (valid) when either bound is absent: a null on either
+     * side simply means "no lower/upper bound" and is not a cross-field
+     * violation (the per-field {@code @DecimalMin} already rejects negatives).
+     */
+    @AssertTrue(message = "minPrice must be less than or equal to maxPrice")
+    public boolean isPriceRangeValid() {
+        if (minPrice == null || maxPrice == null) {
+            return true;
+        }
+        return minPrice.compareTo(maxPrice) <= 0;
+    }
+
+    /**
+     * Canonical {@code serviceTypeSlugs} view used for BOTH the {@code @Cacheable}
+     * key and the service-layer filter (Phase 20.2): {@code null}-safe, trimmed,
+     * lower-cased, blank-dropped, de-duplicated, and sorted — mirrors
+     * {@link MasterSearchRequest#normalizedServiceTypeSlugs()}. Lower-casing
+     * collapses casing variants onto one cache key (slugs are a fixed lowercase
+     * vocabulary). Never {@code null}.
+     */
+    public List<String> normalizedServiceTypeSlugs() {
+        if (serviceTypeSlugs == null) {
+            return List.of();
+        }
+        return serviceTypeSlugs.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .map(slug -> slug.toLowerCase(Locale.ROOT))
+                .filter(slug -> !slug.isEmpty())
+                .distinct()
+                .sorted()
+                .toList();
+    }
 }

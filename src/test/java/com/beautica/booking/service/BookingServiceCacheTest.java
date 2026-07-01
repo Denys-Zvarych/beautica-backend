@@ -9,7 +9,9 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.review.repository.ReviewRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -110,6 +112,8 @@ class BookingServiceCacheTest {
     @MockBean AuthorizationService authz;
     @MockBean NotificationOutboxService outboxService;
     @MockBean SlotCalculationService slotCalculationService;
+    @MockBean ReviewRepository reviewRepository;
+    @MockBean DiscoveryLocationResolver discoveryLocationResolver;
 
     @Autowired BookingService bookingService;
     @Autowired CacheManager cacheManager;

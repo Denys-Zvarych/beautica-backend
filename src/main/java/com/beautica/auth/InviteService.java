@@ -11,7 +11,6 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.master.service.MasterService;
-import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
@@ -19,7 +18,9 @@ import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -30,8 +31,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 
+@Slf4j
 @Service
 public class InviteService {
 
@@ -42,7 +46,7 @@ public class InviteService {
     private final TokenGenerator tokenGenerator;
     private final MasterService masterService;
     private final AuthResponseBuilder authResponseBuilder;
-    private final NotificationOutboxService outboxService;
+    private final InvitePersistenceService invitePersistenceService;
     private final String frontendBaseUrl;
     private final long tokenExpirationHours;
     private final Clock clock;
@@ -55,7 +59,7 @@ public class InviteService {
             TokenGenerator tokenGenerator,
             MasterService masterService,
             AuthResponseBuilder authResponseBuilder,
-            NotificationOutboxService outboxService,
+            InvitePersistenceService invitePersistenceService,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours,
             Clock clock
@@ -67,7 +71,7 @@ public class InviteService {
         this.tokenGenerator = tokenGenerator;
         this.masterService = masterService;
         this.authResponseBuilder = authResponseBuilder;
-        this.outboxService = outboxService;
+        this.invitePersistenceService = invitePersistenceService;
         this.frontendBaseUrl = frontendBaseUrl;
         this.tokenExpirationHours = tokenExpirationHours;
         this.clock = clock;
@@ -86,11 +90,48 @@ public class InviteService {
         }
     }
 
-    @Transactional
+    /**
+     * Sends a salon invite for the target email, or returns a non-distinguishing generic
+     * success when an invite cannot or should not be created.
+     *
+     * <p><strong>Enumeration hardening:</strong> all three outcomes — target already
+     * registered, target already has an active pending invite, and target is brand-new —
+     * return a structurally identical {@link InviteResponse} (echoed email + a freshly
+     * computed ~{@code tokenExpirationHours} expiry) with the same success status. None of
+     * them surfaces a distinguishing 4xx, and the returned expiry is recomputed on every
+     * call in every branch, so repeated invites cannot reveal registration status (the
+     * earlier residual {@code 200-vs-409} oracle on the second call is closed). An active
+     * pending invite is treated as an idempotent success — no second token is issued and no
+     * second e-mail is dispatched. An expired prior token is recycled (deleted) before a
+     * fresh one is created.
+     *
+     * <p><strong>Residual timing side-channel:</strong> the already-registered and
+     * active-invite branches skip token generation, hashing, persistence and outbox
+     * encryption, so they complete measurably faster than the brand-new branch. Full timing
+     * equalization is intentionally not attempted here; the compensating control is the
+     * per-IP rate limit on {@code POST /api/v1/auth/invite} (see {@code AuthRateLimitFilter}),
+     * which bounds how many timing samples an attacker can collect. The endpoint also
+     * requires an authenticated {@code SALON_OWNER}, so any abuse is attributable to a known
+     * principal.
+     */
+    @Transactional(readOnly = true)
     public InviteResponse sendInvite(InviteRequest request, UUID callerId) {
-        if (userRepository.existsByEmail(request.email())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
-        }
+        // Normalise e-mail (lower-case + strip) exactly as AuthService does on every write path,
+        // so this pre-check and the persisted row agree with the case-insensitive
+        // ux_invite_tokens_active index (lower(email), salon_id). Without this, re-inviting
+        // "a@x" while an active "A@x" token exists would miss the salon-scoped pre-check yet
+        // still collide on the lower(email) guard — silently dropping the invite (no token, no
+        // e-mail). Normalising once here keeps existsByEmail, the finder, the persisted token,
+        // the outbox enqueue and the response all on the same canonical value.
+        String email = request.email().toLowerCase(Locale.ROOT).strip();
+
+        // SECURITY (email-enumeration): do NOT surface a distinct "already registered"
+        // error here — that turns this endpoint into an enumeration oracle (an authenticated
+        // SALON_OWNER could probe arbitrary emails for registration status). Instead we run
+        // the same authorization flow regardless and, if the email is already registered,
+        // silently skip invite creation while returning the same generic response shape.
+        // The real reason is logged at debug only. Happy-path semantics are unchanged.
+        boolean alreadyRegistered = userRepository.existsByEmail(email);
 
         User caller = userRepository.findById(callerId)
                 .orElseThrow(() -> new NotFoundException("Caller not found"));
@@ -129,27 +170,60 @@ public class InviteService {
             }
         }
 
-        inviteTokenRepository.findByEmailAndIsUsedFalse(request.email()).ifPresent(existing -> {
-            if (existing.getExpiresAt().isAfter(clock.instant())) {
-                throw new BusinessException(HttpStatus.CONFLICT, "An active invite already exists for this email");
-            }
-            inviteTokenRepository.delete(existing);
-        });
+        Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
+
+        // Non-distinguishing outcome: an already-registered target gets the same generic
+        // success response (same shape, plausible expiry) without an invite ever being
+        // created or an e-mail dispatched. Only this debug line records the real reason.
+        if (alreadyRegistered) {
+            log.debug("Invite skipped: target email already registered (salonId={})", request.salonId());
+            return new InviteResponse(email, expiresAt);
+        }
+
+        // A pre-existing *active* (unused, unexpired) invite for THIS salon is an idempotent
+        // success — return the same generic response WITHOUT issuing a second token or e-mail.
+        // Raising a 409 here (the old behaviour) re-opened the enumeration oracle: combined
+        // with the already-registered early return above, a *second* identical call had a not-
+        // yet-registered email hit the 409 while a registered email still returned 200, so the
+        // 200-vs-409 split deterministically revealed registration status. An expired prior
+        // token is recycled (deleted) before a fresh one is issued.
+        //
+        // SECURITY/CORRECTNESS (cross-salon silent-drop): the lookup is salon-scoped via
+        // salonId. An email-global lookup let salon A's pending invite short-circuit salon B's
+        // dispatch — B's owner saw a false success while no invite for B was ever created. Each
+        // salon now decides idempotency independently against its own pending invite.
+        Optional<InviteToken> existingInvite =
+                inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse(email, request.salonId());
+        if (existingInvite.isPresent() && existingInvite.get().getExpiresAt().isAfter(clock.instant())) {
+            log.debug("Invite idempotent: active invite already exists for this salon (salonId={})", request.salonId());
+            return new InviteResponse(email, expiresAt);
+        }
+        // An expired-but-unused token still carries is_used = false, so it occupies the
+        // ux_invite_tokens_active slot for (lower(email), salon_id); it is recycled (deleted)
+        // atomically inside persistInviteAndEnqueue, in the same transaction as the new INSERT,
+        // so the delete and insert never deadlock across transaction boundaries.
 
         String rawToken = tokenGenerator.generateToken();
         String hashedToken = tokenGenerator.hash(rawToken);
-        Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
-
-        var inviteToken = new InviteToken(hashedToken, request.email(), request.salonId(), targetRole, expiresAt);
-        var savedInviteToken = inviteTokenRepository.save(inviteToken);
-
-        // Outbox pattern: write encrypted-payload row inside this @Transactional boundary
-        // (NotificationOutboxService.enqueueInvite uses Propagation.MANDATORY). The drain
-        // worker decrypts and dispatches the e-mail asynchronously after commit.
         String inviteLink = buildInviteLink(rawToken);
-        outboxService.enqueueInvite(savedInviteToken.getId(), request.email(), inviteLink, salon.getName());
 
-        return new InviteResponse(request.email(), expiresAt);
+        // CORRECTNESS (race path): the recycle + INSERT + outbox enqueue run in a SEPARATE
+        // physical transaction (REQUIRES_NEW on InvitePersistenceService). A concurrent
+        // same-(salon, lower(email)) request that raced past the pre-check above trips the
+        // ux_invite_tokens_active guard, throwing DataIntegrityViolationException. Because that
+        // violation poisons only the inner transaction (the caller's — possibly
+        // SalonService.inviteMaster's — transaction is suspended), we can catch it here and
+        // return the generic success WITHOUT triggering UnexpectedRollbackException. The loser
+        // gets a generic 201, no second token, and no second outbox row (both roll back together).
+        try {
+            invitePersistenceService.persistInviteAndEnqueue(
+                    email, request.salonId(), targetRole, expiresAt, hashedToken, inviteLink, salon.getName());
+        } catch (DataIntegrityViolationException e) {
+            log.debug("Invite idempotent: concurrent same-salon invite raced the unique guard (salonId={})", request.salonId());
+            return new InviteResponse(email, expiresAt);
+        }
+
+        return new InviteResponse(email, expiresAt);
     }
 
     @Transactional(readOnly = true)

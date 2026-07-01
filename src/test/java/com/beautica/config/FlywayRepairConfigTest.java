@@ -9,8 +9,12 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.flyway.FlywayMigrationStrategy;
 import org.springframework.context.annotation.Profile;
+
+import java.lang.reflect.Field;
+import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.doThrow;
@@ -117,5 +121,30 @@ class FlywayRepairConfigTest {
 
         assertThat(profile).as("@Profile must be present").isNotNull();
         assertThat(profile.value()).containsExactly("prod");
+    }
+
+    @Test
+    @DisplayName("self-heal is NOT env-flag-gated: no @Value-bound toggle field exists")
+    void should_haveNoEnvFlagGate_onAnyField() {
+        // Regression pin for the project contract: the self-heal must never be
+        // hidden behind an env flag. Gating repair() behind an unset Railway
+        // variable previously left prod in an infinite crash-loop on the very
+        // deploy that needed the repair. The old @Value-bound `repair-on-migrate`
+        // boolean was deleted; this test fails if any such toggle is reintroduced.
+        Field[] fields = FlywayRepairConfig.class.getDeclaredFields();
+
+        boolean hasValueAnnotatedField = Arrays.stream(fields)
+                .anyMatch(f -> f.isAnnotationPresent(Value.class));
+        assertThat(hasValueAnnotatedField)
+                .as("FlywayRepairConfig must not carry any @Value-bound gating field, "
+                        + "found: %s", Arrays.toString(fields))
+                .isFalse();
+
+        boolean hasBooleanToggleField = Arrays.stream(fields)
+                .anyMatch(f -> f.getType() == boolean.class || f.getType() == Boolean.class);
+        assertThat(hasBooleanToggleField)
+                .as("FlywayRepairConfig must not carry a boolean toggle field, found: %s",
+                        Arrays.toString(fields))
+                .isFalse();
     }
 }

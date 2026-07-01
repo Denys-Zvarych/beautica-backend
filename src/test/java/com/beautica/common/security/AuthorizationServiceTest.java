@@ -382,6 +382,68 @@ class AuthorizationServiceTest {
         assertThat(result).isFalse();
     }
 
+    // ── hasManagementAccess (2-arg) — direct role-branch isolation ─────────────
+    // The 2-arg public overload reads the role from SecurityContext, then delegates to the
+    // 3-arg private overload. These tests pin each role branch directly (previously covered
+    // only transitively through canManageSalon).
+
+    @Test
+    @DisplayName("hasManagementAccess returns true via SALON_OWNER fast-path (existsByIdAndOwnerId only — no findSalonIdById round-trip)")
+    void should_returnTrue_when_salonOwnerFastPathHitsOwnershipQueryOnly() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        boolean result = authorizationService.hasManagementAccess(salonId, actorId);
+
+        assertThat(result)
+                .as("SALON_OWNER must be granted via the ownership query alone")
+                .isTrue();
+        verify(salonRepository).existsByIdAndOwnerId(salonId, actorId);
+        // SALON_OWNER fast-path must NOT consult the user record for an assigned salonId.
+        verify(userRepository, never()).findSalonIdById(any());
+        verify(userRepository, never()).findById(any());
+    }
+
+    @Test
+    @DisplayName("hasManagementAccess returns false for SALON_OWNER who does not own the salon (still no findSalonIdById round-trip)")
+    void should_returnFalse_when_salonOwnerFastPathOwnershipQueryFails() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(false);
+
+        boolean result = authorizationService.hasManagementAccess(salonId, actorId);
+
+        assertThat(result)
+                .as("a non-owning SALON_OWNER must be rejected by the ownership query")
+                .isFalse();
+        verify(userRepository, never()).findSalonIdById(any());
+    }
+
+    @Test
+    @DisplayName("hasManagementAccess returns true for SALON_ADMIN whose assigned salonId matches (via findSalonIdById, not the ownership query)")
+    void should_returnTrue_when_salonAdminAssignedSalonMatchesViaFindSalonIdById() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_ADMIN"));
+        // SALON_ADMIN's assigned salonId lives on the User record — resolved via the projection.
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        boolean result = authorizationService.hasManagementAccess(salonId, actorId);
+
+        assertThat(result)
+                .as("SALON_ADMIN whose assigned salonId matches must be granted")
+                .isTrue();
+        verify(userRepository).findSalonIdById(actorId);
+        // SALON_ADMIN must NOT use the owner-equality query — it is not a salon owner.
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
     // ── masterBelongsToSalon ───────────────────────────────────────────────────
 
     @Test
@@ -735,6 +797,51 @@ class AuthorizationServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    @Test
+    @DisplayName("canViewBooking returns false when a SALON_ADMIN tries to view a booking (no owner/master/client match → fall-through)")
+    void should_returnFalse_when_salonAdminViewsBooking() {
+        UUID adminId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID clientUserId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+        UUID salonOwnerUserId = UUID.randomUUID();
+
+        // SALON_ADMIN's id matches none of the ownership fields. SALON_ADMIN is neither
+        // CLIENT nor SALON_MASTER, so canViewBooking reaches the final `return false`.
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, masterUserId, salonOwnerUserId)));
+
+        Authentication auth = mockAuth(adminId, "ROLE_SALON_ADMIN");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result)
+                .as("SALON_ADMIN must fall through to false on canViewBooking — no view path for individual bookings")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("canViewBooking returns true when an INDEPENDENT_MASTER views their own booking (masterUserId == actorId, salonOwnerUserId null)")
+    void should_returnTrue_when_independentMasterViewsOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID clientUserId = UUID.randomUUID();
+
+        // Independent master booking: salonOwnerUserId is null, masterUserId == actorId.
+        // The salon-owner branch is skipped (null guard); the masterUserId branch fires
+        // because the actor's role (INDEPENDENT_MASTER) is not SALON_MASTER.
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        boolean result = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(result)
+                .as("INDEPENDENT_MASTER must be able to view their own booking via the masterUserId branch")
+                .isTrue();
+    }
+
     // ── enforceCanViewBooking ──────────────────────────────────────────────────
     // After Finding 3 fix: enforceCanViewBooking reads role from SecurityContextHolder
     // instead of calling userRepository.findById — the SecurityContext must be populated.
@@ -796,6 +903,36 @@ class AuthorizationServiceTest {
 
         assertThatCode(() -> authorizationService.enforceCanViewBooking(actorId, booking))
                 .doesNotThrowAnyException();
+    }
+
+    // ── canManageMaster — role fast-path (no DB hit) ──────────────────────────
+
+    @Test
+    @DisplayName("canManageMaster returns false without DB hit when actor has ROLE_CLIENT")
+    void should_returnFalseWithoutDbHit_when_clientTriesToManageMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Authentication auth = mockAuth(actorId, "ROLE_CLIENT");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result).isFalse();
+        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+    }
+
+    @Test
+    @DisplayName("canManageMaster returns false without DB hit when actor has ROLE_SALON_MASTER")
+    void should_returnFalseWithoutDbHit_when_salonMasterTriesToManageMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canManageMaster(auth, masterId);
+
+        assertThat(result).isFalse();
+        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
     }
 
     // ── canManageMaster — SALON_OWNER branch (Phase 12.1) ─────────────────────
@@ -1204,9 +1341,12 @@ class AuthorizationServiceTest {
 
     // ── Phase 12.3 — Owner-as-master: authorization explicit tests ────────────
 
+    // Split from the former dual-behaviour should_allowOwner_toConfirmOwnMasterBooking,
+    // which exercised both the SpEL projection path (canManageBooking) and the in-memory
+    // entity path (enforceCanManageBooking) in one method. One behaviour per test now.
     @Test
-    @DisplayName("Phase 12.3: canManageBooking and enforceCanManageBooking both allow the owner to confirm their own SALON_OWNER-type master booking")
-    void should_allowOwner_toConfirmOwnMasterBooking() {
+    @DisplayName("Phase 12.3: canManageBooking allows the owner to confirm their own SALON_OWNER-type master booking (projection path)")
+    void should_allowOwner_toConfirmOwnMasterBooking_viaCanManageBooking() {
         UUID actorId = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
         UUID masterUserId = actorId; // owner is the master's user
@@ -1222,6 +1362,12 @@ class AuthorizationServiceTest {
         assertThat(canManage)
                 .as("SALON_OWNER actor must be able to manage their own SALON_OWNER-type master booking via canManageBooking")
                 .isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 12.3: enforceCanManageBooking allows the owner to confirm their own SALON_OWNER-type master booking (in-memory entity path)")
+    void should_allowOwner_toConfirmOwnMasterBooking_viaEnforceCanManageBooking() {
+        UUID actorId = UUID.randomUUID();
 
         // isAuthorizedToManageBooking path: in-memory entity check via enforceCanManageBooking
         User salonOwner = mock(User.class);

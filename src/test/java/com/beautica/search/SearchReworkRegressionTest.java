@@ -168,33 +168,27 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("regression — a master is found by city_id even though its user-row legacy city is a third arbitrary spelling 'kyiv'")
+    @DisplayName("regression — an INDEPENDENT_MASTER is found by city_id even though its user-row legacy city is an arbitrary free-text spelling (FK discovery, not the old string path)")
     void should_findMasterByCityId_regardlessOfLegacyUserRowSpelling() throws Exception {
         ensureHttpClient();
         UUID kyivCityId = cityIdByName("Київ");
 
-        UUID ownerId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
-                ownerId, "regr-m-owner-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$04$placeholdervaluefortestonlydigest");
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'kyiv', ?, true, NOW(), NOW())",
-                salonId, ownerId, "RegrMasterSalon", kyivCityId);
+        // Phase 19.7: /search/masters returns INDEPENDENT_MASTER only. The
+        // "Київ ≠ Киев ≠ kyiv" regression under test is role-agnostic — it is
+        // about FK discovery beating the removed free-text-equality path. The
+        // independent master's user-row free-text city is a deliberately wrong
+        // spelling; only the FK city_id makes it discoverable.
         UUID masterUserId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?, 'KYÏV-typo', true, true)",
+                "INSERT INTO users (id, email, password_hash, role, city, city_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', 'KYIV-typo', ?, true, true)",
                 masterUserId, "regr-master-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$04$placeholdervaluefortestonlydigest", salonId);
+                "$2a$04$placeholdervaluefortestonlydigest", kyivCityId);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', 4.5::numeric, 1, true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', 4.5::numeric, 1, true, NOW(), NOW())",
+                masterId, masterUserId);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + kyivCityId + "&page=0&size=20",
@@ -203,9 +197,8 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
         assertThat(data.path("totalElements").asLong())
-                .as("three different arbitrary free-text spellings across the rows "
-                        + "('kyiv', 'KYÏV-typo') must not matter — FK discovery via "
-                        + "the salon-link city_id is the only path")
+                .as("the arbitrary free-text spelling on the user row must not matter — "
+                        + "FK discovery via the user-row city_id is the only path")
                 .isEqualTo(1L);
         assertThat(data.path("data").get(0).path("masterId").asText())
                 .isEqualTo(masterId.toString());
@@ -317,17 +310,18 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     // ── Multi-salon (2.11–2.14): one owner, two salons, two districts ─────────
 
     @Test
-    @DisplayName("multi-salon — one owner's two salons sit in two districts; each salon's master is discoverable ONLY under its own salon's district (salon-link locality resolves per row, never denormalised)")
-    void should_discoverEachSalonMasterUnderItsOwnSalonDistrict() throws Exception {
-        // The Beautica model (V4: masters.user_id UNIQUE) is one masters row
-        // per user — a master belongs to exactly one salon. "Multi-salon"
-        // (phases 2.11–2.14) means a SALON_OWNER owning several salons. The
-        // Step 3 property under test: when one owner has two salons in two
-        // districts, each salon's employed master is discovered under THAT
-        // salon's district (COALESCE(sal.district_id, u.district_id) resolved
-        // per masters row at query time), and the two are not cross-visible —
-        // proving salon-link locality is never denormalised onto the owner or
-        // the user row.
+    @DisplayName("multi-salon (Phase 19.7) — one owner's two salons sit in two districts; both salons' employed SALON_MASTERs are EXCLUDED from /search/masters (salon-page only); an INDEPENDENT_MASTER in district A is still discoverable")
+    void should_excludeSalonMastersButDiscoverIndependent_acrossOwnerSalons() throws Exception {
+        // The Beautica model (V4: masters.user_id UNIQUE) is one masters row per
+        // user — a master belongs to exactly one salon. "Multi-salon"
+        // (phases 2.11–2.14) means a SALON_OWNER owning several salons. Pre-19.7
+        // each salon's employed SALON_MASTER was discoverable on /search/masters
+        // under its own salon's district. Phase 19.7 (decision 7) restricts the
+        // public master grid to INDEPENDENT_MASTER only: both employed
+        // SALON_MASTERs must now be absent (they are reached via the salon page),
+        // while an independent master in district A is still discovered via its
+        // own user-row locality. This pins that the role predicate lives on both
+        // the data and the count path across a multi-salon owner context.
         ensureHttpClient();
         UUID kyivCityId = cityIdByName("Київ");
         UUID districtA = districtIdInCity("Київ", 0);
@@ -340,8 +334,9 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 ownerId, "ms-owner-" + UUID.randomUUID() + "@beautica.test",
                 "$2a$04$placeholdervaluefortestonlydigest");
 
-        UUID masterInA = seedSalonWithMaster(ownerId, kyivCityId, districtA, "SalonInDistrictA");
-        UUID masterInB = seedSalonWithMaster(ownerId, kyivCityId, districtB, "SalonInDistrictB");
+        UUID salonMasterInA = seedSalonWithMaster(ownerId, kyivCityId, districtA, "SalonInDistrictA");
+        UUID salonMasterInB = seedSalonWithMaster(ownerId, kyivCityId, districtB, "SalonInDistrictB");
+        UUID independentInA = seedIndependentMasterInDistrict(kyivCityId, districtA);
 
         ResponseEntity<String> underA = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + kyivCityId
@@ -356,40 +351,39 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         JsonNode pageB = objectMapper.readTree(underB.getBody()).path("data");
 
         assertThat(pageA.path("totalElements").asLong())
-                .as("only salon-A's master is discoverable under district A")
+                .as("district A: only the INDEPENDENT_MASTER is discoverable — the employed SALON_MASTER is excluded")
                 .isEqualTo(1L);
         assertThat(pageA.path("data").get(0).path("masterId").asText())
-                .isEqualTo(masterInA.toString());
+                .isEqualTo(independentInA.toString());
 
         assertThat(pageB.path("totalElements").asLong())
-                .as("only salon-B's master is discoverable under district B — the "
-                        + "other owner-salon's master is NOT cross-visible; salon-link "
-                        + "locality resolves per masters row, never denormalised")
-                .isEqualTo(1L);
-        assertThat(pageB.path("data").get(0).path("masterId").asText())
-                .isEqualTo(masterInB.toString());
+                .as("district B: the employed SALON_MASTER is excluded and there is no independent master there — zero results")
+                .isZero();
 
-        // Cross-check: district A must NOT surface salon-B's master (and vice
-        // versa) — a denormalised/owner-level locality leak would break this.
+        // Neither employed SALON_MASTER may ever surface on the public grid.
         for (JsonNode row : pageA.path("data")) {
-            assertThat(row.path("masterId").asText()).isNotEqualTo(masterInB.toString());
+            assertThat(row.path("masterId").asText())
+                    .as("salon-A's SALON_MASTER must never appear")
+                    .isNotEqualTo(salonMasterInA.toString());
         }
         for (JsonNode row : pageB.path("data")) {
-            assertThat(row.path("masterId").asText()).isNotEqualTo(masterInA.toString());
+            assertThat(row.path("masterId").asText())
+                    .as("salon-B's SALON_MASTER must never appear")
+                    .isNotEqualTo(salonMasterInB.toString());
         }
     }
 
     /**
      * Seeds one salon (under {@code ownerId}) stamped with the given
      * city/district FK and one employed SALON_MASTER + masters row. Returns the
-     * {@code masters.id}. The master's discovery locality resolves through this
-     * salon link at query time — never copied onto the user row.
+     * {@code masters.id}. Under Phase 19.7 this master is reachable only via the
+     * salon page, never via {@code /search/masters}.
      */
     private UUID seedSalonWithMaster(UUID ownerId, UUID cityId, UUID districtId, String salonName) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'Київ', ?, ?, true, NOW(), NOW())",
+                        + "VALUES (?, ?, ?, 'Kyiv', ?, ?, true, NOW(), NOW())",
                 salonId, ownerId, salonName, cityId, districtId);
 
         UUID masterUserId = UUID.randomUUID();
@@ -404,6 +398,27 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'SALON_MASTER', 4.7::numeric, 3, true, NOW(), NOW())",
                 masterId, masterUserId, salonId);
+        return masterId;
+    }
+
+    /**
+     * Seeds an INDEPENDENT_MASTER (no salon) whose own user row carries the
+     * city + district FK. The {@code COALESCE(sal.*, u.*)} discovery-locality
+     * expression falls through to the user row.
+     */
+    private UUID seedIndependentMasterInDistrict(UUID cityId, UUID districtId) {
+        UUID userId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, city_id, district_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', ?, ?, true, true)",
+                userId, "ms-indep-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", cityId, districtId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', 4.2::numeric, 1, true, NOW(), NOW())",
+                masterId, userId);
         return masterId;
     }
 

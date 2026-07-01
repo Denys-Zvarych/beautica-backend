@@ -100,6 +100,15 @@ class PriceDisplayFormatterTest {
         assertThat(PriceDisplayFormatter.formatAmount(new BigDecimal("350.50"))).isEqualTo("350.50");
     }
 
+    @Test
+    @DisplayName("formatAmount rounds to two decimals HALF_UP — 350.555 → 350.56, 350.554 → 350.55")
+    void should_roundHalfUp_when_inputHasMoreThanTwoDecimals() {
+        // Pins setScale(2, HALF_UP). Regressing to RoundingMode.UNNECESSARY would
+        // throw ArithmeticException on these >2-decimal inputs instead of rounding.
+        assertThat(PriceDisplayFormatter.formatAmount(new BigDecimal("350.555"))).isEqualTo("350.56");
+        assertThat(PriceDisplayFormatter.formatAmount(new BigDecimal("350.554"))).isEqualTo("350.55");
+    }
+
     // ── null guards ────────────────────────────────────────────────────────────
 
     @Test

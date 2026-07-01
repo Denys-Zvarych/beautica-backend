@@ -58,6 +58,9 @@ public abstract class AbstractIntegrationTest {
     @AfterEach
     void cleanDb() {
         jdbcTemplate.execute("DELETE FROM notification_outbox");
+        // favorites FK → users ON DELETE CASCADE, but §O-7 forbids relying on CASCADE
+        // here; delete explicitly (no child tables reference favorites).
+        jdbcTemplate.execute("DELETE FROM favorites");
         jdbcTemplate.execute("DELETE FROM reviews");
         jdbcTemplate.execute("DELETE FROM bookings");
         jdbcTemplate.execute("DELETE FROM media_files");
@@ -84,6 +87,9 @@ public abstract class AbstractIntegrationTest {
         // the cleanup intent clear. Must precede the users DELETE.
         jdbcTemplate.execute("DELETE FROM password_reset_tokens");
         jdbcTemplate.execute("DELETE FROM device_tokens");
+        // Phase 13.2: phone_otps has no FK (guest flow, no user row) — delete anywhere,
+        // kept here with the other side tables so a fresh DB is left for the next test.
+        jdbcTemplate.execute("DELETE FROM phone_otps");
         jdbcTemplate.execute("DELETE FROM users");
 
         cacheManager.getCacheNames().forEach(name -> {

@@ -217,4 +217,40 @@ class AuthControllerVerifyEmailTest {
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.data.code").value("INVALID_CODE"));
     }
+
+    @Test
+    @DisplayName("400 with VerificationErrorResponse containing code=CODE_EXPIRED when service throws an expired-code VerificationException")
+    void should_return400WithCodeExpired_when_serviceThrowsExpiredVerificationException() throws Exception {
+        log.debug("Arrange: stub authService.verifyEmail() to throw VerificationException(CODE_EXPIRED)");
+
+        when(authService.verifyEmail(any(VerifyEmailRequest.class)))
+                .thenThrow(new VerificationException(VerificationException.Code.CODE_EXPIRED));
+
+        log.debug("Act: POST {} with valid body whose code has expired server-side", VERIFY_EMAIL_URL);
+        mvc.perform(post(VERIFY_EMAIL_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"user@example.com","code":"123456"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Verification failed"))
+                .andExpect(jsonPath("$.data.code").value("CODE_EXPIRED"));
+    }
+
+    @Test
+    @DisplayName("400 with success=false and a per-field email error when email is blank (Bean Validation envelope)")
+    void should_return400WithFieldError_when_verifyEmailWithBlankEmail() throws Exception {
+        log.debug("Arrange: no mock needed — blank email fails @NotBlank before service is reached");
+
+        log.debug("Act: POST {} with blank email; assert the validationError envelope, not just the status", VERIFY_EMAIL_URL);
+        mvc.perform(post(VERIFY_EMAIL_URL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"","code":"123456"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.email").value("Email is required"));
+    }
 }

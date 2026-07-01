@@ -9,6 +9,7 @@ import java.time.Clock;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.time.temporal.TemporalAdjusters;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -103,10 +104,11 @@ public class ScheduleDateMath {
      * surface as a 400 {@link BusinessException}.
      */
     public void assertWithinBounds(LocalDate from, LocalDate to) {
-        if (isPast(from)) {
+        LocalDate today = today();
+        if (from.isBefore(today)) {
             throw new BusinessException("Schedule range start must not be in the past");
         }
-        if (to.isAfter(cap())) {
+        if (to.isAfter(today.plusYears(FAR_FUTURE_CAP_YEARS))) {
             throw new BusinessException("Schedule range end exceeds the allowed two-year window");
         }
         if (from.isAfter(to)) {
@@ -189,7 +191,12 @@ public class ScheduleDateMath {
         if (spanDays > MAX_EXPANSION_SPAN_DAYS) {
             throw new BusinessException("Date expansion exceeds the maximum of 366 days");
         }
-        return from.datesUntil(to.plusDays(1)).toList();
+        int size = (int) spanDays + 1; // inclusive of both endpoints; spanDays bounded ≤ 365
+        List<LocalDate> dates = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            dates.add(from.plusDays(i));
+        }
+        return dates;
     }
 
     /** ISO day-of-week: 1=Monday .. 7=Sunday, matching {@code working_intervals.day_of_week}. */

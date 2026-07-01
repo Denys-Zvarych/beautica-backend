@@ -1,10 +1,10 @@
 package com.beautica.user;
 
 import com.beautica.common.ApiResponse;
+import com.beautica.common.security.AuthenticationUtils;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -27,7 +27,7 @@ public class UserController {
     @GetMapping("/me")
     @PreAuthorize("isAuthenticated()")
     public ResponseEntity<ApiResponse<UserProfileResponse>> getMe(Authentication authentication) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         UserProfileResponse profile = userService.getProfile(userId);
         return ResponseEntity.ok(ApiResponse.ok(profile));
     }
@@ -38,16 +38,8 @@ public class UserController {
             @Valid @RequestBody UpdateProfileRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         UserProfileResponse updated = userService.updateProfile(userId, request);
         return ResponseEntity.ok(ApiResponse.ok(updated));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new com.beautica.common.exception.ForbiddenException("Not authenticated");
     }
 }

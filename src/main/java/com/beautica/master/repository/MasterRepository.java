@@ -171,4 +171,29 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             WHERE m.id IN :masterIds
             """)
     void refreshMinEffectivePriceForAll(@Param("masterIds") List<UUID> masterIds);
+
+    /**
+     * Global uniqueness check for the public booking slug (Phase 13.1). Backs the
+     * {@code BookingSlugService} retry loop — a candidate slug is rejected if any
+     * master already owns it. Spans the whole {@code masters} table (single-table
+     * model — there is no separate {@code independent_masters} table), so this one
+     * query covers SALON_MASTER, SALON_OWNER, and INDEPENDENT_MASTER rows.
+     */
+    boolean existsByBookingSlug(String bookingSlug);
+
+    /**
+     * Resolves a public booking slug to its master, JOIN FETCH-ing the {@code user}
+     * association so the caller can read {@code firstName}/{@code lastName}/
+     * {@code avatarUrl}/{@code bio} (which live on {@link com.beautica.user.User},
+     * not on {@link Master}) without a lazy load or LazyInitializationException
+     * (Anti-Bug §E). Filters {@code isActive = true} so a deactivated master's
+     * public booking page returns 404.
+     */
+    @Query("""
+            SELECT m FROM Master m
+            JOIN FETCH m.user
+            WHERE m.bookingSlug = :slug
+              AND m.isActive = true
+            """)
+    Optional<Master> findByBookingSlugWithUser(@Param("slug") String slug);
 }

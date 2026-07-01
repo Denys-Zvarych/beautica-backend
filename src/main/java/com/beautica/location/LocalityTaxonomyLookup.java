@@ -69,7 +69,10 @@ public class LocalityTaxonomyLookup {
      * @return the resolved taxonomy facts; {@link LocalityFacts#cityExists()}
      *         is {@code false} when no city row matched {@code cityId}
      */
-    @Cacheable(value = CACHE_TAXONOMY_FACTS, key = "{#cityId, #districtId}")
+    // sync = true: on the 24h-TTL cold/expiry miss for a popular (city, district) pair, only
+    // ONE thread runs the fused taxonomy query while concurrent provider saves wait for it,
+    // instead of a herd of identical round-trips (Anti-Bug §F-7).
+    @Cacheable(value = CACHE_TAXONOMY_FACTS, key = "{#cityId, #districtId}", sync = true)
     @Transactional(readOnly = true)
     public LocalityFacts resolve(UUID cityId, UUID districtId) {
         return cityRepository.resolveTaxonomyFacts(cityId, districtId)

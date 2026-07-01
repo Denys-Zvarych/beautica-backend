@@ -5,6 +5,7 @@ import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,11 +24,13 @@ import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 @RestControllerAdvice
@@ -72,6 +75,12 @@ public class GlobalExceptionHandler {
         String clientMessage = switch (ex.getStatus()) {
             case CONFLICT -> "Request could not be completed due to a conflict";
             case BAD_REQUEST -> "Invalid request";
+            // 422 carries deliberate, user-facing domain copy (e.g. the Ukrainian
+            // cancel-window-closed message in Phase 13.4) that the client must display
+            // verbatim. These messages are non-sensitive product strings — no enum
+            // constants, SQL, IDs, or bound values — so echoing ex.getMessage() here is
+            // safe and intended, unlike the genericised CONFLICT/BAD_REQUEST branches.
+            case UNPROCESSABLE_ENTITY -> ex.getMessage();
             default -> "Request could not be completed";
         };
         return ResponseEntity
@@ -107,12 +116,34 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("Access denied"));
     }
 
+    /**
+     * Method-security denial (a {@code @PreAuthorize}/{@code @PostAuthorize} check failed),
+     * surfaced by Spring's {@code AuthorizationManagerBeforeMethodInterceptor}. Without an
+     * explicit WARN line here the only trace is Spring's opaque
+     * {@code Resolved [AuthorizationDeniedException: Access Denied]}, which carries no path
+     * or principal and makes 403s impossible to triage.
+     *
+     * <p>Logs HTTP method + request URI + the principal's authorities + the non-PII subject
+     * (the user id held in {@link Authentication#getDetails()}, set by
+     * {@code JwtAuthenticationFilter}). Never logs the email ({@code getName()}), the JWT,
+     * or the query string — only the role/authorities, path, and user id (§I / Security rules).
+     * The response body is unchanged: 403 for an authenticated caller, 401 for an
+     * unauthenticated one.
+     */
     @ExceptionHandler(AuthorizationDeniedException.class)
-    public ResponseEntity<ApiResponse<Void>> handleAuthorizationDenied(AuthorizationDeniedException ex) {
+    public ResponseEntity<ApiResponse<Void>> handleAuthorizationDenied(
+            AuthorizationDeniedException ex, HttpServletRequest request) {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         boolean isUnauthenticated = auth == null
                 || !auth.isAuthenticated()
                 || auth instanceof AnonymousAuthenticationToken;
+
+        log.warn("Access denied: {} {} for authorities={} (subject={})",
+                request.getMethod(),
+                request.getRequestURI(),
+                isUnauthenticated || auth == null ? "[none]" : auth.getAuthorities(),
+                subjectOf(auth, isUnauthenticated));
+
         if (isUnauthenticated) {
             return ResponseEntity
                     .status(HttpStatus.UNAUTHORIZED)
@@ -121,6 +152,19 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.FORBIDDEN)
                 .body(ApiResponse.error("Access denied"));
+    }
+
+    /**
+     * Returns a non-PII principal identifier for diagnostic logging: the user id (UUID)
+     * stored in {@link Authentication#getDetails()} by {@code JwtAuthenticationFilter}.
+     * Never returns {@code auth.getName()} — that is the email (PII). Falls back to
+     * {@code "[anonymous]"} / {@code "[unknown]"} rather than risk leaking anything else.
+     */
+    private static String subjectOf(Authentication auth, boolean isUnauthenticated) {
+        if (isUnauthenticated || auth == null) {
+            return "[anonymous]";
+        }
+        return auth.getDetails() instanceof UUID userId ? userId.toString() : "[unknown]";
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -304,6 +348,21 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.NOT_FOUND)
                 .body(ApiResponse.error("Resource not found"));
+    }
+
+    /**
+     * Thrown by the multipart resolver when an uploaded request body exceeds the
+     * configured {@code spring.servlet.multipart.max-*-size} (5 MB). Without this
+     * mapping the generic {@code Exception} fallback turns an oversized upload into
+     * a 500. The correct status is 413 Payload Too Large. The static message does
+     * not echo the configured limit (no internal-config disclosure, §I).
+     */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMaxUploadSize(MaxUploadSizeExceededException ex) {
+        log.debug("Upload rejected — request body exceeds the multipart size limit");
+        return ResponseEntity
+                .status(HttpStatus.PAYLOAD_TOO_LARGE)
+                .body(ApiResponse.error("Upload exceeds the maximum allowed size"));
     }
 
     @ExceptionHandler(Exception.class)

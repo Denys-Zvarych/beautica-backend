@@ -3,6 +3,8 @@ package com.beautica.config;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.filter.AuthRateLimitFilter;
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -16,21 +18,28 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.AccessDeniedHandler;
+import org.springframework.security.web.access.AccessDeniedHandlerImpl;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import java.util.List;
+import java.util.UUID;
 
 @Configuration
 @EnableWebSecurity
 @EnableMethodSecurity
 public class SecurityConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(SecurityConfig.class);
 
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
@@ -60,7 +69,8 @@ public class SecurityConfig {
                 .sessionManagement(session ->
                         session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .exceptionHandling(ex -> ex
-                        .authenticationEntryPoint(unauthorizedEntryPoint()))
+                        .authenticationEntryPoint(unauthorizedEntryPoint())
+                        .accessDeniedHandler(accessDeniedHandler()))
                 .authorizeHttpRequests(auth -> {
                     auth.requestMatchers(
                             "/api/v1/auth/register",
@@ -96,7 +106,9 @@ public class SecurityConfig {
                     // approve/reject mutate. POST /requests (provider role-gated)
                     // and GET /approved (any authenticated user) are NOT listed
                     // here and fall through to anyRequest().authenticated().
-                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review").permitAll();
+                    // Token rides as the trailing path segment (review/{token}) to keep
+                    // it out of the email-link query string (proxy/Referer log exposure).
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review/*").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/approve").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/reject").permitAll();
                     // Phase 16.8 service-type suggestion review pages — token-authenticated
@@ -134,6 +146,36 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts/{oblastId}/cities").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/cities/{cityId}/districts").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/search/**").permitAll();
+                    // Phase 13.1 — Guest Booking Link. The public booking page
+                    // (beautica.app/book/{slug}) is opened by unauthenticated clients
+                    // from a shared link, so GET /api/v1/book/** is permitAll. Placed
+                    // before anyRequest().authenticated() below. CSRF is already disabled
+                    // on /api/** and the response carries no owner identifiers (§I-2).
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/book/**").permitAll();
+                    // Phase 13.2 — Phone OTP & Guest Token. Unauthenticated clients on the
+                    // public booking page request and verify an SMS code before they hold any
+                    // JWT, so POST /api/v1/book/otp/{send,verify} must be permitAll. Scoped
+                    // tightly to /otp/** (not all POST /book/**) so future authenticated
+                    // booking-write endpoints under /book are not accidentally opened. A
+                    // dedicated per-IP Bucket4j throttle guards /send (AuthRateLimitFilter);
+                    // the per-phone limit + generic-401 verify guard live in PhoneOtpService.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/otp/**").permitAll();
+                    // Phase 13.3 — Guest Booking Creation. An unauthenticated client on the
+                    // public booking page holds only a guest JWT (type=GUEST, no Spring
+                    // principal), so the create-booking POST must be permitAll at the filter
+                    // chain; GuestBookingService validates the guest token itself. Scoped
+                    // tightly to POST /api/v1/book/*/booking (single path segment for the slug,
+                    // then literal /booking) so no other authenticated POST under /book is opened.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/*/booking").permitAll();
+                    // Phase 13.4 — Guest Booking Cancellation by Link. The cancel link in
+                    // the confirmation SMS is opened by an unauthenticated guest holding no
+                    // JWT; the one-time cancel_token in the path is the credential. GET is
+                    // already covered by the /api/v1/book/** permitAll above; the cancel POST
+                    // must also be permitAll. Scoped tightly to POST /api/v1/book/cancel/*
+                    // (literal "cancel" segment, then exactly one token segment) — a different
+                    // path shape from POST /api/v1/book/*/booking (slug, then literal
+                    // "booking"), so the two matchers cannot shadow or collide with each other.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/cancel/*").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),
@@ -166,6 +208,35 @@ public class SecurityConfig {
     public AuthenticationEntryPoint unauthorizedEntryPoint() {
         return (request, response, authException) ->
                 response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Unauthorized");
+    }
+
+    /**
+     * Filter-chain (pre-controller) access-denied handler for already-authenticated
+     * principals whose request is rejected by {@code ExceptionTranslationFilter} (e.g. a
+     * URL-matcher authorization rule). Method-security ({@code @PreAuthorize}) denials are
+     * handled by {@code GlobalExceptionHandler#handleAuthorizationDenied} instead.
+     *
+     * <p>Logs the same self-diagnosing line — HTTP method + request URI + the principal's
+     * authorities + the non-PII subject (the user id in {@link Authentication#getDetails()},
+     * set by {@code JwtAuthenticationFilter}) — then delegates to the default 403 response so
+     * the wire contract is unchanged. Never logs the email ({@code getName()}), the JWT, or
+     * the query string.
+     */
+    @Bean
+    public AccessDeniedHandler accessDeniedHandler() {
+        AccessDeniedHandlerImpl delegate = new AccessDeniedHandlerImpl();
+        return (request, response, accessDeniedException) -> {
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+            Object subject = (auth != null && auth.getDetails() instanceof UUID userId)
+                    ? userId
+                    : "[unknown]";
+            log.warn("Access denied: {} {} for authorities={} (subject={})",
+                    request.getMethod(),
+                    request.getRequestURI(),
+                    auth != null ? auth.getAuthorities() : "[none]",
+                    subject);
+            delegate.handle(request, response, accessDeniedException);
+        };
     }
 
     @Bean

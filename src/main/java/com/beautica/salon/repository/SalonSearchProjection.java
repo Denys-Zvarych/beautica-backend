@@ -1,5 +1,6 @@
 package com.beautica.salon.repository;
 
+import java.math.BigDecimal;
 import java.util.UUID;
 
 /**
@@ -30,6 +31,14 @@ import java.util.UUID;
  *   <li>{@code getCityId()} → {@code s.cityId} ({@code city_id} column)</li>
  *   <li>{@code getDistrictId()} → {@code s.districtId} ({@code district_id} column)</li>
  *   <li>{@code getAvatarUrl()} → {@code s.avatarUrl} ({@code avatar_url} column)</li>
+ *   <li>{@code getPriceMin()} / {@code getPriceMax()} → price-range aggregates
+ *       over the salon's masters' active services (Phase 19.7, decision 5).
+ *       Computed in a single {@code LEFT JOIN LATERAL} pass per salon (both
+ *       aggregates in one nested-loop probe — Phase 19.7 PERF MEDIUM, replacing
+ *       the earlier two byte-identical correlated sub-queries), not columns on
+ *       the {@code salons} table; both are {@code null} when the salon has no
+ *       active, priced services (LATERAL over an empty set yields NULL
+ *       aggregates).</li>
  * </ul>
  */
 public interface SalonSearchProjection {
@@ -43,4 +52,53 @@ public interface SalonSearchProjection {
     UUID getDistrictId();
 
     String getAvatarUrl();
+
+    /**
+     * Lowest service-price floor ({@code MIN(base_price)}) across the salon's
+     * masters' active services, scoped to the searched category when present.
+     * {@code null} when the salon has no active, priced services.
+     */
+    BigDecimal getPriceMin();
+
+    /**
+     * Highest service-price ceiling across the salon's masters' active services
+     * ({@code MAX(price_max)} for {@code RANGE} services, else {@code base_price}
+     * for {@code FIXED}), scoped to the searched category when present.
+     * {@code null} when the salon has no active, priced services.
+     */
+    BigDecimal getPriceMax();
+
+    /**
+     * Capped ({@code SERVICE_NAME_CAP}) array of distinct active service names
+     * offered across the salon's masters, computed by the same price-band
+     * {@code LEFT JOIN LATERAL} via {@code array_agg(DISTINCT sd.name)}.
+     * The Postgres JDBC driver materialises a {@code text[]} column as a Java
+     * {@code String[]}; the service mapper converts it to an immutable
+     * {@code List<String>} ({@code []} when none, never {@code null}). Carries
+     * display strings only — safe on the {@code permitAll} endpoint (§I).
+     */
+    String[] getServiceNames();
+
+    /**
+     * The salon's street name ({@code salons.street}). AUTH-GATED: always
+     * fetched in SQL, but nulled out per-request for anonymous callers after the
+     * {@code @Cacheable} read (privacy — see {@code SalonSearchResult}). May be
+     * {@code null} when the salon has not recorded a street.
+     */
+    String getStreet();
+
+    /**
+     * The salon's building number ({@code salons.building_no}). AUTH-GATED, same
+     * handling as {@link #getStreet()}. May be {@code null}.
+     */
+    String getBuildingNo();
+
+    /**
+     * The salon's free-text arrival note ({@code salons.location_note}).
+     * AUTH-GATED, same handling as {@link #getStreet()} — always fetched in SQL,
+     * nulled out per-request for anonymous callers after the {@code @Cacheable}
+     * read (privacy — see {@code SalonSearchResult}). May be {@code null} when
+     * the salon recorded no note.
+     */
+    String getLocationNote();
 }

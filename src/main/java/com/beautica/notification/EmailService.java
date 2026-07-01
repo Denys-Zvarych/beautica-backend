@@ -1,9 +1,11 @@
 package com.beautica.notification;
 
+import com.beautica.support.dto.SupportAttachment;
 import jakarta.mail.internet.MimeMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.mail.MailException;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
@@ -12,7 +14,9 @@ import org.springframework.stereotype.Service;
 import org.thymeleaf.context.Context;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
+import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Legacy email transport retained for {@link #sendAdminNotification} (still wired
@@ -151,6 +155,77 @@ public class EmailService {
             log.error("Failed to send service-type-suggestion notification email: {}", ex.getClass().getSimpleName());
         } catch (Exception ex) {
             log.error("Failed to send service-type-suggestion notification email: {}", ex.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Sends the support inbox a Help / Contact-us message with the authenticated
+     * sender's identity and any embedded file attachments.
+     *
+     * <p>The HTML body is rendered through Thymeleaf with auto-escaping, so a
+     * malicious message body or subject cannot inject markup. The mail
+     * {@code Subject} header is a constant prefix + the authenticated sender email
+     * (a server-resolved, validated value), so no caller-supplied free text can
+     * inject a CR/LF header. Attachments are added verbatim — their bytes, MIME
+     * types, count, and total size are validated upstream in {@code SupportService}
+     * before this method is called.
+     *
+     * <p>Returns a {@link CompletableFuture} so a fire-and-forget caller may ignore
+     * it while a synchronous caller (or a test) can observe send failure rather than
+     * having a {@code @Async} exception silently swallowed (Anti-Bug §H).
+     *
+     * @param toEmail       fixed support-inbox recipient (resolved from config)
+     * @param senderUserId  authenticated user's UUID (audit, shown in body)
+     * @param senderEmail   authenticated user's email (shown in body + subject)
+     * @param subject       optional caller subject hint (auto-escaped; may be null/blank)
+     * @param body          message text (auto-escaped on render)
+     * @param attachments   already-validated attachments to embed (may be empty)
+     */
+    @Async("supportEmailExecutor")
+    public CompletableFuture<Void> sendSupportContactEmail(
+            String toEmail,
+            String senderUserId,
+            String senderEmail,
+            String subject,
+            String body,
+            List<SupportAttachment> attachments) {
+        try {
+            Context ctx = new Context(Locale.of("uk"));
+            ctx.setVariable("senderUserId", senderUserId);
+            ctx.setVariable("senderEmail", senderEmail);
+            ctx.setVariable("subject", subject);
+            ctx.setVariable("body", body);
+
+            String html = templateEngine.process("email/support-contact", ctx);
+
+            MimeMessage message = mailSender.createMimeMessage();
+            // multipart=true: required so addAttachment can build a mixed body.
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+            helper.setFrom(fromEmail);
+            helper.setTo(toEmail);
+            // Reply-To is the authenticated sender so support can answer directly,
+            // while From stays the platform no-reply (DMARC-aligned).
+            helper.setReplyTo(senderEmail);
+            helper.setSubject("[Beautica Support] message from " + senderEmail);
+            helper.setText(html, true);
+
+            for (SupportAttachment attachment : attachments) {
+                helper.addAttachment(
+                        attachment.filename(),
+                        new ByteArrayResource(attachment.bytes()),
+                        attachment.contentType());
+            }
+
+            mailSender.send(message);
+            return CompletableFuture.completedFuture(null);
+        } catch (Exception ex) {
+            // Fire-and-forget: SupportService.contact returns 202 before this completes, so a
+            // post-202 send failure would otherwise be silent. Log recipient inbox + sender
+            // userId + exception type (no message body, no token bytes — no PII beyond the
+            // audit identity already logged at accept time) so the drop is observable.
+            log.error("Failed to send support contact email to {} from user {}: {}",
+                    toEmail, senderUserId, ex.getClass().getSimpleName());
+            return CompletableFuture.failedFuture(ex);
         }
     }
 }

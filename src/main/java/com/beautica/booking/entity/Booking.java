@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.common.AuditableEntity;
@@ -39,7 +40,26 @@ import java.util.UUID;
                 @Index(name = "idx_bookings_master_completed_starts_at", columnList = "master_id, starts_at"),
                 // partial index (V43): dashboard revenue — SALON_OWNER path
                 // same JPA partial-index limitation as above; V43 is authoritative for the WHERE clause.
-                @Index(name = "idx_bookings_salon_completed_starts_at", columnList = "salon_id, starts_at")
+                @Index(name = "idx_bookings_salon_completed_starts_at", columnList = "salon_id, starts_at"),
+                // partial UNIQUE index (V90): cancel-token lookup for the public guest-cancel page.
+                // JPA cannot encode WHERE cancel_token IS NOT NULL nor the partial-uniqueness —
+                // the predicate + UNIQUE live in V90 only (V90 dropped the V89 full unique
+                // constraint + non-unique partial index in favour of one partial-unique index).
+                @Index(name = "idx_bookings_cancel_token", columnList = "cancel_token"),
+                // partial index (V89): hourly guest-reminder sweep.
+                // JPA cannot encode WHERE booking_source='LINK' AND reminder_sent=FALSE —
+                // predicate lives in V89 only; do NOT treat this annotation as authoritative.
+                @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
+                // composite index (V93): per-client "latest booking" LATERAL subquery in
+                // FavoriteRepository.findFavoriteMasterRows. JPA cannot encode the DESC sort
+                // direction — V93 declares starts_at DESC; this annotation mirrors the columns
+                // only so ddl-auto=validate sees the index exists.
+                @Index(name = "idx_bookings_master_client_starts_at", columnList = "master_id, client_id, starts_at"),
+                // composite index (V95): BookingRepository.findClientBookingDetails unfiltered
+                // shape — WHERE client_id = ? ORDER BY starts_at DESC. JPA cannot encode the DESC
+                // sort direction — V95 declares starts_at DESC; this annotation mirrors the columns
+                // only so ddl-auto=validate sees the index exists.
+                @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at")
         }
 )
 @Getter
@@ -52,8 +72,10 @@ public class Booking extends AuditableEntity {
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
+    // Nullable since V89: a guest (LINK) booking has no registered account. The DB
+    // CHECK chk_bookings_guest_fields keeps APP bookings' client_id NOT NULL.
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "client_id", nullable = false)
+    @JoinColumn(name = "client_id")
     private User client;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -102,4 +124,115 @@ public class Booking extends AuditableEntity {
     @Setter
     @Column(name = "provider_comment", length = 1000)
     private String providerComment;
+
+    // ── Guest-booking columns (Phase 13.3 / V89; relaxed by V91) ──────────────
+    // A LINK booking is created via beautica.app/book/{slug} by a phone-verified,
+    // account-less client. The DB CHECK chk_bookings_guest_fields enforces that
+    // LINK ⇒ guestName/guestPhone non-null and APP ⇒ all null; the application
+    // mirror lives in Booking.guestBooking(...). V91 relaxes the cancelToken clause
+    // so a LINK row may have a NULL cancelToken once status is terminal
+    // (CANCELLED/COMPLETED/NOT_COMPLETED/DECLINED) — the guest-cancel UPDATE nulls
+    // the token while setting status = CANCELLED.
+
+    // Defaults to APP so the regular (registered-client) booking path and existing
+    // fixtures need not set it explicitly — Hibernate always emits the column in the
+    // INSERT, so a null here would violate the NOT NULL despite the DB DEFAULT. The
+    // guest factory overrides this to LINK.
+    @Builder.Default
+    @Enumerated(EnumType.STRING)
+    @Column(name = "booking_source", nullable = false, length = 10)
+    private BookingSource bookingSource = BookingSource.APP;
+
+    @Column(name = "guest_name", length = 100)
+    private String guestName;
+
+    @Column(name = "guest_surname", length = 100)
+    private String guestSurname;
+
+    @Column(name = "guest_phone", length = 20)
+    private String guestPhone;
+
+    // Uniqueness is enforced by the V90 partial-unique index (UNIQUE only over non-NULL
+    // rows). `unique = true` here would direct Hibernate ddl-auto to recreate the full
+    // unique constraint V90 deliberately dropped, so it is intentionally omitted.
+    @Column(name = "cancel_token")
+    private UUID cancelToken;
+
+    @Setter
+    @Column(name = "reminder_sent", nullable = false)
+    private boolean reminderSent;
+
+    /**
+     * Factory for an auto-confirmed guest (LINK) booking. Enforces the LINK
+     * invariant (guest identity + cancel token non-null) before the row exists,
+     * so a partially-populated guest booking can never be constructed in code —
+     * mirroring the DB CHECK {@code chk_bookings_guest_fields}.
+     *
+     * @param guestName    OTP-verified client's first name (required)
+     * @param guestSurname client's surname (optional — column is nullable)
+     * @param guestPhone   E.164 phone copied from the guest JWT {@code sub} (required)
+     */
+    public static Booking guestBooking(
+            Master master,
+            MasterServiceAssignment masterService,
+            Salon salon,
+            OffsetDateTime startsAt,
+            OffsetDateTime endsAt,
+            BigDecimal priceAtBooking,
+            int durationMinutesAtBooking,
+            int bufferMinutesAtBooking,
+            String guestName,
+            String guestSurname,
+            String guestPhone) {
+        if (guestName == null || guestName.isBlank()) {
+            throw new IllegalArgumentException("guestName must not be blank for a LINK booking");
+        }
+        if (guestPhone == null || guestPhone.isBlank()) {
+            throw new IllegalArgumentException("guestPhone must not be blank for a LINK booking");
+        }
+        return Booking.builder()
+                // No client FK: a guest booking has no registered account
+                // (client_id is nullable since V89; the DB CHECK enforces LINK ⇒ client_id NULL).
+                .master(master)
+                .masterService(masterService)
+                .salon(salon)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(startsAt)
+                .endsAt(endsAt)
+                .priceAtBooking(priceAtBooking)
+                .durationMinutesAtBooking(durationMinutesAtBooking)
+                .bufferMinutesAtBooking(bufferMinutesAtBooking)
+                .bookingSource(BookingSource.LINK)
+                .guestName(guestName)
+                .guestSurname(guestSurname)
+                .guestPhone(guestPhone)
+                .cancelToken(UUID.randomUUID())
+                .reminderSent(false)
+                .build();
+    }
+
+    /**
+     * Moves this booking to a new time window and re-enters the approval queue.
+     *
+     * <p>Per the Phase 19.2 locked decision a {@code CONFIRMED} booking reverts to
+     * {@code PENDING} on reschedule (the provider must re-approve at the new time);
+     * a {@code PENDING} booking stays {@code PENDING}. {@code priceAtBooking} and
+     * {@code durationMinutesAtBooking} are frozen at the original booking and are
+     * deliberately NOT recomputed here — the caller computes {@code newEndsAt} from
+     * the frozen duration (+ buffer) before invoking this method.
+     *
+     * <p>Allowed source-state and slot/overlap validation are the caller's
+     * responsibility (see {@code BookingService.rescheduleBooking}); this method only
+     * applies the state transition once those checks have passed.
+     *
+     * @param newStartsAt the new start instant (already validated by the service)
+     * @param newEndsAt   the new end instant ({@code newStartsAt + duration + buffer})
+     */
+    public void reschedule(OffsetDateTime newStartsAt, OffsetDateTime newEndsAt) {
+        this.startsAt = newStartsAt;
+        this.endsAt = newEndsAt;
+        if (this.status == BookingStatus.CONFIRMED) {
+            this.status = BookingStatus.PENDING;
+        }
+    }
 }
