@@ -117,4 +117,112 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
              WHERE m.id = :masterId
             """, nativeQuery = true)
     void recalculateMasterRating(@Param("masterId") UUID masterId);
+
+    /**
+     * Salon-scoped symmetric twin of {@link #recalculateMasterRating}, added for Phase 13.6
+     * (Public Salon Profile). Same single-pass native aggregate, same COALESCE-to-zero
+     * no-reviews handling, same {@code clearAutomatically}/{@code flushAutomatically}
+     * contract. Called from {@link com.beautica.review.event.ReviewEventListener#onReviewCreated}
+     * only when the reviewed booking carried a non-null salon id.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE salons s
+               SET avg_rating   = agg.avg_rating,
+                   review_count = agg.cnt
+              FROM (SELECT COALESCE(AVG(r.rating::numeric), 0) AS avg_rating,
+                           COUNT(*) AS cnt
+                      FROM reviews r
+                     WHERE r.salon_id = :salonId) agg
+             WHERE s.id = :salonId
+            """, nativeQuery = true)
+    void recalculateSalonRating(@Param("salonId") UUID salonId);
+
+    /**
+     * Rating-bucket counts for a salon's reviews, backing {@link com.beautica.review.dto.SalonReviewSummaryResponse}'s
+     * {@code ratingDistribution}. Only buckets with at least one review are returned —
+     * the service layer zero-fills the missing 1-5 buckets so every bucket is present in
+     * the response (never omit a zero-count star rating).
+     */
+    @Query("SELECT r.rating AS rating, COUNT(r) AS count FROM Review r WHERE r.salon.id = :salonId GROUP BY r.rating")
+    List<RatingCountProjection> countBySalonIdGroupByRating(@Param("salonId") UUID salonId);
+
+    // ── Salon reviews — sortable list (Phase 13.6) ─────────────────────────────
+    //
+    // Four fixed, named finder methods — one per SalonReviewSort value — instead of
+    // accepting a caller-supplied Sort/@SortDefault. A free-form sort string would let a
+    // caller probe entity property names via PropertyReferenceException (the same reason
+    // findIdsByMasterIdOrderByCreatedAtDesc above hardcodes its ORDER BY). Same two-query
+    // ID-then-hydrate pattern: paginate on IDs only (SQL LIMIT/OFFSET, no JOIN FETCH),
+    // then hydrate the bounded ID set via findByIdsWithGraphForSalonReviews below.
+
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.salon.id = :salonId
+            ORDER BY r.createdAt DESC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.salon.id = :salonId
+            """)
+    Page<UUID> findIdsBySalonIdOrderByCreatedAtDesc(@Param("salonId") UUID salonId, Pageable pageable);
+
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.salon.id = :salonId
+            ORDER BY r.createdAt ASC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.salon.id = :salonId
+            """)
+    Page<UUID> findIdsBySalonIdOrderByCreatedAtAsc(@Param("salonId") UUID salonId, Pageable pageable);
+
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.salon.id = :salonId
+            ORDER BY r.rating DESC, r.createdAt DESC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.salon.id = :salonId
+            """)
+    Page<UUID> findIdsBySalonIdOrderByRatingDescCreatedAtDesc(@Param("salonId") UUID salonId, Pageable pageable);
+
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.salon.id = :salonId
+            ORDER BY r.rating ASC, r.createdAt DESC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.salon.id = :salonId
+            """)
+    Page<UUID> findIdsBySalonIdOrderByRatingAscCreatedAtDesc(@Param("salonId") UUID salonId, Pageable pageable);
+
+    /**
+     * Batch-hydrates a bounded set of salon reviews with the associations
+     * {@link com.beautica.review.dto.SalonReviewResponse} needs: {@code client} (masking),
+     * {@code master.user} (master display name), and the two-hop
+     * {@code booking.masterService.serviceDefinition} chain (service name).
+     *
+     * <p>Deliberately a NEW method rather than widening {@link #findByIdsWithGraph}: that
+     * method backs the master-reviews path and does not need the booking/service-definition
+     * chain — adding it there would regress that path with an unneeded JOIN (anti-bug §E.1).
+     *
+     * <p><strong>Result order is undefined</strong> — same contract as
+     * {@link #findByIdsWithGraph}. Callers must reorder using the ID sequence from the
+     * {@code findIdsBySalonIdOrderBy...} method that produced {@code ids}.
+     */
+    @Query("""
+            SELECT r FROM Review r
+            JOIN FETCH r.client
+            JOIN FETCH r.master m
+            JOIN FETCH m.user
+            JOIN FETCH r.booking b
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE r.id IN :ids
+            """)
+    List<Review> findByIdsWithGraphForSalonReviews(@Param("ids") List<UUID> ids);
 }

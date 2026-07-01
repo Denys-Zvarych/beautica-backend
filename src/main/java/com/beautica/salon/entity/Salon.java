@@ -18,6 +18,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.math.BigDecimal;
 import java.util.UUID;
 
 @Entity
@@ -94,6 +95,29 @@ public class Salon extends AuditableEntity {
 
     @Column(name = "avatar_url")
     private String avatarUrl;
+
+    /**
+     * Wide hero/banner image shown at the top of the public salon profile (Phase 13.6).
+     * Nullable — salons without a cover image fall back to a plain header on the client.
+     * No CHECK constraint yet (V103): there is no upload endpoint until the Phase 9
+     * media feature ships, so URL-format validation is deferred to that migration.
+     */
+    @Column(name = "cover_image_url", length = 2048)
+    private String coverImageUrl;
+
+    /**
+     * Persisted rating aggregate — mirrors {@code Master#avgRating}'s exact JPA style
+     * (bare {@code @Column(name = "avg_rating")}, no {@code nullable = false}; the DB
+     * column is {@code NUMERIC(3,2)}, precision/scale intentionally left off the
+     * annotation to match). {@code null} until {@link com.beautica.review.repository.ReviewRepository#recalculateSalonRating}
+     * has run at least once; the DTO layer additionally treats a zero {@code reviewCount}
+     * as "no rating" regardless of the stored value.
+     */
+    @Column(name = "avg_rating")
+    private BigDecimal avgRating;
+
+    @Column(name = "review_count")
+    private int reviewCount;
 
     @Column(name = "is_active")
     private boolean isActive;

@@ -40,6 +40,7 @@ import static org.mockito.Mockito.when;
 @SpringBootTest(
         classes = {
                 CategoryRequestService.class,
+                PlatformCategoryOrderLookup.class,
                 CacheConfig.class,
                 CategoryRequestServiceCacheTest.ClockTestConfig.class
         },
@@ -68,12 +69,15 @@ class CategoryRequestServiceCacheTest {
     @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
 
     @Autowired CategoryRequestService service;
+    @Autowired PlatformCategoryOrderLookup platformCategoryOrderLookup;
     @Autowired CacheManager cacheManager;
 
     @BeforeEach
     void clearCache() {
         var cache = cacheManager.getCache("approved-categories");
         if (cache != null) cache.clear();
+        var orderCache = cacheManager.getCache("platform-category-order");
+        if (orderCache != null) orderCache.clear();
     }
 
     private PlatformCategory pending() {
@@ -129,5 +133,60 @@ class CategoryRequestServiceCacheTest {
     @DisplayName("should_registerNamedCache_when_contextLoads")
     void should_registerNamedCache_when_contextLoads() {
         assertThat(cacheManager.getCache("approved-categories")).isNotNull();
+    }
+
+    // ── platform-category-order cache (perf follow-up, Phase 13.6) ─────────────
+    //
+    // PlatformCategoryOrderLookup#getApprovedActive backs ServiceCatalogService
+    // #buildCategoryOrder — this proves the sibling cache (a separate bean/cache from
+    // "approved-categories" above) actually hits on a second call, and that approve/reject
+    // evict it via the same @Caching(evict = {...}) block that evicts "approved-categories".
+
+    @Test
+    @DisplayName("should_registerNamedCache_when_contextLoads_platformCategoryOrder")
+    void should_registerNamedCache_when_contextLoads_platformCategoryOrder() {
+        assertThat(cacheManager.getCache("platform-category-order")).isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_hitCache_when_platformCategoryOrderLookupCalledTwice")
+    void should_hitCache_when_platformCategoryOrderLookupCalledTwice() {
+        when(platformCategoryRepository.findApprovedActive())
+                .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
+
+        platformCategoryOrderLookup.getApprovedActive();
+        platformCategoryOrderLookup.getApprovedActive();
+
+        verify(platformCategoryRepository, times(1)).findApprovedActive();
+    }
+
+    @Test
+    @DisplayName("should_evictPlatformCategoryOrderCache_when_approveCalled")
+    void should_evictPlatformCategoryOrderCache_when_approveCalled() {
+        when(platformCategoryRepository.findApprovedActive())
+                .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+
+        platformCategoryOrderLookup.getApprovedActive();  // populate cache
+        service.approve(RAW_TOKEN);                       // must evict
+        platformCategoryOrderLookup.getApprovedActive();  // cache miss → re-query
+
+        verify(platformCategoryRepository, times(2)).findApprovedActive();
+    }
+
+    @Test
+    @DisplayName("should_evictPlatformCategoryOrderCache_when_rejectCalled")
+    void should_evictPlatformCategoryOrderCache_when_rejectCalled() {
+        when(platformCategoryRepository.findApprovedActive())
+                .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+
+        platformCategoryOrderLookup.getApprovedActive();  // populate cache
+        service.reject(RAW_TOKEN);                        // must evict
+        platformCategoryOrderLookup.getApprovedActive();  // cache miss → re-query
+
+        verify(platformCategoryRepository, times(2)).findApprovedActive();
     }
 }

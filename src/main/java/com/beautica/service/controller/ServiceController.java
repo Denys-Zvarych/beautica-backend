@@ -6,6 +6,7 @@ import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
@@ -72,6 +73,23 @@ public class ServiceController {
     public ApiResponse<List<MasterServiceResponse>> getMasterServices(
             @PathVariable UUID masterId) {
         return ApiResponse.ok(serviceCatalogService.getMasterServices(masterId));
+    }
+
+    /**
+     * Returns a salon's public, bookable service catalog grouped by category.
+     *
+     * <p><strong>Public endpoint — no authentication required.</strong> Matches the
+     * {@link #getMasterServices(UUID)} no-auth pattern above: unauthenticated clients
+     * browse a salon's menu before deciding to book. No {@code @PreAuthorize} guard is
+     * intentional; adding one would break the discovery flow for anonymous users.
+     *
+     * <p>Note this shares its path with {@link #addServiceToSalon} above — no route
+     * collision, they are distinct HTTP methods (POST vs GET).
+     */
+    @GetMapping("/salons/{salonId}/services")
+    public ApiResponse<SalonServiceCatalogResponse> getSalonServiceCatalog(
+            @PathVariable UUID salonId) {
+        return ApiResponse.ok(serviceCatalogService.getSalonServiceCatalog(salonId));
     }
 
     /**

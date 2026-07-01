@@ -12,6 +12,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
@@ -76,6 +77,9 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private PlatformCategoryRepository platformCategoryRepository;
+
+    @Mock
+    private PlatformCategoryOrderLookup platformCategoryOrderLookup;
 
     @Mock
     private EmailService emailService;
@@ -1043,5 +1047,124 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceRepository, never()).save(any());
+    }
+
+    // ── getSalonServiceCatalog (Phase 13.6 — Public Salon Profile) ──────────────
+
+    private ServiceDefinition buildCatalogDefinition(String category, String name) {
+        return ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .name(name)
+                .category(category)
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("300.00"))
+                .build();
+    }
+
+    private com.beautica.service.entity.PlatformCategory approvedCategory(String name) {
+        return com.beautica.service.entity.PlatformCategory.ofApproved(name, name);
+    }
+
+    @Test
+    @DisplayName("groups services by category, one group per distinct category")
+    void should_groupServicesByCategory_when_multipleCategoriesPresent() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition manicure1 = buildCatalogDefinition("MANICURE", "Classic manicure");
+        ServiceDefinition manicure2 = buildCatalogDefinition("MANICURE", "Gel manicure");
+        ServiceDefinition haircut = buildCatalogDefinition("HAIRCUT", "Women's haircut");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(manicure1, manicure2, haircut));
+        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).hasSize(2);
+        var manicureGroup = result.categories().stream()
+                .filter(g -> g.category().equals("MANICURE")).findFirst().orElseThrow();
+        assertThat(manicureGroup.count()).isEqualTo(2);
+        assertThat(manicureGroup.services()).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("orders category groups using the approved+active platform-category display order")
+    void should_orderCategories_byApprovedActiveDisplayOrder() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition haircut = buildCatalogDefinition("HAIRCUT", "Women's haircut");
+        ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
+
+        // findApprovedActive is ORDER BY displayName — MANICURE listed before HAIRCUT here
+        // to prove the group order follows THIS list's index, not alphabetical category order.
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(haircut, manicure));
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("MANICURE"), approvedCategory("HAIRCUT")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories())
+                .extracting(SalonServiceCategoryGroup::category)
+                .as("MANICURE must sort first — it has the lower index in findApprovedActive")
+                .containsExactly("MANICURE", "HAIRCUT");
+    }
+
+    @Test
+    @DisplayName("sorts a category with no match in the approved list alphabetically AFTER every known category")
+    void should_sortUnknownCategoryAlphabeticallyAfterKnownCategories() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition legacy = buildCatalogDefinition("ZZZ_LEGACY", "Old-style service");
+        ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(legacy, manicure));
+        // ZZZ_LEGACY is intentionally absent from the approved+active list.
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("MANICURE")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories())
+                .extracting(SalonServiceCategoryGroup::category)
+                .as("the known MANICURE category must sort before the unmatched ZZZ_LEGACY category")
+                .containsExactly("MANICURE", "ZZZ_LEGACY");
+    }
+
+    @Test
+    @DisplayName("returns an empty category list when the salon has no bookable services")
+    void should_returnEmptyCategories_when_salonHasNoBookableServices() {
+        UUID salonId = UUID.randomUUID();
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of());
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).isEmpty();
+        verify(platformCategoryOrderLookup, never()).getApprovedActive();
+    }
+
+    @Test
+    @DisplayName("reuses ServiceDefinitionResponse as the leaf DTO with fields mapped through")
+    void should_mapServiceDefinitionFields_intoLeafDto() {
+        UUID salonId = UUID.randomUUID();
+        ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(manicure));
+        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        var leaf = result.categories().get(0).services().get(0);
+        assertThat(leaf.id()).isEqualTo(manicure.getId());
+        assertThat(leaf.name()).isEqualTo("Classic manicure");
+        assertThat(leaf.category()).isEqualTo("MANICURE");
     }
 }

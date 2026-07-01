@@ -49,6 +49,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private MasterRepository masterRepository;
     @Mock private CatalogCategoryLookup catalogCategoryLookup;
     @Mock private PlatformCategoryRepository platformCategoryRepository;
+    @Mock private PlatformCategoryOrderLookup platformCategoryOrderLookup;
     @Mock private ServiceTypeSuggestionService serviceTypeSuggestionService;
     @Mock private ServiceTypeLookup serviceTypeLookup;
     @Mock private ServiceTypeSearchService serviceTypeSearchService;
@@ -67,6 +68,7 @@ class ServiceCatalogServiceCatalogTest {
                 masterRepository,
                 catalogCategoryLookup,
                 platformCategoryRepository,
+                platformCategoryOrderLookup,
                 serviceTypeSuggestionService,
                 serviceTypeLookup,
                 serviceTypeSearchService,

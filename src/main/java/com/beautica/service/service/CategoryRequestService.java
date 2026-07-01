@@ -14,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -144,7 +145,10 @@ public class CategoryRequestService {
      * {@link DecisionOutcome#ALREADY_DECIDED} (or INVALID_OR_EXPIRED) — no 500.
      */
     @Transactional
-    @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY)
+    @Caching(evict = {
+            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY),
+            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY)
+    })
     public DecisionOutcome approve(String rawToken) {
         return decide(rawToken, true);
     }
@@ -154,7 +158,10 @@ public class CategoryRequestService {
      * Idempotent (see {@link #approve}).
      */
     @Transactional
-    @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY)
+    @Caching(evict = {
+            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY),
+            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY)
+    })
     public DecisionOutcome reject(String rawToken) {
         return decide(rawToken, false);
     }
@@ -171,6 +178,12 @@ public class CategoryRequestService {
      * stale snapshot between eviction and commit; the 60-minute TTL is the backstop.
      * {@code submitRequest} only inserts PENDING rows (not in this list) so it needs
      * no eviction.
+     *
+     * <p>The sibling {@link PlatformCategoryOrderLookup#CACHE_NAME} cache is evicted
+     * alongside this one on {@link #approve}/{@link #reject}: it backs {@code
+     * ServiceCatalogService#buildCategoryOrder} with the same {@code findApprovedActive()}
+     * query result, kept as a separate cache/bean because it returns entities for internal
+     * ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.
      */
     @Transactional(readOnly = true)
     @Cacheable(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY)

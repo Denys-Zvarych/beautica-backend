@@ -13,6 +13,8 @@ import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
@@ -20,6 +22,7 @@ import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
@@ -39,12 +42,15 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -56,6 +62,7 @@ public class ServiceCatalogService {
     private final MasterRepository masterRepository;
     private final CatalogCategoryLookup catalogCategoryLookup;
     private final PlatformCategoryRepository platformCategoryRepository;
+    private final PlatformCategoryOrderLookup platformCategoryOrderLookup;
     private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
@@ -676,6 +683,84 @@ public class ServiceCatalogService {
     @Transactional(readOnly = true)
     public List<CatalogCategoryResponse> getCategories() {
         return catalogCategoryLookup.getAll();
+    }
+
+    /**
+     * A salon's public, bookable service catalog grouped by category (Phase 13.6,
+     * {@code GET /salons/{salonId}/services}).
+     *
+     * <p>No caching for v1 (deliberate — keeps this PR scoped): the underlying query is
+     * already cheap (indexed {@code owner_type}/{@code owner_id}/{@code is_active} plus an
+     * {@code EXISTS} on an indexed FK), unlike {@code getMasterServices} which justified a
+     * cache by eliminating a JOIN-heavy graph query on a very hot single-master path.
+     *
+     * <p>Bounded via an internal soft cap ({@code PageRequest.of(0, 500)}, mirroring
+     * {@code getMasterServices}'s {@code PageRequest.of(0, 200)}) rather than exposing a
+     * caller-supplied {@code Pageable} — the mobile client needs the WHOLE catalog at once
+     * to group it by category, so pagination would only fragment categories across pages.
+     */
+    @Transactional(readOnly = true)
+    public SalonServiceCatalogResponse getSalonServiceCatalog(UUID salonId) {
+        List<ServiceDefinition> definitions =
+                serviceRepository.findBookableServicesBySalon(salonId, PageRequest.of(0, 500));
+
+        if (definitions.isEmpty()) {
+            return new SalonServiceCatalogResponse(List.of());
+        }
+
+        Map<String, Integer> categoryOrder = buildCategoryOrder();
+
+        Map<String, List<ServiceDefinition>> byCategory = definitions.stream()
+                .collect(Collectors.groupingBy(
+                        sd -> Objects.requireNonNullElse(sd.getCategory(), ""),
+                        LinkedHashMap::new,
+                        Collectors.toList()));
+
+        List<SalonServiceCategoryGroup> categories = byCategory.entrySet().stream()
+                .sorted(Comparator
+                        .<Map.Entry<String, List<ServiceDefinition>>>comparingInt(
+                                e -> categoryOrder.getOrDefault(e.getKey(), Integer.MAX_VALUE))
+                        .thenComparing(Map.Entry::getKey))
+                .map(e -> new SalonServiceCategoryGroup(
+                        e.getKey(),
+                        e.getValue().size(),
+                        e.getValue().stream().map(ServiceDefinitionResponse::from).toList()))
+                .toList();
+
+        return new SalonServiceCatalogResponse(categories);
+    }
+
+    /**
+     * Builds a {@code category name -> ordinal position} map from the approved+active
+     * {@link PlatformCategory} rows, in the same display order the category picker already
+     * uses ({@link PlatformCategoryRepository#findApprovedActive}, {@code ORDER BY
+     * displayName} — {@link PlatformCategory} carries no explicit {@code sortOrder}
+     * column). A {@code ServiceDefinition.category} value with no entry in this map
+     * (inactive/legacy/unknown category) sorts alphabetically AFTER every known category
+     * in {@link #getSalonServiceCatalog}.
+     *
+     * <p>Deliberately NOT {@link #getCategories()} / {@link CatalogCategoryLookup}: that
+     * returns the separate, orphaned "System A" {@code service_categories} table keyed by
+     * {@code nameUk}/{@code nameEn} display strings (e.g. {@code "Nails"}) — those never
+     * match {@code ServiceDefinition.category}, which stores the live {@link PlatformCategory
+     * #getName()} canonical code (e.g. {@code "MANICURE"}). Using {@code getCategories()}
+     * here would silently never match anything, degrading every group to alphabetical order.
+     *
+     * <p>Delegates the {@code findApprovedActive()} query through {@link
+     * PlatformCategoryOrderLookup} (a separate {@code @Cacheable} bean, 60-min TTL) instead of
+     * calling {@link #platformCategoryRepository} directly: this data is static,
+     * admin-approval-gated reference data identical across every request, so re-querying it on
+     * every public {@link #getSalonServiceCatalog} hit was pure waste. A same-class
+     * {@code @Cacheable} method would not intercept via the AOP proxy on this self-invocation
+     * (same caveat documented on {@link #searchServiceTypes}), hence the separate bean.
+     */
+    private Map<String, Integer> buildCategoryOrder() {
+        List<PlatformCategory> approved = platformCategoryOrderLookup.getApprovedActive();
+        Map<String, Integer> order = new LinkedHashMap<>();
+        for (int i = 0; i < approved.size(); i++) {
+            order.put(approved.get(i).getName(), i);
+        }
+        return order;
     }
 
     @Transactional(readOnly = true)

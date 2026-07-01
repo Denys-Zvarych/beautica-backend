@@ -30,7 +30,10 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 @DisplayName("ReviewEventListener — unit")
 @ExtendWith(MockitoExtension.class)
@@ -75,7 +78,7 @@ class ReviewEventListenerTest {
     void should_logError_when_recalculateMasterRatingThrows() {
         // Arrange
         UUID masterId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, null);
 
         doThrow(new RuntimeException("simulated DB timeout"))
                 .when(reviewRepository).recalculateMasterRating(masterId);
@@ -102,7 +105,7 @@ class ReviewEventListenerTest {
     void should_notLogError_when_recalculateMasterRatingSucceeds() {
         // Arrange
         UUID masterId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, null);
         // No stub for reviewRepository.recalculateMasterRating — default Mockito void stub is fine.
         // No stub for cacheManager — afterCommit() only fires on real TX commit.
 
@@ -112,6 +115,71 @@ class ReviewEventListenerTest {
         assertThat(listAppender.list)
                 .as("no ERROR log must be emitted on success path")
                 .noneMatch(e -> e.getLevel() == Level.ERROR);
+    }
+
+    // ── onReviewCreated — salon rating recalculation (Phase 13.6) ──────────────
+
+    @Test
+    @DisplayName("should_callRecalculateSalonRating_when_eventCarriesSalonId")
+    void should_callRecalculateSalonRating_when_eventCarriesSalonId() {
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, salonId);
+
+        reviewEventListener.onReviewCreated(event);
+
+        verify(reviewRepository).recalculateSalonRating(salonId);
+    }
+
+    @Test
+    @DisplayName("should_notCallRecalculateSalonRating_when_eventSalonIdIsNull")
+    void should_notCallRecalculateSalonRating_when_eventSalonIdIsNull() {
+        UUID masterId = UUID.randomUUID();
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, null);
+
+        reviewEventListener.onReviewCreated(event);
+
+        verify(reviewRepository, never()).recalculateSalonRating(any());
+    }
+
+    @Test
+    @DisplayName("should_logError_when_recalculateSalonRatingThrows")
+    void should_logError_when_recalculateSalonRatingThrows() {
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, salonId);
+
+        doThrow(new RuntimeException("simulated DB timeout"))
+                .when(reviewRepository).recalculateSalonRating(salonId);
+
+        assertThatNoException()
+                .as("exception from recalculateSalonRating must not propagate out of onReviewCreated")
+                .isThrownBy(() -> reviewEventListener.onReviewCreated(event));
+
+        assertThat(listAppender.list)
+                .as("an ERROR log entry must be emitted when recalculateSalonRating throws")
+                .anyMatch(e ->
+                        e.getLevel() == Level.ERROR
+                        && e.getFormattedMessage().contains(salonId.toString())
+                        && e.getFormattedMessage().contains("RuntimeException")
+                        && !e.getFormattedMessage().contains("simulated DB timeout"));
+    }
+
+    @Test
+    @DisplayName("should_stillRecalculateMasterRating_when_salonRecalcThrows")
+    void should_stillRecalculateMasterRating_when_salonRecalcThrows() {
+        // A salon-recalc failure must not prevent (or be prevented by) the master branch —
+        // the two are independent try/catch blocks.
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, salonId);
+
+        doThrow(new RuntimeException("simulated DB timeout"))
+                .when(reviewRepository).recalculateSalonRating(salonId);
+
+        reviewEventListener.onReviewCreated(event);
+
+        verify(reviewRepository).recalculateMasterRating(masterId);
     }
 
     // ── Cache eviction isolation (FIX 14) ─────────────────────────────────────
@@ -138,6 +206,8 @@ class ReviewEventListenerTest {
         void clearCache() {
             org.springframework.cache.Cache c = cacheManager.getCache("reviews-by-master");
             if (c != null) c.clear();
+            org.springframework.cache.Cache s = cacheManager.getCache("reviews-by-salon");
+            if (s != null) s.clear();
         }
 
         @Test
@@ -168,7 +238,7 @@ class ReviewEventListenerTest {
             // Call evictMasterReviewPages indirectly via onReviewCreated.
             // The listener calls reviewRepository.recalculateMasterRating (which we ignore)
             // then calls evictMasterReviewPages(masterA).
-            reviewEventListener.onReviewCreated(new ReviewCreatedEvent(masterA));
+            reviewEventListener.onReviewCreated(new ReviewCreatedEvent(masterA, null));
 
             // Assert — masterA's entry is gone; masterB's entry is intact
             assertThat(nativeCache.getIfPresent(keyA))
@@ -176,6 +246,68 @@ class ReviewEventListenerTest {
                     .isNull();
             assertThat(nativeCache.getIfPresent(keyB))
                     .as("masterB's cache entry must NOT be evicted by an event for masterA")
+                    .isNotNull();
+        }
+
+        // ── evictSalonReviewPages — per-salon isolation (Finding 1 — perf follow-up) ──
+
+        @Test
+        @DisplayName("should_notEvictSalonB_when_evictingSalonA")
+        void should_notEvictSalonB_when_evictingSalonA() {
+            // Arrange — obtain native Caffeine cache and manually populate two entries
+            org.springframework.cache.Cache springCache = cacheManager.getCache("reviews-by-salon");
+            assertThat(springCache).isNotNull();
+
+            @SuppressWarnings("unchecked")
+            Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
+
+            UUID salonA = UUID.randomUUID();
+            UUID salonB = UUID.randomUUID();
+
+            // Populate cache with String keys matching the format used by
+            // ReviewService.getSalonReviews:
+            // "'salon:' + #salonId + ':sort:' + #sort + ':page:' + #pageable.pageNumber + ':size:' + #pageable.pageSize"
+            String keyA = "salon:" + salonA + ":sort:NEWEST:page:0:size:20";
+            String keyB = "salon:" + salonB + ":sort:NEWEST:page:0:size:20";
+
+            nativeCache.put(keyA, "page-content-for-A");
+            nativeCache.put(keyB, "page-content-for-B");
+
+            assertThat(nativeCache.getIfPresent(keyA)).isNotNull();
+            assertThat(nativeCache.getIfPresent(keyB)).isNotNull();
+
+            // Act — fire a ReviewCreatedEvent carrying salonA only
+            reviewEventListener.onReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), salonA));
+
+            // Assert — salonA's entry is gone; salonB's entry is intact
+            assertThat(nativeCache.getIfPresent(keyA))
+                    .as("salonA's cache entry must be evicted after a ReviewCreatedEvent carrying salonA")
+                    .isNull();
+            assertThat(nativeCache.getIfPresent(keyB))
+                    .as("salonB's cache entry must NOT be evicted by an event for salonA")
+                    .isNotNull();
+        }
+
+        @Test
+        @DisplayName("should_notTouchSalonCache_when_eventSalonIdIsNull")
+        void should_notTouchSalonCache_when_eventSalonIdIsNull() {
+            // Arrange
+            org.springframework.cache.Cache springCache = cacheManager.getCache("reviews-by-salon");
+            assertThat(springCache).isNotNull();
+
+            @SuppressWarnings("unchecked")
+            Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
+
+            UUID salonA = UUID.randomUUID();
+            String keyA = "salon:" + salonA + ":sort:NEWEST:page:0:size:20";
+            nativeCache.put(keyA, "page-content-for-A");
+
+            // Act — an INDEPENDENT_MASTER booking review (no salon)
+            reviewEventListener.onReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), null));
+
+            // Assert — unrelated salon entry is untouched
+            assertThat(nativeCache.getIfPresent(keyA))
+                    .as("a null-salonId event must not touch any reviews-by-salon entry")
                     .isNotNull();
         }
     }

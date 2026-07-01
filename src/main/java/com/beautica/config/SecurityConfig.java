@@ -97,6 +97,14 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
+                    // Phase 13.6 (Public Salon Profile). "/reviews/summary" is registered
+                    // BEFORE "/reviews" defensively; in practice PathPattern matching for
+                    // "/api/v1/salons/{salonId}/reviews" is an exact-segment-count match (no
+                    // trailing **), so it does not match the extra "/summary" segment either
+                    // way — order does not actually change behaviour here.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/reviews/summary").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/reviews").permitAll();
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
                     // Self-service category approval pages — token-authenticated
