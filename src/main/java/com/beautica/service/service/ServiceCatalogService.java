@@ -119,7 +119,7 @@ public class ServiceCatalogService {
             throw new ForbiddenException("Access denied");
         }
 
-        ServiceDefinition serviceDef = serviceRepository.findById(request.serviceDefId())
+        ServiceDefinition serviceDef = serviceRepository.findByIdWithServiceType(request.serviceDefId())
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + request.serviceDefId()));
 
         if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
