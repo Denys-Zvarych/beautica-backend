@@ -70,10 +70,23 @@ public class AuthorizationService {
         return hasManagementAccess(salonId, actorId, actorRole);
     }
 
+    /**
+     * Role-aware fast path (symmetry with {@link #canManageMasterSchedule}): the
+     * {@code SALON_MASTER} (read-only) and {@code CLIENT} roles can never manage a master,
+     * so they are rejected immediately without the {@code findByIdWithSalonAndOwner}
+     * DB round-trip (the role is read from the JWT-derived authorities, not the database).
+     *
+     * <p>{@code INDEPENDENT_MASTER} is intentionally NOT short-circuited: an independent
+     * master manages their OWN master row (e.g. self-deactivation via
+     * {@code DELETE /masters/{masterId}}), which the {@code INDEPENDENT_MASTER} branch below
+     * authorizes by matching {@code m.getUser().getId()} to the actor. Early-rejecting it
+     * would break that legitimate self-management path.
+     */
     public boolean canManageMaster(Authentication auth, UUID masterId) {
-        boolean hasSalonMasterRole = auth.getAuthorities().stream()
-                .anyMatch(a -> a.getAuthority().equals("ROLE_SALON_MASTER"));
-        if (hasSalonMasterRole) {
+        boolean cannotManage = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotManage) {
             return false;
         }
         UUID actorId = principalId(auth);

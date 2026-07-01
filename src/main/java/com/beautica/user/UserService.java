@@ -8,6 +8,7 @@ import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
@@ -27,15 +28,18 @@ public class UserService {
     private final UserRepository userRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final CityRepository cityRepository;
+    private final CityDistrictRepository cityDistrictRepository;
     private final CacheManager cacheManager;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
                        CityRepository cityRepository,
+                       CityDistrictRepository cityDistrictRepository,
                        CacheManager cacheManager) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
         this.cityRepository = cityRepository;
+        this.cityDistrictRepository = cityDistrictRepository;
         this.cacheManager = cacheManager;
     }
 
@@ -43,7 +47,21 @@ public class UserService {
     public UserProfileResponse getProfile(UUID userId) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
-        return UserProfileResponse.from(user);
+        // cityName/oblastName are read off the denormalised users.city/users.region columns
+        // by UserProfileResponse.from (zero query). districtName is resolved on demand only
+        // when a district is set — most users (CLIENTs, districtless cities) skip the query.
+        String districtName = user.getDistrictId() == null
+                ? null
+                : cityDistrictRepository.findNameUkById(user.getDistrictId()).orElse(null);
+        // oblastId lets the mobile Location-edit screen pre-select the oblast tier without
+        // scanning every oblast's cities. Resolved on demand only when a city is set — one
+        // scalar FK lookup (cities.oblast_id, no JOIN to oblasts); null otherwise. No City is
+        // loaded on this read path (cityName/oblastName come from denormalised columns), so
+        // there is nothing to reuse — this is the minimal extra query.
+        UUID oblastId = user.getCityId() == null
+                ? null
+                : cityRepository.findOblastIdById(user.getCityId()).orElse(null);
+        return UserProfileResponse.from(user, districtName, oblastId);
     }
 
     @Transactional
@@ -244,12 +262,22 @@ public class UserService {
      * here only — callers are unchanged.
      */
     private void writeLocalityFields(User user, UpdateProfileRequest request) {
-        user.setCityId(request.cityId());
-        user.setDistrictId(request.districtId());
+        // PATCH semantics: a null cityId means "locality not included in this update",
+        // NOT "clear my city". Assigning unconditionally let a street/note-only edit
+        // (cityId omitted) wipe a previously-saved city FK while leaving the denormalized
+        // city/region text behind — the mobile read keys off cityId/oblastId, so location
+        // then rendered empty. Only (re)write the FK + display strings when a city is supplied.
+        // A city-with-no-districts case is still handled correctly: when a real cityId is
+        // sent, setDistrictId(request.districtId()) runs with the supplied (possibly null)
+        // districtId, so districtless cities persist district_id = NULL as before.
+        if (request.cityId() != null) {
+            user.setCityId(request.cityId());
+            user.setDistrictId(request.districtId());
+            writeCityDisplayStrings(user, request.cityId());
+        }
         Optional.ofNullable(request.street()).ifPresent(user::setStreet);
         Optional.ofNullable(request.buildingNo()).ifPresent(user::setBuildingNo);
         Optional.ofNullable(request.locationNote()).ifPresent(user::setLocationNote);
-        writeCityDisplayStrings(user, request.cityId());
     }
 
     /**

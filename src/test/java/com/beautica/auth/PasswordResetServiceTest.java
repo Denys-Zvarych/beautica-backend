@@ -270,6 +270,49 @@ class PasswordResetServiceTest {
         verify(emailNotificationService, never()).sendPasswordResetEmail(anyString(), anyString());
     }
 
+    @Test
+    @DisplayName("requestReset — decoy issues a read-only DB probe (findByToken) but NO mutation on unknown-email no-op (timing defense, falsifiable)")
+    void should_performDecoyDbRead_when_emailUnknown() {
+        log.debug("Arrange: unknown email — decoy must hash a throwaway token then read it back from the DB");
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+
+        log.debug("Act: requestReset for a phantom account — must mirror the eligible path's DB round-trip");
+        service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
+
+        // The anti-oracle DB read: the eligible path hits the DB (markAllUsed UPDATE + save INSERT);
+        // this no-op branch must hit the DB too — a read-only probe by the throwaway hashed token —
+        // so response latency cannot distinguish a phantom account from an eligible one.
+        verify(passwordResetTokenRepository).findByToken(HASHED_TOKEN);
+        // ...but the probe is strictly read-only: NO mutation may leak from the no-op branch.
+        verify(passwordResetTokenRepository, never()).markAllUsedByUserId(any());
+        verify(passwordResetTokenRepository, never()).save(any());
+        // ...and the externally-observable outcome matches the eligible path: no email is dispatched
+        // here, and the method returned normally (no exception) — an identical generic success.
+        verify(emailNotificationService, never()).sendPasswordResetEmail(anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("requestReset — decoy issues a read-only DB probe (findByToken) but NO mutation when an existing user is ineligible (inactive)")
+    void should_performDecoyDbRead_when_userIneligible() {
+        log.debug("Arrange: existing but inactive user — decoy DB probe must still run from this no-op branch");
+        User user = inactiveUser();
+        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+
+        log.debug("Act: requestReset for an ineligible existing account");
+        service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
+
+        // Same falsifiable contract from the second no-op call site: read-only probe, zero mutation,
+        // identical generic success (no email, no exception).
+        verify(passwordResetTokenRepository).findByToken(HASHED_TOKEN);
+        verify(passwordResetTokenRepository, never()).markAllUsedByUserId(any());
+        verify(passwordResetTokenRepository, never()).save(any());
+        verify(emailNotificationService, never()).sendPasswordResetEmail(anyString(), anyString());
+    }
+
     // =========================================================================
     // requestReset — buildResetLink scheme guard
     // =========================================================================

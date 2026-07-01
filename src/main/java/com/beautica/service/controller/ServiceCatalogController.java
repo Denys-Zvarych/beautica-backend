@@ -1,7 +1,7 @@
 package com.beautica.service.controller;
 
 import com.beautica.common.ApiResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
@@ -17,7 +17,6 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -104,16 +103,8 @@ public class ServiceCatalogController {
     public ResponseEntity<ApiResponse<Void>> suggestServiceType(
             @Valid @RequestBody SuggestServiceTypeRequest request,
             Authentication authentication) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         serviceCatalogService.suggestServiceType(request, userId);
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(ApiResponse.ok(null, "Suggestion submitted"));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID userId) {
-            return userId;
-        }
-        throw new ForbiddenException("Not authenticated");
     }
 }

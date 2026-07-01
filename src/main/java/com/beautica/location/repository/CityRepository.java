@@ -75,6 +75,30 @@ public interface CityRepository extends JpaRepository<City, UUID> {
     List<Object[]> findNameUkByIdIn(@Param("ids") Collection<UUID> ids);
 
     /**
+     * Resolves the parent oblast id of a single city by the city's id.
+     *
+     * <p>Single-key sibling of {@link CityDistrictRepository#findNameUkById(UUID)}:
+     * used by the {@code GET /users/me} read path to stamp the {@code oblastId}
+     * onto {@link com.beautica.user.UserProfileResponse} when the account owner
+     * has a {@code cityId} set. The mobile Location-edit screen needs the resolved
+     * oblast UUID to pre-select the oblast tier of the oblast→city→district
+     * cascade without scanning every oblast's city list.
+     *
+     * <p>Scalar projection ({@code c.oblast.id} only) avoids hydrating the
+     * {@link City} entity and its LAZY {@code oblast} association just to read one
+     * FK column — the {@code c.oblast.id} path compiles to the {@code cities.oblast_id}
+     * column with no JOIN to {@code oblasts}. Single-row by PK, so this is not a §E
+     * "non-graph variant" concern: it is the per-row read for a one-off profile
+     * lookup, never a page-level loop (the batch label path uses
+     * {@link #findNameUkByIdIn(Collection)} instead).
+     *
+     * @param id surrogate PK of the city to resolve
+     * @return the city's parent oblast id, or empty when the id is unknown
+     */
+    @Query("SELECT c.oblast.id FROM City c WHERE c.id = :id")
+    Optional<UUID> findOblastIdById(@Param("id") UUID id);
+
+    /**
      * Single-query taxonomy resolution for the Phase 10.6 most-specific-node
      * write rule: in <em>one</em> round-trip it answers all three facts
      * {@link com.beautica.location.LocalityWriteValidator} needs about a

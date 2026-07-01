@@ -30,6 +30,7 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
@@ -81,7 +82,16 @@ class ServiceTypeSuggestionReviewControllerTest {
 
         mockMvc.perform(get(REVIEW).param("token", "good-token"))
                 .andExpect(status().isOk())
-                .andExpect(content().string(org.hamcrest.Matchers.containsString("Балаяж")));
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("Балаяж")))
+                // Token rides in the URL query → no-store stops cache retention,
+                // no-referrer stops the token leaking via a later cross-origin Referer.
+                .andExpect(header().string("Cache-Control",
+                        org.hamcrest.Matchers.containsString("no-store")))
+                .andExpect(header().string("Cache-Control",
+                        org.hamcrest.Matchers.containsString("no-cache")))
+                .andExpect(header().string("Cache-Control",
+                        org.hamcrest.Matchers.containsString("must-revalidate")))
+                .andExpect(header().string("Referrer-Policy", "no-referrer"));
 
         // Critical: GET must NOT mutate state — email-scanner pre-fetch must not approve.
         verify(suggestionService, never()).approve(anyString());
@@ -124,6 +134,17 @@ class ServiceTypeSuggestionReviewControllerTest {
         verify(suggestionService, never()).loadForReview(anyString());
     }
 
+    @Test
+    @DisplayName("should_return400AndNotProbe_when_reviewTokenHasIllegalChar")
+    void should_return400AndNotProbe_when_reviewTokenHasIllegalChar() throws Exception {
+        // '!' is outside the base64url charset [A-Za-z0-9-_] → @Pattern rejects it.
+        mockMvc.perform(get(REVIEW).param("token", "bad!token"))
+                .andExpect(status().isBadRequest());
+
+        // Charset guard fires before routing/service — no existence probe.
+        verify(suggestionService, never()).loadForReview(anyString());
+    }
+
     // ── POST /approve and /reject (state change) ───────────────────────────────
 
     @Test
@@ -132,7 +153,10 @@ class ServiceTypeSuggestionReviewControllerTest {
         when(suggestionService.approve("good-token")).thenReturn(DecisionOutcome.APPROVED);
 
         mockMvc.perform(post(APPROVE).with(csrf()).param("token", "good-token"))
-                .andExpect(status().isOk());
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control",
+                        org.hamcrest.Matchers.containsString("no-store")))
+                .andExpect(header().string("Referrer-Policy", "no-referrer"));
 
         verify(suggestionService).approve(eq("good-token"));
         verify(suggestionService, never()).reject(anyString());
@@ -144,7 +168,10 @@ class ServiceTypeSuggestionReviewControllerTest {
         when(suggestionService.reject("good-token")).thenReturn(DecisionOutcome.REJECTED);
 
         mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token"))
-                .andExpect(status().isOk());
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control",
+                        org.hamcrest.Matchers.containsString("no-store")))
+                .andExpect(header().string("Referrer-Policy", "no-referrer"));
 
         verify(suggestionService).reject(eq("good-token"));
         verify(suggestionService, never()).approve(anyString());
@@ -179,6 +206,17 @@ class ServiceTypeSuggestionReviewControllerTest {
         String oversized = "x".repeat(129);
 
         mockMvc.perform(post(APPROVE).with(csrf()).param("token", oversized))
+                .andExpect(status().isBadRequest());
+
+        verify(suggestionService, never()).approve(anyString());
+    }
+
+    @Test
+    @DisplayName("should_return400AndNotMutate_when_approveTokenHasIllegalChar")
+    void should_return400AndNotMutate_when_approveTokenHasIllegalChar() throws Exception {
+        // A space is outside the base64url charset [A-Za-z0-9-_] → @Pattern rejects it
+        // before the mutating service is ever reached.
+        mockMvc.perform(post(APPROVE).with(csrf()).param("token", "bad token"))
                 .andExpect(status().isBadRequest());
 
         verify(suggestionService, never()).approve(anyString());

@@ -20,14 +20,20 @@ class ServiceTypeLookup {
         this.serviceTypeRepository = serviceTypeRepository;
     }
 
-    @Cacheable(value = "service-type-by-id", key = "#id")
+    // sync = true: single-key reference-data read; on TTL expiry of a hot service-type id only
+    // ONE thread reloads it while concurrent callers wait, instead of a herd of identical
+    // findById round-trips (Anti-Bug §F-7).
+    @Cacheable(value = "service-type-by-id", key = "#id", sync = true)
     @Transactional(readOnly = true)
     ServiceType getById(UUID id) {
         return serviceTypeRepository.findById(id)
                 .orElseThrow(() -> new NotFoundException("ServiceType not found: " + id));
     }
 
-    @Cacheable(value = "service-types", key = "#categoryId != null ? #categoryId.toString() : 'ALL'")
+    // sync = true: hot public catalog read (service types per category); collapses the herd on
+    // a popular category's TTL expiry to a single reload. No unless/condition, single cache name,
+    // so sync is supported and safe (Anti-Bug §F-7).
+    @Cacheable(value = "service-types", key = "#categoryId != null ? #categoryId.toString() : 'ALL'", sync = true)
     @Transactional(readOnly = true)
     List<ServiceType> getByCategory(@Nullable UUID categoryId) {
         if (categoryId == null) {

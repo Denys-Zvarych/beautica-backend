@@ -1,7 +1,7 @@
 package com.beautica.master.controller;
 
 import com.beautica.common.ApiResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.master.dto.IndependentMasterUpdateRequest;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
@@ -12,7 +12,6 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -57,7 +56,7 @@ public class IndependentMasterController {
             @Valid @RequestBody IndependentMasterUpdateRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         UserProfileResponse updated = userService.updateProfile(
                 userId,
                 new UpdateProfileRequest(
@@ -84,7 +83,7 @@ public class IndependentMasterController {
      *
      * <p>Role gate: {@code INDEPENDENT_MASTER} only — same as {@code PATCH /me}.
      * No further ownership check is needed; the authenticated user ID is resolved
-     * from the JWT ({@link #extractUserId}) and the service writes only that row.
+     * from the JWT ({@link AuthenticationUtils#userId}) and the service writes only that row.
      *
      * @param request        validated profile update body
      * @param authentication Spring Security context — carries the user UUID
@@ -96,16 +95,8 @@ public class IndependentMasterController {
             @Valid @RequestBody MasterProfileUpdateRequest request,
             Authentication authentication
     ) {
-        UUID userId = extractUserId(authentication);
+        UUID userId = AuthenticationUtils.userId(authentication);
         MasterPublicProfileResponse updated = userService.updateMasterProfile(userId, request);
         return ResponseEntity.ok(ApiResponse.ok(updated));
-    }
-
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Not authenticated");
     }
 }

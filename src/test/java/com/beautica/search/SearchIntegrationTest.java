@@ -44,6 +44,19 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     private static final String MASTERS_URL = "/api/v1/search/masters";
     private static final String SALONS_URL = "/api/v1/search/salons";
 
+    // ── Phase 20.1–20.3 — per-service filter fixtures ────────────────────────
+    // Two real, Flyway-seeded (V75/V81) platform service-type slugs with
+    // distinctive, collision-free Ukrainian display names. The hybrid match
+    // resolves a slug to (service_type_id, name_uk); the name branch wraps name_uk
+    // in %…% so a service_definition whose NAME contains it matches even when its
+    // service_type_id FK is NULL (the legacy-recovery branch).
+    private static final String SLUG_A = "hair-treatment-keratin";   // name_uk "Кератин"
+    private static final String NAME_UK_A = "Кератин";
+    private static final String SLUG_B = "injection-mesotherapy";    // name_uk "Мезотерапія"
+
+    @org.springframework.boot.test.web.server.LocalServerPort
+    private int port;
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -296,6 +309,176 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("totalElements").asLong())
                 .as("HAVING-aware count must reflect actual filtered rows")
                 .isEqualTo(1L);
+    }
+
+    // ── Price band-overlap fix — MULTI-service masters (regression net) ───────
+    // The earlier predicate filtered on the whole-catalogue floor column
+    // (m.min_effective_price): min bound tested floor >= :minPrice (should be
+    // CEILING >= :minPrice) and the band was never scoped to the active filter.
+    // Every case below seeds a master with TWO services so floor != ceiling —
+    // exactly what the old single-service tests (floor == ceiling) could not catch.
+    // Band semantics mirror the salon path: ceiling >= :minPrice AND floor <= :maxPrice.
+
+    @Test
+    @DisplayName("GET /search/masters — maxPrice excludes an expensive-only master and keeps a master whose floor clears the ceiling")
+    void should_excludeExpensiveOnlyMaster_when_maxPriceBelowEntireBand() throws Exception {
+        ensureHttpClient();
+        // A band [100,800] — its cheapest 100 sits under the ceiling.
+        UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+        // B band [1000,1200] — every service above the ceiling.
+        seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("1000.00"), new BigDecimal("1200.00"));
+
+        log.debug("Act: GET {}?maxPrice=300 — A(floor 100) in, B(floor 1000) out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?maxPrice=300&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("only A (floor 100 <= 300) survives; B (floor 1000 > 300) is excluded")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(a.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — minPrice above a master's ENTIRE band (ceiling 800 < 900) excludes it (min-bound correctness lock; ceiling-vs-floor discrimination lives in the min-only band test)")
+    void should_excludeMaster_when_minPriceAboveEntireBand() throws Exception {
+        ensureHttpClient();
+        // A band [100,800] — ceiling 800 < 900 → A must NOT match even though its
+        // cheap 100 would pass a (wrong) floor-driven predicate inversion.
+        UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+        // B band [1000,1200] — ceiling 1200 >= 900 → B matches.
+        UUID b = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("1000.00"), new BigDecimal("1200.00"));
+
+        log.debug("Act: GET {}?minPrice=900 — B(ceiling 1200) in, A(ceiling 800) out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=900&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("only B (ceiling 1200 >= 900) survives; A (ceiling 800 < 900) is excluded")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(b.toString());
+        for (JsonNode row : data.path("data")) {
+            assertThat(row.path("masterId").asText())
+                    .as("A's cheap 100 must NOT drive inclusion under minPrice=900")
+                    .isNotEqualTo(a.toString());
+        }
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — both bounds: a master is included when its band overlaps [min,max], not when a single service falls inside")
+    void should_includeMaster_when_bandOverlapsBothBounds() throws Exception {
+        ensureHttpClient();
+        // A band [100,800] overlaps [400,500] (ceiling 800 >= 400 AND floor 100 <= 500)
+        // even though NEITHER seeded service price (100, 800) lands inside [400,500].
+        UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+
+        log.debug("Act: GET {}?minPrice=400&maxPrice=500 — band [100,800] overlaps the window", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=400&maxPrice=500&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("band-overlap inclusion: [100,800] overlaps [400,500] despite no service price in range")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(a.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — min-only band test: master included iff its ceiling clears minPrice")
+    void should_applyMinOnlyBand_usingCeiling() throws Exception {
+        ensureHttpClient();
+        // [100,800] — ceiling 800 >= 500 → included.
+        UUID included = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+        // [100,200] — ceiling 200 < 500 → excluded.
+        seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("200.00"));
+
+        log.debug("Act: GET {}?minPrice=500 — [100,800] in, [100,200] out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=500&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("min-only: ceiling 800 clears 500; ceiling 200 does not")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(included.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — max-only band test: master included iff its floor is at or below maxPrice")
+    void should_applyMaxOnlyBand_usingFloor() throws Exception {
+        ensureHttpClient();
+        // [1000,1200] — floor 1000 > 500 → excluded.
+        seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("1000.00"), new BigDecimal("1200.00"));
+        // [100,800] — floor 100 <= 500 → included.
+        UUID included = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
+                new BigDecimal("100.00"), new BigDecimal("800.00"));
+
+        log.debug("Act: GET {}?maxPrice=500 — [100,800] in, [1000,1200] out", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?maxPrice=500&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("max-only: floor 100 is within 500; floor 1000 is not")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(included.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — price band is SCOPED to the category filter (a cheap service in another category must not rescue a master)")
+    void should_scopePriceBandToCategory_when_categoryAndMaxSet() throws Exception {
+        ensureHttpClient();
+        // Trap: cheap HAIRCUT 100 + expensive MANICURE 900. The whole-catalogue
+        // cheapest is 100, but the MANICURE-scoped band is [900,900]. Under the old
+        // unscoped predicate (floor 100 <= 300) this master wrongly survived.
+        UUID trap = seedMaster("Київ", "4.00");
+        seedServiceWithCategory(trap, trap, "HAIRCUT", new BigDecimal("100.00"), true, true);
+        seedServiceWithCategory(trap, trap, "MANICURE", new BigDecimal("900.00"), true, true);
+        // Control: a genuine MANICURE 200 inside the window.
+        UUID control = seedMaster("Київ", "4.00");
+        seedServiceWithCategory(control, control, "MANICURE", new BigDecimal("200.00"), true, true);
+
+        log.debug("Act: GET {}?category=MANICURE&maxPrice=300 — scoped band [900,900] excludes the trap", MASTERS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?category=MANICURE&maxPrice=300&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size())
+                .as("MANICURE-scoped band [900,900] > 300 excludes the trap; only the control survives")
+                .isEqualTo(1);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(control.toString());
+        for (JsonNode row : data.path("data")) {
+            assertThat(row.path("masterId").asText())
+                    .as("the trap's cheap HAIRCUT 100 must not rescue it under a MANICURE filter")
+                    .isNotEqualTo(trap.toString());
+        }
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
     }
 
     // ── Phase 6.5 — dynamic SQL branches ─────────────────────────────────────
@@ -949,8 +1132,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Only an INACTIVE service exists — it must not contribute to the band.
+        // Salon-owned def is itself inactive (is_active = false) → it must not
+        // contribute to the salon's price band / serviceNames. (master_services
+        // is no longer consulted for salon search; the def's own is_active is the
+        // gate — see SalonRepository salon row-source fix.)
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
-                new BigDecimal("300.00"), null, true, false);
+                new BigDecimal("300.00"), null, false, false);
 
         JsonNode row = singleSalonRow("Київ", null);
         assertThat(row.path("priceMin").isNull())
@@ -978,6 +1165,85 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(new BigDecimal(row.path("priceMax").asText()))
                 .as("priceMax equals priceMin for a lone FIXED service — both present, not collapsed")
                 .isEqualByComparingTo(new BigDecimal("350.00"));
+    }
+
+    // ── Phase 19.7 — salon serviceNames (never null, DISTINCT, capped at 3) ───
+
+    @Test
+    @DisplayName("GET /search/salons — serviceNames carries the salon's distinct active service names, capped at 3")
+    void should_populateSalonServiceNames_distinctAndCapped() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        // Five distinct names + one duplicate → 5 distinct, 6 rows; cap is 3.
+        seedNamedSalonServiceForMaster(masterId, salonId, "Манікюр", "MANICURE", new BigDecimal("200.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Педикюр", "PEDICURE", new BigDecimal("300.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Стрижка", "HAIRCUT", new BigDecimal("400.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Фарбування", "HAIRCUT", new BigDecimal("500.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Брови", "BROWS", new BigDecimal("150.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Манікюр", "MANICURE", new BigDecimal("210.00")); // dup name
+
+        JsonNode row = singleSalonRow("Київ", null);
+        JsonNode names = row.path("serviceNames");
+        assertThat(names.isArray())
+                .as("salon serviceNames must be a JSON array")
+                .isTrue();
+        java.util.List<String> values = new java.util.ArrayList<>();
+        names.forEach(n -> values.add(n.asText()));
+        assertThat(values)
+                .as("salon serviceNames is capped at SERVICE_NAME_CAP=3")
+                .hasSize(3);
+        assertThat(values)
+                .as("salon serviceNames is DISTINCT — no duplicate display string")
+                .doesNotHaveDuplicates();
+        assertThat(values)
+                .as("each surfaced name is one of the salon's seeded distinct service names")
+                .isSubsetOf("Брови", "Манікюр", "Педикюр", "Стрижка", "Фарбування");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — serviceNames is an empty array (never null) for a salon with no active priced services")
+    void should_returnEmptySalonServiceNames_when_salonHasNoActiveServices() throws Exception {
+        ensureHttpClient();
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        // Only an INACTIVE service — it must not contribute to serviceNames.
+        // Salon-owned def is itself inactive (is_active = false) → it must not
+        // contribute to the salon's price band / serviceNames. (master_services
+        // is no longer consulted for salon search; the def's own is_active is the
+        // gate — see SalonRepository salon row-source fix.)
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                new BigDecimal("300.00"), null, false, false);
+
+        JsonNode row = singleSalonRow("Київ", null);
+        assertThat(row.path("serviceNames").isArray())
+                .as("service-less salon → empty array")
+                .isTrue();
+        assertThat(row.path("serviceNames").size())
+                .as("service-less salon → serviceNames is [] (never null)")
+                .isZero();
+    }
+
+    /**
+     * Seeds an active, FIXED-priced SALON-owned service definition with an
+     * explicit (custom) {@code name} plus an active {@code master_services} link
+     * for the given salon master. Used by the salon serviceNames test where the
+     * surfaced names must be deterministic.
+     */
+    private void seedNamedSalonServiceForMaster(UUID masterId, UUID salonId, String serviceName,
+                                                String category, BigDecimal basePrice) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, 60, ?, 'FIXED', 0, true, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, category, basePrice);
+
+        UUID msId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, true, NOW(), NOW())",
+                msId, masterId, serviceDefId);
     }
 
     /**
@@ -1051,7 +1317,1669 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 msId, masterId, serviceDefId, msActive);
     }
 
+    // ── Phase — name / service-name search, serviceNames, sort, salon price ──
+
+    @Test
+    @DisplayName("GET /search/masters — ?q matches the master's last name case-insensitively")
+    void should_matchMasterByName_caseInsensitively_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
+        seedNamedIndependentMaster("Київ", "4.50", "Ivan", "Petrenko");
+
+        // Lower-case query must still hit "Kovalenko" (ILIKE, case-insensitive).
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?q=kovalenko&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — ?q matches a master via the (custom) service-definition name")
+    void should_matchMasterByServiceName_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Anna", "Koval");
+        seedNamedServiceForMaster(match, "Французький манікюр", "MANICURE", new BigDecimal("300.00"));
+        seedNamedIndependentMaster("Київ", "4.50", "Boris", "Tkach");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?q=французький&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — serviceNames carries the custom service-definition names (custom-over-default automatic)")
+    void should_populateServiceNames_withCustomNames() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Master");
+        seedNamedServiceForMaster(master, "Авторський манікюр", "MANICURE", new BigDecimal("250.00"));
+        seedNamedServiceForMaster(master, "Педикюр SPA", "PEDICURE", new BigDecimal("350.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        JsonNode names = row.path("serviceNames");
+        assertThat(names.isArray()).isTrue();
+        java.util.List<String> values = new java.util.ArrayList<>();
+        names.forEach(n -> values.add(n.asText()));
+        assertThat(values).containsExactlyInAnyOrder("Авторський манікюр", "Педикюр SPA");
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — serviceNames is an empty array (not null) for a master with no active services")
+    void should_returnEmptyServiceNames_when_masterHasNoServices() throws Exception {
+        ensureHttpClient();
+        seedNamedIndependentMaster("Київ", "4.50", "Solo", "Master");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        assertThat(row.path("serviceNames").isArray()).isTrue();
+        assertThat(row.path("serviceNames").size())
+                .as("service-less master → empty array, never null")
+                .isZero();
+    }
+
+    // ── Phase 19.7 regression — category-scoped serviceNames preview ──────────
+
+    @Test
+    @DisplayName("GET /search/masters?category=EYELASH — serviceNames lists ONLY the filtered-category names (no foreign-category leak)")
+    void should_scopeServiceNamesToFilteredCategory_when_masterHasMultiCategoryServices() throws Exception {
+        ensureHttpClient();
+        // ONE master carrying services in TWO categories: 2 in EYELASH, 1 in MAKEUP.
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Lash", "Master");
+        seedNamedServiceForMaster(master, "Ламінування вій №3", "EYELASH", new BigDecimal("400.00"));
+        seedNamedServiceForMaster(master, "Ламінування вій №4", "EYELASH", new BigDecimal("450.00"));
+        seedNamedServiceForMaster(master, "Макіяж №1", "MAKEUP", new BigDecimal("700.00"));
+
+        // Search the EYELASH category in the seed's city — the WHERE EXISTS keeps the
+        // master in (it has an EYELASH service), and the names preview must be scoped.
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&category=EYELASH&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("category filter keeps the master with an EYELASH service")
+                .isEqualTo(1L);
+        JsonNode row = data.path("data").get(0);
+        assertThat(row.path("masterId").asText()).isEqualTo(master.toString());
+
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("category-filtered card lists ONLY EYELASH names — exactly the two seeded")
+                .containsExactlyInAnyOrder("Ламінування вій №3", "Ламінування вій №4");
+        assertThat(names)
+                .as("the MAKEUP name from another category must NOT leak into an EYELASH-filtered card")
+                .doesNotContain("Макіяж №1");
+    }
+
+    @Test
+    @DisplayName("GET /search/masters (no category) — serviceNames spans ALL categories (no-filter branch stays catalogue-wide)")
+    void should_returnAllCategoryServiceNames_when_noCategoryFilter() throws Exception {
+        ensureHttpClient();
+        // Same multi-category master; with NO category filter the preview is
+        // catalogue-wide and capped at SERVICE_NAME_CAP=3 → all three names surface.
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Multi", "Master");
+        seedNamedServiceForMaster(master, "Ламінування вій №3", "EYELASH", new BigDecimal("400.00"));
+        seedNamedServiceForMaster(master, "Ламінування вій №4", "EYELASH", new BigDecimal("450.00"));
+        seedNamedServiceForMaster(master, "Макіяж №1", "MAKEUP", new BigDecimal("700.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("no-filter branch is catalogue-wide — all three names across both categories surface (cap=3)")
+                .containsExactlyInAnyOrder("Ламінування вій №3", "Ламінування вій №4", "Макіяж №1");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?category=EYELASH — serviceNames is category-scoped (salon-side parity guard)")
+    void should_scopeSalonServiceNamesToFilteredCategory_when_salonHasMultiCategoryServices() throws Exception {
+        ensureHttpClient();
+        // ONE salon, ONE master carrying services in TWO categories: 2 EYELASH, 1 MAKEUP.
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(masterId, salonId, "Ламінування вій №3", "EYELASH", new BigDecimal("400.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Ламінування вій №4", "EYELASH", new BigDecimal("450.00"));
+        seedNamedSalonServiceForMaster(masterId, salonId, "Макіяж №1", "MAKEUP", new BigDecimal("700.00"));
+
+        JsonNode row = singleSalonRow("Київ", "EYELASH");
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("salon category-filtered card lists ONLY EYELASH names — exactly the two seeded")
+                .containsExactlyInAnyOrder("Ламінування вій №3", "Ламінування вій №4");
+        assertThat(names)
+                .as("the MAKEUP name from another category must NOT leak into an EYELASH-filtered salon card")
+                .doesNotContain("Макіяж №1");
+    }
+
+    // ── Phase 19.x — master priceMax (FIXED vs RANGE discriminator) ───────────
+
+    @Test
+    @DisplayName("GET /search/masters — priceMax == minEffectivePrice for a single FIXED-price master")
+    void should_returnPriceMaxEqualToMin_forSingleFixedPriceMaster() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Fixed", "Master");
+        // A single FIXED service at 300.00 → both floor and ceiling are 300.00.
+        seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        assertThat(new BigDecimal(row.path("minEffectivePrice").asText()))
+                .as("FIXED master: minEffectivePrice = 300.00")
+                .isEqualByComparingTo(new BigDecimal("300.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("FIXED master: priceMax collapses to minEffectivePrice (MAX(base_price) = 300.00)")
+                .isEqualByComparingTo(new BigDecimal("300.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — priceMax > minEffectivePrice for a master carrying a RANGE service")
+    void should_returnPriceMaxAboveMin_forRangeMaster() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Range", "Master");
+        // A RANGE service 200..650 → floor 200.00, ceiling 650.00 (a genuine range).
+        seedRangeServiceForMaster(master, "Авторський манікюр", "MANICURE",
+                new BigDecimal("200.00"), new BigDecimal("650.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        BigDecimal min = new BigDecimal(row.path("minEffectivePrice").asText());
+        BigDecimal max = new BigDecimal(row.path("priceMax").asText());
+        assertThat(min)
+                .as("RANGE master: minEffectivePrice = the floor 200.00")
+                .isEqualByComparingTo(new BigDecimal("200.00"));
+        assertThat(max)
+                .as("RANGE master: priceMax = the ceiling 650.00")
+                .isEqualByComparingTo(new BigDecimal("650.00"));
+        assertThat(max)
+                .as("RANGE master: priceMax must strictly exceed minEffectivePrice")
+                .isGreaterThan(min);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — ?sort=PRICE_ASC orders by ascending minEffectivePrice")
+    void should_orderByPriceAscending_when_sortPriceAsc() throws Exception {
+        ensureHttpClient();
+        seedMasterWithService("Київ", "4.00", new BigDecimal("500.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(new BigDecimal(rows.get(0).path("minEffectivePrice").asText()))
+                .isEqualByComparingTo(new BigDecimal("100.00"));
+        assertThat(new BigDecimal(rows.get(2).path("minEffectivePrice").asText()))
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — min_effective_price NULL masters are excluded by a price filter")
+    void should_excludeNullPriceMasters_when_priceFilterApplied() throws Exception {
+        ensureHttpClient();
+        seedNamedIndependentMaster("Київ", "4.00", "No", "Price");   // no services → NULL price
+        seedMasterWithService("Київ", "4.00", new BigDecimal("250.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?minPrice=100&maxPrice=400&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("NULL min_effective_price fails the range predicate naturally")
+                .isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?minPrice/?maxPrice narrows to salons whose price band overlaps the requested band")
+    void should_narrowSalonsByPriceBand_when_priceFilterApplied() throws Exception {
+        ensureHttpClient();
+        // Salon A: band 150..200 (overlaps [250,400]? no)
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
+        seedSalonServiceForMaster(masterA, salonA, "MANICURE", "FIXED",
+                new BigDecimal("150.00"), null, true, true);
+        // Salon B: band 300..300 (overlaps [250,400]? yes)
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        seedSalonServiceForMaster(masterB, salonB, "MANICURE", "FIXED",
+                new BigDecimal("300.00"), null, true, true);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ")
+                        + "&minPrice=250&maxPrice=400&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("only salon B's 300 band overlaps [250,400]")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(salonB.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — a salon with no active priced service is excluded once a price bound is supplied")
+    void should_excludeUnpricedSalon_when_priceFilterApplied() throws Exception {
+        ensureHttpClient();
+        seedActiveSalon("Київ", null);   // no master / no services → NULL band
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&minPrice=100&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("NULL price band fails the overlap predicate once a bound is set")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?q matches the salon name case-insensitively")
+    void should_matchSalonByName_caseInsensitively_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID glow = seedNamedSalon("Київ", "Glow Studio");
+        seedNamedSalon("Київ", "Shine Bar");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=glow&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(glow.toString());
+    }
+
+    // ── Regression — salon ?q matches an OFFERED service name (not just s.name) ─
+    //
+    // Bug: the salon `q` predicate was `s.name ILIKE :q` only. A salon whose
+    // business name did NOT contain the typed term, but which offered a service
+    // named with that term, was never returned. The fix widened the predicate to
+    // `s.name ILIKE :q OR EXISTS(<active master_services → masters →
+    // service_definitions WHERE sdq.name ILIKE :q>)`. These tests fail against
+    // the pre-fix name-only predicate and pass on the widened query.
+
+    @Test
+    @DisplayName("GET /search/salons — regression: ?q matches a salon via an OFFERED service-definition name even when the salon NAME does not contain the term (pre-fix name-only predicate returned 0)")
+    void should_matchSalonByServiceName_when_salonNameDoesNotContainTerm() throws Exception {
+        ensureHttpClient();
+        // Salon name has NO "balayage"; its offered service does. Pre-fix this
+        // salon was invisible for q=balayage (s.name ILIKE only).
+        UUID match = seedNamedSalon("Київ", "Downtown Studio");
+        UUID matchMaster = seedSalonMasterFor(match, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(matchMaster, match, "Balayage Coloring",
+                "HAIRCUT", new BigDecimal("900.00"));
+        // Control: a salon that matches neither by name nor by service name.
+        UUID other = seedNamedSalon("Київ", "Plain Salon");
+        UUID otherMaster = seedSalonMasterFor(other, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(otherMaster, other, "Classic Haircut",
+                "HAIRCUT", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=balayage&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("a salon offering a service named like the query is discoverable "
+                        + "even though its business name does not contain the term — "
+                        + "the widened q EXISTS(service-name) predicate")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?q matches a salon's offered service name case-insensitively and partially (Cyrillic: service 'Манікюр', q='манік')")
+    void should_matchSalonByServiceName_caseInsensitivePartialCyrillic_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedSalon("Київ", "Beauty Hub");
+        UUID matchMaster = seedSalonMasterFor(match, "Київ", "4.00");
+        seedNamedSalonServiceForMaster(matchMaster, match, "Манікюр",
+                "MANICURE", new BigDecimal("250.00"));
+        seedNamedSalon("Київ", "Shine Bar");   // no matching service, no matching name
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=манік&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("lower-case partial Cyrillic 'манік' must hit the offered service "
+                        + "'Манікюр' via ILIKE (case-insensitive, partial, Ukrainian)")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?q matches a salon via its ACTIVE salon-owned service_definition regardless of master/master_services state; an inactive def never surfaces (def is_active is the sole gate)")
+    void should_matchSalonByServiceName_onActiveDefOnly_ignoringMasterLayers() throws Exception {
+        ensureHttpClient();
+        // Salon search resolves a salon's catalog through its owner-scoped
+        // service_definitions (owner_type='SALON'); master / master_services are
+        // NOT consulted. The sole gate is the def's own is_active:
+        //   • active def + inactive master + inactive link → MUST surface
+        //   • inactive def + active master + active link    → MUST NOT surface
+        UUID active = seedSalonWithNamedService("Київ", "Active Def Salon", "Microblading",
+                false, false, true);    // def active (master & link inactive — irrelevant)
+        seedSalonWithNamedService("Київ", "Inactive Def Salon", "Microblading",
+                true, true, false);     // def inactive → excluded
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?q=microblading&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("only the salon with an ACTIVE owner-scoped service_definition "
+                        + "surfaces via ?q; master/master_services activity is irrelevant")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText())
+                .as("the surfaced salon is the active-def one")
+                .isEqualTo(active.toString());
+    }
+
+    // ── Item A — server-side location filtering proof ────────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters — location.cityId narrows masters to that city and excludes others (server-side filter proof)")
+    void should_narrowMastersByCity_andExcludeOtherCities() throws Exception {
+        ensureHttpClient();
+        UUID inKyiv = seedNamedIndependentMaster("Київ", "4.50", "Kyiv", "Master");
+        seedNamedIndependentMaster("Львів", "4.90", "Lviv", "Master");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("server-side city FK filter narrows to Київ only")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(inKyiv.toString());
+    }
+
+    // ── QA additions — name-search behavioural gaps (Cyrillic, first-name, literal escape) ─
+
+    @Test
+    @DisplayName("GET /search/masters — ?q matches the master's FIRST name case-insensitively (Cyrillic фолд: q=олена matches 'Олена')")
+    void should_matchMasterByFirstName_caseInsensitively_cyrillic_when_qSupplied() throws Exception {
+        ensureHttpClient();
+        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Олена", "Коваленко");
+        seedNamedIndependentMaster("Київ", "4.50", "Іван", "Петренко");
+
+        // Lower-case Cyrillic query must still hit the capitalised first name
+        // "Олена" — proves ILIKE case-folds Ukrainian letters, not just ASCII.
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?q=олена&page=0&size=20", HttpMethod.GET,
+                anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("Cyrillic ILIKE must case-fold: q=олена matches first name 'Олена'")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — a literal '%' in ?q is escaped (matches a literal percent, NOT used as a wildcard)")
+    void should_treatPercentInQ_asLiteral_notWildcard() throws Exception {
+        ensureHttpClient();
+        // One master whose last name literally contains '%', one that does not.
+        UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "50%off");
+        seedNamedIndependentMaster("Київ", "4.50", "Boris", "Plainname");
+
+        // q="%off" — if '%' were treated as a SQL wildcard, the pattern would be
+        // %%off% and match anything ending in "off"; escaped, it matches only the
+        // literal "%off" substring, so exactly the one master is returned.
+        // Build a concrete URI (not a String template) so RestTemplate does not
+        // re-encode the already-encoded '%25' into '%2525' (double-encoding would
+        // deliver a literal "%25off" to the server and match nothing).
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(MASTERS_URL + "?q=" + enc("%off") + "&page=0&size=20"),
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("escaped '%' matches a literal percent — only the '50%off' master, not every '...off'")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(literal.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — a literal '_' in ?q is escaped (single-underscore is not the any-char wildcard)")
+    void should_treatUnderscoreInQ_asLiteral_notWildcard() throws Exception {
+        ensureHttpClient();
+        UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "a_b");
+        // "axb" would be matched by an UNescaped '_' wildcard (a<any>b) — it must NOT match.
+        seedNamedIndependentMaster("Київ", "4.50", "Boris", "axb");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(MASTERS_URL + "?q=" + enc("a_b") + "&page=0&size=20"),
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("escaped '_' matches a literal underscore — 'a_b' only, never 'axb' via wildcard")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(literal.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — a literal '%' in ?q is escaped against the salon name (not a wildcard)")
+    void should_treatPercentInSalonQ_asLiteral_notWildcard() throws Exception {
+        ensureHttpClient();
+        UUID literal = seedNamedSalon("Київ", "Glow 50%");
+        seedNamedSalon("Київ", "Shine Bar 50 off");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(SALONS_URL + "?q=" + enc("50%") + "&page=0&size=20"),
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("salon ?q '%' is a literal — only 'Glow 50%' matches")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(literal.toString());
+    }
+
+    // ── QA additions — serviceNames DISTINCT + cap-at-3 ──────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters — serviceNames is DISTINCT and capped at 3 even when the master has 5 distinct active services")
+    void should_capServiceNamesAtThree_andDeduplicate_when_masterHasManyServices() throws Exception {
+        ensureHttpClient();
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Many", "Services");
+        // Five DISTINCT names + one duplicate of the first → 5 distinct, 6 rows.
+        seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("200.00"));
+        seedNamedServiceForMaster(master, "Педикюр SPA", "PEDICURE", new BigDecimal("300.00"));
+        seedNamedServiceForMaster(master, "Стрижка", "HAIRCUT", new BigDecimal("400.00"));
+        seedNamedServiceForMaster(master, "Фарбування", "HAIRCUT", new BigDecimal("500.00"));
+        seedNamedServiceForMaster(master, "Брови", "BROWS", new BigDecimal("150.00"));
+        seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("210.00")); // duplicate name
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
+        JsonNode names = row.path("serviceNames");
+        assertThat(names.isArray()).isTrue();
+        java.util.List<String> values = new java.util.ArrayList<>();
+        names.forEach(n -> values.add(n.asText()));
+        // Cap: at most 3 names surface. DISTINCT: no value repeats. Membership:
+        // every surfaced name is one of the seeded distinct names (ordering is a
+        // deterministic array_agg(... ORDER BY sd.name) slice, but we assert the
+        // observable contract — size<=3 + distinct + subset — which survives the
+        // post-LIMIT-lateral perf refactor).
+        assertThat(values)
+                .as("serviceNames is capped at SERVICE_NAME_CAP=3")
+                .hasSize(3);
+        assertThat(values)
+                .as("serviceNames is DISTINCT — no duplicate display string")
+                .doesNotHaveDuplicates();
+        assertThat(values)
+                .as("each surfaced name is one of the master's seeded distinct service names")
+                .isSubsetOf("Брови", "Манікюр класичний", "Педикюр SPA", "Стрижка", "Фарбування");
+    }
+
+    // ── QA additions — master sort ordering for every enum value ─────────────
+
+    @Test
+    @DisplayName("GET /search/masters — ?sort=PRICE_DESC orders by descending minEffectivePrice")
+    void should_orderByPriceDescending_when_sortPriceDesc() throws Exception {
+        ensureHttpClient();
+        seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("500.00"));
+        seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(new BigDecimal(rows.get(0).path("minEffectivePrice").asText()))
+                .as("PRICE_DESC: highest price first")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(rows.get(2).path("minEffectivePrice").asText()))
+                .as("PRICE_DESC: lowest price last")
+                .isEqualByComparingTo(new BigDecimal("100.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — ?sort=REVIEWS_DESC orders by descending review_count")
+    void should_orderByReviewsDescending_when_sortReviewsDesc() throws Exception {
+        ensureHttpClient();
+        seedMasterWithReviewCount("Київ", "4.00", 2);
+        seedMasterWithReviewCount("Київ", "4.00", 50);
+        seedMasterWithReviewCount("Київ", "4.00", 17);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=REVIEWS_DESC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.get(0).path("reviewCount").asInt())
+                .as("REVIEWS_DESC: most-reviewed first")
+                .isEqualTo(50);
+        assertThat(rows.get(2).path("reviewCount").asInt())
+                .as("REVIEWS_DESC: least-reviewed last")
+                .isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — default sort (no ?sort) orders by descending avg_rating")
+    void should_orderByRatingDescending_when_sortOmitted() throws Exception {
+        ensureHttpClient();
+        seedMasterWithCity("Київ", "3.80");
+        seedMasterWithCity("Київ", "4.90");
+        seedMasterWithCity("Київ", "4.20");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.get(0).path("avgRating").asDouble())
+                .as("RATING_DESC default: highest rating first")
+                .isEqualTo(4.90);
+        assertThat(rows.get(2).path("avgRating").asDouble())
+                .as("RATING_DESC default: lowest rating last")
+                .isEqualTo(3.80);
+    }
+
+    // ── QA additions — salon sort (PRICE_ASC / PRICE_DESC by band) ───────────
+
+    @Test
+    @DisplayName("GET /search/salons — ?sort=PRICE_ASC orders salons by ascending priceMin band floor")
+    void should_orderSalonsByPriceAscending_when_sortPriceAsc() throws Exception {
+        ensureHttpClient();
+        UUID cheap = seedSalonWithFixedService("Київ", new BigDecimal("100.00"));
+        UUID mid = seedSalonWithFixedService("Київ", new BigDecimal("300.00"));
+        UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.size()).isEqualTo(3);
+        assertThat(rows.get(0).path("salonId").asText())
+                .as("PRICE_ASC: cheapest band floor first")
+                .isEqualTo(cheap.toString());
+        assertThat(rows.get(2).path("salonId").asText())
+                .as("PRICE_ASC: dearest band floor last")
+                .isEqualTo(dear.toString());
+        // mid sits between — pin it so a stable, total ordering is proven.
+        assertThat(rows.get(1).path("salonId").asText()).isEqualTo(mid.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — ?sort=PRICE_DESC orders salons by descending priceMax band ceiling")
+    void should_orderSalonsByPriceDescending_when_sortPriceDesc() throws Exception {
+        ensureHttpClient();
+        UUID cheap = seedSalonWithFixedService("Київ", new BigDecimal("100.00"));
+        UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
+        assertThat(rows.get(0).path("salonId").asText())
+                .as("PRICE_DESC: dearest band ceiling first")
+                .isEqualTo(dear.toString());
+        assertThat(rows.get(rows.size() - 1).path("salonId").asText())
+                .as("PRICE_DESC: cheapest band ceiling last")
+                .isEqualTo(cheap.toString());
+    }
+
+    // ── QA additions — short ?q normalize-to-null (coordinate with perf fix) ──
+
+    @Test
+    @DisplayName("GET /search/masters — a 1-2 char ?q normalises to null and returns the full location-scoped result set (not an ILIKE on the short term)")
+    void should_normalizeShortQToNull_andReturnLocationScopedResults() throws Exception {
+        ensureHttpClient();
+        // Master in Київ whose name does NOT contain the short term "zz".
+        UUID inKyiv = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&q=zz&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("short q is normalised to null → the city-scoped master is returned despite its name not containing 'zz'")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(inKyiv.toString());
+    }
+
+    // ── Phase 20.1 — master per-service filter (hybrid FK-or-name, AND) ──────
+
+    @Test
+    @DisplayName("GET /search/masters — FK-only match: a master whose service has service_type_id set (NAME does NOT contain the type name) is returned for that slug")
+    void should_returnMaster_when_serviceMatchesByServiceTypeIdFk() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Match purely via the FK — the service name deliberately omits "Кератин".
+        UUID fkMaster = seedNamedIndependentMaster("Київ", "4.50", "Fk", "Master");
+        seedTypedServiceForMaster(fkMaster, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Control: a master with a service that matches NEITHER the FK nor the name.
+        // It WOULD be returned without the filter — proving the predicate narrows.
+        UUID other = seedNamedIndependentMaster("Київ", "4.50", "Other", "Master");
+        seedTypedServiceForMaster(other, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("FK branch matches: only the master whose service_type_id = keratin is returned")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(fkMaster.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — name-only match (legacy recovery): a master whose service has NULL service_type_id but a NAME matching name_uk is returned")
+    void should_returnMaster_when_serviceMatchesByNameOnly_withNullFk() throws Exception {
+        ensureHttpClient();
+        // FK is NULL (legacy / single-create row) — recovery is via the name branch.
+        UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
+        seedTypedServiceForMaster(nameMaster, NAME_UK_A + " преміум", "HAIRCUT",
+                new BigDecimal("300.00"), null, true, true);
+        UUID other = seedNamedIndependentMaster("Київ", "4.50", "Other", "Master");
+        seedTypedServiceForMaster(other, "Педикюр SPA", "PEDICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("name branch recovers a NULL-FK row whose name contains the resolved name_uk")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(nameMaster.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — both branches: one master matched via FK, another via NAME for the same slug — BOTH returned")
+    void should_returnBothMasters_when_oneMatchesByFk_andOneByName() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID fkMaster = seedNamedIndependentMaster("Київ", "4.50", "Fk", "Master");
+        seedTypedServiceForMaster(fkMaster, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);   // FK only (no name match)
+        UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
+        seedTypedServiceForMaster(nameMaster, NAME_UK_A + " класичний", "HAIRCUT",
+                new BigDecimal("320.00"), null, true, true);      // name only (NULL FK)
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong()).isEqualTo(2L);
+        assertThat(masterIds(data))
+                .as("the hybrid OR matches FK rows AND legacy name rows for the same slug")
+                .containsExactlyInAnyOrder(fkMaster.toString(), nameMaster.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — OR/union of two slugs: master offering BOTH returned AND master offering only one also returned")
+    void should_returnMastersOfferingAnySlug_when_unionOfTwoSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        // Master A offers BOTH service types.
+        UUID both = seedNamedIndependentMaster("Київ", "4.50", "Both", "Master");
+        seedTypedServiceForMaster(both, "Послуга A1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(both, "Послуга A2", "INJECTION",
+                new BigDecimal("400.00"), typeIdB, true, true);
+        // Master B offers only the first — under OR/union it is ALSO returned.
+        UUID one = seedNamedIndependentMaster("Київ", "4.50", "One", "Master");
+        seedTypedServiceForMaster(one, "Послуга B1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        JsonNode data = masterSearch(
+                "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("OR/union semantics: a master matching ANY selected slug is returned (both the both-offering and the one-offering master)")
+                .isEqualTo(2L);
+        assertThat(masterIds(data))
+                .as("both the master offering both slugs and the master offering only one are returned")
+                .containsExactlyInAnyOrder(both.toString(), one.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — all-unknown: the only selected slug is unresolvable → explicit empty page (NOT unfiltered everything)")
+    void should_returnEmpty_when_allSelectedSlugsUnresolvable() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Real", "Master");
+        seedTypedServiceForMaster(master, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        // Pattern-valid but absent from the taxonomy. Under OR/union resolveServiceTypes
+        // drops it; ALL slugs unknown → Optional.empty() → explicit empty page. It must
+        // NOT fall through to the unfiltered "everything" path (the seeded master proves
+        // an unfiltered query would return >= 1 row).
+        JsonNode data = masterSearch("?serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("every selected slug unknown → empty page, not a 500 and not unfiltered everything")
+                .isZero();
+        assertThat(data.path("data").size()).isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — mix valid + unknown: the unknown slug is dropped; masters offering the VALID slug are returned")
+    void should_returnMastersOfferingValidSlug_when_mixOfValidAndUnknownSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Master offers the valid slug A — must survive once the unknown slug is dropped.
+        UUID valid = seedNamedIndependentMaster("Київ", "4.50", "Valid", "Master");
+        seedTypedServiceForMaster(valid, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Control: matches NEITHER the valid slug FK nor its name → excluded (proves the
+        // surviving slug still narrows; the unknown slug neither errors nor widens).
+        UUID other = seedNamedIndependentMaster("Київ", "4.50", "Other", "Master");
+        seedTypedServiceForMaster(other, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A
+                + "&serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("unknown slug dropped; the valid-slug disjunction still matches the offering master only")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(valid.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — matchedServiceNames present (distinct, capped at 3) when filtering; EMPTY when no serviceTypeSlugs")
+    void should_populateMatchedServiceNames_whenFiltering_andEmptyOtherwise() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Matched", "Master");
+        // Four DISTINCT matching service names (all via FK A) → cap to 3, distinct.
+        seedTypedServiceForMaster(master, "Догляд Альфа", "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(master, "Догляд Бета", "HAIRCUT", new BigDecimal("310.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(master, "Догляд Гамма", "HAIRCUT", new BigDecimal("320.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(master, "Догляд Дельта", "HAIRCUT", new BigDecimal("330.00"), typeIdA, true, true);
+
+        // Filtering → matchedServiceNames populated.
+        JsonNode filtered = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        JsonNode matched = filtered.path("data").get(0).path("matchedServiceNames");
+        assertThat(matched.isArray()).as("matchedServiceNames is a JSON array").isTrue();
+        java.util.List<String> matchedNames = new java.util.ArrayList<>();
+        matched.forEach(n -> matchedNames.add(n.asText()));
+        assertThat(matchedNames)
+                .as("matchedServiceNames is capped at SERVICE_NAME_CAP=3 and distinct")
+                .hasSize(3)
+                .doesNotHaveDuplicates()
+                .isSubsetOf("Догляд Альфа", "Догляд Бета", "Догляд Гамма", "Догляд Дельта");
+
+        // No serviceTypeSlugs → matchedServiceNames empty (card falls back to serviceNames).
+        JsonNode unfiltered = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
+                .as("matchedServiceNames is empty when no service filter is active")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — inactive exclusion: a master matched only via an inactive master_service or inactive service_definition is NOT returned")
+    void should_excludeMaster_when_onlyInactiveLayerMatchesSlug() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Master 1: service_definition inactive (FK matches but def is_active = false).
+        UUID inactiveDef = seedNamedIndependentMaster("Київ", "4.50", "InactiveDef", "Master");
+        seedTypedServiceForMaster(inactiveDef, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, false, true);
+        // Master 2: master_services link inactive (FK matches but link is_active = false).
+        UUID inactiveLink = seedNamedIndependentMaster("Київ", "4.50", "InactiveLink", "Master");
+        seedTypedServiceForMaster(inactiveLink, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, false);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("the per-slug EXISTS requires master_services.is_active AND service_definitions.is_active")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — composition: serviceTypeSlugs + category + price together narrow to the single fully-matching master")
+    void should_narrowByServiceTypeSlugsCategoryAndPrice_when_combined() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // m1 — matches every predicate.
+        UUID m1 = seedNamedIndependentMaster("Київ", "4.50", "Full", "Match");
+        seedTypedServiceForMaster(m1, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // m2 — right slug + price, WRONG category (MANICURE) → fails category EXISTS.
+        UUID m2 = seedNamedIndependentMaster("Київ", "4.50", "Wrong", "Category");
+        seedTypedServiceForMaster(m2, "Догляд інший", "MANICURE",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // m3 — right slug + category, price 50 BELOW the floor → fails price.
+        UUID m3 = seedNamedIndependentMaster("Київ", "4.50", "Too", "Cheap");
+        seedTypedServiceForMaster(m3, "Догляд дешевий", "HAIRCUT",
+                new BigDecimal("50.00"), typeIdA, true, true);
+        // m4 — right category + price, NO slug match (NULL FK, neutral name).
+        UUID m4 = seedNamedIndependentMaster("Київ", "4.50", "No", "Slug");
+        seedTypedServiceForMaster(m4, "Стрижка проста", "HAIRCUT",
+                new BigDecimal("300.00"), null, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A
+                + "&category=HAIRCUT&minPrice=100.00&maxPrice=500.00&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("only the master matching slug AND category AND price survives all three predicates")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(m1.toString());
+    }
+
+    // ── Regression — per-slug scoped price band (FIXED vs RANGE) ─────────────
+    //
+    // Bug: search returned the master's WHOLE-CATALOGUE price band instead of the
+    // band scoped to the active serviceTypeSlugs filter. A master with a FIXED 500
+    // service on slug A and a RANGE 800..4000 service on slug B returned
+    // minEffectivePrice=500 / priceMax=4000 for BOTH slug filters (and for A the
+    // floor leaked the 500 FIXED while the ceiling leaked the 4000 RANGE).
+    //
+    // This test FAILS against the old whole-catalogue logic (slug A would project
+    // priceMax=4000, slug B would project minEffectivePrice=500) and PASSES against
+    // the SearchService fix, where the `sn` price lateral computes a slug-scoped
+    // MIN + MAX and minEffectivePrice sources from sn.price_min when a filter is
+    // active. No existing price test exercised a master holding BOTH a FIXED and a
+    // RANGE service under DIFFERENT slugs, so the suite missed it.
+
+    @Test
+    @DisplayName("GET /search/masters?serviceTypeSlugs=… — regression: the displayed price band is scoped to the matched service-type — a master with a FIXED 500 on slug A and a RANGE 800..4000 on slug B shows 500/500 for A, 800/4000 for B, and the 500/4000 whole-catalogue band only when unfiltered")
+    void should_scopeMasterPriceBand_toActiveServiceTypeSlug_acrossFixedAndRange() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        UUID master = seedNamedIndependentMaster("Київ", "4.50", "Scoped", "Band");
+        // Slug A: FIXED 500 (floor == ceiling == 500). Neutral name → FK-only match,
+        // never the other slug's name_uk.
+        seedTypedServiceForMaster(master, "Послуга Фікс A", "HAIRCUT",
+                "FIXED", new BigDecimal("500.00"), null, typeIdA, true, true);
+        // Slug B: RANGE 800..4000 (floor 800, ceiling 4000).
+        seedTypedServiceForMaster(master, "Послуга Діапазон B", "INJECTION",
+                "RANGE", new BigDecimal("800.00"), new BigDecimal("4000.00"), typeIdB, true, true);
+
+        // ── slug A → the FIXED service's single price: 500 / 500 ─────────────
+        JsonNode aRow = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(aRow.path("minEffectivePrice").asText()))
+                .as("slug A floor = the matched FIXED 500 (pre-fix this was the catalogue MIN, also 500 — but the ceiling leaked)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(aRow.path("priceMax").asText()))
+                .as("slug A ceiling = the matched FIXED 500, NOT the off-slug RANGE 4000 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+
+        // ── slug B → the RANGE service's band: 800 / 4000 ────────────────────
+        JsonNode bRow = masterSearch("?serviceTypeSlugs=" + SLUG_B + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(bRow.path("minEffectivePrice").asText()))
+                .as("slug B floor = the matched RANGE floor 800, NOT the off-slug FIXED 500 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("800.00"));
+        assertThat(new BigDecimal(bRow.path("priceMax").asText()))
+                .as("slug B ceiling = the matched RANGE ceiling 4000")
+                .isEqualByComparingTo(new BigDecimal("4000.00"));
+
+        // ── no filter → whole-catalogue band 500 / 4000 (preserved) ──────────
+        JsonNode allRow = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(allRow.path("minEffectivePrice").asText()))
+                .as("unfiltered floor = catalogue MIN(500, 800) = 500 (whole-catalogue behaviour preserved)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(allRow.path("priceMax").asText()))
+                .as("unfiltered ceiling = catalogue MAX(FIXED 500, RANGE 4000) = 4000")
+                .isEqualByComparingTo(new BigDecimal("4000.00"));
+    }
+
+    // ── Phase 20.2/20.3 — salon per-service filter ───────────────────────────
+
+    @Test
+    @DisplayName("GET /search/salons — a salon whose active master offers a matching service (FK or name) is returned")
+    void should_returnSalon_when_activeMasterOffersMatchingService() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Salon matched via FK (name omits "Кератин").
+        UUID salonFk = seedActiveSalon("Київ", null);
+        UUID masterFk = seedSalonMasterFor(salonFk, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterFk, salonFk, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Salon matched via name only (NULL FK).
+        UUID salonName = seedActiveSalon("Київ", null);
+        UUID masterName = seedSalonMasterFor(salonName, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterName, salonName, NAME_UK_A + " Lux", "HAIRCUT",
+                new BigDecimal("320.00"), null, true, true);
+        // Control salon offering nothing matching — would appear without the filter.
+        UUID other = seedActiveSalon("Київ", null);
+        UUID otherMaster = seedSalonMasterFor(other, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(otherMaster, other, "Манікюр", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("salon filter matches via the master's service FK OR name; the control salon is excluded")
+                .isEqualTo(2L);
+        assertThat(salonIds(data)).containsExactlyInAnyOrder(salonFk.toString(), salonName.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — OR/union of two slugs at salon granularity: salon offering BOTH AND salon offering only one are both returned")
+    void should_returnSalonsOfferingAnySlug_when_unionOfTwoSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        UUID salonBoth = seedActiveSalon("Київ", null);
+        UUID masterBoth = seedSalonMasterFor(salonBoth, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterBoth, salonBoth, "Послуга A1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedSalonServiceForMaster(masterBoth, salonBoth, "Послуга A2", "INJECTION",
+                new BigDecimal("400.00"), typeIdB, true, true);
+        UUID salonOne = seedActiveSalon("Київ", null);
+        UUID masterOne = seedSalonMasterFor(salonOne, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterOne, salonOne, "Послуга B1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        JsonNode data = salonSearch(
+                "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("OR/union at salon granularity: a salon offering a service for ANY selected slug is returned")
+                .isEqualTo(2L);
+        assertThat(salonIds(data))
+                .as("both the salon offering both slugs and the salon offering only one are returned")
+                .containsExactlyInAnyOrder(salonBoth.toString(), salonOne.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — mix valid + unknown: the unknown slug is dropped; salons offering the VALID slug are returned")
+    void should_returnSalonsOfferingValidSlug_when_mixOfValidAndUnknownSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Salon whose active master offers the valid slug A — survives after the drop.
+        UUID validSalon = seedActiveSalon("Київ", null);
+        UUID validMaster = seedSalonMasterFor(validSalon, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(validMaster, validSalon, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        // Control salon offering nothing matching the valid slug → excluded.
+        UUID other = seedActiveSalon("Київ", null);
+        UUID otherMaster = seedSalonMasterFor(other, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(otherMaster, other, "Манікюр", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A
+                + "&serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("unknown slug dropped; the valid-slug disjunction still matches the offering salon only")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText()).isEqualTo(validSalon.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — all-unknown: the only selected slug is unresolvable → explicit empty page (NOT unfiltered everything)")
+    void should_returnEmpty_when_allSelectedSalonSlugsUnresolvable() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // A real, matching salon exists — an unfiltered query would return it, proving
+        // the empty result is the explicit empty page, not "no rows seeded".
+        UUID salon = seedActiveSalon("Київ", null);
+        UUID master = seedSalonMasterFor(salon, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(master, salon, "Догляд за волоссям", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=nonexistent-slug-xyz&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("every selected slug unknown → empty page, not unfiltered everything")
+                .isZero();
+        assertThat(data.path("data").size()).isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — per-slug EXISTS surfaces a salon via its ACTIVE salon-owned service_definition regardless of master/master_services state; an inactive def is excluded (def is_active is the sole gate)")
+    void should_surfaceSalonBySlug_onActiveDefOnly_ignoringMasterLayers() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Active def, but master inactive + link inactive → MUST surface (salon
+        // search reads owner-scoped defs directly; master/master_services are not
+        // consulted — only the def's own is_active gates).
+        UUID salonActiveDef = seedActiveSalon("Київ", null);
+        UUID inactiveMaster = seedSalonMasterFor(salonActiveDef, "Київ", "4.00");
+        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactiveMaster);
+        seedTypedSalonServiceForMaster(inactiveMaster, salonActiveDef, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, false); // defActive=true, msActive=false
+        // Inactive def, master active + link active → MUST NOT surface.
+        UUID salonInactiveDef = seedActiveSalon("Київ", null);
+        UUID activeMaster = seedSalonMasterFor(salonInactiveDef, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(activeMaster, salonInactiveDef, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, false, true); // defActive=false
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(data.path("totalElements").asLong())
+                .as("only the salon with an ACTIVE owner-scoped service_definition "
+                        + "surfaces via the per-slug EXISTS; master/master_services "
+                        + "activity is irrelevant")
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("salonId").asText())
+                .isEqualTo(salonActiveDef.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — matchedServiceNames is aggregated across the salon's masters when filtering, and empty when unfiltered")
+    void should_aggregateSalonMatchedServiceNames_acrossMasters_whenFiltering() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID salon = seedActiveSalon("Київ", null);
+        UUID master1 = seedSalonMasterFor(salon, "Київ", "4.00");
+        UUID master2 = seedSalonMasterFor(salon, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(master1, salon, "Догляд М1", "HAIRCUT",
+                new BigDecimal("300.00"), typeIdA, true, true);
+        seedTypedSalonServiceForMaster(master2, salon, "Догляд М2", "HAIRCUT",
+                new BigDecimal("310.00"), typeIdA, true, true);
+
+        JsonNode filtered = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(filtered.path("totalElements").asLong()).isEqualTo(1L);
+        JsonNode matched = filtered.path("data").get(0).path("matchedServiceNames");
+        java.util.List<String> matchedNames = new java.util.ArrayList<>();
+        matched.forEach(n -> matchedNames.add(n.asText()));
+        assertThat(matchedNames)
+                .as("matched names span BOTH masters of the salon, distinct and capped at 3")
+                .containsExactlyInAnyOrder("Догляд М1", "Догляд М2");
+
+        JsonNode unfiltered = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
+                .as("matchedServiceNames is empty when no service filter is active")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — regression (salon analog): the salon price band is scoped to the matched service-type — a salon owning a FIXED 500 on slug A and a RANGE 800..4000 on slug B shows priceMin/priceMax 500/500 for A and 800/4000 for B (pre-fix the slug-filtered band leaked the whole-catalogue 500/4000)")
+    void should_scopeSalonPriceBand_toActiveServiceTypeSlug_acrossFixedAndRange() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        // ONE salon owning two ACTIVE owner-scoped defs under two distinct slugs:
+        // a FIXED 500 (slug A) and a RANGE 800..4000 (slug B). The appendSalonPrice
+        // AggregateLateral got the same slug-scoping fix as the master path.
+        UUID salon = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salon, "Салон Фікс A", "HAIRCUT",
+                "FIXED", new BigDecimal("500.00"), null, typeIdA, true);
+        seedSalonOwnedServiceNoMaster(salon, "Салон Діапазон B", "INJECTION",
+                "RANGE", new BigDecimal("800.00"), new BigDecimal("4000.00"), typeIdB, true);
+
+        // ── slug A → the FIXED service band: 500 / 500 ───────────────────────
+        JsonNode aRow = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(aRow.path("priceMin").asText()))
+                .as("slug A salon floor = the matched FIXED 500")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(aRow.path("priceMax").asText()))
+                .as("slug A salon ceiling = the matched FIXED 500, NOT the off-slug RANGE 4000 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+
+        // ── slug B → the RANGE service band: 800 / 4000 ──────────────────────
+        JsonNode bRow = salonSearch("?serviceTypeSlugs=" + SLUG_B + "&page=0&size=20")
+                .path("data").get(0);
+        assertThat(new BigDecimal(bRow.path("priceMin").asText()))
+                .as("slug B salon floor = the matched RANGE floor 800, NOT the off-slug FIXED 500 (the bug)")
+                .isEqualByComparingTo(new BigDecimal("800.00"));
+        assertThat(new BigDecimal(bRow.path("priceMax").asText()))
+                .as("slug B salon ceiling = the matched RANGE ceiling 4000")
+                .isEqualByComparingTo(new BigDecimal("4000.00"));
+    }
+
+    // ── Regression — salon CATEGORY-only filter excludes foreign-category salons ─
+    //
+    // Bug: the salon category predicate lived ONLY inside the price/name preview
+    // LATERAL, never on the outer WHERE. Because that LATERAL is a LEFT JOIN it
+    // never removes the salon row, so a salon offering NOTHING in the selected
+    // category was still returned — as an empty-name / null-price card. The fix
+    // adds a null-gated salon-level `AND (CAST(:category AS text) IS NULL OR
+    // EXISTS(... AND sdc.category = :category))` to the outer WHERE of all six
+    // salon projection overloads AND their countQueries. These tests fail against
+    // the pre-fix query (the foreign-category salon leaks in / inflates the count)
+    // and pass on the gated WHERE.
+
+    @Test
+    @DisplayName("GET /search/salons?category=HAIRCUT — regression: a salon whose ONLY active services are in a DIFFERENT category is EXCLUDED (pre-fix it leaked in as an empty-name card)")
+    void should_excludeSalon_when_offersNothingInFilteredCategory() throws Exception {
+        ensureHttpClient();
+        // Salon A — an active master offering two ACTIVE services in category HAIRCUT.
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterA, salonA, "Стрижка жіноча", "HAIRCUT",
+                new BigDecimal("400.00"), null, true, true);
+        seedTypedSalonServiceForMaster(masterA, salonA, "Фарбування волосся", "HAIRCUT",
+                new BigDecimal("900.00"), null, true, true);
+        // Salon B — an active master offering ONLY a service in category MANICURE.
+        // Pre-fix this salon surfaced for ?category=HAIRCUT with a null price band
+        // and empty serviceNames because the category lived only inside the
+        // LEFT-JOIN LATERAL, never on the salon's outer WHERE.
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterB, salonB, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+                + "&category=HAIRCUT&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("only salon A offers a HAIRCUT service — salon B (MANICURE-only) must be excluded by the outer-WHERE EXISTS gate")
+                .isEqualTo(1L);
+        assertThat(salonIds(data))
+                .as("the single returned salon is salon A; salon B never leaks in as an empty-name card")
+                .containsExactly(salonA.toString());
+
+        JsonNode row = data.path("data").get(0);
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("the category-scoped preview lists ONLY salon A's HAIRCUT names — no foreign-category leak")
+                .containsExactlyInAnyOrder("Стрижка жіноча", "Фарбування волосся");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons (no category) — null-gate no-op: BOTH salons returned regardless of which single category each offers")
+    void should_returnBothSalons_when_noCategoryFilter() throws Exception {
+        ensureHttpClient();
+        // Same two salons as the exclusion test — one HAIRCUT-only, one MANICURE-only.
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterA, salonA, "Стрижка жіноча", "HAIRCUT",
+                new BigDecimal("400.00"), null, true, true);
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(masterB, salonB, "Манікюр класичний", "MANICURE",
+                new BigDecimal("250.00"), null, true, true);
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("with no category the EXISTS gate is short-circuited by `:category IS NULL` — both salons returned (the null-gate no-op)")
+                .isEqualTo(2L);
+        assertThat(salonIds(data))
+                .as("both the HAIRCUT salon and the MANICURE salon are present when no category narrows the result")
+                .containsExactlyInAnyOrder(salonA.toString(), salonB.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?category=HAIRCUT&size=2 — countQuery parity: totalElements counts ONLY category-matching salons (the foreign-category salon is absent from the count too — no phantom page)")
+    void should_matchCountQueryToFilteredRows_when_categoryFilterPaginated() throws Exception {
+        ensureHttpClient();
+        // Three salons each offering an active HAIRCUT service ...
+        UUID s1 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 1");
+        UUID s2 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 2");
+        UUID s3 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 3");
+        // ... and one offering ONLY a MANICURE service — it must be excluded from
+        // BOTH the page content AND the countQuery. A pre-fix count (EXISTS gate
+        // only in the data query) would return 4 and hand an anonymous caller a
+        // phantom HAIRCUT page populated by the MANICURE salon.
+        UUID manicureOnly = seedSalonOfferingCategory("Київ", "MANICURE", "Манікюр класичний");
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+                + "&category=HAIRCUT&page=0&size=2");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("countQuery EXISTS-gate parity: exactly the three HAIRCUT salons are counted, not four")
+                .isEqualTo(3L);
+        assertThat(data.path("totalPages").asInt())
+                .as("3 matching rows / size 2 → 2 pages, no phantom page from the foreign-category salon")
+                .isEqualTo(2);
+        assertThat(data.path("data").size())
+                .as("page 0 holds exactly size=2 rows")
+                .isEqualTo(2);
+        assertThat(salonIds(data))
+                .as("every row on the HAIRCUT page is one of the three HAIRCUT salons")
+                .isSubsetOf(s1.toString(), s2.toString(), s3.toString());
+        assertThat(salonIds(data))
+                .as("the MANICURE-only salon must never appear in the HAIRCUT page content")
+                .doesNotContain(manicureOnly.toString());
+    }
+
+    // ── Regression — salon-owned def with NO master_services row surfaces ─────
+    //
+    // Bug (just fixed): salon search resolved each salon's offered services via
+    // `master_services → masters → service_definitions` (the salon's MASTERS'
+    // assignments). But a salon's catalog is `service_definitions WHERE
+    // owner_type='SALON' AND owner_id = salonId` — created via
+    // `POST /salons/{id}/services` — which are NOT necessarily assigned to any
+    // master. A salon whose owned def has NO `master_services` row therefore
+    // matched 0 under a category filter, returned null priceMin/priceMax, and
+    // an empty serviceNames card. Fixed by switching the row-source of the 6
+    // SalonRepository projection queries + the 5 SearchService salon laterals to
+    // `service_definitions WHERE owner_type='SALON' AND owner_id = s.id AND
+    // is_active = true` (no master_services hop).
+    //
+    // These tests PIN that row-source: they seed an ACTIVE salon-owned def with
+    // NO `master_services` row whatsoever (no salon master) — the exact gap the
+    // pre-existing helpers (seedSalonServiceForMaster / seedTypedSalonServiceForMaster /
+    // seedSalonWithNamedService) could never express, because they ALWAYS insert
+    // a master_services link alongside the def. They FAIL against the old
+    // master_services-join logic (salon invisible / null band / empty names) and
+    // PASS against the owner-scoped fix.
+
+    @Test
+    @DisplayName("GET /search/salons?category=NAIL_SERVICE — regression: a salon whose ACTIVE owned def has NO master_services row STILL surfaces with the owned def's price band + category-scoped names; a different-category owned salon is excluded (pins owner-scoped row-source, not the master_services join)")
+    void should_surfaceSalonByOwnedDef_when_noMasterServicesRowExists() throws Exception {
+        ensureHttpClient();
+        // Salon A — an active salon with NO master at all. Two ACTIVE salon-owned
+        // defs created directly (as POST /salons/{id}/services would): a
+        // NAIL_SERVICE RANGE 150..600 and an off-category HAIRCUT FIXED 900.
+        // NO master_services row exists for either → the pre-fix master_services
+        // join finds nothing and the salon vanishes from a category search.
+        UUID salonA = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonA, "Манікюр гель-лак", "NAIL_SERVICE",
+                "RANGE", new BigDecimal("150.00"), new BigDecimal("600.00"), null, true);
+        seedSalonOwnedServiceNoMaster(salonA, "Стрижка жіноча", "HAIRCUT",
+                "FIXED", new BigDecimal("900.00"), null, null, true);
+        // Salon B — an active salon whose ONLY active owned def is in a DIFFERENT
+        // category (HAIRCUT), also with NO master_services row. It must be
+        // EXCLUDED under ?category=NAIL_SERVICE (negative guard).
+        UUID salonB = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonB, "Фарбування волосся", "HAIRCUT",
+                "FIXED", new BigDecimal("700.00"), null, null, true);
+
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+                + "&category=NAIL_SERVICE&page=0&size=20");
+
+        // (1) The masterless salon-owned def surfaces — totalElements must NOT be 0.
+        assertThat(data.path("totalElements").asLong())
+                .as("salon A surfaces via its ACTIVE owner-scoped NAIL_SERVICE def despite having NO master_services row; pre-fix the master_services join returned 0")
+                .isEqualTo(1L);
+        assertThat(salonIds(data))
+                .as("the single returned salon is salon A; salon B (HAIRCUT-only owned def) is excluded under category=NAIL_SERVICE")
+                .containsExactly(salonA.toString());
+
+        JsonNode row = data.path("data").get(0);
+        // (2) Non-null priceMin/priceMax derived from the owned def's RANGE pricing,
+        // category-scoped to NAIL_SERVICE (the off-category HAIRCUT 900 must not leak).
+        assertThat(row.path("priceMin").isNull())
+                .as("priceMin is derived from the owned def — never null when an active NAIL_SERVICE def exists")
+                .isFalse();
+        assertThat(new BigDecimal(row.path("priceMin").asText()))
+                .as("category-scoped priceMin = the NAIL_SERVICE RANGE floor 150.00 (NOT the off-category HAIRCUT 900)")
+                .isEqualByComparingTo(new BigDecimal("150.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("category-scoped priceMax = the NAIL_SERVICE RANGE ceiling 600.00")
+                .isEqualByComparingTo(new BigDecimal("600.00"));
+
+        // (3)/(4) serviceNames is non-empty and lists ONLY the NAIL_SERVICE name —
+        // the off-category HAIRCUT owned def on the same salon never leaks in.
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+        assertThat(names)
+                .as("serviceNames is non-empty and category-scoped to the owned NAIL_SERVICE def only — no different-category leak")
+                .containsExactly("Манікюр гель-лак");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — regression: the per-slug EntityManager lateral surfaces a salon via its ACTIVE owned def carrying the slug's service_type_id even with NO master_services row; matchedServiceNames carries the owned def's name (pins owner-scoped row-source on the SearchService salon path)")
+    void should_surfaceSalonBySlug_when_ownedDefHasNoMasterServicesRow() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        // Salon with an ACTIVE owned def carrying SLUG_A's service_type_id and NO
+        // master_services row. The SearchService EntityManager builder's salon
+        // per-slug EXISTS must read owner-scoped defs directly.
+        UUID salonWithType = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonWithType, "Кератинове відновлення", "HAIRCUT",
+                "FIXED", new BigDecimal("800.00"), null, typeIdA, true);
+        // A second salon whose owned def is type-less (legacy NULL service_type_id)
+        // and NO master link → must NOT surface under the typed slug filter.
+        UUID salonNoType = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(salonNoType, "Звичайна стрижка", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, null, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("the masterless salon surfaces via the owner-scoped per-slug EXISTS; pre-fix the master_services join returned 0")
+                .isEqualTo(1L);
+        assertThat(salonIds(data))
+                .as("only the salon whose owned def carries SLUG_A's service_type_id is returned")
+                .containsExactly(salonWithType.toString());
+
+        java.util.List<String> matched = new java.util.ArrayList<>();
+        data.path("data").get(0).path("matchedServiceNames").forEach(n -> matched.add(n.asText()));
+        assertThat(matched)
+                .as("matchedServiceNames carries the owned def's name even with no master_services row")
+                .containsExactly("Кератинове відновлення");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Seeds an ACTIVE-or-inactive SALON-owned {@code service_definitions} row
+     * (FIXED or RANGE) created directly under the salon's catalog — exactly as
+     * {@code POST /salons/{id}/services} does — with <b>NO {@code master_services}
+     * row at all</b>. This is the production shape that the pre-fix
+     * master_services-join salon search could never see; it is the row-source
+     * the fix pins. Distinct from {@link #seedSalonServiceForMaster} /
+     * {@link #seedTypedSalonServiceForMaster}, which always attach a master link.
+     *
+     * <p>Honours the V67 {@code chk_service_def_price_mode} CHECK: FIXED →
+     * {@code price_max} NULL; RANGE → {@code price_max} >= {@code base_price}.</p>
+     *
+     * @param serviceTypeId optional platform service-type FK (nullable for the
+     *                      category-only / legacy path)
+     */
+    private void seedSalonOwnedServiceNoMaster(UUID salonId, String serviceName, String category,
+                                               String priceType, BigDecimal basePrice,
+                                               BigDecimal priceMax, UUID serviceTypeId,
+                                               boolean defActive) {
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
+                UUID.randomUUID(), salonId, serviceName, category, serviceTypeId,
+                basePrice, priceType, priceMax, defActive);
+        // Deliberately NO master_services INSERT — that absence is the test fixture.
+    }
+
+    /** Issues an anonymous master search and returns the {@code data} (PageResponse) node. */
+    private JsonNode masterSearch(String query) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + query, HttpMethod.GET, anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    /** Issues an anonymous salon search and returns the {@code data} (PageResponse) node. */
+    private JsonNode salonSearch(String query) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + query, HttpMethod.GET, anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    /** Collects the {@code masterId} strings of a search PageResponse data node. */
+    private static java.util.List<String> masterIds(JsonNode data) {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        data.path("data").forEach(row -> ids.add(row.path("masterId").asText()));
+        return ids;
+    }
+
+    /** Collects the {@code salonId} strings of a search PageResponse data node. */
+    private static java.util.List<String> salonIds(JsonNode data) {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        data.path("data").forEach(row -> ids.add(row.path("salonId").asText()));
+        return ids;
+    }
+
+    /** Resolves a Flyway-seeded {@code service_types.id} by its globally-unique slug. */
+    private UUID serviceTypeIdBySlug(String slug) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM service_types WHERE slug = ?", UUID.class, slug);
+    }
+
+    /**
+     * Seeds an active (or inactive) INDEPENDENT_MASTER-owned service definition
+     * with a controllable {@code service_type_id} (nullable — pass {@code null}
+     * for the legacy/name-only path) plus a {@code master_services} link, then
+     * refreshes {@code masters.min_effective_price} so per-service + price
+     * composition tests see the pre-computed column.
+     */
+    private void seedTypedServiceForMaster(UUID masterId, String serviceName, String category,
+                                           BigDecimal basePrice, UUID serviceTypeId,
+                                           boolean defActive, boolean msActive) {
+        // FIXED-only delegation (price_max NULL) — preserves the historical shape
+        // that all category/slug-membership callers rely on.
+        seedTypedServiceForMaster(masterId, serviceName, category, "FIXED",
+                basePrice, null, serviceTypeId, defActive, msActive);
+    }
+
+    /**
+     * RANGE-capable overload of {@link #seedTypedServiceForMaster}: seeds an
+     * INDEPENDENT_MASTER-owned typed service definition with an explicit
+     * {@code priceType} ("FIXED" or "RANGE") and {@code priceMax} ceiling, plus a
+     * {@code master_services} link, then refreshes
+     * {@code masters.min_effective_price}. Honours the V67
+     * {@code chk_service_def_price_mode} CHECK: FIXED → {@code price_max} NULL;
+     * RANGE → {@code price_max} >= {@code base_price}. Backs the per-slug
+     * scoped-price regression where a master carries BOTH a FIXED service on one
+     * service-type and a RANGE service on another.
+     */
+    private void seedTypedServiceForMaster(UUID masterId, String serviceName, String category,
+                                           String priceType, BigDecimal basePrice, BigDecimal priceMax,
+                                           UUID serviceTypeId, boolean defActive, boolean msActive) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, serviceTypeId,
+                basePrice, priceType, priceMax, defActive);
+
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, msActive);
+
+        jdbcTemplate.update(
+                "UPDATE masters SET min_effective_price = (" +
+                "  SELECT MIN(COALESCE(ms2.price_override, sd2.base_price))" +
+                "  FROM master_services ms2" +
+                "  JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id" +
+                "  WHERE ms2.master_id = ? AND ms2.is_active = true AND sd2.is_active = true" +
+                ") WHERE id = ?",
+                masterId, masterId);
+    }
+
+    /**
+     * Seeds a SALON-owned FIXED-priced service definition with a controllable
+     * {@code service_type_id} (nullable) and {@code is_active} flags, plus a
+     * {@code master_services} link for the given salon master. Backs the salon
+     * per-service-filter tests (the salon EXISTS reaches active masters' active
+     * services).
+     */
+    private void seedTypedSalonServiceForMaster(UUID masterId, UUID salonId, String serviceName,
+                                                String category, BigDecimal basePrice, UUID serviceTypeId,
+                                                boolean defActive, boolean msActive) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, 'FIXED', 0, ?, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, category, serviceTypeId, basePrice, defActive);
+
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, msActive);
+    }
+
+    /**
+     * Seeds an active salon in {@code city} whose active SALON_MASTER offers a
+     * single active FIXED service in {@code category} (service_type_id NULL —
+     * category-only). Backs the salon category-filter regression tests where each
+     * salon's discovery eligibility hinges solely on the category of its one
+     * offered service.
+     */
+    private UUID seedSalonOfferingCategory(String city, String category, String serviceName) {
+        UUID salonId = seedActiveSalon(city, null);
+        UUID masterId = seedSalonMasterFor(salonId, city, "4.00");
+        seedTypedSalonServiceForMaster(masterId, salonId, serviceName, category,
+                new BigDecimal("300.00"), null, true, true);
+        return salonId;
+    }
+
+    /**
+     * Seeds an INDEPENDENT_MASTER with explicit first/last name on the user row
+     * (the generic {@link #seedMaster} leaves names null, which the name-search
+     * tests need populated). City FK lives on the user row.
+     */
+    private UUID seedNamedIndependentMaster(String city, String avgRating,
+                                            String firstName, String lastName) {
+        UUID cityId = cityIdByName(city);
+
+        UUID userId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, first_name, last_name, city, city_id, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, true, true)",
+                userId, "named-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", firstName, lastName, city, cityId);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
+                masterId, userId, avgRating);
+        return masterId;
+    }
+
+    /**
+     * Seeds an active, priced service definition with an explicit (custom)
+     * {@code name} plus an active {@code master_services} link, then refreshes
+     * {@code masters.min_effective_price}. Used by the service-name search and
+     * {@code serviceNames}-population tests where the name must be deterministic.
+     */
+    private void seedNamedServiceForMaster(UUID masterId, String serviceName,
+                                           String category, BigDecimal basePrice) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 0, true, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, basePrice);
+
+        UUID msId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, true, NOW(), NOW())",
+                msId, masterId, serviceDefId);
+
+        jdbcTemplate.update(
+                "UPDATE masters SET min_effective_price = (" +
+                "  SELECT MIN(COALESCE(ms2.price_override, sd2.base_price))" +
+                "  FROM master_services ms2" +
+                "  JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id" +
+                "  WHERE ms2.master_id = ? AND ms2.is_active = true AND sd2.is_active = true" +
+                ") WHERE id = ?",
+                masterId, masterId);
+    }
+
+    /**
+     * Seeds an active, priced RANGE service definition (floor {@code basePrice},
+     * ceiling {@code priceMax}) owned by the independent master, plus an active
+     * {@code master_services} link, then refreshes
+     * {@code masters.min_effective_price}. Honours the V67
+     * {@code chk_service_def_price_mode} CHECK: RANGE requires
+     * {@code price_max >= base_price}. Used by the master priceMax discriminator
+     * test where the ceiling must strictly exceed the floor.
+     */
+    private void seedRangeServiceForMaster(UUID masterId, String serviceName,
+                                           String category, BigDecimal basePrice, BigDecimal priceMax) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 'RANGE', ?, 0, true, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, basePrice, priceMax);
+
+        UUID msId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, true, NOW(), NOW())",
+                msId, masterId, serviceDefId);
+
+        jdbcTemplate.update(
+                "UPDATE masters SET min_effective_price = (" +
+                "  SELECT MIN(COALESCE(ms2.price_override, sd2.base_price))" +
+                "  FROM master_services ms2" +
+                "  JOIN service_definitions sd2 ON sd2.id = ms2.service_def_id" +
+                "  WHERE ms2.master_id = ? AND ms2.is_active = true AND sd2.is_active = true" +
+                ") WHERE id = ?",
+                masterId, masterId);
+    }
+
+    /** Seeds a SALON_OWNER + an active salon with an explicit name in the given city. */
+    private UUID seedNamedSalon(String city, String name) {
+        UUID cityId = cityIdByName(city);
+
+        UUID ownerId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
+                ownerId, "named-salon-owner-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest");
+
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, name, city, cityId);
+        return salonId;
+    }
+
+    /**
+     * Seeds an active, named salon in {@code city} plus one SALON_MASTER, one
+     * named SALON-owned service definition and the {@code master_services} link
+     * — with the three discovery {@code is_active} flags individually
+     * controllable. Backs the salon service-name search active-only guard: the
+     * widened {@code q} EXISTS clause requires the master, the link AND the
+     * definition to all be active, so a term carried only by an inactive layer
+     * must not surface the salon. The salon itself is always active (the term is
+     * not in its name).
+     */
+    private UUID seedSalonWithNamedService(String city, String salonName, String serviceName,
+                                           boolean masterActive, boolean msActive, boolean defActive) {
+        UUID salonId = seedNamedSalon(city, salonName);
+
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, city, is_active, email_verified) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, true, true)",
+                masterUserId, "svc-name-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", salonId, city);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, 'SALON_MASTER', 4.0::numeric, 1, ?, NOW(), NOW())",
+                masterId, masterUserId, salonId, masterActive);
+
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, 'EYEBROW', 60, 300.00, 'FIXED', 0, ?, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, defActive);
+
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, msActive);
+        return salonId;
+    }
 
     /**
      * Resolves the Nth Flyway-seeded {@code city_districts.id} of a city by the
@@ -1186,9 +3114,46 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         return salonId;
     }
 
+    /** Percent-encodes a query-parameter value (UTF-8). */
+    private static String enc(String raw) {
+        return java.net.URLEncoder.encode(raw, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Builds a concrete {@link java.net.URI} from an already-encoded path+query
+     * string so {@link TestRestTemplate} treats it as a final URI and does NOT
+     * re-expand/re-encode it as a URI template (which would double-encode a
+     * pre-encoded {@code %25} into {@code %2525}). Required by the literal-{@code %}
+     * escaping tests where the query value carries percent-encoded metacharacters.
+     *
+     * <p>The URI is built absolute (against the random server port) because
+     * {@link TestRestTemplate} only prepends its root URI for String templates,
+     * not for a concrete {@link java.net.URI} argument.
+     */
+    private java.net.URI rawUri(String encodedPathAndQuery) {
+        return java.net.URI.create("http://localhost:" + port + encodedPathAndQuery);
+    }
+
+    // Per-request unique source IP. The new AuthRateLimitFilter throttles
+    // GET /api/v1/search/** at 40 req/60 s PER IP (searchBuckets). This class
+    // fires 60+ search GETs which, from a single loopback IP, would exhaust that
+    // bucket mid-suite — and Apache HC5's DefaultHttpRequestRetryStrategy HONORS
+    // the 429 `Retry-After: 60` header, sleeping 60 s and timing the test out
+    // (the SlowTestExtension 10 s ceiling). Stamping a fresh X-Forwarded-For per
+    // request gives each call its own per-IP bucket (resolveClientIp reads the
+    // rightmost, trusted-proxy entry), so the real throttle stays active in prod
+    // while these high-volume same-host ITs never trip it. The dedicated
+    // SearchGetRateLimitRegressionTest exercises the throttle itself.
+    private static final java.util.concurrent.atomic.AtomicInteger IP_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     private static HttpHeaders anonymousHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(java.util.List.of(MediaType.APPLICATION_JSON));
+        // Unique synthetic client IP per request — 10.x.x.x, distinct each call.
+        int n = IP_SEQ.incrementAndGet();
+        headers.set("X-Forwarded-For",
+                "10." + ((n >> 16) & 0xFF) + "." + ((n >> 8) & 0xFF) + "." + (n & 0xFF));
         return headers;
     }
 
@@ -1275,12 +3240,55 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
+     * Seeds an INDEPENDENT_MASTER in the given city with an explicit
+     * {@code review_count} (overriding the {@code seedMaster} default of 1) so
+     * the {@code sort=REVIEWS_DESC} ordering test has a deterministic spread.
+     */
+    private UUID seedMasterWithReviewCount(String city, String avgRating, int reviewCount) {
+        UUID masterId = seedMaster(city, avgRating);
+        jdbcTemplate.update(
+                "UPDATE masters SET review_count = ? WHERE id = ?", reviewCount, masterId);
+        return masterId;
+    }
+
+    /**
+     * Seeds an active salon in the given city priced by a single FIXED service
+     * at {@code fixedPrice}, so its aggregate band collapses to
+     * {@code priceMin == priceMax == fixedPrice}. Used by the salon sort tests
+     * where each salon must carry a deterministic, distinct price band.
+     */
+    private UUID seedSalonWithFixedService(String city, BigDecimal fixedPrice) {
+        UUID salonId = seedActiveSalon(city, null);
+        UUID masterId = seedSalonMasterFor(salonId, city, "4.00");
+        seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
+                fixedPrice, null, true, true);
+        return salonId;
+    }
+
+    /**
      * Seeds a master plus one active SALON-owned MANICURE service definition
      * priced at {@code basePrice}, with an active {@code master_services} row.
      */
     private UUID seedMasterWithService(String city, String avgRating, BigDecimal basePrice) {
         UUID masterId = seedMaster(city, avgRating);
         seedServiceWithCategory(masterId, masterId, "MANICURE", basePrice, true, true);
+        return masterId;
+    }
+
+    /**
+     * Seeds an INDEPENDENT_MASTER with TWO active FIXED services in the same
+     * {@code category}, priced {@code price1} and {@code price2}, so the master's
+     * effective price BAND ({@code [min, max]}) is genuinely wider than a single
+     * point. This is the fixture the price band-overlap regression net needs: the
+     * pre-fix predicate filtered on the whole-catalogue floor only, so a band
+     * {@code floor != ceiling} was the precise shape that single-service tests
+     * (where {@code floor == ceiling}) could not exercise.
+     */
+    private UUID seedMasterWithTwoServices(String city, String avgRating, String category,
+                                           BigDecimal price1, BigDecimal price2) {
+        UUID masterId = seedMaster(city, avgRating);
+        seedServiceWithCategory(masterId, masterId, category, price1, true, true);
+        seedServiceWithCategory(masterId, masterId, category, price2, true, true);
         return masterId;
     }
 

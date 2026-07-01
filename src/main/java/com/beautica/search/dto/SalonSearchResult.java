@@ -1,6 +1,7 @@
 package com.beautica.search.dto;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -33,6 +34,29 @@ import java.util.UUID;
  * band collapses to a single number — collapsing to one display value is a
  * mobile-rendering concern; the backend always returns both.</p>
  *
+ * <p><b>{@code serviceNames} — service-name preview:</b> a short, capped
+ * ({@code SERVICE_NAME_CAP}) list of the distinct active service names offered
+ * across the salon's masters, surfaced so the result card can preview what the
+ * salon does. Each name is the owner-set {@code service_definitions.name}. The
+ * list is never {@code null}: a salon with no active, priced services yields an
+ * empty list, serialised as {@code []} — mirroring the master
+ * {@code serviceNames} contract. Carries no internal IDs, so it is safe on this
+ * {@code permitAll} endpoint (§I).</p>
+ *
+ * <p><b>{@code street} / {@code buildingNo} / {@code locationNote} — AUTH-GATED
+ * street address:</b> the salon's full street-level address
+ * ({@code salons.street} / {@code salons.building_no} /
+ * {@code salons.location_note}), returned <b>only to an authenticated
+ * caller</b>. For an anonymous request all three are {@code null}; the public
+ * {@code cityLabel}/{@code districtLabel} remain visible to everyone.
+ * {@code locationNote} is a free-text arrival hint ("entrance from the yard")
+ * and may be {@code null} even for an authenticated caller when the salon
+ * recorded none. The values are always computed in SQL and cached on the full
+ * object; the auth-gate (nulling for anon) happens per-request <em>after</em>
+ * the cache read in the controller, so a warm cache can never leak addresses
+ * across the anon/authenticated boundary. See {@code SearchController} for the
+ * strip.</p>
+ *
  * <p>This is a response DTO only — no Bean Validation annotations
  * apply. Assembled by the search service from a projection query;
  * the JPA entity is never exposed directly.</p>
@@ -44,6 +68,28 @@ public record SalonSearchResult(
         String districtLabel,
         String avatarUrl,
         BigDecimal priceMin,
-        BigDecimal priceMax
+        BigDecimal priceMax,
+        List<String> serviceNames,
+        String street,
+        String buildingNo,
+        String locationNote,
+        List<String> matchedServiceNames
 ) {
+
+    /**
+     * Returns a copy with the auth-gated street-level fields ({@code street},
+     * {@code buildingNo}, {@code locationNote}) nulled out, for serving to
+     * anonymous callers. All other fields — including the public locality
+     * labels — are preserved.
+     *
+     * <p>Applied per-request in the controller <em>after</em> the
+     * {@code @Cacheable} read so the cache always holds the full object and
+     * never leaks addresses across the anon/authenticated boundary.</p>
+     */
+    public SalonSearchResult withoutStreetAddress() {
+        return new SalonSearchResult(
+                salonId, name, cityLabel, districtLabel, avatarUrl,
+                priceMin, priceMax, serviceNames, null, null, null, matchedServiceNames
+        );
+    }
 }

@@ -40,6 +40,7 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -106,6 +107,10 @@ class SearchControllerTest {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    private static final String SAMPLE_STREET = "вул. Хрещатик";
+    private static final String SAMPLE_BUILDING_NO = "22А";
+    private static final String SAMPLE_LOCATION_NOTE = "Дзвоніть за 10 хв";
+
     private static MasterSearchResult sampleMasterResult() {
         return new MasterSearchResult(
                 UUID.randomUUID(),
@@ -115,8 +120,14 @@ class SearchControllerTest {
                 "Голосіївський район",
                 4.6,
                 17,
-                null,
-                new BigDecimal("250.00")
+                null,                               // avatarUrl
+                new BigDecimal("250.00"),           // minEffectivePrice
+                new BigDecimal("400.00"),           // priceMax (a genuine range: > min)
+                List.of("Манікюр", "Педикюр"),      // serviceNames
+                SAMPLE_STREET,                       // street (auth-gated)
+                SAMPLE_BUILDING_NO,                  // buildingNo (auth-gated)
+                SAMPLE_LOCATION_NOTE,                // locationNote (auth-gated)
+                List.of()                            // matchedServiceNames (no service filter)
         );
     }
 
@@ -125,10 +136,15 @@ class SearchControllerTest {
                 UUID.randomUUID(),
                 "Salon Beautica",
                 "Львів",
-                null,
-                null,
-                new BigDecimal("150.00"),
-                new BigDecimal("600.00")
+                null,                               // districtLabel
+                null,                               // avatarUrl
+                new BigDecimal("150.00"),           // priceMin
+                new BigDecimal("600.00"),           // priceMax
+                List.of("Стрижка", "Фарбування"),   // serviceNames (never null)
+                SAMPLE_STREET,                       // street (auth-gated)
+                SAMPLE_BUILDING_NO,                  // buildingNo (auth-gated)
+                SAMPLE_LOCATION_NOTE,                // locationNote (auth-gated)
+                List.of()                            // matchedServiceNames (no service filter)
         );
     }
 
@@ -293,16 +309,19 @@ class SearchControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — 400 when minPrice has 3 decimal places (@Digits fraction=2)")
-    void should_return400_when_minPriceExceedsFractionPrecision() throws Exception {
-        log.debug("Act: GET {} with minPrice=10.123 — must fail @Digits(fraction=2) and return 400", MASTERS_URL);
+    @DisplayName("GET /api/v1/search/masters — 200 when minPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_minPriceFractionRoundedToScale2() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        log.debug("Act: GET {} with minPrice=1700.0000000000002 — float-slider artifact, must round to 1700.00 and return 200", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
-                        .param("minPrice", "10.123")
+                        .param("minPrice", "1700.0000000000002")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false));
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
     }
 
     @Test
@@ -327,6 +346,83 @@ class SearchControllerTest {
         log.debug("Act: GET {} with minPrice=12345678.90 — exactly NUMERIC(10,2), must be accepted (200)", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
                         .param("minPrice", "12345678.90")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when maxPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_maxPriceFractionRoundedToScale2() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // The exact prod artifact from the mobile float price slider, mirrored on the
+        // MAX bound. Pre-fix (no compact ctor) the 13-fraction-digit value trips
+        // @Digits(fraction=2) → spurious 400; post-fix it rounds to 1700.00 → 200.
+        log.debug("Act: GET {} with maxPrice=1700.0000000000002 — float-slider artifact, must round to 1700.00 and return 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("maxPrice", "1700.0000000000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when both price bounds round HALF_UP into the same scale-2 bucket (cross-field guard not tripped by raw values)")
+    void should_return200_when_priceBoundsRoundHalfUpAndRangeStaysValid() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // RAW minPrice (99.014) > RAW maxPrice (99.006): a pre-fix DTO would 400 on
+        // @AssertTrue (min > max) AND on @Digits (3 fraction digits). The compact ctor
+        // rounds BOTH HALF_UP into 99.01 (99.006 rounds UP, 99.014 rounds down), so the
+        // cross-field guard sees 99.01 <= 99.01 → valid → 200. This pins ordering:
+        // rounding happens before @Digits AND before @AssertTrue.
+        log.debug("Act: GET {} with minPrice=99.014 & maxPrice=99.006 — both round HALF_UP to 99.01, range must stay valid → 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "99.014")
+                        .param("maxPrice", "99.006")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when maxPrice rounds to 9 integer digits (magnitude guard survives rounding)")
+    void should_return400_when_maxPriceRoundsToNineIntegerDigits() throws Exception {
+        // Rounding collapses only excess FRACTION digits — it must never relax the
+        // 8-integer-digit cap. 123456789.0000002 rounds to 123456789.00 (9 integer
+        // digits) and still fails @Digits(integer=8) → 400.
+        log.debug("Act: GET {} with maxPrice=123456789.0000002 — rounds to 9 int digits, must still fail @Digits(integer=8) → 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("maxPrice", "123456789.0000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when sub-half-cent negative minPrice rounds to 0.00 (intended benign edge)")
+    void should_return200_when_subHalfCentNegativeMinPriceRoundsToZero() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // Documented benign edge (accepted by security): a sub-half-cent negative
+        // (|value| < 0.005) rounds HALF_UP to 0.00, which satisfies @DecimalMin(0) → 200.
+        // This is NOT a negative-bypass: -0.01 (>= half a cent) still rounds to -0.01
+        // and is rejected by should_return400_when_minPriceNegative.
+        log.debug("Act: GET {} with minPrice=-0.001 — rounds to 0.00, intended benign edge → 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minPrice", "-0.001")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
@@ -361,6 +457,25 @@ class SearchControllerTest {
         log.debug("Act: GET {} with minRating=5.0 — exactly at @DecimalMax(5.0), must be accepted (200)", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
                         .param("minRating", "5.0")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when minRating has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_minRatingFractionRoundedToScale2() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // Rating slider artifact mirroring the price case: 4.7000000000001 (13 fraction
+        // digits) would trip @Digits(integer=1, fraction=2) pre-fix; the compact ctor
+        // rounds it to 4.70 (still within 0.00–5.00) → 200.
+        log.debug("Act: GET {} with minRating=4.7000000000001 — float artifact, must round to 4.70 and return 200", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("minRating", "4.7000000000001")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
@@ -589,6 +704,429 @@ class SearchControllerTest {
         when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
 
         mockMvc.perform(get(MASTERS_URL)
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── q / sort / serviceNames (Phase — search contract additions) ──────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when q and a valid sort are supplied (binds q + enum)")
+    void should_return200_when_qAndSortProvided() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "Olena")
+                        .param("sort", "PRICE_ASC")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when sort is not in the allow-list (enum bind fails → generic 400)")
+    void should_return400_when_unknownSort() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("sort", "DROP_TABLE")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when q contains a control character (@Pattern)")
+    void should_return400_when_qHasControlChar() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "<script>")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when q exceeds 100 characters (@Size)")
+    void should_return400_when_qTooLong() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "a".repeat(101))
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — serviceNames array is present in the result DTO")
+    void should_exposeServiceNames_inMasterSearchResponse() throws Exception {
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].serviceNames").isArray())
+                .andExpect(jsonPath("$.data.data[0].serviceNames[0]").value("Манікюр"));
+    }
+
+    // ── priceMax semantics (FIXED vs RANGE discriminator) ────────────────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — priceMax is present in the result DTO and exceeds minEffectivePrice for a range master")
+    void should_exposePriceMax_aboveMin_forRangeMaster() throws Exception {
+        // sampleMasterResult() seeds min=250.00, priceMax=400.00 — a genuine range.
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].minEffectivePrice").value(250.00))
+                .andExpect(jsonPath("$.data.data[0].priceMax").value(400.00));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — priceMax equals minEffectivePrice for a single FIXED-price master")
+    void should_returnEqualPriceMaxAndMin_forFixedPriceMaster() throws Exception {
+        MasterSearchResult fixed = new MasterSearchResult(
+                UUID.randomUUID(), "Iryna", "Fixed", "Київ", null,
+                4.9, 5, null,
+                new BigDecimal("300.00"),   // minEffectivePrice
+                new BigDecimal("300.00"),   // priceMax == min → FIXED single price
+                List.of("Манікюр"),
+                SAMPLE_STREET, SAMPLE_BUILDING_NO, SAMPLE_LOCATION_NOTE,
+                List.of());
+        Page<MasterSearchResult> page = new PageImpl<>(List.of(fixed), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].minEffectivePrice").value(300.00))
+                .andExpect(jsonPath("$.data.data[0].priceMax").value(300.00));
+    }
+
+    // ── AUTH-GATE street address (security regression guard, pins SearchController.java:157) ─
+    //
+    // The mocked SearchService always returns a result WITH street + buildingNo
+    // populated (the cache always holds the full object). The controller's
+    // isAuthenticated() gate decides whether the per-request strip runs. These
+    // four tests pin the exact behaviour so a future refactor to
+    // `auth.isAuthenticated()` (which is TRUE for an AnonymousAuthenticationToken)
+    // can never silently start leaking masters'/salons' home addresses to anon.
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — ANONYMOUS caller gets street, buildingNo AND locationNote nulled (no address leak)")
+    void should_stripStreetAddress_forMasters_when_anonymous() throws Exception {
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        // No authentication() post-processor → the test SecurityFilterChain admits
+        // the request as anonymous (AnonymousAuthenticationToken), so the strip fires.
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value((Object) null))
+                // public locality labels must still be visible to anonymous callers
+                .andExpect(jsonPath("$.data.data[0].cityLabel").value("Київ"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — AUTHENTICATED caller gets street, buildingNo AND locationNote populated")
+    void should_returnStreetAddress_forMasters_when_authenticated() throws Exception {
+        Page<MasterSearchResult> page = new PageImpl<>(
+                List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .with(authentication(authenticatedClient()))
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value(SAMPLE_STREET))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value(SAMPLE_LOCATION_NOTE));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — ANONYMOUS caller gets street, buildingNo AND locationNote nulled (no address leak)")
+    void should_stripStreetAddress_forSalons_when_anonymous() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value((Object) null))
+                .andExpect(jsonPath("$.data.data[0].cityLabel").value("Львів"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — AUTHENTICATED caller gets street, buildingNo AND locationNote populated")
+    void should_returnStreetAddress_forSalons_when_authenticated() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .with(authentication(authenticatedClient()))
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].street").value(SAMPLE_STREET))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value(SAMPLE_BUILDING_NO))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value(SAMPLE_LOCATION_NOTE));
+    }
+
+    // ── salon serviceNames contract (never null) ─────────────────────────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — serviceNames is a present array for a salon with priced services")
+    void should_exposeServiceNames_inSalonSearchResponse() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].serviceNames").isArray())
+                .andExpect(jsonPath("$.data.data[0].serviceNames.length()").value(2))
+                .andExpect(jsonPath("$.data.data[0].serviceNames[0]").value("Стрижка"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — serviceNames serialises as [] (never null) for a salon with no services")
+    void should_serialiseEmptyServiceNames_asArray_forSalonWithNoServices() throws Exception {
+        SalonSearchResult noServices = new SalonSearchResult(
+                UUID.randomUUID(), "Empty Salon", "Київ", null, null,
+                null, null,                 // priceMin / priceMax null
+                List.of(),                  // serviceNames empty (never null per the contract)
+                null, null, null,           // street / buildingNo / locationNote
+                List.of());                 // matchedServiceNames (no service filter)
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(noServices), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].serviceNames").isArray())
+                .andExpect(jsonPath("$.data.data[0].serviceNames.length()").value(0));
+    }
+
+    /**
+     * Builds a non-anonymous {@link org.springframework.security.core.Authentication}
+     * for the authenticated-caller auth-gate tests. A
+     * {@link org.springframework.security.authentication.UsernamePasswordAuthenticationToken}
+     * with authorities is authenticated AND is NOT an
+     * {@link org.springframework.security.authentication.AnonymousAuthenticationToken},
+     * so {@code SearchController.isAuthenticated()} returns {@code true} and the
+     * street-address strip is skipped.
+     */
+    private static org.springframework.security.core.Authentication authenticatedClient() {
+        return new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                "client@test.com",
+                "n/a",
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority("ROLE_CLIENT")));
+    }
+
+    // ── salon q / sort / price filter binding ────────────────────────────────
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when q, sort and price band are supplied")
+    void should_return200_when_salonQSortPriceProvided() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(
+                List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        mockMvc.perform(get(SALONS_URL)
+                        .param("q", "Glow")
+                        .param("sort", "PRICE_DESC")
+                        .param("minPrice", "100.00")
+                        .param("maxPrice", "500.00")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when minPrice exceeds maxPrice (@AssertTrue)")
+    void should_return400_when_salonMinPriceExceedsMaxPrice() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "500.00")
+                        .param("maxPrice", "100.00")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when minPrice is negative (@DecimalMin)")
+    void should_return400_when_salonMinPriceNegative() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "-1")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when minPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_salonMinPriceFractionRoundedToScale2() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        // Salon parity for the prod float-slider artifact on the MIN bound.
+        log.debug("Act: GET {} with minPrice=1700.0000000000002 — must round to 1700.00 and return 200", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "1700.0000000000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when maxPrice has excess fraction digits (compact ctor rounds to scale 2 before @Digits)")
+    void should_return200_when_salonMaxPriceFractionRoundedToScale2() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        // The exact prod artifact, mirrored on the salon MAX bound.
+        log.debug("Act: GET {} with maxPrice=1700.0000000000002 — must round to 1700.00 and return 200", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("maxPrice", "1700.0000000000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when both price bounds round HALF_UP into the same scale-2 bucket (cross-field guard not tripped by raw values)")
+    void should_return200_when_salonPriceBoundsRoundHalfUpAndRangeStaysValid() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
+
+        // RAW minPrice (99.014) > RAW maxPrice (99.006) — both round HALF_UP to 99.01,
+        // so the cross-field @AssertTrue sees a valid range. Pre-fix this 400s on both
+        // @Digits (3 fraction digits) and @AssertTrue (raw min > raw max).
+        log.debug("Act: GET {} with minPrice=99.014 & maxPrice=99.006 — both round HALF_UP to 99.01, range must stay valid → 200", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("minPrice", "99.014")
+                        .param("maxPrice", "99.006")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when maxPrice rounds to 9 integer digits (magnitude guard survives rounding)")
+    void should_return400_when_salonMaxPriceRoundsToNineIntegerDigits() throws Exception {
+        log.debug("Act: GET {} with maxPrice=123456789.0000002 — rounds to 9 int digits, must still fail @Digits(integer=8) → 400", SALONS_URL);
+        mockMvc.perform(get(SALONS_URL)
+                        .param("maxPrice", "123456789.0000002")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── serviceTypeSlugs validation (Phase 20.1–20.2 — @Size limit + @Pattern) ─
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when serviceTypeSlugs exceeds the 20-entry limit (@Size(max=20))")
+    void should_return400_when_serviceTypeSlugsExceedLimit() throws Exception {
+        String[] slugs = new String[21];
+        for (int i = 0; i < slugs.length; i++) {
+            slugs[i] = "slug-" + i;   // each individually pattern-valid; the LIST size is the violation
+        }
+        log.debug("Act: GET {} with 21 serviceTypeSlugs — must fail @Size(max=20) and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("serviceTypeSlugs", slugs)
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when a serviceTypeSlug violates the lowercase-hyphenated @Pattern")
+    void should_return400_when_serviceTypeSlugViolatesPattern() throws Exception {
+        log.debug("Act: GET {} with serviceTypeSlugs=Not_A_Slug — must fail the slug @Pattern and return 400", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("serviceTypeSlugs", "Not_A_Slug")   // upper-case + underscore → invalid
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when a serviceTypeSlug violates the lowercase-hyphenated @Pattern (salon parity)")
+    void should_return400_when_salonServiceTypeSlugViolatesPattern() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("serviceTypeSlugs", "Bad Slug!")   // space + bang → invalid
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when serviceTypeSlugs holds valid lowercase-hyphenated slugs (binds the list)")
+    void should_return200_when_serviceTypeSlugsValid() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("serviceTypeSlugs", "hair-treatment-keratin", "injection-mesotherapy")
+                        .param("page", "0")
+                        .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));

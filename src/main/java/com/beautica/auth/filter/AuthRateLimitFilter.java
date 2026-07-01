@@ -32,6 +32,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String RESEND_VERIFICATION_PATH = "/api/v1/auth/resend-verification";
     private static final String FORGOT_PASSWORD_PATH = "/api/v1/auth/forgot-password";
     private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
+    private static final String INVITE_PATH = "/api/v1/auth/invite";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
@@ -63,6 +64,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // exact paths (/book/otp/send, /book/otp/verify), and the GET cancel-info read is excluded
     // by the POST-method guard, so only the cancel POST consumes this bucket.
     private static final String CANCEL_POST_PATH_PREFIX = "/api/v1/book/cancel/";
+    // Discovery search read paths (all GET, all permitAll): /api/v1/search/masters and
+    // /api/v1/search/salons. Matched by prefix so any future /search/* read inherits the
+    // same throttle. These endpoints now surface authed-only street addresses for
+    // independent masters, so an unthrottled crawler could bulk-harvest home addresses;
+    // this is the IP-layer defence against that scraping.
+    private static final String SEARCH_PATH_PREFIX = "/api/v1/search/";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
@@ -110,6 +117,32 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // this filter directly.
     private static final long CANCEL_POST_CAPACITY = 10;
     private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for GET /api/v1/search/** (40 / 60 s). These permitAll() discovery reads
+    // now expose authed-only street addresses for independent masters, so without a throttle
+    // a single IP could page through every district/city and bulk-harvest home addresses.
+    // 40/min is a paging-friendly ceiling — a human filtering + paginating discovery results
+    // (each page is one request) stays well under it, while a scripted crawler sweeping the
+    // catalogue is capped. IP-keyed for consistency with every other bucket in this filter
+    // (JWT is parsed in JwtAuthenticationFilter, which runs AFTER this filter; and the search
+    // endpoints are permitAll anyway, so anonymous callers carry no principal). Built
+    // internally (not an injected @Qualifier bean) so the public 16-arg constructor — depended
+    // on by several slice/regression tests — stays unchanged.
+    private static final long SEARCH_CAPACITY = 40;
+    private static final Duration SEARCH_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
+    // unthrottled surface. This is both the residual enumeration/timing surface left after the
+    // InviteService 409->idempotent fix (the already-registered and active-invite branches do
+    // measurably less work — no token gen, hash, persist or outbox encrypt — so an unthrottled
+    // authenticated SALON_OWNER could gather enough timing samples to infer registration
+    // status) AND an invite-email surface (the happy path enqueues an outbox e-mail). 15/min
+    // is generous for a human onboarding their team one invite at a time while bounding both
+    // automated probing and e-mail abuse; any abuse is still attributable to the authenticated
+    // SALON_OWNER principal. IP-keyed for consistency with every other bucket here (JWT is
+    // parsed in JwtAuthenticationFilter, which runs AFTER this filter). Built internally (not
+    // an injected @Qualifier bean) so the public 16-arg constructor — depended on by several
+    // slice/regression tests — stays unchanged.
+    private static final long INVITE_CAPACITY = 15;
+    private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -166,6 +199,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rather than injected so the public 16-arg constructor stays stable for the slice/regression
     // tests that construct this filter directly.
     private final LoadingCache<String, Bucket> cancelPostBuckets;
+    // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
+    // discovery reads (which now surface authed-only independent-master street addresses).
+    // Built internally rather than injected so the public 16-arg constructor stays stable for
+    // the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> searchBuckets;
+    // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
+    // timing oracle in InviteService.sendInvite (the already-registered / active-invite
+    // branches return fast). Built internally rather than injected so the public 16-arg
+    // constructor stays stable for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> inviteBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -218,6 +261,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(cancelPostBandwidth())
                         .build());
+        this.searchBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SEARCH_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(searchBandwidth())
+                        .build());
+        this.inviteBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(inviteBandwidth())
+                        .build());
     }
 
     private static Bandwidth otpVerifyBandwidth() {
@@ -238,6 +293,20 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(CANCEL_POST_CAPACITY)
                 .refillIntervally(CANCEL_POST_CAPACITY, CANCEL_POST_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth searchBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SEARCH_CAPACITY)
+                .refillIntervally(SEARCH_CAPACITY, SEARCH_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth inviteBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(INVITE_CAPACITY)
+                .refillIntervally(INVITE_CAPACITY, INVITE_WINDOW)
                 .build();
     }
 
@@ -272,6 +341,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(SLOTS_PATH_PREFIX)
                 && path.endsWith(SLOTS_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, slotsBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
+        // before the POST-only guard so these GET reads are covered. These permitAll() paths
+        // expose authed-only independent-master street addresses, so the throttle is the
+        // IP-layer defence against bulk home-address harvesting. Cap: 40 / 60 s per IP.
+        if (HttpMethod.GET.matches(method)
+                && path.startsWith(SEARCH_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -356,6 +435,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (RESET_PASSWORD_PATH.equals(path)) {
             cache = resetPasswordBuckets;
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
+        } else if (INVITE_PATH.equals(path)) {
+            cache = inviteBuckets;
         } else if (CATEGORY_REQUEST_PATH.equals(path)) {
             cache = categoryRequestBuckets;
             retryAfterSeconds = CATEGORY_REQUEST_RETRY_AFTER_SECONDS;

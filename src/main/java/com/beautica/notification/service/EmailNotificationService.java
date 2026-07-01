@@ -160,10 +160,7 @@ public class EmailNotificationService {
                     "resetUrl must use https:// scheme or http://localhost — got an unsafe scheme");
         }
         try {
-            var message = mailSender.createMimeMessage();
-            var helper = new MimeMessageHelper(message, true, "UTF-8");
-            helper.setFrom(fromAddress);
-            helper.setTo(to.replaceAll("[\r\n]", ""));
+            var helper = buildMimeHelper(to, true);
             helper.setSubject("Скидання паролю Beautica");
 
             var ctx = new Context();
@@ -173,7 +170,7 @@ public class EmailNotificationService {
 
             addLogoInline(helper);
 
-            mailSender.send(message);
+            mailSender.send(helper.getMimeMessage());
         } catch (MessagingException | MailException e) {
             // Non-fatal: delivery failure is acceptable; the user can request a new link.
             // 'to' is PII — never log it. Log template + exception type only.
@@ -183,10 +180,7 @@ public class EmailNotificationService {
 
     public void sendVerificationEmail(String to, String rawOtp) {
         try {
-            var message = mailSender.createMimeMessage();
-            var helper = new MimeMessageHelper(message, true, "UTF-8");
-            helper.setFrom(fromAddress);
-            helper.setTo(to.replaceAll("[\r\n]", ""));
+            var helper = buildMimeHelper(to, true);
             helper.setSubject("Код підтвердження Beautica");
 
             // Render template — code is ONLY passed as a context variable, never logged
@@ -198,7 +192,7 @@ public class EmailNotificationService {
             // Embed logo as CID inline attachment
             addLogoInline(helper);
 
-            mailSender.send(message);
+            mailSender.send(helper.getMimeMessage());
         } catch (MessagingException | MailException e) {
             log.error("sendVerificationEmail failed: template=email/verify-email exception={}", e.getClass().getSimpleName());
             // delivery failure is non-fatal — caller retries via resend endpoint
@@ -219,17 +213,36 @@ public class EmailNotificationService {
     // Private helpers
     // -------------------------------------------------------------------------
 
+    /**
+     * Builds a {@link MimeMessageHelper} carrying the envelope every send path in this
+     * service shares: the {@code UTF-8} charset, the platform {@code From} address, and the
+     * CR/LF-stripped {@code To} (header-injection guard). Callers then set the subject + body
+     * and add any inline CID attachments before handing {@link MimeMessageHelper#getMimeMessage()}
+     * to {@link JavaMailSender#send}.
+     *
+     * <p>Extracted so future hardening of the common envelope propagates to <em>every</em> path
+     * uniformly — the multipart verification/reset paths previously hand-rolled this setup and
+     * could silently drift from {@link #send}.
+     *
+     * @param to        recipient address — CR/LF stripped to prevent header injection
+     * @param multipart whether a multipart body is needed (required for inline CID images)
+     */
+    private MimeMessageHelper buildMimeHelper(String to, boolean multipart) throws MessagingException {
+        MimeMessage message = mailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message, multipart, "UTF-8");
+        helper.setFrom(fromAddress);
+        helper.setTo(to.replaceAll("[\r\n]", ""));
+        return helper;
+    }
+
     private void send(String to, String subject, String template, Context ctx) {
         try {
             String html = templateEngine.process(template, ctx);
-            MimeMessage message = mailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
-            helper.setFrom(fromAddress);
-            helper.setTo(to.replaceAll("[\r\n]", ""));
+            MimeMessageHelper helper = buildMimeHelper(to, true);
             helper.setSubject(subject);
             helper.setText(html, true);
             addLogoInline(helper);
-            mailSender.send(message);
+            mailSender.send(helper.getMimeMessage());
         } catch (MessagingException | MailException ex) {
             // Deliberate swallow: delivery failures must not crash the outbox drain loop.
             // 'to' is PII — never log it. Log template + exception type only.

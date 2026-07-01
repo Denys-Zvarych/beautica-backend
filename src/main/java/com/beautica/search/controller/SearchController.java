@@ -12,11 +12,16 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.ModelAttribute;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 
 /**
  * Public discovery endpoints for masters and salons.
@@ -90,8 +95,14 @@ public class SearchController {
         pageNum = Math.min(pageNum, 10_000);
         Pageable pageable = PageRequest.of(pageNum, pageSize);
         Page<MasterSearchResult> result = searchService.searchMasters(request, pageable);
+        // AUTH-GATE street address per-request, AFTER the cache read (the cached
+        // value always holds the full object). Anonymous callers get street /
+        // buildingNo nulled out — privacy for masters' home addresses (§I).
+        List<MasterSearchResult> content = isAuthenticated()
+                ? result.getContent()
+                : result.getContent().stream().map(MasterSearchResult::withoutStreetAddress).toList();
         return ApiResponse.ok(PageResponse.of(
-                result.getContent(),
+                content,
                 result.getNumber(),
                 result.getSize(),
                 result.getTotalElements(),
@@ -119,12 +130,34 @@ public class SearchController {
         pageNum = Math.min(pageNum, 10_000);
         Pageable pageable = PageRequest.of(pageNum, pageSize);
         Page<SalonSearchResult> result = searchService.searchSalons(request, pageable);
+        // AUTH-GATE street address per-request, AFTER the cache read (see masters).
+        List<SalonSearchResult> content = isAuthenticated()
+                ? result.getContent()
+                : result.getContent().stream().map(SalonSearchResult::withoutStreetAddress).toList();
         return ApiResponse.ok(PageResponse.of(
-                result.getContent(),
+                content,
                 result.getNumber(),
                 result.getSize(),
                 result.getTotalElements(),
                 result.getTotalPages()
         ));
+    }
+
+    /**
+     * True iff the current request carries an authenticated principal.
+     *
+     * <p>These endpoints are {@code permitAll}, so anonymous requests still
+     * reach here but carry an {@link AnonymousAuthenticationToken} (or a null
+     * authentication) in the {@code SecurityContext}. Street-level address
+     * fields are returned only when this is {@code true}; for everyone else they
+     * are nulled out post-cache. The cache itself is auth-agnostic (it always
+     * stores the full object), so this per-request gate cannot leak addresses
+     * across the anon/authenticated boundary.</p>
+     */
+    private static boolean isAuthenticated() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        return auth != null
+                && auth.isAuthenticated()
+                && !(auth instanceof AnonymousAuthenticationToken);
     }
 }

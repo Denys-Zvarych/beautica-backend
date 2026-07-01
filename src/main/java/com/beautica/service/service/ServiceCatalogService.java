@@ -422,7 +422,10 @@ public class ServiceCatalogService {
     }
 
     @Transactional(readOnly = true)
-    @Cacheable(value = "masterServices", key = "#masterId")
+    // sync = true collapses the thundering herd: when a popular master's entry expires
+    // (10-min TTL) only ONE thread runs the JOIN-FETCH graph query while concurrent callers
+    // wait for it, instead of N identical queries firing on this public read (Anti-Bug §F-7).
+    @Cacheable(value = "masterServices", key = "#masterId", sync = true)
     public List<MasterServiceResponse> getMasterServices(UUID masterId) {
         // An unknown masterId produces an empty list — the existsById check was a
         // redundant DB round-trip because the JOIN FETCH graph query already returns

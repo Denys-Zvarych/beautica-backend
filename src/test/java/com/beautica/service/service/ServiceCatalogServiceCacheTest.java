@@ -23,10 +23,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.interceptor.SimpleKey;
 
 import org.springframework.data.domain.Pageable;
 
+import java.lang.reflect.Method;
 import java.time.LocalDate;
 
 import java.math.BigDecimal;
@@ -73,6 +75,42 @@ class ServiceCatalogServiceCacheTest {
         cacheManager.getCache("service-type-search").clear();
         cacheManager.getCache("service-categories").clear();
         cacheManager.getCache("available-slots").clear();
+    }
+
+    // ── sync = true regression pins (Anti-Bug §F-7 — thundering-herd guard) ────
+    //
+    // sync=true cannot be proven deterministically by a single-threaded times(1) hit;
+    // these reflection assertions pin the annotation flag so a future edit that drops
+    // sync=true on a hot public/reference read is caught by the build.
+
+    @Test
+    @DisplayName("getMasterServices @Cacheable carries sync=true (hot public read, herd guard)")
+    void should_declareSyncTrue_on_getMasterServices() throws Exception {
+        Method m = ServiceCatalogService.class.getMethod("getMasterServices", UUID.class);
+        Cacheable cacheable = m.getAnnotation(Cacheable.class);
+
+        assertThat(cacheable).isNotNull();
+        assertThat(cacheable.sync()).isTrue();
+    }
+
+    @Test
+    @DisplayName("ServiceTypeLookup.getById @Cacheable carries sync=true (single-key reference read)")
+    void should_declareSyncTrue_on_serviceTypeLookupGetById() throws Exception {
+        Method m = ServiceTypeLookup.class.getDeclaredMethod("getById", UUID.class);
+        Cacheable cacheable = m.getAnnotation(Cacheable.class);
+
+        assertThat(cacheable).isNotNull();
+        assertThat(cacheable.sync()).isTrue();
+    }
+
+    @Test
+    @DisplayName("ServiceTypeLookup.getByCategory @Cacheable carries sync=true (hot catalog read)")
+    void should_declareSyncTrue_on_serviceTypeLookupGetByCategory() throws Exception {
+        Method m = ServiceTypeLookup.class.getDeclaredMethod("getByCategory", UUID.class);
+        Cacheable cacheable = m.getAnnotation(Cacheable.class);
+
+        assertThat(cacheable).isNotNull();
+        assertThat(cacheable.sync()).isTrue();
     }
 
     @Test

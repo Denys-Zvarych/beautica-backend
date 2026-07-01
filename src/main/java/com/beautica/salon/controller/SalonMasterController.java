@@ -1,14 +1,13 @@
 package com.beautica.salon.controller;
 
 import com.beautica.common.ApiResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.service.MasterService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -57,7 +56,7 @@ public class SalonMasterController {
             @PathVariable UUID salonId,
             Authentication authentication) {
 
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         Master master = masterService.createMasterForOwner(actorId, salonId);
         // MEDIUM-2: use entity overload to avoid a redundant findByIdWithSalonAndOwner
         // graph-fetch — the master entity is already in the Hibernate first-level cache.
@@ -77,24 +76,8 @@ public class SalonMasterController {
             @PathVariable UUID salonId,
             Authentication authentication) {
 
-        UUID actorId = extractUserId(authentication);
+        UUID actorId = AuthenticationUtils.userId(authentication);
         masterService.deactivateOwnerMaster(actorId, salonId);
         return ResponseEntity.noContent().build();
-    }
-
-    /**
-     * Extracts the authenticated user's UUID from the JWT-populated
-     * {@link UsernamePasswordAuthenticationToken#getDetails()} field.
-     *
-     * <p>Pattern-match guard (Anti-Bug §B): a direct cast would throw
-     * {@link ClassCastException} (→ 500) on a malformed token. The
-     * {@code instanceof} check converts the same condition to a clean 403.
-     */
-    private UUID extractUserId(Authentication authentication) {
-        if (authentication instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Access denied");
     }
 }

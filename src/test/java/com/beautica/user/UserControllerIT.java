@@ -443,6 +443,127 @@ class UserControllerIT extends AbstractIntegrationTest {
                 .isNull();
     }
 
+    @Test
+    @DisplayName("PATCH /me (CLIENT) — a later street-only PATCH (cityId null) RETAINS the saved city; GET /me still resolves cityId/oblastId/cityName (regression: FK-wipe bug)")
+    void should_retainCity_when_clientPatchesStreetOnlyAfterSettingCity() throws Exception {
+        log.debug("Arrange: register a CLIENT and set a real seeded city via a first PATCH");
+        String accessToken = registerAndGetToken(
+                "client-fkwipe@beautica.com", "Str0ngP@ss1!", "Anna", "Klient", null);
+        UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
+        UUID districtId = anyDistrictOfCity(cityId);
+
+        // First PATCH: persist the city (and a child district) — the saved discovery default.
+        var setCity = new UpdateProfileRequest(null, null, null,
+                cityId, districtId, null, null, null, null);
+        restTemplate.exchange("/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(setCity, bearerHeaders(accessToken)), String.class);
+
+        // Second PATCH: the mobile Location screen edits ONLY the street. cityId is null because a
+        // CLIENT city is optional. Pre-fix this wiped users.city_id; post-fix it must be retained.
+        log.debug("Act: PATCH /api/v1/users/me with street only and cityId=null — must NOT wipe the saved city FK");
+        var streetOnly = new UpdateProfileRequest(null, null, null,
+                null, null, "вул. Нова", null, null, null);
+        ResponseEntity<String> patchResponse = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(streetOnly, bearerHeaders(accessToken)), String.class);
+
+        assertThat(patchResponse.getStatusCode())
+                .as("a street-only CLIENT PATCH with null cityId must be a clean 200")
+                .isEqualTo(HttpStatus.OK);
+
+        log.debug("Act: GET /api/v1/users/me — the saved city must still resolve (mobile read keys off cityId/oblastId)");
+        ResponseEntity<String> getResponse = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(accessToken)), String.class);
+
+        var apiResponse = objectMapper.readValue(
+                getResponse.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().cityId())
+                .as("the city FK must survive a street-only edit — the original FK-wipe bug")
+                .isEqualTo(cityId);
+        assertThat(apiResponse.data().oblastId())
+                .as("oblastId still resolves from the retained cityId (the mobile read key)")
+                .isEqualTo(oblastIdOfCity(cityId));
+        assertThat(apiResponse.data().cityName())
+                .as("the denormalized cityName is unchanged and still rendered")
+                .isNotBlank();
+        assertThat(apiResponse.data().street())
+                .as("the street edit DID land")
+                .isEqualTo("вул. Нова");
+    }
+
+    // ── Client home hub — resolved locality NAMES on GET /me ─────────────────
+
+    @Test
+    @DisplayName("GET /me (CLIENT with city + district) — resolved cityName/oblastName/districtName are non-null")
+    void should_returnResolvedLocalityNames_when_clientHasCityAndDistrict() throws Exception {
+        log.debug("Arrange: register a CLIENT, set a districted city + one of its districts via PATCH");
+        String accessToken = registerAndGetToken(
+                "client-names@beautica.com", "Str0ngP@ss1!", "Dana", "Imenna", null);
+        UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
+        UUID districtId = anyDistrictOfCity(cityId);
+
+        var patchRequest = new UpdateProfileRequest(null, null, null,
+                cityId, districtId, null, null, null, null);
+        restTemplate.exchange("/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(accessToken)), String.class);
+
+        log.debug("Act: GET /api/v1/users/me — the home hub reads back the resolved city name");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(accessToken)), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().cityName())
+                .as("cityName is denormalised onto users.city on every locality write — must be non-null")
+                .isNotBlank();
+        assertThat(apiResponse.data().oblastName())
+                .as("oblastName is denormalised onto users.region — must be non-null")
+                .isNotBlank();
+        assertThat(apiResponse.data().districtName())
+                .as("districtName is resolved via CityDistrictRepository.findNameUkById when a district is set")
+                .isNotBlank();
+        assertThat(apiResponse.data().oblastId())
+                .as("oblastId is resolved via CityRepository.findOblastIdById and must equal the city's parent oblast")
+                .isEqualTo(oblastIdOfCity(cityId));
+    }
+
+    @Test
+    @DisplayName("GET /me (CLIENT with null city) — resolved names are null and the endpoint does not error")
+    void should_returnNullLocalityNames_when_clientHasNoCity() throws Exception {
+        log.debug("Arrange: register a CLIENT and leave locality unset (optional-location path)");
+        String accessToken = registerAndGetToken(
+                "client-noloc-names@beautica.com", "Str0ngP@ss1!", "Bez", "Mista", null);
+
+        log.debug("Act: GET /api/v1/users/me — no city/district set, names must resolve to null without error");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(accessToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("a CLIENT with no locality must read its own profile cleanly (200, not 500)")
+                .isEqualTo(HttpStatus.OK);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().cityId()).isNull();
+        assertThat(apiResponse.data().oblastId())
+                .as("no city set → oblastId is never resolved (no query) and stays null")
+                .isNull();
+        assertThat(apiResponse.data().cityName())
+                .as("no city set → cityName is null (no denormalised value)")
+                .isNull();
+        assertThat(apiResponse.data().oblastName())
+                .as("no city set → oblastName is null")
+                .isNull();
+        assertThat(apiResponse.data().districtName())
+                .as("no district set → districtName is never resolved (no query) and stays null")
+                .isNull();
+    }
+
     // ── Phase 10.6 — INDEPENDENT_MASTER most-specific-node rule (AC 1/2/3) ────
 
     @Test
@@ -708,6 +829,26 @@ class UserControllerIT extends AbstractIntegrationTest {
     private UUID cityIdByKatotth(String katotthCode) {
         return jdbcTemplate.queryForObject(
                 "SELECT id FROM cities WHERE katotth_code = ?", UUID.class, katotthCode);
+    }
+
+    /**
+     * Returns a seeded urban-district id that is a child of the given city.
+     * Resolved from the live seed (the seed assigns district ids via
+     * {@code gen_random_uuid()}) so the test never hardcodes a UUID.
+     */
+    private UUID anyDistrictOfCity(UUID cityId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM city_districts WHERE city_id = ? LIMIT 1", UUID.class, cityId);
+    }
+
+    /**
+     * Resolves the parent oblast id of a seeded city from the live seed (ids are
+     * assigned via {@code gen_random_uuid()}), so the GET /me oblastId assertion
+     * never hardcodes a UUID and stays correct if the snapshot changes.
+     */
+    private UUID oblastIdOfCity(UUID cityId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT oblast_id FROM cities WHERE id = ?", UUID.class, cityId);
     }
 
     /**

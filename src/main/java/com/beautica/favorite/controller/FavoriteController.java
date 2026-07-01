@@ -2,7 +2,7 @@ package com.beautica.favorite.controller;
 
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
-import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.favorite.dto.AddFavoriteRequest;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
@@ -17,7 +17,6 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.web.PageableDefault;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -61,7 +60,7 @@ public class FavoriteController {
             @Valid @RequestBody AddFavoriteRequest request,
             Authentication auth) {
         FavoriteResponse response = favoriteService.addFavorite(
-                principalId(auth), request.targetType(), request.targetId());
+                AuthenticationUtils.userId(auth), request.targetType(), request.targetId());
         return ApiResponse.ok(response);
     }
 
@@ -71,7 +70,7 @@ public class FavoriteController {
             @RequestParam @NotNull FavoriteTargetType targetType,
             @RequestParam @NotNull UUID targetId,
             Authentication auth) {
-        favoriteService.removeFavorite(principalId(auth), targetType, targetId);
+        favoriteService.removeFavorite(AuthenticationUtils.userId(auth), targetType, targetId);
         return ResponseEntity.noContent().build();
     }
 
@@ -81,7 +80,7 @@ public class FavoriteController {
             @PageableDefault(size = 20) Pageable pageable,
             Authentication auth) {
         Page<FavoriteMasterResponse> page =
-                favoriteService.listMasterFavorites(principalId(auth), pageable);
+                favoriteService.listMasterFavorites(AuthenticationUtils.userId(auth), pageable);
         return ApiResponse.ok(toPageResponse(page));
     }
 
@@ -91,7 +90,7 @@ public class FavoriteController {
             @PageableDefault(size = 20) Pageable pageable,
             Authentication auth) {
         Page<FavoriteSalonResponse> page =
-                favoriteService.listSalonFavorites(principalId(auth), pageable);
+                favoriteService.listSalonFavorites(AuthenticationUtils.userId(auth), pageable);
         return ApiResponse.ok(toPageResponse(page));
     }
 
@@ -102,13 +101,5 @@ public class FavoriteController {
                 page.getSize(),
                 page.getTotalElements(),
                 page.getTotalPages());
-    }
-
-    private UUID principalId(Authentication auth) {
-        if (auth instanceof UsernamePasswordAuthenticationToken token
-                && token.getDetails() instanceof UUID id) {
-            return id;
-        }
-        throw new ForbiddenException("Access denied");
     }
 }
