@@ -15,6 +15,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,8 +41,10 @@ import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import java.util.List;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -683,6 +686,55 @@ class SalonControllerTest {
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Valid Salon\",\"locationNote\":\"near the park\\tbad\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── Phase 20.x: instagramUrl widened validation ──────────────────────────
+    // Before these two tests, no test anywhere in this class ever set instagramUrl to a
+    // non-null value: the @Pattern widen (URL-only → handle-or-URL) had zero HTTP-boundary
+    // coverage. SalonService is a @MockBean here, so normalisation itself is proven by
+    // SalonServiceTest — this class proves @Valid actually lets a bare handle reach the
+    // controller/service (201, not 400) and still rejects a value matching neither pattern.
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 201 when instagramUrl is a bare @-prefixed handle (widened pattern)")
+    void should_return201_when_salonInstagramIsBareAtHandle() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var request = new CreateSalonRequest("My Salon", null, null, null, null, null, "@some.handle",
+                null, null, null, null, null);
+        var stubResponse = stubSalonResponse(salonId, "My Salon");
+
+        when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class))).thenReturn(stubResponse);
+
+        log.debug("Act: POST {} with instagramUrl='@some.handle' — must pass @Valid now that the pattern is widened", SALONS_URL);
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true));
+
+        ArgumentCaptor<CreateSalonRequest> captor = ArgumentCaptor.forClass(CreateSalonRequest.class);
+        verify(salonService).createSalon(eq(userId), captor.capture());
+        assertThat(captor.getValue().instagramUrl())
+                .as("the raw (pre-normalisation) handle must reach the service unchanged — normalisation happens in SalonService")
+                .isEqualTo("@some.handle");
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 when instagramUrl matches neither the handle nor the URL pattern")
+    void should_return400_when_salonInstagramMatchesNeitherPattern() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: POST {} with an instagramUrl matching neither pattern — must still be rejected after the widen", SALONS_URL);
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Name\",\"instagramUrl\":\"not a real value!!\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
     }
