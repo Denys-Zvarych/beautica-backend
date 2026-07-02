@@ -1136,6 +1136,10 @@ class ServiceCatalogServiceTest {
         return com.beautica.service.entity.PlatformCategory.ofApproved(name, name);
     }
 
+    private com.beautica.service.entity.PlatformCategory approvedCategory(String name, String displayName) {
+        return com.beautica.service.entity.PlatformCategory.ofApproved(name, displayName);
+    }
+
     @Test
     @DisplayName("groups services by category, one group per distinct category")
     void should_groupServicesByCategory_when_multipleCategoriesPresent() {
@@ -1201,6 +1205,49 @@ class ServiceCatalogServiceTest {
                 .extracting(SalonServiceCategoryGroup::category)
                 .as("the known MANICURE category must sort before the unmatched ZZZ_LEGACY category")
                 .containsExactly("MANICURE", "ZZZ_LEGACY");
+    }
+
+    @Test
+    @DisplayName("resolves displayName from the matching approved+active platform category, not the raw category slug")
+    void should_resolveDisplayName_fromMatchingApprovedActivePlatformCategory() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition haircut = buildCatalogDefinition("HAIRDRESSING", "Women's haircut");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(haircut));
+        // displayName deliberately differs from the category slug, so an accidental
+        // "displayName == category" implementation (e.g. reusing the map key) would fail this.
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("HAIRDRESSING", "Перукарські послуги")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).hasSize(1);
+        assertThat(result.categories().get(0).displayName())
+                .as("HAIRDRESSING must resolve to its approved+active PlatformCategory.displayName")
+                .isEqualTo("Перукарські послуги");
+    }
+
+    @Test
+    @DisplayName("falls back to the raw category slug as displayName when the category has no approved+active match")
+    void should_fallBackToRawCategorySlugAsDisplayName_when_categoryHasNoApprovedActiveMatch() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition legacy = buildCatalogDefinition("ZZZ_LEGACY", "Old-style service");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(legacy));
+        // ZZZ_LEGACY is intentionally absent from the approved+active list.
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("MANICURE", "Манікюр")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).hasSize(1);
+        assertThat(result.categories().get(0).displayName())
+                .as("an unmatched category must fall back to its own raw slug, never null/blank")
+                .isEqualTo("ZZZ_LEGACY");
     }
 
     @Test

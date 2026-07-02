@@ -11,7 +11,7 @@ import java.util.List;
 /**
  * Cached lookup for the approved+active {@link PlatformCategory} rows, in
  * {@code ORDER BY displayName} — the same order {@link CategoryRequestService#listApproved}
- * exposes to the mobile picker. Backs {@link ServiceCatalogService#buildCategoryOrder}, which
+ * exposes to the mobile picker. Backs {@link ServiceCatalogService#buildCategoryOrderAndNames}, which
  * derives a {@code category name -> ordinal} map from this list to sort a salon's public
  * catalog groups.
  *
@@ -26,7 +26,7 @@ import java.util.List;
  * <p>Deliberately a NEW bean rather than reusing {@link CatalogCategoryLookup}: that class
  * caches the separate, orphaned "System A" {@code service_categories} table, not
  * {@code platform_categories} — see the warning in {@link ServiceCatalogService
- * #buildCategoryOrder}'s Javadoc. Returns entities (not a DTO): this bean is an internal
+ * #buildCategoryOrderAndNames}'s Javadoc. Returns entities (not a DTO): this bean is an internal
  * lookup consumed only by {@link ServiceCatalogService}, never exposed across a controller
  * boundary.
  */

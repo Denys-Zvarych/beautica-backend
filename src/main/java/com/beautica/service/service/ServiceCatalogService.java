@@ -708,7 +708,9 @@ public class ServiceCatalogService {
             return new SalonServiceCatalogResponse(List.of());
         }
 
-        Map<String, Integer> categoryOrder = buildCategoryOrder();
+        CategoryOrderAndNames orderAndNames = buildCategoryOrderAndNames();
+        Map<String, Integer> categoryOrder = orderAndNames.order();
+        Map<String, String> categoryDisplayNames = orderAndNames.displayNames();
 
         Map<String, List<ServiceDefinition>> byCategory = definitions.stream()
                 .collect(Collectors.groupingBy(
@@ -723,6 +725,7 @@ public class ServiceCatalogService {
                         .thenComparing(Map.Entry::getKey))
                 .map(e -> new SalonServiceCategoryGroup(
                         e.getKey(),
+                        categoryDisplayNames.getOrDefault(e.getKey(), e.getKey()),
                         e.getValue().size(),
                         e.getValue().stream().map(ServiceDefinitionResponse::from).toList()))
                 .toList();
@@ -731,20 +734,32 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Builds a {@code category name -> ordinal position} map from the approved+active
-     * {@link PlatformCategory} rows, in the same display order the category picker already
-     * uses ({@link PlatformCategoryRepository#findApprovedActive}, {@code ORDER BY
-     * displayName} — {@link PlatformCategory} carries no explicit {@code sortOrder}
-     * column). A {@code ServiceDefinition.category} value with no entry in this map
-     * (inactive/legacy/unknown category) sorts alphabetically AFTER every known category
-     * in {@link #getSalonServiceCatalog}.
+     * {@code buildCategoryOrderAndNames()}'s return shape — the ordinal-position map used to
+     * sort {@link #getSalonServiceCatalog} groups, and the sibling {@code name -> displayName}
+     * map used to resolve the human-readable category header. Both are derived from a single
+     * pass over the same {@link PlatformCategoryOrderLookup#getApprovedActive()} list so the
+     * cached lookup is not queried twice per request.
+     */
+    private record CategoryOrderAndNames(Map<String, Integer> order, Map<String, String> displayNames) {
+    }
+
+    /**
+     * Builds a {@code category name -> ordinal position} map, and a sibling {@code category
+     * name -> displayName} map, from the approved+active {@link PlatformCategory} rows, in the
+     * same display order the category picker already uses ({@link
+     * PlatformCategoryRepository#findApprovedActive}, {@code ORDER BY displayName} —
+     * {@link PlatformCategory} carries no explicit {@code sortOrder} column). A {@code
+     * ServiceDefinition.category} value with no entry in these maps (inactive/legacy/unknown
+     * category) sorts alphabetically AFTER every known category, and falls back to the raw
+     * category slug itself as its display name, in {@link #getSalonServiceCatalog}.
      *
      * <p>Deliberately NOT {@link #getCategories()} / {@link CatalogCategoryLookup}: that
      * returns the separate, orphaned "System A" {@code service_categories} table keyed by
      * {@code nameUk}/{@code nameEn} display strings (e.g. {@code "Nails"}) — those never
      * match {@code ServiceDefinition.category}, which stores the live {@link PlatformCategory
      * #getName()} canonical code (e.g. {@code "MANICURE"}). Using {@code getCategories()}
-     * here would silently never match anything, degrading every group to alphabetical order.
+     * here would silently never match anything, degrading every group to alphabetical order
+     * and its raw slug as the display name.
      *
      * <p>Delegates the {@code findApprovedActive()} query through {@link
      * PlatformCategoryOrderLookup} (a separate {@code @Cacheable} bean, 60-min TTL) instead of
@@ -754,13 +769,16 @@ public class ServiceCatalogService {
      * {@code @Cacheable} method would not intercept via the AOP proxy on this self-invocation
      * (same caveat documented on {@link #searchServiceTypes}), hence the separate bean.
      */
-    private Map<String, Integer> buildCategoryOrder() {
+    private CategoryOrderAndNames buildCategoryOrderAndNames() {
         List<PlatformCategory> approved = platformCategoryOrderLookup.getApprovedActive();
         Map<String, Integer> order = new LinkedHashMap<>();
+        Map<String, String> displayNames = new LinkedHashMap<>();
         for (int i = 0; i < approved.size(); i++) {
-            order.put(approved.get(i).getName(), i);
+            PlatformCategory category = approved.get(i);
+            order.put(category.getName(), i);
+            displayNames.put(category.getName(), category.getDisplayName());
         }
-        return order;
+        return new CategoryOrderAndNames(order, displayNames);
     }
 
     @Transactional(readOnly = true)

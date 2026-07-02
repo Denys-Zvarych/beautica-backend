@@ -147,6 +147,10 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
                         + "legacy category, despite AAA_LEGACY_CATEGORY sorting first alphabetically — "
                         + "proves ordering uses the platform-category map, not plain alphabetical order")
                 .isEqualTo("HAIRDRESSING");
+        assertThat(known.displayName())
+                .as("HAIRDRESSING must resolve its real seeded PlatformCategory.displayName "
+                        + "(V74__seed_taxonomy_platform_categories.sql), not the raw category slug")
+                .isEqualTo("Перукарські послуги");
         assertThat(known.count())
                 .as("HAIRDRESSING group must contain exactly the shared + exclusive service")
                 .isEqualTo(2);
@@ -157,6 +161,10 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
                 .containsExactlyInAnyOrder("Shared Haircut", "Exclusive Style");
 
         assertThat(unknown.category()).isEqualTo("AAA_LEGACY_CATEGORY");
+        assertThat(unknown.displayName())
+                .as("AAA_LEGACY_CATEGORY has no matching row in platform_categories, so displayName "
+                        + "must fall back to the raw category slug itself, never null/blank")
+                .isEqualTo("AAA_LEGACY_CATEGORY");
         assertThat(unknown.count())
                 .as("only the master1-assigned legacy service counts — the inactive-master-only "
                         + "one must be excluded (its only assignment is on a deactivated master)")

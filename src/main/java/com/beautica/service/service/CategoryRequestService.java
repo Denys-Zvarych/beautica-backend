@@ -181,7 +181,7 @@ public class CategoryRequestService {
      *
      * <p>The sibling {@link PlatformCategoryOrderLookup#CACHE_NAME} cache is evicted
      * alongside this one on {@link #approve}/{@link #reject}: it backs {@code
-     * ServiceCatalogService#buildCategoryOrder} with the same {@code findApprovedActive()}
+     * ServiceCatalogService#buildCategoryOrderAndNames} with the same {@code findApprovedActive()}
      * query result, kept as a separate cache/bean because it returns entities for internal
      * ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.
      */

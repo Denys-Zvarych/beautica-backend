@@ -39,7 +39,7 @@ public class CacheConfig {
      *   reviews-by-salon    — paginated review list per salon, public endpoint — 5 min TTL, max 1000 entries
      *   review-detail       — single review by ID, public endpoint — 10 min TTL, max 2000 entries (immutable; no evict path)
      *   platform-category-order — approved+active PlatformCategory ordering used to sort a salon's
-     *                             public catalog groups (ServiceCatalogService#buildCategoryOrder);
+     *                             public catalog groups (ServiceCatalogService#buildCategoryOrderAndNames);
      *                             admin-approval-gated reference data, identical across every
      *                             salon/request — 60 min TTL, max 200 entries; evicted by
      *                             CategoryRequestService.approve/reject
@@ -226,7 +226,7 @@ public class CacheConfig {
                         .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
         // Phase 13.6 (perf follow-up) — approved+active PlatformCategory ordering backing
-        // ServiceCatalogService#buildCategoryOrder. Mirrors service-categories's config: this
+        // ServiceCatalogService#buildCategoryOrderAndNames. Mirrors service-categories's config: this
         // is admin-approval-gated reference data, identical across every request, previously
         // re-queried on every public salon-catalog hit. Evicted by
         // CategoryRequestService.approve/reject, the only writes that change APPROVED/active
