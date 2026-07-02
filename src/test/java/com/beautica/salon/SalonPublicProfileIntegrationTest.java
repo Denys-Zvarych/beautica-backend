@@ -12,6 +12,7 @@ import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSummaryResponse;
 import com.beautica.salon.dto.PublicSalonResponse;
+import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
@@ -391,6 +392,64 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         assertThat(restTemplate.getForEntity(SALONS_URL + "/" + salonId + "/reviews", String.class).getStatusCode())
                 .as("GET /salons/{id}/reviews must be reachable without auth")
                 .isEqualTo(HttpStatus.OK);
+    }
+
+    // ── Phase 10.6 bugfix regression: taxonomy locality must reach the public DTO ──
+
+    @Test
+    @DisplayName("GET /salons/{salonId} — after the owner PATCHes taxonomy locality (cityId/street), "
+            + "the public unauthenticated response carries it (was previously silently dropped)")
+    void should_exposeTaxonomyLocality_when_ownerUpdatesSalonAndPublicProfileIsFetched() throws Exception {
+        String ownerEmail = "owner-locality-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = createSalonOwner(ownerEmail);
+        UUID salonId = createSalon(ownerId, "Locality Salon " + System.nanoTime());
+        String ownerToken = loginAndGetToken(ownerEmail);
+
+        UUID cityId = jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+
+        // UpdateSalonRequest field order: name, description, city, region, address,
+        // cityId, districtId, street, buildingNo, locationNote, phone, instagramUrl.
+        var updateRequest = new UpdateSalonRequest(
+                null, null, null, null, null,
+                cityId, null, "Khreshchatyk St", "22", "Near the fountain",
+                null, null);
+
+        log.debug("Act: PATCH {}/{} with taxonomy locality fields as the owner", SALONS_URL, salonId);
+        ResponseEntity<String> patchResp = restTemplate.exchange(
+                SALONS_URL + "/" + salonId, HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(updateRequest), bearerHeaders(ownerToken)),
+                String.class);
+        assertThat(patchResp.getStatusCode())
+                .as("owner PATCH of taxonomy locality fields must succeed")
+                .isEqualTo(HttpStatus.OK);
+
+        log.debug("Act: GET {}/{} with no Authorization header", SALONS_URL, salonId);
+        ResponseEntity<String> publicResp =
+                restTemplate.getForEntity(SALONS_URL + "/" + salonId, String.class);
+        assertThat(publicResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        var wrapper = objectMapper.readValue(publicResp.getBody(),
+                new TypeReference<ApiResponse<PublicSalonResponse>>() {});
+        PublicSalonResponse publicSalon = wrapper.data();
+
+        assertThat(publicSalon.cityId())
+                .as("public salon profile must carry the taxonomy cityId the owner just wrote — "
+                        + "this was previously always null because PublicSalonResponse only mapped "
+                        + "the legacy free-text city/region/address fields, which SalonService stopped "
+                        + "writing back in Phase 10.6")
+                .isEqualTo(cityId);
+        assertThat(publicSalon.street())
+                .as("public salon profile must carry the structured street the owner just wrote")
+                .isEqualTo("Khreshchatyk St");
+        assertThat(publicSalon.buildingNo()).isEqualTo("22");
+        assertThat(publicSalon.locationNote()).isEqualTo("Near the fountain");
+        assertThat(publicSalon.city())
+                .as("backward-compat: the legacy free-text city ('Kyiv', set at fixture creation) "
+                        + "must survive a taxonomy-only PATCH untouched — updateSalon() never calls "
+                        + "setCity/setRegion/setAddress (Phase 10.6), so the new taxonomy fields are "
+                        + "additive, not a replacement, for pre-existing legacy data")
+                .isEqualTo("Kyiv");
     }
 
     // ── fixtures — salon side ─────────────────────────────────────────────────────
