@@ -12,6 +12,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
@@ -76,6 +77,9 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private PlatformCategoryRepository platformCategoryRepository;
+
+    @Mock
+    private PlatformCategoryOrderLookup platformCategoryOrderLookup;
 
     @Mock
     private EmailService emailService;
@@ -188,7 +192,7 @@ class ServiceCatalogServiceTest {
         when(savedAssignment.isActive()).thenReturn(true);
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
-        when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(serviceDef));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
         when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
                 .thenReturn(false);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
@@ -211,6 +215,73 @@ class ServiceCatalogServiceTest {
         verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
         // MEDIUM-1: service must refresh the pre-computed min_effective_price index after saving the assignment.
         verify(masterRepository).refreshMinEffectivePrice(masterId);
+    }
+
+    @Test
+    @DisplayName("does not throw LazyInitializationException and populates serviceTypeNameUk when the "
+            + "assigned service definition has a serviceType (regression for the findById/findByIdWithServiceType bug)")
+    void should_populateServiceTypeNameUk_when_assignedServiceDefinitionHasServiceType() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getSalon()).thenReturn(salon);
+
+        // Mirrors production: ServiceDefinition.serviceType is a lazy @ManyToOne. In production this
+        // would be an uninitialized Hibernate proxy unless the repository eagerly fetches it via
+        // findByIdWithServiceType (LEFT JOIN FETCH). Mockito mocks can't reproduce the proxy/session
+        // detachment itself, but this test pins the service to call findByIdWithServiceType (not the
+        // plain findById) and asserts the resulting DTO is fully populated — if the service regresses
+        // to findById, this stub is never hit, findByIdWithServiceType returns empty by default, and
+        // the call throws NotFoundException instead of succeeding.
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        when(serviceType.getNameUk()).thenReturn("Манікюр");
+
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getId()).thenReturn(serviceDefId);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.getBasePrice()).thenReturn(new BigDecimal("350.00"));
+        when(serviceDef.getBaseDurationMinutes()).thenReturn(60);
+        when(serviceDef.getServiceType()).thenReturn(serviceType);
+
+        MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
+        when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
+        when(savedAssignment.getMaster()).thenReturn(master);
+        when(savedAssignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(savedAssignment.isActive()).thenReturn(true);
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
+        when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(false);
+        when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
+
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        MasterServiceResponse result = serviceCatalogService.assignServiceToMaster(
+                salonId, masterId, request);
+
+        assertThat(result).isNotNull();
+        assertThat(result.serviceDefinition().serviceTypeId())
+                .as("serviceTypeId must be lifted from the assigned service definition's serviceType")
+                .isEqualTo(serviceTypeId);
+        assertThat(result.serviceDefinition().serviceTypeNameUk())
+                .as("serviceTypeNameUk must be populated, not null, when the service definition has a serviceType")
+                .isEqualTo("Манікюр");
+        assertThat(result.serviceTypeNameUk())
+                .as("serviceTypeNameUk must also be lifted onto the top-level MasterServiceResponse")
+                .isEqualTo("Манікюр");
+
+        verify(serviceRepository).findByIdWithServiceType(serviceDefId);
+        verify(serviceRepository, never()).findById(serviceDefId);
     }
 
     @Test
@@ -258,7 +329,7 @@ class ServiceCatalogServiceTest {
         when(foreignServiceDef.getOwnerId()).thenReturn(attackerSalonId);
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
-        when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(foreignServiceDef));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(foreignServiceDef));
 
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
 
@@ -288,7 +359,7 @@ class ServiceCatalogServiceTest {
         when(serviceDef.getOwnerId()).thenReturn(salonId);
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
-        when(serviceRepository.findById(serviceDefId)).thenReturn(Optional.of(serviceDef));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
         when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
                 .thenReturn(true);
 
@@ -1043,5 +1114,171 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceRepository, never()).save(any());
+    }
+
+    // ── getSalonServiceCatalog (Phase 13.6 — Public Salon Profile) ──────────────
+
+    private ServiceDefinition buildCatalogDefinition(String category, String name) {
+        return ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .name(name)
+                .category(category)
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("300.00"))
+                .build();
+    }
+
+    private com.beautica.service.entity.PlatformCategory approvedCategory(String name) {
+        return com.beautica.service.entity.PlatformCategory.ofApproved(name, name);
+    }
+
+    private com.beautica.service.entity.PlatformCategory approvedCategory(String name, String displayName) {
+        return com.beautica.service.entity.PlatformCategory.ofApproved(name, displayName);
+    }
+
+    @Test
+    @DisplayName("groups services by category, one group per distinct category")
+    void should_groupServicesByCategory_when_multipleCategoriesPresent() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition manicure1 = buildCatalogDefinition("MANICURE", "Classic manicure");
+        ServiceDefinition manicure2 = buildCatalogDefinition("MANICURE", "Gel manicure");
+        ServiceDefinition haircut = buildCatalogDefinition("HAIRCUT", "Women's haircut");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(manicure1, manicure2, haircut));
+        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).hasSize(2);
+        var manicureGroup = result.categories().stream()
+                .filter(g -> g.category().equals("MANICURE")).findFirst().orElseThrow();
+        assertThat(manicureGroup.count()).isEqualTo(2);
+        assertThat(manicureGroup.services()).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("orders category groups using the approved+active platform-category display order")
+    void should_orderCategories_byApprovedActiveDisplayOrder() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition haircut = buildCatalogDefinition("HAIRCUT", "Women's haircut");
+        ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
+
+        // findApprovedActive is ORDER BY displayName — MANICURE listed before HAIRCUT here
+        // to prove the group order follows THIS list's index, not alphabetical category order.
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(haircut, manicure));
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("MANICURE"), approvedCategory("HAIRCUT")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories())
+                .extracting(SalonServiceCategoryGroup::category)
+                .as("MANICURE must sort first — it has the lower index in findApprovedActive")
+                .containsExactly("MANICURE", "HAIRCUT");
+    }
+
+    @Test
+    @DisplayName("sorts a category with no match in the approved list alphabetically AFTER every known category")
+    void should_sortUnknownCategoryAlphabeticallyAfterKnownCategories() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition legacy = buildCatalogDefinition("ZZZ_LEGACY", "Old-style service");
+        ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(legacy, manicure));
+        // ZZZ_LEGACY is intentionally absent from the approved+active list.
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("MANICURE")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories())
+                .extracting(SalonServiceCategoryGroup::category)
+                .as("the known MANICURE category must sort before the unmatched ZZZ_LEGACY category")
+                .containsExactly("MANICURE", "ZZZ_LEGACY");
+    }
+
+    @Test
+    @DisplayName("resolves displayName from the matching approved+active platform category, not the raw category slug")
+    void should_resolveDisplayName_fromMatchingApprovedActivePlatformCategory() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition haircut = buildCatalogDefinition("HAIRDRESSING", "Women's haircut");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(haircut));
+        // displayName deliberately differs from the category slug, so an accidental
+        // "displayName == category" implementation (e.g. reusing the map key) would fail this.
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("HAIRDRESSING", "Перукарські послуги")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).hasSize(1);
+        assertThat(result.categories().get(0).displayName())
+                .as("HAIRDRESSING must resolve to its approved+active PlatformCategory.displayName")
+                .isEqualTo("Перукарські послуги");
+    }
+
+    @Test
+    @DisplayName("falls back to the raw category slug as displayName when the category has no approved+active match")
+    void should_fallBackToRawCategorySlugAsDisplayName_when_categoryHasNoApprovedActiveMatch() {
+        UUID salonId = UUID.randomUUID();
+
+        ServiceDefinition legacy = buildCatalogDefinition("ZZZ_LEGACY", "Old-style service");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(legacy));
+        // ZZZ_LEGACY is intentionally absent from the approved+active list.
+        when(platformCategoryOrderLookup.getApprovedActive())
+                .thenReturn(List.of(approvedCategory("MANICURE", "Манікюр")));
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).hasSize(1);
+        assertThat(result.categories().get(0).displayName())
+                .as("an unmatched category must fall back to its own raw slug, never null/blank")
+                .isEqualTo("ZZZ_LEGACY");
+    }
+
+    @Test
+    @DisplayName("returns an empty category list when the salon has no bookable services")
+    void should_returnEmptyCategories_when_salonHasNoBookableServices() {
+        UUID salonId = UUID.randomUUID();
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of());
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories()).isEmpty();
+        verify(platformCategoryOrderLookup, never()).getApprovedActive();
+    }
+
+    @Test
+    @DisplayName("reuses ServiceDefinitionResponse as the leaf DTO with fields mapped through")
+    void should_mapServiceDefinitionFields_intoLeafDto() {
+        UUID salonId = UUID.randomUUID();
+        ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+                .thenReturn(List.of(manicure));
+        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        var leaf = result.categories().get(0).services().get(0);
+        assertThat(leaf.id()).isEqualTo(manicure.getId());
+        assertThat(leaf.name()).isEqualTo("Classic manicure");
+        assertThat(leaf.category()).isEqualTo("MANICURE");
     }
 }

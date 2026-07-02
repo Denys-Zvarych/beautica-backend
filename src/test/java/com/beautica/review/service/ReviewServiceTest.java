@@ -11,9 +11,12 @@ import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewSummaryResponse;
 import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
 import com.beautica.review.repository.ReviewRepository;
+import com.beautica.salon.entity.Salon;
+import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -33,6 +36,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -58,6 +62,9 @@ class ReviewServiceTest {
 
     @Mock
     private BookingRepository bookingRepository;
+
+    @Mock
+    private SalonRepository salonRepository;
 
     @Mock
     private ApplicationEventPublisher eventPublisher;
@@ -115,7 +122,51 @@ class ReviewServiceTest {
         assertThat(response.comment()).isEqualTo("Great service");
         assertThat(response.clientDisplayName()).isEqualTo("Anna K.");
         verify(reviewRepository).saveAndFlush(any(Review.class));
-        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, null));
+    }
+
+    @Test
+    @DisplayName("publishes a non-null salonId when the booking belongs to a salon-affiliated master")
+    void should_publishSalonId_when_bookingHasSalon() {
+        UUID salonId = UUID.randomUUID();
+
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(BOOKING_ID);
+        when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getSalon()).thenReturn(salon);
+
+        User savedClient = mock(User.class);
+        when(savedClient.getFirstName()).thenReturn("Anna");
+        when(savedClient.getLastName()).thenReturn("Koval");
+
+        Review saved = mock(Review.class);
+        when(saved.getId()).thenReturn(REVIEW_ID);
+        when(saved.getClient()).thenReturn(savedClient);
+        when(saved.getMaster()).thenReturn(master);
+        when(saved.getRating()).thenReturn((short) 5);
+        when(saved.getComment()).thenReturn("Great service");
+        when(saved.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, "Great service");
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(BOOKING_ID)).thenReturn(false);
+        when(reviewRepository.saveAndFlush(any(Review.class))).thenReturn(saved);
+
+        reviewService.createReview(CLIENT_ID, request);
+
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, salonId));
     }
 
     @ParameterizedTest
@@ -539,5 +590,248 @@ class ReviewServiceTest {
         assertThat(result.getTotalElements())
                 .as("total elements must be 0 for unknown master")
                 .isZero();
+    }
+
+    // ── getSalonReviewSummary (Phase 13.6 — Public Salon Profile) ───────────────
+
+    @Test
+    @DisplayName("getSalonReviewSummary — zero-fills every rating bucket from 5 down to 1")
+    void should_zeroFillAllBuckets_when_gettingSalonReviewSummary() {
+        UUID salonId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getReviewCount()).thenReturn(3);
+        when(salon.getAvgRating()).thenReturn(new BigDecimal("4.33"));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        // Only ratings 5 and 4 actually have reviews — 3, 2, 1 must still appear as count=0.
+        com.beautica.review.repository.RatingCountProjection fiveStar =
+                mock(com.beautica.review.repository.RatingCountProjection.class);
+        when(fiveStar.getRating()).thenReturn(5);
+        when(fiveStar.getCount()).thenReturn(2L);
+        com.beautica.review.repository.RatingCountProjection fourStar =
+                mock(com.beautica.review.repository.RatingCountProjection.class);
+        when(fourStar.getRating()).thenReturn(4);
+        when(fourStar.getCount()).thenReturn(1L);
+
+        when(reviewRepository.countBySalonIdGroupByRating(salonId))
+                .thenReturn(List.of(fiveStar, fourStar));
+
+        var result = reviewService.getSalonReviewSummary(salonId);
+
+        assertThat(result.ratingDistribution())
+                .as("distribution must always carry exactly 5 buckets, ratings 5..1")
+                .extracting(SalonReviewSummaryResponse.RatingBucket::rating)
+                .containsExactly(5, 4, 3, 2, 1);
+        assertThat(result.ratingDistribution())
+                .extracting(SalonReviewSummaryResponse.RatingBucket::count)
+                .containsExactly(2L, 1L, 0L, 0L, 0L);
+    }
+
+    @Test
+    @DisplayName("getSalonReviewSummary — avgRating is null when reviewCount is 0")
+    void should_returnNullAvgRating_when_salonReviewCountIsZero() {
+        UUID salonId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getReviewCount()).thenReturn(0);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(reviewRepository.countBySalonIdGroupByRating(salonId)).thenReturn(List.of());
+
+        var result = reviewService.getSalonReviewSummary(salonId);
+
+        assertThat(result.avgRating()).isNull();
+        assertThat(result.reviewCount()).isZero();
+        assertThat(result.ratingDistribution()).hasSize(5);
+        assertThat(result.ratingDistribution())
+                .allMatch(bucket -> bucket.count() == 0L);
+    }
+
+    @Test
+    @DisplayName("getSalonReviewSummary — 404 Not Found when the salon does not exist")
+    void should_throwNotFound_when_salonDoesNotExistForSummary() {
+        UUID salonId = UUID.randomUUID();
+        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> reviewService.getSalonReviewSummary(salonId))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(reviewRepository, never()).countBySalonIdGroupByRating(any());
+    }
+
+    // ── getSalonReviews (Phase 13.6 — sort-mapping) ─────────────────────────────
+
+    private Review buildSalonReview(UUID reviewId, short rating) {
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn("Anna");
+        when(client.getLastName()).thenReturn("Koval");
+
+        User masterUser = mock(User.class);
+        when(masterUser.getFirstName()).thenReturn("Iryna");
+        when(masterUser.getLastName()).thenReturn("Shevchenko");
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+        when(master.getUser()).thenReturn(masterUser);
+
+        com.beautica.service.entity.ServiceDefinition serviceDefinition =
+                mock(com.beautica.service.entity.ServiceDefinition.class);
+        when(serviceDefinition.getName()).thenReturn("Manicure");
+
+        com.beautica.service.entity.MasterServiceAssignment masterService =
+                mock(com.beautica.service.entity.MasterServiceAssignment.class);
+        when(masterService.getServiceDefinition()).thenReturn(serviceDefinition);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMasterService()).thenReturn(masterService);
+
+        Review review = mock(Review.class);
+        when(review.getId()).thenReturn(reviewId);
+        when(review.getClient()).thenReturn(client);
+        when(review.getMaster()).thenReturn(master);
+        when(review.getBooking()).thenReturn(booking);
+        when(review.getRating()).thenReturn(rating);
+        when(review.getComment()).thenReturn("Great service");
+        when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+        return review;
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — NEWEST dispatches to findIdsBySalonIdOrderByCreatedAtDesc")
+    void should_dispatchToCreatedAtDesc_when_sortIsNewest() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        when(reviewRepository.findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), any(Pageable.class)))
+                .thenReturn(Page.empty(pageable));
+
+        reviewService.getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.NEWEST, pageable);
+
+        verify(reviewRepository).findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), any(Pageable.class));
+        verify(reviewRepository, never()).findIdsBySalonIdOrderByCreatedAtAsc(any(), any());
+        verify(reviewRepository, never()).findIdsBySalonIdOrderByRatingDescCreatedAtDesc(any(), any());
+        verify(reviewRepository, never()).findIdsBySalonIdOrderByRatingAscCreatedAtDesc(any(), any());
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — OLDEST dispatches to findIdsBySalonIdOrderByCreatedAtAsc")
+    void should_dispatchToCreatedAtAsc_when_sortIsOldest() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        when(reviewRepository.findIdsBySalonIdOrderByCreatedAtAsc(eq(salonId), any(Pageable.class)))
+                .thenReturn(Page.empty(pageable));
+
+        reviewService.getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.OLDEST, pageable);
+
+        verify(reviewRepository).findIdsBySalonIdOrderByCreatedAtAsc(eq(salonId), any(Pageable.class));
+        verify(reviewRepository, never()).findIdsBySalonIdOrderByCreatedAtDesc(any(), any());
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — HIGHEST dispatches to findIdsBySalonIdOrderByRatingDescCreatedAtDesc")
+    void should_dispatchToRatingDesc_when_sortIsHighest() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        when(reviewRepository.findIdsBySalonIdOrderByRatingDescCreatedAtDesc(eq(salonId), any(Pageable.class)))
+                .thenReturn(Page.empty(pageable));
+
+        reviewService.getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.HIGHEST, pageable);
+
+        verify(reviewRepository).findIdsBySalonIdOrderByRatingDescCreatedAtDesc(eq(salonId), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — LOWEST dispatches to findIdsBySalonIdOrderByRatingAscCreatedAtDesc")
+    void should_dispatchToRatingAsc_when_sortIsLowest() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        when(reviewRepository.findIdsBySalonIdOrderByRatingAscCreatedAtDesc(eq(salonId), any(Pageable.class)))
+                .thenReturn(Page.empty(pageable));
+
+        reviewService.getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.LOWEST, pageable);
+
+        verify(reviewRepository).findIdsBySalonIdOrderByRatingAscCreatedAtDesc(eq(salonId), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — defaults to NEWEST when sort is null")
+    void should_defaultToNewest_when_sortIsNull() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        when(reviewRepository.findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), any(Pageable.class)))
+                .thenReturn(Page.empty(pageable));
+
+        reviewService.getSalonReviews(salonId, null, pageable);
+
+        verify(reviewRepository).findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — strips caller-supplied sort so the repository receives Sort.unsorted()")
+    void should_stripCallerSort_when_gettingSalonReviews() {
+        UUID salonId = UUID.randomUUID();
+        Pageable callerPageable = PageRequest.of(0, 20, Sort.by("comment"));
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        when(reviewRepository.findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), any(Pageable.class)))
+                .thenReturn(Page.empty(PageRequest.of(0, 20)));
+
+        reviewService.getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.NEWEST, callerPageable);
+
+        verify(reviewRepository).findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), pageableCaptor.capture());
+        assertThat(pageableCaptor.getValue().getSort()).isEqualTo(Sort.unsorted());
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — returns an empty page when the salon has no reviews")
+    void should_returnEmptyPage_when_salonHasNoReviews() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        when(reviewRepository.findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), any(Pageable.class)))
+                .thenReturn(Page.empty(pageable));
+
+        Page<com.beautica.review.dto.SalonReviewResponse> result =
+                reviewService.getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.NEWEST, pageable);
+
+        assertThat(result.getContent()).isEmpty();
+        verify(reviewRepository, never()).findByIdsWithGraphForSalonReviews(any());
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — hydrates and maps rows, reordering them back into the ID-list order")
+    void should_returnMappedReviews_when_salonHasReviews() {
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+        UUID reviewId = UUID.randomUUID();
+        Review review = buildSalonReview(reviewId, (short) 5);
+
+        Page<UUID> idPage = new PageImpl<>(List.of(reviewId), pageable, 1);
+        when(reviewRepository.findIdsBySalonIdOrderByCreatedAtDesc(eq(salonId), any(Pageable.class)))
+                .thenReturn(idPage);
+        when(reviewRepository.findByIdsWithGraphForSalonReviews(List.of(reviewId)))
+                .thenReturn(List.of(review));
+
+        Page<com.beautica.review.dto.SalonReviewResponse> result =
+                reviewService.getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.NEWEST, pageable);
+
+        assertThat(result.getContent()).hasSize(1);
+        var mapped = result.getContent().get(0);
+        assertThat(mapped.id()).isEqualTo(reviewId);
+        assertThat(mapped.masterId()).isEqualTo(MASTER_ID);
+        assertThat(mapped.masterFirstName()).isEqualTo("Iryna");
+        assertThat(mapped.serviceName()).isEqualTo("Manicure");
+        assertThat(mapped.clientDisplayName()).isEqualTo("Anna K.");
+        assertThat(mapped.rating()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("getSalonReviews — throws 400 when the page number exceeds the MAX_PAGE_NUMBER guard")
+    void should_throw400_when_salonReviewsPageNumberExceedsMaximum() {
+        UUID salonId = UUID.randomUUID();
+        Pageable overLimit = PageRequest.of(10_001, 20);
+
+        assertThatThrownBy(() -> reviewService.getSalonReviews(
+                salonId, com.beautica.review.dto.SalonReviewSort.NEWEST, overLimit))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(reviewRepository, never()).findIdsBySalonIdOrderByCreatedAtDesc(any(), any());
     }
 }

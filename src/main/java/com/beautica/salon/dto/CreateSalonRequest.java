@@ -48,8 +48,12 @@ public record CreateSalonRequest(
         String address,
         @Pattern(regexp = "^[+\\d\\s\\-()/]*$", message = "Invalid phone format")
         @Size(max = 20, message = "Phone must be at most 20 characters") String phone,
-        @Pattern(regexp = "^$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
-                message = "Must be a valid Instagram URL or empty")
+        // Accepts a bare handle (@username), an @-less handle, or a full instagram.com
+        // URL — mirrors MasterProfileUpdateRequest.instagram so salon and master
+        // Instagram fields share one contract (independent-master demo data was showing
+        // "@handle" while salon demo data showed a full URL for the same stored concept).
+        @Pattern(regexp = "^$|^@?[A-Za-z0-9._]{1,30}$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
+                message = "Instagram must be a handle (e.g. @username) or a full instagram.com URL")
         @Size(max = 500, message = "Instagram URL must be at most 500 characters") String instagramUrl,
 
         // ---- Phase 10.3 taxonomy locality + light structured address --------

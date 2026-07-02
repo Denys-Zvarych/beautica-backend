@@ -74,7 +74,7 @@ public class SalonService {
                 .buildingNo(request.buildingNo())
                 .locationNote(request.locationNote())
                 .phone(request.phone())
-                .instagramUrl(request.instagramUrl())
+                .instagramUrl(normalizeInstagram(request.instagramUrl()))
                 .isActive(true)
                 .isPrimary(isFirstSalon)
                 .build();
@@ -198,7 +198,7 @@ public class SalonService {
             salon.setPhone(request.phone());
         }
         if (request.instagramUrl() != null) {
-            salon.setInstagramUrl(request.instagramUrl());
+            salon.setInstagramUrl(normalizeInstagram(request.instagramUrl()));
         }
 
         // `salon` was loaded via findById in THIS @Transactional, so it is a managed entity —
@@ -272,5 +272,33 @@ public class SalonService {
         evictOwnerSalonsCacheAfterCommit(ownerId);
         evictSalonDetailCacheAfterCommit(salonId);
         evictSearchSalonsCacheAfterCommit();
+    }
+
+    /**
+     * Normalises a raw Instagram value before persistence: trims surrounding
+     * whitespace and strips a single leading {@code @} so the stored form is the
+     * bare handle (or full URL) — mirroring {@code UserService.normalizeInstagram},
+     * which does the same for the independent-master {@code users.instagram} column.
+     * A blank or {@code @}-only value normalises to {@code null}. The DTO
+     * {@code @Pattern} has already constrained the shape at the boundary; this
+     * method only canonicalises an already-valid value.
+     *
+     * <p>Unlike {@code UserService.normalizeInstagram}, {@code raw} may be
+     * {@code null} here: {@code instagramUrl} is an optional field on
+     * {@code CreateSalonRequest}, so the create path calls this unconditionally.
+     *
+     * @param raw the validated request value, possibly {@code null}
+     * @return the canonical handle/URL, or {@code null} when the value is
+     *         {@code null} or blank
+     */
+    private String normalizeInstagram(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.strip();
+        if (trimmed.startsWith("@")) {
+            trimmed = trimmed.substring(1).strip();
+        }
+        return trimmed.isBlank() ? null : trimmed;
     }
 }

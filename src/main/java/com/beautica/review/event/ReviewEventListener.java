@@ -46,6 +46,27 @@ public class ReviewEventListener {
         // Eviction always runs — even if rating recalc failed — so stale pages
         // are not served from cache.
         evictMasterReviewPages(event.masterId());
+
+        // Symmetric salon branch (Phase 13.6): only runs when the reviewed booking
+        // belonged to a salon-affiliated master. Same fire-and-log-don't-fail contract —
+        // a salon-recalc failure must never roll back the already-committed review, and
+        // this method already runs in its own REQUIRES_NEW transaction.
+        //
+        // No "salon-detail" cache eviction here, deliberately — this mirrors the existing
+        // "master-detail" precedent (see MasterService#getMasterDetail Javadoc): the
+        // 5-minute TTL is an accepted staleness bound for rating updates reaching the
+        // public detail cache, and this listener does not evict "master-detail" either.
+        if (event.salonId() != null) {
+            try {
+                reviewRepository.recalculateSalonRating(event.salonId());
+            } catch (Exception ex) {
+                log.error("recalculateSalonRating failed for salon={} — {}",
+                          event.salonId(), ex.getClass().getSimpleName());
+            }
+            // Eviction always runs — even if rating recalc failed — so stale salon
+            // review pages are not served from cache (mirrors the master branch above).
+            evictSalonReviewPages(event.salonId());
+        }
     }
 
     // Evicts only the cached review pages belonging to the given master.
@@ -64,6 +85,28 @@ public class ReviewEventListener {
         }
         Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
         String prefix = "master:" + masterId + ":";
+        nativeCache.invalidateAll(
+                nativeCache.asMap().keySet().stream()
+                        .filter(k -> k instanceof String s && s.startsWith(prefix))
+                        .toList()
+        );
+    }
+
+    // Evicts only the cached review pages belonging to the given salon.
+    //
+    // Cache keys use the format "salon:<uuid>:sort:<sort>:page:<n>:size:<m>" (set in
+    // ReviewService#getSalonReviews). Prefix scan on "salon:<uuid>:" matches every sort
+    // dimension for that salon — the UUID delimiter ':' cannot appear inside a UUID.
+    // Same Caffeine-coupling caveat as evictMasterReviewPages above.
+    @SuppressWarnings("unchecked")
+    private void evictSalonReviewPages(UUID salonId) {
+        org.springframework.cache.Cache springCache = cacheManager.getCache("reviews-by-salon");
+        if (springCache == null) {
+            log.warn("Cache 'reviews-by-salon' not found during eviction for salon={}", salonId);
+            return;
+        }
+        Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
+        String prefix = "salon:" + salonId + ":";
         nativeCache.invalidateAll(
                 nativeCache.asMap().keySet().stream()
                         .filter(k -> k instanceof String s && s.startsWith(prefix))

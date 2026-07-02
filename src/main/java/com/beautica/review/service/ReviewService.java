@@ -10,9 +10,16 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewResponse;
+import com.beautica.review.dto.SalonReviewSort;
+import com.beautica.review.dto.SalonReviewSummaryResponse;
+import com.beautica.review.dto.SalonReviewSummaryResponse.RatingBucket;
 import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
+import com.beautica.review.repository.RatingCountProjection;
 import com.beautica.review.repository.ReviewRepository;
+import com.beautica.salon.entity.Salon;
+import com.beautica.salon.repository.SalonRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.context.ApplicationEventPublisher;
@@ -25,10 +32,12 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 @Service
 @RequiredArgsConstructor
@@ -36,6 +45,7 @@ public class ReviewService {
 
     private final ReviewRepository reviewRepository;
     private final BookingRepository bookingRepository;
+    private final SalonRepository salonRepository;
     private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
@@ -74,7 +84,12 @@ public class ReviewService {
             throw new BusinessException(HttpStatus.CONFLICT,
                     "Review already exists for this booking");
         }
-        eventPublisher.publishEvent(new ReviewCreatedEvent(booking.getMaster().getId()));
+        // booking.getSalon() is already populated on Review.salon by the builder above
+        // (verified: createReview sets .salon(booking.getSalon()), not a lazy re-derivation
+        // from master.getSalon() — booking.salon is the source of truth for "which salon
+        // owned this booking at completion time"). null for an INDEPENDENT_MASTER booking.
+        UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
+        eventPublisher.publishEvent(new ReviewCreatedEvent(booking.getMaster().getId(), salonId));
         return ReviewResponse.from(saved);
     }
 
@@ -140,5 +155,91 @@ public class ReviewService {
         Review review = reviewRepository.findByIdWithAssociations(reviewId)
                 .orElseThrow(() -> new NotFoundException("Review not found"));
         return ReviewResponse.from(review);
+    }
+
+    // ── Salon reviews (Phase 13.6 — Public Salon Profile) ───────────────────────
+
+    /**
+     * Rating summary for a salon's public profile ({@code GET /salons/{salonId}/reviews/summary}).
+     *
+     * <p>{@code avgRating}/{@code reviewCount} are read straight off the persisted
+     * {@code Salon} row (no live aggregation) — consistent with the "recalculate on write,
+     * read persisted on read" contract {@link com.beautica.review.event.ReviewEventListener}
+     * maintains. Not cached: this is a single primary-key lookup plus one indexed GROUP BY,
+     * cheap enough that a dedicated cache would only add eviction-wiring surface.
+     */
+    @Transactional(readOnly = true)
+    public SalonReviewSummaryResponse getSalonReviewSummary(UUID salonId) {
+        Salon salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+
+        List<RatingCountProjection> rows = reviewRepository.countBySalonIdGroupByRating(salonId);
+        Map<Integer, Long> countsByRating = rows.stream()
+                .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount));
+
+        // Zero-fill every bucket from 5 down to 1 — a rating with zero reviews must still
+        // appear in the response, never be silently omitted.
+        List<RatingBucket> distribution = IntStream.rangeClosed(1, 5)
+                .boxed()
+                .sorted((a, b) -> b - a)
+                .map(rating -> new RatingBucket(rating, countsByRating.getOrDefault(rating, 0L)))
+                .toList();
+
+        BigDecimal avgRating = salon.getReviewCount() == 0 ? null : salon.getAvgRating();
+
+        return new SalonReviewSummaryResponse(avgRating, salon.getReviewCount(), distribution);
+    }
+
+    /**
+     * Sortable, paginated review list for a salon's public profile ({@code GET
+     * /salons/{salonId}/reviews}). Mirrors {@link #getReviewsForMaster} exactly (two-query
+     * ID-then-hydrate pattern, caller-supplied sort stripped from the {@link Pageable}
+     * before it reaches the repository) — the only difference is the sort dimension is a
+     * closed {@link SalonReviewSort} enum dispatched to one of four fixed repository
+     * methods, instead of a single hardcoded {@code ORDER BY}.
+     *
+     * <p>Cached under {@code reviews-by-salon} — same rationale as {@link #getReviewsForMaster}:
+     * a public, high-traffic endpoint backed by an identical two-query pattern. The key
+     * includes {@code sort} (unlike the master path, which has only one fixed order) so each
+     * sort dimension gets its own cache entry. {@code sync = true} collapses the thundering
+     * herd when a popular salon's page expires. Evicted by {@link
+     * com.beautica.review.event.ReviewEventListener#onReviewCreated} via a prefix scan on
+     * {@code "salon:<salonId>:"}.
+     */
+    @Cacheable(
+            value = "reviews-by-salon",
+            key = "'salon:' + #salonId + ':sort:' + #sort + ':page:' + #pageable.pageNumber + ':size:' + #pageable.pageSize",
+            sync = true)
+    @Transactional(readOnly = true)
+    public Page<SalonReviewResponse> getSalonReviews(UUID salonId, SalonReviewSort sort, Pageable pageable) {
+        if (pageable.getPageNumber() > MAX_PAGE_NUMBER) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Page number must not exceed " + MAX_PAGE_NUMBER);
+        }
+        SalonReviewSort effectiveSort = sort != null ? sort : SalonReviewSort.NEWEST;
+
+        // Strip caller-supplied sort: each JPQL query below hardcodes its own ORDER BY.
+        // A caller-supplied sort field can trigger PropertyReferenceException, leaking
+        // entity property names.
+        Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
+        Page<UUID> idPage = switch (effectiveSort) {
+            case NEWEST -> reviewRepository.findIdsBySalonIdOrderByCreatedAtDesc(salonId, unsortedPage);
+            case OLDEST -> reviewRepository.findIdsBySalonIdOrderByCreatedAtAsc(salonId, unsortedPage);
+            case HIGHEST -> reviewRepository.findIdsBySalonIdOrderByRatingDescCreatedAtDesc(salonId, unsortedPage);
+            case LOWEST -> reviewRepository.findIdsBySalonIdOrderByRatingAscCreatedAtDesc(salonId, unsortedPage);
+        };
+        if (idPage.isEmpty()) {
+            return Page.empty(pageable);
+        }
+        List<UUID> ids = idPage.getContent();
+        List<Review> reviews = reviewRepository.findByIdsWithGraphForSalonReviews(ids);
+        Map<UUID, Review> byId = reviews.stream()
+                .collect(Collectors.toMap(Review::getId, r -> r));
+        // Re-sort hydrated results back into the ID-list order — findByIdsWithGraphForSalonReviews
+        // returns rows in undefined order (same contract as findByIdsWithGraph).
+        List<SalonReviewResponse> content = ids.stream()
+                .map(id -> SalonReviewResponse.from(byId.get(id)))
+                .toList();
+        return new PageImpl<>(content, pageable, idPage.getTotalElements());
     }
 }

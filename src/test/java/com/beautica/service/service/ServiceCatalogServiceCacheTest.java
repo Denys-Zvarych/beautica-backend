@@ -44,7 +44,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class, CatalogCategoryLookup.class, CacheConfig.class},
+        classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class,
+                CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, CacheConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
@@ -75,6 +76,7 @@ class ServiceCatalogServiceCacheTest {
         cacheManager.getCache("service-type-search").clear();
         cacheManager.getCache("service-categories").clear();
         cacheManager.getCache("available-slots").clear();
+        cacheManager.getCache("platform-category-order").clear();
     }
 
     // ── sync = true regression pins (Anti-Bug §F-7 — thundering-herd guard) ────
@@ -310,5 +312,40 @@ class ServiceCatalogServiceCacheTest {
 
         // Assert — the cache entry for the affected master must be gone.
         assertThat(slotsCache.get(cacheKey)).isNull();
+    }
+
+    // ── platform-category-order cache (perf follow-up, Phase 13.6) ─────────────
+
+    @Test
+    @DisplayName("second getSalonServiceCatalog call for a different salon does not re-query findApprovedActive — platform-category-order cache is effective")
+    void should_hitCache_when_getSalonServiceCatalogCalledForTwoSalons() {
+        UUID salonId1 = UUID.randomUUID();
+        UUID salonId2 = UUID.randomUUID();
+
+        ServiceDefinition manicure = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .name("Manicure")
+                .category("MANICURE")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("300.00"))
+                .build();
+
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId1), any(Pageable.class)))
+                .thenReturn(List.of(manicure));
+        when(serviceRepository.findBookableServicesBySalon(eq(salonId2), any(Pageable.class)))
+                .thenReturn(List.of(manicure));
+        when(platformCategoryRepository.findApprovedActive())
+                .thenReturn(List.of(com.beautica.service.entity.PlatformCategory.ofApproved("MANICURE", "Манікюр")));
+
+        serviceCatalogService.getSalonServiceCatalog(salonId1);
+        serviceCatalogService.getSalonServiceCatalog(salonId2);
+
+        // Two distinct salons still share the SAME platform-category-order cache entry
+        // ('all' key, no salonId in the key) — the repository must be hit only once.
+        verify(platformCategoryRepository, times(1)).findApprovedActive();
     }
 }

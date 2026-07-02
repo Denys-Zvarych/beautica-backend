@@ -6,6 +6,9 @@ import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewResponse;
+import com.beautica.review.dto.SalonReviewSort;
+import com.beautica.review.dto.SalonReviewSummaryResponse;
 import com.beautica.review.service.ReviewService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +24,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.UUID;
@@ -70,5 +74,39 @@ public class ReviewController {
     @GetMapping("/reviews/{reviewId}")
     public ApiResponse<ReviewResponse> getReview(@PathVariable UUID reviewId) {
         return ApiResponse.ok(reviewService.getReview(reviewId));
+    }
+
+    /**
+     * Rating summary for a salon's public profile.
+     *
+     * <p><strong>Public endpoint — no authentication required.</strong> Matches the
+     * existing {@link #getReviewsByMaster} no-auth pattern: unauthenticated clients browse
+     * a salon's rating before deciding whether to book.
+     */
+    @GetMapping("/salons/{salonId}/reviews/summary")
+    public ApiResponse<SalonReviewSummaryResponse> getSalonReviewSummary(@PathVariable UUID salonId) {
+        return ApiResponse.ok(reviewService.getSalonReviewSummary(salonId));
+    }
+
+    /**
+     * Sortable, paginated review list for a salon's public profile.
+     *
+     * <p><strong>Public endpoint — no authentication required.</strong> Same no-auth
+     * rationale as {@link #getSalonReviewSummary}. {@code sort} defaults to {@code NEWEST}
+     * when omitted.
+     */
+    @GetMapping("/salons/{salonId}/reviews")
+    public ApiResponse<PageResponse<SalonReviewResponse>> getSalonReviews(
+            @PathVariable UUID salonId,
+            @RequestParam(required = false, defaultValue = "NEWEST") SalonReviewSort sort,
+            @PageableDefault(size = 20) Pageable pageable) {
+        Page<SalonReviewResponse> page = reviewService.getSalonReviews(salonId, sort, pageable);
+        return ApiResponse.ok(PageResponse.of(
+                page.getContent(),
+                page.getNumber(),
+                page.getSize(),
+                page.getTotalElements(),
+                page.getTotalPages()
+        ));
     }
 }

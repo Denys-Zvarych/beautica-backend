@@ -36,7 +36,13 @@ public class CacheConfig {
      *   search:salons       — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
      *   portfolio           — per-entity portfolio listing, public unauthenticated GET — 5 min TTL, max 2000 entries
      *   reviews-by-master   — paginated review list per master, public endpoint — 5 min TTL, max 1000 entries
+     *   reviews-by-salon    — paginated review list per salon, public endpoint — 5 min TTL, max 1000 entries
      *   review-detail       — single review by ID, public endpoint — 10 min TTL, max 2000 entries (immutable; no evict path)
+     *   platform-category-order — approved+active PlatformCategory ordering used to sort a salon's
+     *                             public catalog groups (ServiceCatalogService#buildCategoryOrderAndNames);
+     *                             admin-approval-gated reference data, identical across every
+     *                             salon/request — 60 min TTL, max 200 entries; evicted by
+     *                             CategoryRequestService.approve/reject
      *   revenue-dashboard   — revenue summary per actor (master or salon owner) — 5 min TTL, max 500 entries
      *   locationOblasts        — full serviced-oblast list (single entry) — 24 h TTL, max 4 entries
      *   locationCitiesByOblast — cities (+hasDistricts) per oblast — 24 h TTL, max 50 entries
@@ -156,6 +162,13 @@ public class CacheConfig {
                         .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
+        // Phase 13.6 — public review listing per salon; mirrors reviews-by-master. Evicted by
+        // ReviewEventListener on new review creation (salon branch, prefix "salon:<salonId>:").
+        manager.registerCustomCache("reviews-by-salon",
+                Caffeine.newBuilder()
+                        .maximumSize(1000)
+                        .expireAfterWrite(5, TimeUnit.MINUTES)
+                        .build());
         // Phase 8 — single review by ID; reviews are immutable after creation so TTL is the only expiry path.
         manager.registerCustomCache("review-detail",
                 Caffeine.newBuilder()
@@ -211,6 +224,17 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS)
+                        .build());
+        // Phase 13.6 (perf follow-up) — approved+active PlatformCategory ordering backing
+        // ServiceCatalogService#buildCategoryOrderAndNames. Mirrors service-categories's config: this
+        // is admin-approval-gated reference data, identical across every request, previously
+        // re-queried on every public salon-catalog hit. Evicted by
+        // CategoryRequestService.approve/reject, the only writes that change APPROVED/active
+        // membership.
+        manager.registerCustomCache("platform-category-order",
+                Caffeine.newBuilder()
+                        .maximumSize(200)
+                        .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
         return manager;
     }

@@ -13,6 +13,8 @@ import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
@@ -20,6 +22,7 @@ import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
@@ -39,12 +42,15 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -56,6 +62,7 @@ public class ServiceCatalogService {
     private final MasterRepository masterRepository;
     private final CatalogCategoryLookup catalogCategoryLookup;
     private final PlatformCategoryRepository platformCategoryRepository;
+    private final PlatformCategoryOrderLookup platformCategoryOrderLookup;
     private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final ServiceTypeLookup serviceTypeLookup;
     private final ServiceTypeSearchService serviceTypeSearchService;
@@ -112,7 +119,7 @@ public class ServiceCatalogService {
             throw new ForbiddenException("Access denied");
         }
 
-        ServiceDefinition serviceDef = serviceRepository.findById(request.serviceDefId())
+        ServiceDefinition serviceDef = serviceRepository.findByIdWithServiceType(request.serviceDefId())
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + request.serviceDefId()));
 
         if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
@@ -676,6 +683,102 @@ public class ServiceCatalogService {
     @Transactional(readOnly = true)
     public List<CatalogCategoryResponse> getCategories() {
         return catalogCategoryLookup.getAll();
+    }
+
+    /**
+     * A salon's public, bookable service catalog grouped by category (Phase 13.6,
+     * {@code GET /salons/{salonId}/services}).
+     *
+     * <p>No caching for v1 (deliberate — keeps this PR scoped): the underlying query is
+     * already cheap (indexed {@code owner_type}/{@code owner_id}/{@code is_active} plus an
+     * {@code EXISTS} on an indexed FK), unlike {@code getMasterServices} which justified a
+     * cache by eliminating a JOIN-heavy graph query on a very hot single-master path.
+     *
+     * <p>Bounded via an internal soft cap ({@code PageRequest.of(0, 500)}, mirroring
+     * {@code getMasterServices}'s {@code PageRequest.of(0, 200)}) rather than exposing a
+     * caller-supplied {@code Pageable} — the mobile client needs the WHOLE catalog at once
+     * to group it by category, so pagination would only fragment categories across pages.
+     */
+    @Transactional(readOnly = true)
+    public SalonServiceCatalogResponse getSalonServiceCatalog(UUID salonId) {
+        List<ServiceDefinition> definitions =
+                serviceRepository.findBookableServicesBySalon(salonId, PageRequest.of(0, 500));
+
+        if (definitions.isEmpty()) {
+            return new SalonServiceCatalogResponse(List.of());
+        }
+
+        CategoryOrderAndNames orderAndNames = buildCategoryOrderAndNames();
+        Map<String, Integer> categoryOrder = orderAndNames.order();
+        Map<String, String> categoryDisplayNames = orderAndNames.displayNames();
+
+        Map<String, List<ServiceDefinition>> byCategory = definitions.stream()
+                .collect(Collectors.groupingBy(
+                        sd -> Objects.requireNonNullElse(sd.getCategory(), ""),
+                        LinkedHashMap::new,
+                        Collectors.toList()));
+
+        List<SalonServiceCategoryGroup> categories = byCategory.entrySet().stream()
+                .sorted(Comparator
+                        .<Map.Entry<String, List<ServiceDefinition>>>comparingInt(
+                                e -> categoryOrder.getOrDefault(e.getKey(), Integer.MAX_VALUE))
+                        .thenComparing(Map.Entry::getKey))
+                .map(e -> new SalonServiceCategoryGroup(
+                        e.getKey(),
+                        categoryDisplayNames.getOrDefault(e.getKey(), e.getKey()),
+                        e.getValue().size(),
+                        e.getValue().stream().map(ServiceDefinitionResponse::from).toList()))
+                .toList();
+
+        return new SalonServiceCatalogResponse(categories);
+    }
+
+    /**
+     * {@code buildCategoryOrderAndNames()}'s return shape — the ordinal-position map used to
+     * sort {@link #getSalonServiceCatalog} groups, and the sibling {@code name -> displayName}
+     * map used to resolve the human-readable category header. Both are derived from a single
+     * pass over the same {@link PlatformCategoryOrderLookup#getApprovedActive()} list so the
+     * cached lookup is not queried twice per request.
+     */
+    private record CategoryOrderAndNames(Map<String, Integer> order, Map<String, String> displayNames) {
+    }
+
+    /**
+     * Builds a {@code category name -> ordinal position} map, and a sibling {@code category
+     * name -> displayName} map, from the approved+active {@link PlatformCategory} rows, in the
+     * same display order the category picker already uses ({@link
+     * PlatformCategoryRepository#findApprovedActive}, {@code ORDER BY displayName} —
+     * {@link PlatformCategory} carries no explicit {@code sortOrder} column). A {@code
+     * ServiceDefinition.category} value with no entry in these maps (inactive/legacy/unknown
+     * category) sorts alphabetically AFTER every known category, and falls back to the raw
+     * category slug itself as its display name, in {@link #getSalonServiceCatalog}.
+     *
+     * <p>Deliberately NOT {@link #getCategories()} / {@link CatalogCategoryLookup}: that
+     * returns the separate, orphaned "System A" {@code service_categories} table keyed by
+     * {@code nameUk}/{@code nameEn} display strings (e.g. {@code "Nails"}) — those never
+     * match {@code ServiceDefinition.category}, which stores the live {@link PlatformCategory
+     * #getName()} canonical code (e.g. {@code "MANICURE"}). Using {@code getCategories()}
+     * here would silently never match anything, degrading every group to alphabetical order
+     * and its raw slug as the display name.
+     *
+     * <p>Delegates the {@code findApprovedActive()} query through {@link
+     * PlatformCategoryOrderLookup} (a separate {@code @Cacheable} bean, 60-min TTL) instead of
+     * calling {@link #platformCategoryRepository} directly: this data is static,
+     * admin-approval-gated reference data identical across every request, so re-querying it on
+     * every public {@link #getSalonServiceCatalog} hit was pure waste. A same-class
+     * {@code @Cacheable} method would not intercept via the AOP proxy on this self-invocation
+     * (same caveat documented on {@link #searchServiceTypes}), hence the separate bean.
+     */
+    private CategoryOrderAndNames buildCategoryOrderAndNames() {
+        List<PlatformCategory> approved = platformCategoryOrderLookup.getApprovedActive();
+        Map<String, Integer> order = new LinkedHashMap<>();
+        Map<String, String> displayNames = new LinkedHashMap<>();
+        for (int i = 0; i < approved.size(); i++) {
+            PlatformCategory category = approved.get(i);
+            order.put(category.getName(), i);
+            displayNames.put(category.getName(), category.getDisplayName());
+        }
+        return new CategoryOrderAndNames(order, displayNames);
     }
 
     @Transactional(readOnly = true)

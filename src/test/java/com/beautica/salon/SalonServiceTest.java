@@ -22,6 +22,7 @@ import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -135,6 +136,63 @@ class SalonServiceTest {
         verify(masterService).createMasterForOwner(owner, savedSalon);
     }
 
+    // ── createSalon — Phase 20.x instagram widened validation + normalisation ──
+    // The @Pattern on instagramUrl was widened to accept a bare handle (@username)
+    // in addition to the pre-existing full instagram.com URL. SalonService.normalizeInstagram
+    // strips a leading @ before persistence, mirroring UserService.normalizeInstagram for the
+    // equivalent independent-master case. Before this pair of tests, no test in the salon
+    // package ever set instagramUrl to a non-null value — the widen had zero app-level coverage.
+
+    @Test
+    @DisplayName("createSalon — strips the leading at-sign from a bare instagram handle before persisting")
+    void should_normaliseInstagramHandle_when_createSalonWithAtPrefixedHandle() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        // Field order: name, description, city, region, address, phone, instagramUrl,
+        //              cityId, districtId, street, buildingNo, locationNote
+        var request = new CreateSalonRequest(
+                "Handle Salon", null, null, null, null, null, "@some.handle",
+                null, null, null, null, null
+        );
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "Handle Salon");
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+
+        salonService.createSalon(ownerId, request);
+
+        ArgumentCaptor<Salon> captor = ArgumentCaptor.forClass(Salon.class);
+        verify(salonRepository).save(captor.capture());
+        assertThat(captor.getValue().getInstagramUrl())
+                .as("leading @ must be stripped before persistence, mirroring UserService.normalizeInstagram")
+                .isEqualTo("some.handle");
+    }
+
+    @Test
+    @DisplayName("createSalon — persists a full instagram.com URL verbatim (regression guard for pre-widen behavior)")
+    void should_persistFullInstagramUrlVerbatim_when_createSalonWithFullUrl() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest(
+                "URL Salon", null, null, null, null, null, "https://instagram.com/some.handle",
+                null, null, null, null, null
+        );
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "URL Salon");
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+
+        salonService.createSalon(ownerId, request);
+
+        ArgumentCaptor<Salon> captor = ArgumentCaptor.forClass(Salon.class);
+        verify(salonRepository).save(captor.capture());
+        assertThat(captor.getValue().getInstagramUrl())
+                .as("a full instagram.com URL has no leading @ to strip and must be stored unchanged")
+                .isEqualTo("https://instagram.com/some.handle");
+    }
+
     @Test
     @DisplayName("getOwnerSalons — returns all salons mapped to SalonResponse when owner has multiple salons")
     void should_getOwnerSalons_when_ownerHasMultipleSalons() {
@@ -230,6 +288,71 @@ class SalonServiceTest {
         SalonResponse response = salonService.updateSalon(actorId, salonId, request);
 
         assertThat(response.name()).isEqualTo("Updated Name");
+    }
+
+    // ── updateSalon — Phase 20.x instagram widened validation + normalisation ──
+
+    @Test
+    @DisplayName("updateSalon — normalises an at-prefixed instagram handle by stripping the leading at-sign and trimming")
+    void should_normaliseInstagram_when_updateSalonWithAtPrefixedHandleAndSpaces() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+
+        // Field order: name, description, city, region, address, cityId, districtId,
+        //              street, buildingNo, locationNote, phone, instagramUrl
+        var request = new UpdateSalonRequest("Salon", null, null, null, null,
+                null, null, null, null, null, null, "  @beauty.master  ");
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getInstagramUrl())
+                .as("leading @ stripped and surrounding whitespace trimmed → canonical handle")
+                .isEqualTo("beauty.master");
+    }
+
+    @Test
+    @DisplayName("updateSalon — persists a full instagram.com URL verbatim (regression guard for pre-widen behavior)")
+    void should_persistFullInstagramUrlVerbatim_when_updateSalonWithFullUrl() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+
+        var request = new UpdateSalonRequest("Salon", null, null, null, null,
+                null, null, null, null, null, null, "https://www.instagram.com/some.handle/");
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getInstagramUrl())
+                .as("a full instagram.com URL has no leading @ to strip and must be stored unchanged")
+                .isEqualTo("https://www.instagram.com/some.handle/");
+    }
+
+    @Test
+    @DisplayName("updateSalon — leaves the existing instagram value unchanged when instagramUrl is null in the patch")
+    void should_notOverwriteInstagram_when_updateSalonInstagramIsNullInPatch() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        salon.setInstagramUrl("kept_handle");
+
+        var request = new UpdateSalonRequest("Salon", null, null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getInstagramUrl())
+                .as("a null instagramUrl in the patch must leave the stored handle untouched (PATCH semantics)")
+                .isEqualTo("kept_handle");
     }
 
     @Test
