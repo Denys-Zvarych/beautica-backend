@@ -251,6 +251,67 @@ class MasterScheduleControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
+    // ── Phase 15.11: GET working-days — open to CLIENT (unlike effective-schedule above) ──
+
+    @Test
+    @DisplayName("GET working-days — 200 when CLIENT requests it (unlike effective-schedule, no authz gate)")
+    void getWorkingDays_clientAllowed() throws Exception {
+        var masterId = UUID.randomUUID();
+        var from = LocalDate.now();
+        var to = from.plusDays(1);
+        when(masterScheduleService.getClientWorkingDays(masterId, from, to)).thenReturn(List.of(
+                new com.beautica.master.dto.MasterWorkingDayResponse(from, true),
+                new com.beautica.master.dto.MasterWorkingDayResponse(to, false)));
+
+        mockMvc.perform(get(BASE + "/" + masterId + "/working-days")
+                        .param("from", from.toString())
+                        .param("to", to.toString())
+                        .with(as(UUID.randomUUID(), Role.CLIENT)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].date").value(from.toString()))
+                .andExpect(jsonPath("$.data[0].working").value(true))
+                .andExpect(jsonPath("$.data[1].date").value(to.toString()))
+                .andExpect(jsonPath("$.data[1].working").value(false))
+                // no schedule detail crosses the boundary — only date + working ever appear on the wire
+                .andExpect(jsonPath("$.data[0].intervals").doesNotExist())
+                .andExpect(jsonPath("$.data[0].times").doesNotExist())
+                .andExpect(jsonPath("$.data[0].source").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("GET working-days — 200 when INDEPENDENT_MASTER (or any authenticated role) requests it")
+    void getWorkingDays_anyAuthenticatedRoleAllowed() throws Exception {
+        var masterId = UUID.randomUUID();
+        var from = LocalDate.now();
+        var to = from.plusDays(1);
+        when(masterScheduleService.getClientWorkingDays(any(), any(), any())).thenReturn(List.of());
+
+        mockMvc.perform(get(BASE + "/" + masterId + "/working-days")
+                        .param("from", from.toString())
+                        .param("to", to.toString())
+                        .with(as(UUID.randomUUID(), Role.INDEPENDENT_MASTER)))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("GET working-days — 401 when unauthenticated")
+    void getWorkingDays_anonymous() throws Exception {
+        var masterId = UUID.randomUUID();
+        mockMvc.perform(get(BASE + "/" + masterId + "/working-days")
+                        .param("from", LocalDate.now().toString())
+                        .param("to", LocalDate.now().plusDays(1).toString()))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET working-days — 400 when range params absent")
+    void getWorkingDays_missingParams() throws Exception {
+        var masterId = UUID.randomUUID();
+        mockMvc.perform(get(BASE + "/" + masterId + "/working-days")
+                        .with(as(UUID.randomUUID(), Role.CLIENT)))
+                .andExpect(status().isBadRequest());
+    }
+
     // ── Writes: canManageMasterSchedule ───────────────────────────────────────
 
     @Test

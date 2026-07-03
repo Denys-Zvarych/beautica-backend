@@ -27,6 +27,9 @@ public class CacheConfig {
      *   masterServices      — service list per master, public endpoint — 10 min TTL, max 500 entries
      *   available-slots     — slot availability per master/date/service — 60 sec TTL, max 500 entries
      *   master-calendar     — paginated booking calendar per master/date range — 30 sec TTL, max 500 entries
+     *   master-working-days — CLIENT-safe boolean working-day gating per master/from/to (Phase 15.11
+     *                         GET /masters/{masterId}/working-days) — 60 sec TTL, max 500 entries; evicted
+     *                         by master prefix alongside available-slots on every schedule write
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
      *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
@@ -105,6 +108,15 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(30, TimeUnit.SECONDS)
+                        .build());
+        // Phase 15.11 (perf follow-up) — CLIENT-safe boolean working-day gating, a pure function of
+        // (masterId, from, to). Mirrors available-slots: same 60-sec TTL/500-entry sizing, same
+        // by-master-prefix eviction technique, fired from the same 4 schedule write paths
+        // (MasterScheduleService#evictSlotsAfterCommit).
+        manager.registerCustomCache("master-working-days",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
         manager.registerCustomCache("master-by-user",
                 Caffeine.newBuilder()

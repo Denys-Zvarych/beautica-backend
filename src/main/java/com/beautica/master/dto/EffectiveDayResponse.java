@@ -35,4 +35,24 @@ public record EffectiveDayResponse(
     public EffectiveDayResponse(LocalDate date, EffectiveDaySource source, List<WorkIntervalDto> intervals) {
         this(date, source, intervals, null);
     }
+
+    /**
+     * Phase 15.11: reduces this projection to the single boolean the CLIENT-facing calendar day-gating
+     * endpoint needs (working / not working), with no hours, intervals, or times leaving the service
+     * layer. A date is a working day when a {@link EffectiveDaySource#TEMPLATE} or
+     * {@link EffectiveDaySource#OVERRIDE_CUSTOM} actually carries bookable content — either an interval
+     * or a discrete time. {@link EffectiveDaySource#OVERRIDE_DAY_OFF} and
+     * {@link EffectiveDaySource#NO_SCHEDULE} are never working days.
+     *
+     * <p>{@code times} is {@code null} for every day except an {@code EXPLICIT_TIMES} weekday (see class
+     * Javadoc), so this null-checks it explicitly rather than assuming a non-null list — a
+     * {@code TEMPLATE} day whose weekday has no defined interval (window covers the date, but that
+     * specific day-of-week is uncovered) legitimately reaches this method with empty intervals and null
+     * times.
+     */
+    public boolean isWorkingDay() {
+        boolean hasContent = !intervals.isEmpty() || (times != null && !times.isEmpty());
+        return (source == EffectiveDaySource.TEMPLATE || source == EffectiveDaySource.OVERRIDE_CUSTOM)
+                && hasContent;
+    }
 }

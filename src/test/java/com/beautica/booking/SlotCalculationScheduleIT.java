@@ -6,6 +6,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.TimeZones;
 import com.beautica.common.util.TimeSlotCalculator;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.WeeklyScheduleDayRequest;
 import com.beautica.master.dto.WeeklyScheduleRequest;
@@ -444,6 +445,87 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
             // Endpoints are correct in wall-clock time even though the day is only 23 real hours; the gap
             // sits at 03:00–04:00, far from this 09:00–18:00 window, so the slot count is the normal 17.
             assertThat(slots).hasSize(17);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // 3. Working-days / slots consistency (Phase 15.11) — the CLIENT-safe boolean signal
+    //    from MasterScheduleService.getClientWorkingDays must agree with what the CLIENT
+    //    can actually book via GET /{masterId}/slots for the same date. Neither endpoint
+    //    reuses the other's full code path (getClientWorkingDays only maps
+    //    resolveEffectiveRange; getAvailableSlots additionally runs the slot calculator and
+    //    booking subtraction), so a drift between them would silently mislead the mobile
+    //    calendar — greying out a bookable day, or showing an open day with nothing to book.
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("working-days boolean agrees with the real /slots pipeline (Phase 15.11)")
+    class WorkingDaysSlotsConsistency {
+
+        @Test
+        @DisplayName("working:true on a template day correlates with at least one real bookable slot")
+        void should_correlateWorkingTrue_withNonEmptySlots_when_templateCoversDate() {
+            Seed s = seedMasterWithService(60);
+            LocalDate monday = LocalDate.of(2024, 6, 3); // ISO 1
+            masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
+                    weekly(monday, null, day(1, iv(LocalTime.of(9, 0), LocalTime.of(17, 0)))));
+
+            List<MasterWorkingDayResponse> workingDays =
+                    masterScheduleService.getClientWorkingDays(s.masterId(), monday, monday);
+            List<AvailableSlotResponse> slots = slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId());
+
+            assertThat(workingDays).containsExactly(new MasterWorkingDayResponse(monday, true));
+            assertThat(slots)
+                    .as("a day the CLIENT-safe endpoint reports working:true must actually offer "
+                            + "bookable slots via /slots — otherwise the mobile calendar shows the day "
+                            + "as open with nothing to book")
+                    .isNotEmpty();
+        }
+
+        @Test
+        @DisplayName("working:false on a DAY_OFF override correlates with zero real bookable slots")
+        void should_correlateWorkingFalse_withEmptySlots_when_dayOffOverridePresent() {
+            Seed s = seedMasterWithService(60);
+            LocalDate monday = LocalDate.of(2024, 6, 3); // ISO 1
+            masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
+                    weekly(monday, null, day(1, iv(LocalTime.of(9, 0), LocalTime.of(17, 0)))));
+            masterScheduleService.upsertOverride(s.actorId(), s.masterId(),
+                    new ScheduleOverrideRequest(monday, ScheduleExceptionKind.DAY_OFF, null));
+
+            List<MasterWorkingDayResponse> workingDays =
+                    masterScheduleService.getClientWorkingDays(s.masterId(), monday, monday);
+            List<AvailableSlotResponse> slots = slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId());
+
+            assertThat(workingDays).containsExactly(new MasterWorkingDayResponse(monday, false));
+            assertThat(slots)
+                    .as("a day the CLIENT-safe endpoint reports working:false must never offer a "
+                            + "bookable slot via /slots — otherwise a CLIENT could book a day the "
+                            + "calendar greys out as non-working")
+                    .isEmpty();
+        }
+
+        @Test
+        @DisplayName("working:false on a schedule gap correlates with zero real bookable slots")
+        void should_correlateWorkingFalse_withEmptySlots_when_dateFallsInScheduleGap() {
+            Seed s = seedMasterWithService(60);
+            // Template only covers June; query a July date no window covers.
+            masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
+                    weekly(LocalDate.of(2024, 6, 1), LocalDate.of(2024, 6, 30),
+                            day(1, iv(LocalTime.of(9, 0), LocalTime.of(17, 0)))));
+            LocalDate gapDate = LocalDate.of(2024, 7, 8); // a Monday outside the window
+
+            List<MasterWorkingDayResponse> workingDays =
+                    masterScheduleService.getClientWorkingDays(s.masterId(), gapDate, gapDate);
+            List<AvailableSlotResponse> slots = slotServiceWithTodayBefore(gapDate)
+                    .getAvailableSlots(s.masterId(), gapDate, s.masterServiceId());
+
+            assertThat(workingDays).containsExactly(new MasterWorkingDayResponse(gapDate, false));
+            assertThat(slots)
+                    .as("a schedule gap resolves to NO_SCHEDULE on both endpoints — working:false and "
+                            + "zero bookable slots must agree")
+                    .isEmpty();
         }
     }
 

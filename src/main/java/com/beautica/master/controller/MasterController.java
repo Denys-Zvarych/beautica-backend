@@ -13,6 +13,7 @@ import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.EffectiveDayResponse;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
 import com.beautica.master.dto.WeeklyScheduleRequest;
@@ -224,6 +225,25 @@ public class MasterController {
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
     ) {
         return ApiResponse.ok(masterScheduleService.resolveEffectiveRange(masterId, from, to));
+    }
+
+    /**
+     * Phase 15.11: CLIENT-safe calendar day-gating — for every date in {@code [from, to]}, whether the
+     * master is working, boolean only. {@code CLIENT} is deliberately blocked from
+     * {@code /effective-schedule} above (no hours/intervals leak); this endpoint strips the schedule
+     * detail down to a boolean in the service layer before it ever reaches this controller, so it is
+     * open to any authenticated role — mirroring {@code GET /{masterId}/slots} below, which already
+     * exposes bookable start times (strictly more detail than a working/non-working flag) to any
+     * authenticated caller. Bounded to ≤366 days by the same guard {@code resolveEffectiveRange} applies.
+     */
+    @GetMapping("/{masterId}/working-days")
+    @PreAuthorize("isAuthenticated()")
+    public ApiResponse<List<MasterWorkingDayResponse>> getWorkingDays(
+            @PathVariable UUID masterId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
+    ) {
+        return ApiResponse.ok(masterScheduleService.getClientWorkingDays(masterId, from, to));
     }
 
     @DeleteMapping("/{masterId}")
