@@ -1,5 +1,6 @@
 package com.beautica.master.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.List;
@@ -49,7 +50,14 @@ public record EffectiveDayResponse(
      * {@code TEMPLATE} day whose weekday has no defined interval (window covers the date, but that
      * specific day-of-week is uncovered) legitimately reaches this method with empty intervals and null
      * times.
+     *
+     * <p>{@code @JsonIgnore}: this follows JavaBean {@code isXxx()} getter convention, which Jackson would
+     * otherwise pick up and serialize as an extra {@code workingDay} field on this record's JSON — an
+     * unreviewed contract change on every endpoint that returns {@link EffectiveDayResponse} (e.g.
+     * {@code GET /{masterId}/effective-schedule}). This method is an internal Java helper only, consumed
+     * directly by {@code MasterScheduleService.getClientWorkingDays}.
      */
+    @JsonIgnore
     public boolean isWorkingDay() {
         boolean hasContent = !intervals.isEmpty() || (times != null && !times.isEmpty());
         return (source == EffectiveDaySource.TEMPLATE || source == EffectiveDaySource.OVERRIDE_CUSTOM)

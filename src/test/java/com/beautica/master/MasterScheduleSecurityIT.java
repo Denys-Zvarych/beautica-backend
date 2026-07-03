@@ -549,5 +549,23 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
                     .doesNotContain("\"reason\"")
                     .doesNotContain("\"note\"");
         }
+
+        @Test
+        @DisplayName("the effective-schedule projection serializes no workingDay key (isWorkingDay is @JsonIgnore)")
+        void should_notExposeWorkingDay_onEffectiveScheduleRead() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertOverride(m.owner().userId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
+
+            ResponseEntity<String> resp = get(
+                    "/" + m.masterId() + "/effective-schedule?from=" + FUTURE_FROM + "&to=" + FUTURE_FROM,
+                    m.owner());
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(resp.getBody())
+                    .as("isWorkingDay() is an internal helper for MasterScheduleService.getClientWorkingDays "
+                            + "only — it must not leak onto the wire as an extra 'workingDay' field")
+                    .doesNotContain("\"workingDay\"");
+        }
     }
 }
