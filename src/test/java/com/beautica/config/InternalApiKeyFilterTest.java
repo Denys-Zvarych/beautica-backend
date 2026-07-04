@@ -1,7 +1,9 @@
 package com.beautica.config;
 
+import com.beautica.auth.AccessTokenDenylist;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
+import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.beautica.service.controller.InternalCategoryController;
 import com.beautica.service.dto.PlatformCategoryUsageResponse;
@@ -89,8 +91,10 @@ class InternalApiKeyFilterTest {
          * auth goes via the InternalApiKeyFilter instead.
          */
         @Bean
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
+        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
+                                                        AccessTokenDenylist accessTokenDenylist,
+                                                        TokensValidAfterCache tokensValidAfterCache) {
+            return new JwtAuthenticationFilter(jwtTokenProvider, accessTokenDenylist, tokensValidAfterCache) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
                                                 HttpServletResponse res,
@@ -149,6 +153,12 @@ class InternalApiKeyFilterTest {
 
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
+
+    @MockBean
+    private AccessTokenDenylist accessTokenDenylist;
+
+    @MockBean
+    private TokensValidAfterCache tokensValidAfterCache;
 
     // ── Tests ──────────────────────────────────────────────────────────────────
 

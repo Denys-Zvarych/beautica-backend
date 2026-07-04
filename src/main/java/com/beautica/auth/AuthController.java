@@ -16,6 +16,8 @@ import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.common.security.BearerTokenExtractor;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -134,9 +136,10 @@ public class AuthController {
     }
 
     @PostMapping("/logout")
-    public ResponseEntity<Void> logout(Authentication authentication) {
+    public ResponseEntity<Void> logout(HttpServletRequest request, Authentication authentication) {
         UUID userId = AuthenticationUtils.userId(authentication);
-        authService.logout(userId);
+        String accessToken = BearerTokenExtractor.extract(request);
+        authService.logout(userId, accessToken);
         return ResponseEntity.noContent().build();
     }
 

@@ -20,6 +20,8 @@ import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtException;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.http.HttpStatus;
@@ -58,6 +60,8 @@ public class AuthService {
     private final TaskExecutor emailExecutor;
     private final EmailVerificationProcessor emailVerificationProcessor;
     private final VerificationPolicyConfig verificationPolicyConfig;
+    private final JwtTokenProvider jwtTokenProvider;
+    private final AccessTokenDenylist accessTokenDenylist;
 
     public AuthService(
             UserRepository userRepository,
@@ -70,7 +74,9 @@ public class AuthService {
             EmailNotificationService emailNotificationService,
             @Qualifier("emailExecutor") TaskExecutor emailExecutor,
             EmailVerificationProcessor emailVerificationProcessor,
-            VerificationPolicyConfig verificationPolicyConfig
+            VerificationPolicyConfig verificationPolicyConfig,
+            JwtTokenProvider jwtTokenProvider,
+            AccessTokenDenylist accessTokenDenylist
     ) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -83,6 +89,8 @@ public class AuthService {
         this.emailExecutor = emailExecutor;
         this.emailVerificationProcessor = emailVerificationProcessor;
         this.verificationPolicyConfig = verificationPolicyConfig;
+        this.jwtTokenProvider = jwtTokenProvider;
+        this.accessTokenDenylist = accessTokenDenylist;
     }
 
     @Transactional
@@ -359,9 +367,36 @@ public class AuthService {
         return RegistrationResponse.of(user.getEmail());
     }
 
+    /**
+     * Logs a user out: revokes every refresh token for the user, and denylists the
+     * {@code jti} of the access token used to authenticate this logout request so it
+     * cannot be replayed for the remainder of its TTL. Access tokens are otherwise
+     * stateless JWTs verified purely by signature + expiry — see
+     * {@link AccessTokenDenylist} for why that previously left a compromised or
+     * just-logged-out access token fully usable until it naturally expired.
+     *
+     * @param accessToken the raw Bearer token from the logout request, or {@code null}
+     *                     if it could not be extracted (defensive only — the endpoint
+     *                     requires authentication, so this is not expected in
+     *                     practice). When {@code null} or unparseable, only the
+     *                     refresh-token revocation takes effect.
+     */
     @Transactional
-    public void logout(UUID userId) {
+    public void logout(UUID userId, String accessToken) {
         refreshTokenRepository.deleteByUserId(userId);
+        denylistAccessToken(accessToken);
+    }
+
+    private void denylistAccessToken(String accessToken) {
+        if (accessToken == null) {
+            return;
+        }
+        try {
+            Claims claims = jwtTokenProvider.parseAllClaims(accessToken);
+            accessTokenDenylist.revoke(jwtTokenProvider.getJti(claims));
+        } catch (JwtException ex) {
+            log.debug("Unable to parse access token during logout: {}", ex.getClass().getSimpleName());
+        }
     }
 
     private AuthResponse buildAuthResponse(User user) {

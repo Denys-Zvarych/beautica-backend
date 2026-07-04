@@ -16,9 +16,13 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.core.context.SecurityContextHolder;
 
+import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -31,6 +35,12 @@ class JwtAuthenticationFilterTest {
     private JwtTokenProvider jwtTokenProvider;
 
     @Mock
+    private AccessTokenDenylist accessTokenDenylist;
+
+    @Mock
+    private TokensValidAfterCache tokensValidAfterCache;
+
+    @Mock
     private Claims mockClaims;
 
     @InjectMocks
@@ -39,6 +49,11 @@ class JwtAuthenticationFilterTest {
     @BeforeEach
     void setUp() {
         SecurityContextHolder.clearContext();
+        // Default: no password reset has ever occurred for any user. Marked lenient()
+        // because most tests below short-circuit (bad token, wrong type, jti denylisted,
+        // etc.) before this cache is ever consulted, and MockitoExtension's strict-stubs
+        // mode would otherwise flag the stub as unnecessary on those tests.
+        lenient().when(tokensValidAfterCache.get(any(UUID.class))).thenReturn(Optional.empty());
     }
 
     @AfterEach
@@ -138,6 +153,65 @@ class JwtAuthenticationFilterTest {
                 .isEqualTo(userId);
 
         verify(jwtTokenProvider, times(1)).parseAllClaims("validToken");
+    }
+
+    @Test
+    @DisplayName("should_notAuthenticate_when_jtiIsDenylisted")
+    void should_notAuthenticate_when_jtiIsDenylisted() throws Exception {
+        var jti = "revoked-jti-abc123";
+
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer revokedToken");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("revokedToken")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getJti(mockClaims)).thenReturn(jti);
+        when(accessTokenDenylist.isRevoked(jti)).thenReturn(true);
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(chain.getRequest())
+                .as("chain must be called even when the jti is denylisted (unauthenticated pass-through)")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("no authentication must be set for a denylisted jti — this is the guarantee "
+                        + "the happy-path test alone cannot prove (Mockito defaults unstubbed "
+                        + "isRevoked() to false)")
+                .isNull();
+        // The request must never progress past the denylist check to claim extraction.
+        verify(jwtTokenProvider, times(0)).getUserIdFromToken(mockClaims);
+    }
+
+    @Test
+    @DisplayName("should_notAuthenticate_when_tokenIssuedBeforeUsersTokensValidAfter")
+    void should_notAuthenticate_when_tokenIssuedBeforeUsersTokensValidAfter() throws Exception {
+        var userId = UUID.randomUUID();
+        Instant issuedAt = Instant.parse("2025-01-01T00:00:00Z");
+        Instant tokensValidAfter = Instant.parse("2025-06-01T00:00:00Z");
+
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer preResetToken");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("preResetToken")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims)).thenReturn(userId);
+        when(tokensValidAfterCache.get(userId)).thenReturn(Optional.of(tokensValidAfter));
+        when(jwtTokenProvider.getIssuedAt(mockClaims)).thenReturn(issuedAt);
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(chain.getRequest())
+                .as("chain must be called even when the token predates a password reset")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("no authentication must be set when the token's iat predates tokensValidAfter")
+                .isNull();
+        // The request must never progress to role/email extraction once rejected.
+        verify(jwtTokenProvider, times(0)).getRoleFromToken(mockClaims);
     }
 
     @Test

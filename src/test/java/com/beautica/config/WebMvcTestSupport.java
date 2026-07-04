@@ -1,8 +1,10 @@
 package com.beautica.config;
 
+import com.beautica.auth.AccessTokenDenylist;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.PasswordResetService;
+import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.LoadingCache;
@@ -53,8 +55,10 @@ public class WebMvcTestSupport {
      */
     @Bean
     @Primary
-    public JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-        return new JwtAuthenticationFilter(jwtTokenProvider) {
+    public JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
+                                                           AccessTokenDenylist accessTokenDenylist,
+                                                           TokensValidAfterCache tokensValidAfterCache) {
+        return new JwtAuthenticationFilter(jwtTokenProvider, accessTokenDenylist, tokensValidAfterCache) {
             @Override
             protected void doFilterInternal(HttpServletRequest req,
                                             HttpServletResponse res,
@@ -63,6 +67,31 @@ public class WebMvcTestSupport {
                 chain.doFilter(req, res);
             }
         };
+    }
+
+    /**
+     * Mock {@link AccessTokenDenylist}: not a {@code Filter}/{@code Controller}, so it
+     * is excluded from {@code @WebMvcTest} component scanning like every other plain
+     * {@code @Component}. Provided here (once) so the {@link JwtAuthenticationFilter}
+     * constructor above resolves without every importing test class needing its own
+     * {@code @MockBean}.
+     */
+    @Bean
+    @Primary
+    public AccessTokenDenylist accessTokenDenylist() {
+        return Mockito.mock(AccessTokenDenylist.class);
+    }
+
+    /**
+     * Mock {@link TokensValidAfterCache}: same rationale as {@link #accessTokenDenylist()}
+     * above — a plain {@code @Component}, excluded from {@code @WebMvcTest} scanning,
+     * provided here once so the {@link JwtAuthenticationFilter} constructor resolves
+     * without every importing test class needing its own {@code @MockBean}.
+     */
+    @Bean
+    @Primary
+    public TokensValidAfterCache tokensValidAfterCache() {
+        return Mockito.mock(TokensValidAfterCache.class);
     }
 
     /**

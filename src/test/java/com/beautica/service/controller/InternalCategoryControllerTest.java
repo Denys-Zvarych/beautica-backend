@@ -1,7 +1,9 @@
 package com.beautica.service.controller;
 
+import com.beautica.auth.AccessTokenDenylist;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
+import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.InternalApiKeyFilter;
@@ -84,8 +86,10 @@ class InternalCategoryControllerTest {
         }
 
         @Bean
-        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
-            return new JwtAuthenticationFilter(jwtTokenProvider) {
+        JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
+                                                        AccessTokenDenylist accessTokenDenylist,
+                                                        TokensValidAfterCache tokensValidAfterCache) {
+            return new JwtAuthenticationFilter(jwtTokenProvider, accessTokenDenylist, tokensValidAfterCache) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
                                                 HttpServletResponse res,
@@ -144,6 +148,12 @@ class InternalCategoryControllerTest {
 
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
+
+    @MockBean
+    private AccessTokenDenylist accessTokenDenylist;
+
+    @MockBean
+    private TokensValidAfterCache tokensValidAfterCache;
 
     // ── GET /api/v1/internal/service-categories ────────────────────────────────
 

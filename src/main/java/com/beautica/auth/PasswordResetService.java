@@ -28,6 +28,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Locale;
+import java.util.UUID;
 
 /**
  * Handles the two-step password-reset flow:
@@ -59,6 +60,7 @@ public class PasswordResetService {
     private final PasswordEncoder passwordEncoder;
     private final EmailNotificationService emailNotificationService;
     private final TaskExecutor emailExecutor;
+    private final TokensValidAfterCache tokensValidAfterCache;
     private final Clock clock;
     private final String frontendBaseUrl;
     private final long tokenExpirationHours;
@@ -71,6 +73,7 @@ public class PasswordResetService {
             PasswordEncoder passwordEncoder,
             EmailNotificationService emailNotificationService,
             @Qualifier("emailExecutor") TaskExecutor emailExecutor,
+            TokensValidAfterCache tokensValidAfterCache,
             Clock clock,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             @Value("${app.password-reset.token-expiration-hours:1}") long tokenExpirationHours
@@ -82,6 +85,7 @@ public class PasswordResetService {
         this.passwordEncoder = passwordEncoder;
         this.emailNotificationService = emailNotificationService;
         this.emailExecutor = emailExecutor;
+        this.tokensValidAfterCache = tokensValidAfterCache;
         this.clock = clock;
         this.frontendBaseUrl = frontendBaseUrl;
         this.tokenExpirationHours = tokenExpirationHours;
@@ -137,9 +141,12 @@ public class PasswordResetService {
      * cannot probe which state was reached.
      *
      * <p>On success: the user's password hash is updated, the consumed token is marked
-     * used, every other outstanding reset token for the user is invalidated, and every
-     * existing refresh token (i.e., all sessions) is revoked. No auth tokens are
-     * returned — the client must route to the login screen.
+     * used, every other outstanding reset token for the user is invalidated, every
+     * existing refresh token (i.e., all sessions) is revoked, AND {@code tokensValidAfter}
+     * is stamped so any already-issued access token also stops working (see
+     * {@link TokensValidAfterCache} / {@link JwtAuthenticationFilter}) — otherwise a
+     * stolen access token would remain usable for its remaining TTL despite the reset.
+     * No auth tokens are returned — the client must route to the login screen.
      *
      * @param request validated DTO carrying the raw token from the email link and the desired new password
      * @throws BusinessException (400) for invalid / used / expired token
@@ -174,6 +181,13 @@ public class PasswordResetService {
         // explicit save() call is required (it would be a redundant no-op).
         user.setPasswordHash(newPasswordHash);
 
+        // Revokes every access token issued before this instant (checked by
+        // JwtAuthenticationFilter via TokensValidAfterCache). Without this, an attacker
+        // holding a stolen access token kept full API access for up to its remaining TTL
+        // even after this reset — refresh-token revocation alone (below) only stops NEW
+        // access tokens from being minted, it does not invalidate ones already issued.
+        user.setTokensValidAfter(clock.instant());
+
         // Primary single-use enforcement: flip the just-validated, pessimistically-locked
         // row directly. This is the authoritative consume — kept independent of the bulk
         // sweep below, which is defence-in-depth only.
@@ -183,6 +197,19 @@ public class PasswordResetService {
         // then terminate all existing sessions (global logout).
         passwordResetTokenRepository.markAllUsedByUserId(user.getId());
         refreshTokenRepository.deleteByUserId(user.getId());
+
+        // Evict the cached tokensValidAfter only AFTER this transaction commits — NOT
+        // synchronously here. TokensValidAfterCache#get() is a read-through cache backed by
+        // the DB row this method is about to update: under READ COMMITTED, a concurrent
+        // request that misses the cache in the window between an inline invalidate() and
+        // the actual COMMIT would read the still-uncommitted (stale, pre-reset) DB value and
+        // cache that stale "no reset happened" answer for the full TTL — reopening the exact
+        // stolen-access-token window this feature exists to close. Deferring to afterCommit
+        // closes that race: by the time anyone can observe an evicted cache, the fresh value
+        // is already committed and visible. (This is why the AccessTokenDenylist.revoke
+        // analogy doesn't apply here: that denylist has no DB read-through to race against,
+        // so synchronous eviction is safe there but not for this cache.)
+        evictTokensValidAfterCache(user.getId());
 
         log.info("Password reset completed: userId={}", user.getId());
     }
@@ -257,6 +284,36 @@ public class PasswordResetService {
             // No active transaction (unit-test path) — call directly on the calling thread.
             emailExecutor.execute(() ->
                     emailNotificationService.sendPasswordResetEmail(email, resetLink));
+        }
+    }
+
+    /**
+     * Evicts {@code userId}'s entry from {@link TokensValidAfterCache} after the current
+     * transaction commits, never before.
+     *
+     * <p>Mirrors {@link #scheduleResetEmail}: when no active transaction synchronization
+     * exists (e.g. in unit tests where the {@code @Transactional} proxy is bypassed), the
+     * eviction runs immediately on the calling thread so tests can verify the call without
+     * standing up a transaction manager.
+     *
+     * <p>See the call site in {@link #resetPassword} for why {@code afterCommit} — rather
+     * than a synchronous inline call — is required here: this cache read-through hits the
+     * DB row this method just updated, so an eviction that fires before commit reopens a
+     * stale-read race window.
+     */
+    private void evictTokensValidAfterCache(UUID userId) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            tokensValidAfterCache.invalidate(userId);
+                        }
+                    }
+            );
+        } else {
+            // No active transaction (unit-test path) — call directly on the calling thread.
+            tokensValidAfterCache.invalidate(userId);
         }
     }
 }

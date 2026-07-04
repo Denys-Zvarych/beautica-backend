@@ -24,6 +24,7 @@ import com.beautica.user.RefreshToken;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import io.jsonwebtoken.Claims;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -90,6 +91,12 @@ class AuthServiceTest {
     @Mock
     private Clock clock;
 
+    @Mock
+    private JwtTokenProvider jwtTokenProvider;
+
+    @Mock
+    private AccessTokenDenylist accessTokenDenylist;
+
     private PasswordEncoder passwordEncoder;
     private AuthService authService;
     // Inline synchronous TaskExecutor: runs the Runnable on the calling thread so
@@ -141,7 +148,9 @@ class AuthServiceTest {
                 emailNotificationService,
                 syncExecutor,
                 emailVerificationProcessor,
-                verificationPolicyConfig
+                verificationPolicyConfig,
+                jwtTokenProvider,
+                accessTokenDenylist
         );
     }
 
@@ -408,15 +417,54 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("logout deletes all refresh tokens for the user")
-    void should_deleteAllUserTokens_when_logoutCalled() {
+    @DisplayName("logout deletes all refresh tokens for the user and denylists the access token's jti")
+    void should_deleteAllUserTokensAndDenylistJti_when_logoutCalled() {
+        var userId = UUID.randomUUID();
+        var accessToken = "access.token.value";
+        var claims = org.mockito.Mockito.mock(Claims.class);
+        log.debug("Arrange: userId={}", userId);
+
+        when(jwtTokenProvider.parseAllClaims(accessToken)).thenReturn(claims);
+        when(jwtTokenProvider.getJti(claims)).thenReturn("jti-123");
+
+        log.debug("Act: logout for userId={} — expects all refresh tokens deleted and jti denylisted", userId);
+        authService.logout(userId, accessToken);
+
+        verify(refreshTokenRepository).deleteByUserId(userId);
+        verify(accessTokenDenylist).revoke("jti-123");
+    }
+
+    @Test
+    @DisplayName("logout tolerates a null access token, still deleting refresh tokens")
+    void should_stillDeleteRefreshTokens_when_logoutCalledWithNullAccessToken() {
         var userId = UUID.randomUUID();
         log.debug("Arrange: userId={}", userId);
 
-        log.debug("Act: logout for userId={} — expects all refresh tokens to be deleted", userId);
-        authService.logout(userId);
+        log.debug("Act: logout for userId={} with no extractable access token", userId);
+        authService.logout(userId, null);
 
         verify(refreshTokenRepository).deleteByUserId(userId);
+        verify(accessTokenDenylist, never()).revoke(anyString());
+    }
+
+    @Test
+    @DisplayName("logout swallows an unparseable access token (JwtException), still deleting refresh tokens")
+    void should_stillDeleteRefreshTokensAndNotRevoke_when_logoutAccessTokenUnparseable() {
+        var userId = UUID.randomUUID();
+        var garbageToken = "not-a-real.jwt.value";
+        log.debug("Arrange: userId={}, access token that fails signature/format parsing", userId);
+
+        when(jwtTokenProvider.parseAllClaims(garbageToken))
+                .thenThrow(new io.jsonwebtoken.MalformedJwtException("malformed compact JWT"));
+
+        log.debug("Act: logout for userId={} with an unparseable access token — must not throw", userId);
+        authService.logout(userId, garbageToken);
+
+        // Defensive catch (JwtException) in denylistAccessToken must swallow the parse
+        // failure: refresh-token revocation (the primary logout guarantee) still happens,
+        // and revoke() is never reached since no jti could be extracted.
+        verify(refreshTokenRepository).deleteByUserId(userId);
+        verify(accessTokenDenylist, never()).revoke(anyString());
     }
 
     @Test
@@ -1004,7 +1052,9 @@ class AuthServiceTest {
                 emailNotificationService,
                 rejectingExecutor,
                 emailVerificationProcessor,
-                verificationPolicyConfig
+                verificationPolicyConfig,
+                jwtTokenProvider,
+                accessTokenDenylist
         );
 
         when(userRepository.existsByEmail("reject@example.com")).thenReturn(false);
@@ -1046,7 +1096,9 @@ class AuthServiceTest {
                 emailNotificationService,
                 rejectingExecutor,
                 emailVerificationProcessor,
-                verificationPolicyConfig
+                verificationPolicyConfig,
+                jwtTokenProvider,
+                accessTokenDenylist
         );
 
         when(userRepository.existsByEmail("logreject@example.com")).thenReturn(false);

@@ -1,6 +1,7 @@
 package com.beautica.auth;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterRequest;
@@ -23,6 +24,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -402,6 +406,52 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         long remaining = transactionTemplate.execute(status ->
                 refreshTokenRepository.countByUserId(user.getId()));
         assertThat(remaining).isZero();
+    }
+
+    @Test
+    @DisplayName("should return 401 for a pre-reset access token after a successful password reset")
+    void should_return401_when_reusingPreResetAccessTokenAfterReset() throws Exception {
+        String email = "reset.accesstoken@beautica.com";
+        String oldPassword = "OldPassword1!";
+        log.debug("Arrange: register, verify, and log in email={} to obtain a pre-reset access token", email);
+        registerAndVerify(email, oldPassword);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, oldPassword), String.class);
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String preResetAccessToken = loginBody.data().accessToken();
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(preResetAccessToken);
+
+        // Sanity check: the token authenticates before the reset.
+        ResponseEntity<String> preResetMe = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(headers), String.class);
+        assertThat(preResetMe.getStatusCode())
+                .as("the pre-reset access token must authenticate before the reset")
+                .isEqualTo(HttpStatus.OK);
+
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+        restTemplate.postForEntity("/api/v1/auth/forgot-password",
+                new ForgotPasswordRequest(email), String.class);
+        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
+        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
+
+        log.debug("Act: complete the reset — the pre-reset access token's iat now predates tokensValidAfter");
+        ResponseEntity<String> resetResp = restTemplate.postForEntity(
+                "/api/v1/auth/reset-password",
+                new ResetPasswordRequest(rawToken, "NewPassword99!"),
+                String.class);
+        assertThat(resetResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<String> postResetMe = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(headers), String.class);
+
+        assertThat(postResetMe.getStatusCode())
+                .as("a pre-reset access token must be rejected after the reset, even though its own "
+                        + "`exp` has not elapsed")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test

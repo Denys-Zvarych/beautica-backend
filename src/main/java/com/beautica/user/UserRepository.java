@@ -24,6 +24,17 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
 
     /**
+     * Scalar projection backing {@link com.beautica.auth.TokensValidAfterCache} — avoids
+     * loading the full {@link User} entity on every cache-refresh read. Returns
+     * {@code Optional.empty()} both when the user does not exist and when
+     * {@code tokensValidAfter} is {@code null} (the common "never reset" case); callers
+     * only need to distinguish "no reset since this instant" from "reset happened at
+     * this instant", so the two empty cases are equivalent for this read path.
+     */
+    @Query("SELECT u.tokensValidAfter FROM User u WHERE u.id = :userId")
+    Optional<Instant> findTokensValidAfterById(@Param("userId") UUID userId);
+
+    /**
      * Acquires a PostgreSQL row-level exclusive lock on the user row before the
      * resend-throttle check runs. This serializes concurrent resend requests for
      * the same email so the TOCTOU window between the cooldown read and the OTP

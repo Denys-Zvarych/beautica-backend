@@ -293,6 +293,59 @@ class AuthControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("should return 401 when reusing an access token after logout")
+    void should_return401_when_reusingAccessTokenAfterLogout() throws Exception {
+        var email = "logout.reuse@beautica.com";
+        var password = "Logoutreuse1";
+        log.debug("Arrange: obtained access token for {}", email);
+
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
+                String.class);
+        verifyEmailInDb(email);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, password),
+                String.class);
+
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String accessToken = loginBody.data().accessToken();
+
+        HttpHeaders authHeaders = new HttpHeaders();
+        authHeaders.setBearerAuth(accessToken);
+        authHeaders.setContentType(MediaType.APPLICATION_JSON);
+
+        // Sanity check: the freshly-issued access token works on an authenticated endpoint
+        // before logout, so the eventual 401 below is attributable to the logout, not to
+        // some unrelated authentication failure.
+        ResponseEntity<String> preLogoutMe = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(authHeaders), String.class);
+        assertThat(preLogoutMe.getStatusCode())
+                .as("access token must authenticate GET /users/me before logout")
+                .isEqualTo(HttpStatus.OK);
+
+        log.debug("Act: POST /auth/logout with the access token for email={}", email);
+        ResponseEntity<Void> logoutResp = restTemplate.exchange(
+                "/api/v1/auth/logout",
+                HttpMethod.POST,
+                new HttpEntity<>(authHeaders),
+                Void.class);
+        assertThat(logoutResp.getStatusCode())
+                .as("status for logout with valid Bearer token")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        log.debug("Act: replay the SAME (now-denylisted) access token on an authenticated endpoint");
+        ResponseEntity<String> postLogoutMe = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(authHeaders), String.class);
+
+        assertThat(postLogoutMe.getStatusCode())
+                .as("a denylisted access token must be rejected even though its own `exp` has not elapsed")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
     @DisplayName("should return 401 when old refresh token is replayed after rotation")
     void should_return401_when_oldRefreshTokenReplayedAfterRotation() throws Exception {
         var email = "replay.user@beautica.com";

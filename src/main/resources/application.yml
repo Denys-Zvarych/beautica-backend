@@ -116,7 +116,7 @@ springdoc:
 app:
   jwt:
     secret: ${JWT_SECRET}
-    access-token-expiration: 900000       # 15 min in ms
+    access-token-expiration: 3600000      # 1 hour in ms
     refresh-token-expiration: 604800000   # 7 days in ms
   cloudflare-r2:
     # Master kill-switch. When false (default), S3Config does NOT register an S3Client bean and
