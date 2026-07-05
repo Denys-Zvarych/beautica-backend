@@ -4,21 +4,26 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.LoginRequest;
+import com.beautica.auth.dto.RefreshRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
+import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
+import com.beautica.auth.dto.VerifyPasswordResetOtpResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.VerificationErrorResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.user.PasswordResetToken;
-import com.beautica.user.PasswordResetTokenRepository;
+import com.beautica.user.PasswordResetTicketRepository;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,29 +36,26 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.mockito.Mockito;
-
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
-
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 /**
- * Integration tests for the password-reset endpoints.
+ * Integration tests for the password-reset OTP endpoints (Phase A — replaces the old
+ * email-link flow):
+ * <ol>
+ *   <li>{@code POST /auth/forgot-password} — mints + emails a 6-digit OTP.</li>
+ *   <li>{@code POST /auth/verify-password-reset-otp} — verifies the OTP, returns a resetTicket.</li>
+ *   <li>{@code POST /auth/reset-password} — consumes the resetTicket, updates the password.</li>
+ * </ol>
  *
  * <p>Uses the shared singleton Testcontainers Postgres from {@link AbstractIntegrationTest}.
  * {@code EmailNotificationService} is a {@code @MockBean} there — no SMTP connection needed;
  * we verify calls on the mock to confirm emails are sent or suppressed.
- *
- * <p>All actions go through the real HTTP stack to exercise the full Spring Security +
- * transaction + rate-limit filter chain, not just the service in isolation.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Password-reset endpoints — integration")
+@DisplayName("Password-reset OTP endpoints — integration")
 class PasswordResetControllerIT extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(PasswordResetControllerIT.class);
@@ -68,25 +70,14 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     private UserRepository userRepository;
 
     @Autowired
-    private PasswordResetTokenRepository passwordResetTokenRepository;
+    private PasswordResetTicketRepository passwordResetTicketRepository;
 
     @Autowired
     private RefreshTokenRepository refreshTokenRepository;
 
     @Autowired
-    private TokenGenerator tokenGenerator;
-
-    @Autowired
     private TransactionTemplate transactionTemplate;
 
-    /**
-     * Resets mock invocation counts before every test.
-     *
-     * <p>{@code @MockBean} creates a shared Mockito mock for the entire Spring context.
-     * Without clearing, {@code verify(emailNotificationService)} in test N+1 sees the
-     * cumulative invocations from tests 1..N and fails with "wanted 1, was 2" etc.
-     * {@link Mockito#clearInvocations} resets only the invocation log — stubbing is kept.
-     */
     @BeforeEach
     void resetMockInvocations() {
         Mockito.clearInvocations(emailNotificationService);
@@ -97,13 +88,11 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     // =========================================================================
 
     @Test
-    @DisplayName("should return 200 and send email when email belongs to active+verified user")
-    void should_return200AndSendEmail_when_emailBelongsToVerifiedActiveUser() throws Exception {
+    @DisplayName("should return 200 and send OTP email when email belongs to active+verified user")
+    void should_return200AndSendOtpEmail_when_emailBelongsToVerifiedActiveUser() throws Exception {
         String email = "reset.valid@beautica.com";
-        log.debug("Arrange: register and verify email={}", email);
         registerAndVerify(email, "Password1!");
 
-        log.debug("Act: POST /auth/forgot-password for valid user");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/forgot-password",
                 new ForgotPasswordRequest(email),
@@ -112,19 +101,15 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
         assertThat(body.success()).isTrue();
-        assertThat(body.message()).isNotBlank();
 
-        // A token row must have been persisted.
-        assertThat(passwordResetTokenRepository.findAll()).isNotEmpty();
-        // Email must have been dispatched.
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), anyString());
+        var user = transactionTemplate.execute(s -> userRepository.findByEmail(email).orElseThrow());
+        assertThat(user.getPasswordResetCodeHash()).isNotNull();
+        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), any(String.class));
     }
 
     @Test
     @DisplayName("should return 200 with identical body and send no email when email is unknown (enumeration protection)")
-    void should_return200AndSendNothing_when_emailUnknown() throws Exception {
-        log.debug("Arrange: no user in DB");
-
+    void should_return200AndSendNothing_when_emailUnknown() {
         ResponseEntity<String> unknownResp = restTemplate.postForEntity(
                 "/api/v1/auth/forgot-password",
                 new ForgotPasswordRequest("unknown-nobody@beautica.com"),
@@ -135,11 +120,9 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
                 String.class);
 
         assertThat(unknownResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        // Bodies must be identical — no distinguishing signal.
         assertThat(unknownResp.getBody()).isEqualTo(alsoUnknownResp.getBody());
 
-        assertThat(passwordResetTokenRepository.findAll()).isEmpty();
-        verify(emailNotificationService, never()).sendPasswordResetEmail(anyString(), anyString());
+        verify(emailNotificationService, never()).sendPasswordResetOtpEmail(any(), any());
     }
 
     @Test
@@ -153,15 +136,173 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
+    // =========================================================================
+    // POST /api/v1/auth/verify-password-reset-otp
+    // =========================================================================
+
     @Test
-    @DisplayName("should return 400 when email field is malformed")
-    void should_return400_when_emailIsMalformed() {
+    @DisplayName("should return 200 with a resetTicket when the correct OTP is submitted")
+    void should_return200WithResetTicket_when_otpCorrect() throws Exception {
+        String email = "reset.otp.valid@beautica.com";
+        registerAndVerify(email, "Password1!");
+        String rawOtp = requestResetAndCaptureOtp(email);
+
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/api/v1/auth/forgot-password",
-                new ForgotPasswordRequest("not-an-email"),
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest(email, rawOtp),
+                String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<VerifyPasswordResetOtpResponse>>() {});
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().resetTicket()).isNotBlank();
+
+        assertThat(passwordResetTicketRepository.findAll()).isNotEmpty();
+    }
+
+    @Test
+    @DisplayName("should return 400 INVALID_CODE when a wrong OTP is submitted")
+    void should_return400InvalidCode_when_otpWrong() throws Exception {
+        String email = "reset.otp.wrong@beautica.com";
+        registerAndVerify(email, "Password1!");
+        String rawOtp = requestResetAndCaptureOtp(email);
+        String wrongOtp = rawOtp.equals("000000") ? "111111" : "000000";
+
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest(email, wrongOtp),
                 String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<VerificationErrorResponse>>() {});
+        assertThat(body.data().code()).isEqualTo("INVALID_CODE");
+    }
+
+    @Test
+    @DisplayName("should return 400 CODE_EXPIRED when the OTP has expired")
+    void should_return400CodeExpired_when_otpExpired() throws Exception {
+        String email = "reset.otp.expired@beautica.com";
+        registerAndVerify(email, "Password1!");
+        requestResetAndCaptureOtp(email);
+
+        jdbcTemplate.update(
+                "UPDATE users SET password_reset_code_expires_at = ? WHERE email = ?",
+                java.sql.Timestamp.from(java.time.Instant.now().minusSeconds(1)), email);
+
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest(email, "000000"),
+                String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<VerificationErrorResponse>>() {});
+        assertThat(body.data().code()).isEqualTo("CODE_EXPIRED");
+    }
+
+    @Test
+    @DisplayName("should return 400 INVALID_CODE for an unknown email (anti-enumeration, wire-identical to wrong-code)")
+    void should_return400InvalidCode_when_emailUnknown() throws Exception {
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest("ghost@beautica.com", "123456"),
+                String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<VerificationErrorResponse>>() {});
+        assertThat(body.data().code()).isEqualTo("INVALID_CODE");
+    }
+
+    // The three tests below close a parity gap with the mirrored email-verification flow:
+    // AuthControllerVerifyEmailTest asserts the same three malformed-code shapes as fast
+    // @WebMvcTest cases (5-digit / non-numeric / blank code all violate
+    // VerifyPasswordResetOtpRequest's @Size(min=6,max=6) / @Pattern(^[0-9]{6}$) / @NotBlank
+    // BEFORE PasswordResetOtpProcessor is ever reached), but no equivalent existed for
+    // verify-password-reset-otp — every other test in this class exercises business-rule
+    // rejections (wrong code, expired, lockout), not the Bean Validation boundary itself.
+    // No registerAndVerify/OTP setup is needed: validation short-circuits before the DB lookup.
+
+    @Test
+    @DisplayName("should return 400 when code is only 5 digits (below the 6-digit minimum)")
+    void should_return400_when_codeIsFiveDigits() {
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest("someone@beautica.com", "12345"),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("5-digit code must fail @Size(min=6,max=6) before reaching the service")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("should return 400 when code contains non-numeric characters")
+    void should_return400_when_codeIsNonNumeric() {
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest("someone@beautica.com", "abcdef"),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("alphabetic code must fail @Pattern(^[0-9]{6}$) before reaching the service")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("should return 400 when code field is blank")
+    void should_return400_when_codeIsBlank() {
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest("someone@beautica.com", ""),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("blank code must fail @NotBlank before reaching the service")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("should lock the account after cumulative failures and reject wire-identically while locked")
+    void should_lockAndRejectWireIdentically_when_cumulativeFailuresReachThreshold() throws Exception {
+        String email = "reset.otp.lockout@beautica.com";
+        registerAndVerify(email, "Password1!");
+        requestResetAndCaptureOtp(email);
+
+        // cumulative-failure-threshold = 10 (test profile mirrors prod default).
+        for (int i = 0; i < 10; i++) {
+            ResponseEntity<String> fail = restTemplate.postForEntity(
+                    "/api/v1/auth/verify-password-reset-otp",
+                    new VerifyPasswordResetOtpRequest(email, "999999"),
+                    String.class);
+            assertThat(fail.getStatusCode())
+                    .as("wrong-code attempt %d must be 400", i + 1)
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+            if (i < 4) {
+                continue;
+            }
+            // Reset the per-code attempt window (without touching the lifetime counter) so
+            // each cycle of 5 wrong guesses doesn't just hit CODE_EXPIRED from the attempt cap.
+            jdbcTemplate.update("UPDATE users SET password_reset_attempts = 0 WHERE email = ?", email);
+        }
+
+        var user = transactionTemplate.execute(s -> userRepository.findByEmail(email).orElseThrow());
+        assertThat(user.getPasswordResetLockedUntil())
+                .as("account must be locked once cumulative failures reach the threshold")
+                .isNotNull();
+
+        ResponseEntity<String> lockedResponse = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest(email, "123456"),
+                String.class);
+        assertThat(lockedResponse.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var lockedBody = objectMapper.readValue(
+                lockedResponse.getBody(), new TypeReference<ApiResponse<VerificationErrorResponse>>() {});
+        assertThat(lockedBody.data().code())
+                .as("locked state must surface as the generic INVALID_CODE — no new oracle")
+                .isEqualTo("INVALID_CODE");
     }
 
     // =========================================================================
@@ -169,25 +310,18 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     // =========================================================================
 
     @Test
-    @DisplayName("should return 200 and change password when token is valid")
-    void should_return200AndChangePassword_when_tokenIsValid() throws Exception {
+    @DisplayName("should return 200 and change password when resetTicket is valid — full forgot→verify→reset flow")
+    void should_return200AndChangePassword_when_resetTicketIsValid() throws Exception {
         String email = "reset.confirm@beautica.com";
         String oldPassword = "OldPassword1!";
         String newPassword = "NewPassword99!";
-        log.debug("Arrange: register, verify, request reset for email={}", email);
         registerAndVerify(email, oldPassword);
 
-        // Capture the reset URL from the (mocked) email send call.
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        restTemplate.postForEntity("/api/v1/auth/forgot-password",
-                new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
-        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
+        String rawTicket = requestVerifyAndCaptureTicket(email);
 
-        log.debug("Act: POST /auth/reset-password with captured raw token");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, newPassword),
+                new ResetPasswordRequest(rawTicket, newPassword),
                 String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -195,37 +329,28 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         assertThat(body.success()).isTrue();
         assertThat(body.data()).isNull();
 
-        // Old password must no longer authenticate.
         ResponseEntity<String> loginOld = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, oldPassword), String.class);
         assertThat(loginOld.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
 
-        // New password must authenticate.
         ResponseEntity<String> loginNew = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, newPassword), String.class);
         assertThat(loginNew.getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     @Test
-    @DisplayName("should return 400 on second submission of same token (single-use)")
-    void should_return400_when_tokenSubmittedTwice() throws Exception {
+    @DisplayName("should return 400 on second submission of the same resetTicket (single-use)")
+    void should_return400_when_ticketSubmittedTwice() throws Exception {
         String email = "reset.singleuse@beautica.com";
         registerAndVerify(email, "Password1!");
+        String rawTicket = requestVerifyAndCaptureTicket(email);
 
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        restTemplate.postForEntity("/api/v1/auth/forgot-password",
-                new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
-        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
-
-        // First use succeeds.
         restTemplate.postForEntity("/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, "NewPassword99!"), String.class);
+                new ResetPasswordRequest(rawTicket, "NewPassword99!"), String.class);
 
-        // Second use must be rejected.
         ResponseEntity<String> secondResp = restTemplate.postForEntity(
                 "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, "AnotherPassword1!"),
+                new ResetPasswordRequest(rawTicket, "AnotherPassword1!"),
                 String.class);
 
         assertThat(secondResp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -234,11 +359,11 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should return 400 with generic message for a random unknown token")
-    void should_return400WithGenericMessage_when_tokenIsUnknown() throws Exception {
+    @DisplayName("should return 400 with generic message for a random unknown resetTicket")
+    void should_return400WithGenericMessage_when_ticketIsUnknown() throws Exception {
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/reset-password",
-                new ResetPasswordRequest("completely-random-nonexistent-token", "ValidPassword1!"),
+                new ResetPasswordRequest("completely-random-nonexistent-ticket", "ValidPassword1!"),
                 String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -248,74 +373,8 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should return 400 with generic message for an expired token (full HTTP stack)")
-    void should_return400WithGenericMessage_when_tokenExpired() throws Exception {
-        String email = "reset.expired@beautica.com";
-        log.debug("Arrange: register+verify email={} then persist a token row already expired", email);
-        registerAndVerify(email, "Password1!");
-
-        // Persist a reset-token row whose expires_at is in the past. The DB stores the
-        // SHA-256 hash; the raw token is what the client submits over HTTP.
-        String rawToken = "expired-raw-token-" + java.util.UUID.randomUUID();
-        String hashedToken = tokenGenerator.hash(rawToken);
-        transactionTemplate.executeWithoutResult(status -> {
-            User user = userRepository.findByEmail(email).orElseThrow();
-            passwordResetTokenRepository.save(new PasswordResetToken(
-                    hashedToken, user.getId(), Instant.now().minus(2, ChronoUnit.HOURS)));
-        });
-
-        log.debug("Act: POST /auth/reset-password with the expired raw token");
-        ResponseEntity<String> response = restTemplate.postForEntity(
-                "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, "NewPassword99!"),
-                String.class);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
-        assertThat(body.success()).isFalse();
-        // Same generic message as used/unknown — the expired branch must not be distinguishable.
-        // GlobalExceptionHandler.handleBusiness maps BAD_REQUEST BusinessException to "Invalid request".
-        assertThat(body.message()).isEqualTo("Invalid request");
-    }
-
-    @Test
-    @DisplayName("should return 400 when new password is too short (bean validation)")
-    void should_return400_when_passwordTooShort() {
-        ResponseEntity<String> response = restTemplate.postForEntity(
-                "/api/v1/auth/reset-password",
-                new ResetPasswordRequest("some-valid-length-token", "short"),
-                String.class);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-    }
-
-    @Test
-    @DisplayName("should return 400 when new password is length-valid but has no uppercase (@StrongPassword)")
-    void should_return400_when_newPasswordHasNoUppercase() throws Exception {
-        String email = "reset.nouppercase@beautica.com";
-        log.debug("Arrange: register, verify, issue a real reset token for email={}", email);
-        registerAndVerify(email, "OldPassword1!");
-
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        restTemplate.postForEntity("/api/v1/auth/forgot-password",
-                new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
-        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
-
-        log.debug("Act: POST /auth/reset-password with valid token but no-uppercase new password");
-        ResponseEntity<String> response = restTemplate.postForEntity(
-                "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, "str0ngp@ss1"),
-                String.class);
-
-        assertThat(response.getStatusCode())
-                .as("status for reset-confirm with no-uppercase new password")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-    }
-
-    @Test
-    @DisplayName("should return 400 when token field is blank (bean validation)")
-    void should_return400_when_tokenIsBlank() {
+    @DisplayName("should return 400 when resetTicket field is blank (bean validation)")
+    void should_return400_when_resetTicketIsBlank() {
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/reset-password",
                 new ResetPasswordRequest("", "ValidPassword1!"),
@@ -325,60 +384,16 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should return 400 with errors.token='Token is invalid' when token has a non-base64url char (charset guard)")
-    void should_return400WithTokenFieldError_when_tokenHasDisallowedChar() throws Exception {
-        // Arrange — a token containing characters OUTSIDE the unpadded base64url alphabet
-        // [A-Za-z0-9_-] that SecureTokenGenerator emits: '+' and '=' are padded-base64 chars
-        // the new @Pattern("^[A-Za-z0-9_-]+$") guard now rejects BEFORE the SHA-256 hash + DB
-        // lookup. This is the security-backlog charset guard regression net.
-        String malformedToken = "abc+def==ghi";
-
-        // Act — JSON body, so '+'/'=' travel verbatim (no URL-encoding involved).
+    @DisplayName("should return 400 with errors.resetTicket='Reset ticket is invalid' when it has a non-base64url char")
+    void should_return400WithFieldError_when_resetTicketHasDisallowedChar() throws Exception {
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(malformedToken, "ValidPassword1!"),
+                new ResetPasswordRequest("abc+def==ghi", "ValidPassword1!"),
                 String.class);
 
-        // Assert — Bean Validation rejects it as a standard 400 validation envelope.
-        assertThat(response.getStatusCode())
-                .as("a token with a disallowed charset char must be rejected at validation, not at the DB")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-
-        var body = objectMapper.readValue(response.getBody(),
-                new TypeReference<ApiResponse<Void>>() {});
-        assertThat(body.success())
-                .as("success must be false")
-                .isFalse();
-
-        // The per-field error map carries the exact @Pattern message keyed by the DTO field.
-        assertThat(body.errors())
-                .as("errors map must carry the token field error from the @Pattern charset guard")
-                .containsEntry("token", "Token is invalid");
-    }
-
-    @Test
-    @DisplayName("should return 400 with errors.token='Token is invalid' when token contains a space")
-    void should_return400WithTokenFieldError_when_tokenContainsSpace() throws Exception {
-        // Arrange — a space is also outside [A-Za-z0-9_-]; covers the whitespace variant
-        // the prompt calls out explicitly (distinct from the '+'/'=' padding case above).
-        String malformedToken = "token with space";
-
-        // Act
-        ResponseEntity<String> response = restTemplate.postForEntity(
-                "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(malformedToken, "ValidPassword1!"),
-                String.class);
-
-        // Assert
-        assertThat(response.getStatusCode())
-                .as("a token containing whitespace must be rejected at validation")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-
-        var body = objectMapper.readValue(response.getBody(),
-                new TypeReference<ApiResponse<Void>>() {});
-        assertThat(body.errors())
-                .as("errors map must carry the token field error for the whitespace case too")
-                .containsEntry("token", "Token is invalid");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        assertThat(body.errors()).containsEntry("resetTicket", "Reset ticket is invalid");
     }
 
     @Test
@@ -387,21 +402,13 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         String email = "reset.sessions@beautica.com";
         registerAndVerify(email, "Password1!");
 
-        // Log in once to create a refresh token.
         restTemplate.postForEntity("/api/v1/auth/login",
                 new LoginRequest(email, "Password1!"), String.class);
 
-        // Issue and complete a reset.
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        restTemplate.postForEntity("/api/v1/auth/forgot-password",
-                new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
-        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
-
+        String rawTicket = requestVerifyAndCaptureTicket(email);
         restTemplate.postForEntity("/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, "NewPassword99!"), String.class);
+                new ResetPasswordRequest(rawTicket, "NewPassword99!"), String.class);
 
-        // No refresh tokens must remain for this user.
         var user = userRepository.findByEmail(email).orElseThrow();
         long remaining = transactionTemplate.execute(status ->
                 refreshTokenRepository.countByUserId(user.getId()));
@@ -413,7 +420,6 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
     void should_return401_when_reusingPreResetAccessTokenAfterReset() throws Exception {
         String email = "reset.accesstoken@beautica.com";
         String oldPassword = "OldPassword1!";
-        log.debug("Arrange: register, verify, and log in email={} to obtain a pre-reset access token", email);
         registerAndVerify(email, oldPassword);
 
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
@@ -425,56 +431,87 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(preResetAccessToken);
 
-        // Sanity check: the token authenticates before the reset.
         ResponseEntity<String> preResetMe = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(headers), String.class);
-        assertThat(preResetMe.getStatusCode())
-                .as("the pre-reset access token must authenticate before the reset")
-                .isEqualTo(HttpStatus.OK);
+        assertThat(preResetMe.getStatusCode()).isEqualTo(HttpStatus.OK);
 
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        restTemplate.postForEntity("/api/v1/auth/forgot-password",
-                new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
-        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
-
-        log.debug("Act: complete the reset — the pre-reset access token's iat now predates tokensValidAfter");
+        String rawTicket = requestVerifyAndCaptureTicket(email);
         ResponseEntity<String> resetResp = restTemplate.postForEntity(
                 "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, "NewPassword99!"),
+                new ResetPasswordRequest(rawTicket, "NewPassword99!"),
                 String.class);
         assertThat(resetResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         ResponseEntity<String> postResetMe = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(headers), String.class);
-
         assertThat(postResetMe.getStatusCode())
-                .as("a pre-reset access token must be rejected after the reset, even though its own "
-                        + "`exp` has not elapsed")
+                .as("a pre-reset access token must be rejected after the reset")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    // =========================================================================
+    // Authenticated entry point: POST /users/me/change-password/request-otp
+    // =========================================================================
+
+    @Test
+    @DisplayName("authenticated change-password-request-otp → verify-otp → reset-password forces the CALLER'S OWN session out too")
+    void should_forceOwnSessionOut_when_authenticatedChangePasswordFlowCompletes() throws Exception {
+        String email = "reset.selfsession@beautica.com";
+        String oldPassword = "OldPassword1!";
+        registerAndVerify(email, oldPassword);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, oldPassword), String.class);
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String accessToken = loginBody.data().accessToken();
+        String refreshToken = loginBody.data().refreshToken();
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(accessToken);
+
+        // Authenticated entry point — no request body, identified by the caller's own JWT.
+        ResponseEntity<String> otpReq = restTemplate.exchange(
+                "/api/v1/users/me/change-password/request-otp",
+                HttpMethod.POST, new HttpEntity<>(headers), String.class);
+        assertThat(otpReq.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ArgumentCaptor<String> otpCaptor = ArgumentCaptor.forClass(String.class);
+        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
+        String rawOtp = otpCaptor.getValue();
+
+        ResponseEntity<String> verifyResp = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest(email, rawOtp),
+                String.class);
+        var verifyBody = objectMapper.readValue(
+                verifyResp.getBody(), new TypeReference<ApiResponse<VerifyPasswordResetOtpResponse>>() {});
+        String rawTicket = verifyBody.data().resetTicket();
+
+        ResponseEntity<String> resetResp = restTemplate.postForEntity(
+                "/api/v1/auth/reset-password",
+                new ResetPasswordRequest(rawTicket, "NewPassword99!"),
+                String.class);
+        assertThat(resetResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // The unconditional refresh-token wipe + tokensValidAfter stamp in resetPassword()
+        // forces the CALLER'S OWN pre-reset session out too — no special-casing.
+        ResponseEntity<String> refreshResp = restTemplate.postForEntity(
+                "/api/v1/auth/refresh",
+                new RefreshRequest(refreshToken),
+                String.class);
+        assertThat(refreshResp.getStatusCode())
+                .as("the same session's existing refresh token must be rejected after self-service reset")
                 .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
-    @DisplayName("should not return auth tokens in reset-password response (no auto-login)")
-    void should_returnNoAuthTokens_when_resetSucceeds() throws Exception {
-        String email = "reset.nologin@beautica.com";
-        registerAndVerify(email, "Password1!");
-
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        restTemplate.postForEntity("/api/v1/auth/forgot-password",
-                new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
-        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
-
+    @DisplayName("unauthenticated caller gets 401 on change-password-request-otp")
+    void should_return401_when_changePasswordOtpRequestedWithoutJwt() {
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/api/v1/auth/reset-password",
-                new ResetPasswordRequest(rawToken, "NewPassword99!"),
-                String.class);
+                "/api/v1/users/me/change-password/request-otp", null, String.class);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
-        // data must be null — no access/refresh tokens embedded.
-        assertThat(body.data()).isNull();
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     // =========================================================================
@@ -499,23 +536,31 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
             userRepository.save(user);
         });
 
-        // Assert the precondition requestReset() depends on: active AND verified.
         User reread = userRepository.findByEmail(email).orElseThrow();
         assertThat(reread.isActive() && reread.isEmailVerified())
                 .as("user must be active and email-verified before forgot-password, else requestReset() no-ops")
                 .isTrue();
     }
 
-    /**
-     * Extracts the raw reset token from a reset URL of the form
-     * {@code https://host/reset-password?token=<rawToken>}.
-     */
-    private static String extractRawTokenFromUrl(String resetUrl) {
-        int idx = resetUrl.indexOf("?token=");
-        if (idx < 0) {
-            throw new AssertionError("Reset URL missing ?token= param: " + resetUrl);
-        }
-        String encoded = resetUrl.substring(idx + 7);
-        return java.net.URLDecoder.decode(encoded, java.nio.charset.StandardCharsets.UTF_8);
+    /** Calls forgot-password and captures the raw OTP from the (mocked) email send. */
+    private String requestResetAndCaptureOtp(String email) {
+        ArgumentCaptor<String> otpCaptor = ArgumentCaptor.forClass(String.class);
+        restTemplate.postForEntity("/api/v1/auth/forgot-password",
+                new ForgotPasswordRequest(email), String.class);
+        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
+        return otpCaptor.getValue();
+    }
+
+    /** Full forgot-password → verify-otp round trip, returning the minted raw resetTicket. */
+    private String requestVerifyAndCaptureTicket(String email) throws Exception {
+        String rawOtp = requestResetAndCaptureOtp(email);
+
+        ResponseEntity<String> verifyResp = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest(email, rawOtp),
+                String.class);
+        var verifyBody = objectMapper.readValue(
+                verifyResp.getBody(), new TypeReference<ApiResponse<VerifyPasswordResetOtpResponse>>() {});
+        return verifyBody.data().resetTicket();
     }
 }

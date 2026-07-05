@@ -36,6 +36,8 @@ app:
     reset-password-capacity: 100000
     profile-update-capacity: 100000
     support-contact-capacity: 100000
+    verify-password-reset-otp-capacity: 100000
+    change-password-otp-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.
@@ -66,6 +68,13 @@ app:
     resend-cooldown: 60s   # Integration tests use the production default; unit tests pass Duration directly
   password-reset:
     cleanup-retention: 7d
+  password-reset-otp:
+    otp-ttl: 15m
+    max-attempts-per-code: 5
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    resend-cooldown: 60s   # Integration tests use the production default; unit tests pass Duration directly
+    ticket-ttl: 10m
   outbox:
     # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
     payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=

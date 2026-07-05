@@ -80,9 +80,13 @@ public class SecurityConfig {
                             "/api/v1/auth/invite/accept",
                             "/api/v1/auth/verify-email",
                             "/api/v1/auth/resend-verification",
-                            // Phase 11.2 / 11.3 — password-reset flow is unauthenticated by design.
-                            // The caller holds no JWT (that is why they are resetting the password).
+                            // Phase 11.2 / 11.3 / A3 — password-reset OTP flow is unauthenticated by
+                            // design. The caller holds no JWT (that is why they are resetting the
+                            // password). Deliberately does NOT include
+                            // /api/v1/users/me/change-password/request-otp — that authenticated
+                            // entry point must fall through to anyRequest().authenticated() below.
                             "/api/v1/auth/forgot-password",
+                            "/api/v1/auth/verify-password-reset-otp",
                             "/api/v1/auth/reset-password"
                     ).permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll();

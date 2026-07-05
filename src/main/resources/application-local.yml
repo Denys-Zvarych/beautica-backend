@@ -66,6 +66,13 @@ app:
     resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between resend attempts
   password-reset:
     cleanup-retention: 7d
+  password-reset-otp:
+    otp-ttl: 15m
+    max-attempts-per-code: 5
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between requests
+    ticket-ttl: 10m
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
     payload-key: ${OUTBOX_PAYLOAD_KEY}

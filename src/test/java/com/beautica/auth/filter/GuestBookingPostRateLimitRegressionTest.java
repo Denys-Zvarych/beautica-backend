@@ -63,15 +63,18 @@ class GuestBookingPostRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 16 permissive caches — one positional arg per @Qualifier bucket on the production
-        // constructor. The booking-POST throttle the fix adds is internal to the filter (built
-        // like otpVerifyBuckets), so this test does not reference any new constructor arg: it
-        // asserts only on observable HTTP behaviour and stays compatible once the bucket is wired.
+        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // constructor (now includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets,
+        // Phase A5). The booking-POST throttle the fix adds is internal to the filter (built
+        // like otpVerifyBuckets), so this test does not reference any new constructor arg beyond
+        // the count: it asserts only on observable HTTP behaviour and stays compatible once the
+        // bucket is wired.
         return new AuthRateLimitFilter(
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive());
     }
 
     private MockHttpServletRequest postBooking() {

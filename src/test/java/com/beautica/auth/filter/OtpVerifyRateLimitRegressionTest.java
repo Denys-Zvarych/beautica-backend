@@ -66,15 +66,18 @@ class OtpVerifyRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 16 permissive caches — one positional arg per @Qualifier bucket on the production
-        // constructor. The verify throttle the fix adds is internal to the filter, so this
-        // test does not (and must not) reference any new constructor arg: it asserts only on
-        // observable HTTP behaviour and stays compatible once the dev wires the new bucket.
+        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // constructor (now includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets,
+        // Phase A5). The verify throttle the fix adds is internal to the filter, so this
+        // test does not (and must not) reference any new constructor arg beyond the count: it
+        // asserts only on observable HTTP behaviour and stays compatible once the dev wires the
+        // new bucket.
         return new AuthRateLimitFilter(
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive());
     }
 
     private MockHttpServletRequest postVerify() {

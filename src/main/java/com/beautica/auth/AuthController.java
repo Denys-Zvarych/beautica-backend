@@ -14,6 +14,8 @@ import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyEmailRequest;
+import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
+import com.beautica.auth.dto.VerifyPasswordResetOtpResponse;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.BearerTokenExtractor;
@@ -98,34 +100,61 @@ public class AuthController {
     }
 
     /**
-     * Initiates a password reset for the given email address.
+     * Initiates a password reset for the given email address by emailing a 6-digit OTP
+     * (Phase A3 — replaces the old emailed reset-link flow).
      *
      * <p>Always returns a generic 200 regardless of whether the email is known, verified, or
      * active — enumeration protection is the primary goal. The only observable difference
-     * between a real user and a phantom address is whether a reset email arrives in the inbox.
+     * between a real user and a phantom address is whether an OTP email arrives in the inbox.
      *
      * <p>Rate-limited per IP via the {@code forgotPasswordBuckets} bucket (3 requests/hour
-     * by default). A 429 with {@code Retry-After: 3600} is returned when exhausted.
+     * by default). A 429 with {@code Retry-After: 3600} is returned when exhausted. A separate
+     * per-account cooldown (60 s) is also enforced by the service, but it never surfaces as a
+     * 429 here — {@code requestReset} passes {@code suppressCooldownThrottle=true} so this
+     * endpoint stays a byte-identical 200 even mid-cooldown (see
+     * {@link PasswordResetService#mintAndSendOtp}'s javadoc). Only the authenticated
+     * {@code POST /users/me/change-password/request-otp} entry point surfaces the 429, since
+     * no anti-enumeration property needs protecting there.
      */
     @PostMapping("/forgot-password")
     public ResponseEntity<ApiResponse<Void>> forgotPassword(
             @Valid @RequestBody ForgotPasswordRequest request) {
         passwordResetService.requestReset(request);
         return ResponseEntity.ok(ApiResponse.ok(null,
-                "If an account exists for that email, a reset link has been sent."));
+                "If an account exists for that email, a reset code has been sent."));
     }
 
     /**
-     * Completes a password reset using the raw token from the emailed link.
+     * Verifies the 6-digit OTP emailed by {@link #forgotPassword} and, on success, returns a
+     * single-use {@code resetTicket} the client must submit to {@link #resetPassword}.
+     *
+     * <p>Invalid, expired, exhausted, and locked-account states all surface as the same
+     * generic {@code INVALID_CODE} / {@code CODE_EXPIRED} shapes used by
+     * {@code POST /auth/verify-email} (no oracle) — see
+     * {@link PasswordResetOtpProcessor#verifyAndIssueTicket}.
+     *
+     * <p>Rate-limited per IP via the {@code verifyPasswordResetOtpBuckets} bucket
+     * (10 requests/15 min by default), mirroring {@code verifyEmailBuckets}.
+     */
+    @PostMapping("/verify-password-reset-otp")
+    public ResponseEntity<ApiResponse<VerifyPasswordResetOtpResponse>> verifyPasswordResetOtp(
+            @Valid @RequestBody VerifyPasswordResetOtpRequest request) {
+        VerifyPasswordResetOtpResponse response = passwordResetService.verifyOtp(request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    /**
+     * Completes a password reset using the raw {@code resetTicket} minted by
+     * {@link #verifyPasswordResetOtp}.
      *
      * <p>On success the user's password is updated and all existing sessions are terminated.
      * No auth tokens are returned — the client must route to the login screen.
      *
-     * <p>Invalid, used, and expired tokens all produce the same generic 400 (no oracle).
-     * Bean-validation failures (blank token, short password) return the standard 400
+     * <p>Invalid, used, and expired tickets all produce the same generic 400 (no oracle).
+     * Bean-validation failures (blank ticket, short password) return the standard 400
      * validation envelope from {@code GlobalExceptionHandler}.
      *
-     * <p>Rate-limited via the shared {@code forgotPasswordBuckets} bucket. 429 with
+     * <p>Rate-limited via the shared {@code resetPasswordBuckets} bucket. 429 with
      * {@code Retry-After: 3600} when exhausted.
      */
     @PostMapping("/reset-password")

@@ -35,6 +35,9 @@ class RateLimitConfigTest {
     // window constants — the contract this test exists to pin.
     private static final long VERIFY_EMAIL_CAPACITY = 10L;
     private static final long RESEND_CAPACITY = 3L;
+    // Phase A5 — password-reset OTP flow rate-limit ceilings.
+    private static final long VERIFY_PASSWORD_RESET_OTP_CAPACITY = 10L;
+    private static final long CHANGE_PASSWORD_OTP_CAPACITY = 3L;
 
     private RateLimitConfig config;
 
@@ -44,6 +47,8 @@ class RateLimitConfigTest {
         // Mirror the @Value defaults — NOT the test-profile overrides.
         ReflectionTestUtils.setField(config, "verifyEmailCapacity", VERIFY_EMAIL_CAPACITY);
         ReflectionTestUtils.setField(config, "resendVerificationCapacity", RESEND_CAPACITY);
+        ReflectionTestUtils.setField(config, "verifyPasswordResetOtpCapacity", VERIFY_PASSWORD_RESET_OTP_CAPACITY);
+        ReflectionTestUtils.setField(config, "changePasswordOtpCapacity", CHANGE_PASSWORD_OTP_CAPACITY);
     }
 
     @Test
@@ -81,6 +86,43 @@ class RateLimitConfigTest {
 
         assertThat(bucket.tryConsume(1))
                 .as("the (capacity+1)th resend request must be throttled")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("should_allowExactlyVerifyPasswordResetOtpCapacityThenThrottle_when_15MinuteWindow")
+    void should_allowExactlyVerifyPasswordResetOtpCapacityThenThrottle_when_15MinuteWindow() {
+        LoadingCache<String, Bucket> buckets = config.verifyPasswordResetOtpBuckets();
+        Bucket bucket = buckets.get("203.0.113.11");
+
+        for (int i = 0; i < VERIFY_PASSWORD_RESET_OTP_CAPACITY; i++) {
+            assertThat(bucket.tryConsume(1))
+                    .as("verify-password-reset-otp request %d of %d must be permitted",
+                            i + 1, VERIFY_PASSWORD_RESET_OTP_CAPACITY)
+                    .isTrue();
+        }
+
+        assertThat(bucket.tryConsume(1))
+                .as("the (capacity+1)th verify-password-reset-otp request must be throttled")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("should_allowExactlyChangePasswordOtpCapacityThenThrottle_when_60MinuteWindow (4th request/hour gets 429)")
+    void should_allowExactlyChangePasswordOtpCapacityThenThrottle_when_60MinuteWindow() {
+        LoadingCache<String, Bucket> buckets = config.changePasswordOtpBuckets();
+        Bucket bucket = buckets.get("203.0.113.13");
+
+        for (int i = 0; i < CHANGE_PASSWORD_OTP_CAPACITY; i++) {
+            assertThat(bucket.tryConsume(1))
+                    .as("change-password-otp request %d of %d must be permitted",
+                            i + 1, CHANGE_PASSWORD_OTP_CAPACITY)
+                    .isTrue();
+        }
+
+        // The 4th request within the 60-minute window must be throttled (429 at the filter).
+        assertThat(bucket.tryConsume(1))
+                .as("the 4th change-password-otp request within the window must be throttled")
                 .isFalse();
     }
 

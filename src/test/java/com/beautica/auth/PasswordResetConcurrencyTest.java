@@ -4,8 +4,14 @@ import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
+import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
+import com.beautica.auth.dto.VerifyPasswordResetOtpResponse;
+import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.EmailNotificationService;
+import com.beautica.user.User;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,23 +42,24 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 
 /**
- * Concurrency regression (QA HIGH): two threads submit the SAME valid raw token to
- * {@code POST /api/v1/auth/reset-password} simultaneously. The {@code PESSIMISTIC_WRITE}
- * row lock in {@code findByTokenForUpdate} must serialise the two attempts so the
- * single-use guarantee holds — exactly ONE succeeds (200) and the other gets the
- * generic 400, with the token marked used exactly once.
+ * Concurrency regression (QA HIGH): two threads submit the SAME valid raw {@code resetTicket}
+ * to {@code POST /api/v1/auth/reset-password} simultaneously. The {@code PESSIMISTIC_WRITE}
+ * row lock in {@code findByTicketHashForUpdate} must serialise the two attempts so the
+ * single-use guarantee holds — exactly ONE succeeds (200) and the other gets the generic 400,
+ * with the ticket marked used exactly once.
  *
- * <p>No {@code @Transactional} on the test — each HTTP call is its own transaction
- * that commits independently. Mirrors {@link VerifyEmailConcurrencyTest}.
+ * <p>No {@code @Transactional} on the test — each HTTP call is its own transaction that
+ * commits independently. Mirrors {@link VerifyEmailConcurrencyTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 @Import(TestSecurityConfig.class)
-@DisplayName("reset-password — concurrency: parallel same-token submissions honour single-use")
+@DisplayName("reset-password — concurrency: parallel same-ticket submissions honour single-use")
 class PasswordResetConcurrencyTest {
 
     private static final Logger log = LoggerFactory.getLogger(PasswordResetConcurrencyTest.class);
@@ -77,6 +84,9 @@ class PasswordResetConcurrencyTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    private ObjectMapper objectMapper;
+
     @MockBean
     private EmailNotificationService emailNotificationService;
 
@@ -88,26 +98,36 @@ class PasswordResetConcurrencyTest {
 
     @AfterEach
     void cleanUp() {
-        jdbcTemplate.execute("DELETE FROM password_reset_tokens");
+        jdbcTemplate.execute("DELETE FROM password_reset_tickets");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
         jdbcTemplate.execute("DELETE FROM users");
     }
 
     @Test
-    @DisplayName("should_succeedExactlyOnce_when_twoParallelSubmissionsOfSameToken")
-    void should_succeedExactlyOnce_when_twoParallelSubmissionsOfSameToken() throws Exception {
+    @DisplayName("should_succeedExactlyOnce_when_twoParallelSubmissionsOfSameResetTicket")
+    void should_succeedExactlyOnce_when_twoParallelSubmissionsOfSameResetTicket() throws Exception {
         String email = "concurrent.reset@beautica.test";
-        log.debug("Arrange: register+verify email={} and issue a reset token", email);
+        log.debug("Arrange: register+verify email={} and issue a reset ticket via the OTP flow", email);
         registerAndVerify(email);
 
-        // Capture the raw reset token from the (mocked) email send.
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+        // forgot-password → capture the raw OTP from the (mocked) email send.
+        ArgumentCaptor<String> otpCaptor = ArgumentCaptor.forClass(String.class);
         restTemplate.postForEntity("/api/v1/auth/forgot-password",
                 new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetEmail(anyString(), urlCaptor.capture());
-        String rawToken = extractRawTokenFromUrl(urlCaptor.getValue());
+        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
+        String rawOtp = otpCaptor.getValue();
 
-        // Two threads, released simultaneously, both submit the SAME valid token.
+        // verify-password-reset-otp → the minted resetTicket.
+        ResponseEntity<String> verifyResp = restTemplate.postForEntity(
+                "/api/v1/auth/verify-password-reset-otp",
+                new VerifyPasswordResetOtpRequest(email, rawOtp),
+                String.class);
+        assertThat(verifyResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var verifyBody = objectMapper.readValue(
+                verifyResp.getBody(), new TypeReference<ApiResponse<VerifyPasswordResetOtpResponse>>() {});
+        String rawTicket = verifyBody.data().resetTicket();
+
+        // Two threads, released simultaneously, both submit the SAME valid ticket.
         int threads = 2;
         var startLatch = new CountDownLatch(1);
         var doneLatch = new CountDownLatch(threads);
@@ -121,7 +141,7 @@ class PasswordResetConcurrencyTest {
                         startLatch.await();
                         ResponseEntity<String> r = restTemplate.postForEntity(
                                 "/api/v1/auth/reset-password",
-                                new ResetPasswordRequest(rawToken, "NewPassword99!"),
+                                new ResetPasswordRequest(rawTicket, "NewPassword99!"),
                                 String.class);
                         if (r.getStatusCode() == HttpStatus.OK) {
                             successCount.incrementAndGet();
@@ -136,7 +156,7 @@ class PasswordResetConcurrencyTest {
                 }, pool);
             }
 
-            startLatch.countDown(); // release both threads at once
+            startLatch.countDown();
             assertThat(doneLatch.await(20, TimeUnit.SECONDS))
                     .as("both reset requests must complete within the timeout")
                     .isTrue();
@@ -151,12 +171,11 @@ class PasswordResetConcurrencyTest {
                 .as("the losing submission must receive the generic 400")
                 .isEqualTo(1);
 
-        // The token must be marked used exactly once — never two live consumptions.
         Integer usedCount = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM password_reset_tokens WHERE is_used = true",
+                "SELECT COUNT(*) FROM password_reset_tickets WHERE is_used = true",
                 Integer.class);
         assertThat(usedCount)
-                .as("exactly one token row must be marked used after the race")
+                .as("exactly one ticket row must be marked used after the race")
                 .isEqualTo(1);
     }
 
@@ -172,14 +191,5 @@ class PasswordResetConcurrencyTest {
                         SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null),
                 String.class);
         jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
-    }
-
-    private static String extractRawTokenFromUrl(String resetUrl) {
-        int idx = resetUrl.indexOf("?token=");
-        if (idx < 0) {
-            throw new AssertionError("Reset URL missing ?token= param: " + resetUrl);
-        }
-        String encoded = resetUrl.substring(idx + 7);
-        return java.net.URLDecoder.decode(encoded, java.nio.charset.StandardCharsets.UTF_8);
     }
 }

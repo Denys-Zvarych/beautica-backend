@@ -31,7 +31,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String VERIFY_EMAIL_PATH = "/api/v1/auth/verify-email";
     private static final String RESEND_VERIFICATION_PATH = "/api/v1/auth/resend-verification";
     private static final String FORGOT_PASSWORD_PATH = "/api/v1/auth/forgot-password";
+    private static final String VERIFY_PASSWORD_RESET_OTP_PATH = "/api/v1/auth/verify-password-reset-otp";
     private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
+    private static final String CHANGE_PASSWORD_OTP_PATH = "/api/v1/users/me/change-password/request-otp";
     private static final String INVITE_PATH = "/api/v1/auth/invite";
     private static final String LOGOUT_PATH = "/api/v1/auth/logout";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
@@ -81,8 +83,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // verify-email bucket window is 15 minutes — Retry-After must reflect the actual window
     // so clients do not spin-retry every 60 s and waste their remaining IP quota.
     private static final int VERIFY_EMAIL_RETRY_AFTER_SECONDS = 900;
-    // forgot-password / reset-password bucket window is 60 minutes.
+    // forgot-password / reset-password / change-password-otp bucket window is 60 minutes.
     private static final int FORGOT_PASSWORD_RETRY_AFTER_SECONDS = 3600;
+    // verify-password-reset-otp bucket window is 15 minutes — mirrors VERIFY_EMAIL.
+    private static final int VERIFY_PASSWORD_RESET_OTP_RETRY_AFTER_SECONDS = 900;
     // otp-send bucket window is 15 minutes — Retry-After reflects the actual window.
     private static final int OTP_SEND_RETRY_AFTER_SECONDS = 900;
     // otp-verify bucket window is 15 minutes — Retry-After reflects the actual window.
@@ -179,6 +183,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // (low cap); reset-password sends no email (higher cap, tolerant of typo retries).
     private final LoadingCache<String, Bucket> forgotPasswordBuckets;
     private final LoadingCache<String, Bucket> resetPasswordBuckets;
+    // Per-IP bucket for POST /api/v1/auth/verify-password-reset-otp — mirrors
+    // verifyEmailBuckets (10/15min), the IP-layer brute-force guard on the 6-digit OTP.
+    private final LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets;
+    // Per-IP bucket for POST /api/v1/users/me/change-password/request-otp — mirrors
+    // forgotPasswordBuckets (3/hr), the email-bomb guard for the authenticated
+    // change-password-from-settings entry point. Kept separate from forgotPasswordBuckets
+    // so a NAT-shared client cannot deplete one flow's budget and lock out the other.
+    private final LoadingCache<String, Bucket> changePasswordOtpBuckets;
     // Per-IP bucket for POST /api/v1/service-categories/requests — every successful
     // request emails the admin, so this is an inbox-flood surface (5/hr).
     private final LoadingCache<String, Bucket> categoryRequestBuckets;
@@ -244,7 +256,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
             @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
             @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
-            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets) {
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
+            @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -261,6 +275,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.bulkServiceSetupBuckets = bulkServiceSetupBuckets;
         this.supportContactBuckets = supportContactBuckets;
         this.otpSendBuckets = otpSendBuckets;
+        this.verifyPasswordResetOtpBuckets = verifyPasswordResetOtpBuckets;
+        this.changePasswordOtpBuckets = changePasswordOtpBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -463,8 +479,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (FORGOT_PASSWORD_PATH.equals(path)) {
             cache = forgotPasswordBuckets;
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
+        } else if (VERIFY_PASSWORD_RESET_OTP_PATH.equals(path)) {
+            cache = verifyPasswordResetOtpBuckets;
+            retryAfterSeconds = VERIFY_PASSWORD_RESET_OTP_RETRY_AFTER_SECONDS;
         } else if (RESET_PASSWORD_PATH.equals(path)) {
             cache = resetPasswordBuckets;
+            retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
+        } else if (CHANGE_PASSWORD_OTP_PATH.equals(path)) {
+            cache = changePasswordOtpBuckets;
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
         } else if (INVITE_PATH.equals(path)) {
             cache = inviteBuckets;

@@ -83,6 +83,23 @@ public class RateLimitConfig {
 
     private static final Duration PASSWORD_RESET_WINDOW = Duration.ofMinutes(60);
 
+    // Per-IP cap for POST /api/v1/auth/verify-password-reset-otp (15-minute window).
+    // Mirrors verify-email-capacity exactly (10/15min): both endpoints brute-force-guard
+    // a 6-digit OTP (1,000,000 combinations) at the IP layer, complementing the per-account
+    // attempt cap + cumulative lockout enforced inside PasswordResetOtpProcessor.
+    // Configurable so integration tests running on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.verify-password-reset-otp-capacity:10}")
+    private long verifyPasswordResetOtpCapacity;
+
+    private static final Duration VERIFY_PASSWORD_RESET_OTP_WINDOW = Duration.ofMinutes(15);
+
+    // Per-IP cap for POST /api/v1/users/me/change-password/request-otp (60-minute window).
+    // Mirrors forgot-password-capacity exactly (3/hr): every successful request emails an
+    // OTP, so this is the same email-bomb surface as forgot-password, just for the
+    // authenticated entry point. Configurable so integration tests can raise the cap.
+    @Value("${app.rate-limit.change-password-otp-capacity:3}")
+    private long changePasswordOtpCapacity;
+
     // Per-IP cap for PATCH /api/v1/independent-masters/me/profile (60-second window).
     // 10/min prevents unbounded DB writes and cache churn from a token-holding client
     // while remaining generous enough for a legitimate profile-edit retry.
@@ -230,6 +247,40 @@ public class RateLimitConfig {
                 DEFAULT_BUCKET_CACHE_SIZE,
                 PASSWORD_RESET_WINDOW.plus(EVICTION_GRACE),
                 forgotPasswordCapacity,
+                PASSWORD_RESET_WINDOW);
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/auth/verify-password-reset-otp}.
+     *
+     * <p>Mirrors {@link #verifyEmailBuckets()}: 10 requests per 15-minute window per source
+     * IP. Generous for a legitimate user re-typing a 6-digit code while still bounding
+     * brute-force of the 1,000,000-value OTP space at the IP layer.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets() {
+        return bucketCache(
+                VERIFY_EMAIL_BUCKET_CACHE_SIZE,
+                VERIFY_PASSWORD_RESET_OTP_WINDOW.plus(EVICTION_GRACE),
+                verifyPasswordResetOtpCapacity,
+                VERIFY_PASSWORD_RESET_OTP_WINDOW);
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/users/me/change-password/request-otp}.
+     *
+     * <p>Mirrors {@link #forgotPasswordBuckets()}: 3 requests per 60-minute window per source
+     * IP — every successful request emails an OTP, so this is the same email-bomb surface,
+     * just for the authenticated "change password from settings" entry point. Kept as its
+     * own bucket (not shared with {@link #forgotPasswordBuckets()}) so a NAT-shared client
+     * exhausting one flow's budget cannot lock out the other.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> changePasswordOtpBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                PASSWORD_RESET_WINDOW.plus(EVICTION_GRACE),
+                changePasswordOtpCapacity,
                 PASSWORD_RESET_WINDOW);
     }
 
