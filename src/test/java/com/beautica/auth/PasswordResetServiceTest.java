@@ -24,10 +24,13 @@ import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -72,6 +75,9 @@ class PasswordResetServiceTest {
     @Mock
     private EmailNotificationService emailNotificationService;
 
+    @Mock
+    private TokensValidAfterCache tokensValidAfterCache;
+
     private PasswordEncoder passwordEncoder;
     private PasswordResetService service;
 
@@ -90,6 +96,7 @@ class PasswordResetServiceTest {
                 passwordEncoder,
                 emailNotificationService,
                 syncExecutor,
+                tokensValidAfterCache,
                 fixedClock,
                 FRONTEND_BASE_URL,
                 TOKEN_EXPIRY_HOURS
@@ -329,6 +336,7 @@ class PasswordResetServiceTest {
                 passwordEncoder,
                 emailNotificationService,
                 Runnable::run,
+                tokensValidAfterCache,
                 Clock.fixed(FIXED_NOW, ZoneOffset.UTC),
                 "http://evil.example",
                 TOKEN_EXPIRY_HOURS
@@ -384,6 +392,72 @@ class PasswordResetServiceTest {
         service.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "NewValidPass1!"));
 
         verify(refreshTokenRepository).deleteByUserId(USER_ID);
+    }
+
+    @Test
+    @DisplayName("resetPassword — stamps tokensValidAfter and evicts the cache entry (revokes outstanding access tokens)")
+    void should_stampTokensValidAfterAndEvictCache_when_resetSucceeds() {
+        log.debug("Arrange: valid token, user with a previously-issued access token");
+        PasswordResetToken token = validToken();
+        User user = activeVerifiedUser();
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(passwordResetTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(token));
+        when(userRepository.findById(USER_ID)).thenReturn(Optional.of(user));
+
+        log.debug("Act: resetPassword — must stamp tokensValidAfter and evict the cache entry");
+        service.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "NewValidPass1!"));
+
+        // The managed `user` entity is stamped with the current instant (from the injected
+        // Clock) so JwtAuthenticationFilter rejects any access token issued before it.
+        assertThat(user.getTokensValidAfter())
+                .as("tokensValidAfter must be stamped with the current clock instant on reset")
+                .isEqualTo(FIXED_NOW);
+
+        // No active transaction synchronization in this plain Mockito unit test, so
+        // evictTokensValidAfterCache falls through to its synchronous (unit-test-path)
+        // branch and invalidate() fires inline. The afterCommit-deferral behaviour under
+        // an active transaction is covered separately below.
+        verify(tokensValidAfterCache).invalidate(USER_ID);
+    }
+
+    @Test
+    @DisplayName("resetPassword — defers tokensValidAfter cache eviction to afterCommit, never fires it synchronously inline (anti stale-read race)")
+    void should_deferCacheEviction_toAfterCommit_when_transactionSynchronizationActive() {
+        log.debug("Arrange: valid token/user, with Spring transaction synchronization manually activated");
+        PasswordResetToken token = validToken();
+        User user = activeVerifiedUser();
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(passwordResetTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(token));
+        when(userRepository.findById(USER_ID)).thenReturn(Optional.of(user));
+
+        // resetPassword guards eviction registration with isSynchronizationActive(). Manually
+        // initialise Spring transaction synchronization so the guard passes in this
+        // non-transactional unit test — mirroring MasterServiceTest's deactivateMaster test —
+        // then inspect whether invalidate() fired before we replay afterCommit() ourselves.
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            log.debug("Act: resetPassword under active transaction synchronization");
+            service.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "NewValidPass1!"));
+
+            // The whole point of the fix: invalidate() must NOT have run yet, because the
+            // (fake) transaction has not committed. If it fired here, a concurrent reader in
+            // this exact window could read the stale pre-reset DB row and cache it for the
+            // full TTL — the race this test guards against.
+            verify(tokensValidAfterCache, never()).invalidate(any());
+
+            List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
+            assertThat(syncs)
+                    .as("resetPassword must register an afterCommit synchronization for the cache eviction")
+                    .isNotEmpty();
+
+            log.debug("Simulate commit: replay the registered afterCommit callbacks");
+            syncs.forEach(TransactionSynchronization::afterCommit);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        // Only now, after the simulated commit, must the cache actually be evicted.
+        verify(tokensValidAfterCache).invalidate(USER_ID);
     }
 
     @Test

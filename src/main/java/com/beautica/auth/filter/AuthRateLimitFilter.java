@@ -33,6 +33,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String FORGOT_PASSWORD_PATH = "/api/v1/auth/forgot-password";
     private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
     private static final String INVITE_PATH = "/api/v1/auth/invite";
+    private static final String LOGOUT_PATH = "/api/v1/auth/logout";
     private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
@@ -143,6 +144,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // slice/regression tests — stays unchanged.
     private static final long INVITE_CAPACITY = 15;
     private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for POST /api/v1/auth/logout (30 / 60 s) — SEC-fix regression net: logout
+    // was previously not covered by this filter at all, an unbounded surface on an otherwise
+    // fully-throttled /auth/* namespace. Logout carries no email/SMS cost and is the
+    // lowest-risk auth mutation in this filter (it can only ever narrow what the calling
+    // token can do — revoke its own session), so the cap is deliberately generous: at or
+    // above the refreshBuckets ceiling (20/min default) rather than the tighter email-bomb
+    // buckets, while still bounding a pathological client-side retry loop hammering the
+    // denylist-write + refresh-token-delete path. Built internally (not an injected
+    // @Qualifier bean) so the public 16-arg constructor — depended on by several
+    // slice/regression tests — stays unchanged.
+    private static final long LOGOUT_CAPACITY = 30;
+    private static final Duration LOGOUT_WINDOW = Duration.ofMinutes(1);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -209,6 +222,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // branches return fast). Built internally rather than injected so the public 16-arg
     // constructor stays stable for the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> inviteBuckets;
+    // Per-IP bucket for POST /api/v1/auth/logout — the SEC-fix regression net closing the
+    // previously-unthrottled /auth/logout surface. Built internally rather than injected so
+    // the public 16-arg constructor stays stable for the slice/regression tests that
+    // construct this filter directly.
+    private final LoadingCache<String, Bucket> logoutBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -273,6 +291,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(inviteBandwidth())
                         .build());
+        this.logoutBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(LOGOUT_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(logoutBandwidth())
+                        .build());
     }
 
     private static Bandwidth otpVerifyBandwidth() {
@@ -307,6 +331,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(INVITE_CAPACITY)
                 .refillIntervally(INVITE_CAPACITY, INVITE_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth logoutBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(LOGOUT_CAPACITY)
+                .refillIntervally(LOGOUT_CAPACITY, LOGOUT_WINDOW)
                 .build();
     }
 
@@ -437,6 +468,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
         } else if (INVITE_PATH.equals(path)) {
             cache = inviteBuckets;
+        } else if (LOGOUT_PATH.equals(path)) {
+            cache = logoutBuckets;
         } else if (CATEGORY_REQUEST_PATH.equals(path)) {
             cache = categoryRequestBuckets;
             retryAfterSeconds = CATEGORY_REQUEST_RETRY_AFTER_SECONDS;

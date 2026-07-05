@@ -6,6 +6,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.EffectiveDaySource;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
 import com.beautica.master.dto.WeeklyScheduleDayRequest;
@@ -32,6 +33,7 @@ import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.temporal.TemporalAdjusters;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -1206,11 +1208,15 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             assertThat(slots).as("available-slots cache must be configured").isNotNull();
             slots.clear();
 
-            // Seed cache entries under the exact SimpleKey shape the resolver uses: {masterId, date, serviceId}.
+            // Seed cache entries under the real runtime key shape: SlotCalculationService's @Cacheable
+            // uses an explicit SpEL key ("{#masterId, #date, #masterServiceId}"), which Spring never
+            // wraps in a SimpleKey — SimpleKey only comes from the default SimpleKeyGenerator when no
+            // `key` attribute is given. The `{...}` inline-list literal evaluates to an ArrayList at
+            // runtime, so that's the shape seeded here (see evictByMasterPrefix).
             UUID svc = UUID.randomUUID();
             LocalDate date = FUTURE_FROM;
-            var writerKey = new org.springframework.cache.interceptor.SimpleKey(writer.masterId(), date, svc);
-            var bystanderKey = new org.springframework.cache.interceptor.SimpleKey(bystander.masterId(), date, svc);
+            var writerKey = new ArrayList<>(List.of(writer.masterId(), date, svc));
+            var bystanderKey = new ArrayList<>(List.of(bystander.masterId(), date, svc));
             slots.put(writerKey, List.of());
             slots.put(bystanderKey, List.of());
 
@@ -1224,6 +1230,49 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             assertThat(slots.get(bystanderKey))
                     .as("an unrelated master's slot key must survive — eviction is master-scoped, not a full clear")
                     .isNotNull();
+        }
+
+        /**
+         * Regression guard for the {@code evictByMasterPrefix} key-shape bug: {@code master-working-days}
+         * is {@code @Cacheable} with an explicit SpEL {@code key = "{#masterId, #from, #to}"}, so Spring
+         * never wraps the entry in a {@link org.springframework.cache.interceptor.SimpleKey} (that type is
+         * only produced by the default {@code SimpleKeyGenerator} when no {@code key} attribute is given).
+         * The old {@code evictByMasterPrefix} checked {@code instanceof SimpleKey}, which never matched
+         * these entries — eviction silently no-opped and {@code getClientWorkingDays} kept serving the
+         * pre-write result for the full 60s TTL instead of being evicted after commit.
+         *
+         * <p>Unlike {@link #should_evictOnlyAffectedMasterSlots_onWrite}, this test drives the
+         * <b>real {@code @Cacheable} proxy end-to-end</b> (no hand-seeded cache entry) so it exercises the
+         * actual runtime key shape produced by the SpEL {@code {...}} inline-list literal (an
+         * {@code ArrayList}), not an assumption about it.
+         */
+        @Test
+        @DisplayName("Cache regression — master-working-days reflects a schedule write, not a stale pre-write result")
+        void should_reflectFreshSchedule_when_readThroughRealCacheableProxy_afterWrite() {
+            SeededMaster m = seedIndependentMaster();
+
+            // First call through the real proxy — populates master-working-days under the true
+            // ArrayList-shaped SpEL key, not a hand-seeded SimpleKey.
+            List<MasterWorkingDayResponse> before =
+                    scheduleService.getClientWorkingDays(m.masterId(), FUTURE_FROM, FUTURE_FROM);
+            assertThat(before).hasSize(1);
+            assertThat(before.get(0).working())
+                    .as("no schedule yet — an uncovered date resolves to NO_SCHEDULE / not working")
+                    .isFalse();
+
+            // A real schedule write for the same master and date — must evict the cached entry above.
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(9, 17))));
+
+            // Under the pre-fix `instanceof SimpleKey` check, eviction is a silent no-op for this cache,
+            // so this second call would incorrectly replay the stale "false" from the first call.
+            List<MasterWorkingDayResponse> after =
+                    scheduleService.getClientWorkingDays(m.masterId(), FUTURE_FROM, FUTURE_FROM);
+            assertThat(after.get(0).working())
+                    .as("the cache must be evicted after commit — must reflect the new CUSTOM_HOURS "
+                            + "override, not the stale pre-write NO_SCHEDULE result")
+                    .isTrue();
         }
     }
 

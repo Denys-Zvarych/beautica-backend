@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Date;
 import java.util.UUID;
 
@@ -197,6 +198,77 @@ class JwtTokenProviderTest {
         assertThatThrownBy(() -> jwtTokenProvider.getRoleFromToken(claims))
                 .as("getRoleFromToken must throw MalformedJwtException, not NullPointerException, when role claim is absent")
                 .isInstanceOf(MalformedJwtException.class);
+    }
+
+    @Test
+    @DisplayName("generateAccessToken embeds a non-blank jti claim recoverable via getJti")
+    void should_embedNonBlankJti_when_accessTokenGenerated() {
+        log.debug("Arrange: fresh access token for a random user");
+
+        String token = jwtTokenProvider.generateAccessToken(UUID.randomUUID(), "jti@beautica.com", Role.CLIENT);
+        String jti = jwtTokenProvider.getJti(token);
+
+        assertThat(jti)
+                .as("every access token must carry a non-blank jti claim — this is the identifier "
+                        + "AccessTokenDenylist keys revocation on")
+                .isNotBlank();
+    }
+
+    @Test
+    @DisplayName("generateAccessToken assigns a distinct jti to each token, even for the same user")
+    void should_generateDistinctJti_when_twoAccessTokensGeneratedForSameUser() {
+        var userId = UUID.randomUUID();
+        log.debug("Arrange: two access tokens minted back-to-back for the same userId={}", userId);
+
+        String tokenOne = jwtTokenProvider.generateAccessToken(userId, "same@beautica.com", Role.CLIENT);
+        String tokenTwo = jwtTokenProvider.generateAccessToken(userId, "same@beautica.com", Role.CLIENT);
+
+        assertThat(jwtTokenProvider.getJti(tokenOne))
+                .as("two separately-minted access tokens must never share a jti — otherwise revoking "
+                        + "one via logout would also silently revoke the other still-live session")
+                .isNotEqualTo(jwtTokenProvider.getJti(tokenTwo));
+    }
+
+    @Test
+    @DisplayName("getJti(Claims) returns null when the token carries no jti claim")
+    void should_returnNullJti_when_tokenHasNoJtiClaim() {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String tokenWithoutJti = Jwts.builder()
+                .subject(UUID.randomUUID().toString())
+                .claim("role", Role.CLIENT.name())
+                .claim("type", "access")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + ACCESS_EXPIRY_MS))
+                .signWith(key)
+                .compact();
+
+        var claims = jwtTokenProvider.parseAllClaims(tokenWithoutJti);
+
+        assertThat(jwtTokenProvider.getJti(claims))
+                .as("getJti must return null (not throw) for a token minted without a jti claim — "
+                        + "AccessTokenDenylist.isRevoked/revoke both treat a null jti as a safe no-op")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("getIssuedAt returns the token's iat claim as an Instant close to generation time")
+    void should_extractIssuedAt_when_accessTokenParsed() {
+        Instant before = Instant.now().minusSeconds(2);
+        log.debug("Arrange: access token minted at approximately now");
+
+        String token = jwtTokenProvider.generateAccessToken(UUID.randomUUID(), "iat@beautica.com", Role.CLIENT);
+        var claims = jwtTokenProvider.parseAllClaims(token);
+        Instant issuedAt = jwtTokenProvider.getIssuedAt(claims);
+        Instant after = Instant.now().plusSeconds(2);
+
+        // This is the exact value JwtAuthenticationFilter compares against
+        // TokensValidAfterCache — a wrong/missing iat would silently defeat the
+        // pre-reset-token-rejection guarantee.
+        assertThat(issuedAt)
+                .as("issuedAt must be a real timestamp within the generation window, not null or epoch")
+                .isNotNull()
+                .isAfterOrEqualTo(before)
+                .isBeforeOrEqualTo(after);
     }
 
     @Test

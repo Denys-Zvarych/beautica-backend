@@ -399,6 +399,113 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // S5 — Phase 15.11: CLIENT-safe working-days endpoint
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("S5 — GET working-days (CLIENT-safe boolean day-gating)")
+    class WorkingDaysEndpoint {
+
+        private ResponseEntity<String> workingDays(SeededMaster m, String from, String to, Actor actor) {
+            return get("/" + m.masterId() + "/working-days?from=" + from + "&to=" + to, actor);
+        }
+
+        @Test
+        @DisplayName("CLIENT reading working-days -> 200 (contrast with S1: CLIENT is 403 on effective-schedule)")
+        void should_allowClient_unlikeEffectiveSchedule() {
+            SeededMaster m = seedIndependentMaster();
+            Actor client = seedUser(Role.CLIENT);
+            String today = LocalDate.now().toString();
+            String week = LocalDate.now().plusDays(7).toString();
+
+            assertThat(workingDays(m, today, week, client).getStatusCode())
+                    .as("CLIENT must be able to read boolean working-day gating for the calendar")
+                    .isEqualTo(HttpStatus.OK);
+        }
+
+        @Test
+        @DisplayName("response body exposes only date + working — no intervals/times/source leak to CLIENT")
+        void should_exposeOnlyDateAndWorking_toClient() throws Exception {
+            SeededMaster m = seedIndependentMaster();
+            Actor client = seedUser(Role.CLIENT);
+            scheduleService.upsertWeeklySchedule(m.owner().userId(), m.masterId(), null,
+                    new WeeklyScheduleRequest(FUTURE_FROM, null, List.of(new WeeklyScheduleDayRequest(
+                            FUTURE_FROM.getDayOfWeek().getValue(),
+                            List.of(new WorkIntervalDto(LocalTime.of(9, 0), LocalTime.of(17, 0)))))));
+
+            ResponseEntity<String> resp =
+                    workingDays(m, FUTURE_FROM.toString(), FUTURE_FROM.toString(), client);
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+            var day = objectMapper.readTree(resp.getBody()).path("data").get(0);
+            assertThat(day.path("date").asText()).isEqualTo(FUTURE_FROM.toString());
+            assertThat(day.path("working").asBoolean()).isTrue();
+            assertThat(day.has("intervals")).as("no interval detail may reach CLIENT").isFalse();
+            assertThat(day.has("times")).as("no discrete-time detail may reach CLIENT").isFalse();
+            assertThat(day.has("source")).as("no schedule provenance may reach CLIENT").isFalse();
+            assertThat(resp.getBody())
+                    .doesNotContain("\"startTime\"")
+                    .doesNotContain("\"endTime\"");
+        }
+
+        @Test
+        @DisplayName("anonymous (no token) -> 401")
+        void should_rejectAnonymous() {
+            SeededMaster m = seedIndependentMaster();
+
+            assertThat(workingDays(m, LocalDate.now().toString(), LocalDate.now().plusDays(1).toString(), null)
+                    .getStatusCode())
+                    .isEqualTo(HttpStatus.UNAUTHORIZED);
+        }
+
+        @Test
+        @DisplayName("span > 366 days -> 400 (same range-cap guard the read endpoints already enforce, S2)")
+        void should_reject_when_spanExceeds366Days() {
+            SeededMaster m = seedIndependentMaster();
+            Actor client = seedUser(Role.CLIENT);
+            LocalDate from = LocalDate.now();
+            LocalDate to = from.plusDays(367);
+
+            assertThat(workingDays(m, from.toString(), to.toString(), client).getStatusCode())
+                    .as("working-days reuses MasterScheduleService.resolveEffectiveRange's range-cap guard")
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+
+        /**
+         * Security-audit regression: {@code getClientWorkingDays}/{@code resolveEffectiveRange}
+         * intentionally never checks master existence. A nonexistent masterId and a real master with no
+         * schedule configured both correctly resolve to {@link com.beautica.master.dto.EffectiveDaySource#NO_SCHEDULE}
+         * for every date, so both return 200 with every {@code working} field {@code false} — no
+         * status/timing/shape differential that would let a CLIENT enumerate valid master ids. This pins
+         * that intentional behavior against future regression (e.g. an added existence check that would
+         * turn this into a 404 oracle).
+         */
+        @Test
+        @DisplayName("nonexistent masterId -> 200, every day working:false (no existence oracle, intentional)")
+        void should_return200AllFalse_when_masterIdDoesNotExist() throws Exception {
+            UUID nonexistentMasterId = UUID.randomUUID();
+            Actor client = seedUser(Role.CLIENT);
+            String today = LocalDate.now().toString();
+            String week = LocalDate.now().plusDays(7).toString();
+
+            ResponseEntity<String> resp = get(
+                    "/" + nonexistentMasterId + "/working-days?from=" + today + "&to=" + week, client);
+
+            assertThat(resp.getStatusCode())
+                    .as("a nonexistent masterId must not be distinguishable from a real master with no "
+                            + "schedule configured — both resolve to NO_SCHEDULE, never 404")
+                    .isEqualTo(HttpStatus.OK);
+            var data = objectMapper.readTree(resp.getBody()).path("data");
+            assertThat(data).isNotEmpty();
+            for (var day : data) {
+                assertThat(day.path("working").asBoolean())
+                        .as("every day must resolve to working:false for an id with no schedule rows")
+                        .isFalse();
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // S3 — V83 contract: reason/note keys never appear on any read path (columns dropped)
     // ════════════════════════════════════════════════════════════════════════════════
 
@@ -441,6 +548,24 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
                     .contains("OVERRIDE_DAY_OFF")   // the source IS exposed
                     .doesNotContain("\"reason\"")
                     .doesNotContain("\"note\"");
+        }
+
+        @Test
+        @DisplayName("the effective-schedule projection serializes no workingDay key (isWorkingDay is @JsonIgnore)")
+        void should_notExposeWorkingDay_onEffectiveScheduleRead() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertOverride(m.owner().userId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null));
+
+            ResponseEntity<String> resp = get(
+                    "/" + m.masterId() + "/effective-schedule?from=" + FUTURE_FROM + "&to=" + FUTURE_FROM,
+                    m.owner());
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(resp.getBody())
+                    .as("isWorkingDay() is an internal helper for MasterScheduleService.getClientWorkingDays "
+                            + "only — it must not leak onto the wire as an extra 'workingDay' field")
+                    .doesNotContain("\"workingDay\"");
         }
     }
 }

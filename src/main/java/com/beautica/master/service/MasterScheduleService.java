@@ -6,6 +6,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.EffectiveDaySource;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
 import com.beautica.master.dto.WeeklyScheduleDayRequest;
@@ -27,6 +28,7 @@ import com.beautica.master.repository.WeeklyScheduleRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -251,6 +253,31 @@ public class MasterScheduleService {
             }
         }
         return result;
+    }
+
+    // ---- Step 7 (Phase 15.11): CLIENT-safe boolean working-day resolver -----------------
+
+    /**
+     * CLIENT-facing calendar day-gating: for every date in {@code [from, to]} inclusive, whether the
+     * master is working — boolean only, no hours/intervals/times. Reuses {@link #resolveEffectiveRange}
+     * verbatim (same override/template/gap precedence, same {@code assertExpandable} range-cap guard —
+     * not duplicated here) and reduces each {@link EffectiveDayResponse} via
+     * {@link EffectiveDayResponse#isWorkingDay()} before it leaves the service layer, so no schedule
+     * detail the {@code CLIENT} role is blocked from reading (see
+     * {@link AuthorizationService#canReadMasterSchedule}) ever reaches the controller.
+     *
+     * <p><b>Caching (perf follow-up).</b> Pure function of its 3 params, mirroring
+     * {@code SlotCalculationService#getAvailableSlots}: cached in {@code master-working-days}
+     * (60 sec TTL, {@code sync=true} to collapse a thundering herd on a popular master when the entry
+     * expires). Evicted by master prefix from {@link #evictSlotsAfterCommit} alongside
+     * {@code available-slots} on every schedule write.
+     */
+    @Transactional(readOnly = true)
+    @Cacheable(value = "master-working-days", key = "{#masterId, #from, #to}", sync = true)
+    public List<MasterWorkingDayResponse> getClientWorkingDays(UUID masterId, LocalDate from, LocalDate to) {
+        return resolveEffectiveRange(masterId, from, to).stream()
+                .map(day -> new MasterWorkingDayResponse(day.date(), day.isWorkingDay()))
+                .toList();
     }
 
     // ---- resolver helpers ---------------------------------------------------------------
@@ -529,10 +556,11 @@ public class MasterScheduleService {
     // ---- cache eviction (afterCommit, per-master prefix) --------------------------------
 
     /**
-     * Evicts the affected master's {@code available-slots} entries <b>after commit</b> so a parallel
-     * reader cannot repopulate stale availability mid-write (§F). A schedule/override change can affect
-     * any service's slots for the master, so we evict by master prefix (the cache key's first element is
-     * the masterId) rather than per {@code (date, masterServiceId)} — bounded to one master, not blanket.
+     * Evicts the affected master's {@code available-slots} <b>and</b> {@code master-working-days}
+     * entries <b>after commit</b> so a parallel reader cannot repopulate stale availability mid-write
+     * (§F). A schedule/override change can affect any service's slots for the master, so we evict by
+     * master prefix (the cache key's first element is the masterId) rather than per
+     * {@code (date, masterServiceId)}/{@code (from, to)} — bounded to one master, not blanket.
      */
     private void evictSlotsAfterCommit(UUID masterId) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -542,21 +570,43 @@ public class MasterScheduleService {
             @Override
             public void afterCommit() {
                 doEvictAvailableSlotsByMaster(masterId);
+                doEvictWorkingDaysByMaster(masterId);
             }
         });
     }
 
     private void doEvictAvailableSlotsByMaster(UUID masterId) {
-        Cache springCache = cacheManager.getCache("available-slots");
+        evictByMasterPrefix("available-slots", masterId);
+    }
+
+    /**
+     * Mirrors {@link #doEvictAvailableSlotsByMaster}: {@code master-working-days} is keyed
+     * {@code {#masterId, #from, #to}}, so the same masterId-prefix Caffeine key scan applies.
+     */
+    private void doEvictWorkingDaysByMaster(UUID masterId) {
+        evictByMasterPrefix("master-working-days", masterId);
+    }
+
+    /**
+     * {@code @Cacheable} with an explicit SpEL {@code key} (e.g. {@code key = "{#masterId, #from, #to}"})
+     * is never wrapped in a {@link org.springframework.cache.interceptor.SimpleKey} — that type is only
+     * produced by the default {@code SimpleKeyGenerator} when no {@code key} attribute is given. The
+     * {@code {...}} inline-list SpEL literal evaluates to a {@link List} (an {@code ArrayList}) at
+     * runtime, so eviction matches on the real key's runtime type — {@link List} — and compares its
+     * first element (the masterId) directly, rather than an {@code instanceof SimpleKey} check (which
+     * never matches these keys) or fragile {@code toString()} substring matching.
+     */
+    private void evictByMasterPrefix(String cacheName, UUID masterId) {
+        Cache springCache = cacheManager.getCache(cacheName);
         if (springCache == null) {
             return;
         }
         Object nativeCache = springCache.getNativeCache();
         if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            String masterIdPrefix = "[" + masterId + ",";
             caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(masterIdPrefix));
+                    k instanceof List<?> keyParts
+                            && !keyParts.isEmpty()
+                            && masterId.equals(keyParts.get(0)));
         } else {
             springCache.clear();
         }

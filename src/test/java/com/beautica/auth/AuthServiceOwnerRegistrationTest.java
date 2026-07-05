@@ -57,6 +57,12 @@ class AuthServiceOwnerRegistrationTest {
     @Mock
     private EmailVerificationProcessor emailVerificationProcessor;
 
+    @Mock
+    private JwtTokenProvider jwtTokenProvider;
+
+    @Mock
+    private AccessTokenDenylist accessTokenDenylist;
+
     private AuthService authService;
 
     @BeforeEach
@@ -76,7 +82,9 @@ class AuthServiceOwnerRegistrationTest {
                 emailNotificationService,
                 syncExecutor,
                 emailVerificationProcessor,
-                verificationPolicyConfig
+                verificationPolicyConfig,
+                jwtTokenProvider,
+                accessTokenDenylist
         );
     }
 

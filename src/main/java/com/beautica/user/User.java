@@ -132,6 +132,19 @@ public class User extends AuditableEntity {
     @Column(name = "salon_id")
     private UUID salonId;
 
+    // Stamped by PasswordResetService.resetPassword. NULL means "no reset has ever
+    // occurred" (the default, common case). When non-null, JwtAuthenticationFilter
+    // rejects any access token whose `iat` (issued-at) claim predates this instant —
+    // access tokens are otherwise stateless JWTs verified purely by signature + expiry,
+    // so without this a stolen access token would remain fully usable for its remaining
+    // TTL even after the legitimate owner reset their password. See
+    // com.beautica.auth.TokensValidAfterCache for the read-path (short-TTL cache backed
+    // by this column) and com.beautica.auth.AccessTokenDenylist for the sibling
+    // per-token (not per-user) revocation mechanism used by logout.
+    @JsonIgnore
+    @Column(name = "tokens_valid_after")
+    private Instant tokensValidAfter;
+
     protected User() {
     }
 
@@ -280,6 +293,22 @@ public class User extends AuditableEntity {
 
     public UUID getSalonId() {
         return salonId;
+    }
+
+    @JsonIgnore
+    public Instant getTokensValidAfter() {
+        return tokensValidAfter;
+    }
+
+    /**
+     * Marks every access token issued before {@code tokensValidAfter} as invalid.
+     * Callers MUST supply the current instant at the moment of a password reset —
+     * this mutator is intentionally narrow: it exists solely for
+     * {@code PasswordResetService.resetPassword} and must not be called from any
+     * other write path.
+     */
+    public void setTokensValidAfter(Instant tokensValidAfter) {
+        this.tokensValidAfter = tokensValidAfter;
     }
 
     public String getBusinessName() {

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -148,5 +149,80 @@ class JwtConfigTest {
         assertThatThrownBy(() -> jwtConfig(placeholder))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("placeholder");
+    }
+
+    // ── TTL bound checks ──────────────────────────────────────────────────────
+    //
+    // A valid 32-byte secret is reused across these so only the expiration field
+    // under test can trip the compact constructor's IllegalStateException guards.
+
+    private static final String VALID_SECRET = "a".repeat(32);
+
+    @Test
+    @DisplayName("should_throw_when_accessTokenExpirationIsNonPositive")
+    void should_throw_when_accessTokenExpirationIsNonPositive() {
+        assertThatThrownBy(() -> new JwtConfig(VALID_SECRET, 0L, 86_400_000L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("access-token-expiration")
+                .hasMessageContaining("positive");
+
+        assertThatThrownBy(() -> new JwtConfig(VALID_SECRET, -1L, 86_400_000L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("access-token-expiration")
+                .hasMessageContaining("positive");
+    }
+
+    @Test
+    @DisplayName("should_throw_when_accessTokenExpirationExceeds24Hours")
+    void should_throw_when_accessTokenExpirationExceeds24Hours() {
+        long twentyFourHoursMs = Duration.ofHours(24).toMillis();
+
+        assertThatThrownBy(() -> new JwtConfig(VALID_SECRET, twentyFourHoursMs + 1, 86_400_000L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("access-token-expiration")
+                .hasMessageContaining("24 hours");
+    }
+
+    @Test
+    @DisplayName("should_accept_when_accessTokenExpirationIsExactly24Hours")
+    void should_accept_when_accessTokenExpirationIsExactly24Hours() {
+        long twentyFourHoursMs = Duration.ofHours(24).toMillis();
+
+        assertThatCode(() -> new JwtConfig(VALID_SECRET, twentyFourHoursMs, 86_400_000L))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("should_throw_when_refreshTokenExpirationIsNonPositive")
+    void should_throw_when_refreshTokenExpirationIsNonPositive() {
+        assertThatThrownBy(() -> new JwtConfig(VALID_SECRET, 3_600_000L, 0L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("refresh-token-expiration")
+                .hasMessageContaining("positive");
+
+        assertThatThrownBy(() -> new JwtConfig(VALID_SECRET, 3_600_000L, -1L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("refresh-token-expiration")
+                .hasMessageContaining("positive");
+    }
+
+    @Test
+    @DisplayName("should_throw_when_refreshTokenExpirationExceeds30Days")
+    void should_throw_when_refreshTokenExpirationExceeds30Days() {
+        long thirtyDaysMs = Duration.ofDays(30).toMillis();
+
+        assertThatThrownBy(() -> new JwtConfig(VALID_SECRET, 3_600_000L, thirtyDaysMs + 1))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("refresh-token-expiration")
+                .hasMessageContaining("30 days");
+    }
+
+    @Test
+    @DisplayName("should_accept_when_refreshTokenExpirationIsExactly30Days")
+    void should_accept_when_refreshTokenExpirationIsExactly30Days() {
+        long thirtyDaysMs = Duration.ofDays(30).toMillis();
+
+        assertThatCode(() -> new JwtConfig(VALID_SECRET, 3_600_000L, thirtyDaysMs))
+                .doesNotThrowAnyException();
     }
 }
