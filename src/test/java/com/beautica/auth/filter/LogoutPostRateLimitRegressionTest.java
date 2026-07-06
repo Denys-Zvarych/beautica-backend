@@ -53,14 +53,17 @@ class LogoutPostRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 16 permissive caches — one positional arg per @Qualifier bucket on the production
-        // constructor. The logout-POST throttle is internal to the filter (built like
-        // inviteBuckets / otpVerifyBuckets), so this test references no new constructor arg.
+        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // constructor (now includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets,
+        // Phase A5). The logout-POST throttle is internal to the filter (built like
+        // inviteBuckets / otpVerifyBuckets), so this test references no new constructor arg
+        // beyond the count.
         return new AuthRateLimitFilter(
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive());
     }
 
     private MockHttpServletRequest postLogout() {

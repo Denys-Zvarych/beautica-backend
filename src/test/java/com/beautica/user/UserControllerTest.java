@@ -2,6 +2,7 @@ package com.beautica.user;
 
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
+import com.beautica.auth.PasswordResetService;
 import com.beautica.auth.Role;
 import com.beautica.config.WebMvcTestSupport;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -28,6 +29,7 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -76,6 +78,10 @@ class UserControllerTest {
     /** Only production collaborator. Stub its responses per test. */
     @MockBean
     private UserService userService;
+
+    /** Required by {@link UserController}'s constructor for the change-password-otp endpoint. */
+    @MockBean
+    private PasswordResetService passwordResetService;
 
     /**
      * Required by {@code SecurityConfig} constructor (via {@code JwtAuthenticationFilter}).
@@ -564,5 +570,36 @@ class UserControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isUnauthorized());
+    }
+
+    // ── POST /api/v1/users/me/change-password/request-otp ────────────────────
+    // Authenticated "change password from settings" entry point (Phase A7). Rate-limit
+    // (429) behaviour for changePasswordOtpBuckets is covered separately by
+    // RateLimitConfigTest and AuthRateLimitFilterTest — this slice only asserts the
+    // controller's own auth-boundary and delegation behaviour.
+
+    @Test
+    @DisplayName("POST /me/change-password/request-otp with valid JWT → 200, delegates to requestResetForUserId(userId)")
+    void should_return200_when_requestChangePasswordOtpWithValidJwt() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(post("/api/v1/users/me/change-password/request-otp")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        org.mockito.Mockito.verify(passwordResetService).requestResetForUserId(userId);
+    }
+
+    @Test
+    @DisplayName("POST /me/change-password/request-otp with no JWT → 401, service never invoked")
+    void should_return401_when_requestChangePasswordOtpWithoutJwt() throws Exception {
+        mockMvc.perform(post("/api/v1/users/me/change-password/request-otp")
+                        .with(csrf()))
+                .andExpect(status().isUnauthorized());
+
+        org.mockito.Mockito.verify(passwordResetService, org.mockito.Mockito.never())
+                .requestResetForUserId(any(UUID.class));
     }
 }

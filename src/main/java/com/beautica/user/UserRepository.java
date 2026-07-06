@@ -49,6 +49,17 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     Optional<User> findByEmailForUpdate(@Param("email") String email);
 
     /**
+     * Id-keyed counterpart of {@link #findByEmailForUpdate} — used by the authenticated
+     * change-password-from-settings entry point ({@code PasswordResetService#requestResetForUserId}),
+     * where the caller is identified by their JWT-derived {@code userId}, not an email from the
+     * request body. Closes the same TOCTOU window between the resend-cooldown read and the OTP
+     * write as the email-keyed variant.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT u FROM User u WHERE u.id = :userId")
+    Optional<User> findByIdForUpdate(@Param("userId") UUID userId);
+
+    /**
      * Single bounded statement that nulls the verification code material on
      * abandoned, unverified registrations whose OTP expired before
      * {@code cutoff}. Keeps stale {@code verification_code_hash} /

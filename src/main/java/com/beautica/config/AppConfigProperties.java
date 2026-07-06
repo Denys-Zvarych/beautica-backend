@@ -11,6 +11,7 @@ import org.springframework.context.annotation.Configuration;
         OtpPepperConfig.class,
         VerificationPolicyConfig.class,
         PasswordResetPolicyConfig.class,
+        PasswordResetOtpPolicyConfig.class,
         InternalApiKeyProperties.class,
         PublicBaseUrlProperties.class,
         SupportProperties.class,

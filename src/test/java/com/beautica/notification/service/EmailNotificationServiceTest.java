@@ -1,5 +1,6 @@
 package com.beautica.notification.service;
 
+import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
 import com.beautica.master.entity.Master;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -30,7 +31,6 @@ import java.util.Properties;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -526,48 +526,48 @@ class EmailNotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
-    // sendPasswordResetEmail
+    // sendPasswordResetOtpEmail (Phase A4 — replaces sendPasswordResetEmail)
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("sendPasswordResetEmail — calls mailSender.send and uses email/reset-password template")
-    void should_callMailSenderSend_when_sendPasswordResetEmailCalled() throws Exception {
+    @DisplayName("sendPasswordResetOtpEmail — calls mailSender.send and uses email/reset-password-otp template")
+    void should_callMailSenderSend_when_sendPasswordResetOtpEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
         ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+        service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "123456");
 
         verify(templateEngine).process(templateCaptor.capture(), any(IContext.class));
         verify(mailSender).send(realMessage);
         assertThat(templateCaptor.getValue())
-                .as("template name must be email/reset-password")
-                .isEqualTo("email/reset-password");
+                .as("template name must be email/reset-password-otp")
+                .isEqualTo("email/reset-password-otp");
     }
 
     @Test
-    @DisplayName("sendPasswordResetEmail — subject is Ukrainian 'Скидання паролю Beautica'")
-    void should_setUkrainianSubject_when_sendPasswordResetEmailCalled() throws Exception {
+    @DisplayName("sendPasswordResetOtpEmail — subject is Ukrainian 'Код для скидання паролю Beautica'")
+    void should_setUkrainianSubject_when_sendPasswordResetOtpEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
 
-        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+        service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "123456");
 
         assertThat(realMessage.getSubject())
-                .as("subject must be the Ukrainian reset-password heading")
-                .isEqualTo("Скидання паролю Beautica");
+                .as("subject must be the Ukrainian reset-password-otp heading")
+                .isEqualTo("Код для скидання паролю Beautica");
     }
 
     @Test
-    @DisplayName("sendPasswordResetEmail — From header contains configured noreply address")
-    void should_setFromAddress_when_sendPasswordResetEmailCalled() throws Exception {
+    @DisplayName("sendPasswordResetOtpEmail — From header contains configured noreply address")
+    void should_setFromAddress_when_sendPasswordResetOtpEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
 
-        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+        service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "123456");
 
         assertThat(realMessage.getFrom())
                 .as("From: must be set")
@@ -579,16 +579,16 @@ class EmailNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("sendPasswordResetEmail — To header contains the recipient address")
-    void should_setToRecipient_when_sendPasswordResetEmailCalled() throws Exception {
+    @DisplayName("sendPasswordResetOtpEmail — To header contains the user's email address")
+    void should_setToRecipient_when_sendPasswordResetOtpEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
 
-        service.sendPasswordResetEmail("reset-user@example.com", "https://beautica.app/reset?token=tok");
+        service.sendPasswordResetOtpEmail(buildUser("reset-user@example.com", "Anna"), "123456");
 
         assertThat(realMessage.getRecipients(jakarta.mail.Message.RecipientType.TO))
-                .as("To: must contain exactly the recipient passed in")
+                .as("To: must contain exactly the recipient's email")
                 .isNotNull()
                 .hasSize(1);
         assertThat(realMessage.getRecipients(jakarta.mail.Message.RecipientType.TO)[0].toString())
@@ -597,31 +597,47 @@ class EmailNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("sendPasswordResetEmail — passes resetUrl to Thymeleaf context variable 'resetUrl'")
-    void should_passResetUrlToContext_when_sendPasswordResetEmailCalled() throws Exception {
-        String expectedUrl = "https://beautica.app/reset?token=securetoken42";
+    @DisplayName("sendPasswordResetOtpEmail — passes the raw OTP to Thymeleaf context variable 'code'")
+    void should_passCodeToContext_when_sendPasswordResetOtpEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
         ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
-        service.sendPasswordResetEmail("user@example.com", expectedUrl);
+        service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "654321");
 
         verify(templateEngine).process(anyString(), contextCaptor.capture());
         Context captured = (Context) contextCaptor.getValue();
-        assertThat(captured.getVariable("resetUrl"))
-                .as("context variable 'resetUrl' must equal the URL passed in")
-                .isEqualTo(expectedUrl);
+        assertThat(captured.getVariable("code"))
+                .as("context variable 'code' must equal the raw OTP passed in")
+                .isEqualTo("654321");
     }
 
     @Test
-    @DisplayName("sendPasswordResetEmail — MimeMessage is multipart/related with inline image/png CID beauticaLogo")
-    void should_attachLogoAsCid_when_sendPasswordResetEmailCalled() throws Exception {
+    @DisplayName("sendPasswordResetOtpEmail — does not pass a 'firstName' context variable (dead/PII-avoidance, template does not use it)")
+    void should_notPassFirstNameToContext_when_sendPasswordResetOtpEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "654321");
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("firstName"))
+                .as("firstName must not be set — reset-password-otp.html never references it")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("sendPasswordResetOtpEmail — MimeMessage is multipart/related with inline image/png CID beauticaLogo")
+    void should_attachLogoAsCid_when_sendPasswordResetOtpEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
 
-        service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok");
+        service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "123456");
 
         realMessage.saveChanges();
         Object content = realMessage.getContent();
@@ -650,60 +666,28 @@ class EmailNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("sendPasswordResetEmail — does not throw when mailSender.send throws MailSendException")
-    void should_notThrow_when_mailSenderThrowsMailException_in_sendPasswordResetEmail() {
+    @DisplayName("sendPasswordResetOtpEmail — does not throw when mailSender.send throws MailSendException")
+    void should_notThrow_when_mailSenderThrowsMailException_in_sendPasswordResetOtpEmail() {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
         doThrow(new MailSendException("SMTP unavailable")).when(mailSender).send(any(MimeMessage.class));
 
         assertThatCode(() ->
-                service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok")
+                service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "123456")
         ).doesNotThrowAnyException();
     }
 
     @Test
-    @DisplayName("sendPasswordResetEmail — does not throw when MimeMessage.setSubject throws MessagingException")
-    void should_notThrow_when_messagingExceptionIn_sendPasswordResetEmail() throws MessagingException {
+    @DisplayName("sendPasswordResetOtpEmail — does not throw when MimeMessage.setSubject throws MessagingException")
+    void should_notThrow_when_messagingExceptionIn_sendPasswordResetOtpEmail() throws MessagingException {
         MimeMessage mockMessage = mock(MimeMessage.class);
         doThrow(new MessagingException("simulated header failure"))
                 .when(mockMessage).setSubject(anyString(), anyString());
         when(mailSender.createMimeMessage()).thenReturn(mockMessage);
 
         assertThatCode(() ->
-                service.sendPasswordResetEmail("user@example.com", "https://beautica.app/reset?token=tok")
-        ).doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("sendPasswordResetEmail — throws IllegalArgumentException when resetUrl uses ftp:// scheme")
-    void should_throwIllegalArgument_when_resetUrlHasFtpScheme() {
-        assertThatThrownBy(() ->
-                service.sendPasswordResetEmail("user@example.com", "ftp://evil.com/reset?token=x")
-        )
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("unsafe scheme");
-    }
-
-    @Test
-    @DisplayName("sendPasswordResetEmail — throws IllegalArgumentException when resetUrl uses http:// with non-localhost host")
-    void should_throwIllegalArgument_when_resetUrlIsHttpNonLocalhost() {
-        assertThatThrownBy(() ->
-                service.sendPasswordResetEmail("user@example.com", "http://attacker.com/reset?token=x")
-        )
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("unsafe scheme");
-    }
-
-    @Test
-    @DisplayName("sendPasswordResetEmail — does not throw when resetUrl is http://localhost (SchemeGuard allows localhost)")
-    void should_notThrow_when_resetUrlIsLocalhostHttp() throws Exception {
-        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
-        when(mailSender.createMimeMessage()).thenReturn(realMessage);
-        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
-
-        assertThatCode(() ->
-                service.sendPasswordResetEmail("dev@localhost", "http://localhost/reset?token=localdev")
+                service.sendPasswordResetOtpEmail(buildUser("user@example.com", "Anna"), "123456")
         ).doesNotThrowAnyException();
     }
 
@@ -712,8 +696,8 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should strip CRLF from To address in sendPasswordResetEmail before setTo is called")
-    void should_stripCrlf_when_sendPasswordResetEmailCalledWithInjectedNewline() throws Exception {
+    @DisplayName("should strip CRLF from To address in sendPasswordResetOtpEmail before setTo is called")
+    void should_stripCrlf_when_sendPasswordResetOtpEmailCalledWithInjectedNewline() throws Exception {
         // Use an address that is valid after CRLF stripping so MimeMessageHelper.setTo() succeeds
         // and we can assert the header was populated without the injected control characters.
         // "user@example.com\r\n" → stripped → "user@example.com" (valid RFC 5321 address).
@@ -721,9 +705,7 @@ class EmailNotificationServiceTest {
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>reset</html>");
 
-        service.sendPasswordResetEmail(
-                "user@example.com\r\n",
-                "https://beautica.app/reset?token=tok");
+        service.sendPasswordResetOtpEmail(buildUser("user@example.com\r\n", "Anna"), "123456");
 
         assertThat(realMessage.getRecipients(Message.RecipientType.TO))
                 .as("To header must be set (CRLF stripped, address remains valid)")
@@ -824,5 +806,14 @@ class EmailNotificationServiceTest {
         lenient().when(booking.getStartsAt()).thenReturn(startsAt);
 
         return booking;
+    }
+
+    /**
+     * Builds a real (non-mock) {@link User} for {@code sendPasswordResetOtpEmail} tests —
+     * only {@code getEmail()} / {@code getFirstName()} are read by the service, both plain
+     * constructor-set fields, so a real instance is simpler than mocking.
+     */
+    private User buildUser(String email, String firstName) {
+        return new User(email, "hash", Role.CLIENT, firstName, "Test", null);
     }
 }

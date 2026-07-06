@@ -50,6 +50,8 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> bulkServiceSetupBuckets;
     @Mock private LoadingCache<String, Bucket> supportContactBuckets;
     @Mock private LoadingCache<String, Bucket> otpSendBuckets;
+    @Mock private LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets;
+    @Mock private LoadingCache<String, Bucket> changePasswordOtpBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -62,7 +64,8 @@ class AuthRateLimitFilterTest {
                 slotsBuckets, deviceTokenBuckets, mediaUploadBuckets, profileUpdateBuckets,
                 resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets,
                 categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets,
-                supportContactBuckets, otpSendBuckets);
+                supportContactBuckets, otpSendBuckets, verifyPasswordResetOtpBuckets,
+                changePasswordOtpBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -1152,6 +1155,122 @@ class AuthRateLimitFilterTest {
             assertThat(response.getHeader("Retry-After")).isEqualTo("3600");
             assertThat(response.getContentType())
                     .as("Content-Type must be application/json on 429 reset-password response")
+                    .startsWith("application/json");
+            assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(chain.getRequest()).isNull();
+            verifyNoInteractions(forgotPasswordBuckets);
+            verifyNoInteractions(loginBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("POST /api/v1/auth/verify-password-reset-otp")
+    class VerifyPasswordResetOtpEndpoint {
+
+        @Test
+        @DisplayName("passes through when verifyPasswordResetOtp bucket has tokens")
+        void should_passThrough_when_verifyPasswordResetOtpBucketHasTokens() throws Exception {
+            log.debug("Arrange: verifyPasswordResetOtpBuckets returns bucket that allows consumption");
+            when(verifyPasswordResetOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/auth/verify-password-reset-otp");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/verify-password-reset-otp when bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when verifyPasswordResetOtp bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(verifyPasswordResetOtpBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(verifyEmailBuckets);
+            verifyNoInteractions(forgotPasswordBuckets);
+            verifyNoInteractions(resetPasswordBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 with 900s Retry-After when verifyPasswordResetOtp bucket is exhausted")
+        void should_return429_when_verifyPasswordResetOtpBucketExhausted() throws Exception {
+            log.debug("Arrange: verifyPasswordResetOtpBuckets returns bucket that denies consumption");
+            when(verifyPasswordResetOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/auth/verify-password-reset-otp");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /auth/verify-password-reset-otp when bucket is exhausted");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when verifyPasswordResetOtp bucket is exhausted")
+                    .isEqualTo(429);
+            // 15-minute window — Retry-After must reflect 900 s.
+            assertThat(response.getHeader("Retry-After")).isEqualTo("900");
+            assertThat(response.getContentType())
+                    .as("Content-Type must be application/json on 429 verify-password-reset-otp response")
+                    .startsWith("application/json");
+            assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(chain.getRequest()).isNull();
+            verifyNoInteractions(verifyEmailBuckets);
+            verifyNoInteractions(forgotPasswordBuckets);
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("POST /api/v1/users/me/change-password/request-otp")
+    class ChangePasswordOtpEndpoint {
+
+        @Test
+        @DisplayName("passes through when changePasswordOtp bucket has tokens")
+        void should_passThrough_when_changePasswordOtpBucketHasTokens() throws Exception {
+            log.debug("Arrange: changePasswordOtpBuckets returns bucket that allows consumption");
+            when(changePasswordOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request  = postRequest("/api/v1/users/me/change-password/request-otp");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /users/me/change-password/request-otp when bucket allows consumption");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 200 when changePasswordOtp bucket allows the request")
+                    .isEqualTo(200);
+            assertThat(chain.getRequest()).isNotNull();
+            verify(changePasswordOtpBuckets).get(REMOTE_ADDR);
+            // Decoupling invariant: change-password-otp must NOT touch the forgot-password bucket.
+            verifyNoInteractions(forgotPasswordBuckets);
+            verifyNoInteractions(loginBuckets);
+        }
+
+        @Test
+        @DisplayName("returns 429 with 3600s Retry-After when changePasswordOtp bucket is exhausted")
+        void should_return429_when_changePasswordOtpBucketExhausted() throws Exception {
+            log.debug("Arrange: changePasswordOtpBuckets returns bucket that denies consumption");
+            when(changePasswordOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request  = postRequest("/api/v1/users/me/change-password/request-otp");
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            log.debug("Act: doFilterInternal for POST /users/me/change-password/request-otp when bucket is exhausted");
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus())
+                    .as("status must be 429 when changePasswordOtp bucket is exhausted")
+                    .isEqualTo(429);
+            // 60-minute window — Retry-After must reflect 3600 s.
+            assertThat(response.getHeader("Retry-After")).isEqualTo("3600");
+            assertThat(response.getContentType())
+                    .as("Content-Type must be application/json on 429 change-password-otp response")
                     .startsWith("application/json");
             assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
             assertThat(chain.getRequest()).isNull();

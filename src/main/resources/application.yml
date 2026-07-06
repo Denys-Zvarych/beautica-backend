@@ -210,10 +210,28 @@ app:
     # Overridden to 10s in the local profile so developers don't wait 60s during testing.
     resend-cooldown: 60s
   password-reset:
-    # Reset tokens expired longer than this are hard-deleted by the daily sweep
-    # (PasswordResetTokenCleanupJob) — keeps password_reset_tokens from growing
-    # unbounded. A few days of buffer past the 1 h TTL for support/forensic lookup.
+    # Reset tickets expired longer than this are hard-deleted by the daily sweep
+    # (PasswordResetTokenCleanupJob) — keeps password_reset_tickets from growing
+    # unbounded. A few days of buffer past the 10 min ticket TTL for support/forensic lookup.
     cleanup-retention: 7d
+  password-reset-otp:
+    # 6-digit OTP lifetime for the password-reset request/verify step (mirrors
+    # app.verification's shape). Kept short — 15 minutes is plenty to check an inbox.
+    otp-ttl: 15m
+    # Per-code attempt cap before PasswordResetOtpProcessor treats the code as expired.
+    max-attempts-per-code: 5
+    # Resend-surviving cumulative brute-force bound: after this many lifetime failed
+    # verifies (NOT reset by a fresh OTP request) the account is locked for lockout-duration.
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    # Minimum time between two consecutive OTP requests for the same account. Shared by
+    # both entry points (forgot-password and the authenticated change-password-from-settings
+    # request-otp). Overridden to a shorter value in the local profile.
+    resend-cooldown: 60s
+    # Lifetime of the PasswordResetTicket minted after a successful OTP verification. Short
+    # — the caller has just proven account ownership and is expected to complete the reset
+    # immediately (unlike the old 1-hour email-link TTL).
+    ticket-ttl: 10m
   rate-limit:
     # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
     # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.

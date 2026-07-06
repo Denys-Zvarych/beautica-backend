@@ -2,18 +2,21 @@ package com.beautica.auth;
 
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.ResetPasswordRequest;
+import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
+import com.beautica.auth.dto.VerifyPasswordResetOtpResponse;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.common.util.SchemeGuard;
+import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.ResendThrottledException;
+import com.beautica.config.PasswordResetOtpPolicyConfig;
 import com.beautica.notification.service.EmailNotificationService;
-import com.beautica.user.PasswordResetToken;
-import com.beautica.user.PasswordResetTokenRepository;
+import com.beautica.user.PasswordResetTicket;
+import com.beautica.user.PasswordResetTicketRepository;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -22,28 +25,34 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.Locale;
 import java.util.UUID;
 
 /**
- * Handles the two-step password-reset flow:
+ * Handles the password-reset OTP flow (Phase A3 — replaces the old email-link flow):
  * <ol>
- *   <li>{@link #requestReset} — mints a hashed single-use token and schedules a reset email.</li>
- *   <li>{@link #resetPassword} — validates the raw token under a pessimistic lock, updates the
- *       password hash, and invalidates all existing sessions.</li>
+ *   <li>{@link #requestReset} / {@link #requestResetForUserId} — both mint and email a
+ *       6-digit OTP via the shared {@link #mintAndSendOtp} helper; the former is the
+ *       anti-enumeration public entry point ({@code POST /auth/forgot-password}), the
+ *       latter is the authenticated change-password-from-settings entry point
+ *       ({@code POST /users/me/change-password/request-otp}).</li>
+ *   <li>{@link #verifyOtp} — validates the submitted OTP via {@link PasswordResetOtpProcessor}
+ *       and returns the freshly-minted {@code resetTicket}.</li>
+ *   <li>{@link #resetPassword} — validates the raw ticket under a pessimistic lock, updates
+ *       the password hash, and invalidates all existing sessions.</li>
  * </ol>
  *
  * <p><strong>Enumeration protection:</strong> {@code requestReset} always returns normally
- * (no exception, same log footprint) whether the email is unknown, unverified, or valid.
- * Only the verified+active branch actually persists a token and enqueues mail.
+ * (no exception, same log footprint) whether the email is unknown, unverified, or inactive.
+ * Only the verified+active branch actually mints an OTP and enqueues mail.
  *
  * <p><strong>Oracle protection:</strong> {@code resetPassword} surfaces invalid, used, and
- * expired tokens as a single identical generic 400 — callers cannot distinguish the three states.
+ * expired tickets as a single identical generic 400 — callers cannot distinguish the three
+ * states. {@code verifyOtp} delegates its own oracle protection entirely to
+ * {@link PasswordResetOtpProcessor}.
  */
 @Service
 public class PasswordResetService {
@@ -51,9 +60,8 @@ public class PasswordResetService {
     private static final Logger log = LoggerFactory.getLogger(PasswordResetService.class);
 
     private static final String GENERIC_RESET_ERROR = "Invalid or expired reset token";
-    private static final String RESET_PATH = "/reset-password?token=";
 
-    private final PasswordResetTokenRepository passwordResetTokenRepository;
+    private final PasswordResetTicketRepository passwordResetTicketRepository;
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
     private final TokenGenerator tokenGenerator;
@@ -61,12 +69,12 @@ public class PasswordResetService {
     private final EmailNotificationService emailNotificationService;
     private final TaskExecutor emailExecutor;
     private final TokensValidAfterCache tokensValidAfterCache;
+    private final PasswordResetOtpProcessor passwordResetOtpProcessor;
+    private final PasswordResetOtpPolicyConfig passwordResetOtpPolicy;
     private final Clock clock;
-    private final String frontendBaseUrl;
-    private final long tokenExpirationHours;
 
     public PasswordResetService(
-            PasswordResetTokenRepository passwordResetTokenRepository,
+            PasswordResetTicketRepository passwordResetTicketRepository,
             UserRepository userRepository,
             RefreshTokenRepository refreshTokenRepository,
             TokenGenerator tokenGenerator,
@@ -74,11 +82,11 @@ public class PasswordResetService {
             EmailNotificationService emailNotificationService,
             @Qualifier("emailExecutor") TaskExecutor emailExecutor,
             TokensValidAfterCache tokensValidAfterCache,
-            Clock clock,
-            @Value("${app.frontend.base-url}") String frontendBaseUrl,
-            @Value("${app.password-reset.token-expiration-hours:1}") long tokenExpirationHours
+            PasswordResetOtpProcessor passwordResetOtpProcessor,
+            PasswordResetOtpPolicyConfig passwordResetOtpPolicy,
+            Clock clock
     ) {
-        this.passwordResetTokenRepository = passwordResetTokenRepository;
+        this.passwordResetTicketRepository = passwordResetTicketRepository;
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
         this.tokenGenerator = tokenGenerator;
@@ -86,20 +94,20 @@ public class PasswordResetService {
         this.emailNotificationService = emailNotificationService;
         this.emailExecutor = emailExecutor;
         this.tokensValidAfterCache = tokensValidAfterCache;
+        this.passwordResetOtpProcessor = passwordResetOtpProcessor;
+        this.passwordResetOtpPolicy = passwordResetOtpPolicy;
         this.clock = clock;
-        this.frontendBaseUrl = frontendBaseUrl;
-        this.tokenExpirationHours = tokenExpirationHours;
     }
 
     /**
-     * Initiates a password-reset request.
+     * Initiates a password-reset request from an unauthenticated caller (the caller holds no
+     * JWT — that is why they are resetting the password).
      *
-     * <p>Enumeration protection: this method always returns normally regardless of
-     * whether the email maps to a known, verified, or active account. Only verified+active
-     * users actually receive a reset email.
-     *
-     * <p>Before issuing a new token, any existing unused reset tokens for the user are
-     * superseded (marked used) so at most one live reset link exists at any time.
+     * <p>Enumeration protection: this method always returns normally regardless of whether
+     * the email maps to a known, verified, or active account. Only verified+active users
+     * actually receive an OTP email — the real OTP mint/send/cooldown logic lives in the
+     * shared {@link #mintAndSendOtp} helper so this entry point and
+     * {@link #requestResetForUserId} share it with zero duplication.
      *
      * @param request validated request DTO carrying the raw email address
      */
@@ -107,76 +115,121 @@ public class PasswordResetService {
     public void requestReset(ForgotPasswordRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // Enumeration protection: unknown / unverified / inactive → silent no-op.
-        // No exception, no log line that references the email or the outcome.
-        var userOpt = userRepository.findByEmail(email);
-        if (userOpt.isEmpty()) {
-            performDecoyWork();
-            return;
-        }
-        User user = userOpt.get();
-        if (!user.isActive() || !user.isEmailVerified()) {
-            performDecoyWork();
+        // Non-locking pre-read — unknown / inactive / unverified take NO row lock.
+        var preReadOpt = userRepository.findByEmail(email);
+        if (preReadOpt.isEmpty() || !preReadOpt.get().isActive() || !preReadOpt.get().isEmailVerified()) {
+            performDecoyWork(email);
             return;
         }
 
-        // Supersede any outstanding unused reset links for this user.
-        passwordResetTokenRepository.markAllUsedByUserId(user.getId());
+        // Real write path — escalate to the pessimistic lock now (closes the TOCTOU window
+        // between the cooldown read inside mintAndSendOtp and the OTP write), mirroring
+        // AuthService.resendVerification.
+        var user = userRepository.findByEmailForUpdate(email).orElse(null);
+        if (user == null || !user.isActive() || !user.isEmailVerified()) {
+            performDecoyWork(email);
+            return;
+        }
 
-        String rawToken = tokenGenerator.generateToken();
-        String hashedToken = tokenGenerator.hash(rawToken);
-        Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
-
-        passwordResetTokenRepository.save(new PasswordResetToken(hashedToken, user.getId(), expiresAt));
-
-        String resetLink = buildResetLink(rawToken);
-        scheduleResetEmail(email, resetLink);
+        mintAndSendOtp(user, true);
     }
 
     /**
-     * Completes a password reset given a raw token from the emailed link.
+     * Initiates a password-reset request for an already-authenticated caller (the
+     * "change password from settings" entry point). No anti-enumeration is needed — the
+     * caller is identified by their own JWT-derived {@code userId}, not an email they typed —
+     * so this delegates directly to the same {@link #mintAndSendOtp} helper used by
+     * {@link #requestReset}. Unlike {@link #requestReset}, the resend cooldown throttle IS
+     * surfaced as a 429 here — see {@link #mintAndSendOtp} for why the two entry points
+     * diverge on that one behavior.
      *
-     * <p>Oracle protection: invalid, used, and expired tokens all throw a
-     * {@link BusinessException} with the same message and HTTP status so callers
-     * cannot probe which state was reached.
+     * @param userId the authenticated caller's id (from {@code AuthenticationUtils.userId})
+     * @throws NotFoundException if the user row is somehow missing (defensive only — the
+     *                           caller already holds a valid JWT for this id)
+     */
+    @Transactional
+    public void requestResetForUserId(UUID userId) {
+        User user = userRepository.findByIdForUpdate(userId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+        mintAndSendOtp(user, false);
+    }
+
+    /**
+     * Verifies the submitted OTP and, on success, returns the freshly-minted reset ticket.
      *
-     * <p>On success: the user's password hash is updated, the consumed token is marked
-     * used, every other outstanding reset token for the user is invalidated, every
-     * existing refresh token (i.e., all sessions) is revoked, AND {@code tokensValidAfter}
-     * is stamped so any already-issued access token also stops working (see
-     * {@link TokensValidAfterCache} / {@link JwtAuthenticationFilter}) — otherwise a
-     * stolen access token would remain usable for its remaining TTL despite the reset.
-     * No auth tokens are returned — the client must route to the login screen.
+     * <p>Delegates entirely to {@link PasswordResetOtpProcessor#verifyAndIssueTicket}, which
+     * owns the locked critical section (attempt cap, cumulative lockout, constant-time
+     * compare) and mints the ticket in the same transaction. Mirrors
+     * {@code AuthService.verifyEmail}'s thin-delegate shape.
+     */
+    public VerifyPasswordResetOtpResponse verifyOtp(VerifyPasswordResetOtpRequest request) {
+        String rawTicket = passwordResetOtpProcessor.verifyAndIssueTicket(request);
+        return new VerifyPasswordResetOtpResponse(rawTicket);
+    }
+
+    /**
+     * Completes a password reset given the raw ticket minted by {@link #verifyOtp}.
      *
-     * @param request validated DTO carrying the raw token from the email link and the desired new password
-     * @throws BusinessException (400) for invalid / used / expired token
+     * <p>Oracle protection: invalid, used, and expired tickets all throw a
+     * {@link BusinessException} with the same message and HTTP status so callers cannot
+     * probe which state was reached.
+     *
+     * <p>On success: the user's password hash is updated, the consumed ticket is marked used,
+     * every other outstanding reset ticket for the user is invalidated, every existing refresh
+     * token (i.e., all sessions) is revoked, AND {@code tokensValidAfter} is stamped so any
+     * already-issued access token also stops working (see {@link TokensValidAfterCache} /
+     * {@link JwtAuthenticationFilter}) — otherwise a stolen access token would remain usable
+     * for its remaining TTL despite the reset. No auth tokens are returned — the client must
+     * route to the login screen.
+     *
+     * <p>This unconditionally revokes every refresh token for the user via
+     * {@code refreshTokenRepository.deleteByUserId} — including the session of the caller
+     * themselves when this was reached via the authenticated change-password-from-settings
+     * entry point ({@link #requestResetForUserId}). That is intentional: a password change
+     * forces every session (including the one that just changed it) to re-authenticate.
+     *
+     * @param request validated DTO carrying the raw ticket from {@link #verifyOtp} and the
+     *                desired new password
+     * @throws BusinessException (400) for invalid / used / expired ticket
      */
     @Transactional
     public void resetPassword(ResetPasswordRequest request) {
-        String hashedToken = tokenGenerator.hash(request.token());
+        String hashedTicket = tokenGenerator.hash(request.resetTicket());
 
-        // Compute the new password BCrypt hash BEFORE acquiring the row lock. BCrypt is
-        // pure CPU work (~80-150 ms) that needs no lock; running it inside the lock would
-        // lengthen the PESSIMISTIC_WRITE hold under concurrent same-token submits. This
-        // shrinks the lock window to fast DB round-trips only. Trade-off: the hash is now
-        // computed even for invalid tokens (minor wasted CPU) — acceptable, and it evens
-        // out per-request timing as an anti-oracle bonus.
+        // Compute the new password BCrypt hash BEFORE looking up the ticket / acquiring the
+        // row lock — and unconditionally, even though an invalid/unknown ticket will discard
+        // it. Two deliberate reasons, both intentional trade-offs, NOT oversights:
+        //
+        // 1. Concurrency: BCrypt is pure CPU work (~80-150 ms) that needs no lock; running it
+        //    inside the lock would lengthen the PESSIMISTIC_WRITE hold under concurrent
+        //    same-ticket submits. Paying it up front shrinks the lock window to fast DB
+        //    round-trips only.
+        // 2. Anti-timing-oracle: paying the ~80-150 ms BCrypt cost on EVERY call — valid
+        //    ticket or not — means an invalid/unknown/used/expired ticket takes the same
+        //    wall-clock time as a successful reset. Skipping the encode for invalid tickets
+        //    would make this endpoint's response latency a side channel that leaks "does this
+        //    ticket exist" independently of the byte-identical 400 body already enforced
+        //    below. The wasted CPU on invalid tickets is the accepted cost of closing that
+        //    channel. This is mitigated (not eliminated) by the per-IP Bucket4j rate limit on
+        //    `/auth/*` bounding how many timing samples an attacker can collect — it is a
+        //    monitoring item, not a defect; do not remove or make this conditional on ticket
+        //    validity.
         String newPasswordHash = passwordEncoder.encode(request.newPassword());
 
-        PasswordResetToken token = passwordResetTokenRepository
-                .findByTokenForUpdate(hashedToken)
+        PasswordResetTicket ticket = passwordResetTicketRepository
+                .findByTicketHashForUpdate(hashedTicket)
                 .orElseThrow(() -> new BusinessException(HttpStatus.BAD_REQUEST, GENERIC_RESET_ERROR));
 
-        if (token.isUsed() || token.getExpiresAt().isBefore(clock.instant())) {
+        if (ticket.isUsed() || ticket.getExpiresAt().isBefore(clock.instant())) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, GENERIC_RESET_ERROR);
         }
 
         // FK integrity guarantees this user exists, but if somehow it does not,
         // surface the same generic error — no oracle distinguishing the FK case.
-        User user = userRepository.findById(token.getUserId())
+        User user = userRepository.findById(ticket.getUserId())
                 .orElseThrow(() -> new BusinessException(HttpStatus.BAD_REQUEST, GENERIC_RESET_ERROR));
 
-        // Both `user` and `token` are managed entities loaded within this @Transactional
+        // Both `user` and `ticket` are managed entities loaded within this @Transactional
         // boundary, so Hibernate dirty-checking flushes these mutations on commit — no
         // explicit save() call is required (it would be a redundant no-op).
         user.setPasswordHash(newPasswordHash);
@@ -191,11 +244,11 @@ public class PasswordResetService {
         // Primary single-use enforcement: flip the just-validated, pessimistically-locked
         // row directly. This is the authoritative consume — kept independent of the bulk
         // sweep below, which is defence-in-depth only.
-        token.markUsed();
+        ticket.markUsed();
 
-        // Defence in depth: invalidate every other outstanding reset token for the user,
+        // Defence in depth: invalidate every other outstanding reset ticket for the user,
         // then terminate all existing sessions (global logout).
-        passwordResetTokenRepository.markAllUsedByUserId(user.getId());
+        passwordResetTicketRepository.markAllUsedByUserId(user.getId());
         refreshTokenRepository.deleteByUserId(user.getId());
 
         // Evict the cached tokensValidAfter only AFTER this transaction commits — NOT
@@ -206,9 +259,7 @@ public class PasswordResetService {
         // cache that stale "no reset happened" answer for the full TTL — reopening the exact
         // stolen-access-token window this feature exists to close. Deferring to afterCommit
         // closes that race: by the time anyone can observe an evicted cache, the fresh value
-        // is already committed and visible. (This is why the AccessTokenDenylist.revoke
-        // analogy doesn't apply here: that denylist has no DB read-through to race against,
-        // so synchronous eviction is safe there but not for this cache.)
+        // is already committed and visible.
         evictTokensValidAfterCache(user.getId());
 
         log.info("Password reset completed: userId={}", user.getId());
@@ -219,82 +270,122 @@ public class PasswordResetService {
     // -------------------------------------------------------------------------
 
     /**
-     * Performs throwaway work on the no-op (unknown / unverified / inactive) branch so the
-     * per-request cost better tracks the verified-account path, which mints + hashes a real
-     * token and performs an UPDATE + INSERT against {@code password_reset_tokens}.
+     * Generates, hashes, and stores a fresh 6-digit OTP on {@code user}, then schedules the
+     * OTP email — the single write path shared by {@link #requestReset} and
+     * {@link #requestResetForUserId} (zero duplication between the two entry points).
      *
-     * <p>This is <em>best-effort latency narrowing, not perfect symmetry</em>: the decoy runs
-     * the same token hash plus a single read-only DB round-trip against the same table, whereas
-     * the real path issues writes (which are typically costlier than the read). The discarded
-     * results are intentional — the cost, not the value, is what matters.
+     * <p>Caller MUST supply a {@code user} entity obtained under a {@code PESSIMISTIC_WRITE}
+     * lock (see the call sites) so the cooldown check below cannot race a concurrent request
+     * for the same account.
      *
-     * <p>The primary enumeration defenses remain the byte-identical generic 200 response (the
-     * HTTP body is the same across all branches) and the per-IP rate limit on {@code /auth/*};
-     * this method only shrinks the residual timing side-channel. (The email-bounce channel is
-     * inherent and accepted.)
+     * <p>Anti-brute-force: a locked account (resend-surviving cumulative lockout, shared with
+     * {@link PasswordResetOtpProcessor}) is silently skipped — no OTP is (re)issued and no
+     * exception is thrown, so a locked account's state never leaks via this entry point
+     * either. An account that is NOT locked but within the per-account resend cooldown
+     * normally throws {@link ResendThrottledException} (429), mirroring
+     * {@code AuthService.resendVerification}'s throttle derivation exactly: {@code issuedAt}
+     * is derived as {@code passwordResetCodeExpiresAt - otpTtl} (no dedicated
+     * {@code sent_at} column) — UNLESS {@code suppressCooldownThrottle} is {@code true}.
+     *
+     * <p><strong>Why the flag exists:</strong> {@link #requestReset} (the unauthenticated,
+     * anti-enumeration {@code POST /auth/forgot-password} entry point) always returns the
+     * same 200 for unknown / inactive / unverified / locked accounts. If it also let a 429
+     * escape for "real, verified, active, unlocked account with a still-live code", an
+     * attacker could call it twice in a row for a candidate email and learn "account exists
+     * and is fully eligible" from the second response's status code alone — an
+     * account-existence oracle on the one endpoint specifically designed not to have one. So
+     * {@code requestReset} passes {@code suppressCooldownThrottle = true}: within the
+     * cooldown, this method silently no-ops (the already-issued, still-live OTP remains
+     * valid, so no legitimate flow is broken) instead of throwing, and the caller always sees
+     * the same 200. {@link #requestResetForUserId} (the authenticated
+     * change-password-from-settings entry point) passes {@code false} — there is no
+     * enumeration risk there (the caller is identified by their own JWT), and telling the
+     * legitimate authenticated user to wait via 429 is a real UX benefit worth keeping.
+     *
+     * @param suppressCooldownThrottle {@code true} to silently no-op within the cooldown
+     *                                 instead of throwing (the anti-enumeration entry point);
+     *                                 {@code false} to throw {@link ResendThrottledException}
+     *                                 as before (the authenticated entry point)
      */
-    private void performDecoyWork() {
-        String decoyToken = tokenGenerator.generateToken();
-        String decoyHash = tokenGenerator.hash(decoyToken);
-        // INTENTIONAL anti-timing-oracle DB round-trip — DO NOT remove or "optimize away".
-        // The real path hits the DB (markAllUsedByUserId UPDATE + save INSERT); without a
-        // representative DB read here this no-op branch would only burn CPU on the hash above,
-        // letting response latency distinguish a phantom account from an eligible one. This is
-        // a read-only probe by the (essentially never-matching) hashed token: no mutation, the
-        // Optional result is deliberately discarded, and the response stays an identical 200.
-        passwordResetTokenRepository.findByToken(decoyHash);
-    }
-
-    /**
-     * Builds the absolute reset URL that will appear in the email.
-     *
-     * <p>The path {@code /reset-password?token=<rawToken>} is the mobile + web deep-link
-     * contract. Do not change the query-param name without versioning the API.
-     */
-    private String buildResetLink(String rawToken) {
-        if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
-            // Configuration bug — do not swallow; surface loudly at startup time.
-            throw new IllegalStateException(
-                    "app.frontend.base-url must use https:// or http://localhost, "
-                    + "got an unsafe scheme. Check the environment configuration.");
+    private void mintAndSendOtp(User user, boolean suppressCooldownThrottle) {
+        if (passwordResetOtpProcessor.isLocked(user)) {
+            return;
         }
-        return frontendBaseUrl + RESET_PATH + URLEncoder.encode(rawToken, StandardCharsets.UTF_8);
+
+        if (user.getPasswordResetCodeExpiresAt() != null) {
+            Instant issuedAt = user.getPasswordResetCodeExpiresAt().minus(passwordResetOtpPolicy.otpTtl());
+            Instant nextAllowed = issuedAt.plus(passwordResetOtpPolicy.resendCooldown());
+            if (clock.instant().isBefore(nextAllowed)) {
+                if (suppressCooldownThrottle) {
+                    return;
+                }
+                long retryAfter = Duration.between(clock.instant(), nextAllowed).getSeconds() + 1;
+                throw new ResendThrottledException(retryAfter);
+            }
+        }
+
+        String rawOtp = tokenGenerator.generateOtp();
+        user.setPasswordResetCodeHash(tokenGenerator.hashOtp(rawOtp));
+        user.setPasswordResetCodeExpiresAt(clock.instant().plus(passwordResetOtpPolicy.otpTtl()));
+        // Reset the per-code attempt window only. passwordResetFailedTotal is deliberately
+        // NOT reset here — that is the resend-surviving cumulative bound.
+        user.setPasswordResetAttempts((short) 0);
+
+        scheduleResetOtpEmail(user, rawOtp);
     }
 
     /**
-     * Schedules a password-reset email to be dispatched after the current transaction commits.
+     * Performs throwaway work on the no-op (unknown / inactive / unverified) branch so the
+     * per-request cost tracks the eligible path, which escalates to a second
+     * {@code SELECT ... FOR UPDATE} lookup and generates+hashes a real OTP.
      *
-     * <p>Mirrors {@code AuthService.scheduleVerificationEmail}: when no active transaction
-     * synchronization exists (e.g. in unit tests where the {@code @Transactional} proxy is
-     * bypassed), the email is sent immediately on the calling thread so tests can verify
-     * the call without standing up a transaction manager.
+     * <p>This is <em>best-effort latency narrowing, not perfect symmetry</em>. The primary
+     * enumeration defenses remain the byte-identical generic 200 response and the per-IP rate
+     * limit on {@code /auth/*}; this method only shrinks the residual timing side-channel.
      */
-    private void scheduleResetEmail(String email, String resetLink) {
+    private void performDecoyWork(String email) {
+        // Decoy crypto cost mirroring mintAndSendOtp's generateOtp + hashOtp.
+        tokenGenerator.hashOtp(tokenGenerator.generateOtp());
+        // Decoy DB round-trip mirroring the eligible path's lock-escalation lookup — using the
+        // NON-locking findByEmail, deliberately NOT findByEmailForUpdate. This branch is
+        // reached for both a genuinely unknown email (no row exists to lock) AND a
+        // known-but-ineligible (inactive/unverified) email (a real row DOES exist). Taking a
+        // real PESSIMISTIC_WRITE lock in the latter case would serialize against any
+        // concurrent legitimate write to that account for no benefit — the Optional result is
+        // discarded either way, so no behavior depends on which finder is used, only lock
+        // semantics. findByEmail's plain SELECT preserves the DB-round-trip timing mirror
+        // without paying that concurrency cost.
+        userRepository.findByEmail(email);
+    }
+
+    /**
+     * Schedules the password-reset OTP email to be dispatched after the current transaction
+     * commits. Mirrors {@code AuthService.scheduleVerificationEmail}: when no active
+     * transaction synchronization exists (e.g. in unit tests where the {@code @Transactional}
+     * proxy is bypassed), the email is sent immediately on the calling thread so tests can
+     * verify the call without standing up a transaction manager.
+     */
+    private void scheduleResetOtpEmail(User user, String rawOtp) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(
                     new TransactionSynchronization() {
                         @Override
                         public void afterCommit() {
                             emailExecutor.execute(() ->
-                                    emailNotificationService.sendPasswordResetEmail(email, resetLink));
+                                    emailNotificationService.sendPasswordResetOtpEmail(user, rawOtp));
                         }
                     }
             );
         } else {
             // No active transaction (unit-test path) — call directly on the calling thread.
             emailExecutor.execute(() ->
-                    emailNotificationService.sendPasswordResetEmail(email, resetLink));
+                    emailNotificationService.sendPasswordResetOtpEmail(user, rawOtp));
         }
     }
 
     /**
      * Evicts {@code userId}'s entry from {@link TokensValidAfterCache} after the current
      * transaction commits, never before.
-     *
-     * <p>Mirrors {@link #scheduleResetEmail}: when no active transaction synchronization
-     * exists (e.g. in unit tests where the {@code @Transactional} proxy is bypassed), the
-     * eviction runs immediately on the calling thread so tests can verify the call without
-     * standing up a transaction manager.
      *
      * <p>See the call site in {@link #resetPassword} for why {@code afterCommit} — rather
      * than a synchronous inline call — is required here: this cache read-through hits the

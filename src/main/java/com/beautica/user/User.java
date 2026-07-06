@@ -120,6 +120,34 @@ public class User extends AuditableEntity {
     @Column(name = "verification_locked_until")
     private Instant verificationLockedUntil;
 
+    // ---- Phase A1 password-reset OTP columns (mirror verification_* exactly) --------
+    // Backs PasswordResetOtpProcessor's locked critical section, which reuses
+    // EmailVerificationProcessor's per-code attempt cap + resend-surviving cumulative
+    // lockout verbatim. See V107 for the CHECK constraints mirroring V49/V50/V63.
+    @JsonIgnore
+    @Column(name = "password_reset_code_hash", length = 64)
+    private String passwordResetCodeHash;
+
+    @JsonIgnore
+    @Column(name = "password_reset_code_expires_at")
+    private Instant passwordResetCodeExpiresAt;
+
+    @JsonIgnore
+    @Column(name = "password_reset_attempts", nullable = false)
+    private short passwordResetAttempts = 0;
+
+    // Lifetime failed-verify counter that a fresh OTP request does NOT reset. Backs the
+    // resend-surviving cumulative brute-force bound (mirrors verificationFailedTotal).
+    @JsonIgnore
+    @Column(name = "password_reset_failed_total", nullable = false)
+    private short passwordResetFailedTotal = 0;
+
+    // When non-null and in the future, both the OTP verify and any fresh OTP mint reject —
+    // but with the wire-identical generic failure shape (no new oracle).
+    @JsonIgnore
+    @Column(name = "password_reset_locked_until")
+    private Instant passwordResetLockedUntil;
+
     @Column(name = "bio", columnDefinition = "TEXT")
     private String bio;
 
@@ -289,6 +317,51 @@ public class User extends AuditableEntity {
 
     public void setVerificationLockedUntil(Instant verificationLockedUntil) {
         this.verificationLockedUntil = verificationLockedUntil;
+    }
+
+    @JsonIgnore
+    public String getPasswordResetCodeHash() {
+        return passwordResetCodeHash;
+    }
+
+    public void setPasswordResetCodeHash(String passwordResetCodeHash) {
+        this.passwordResetCodeHash = passwordResetCodeHash;
+    }
+
+    @JsonIgnore
+    public Instant getPasswordResetCodeExpiresAt() {
+        return passwordResetCodeExpiresAt;
+    }
+
+    public void setPasswordResetCodeExpiresAt(Instant passwordResetCodeExpiresAt) {
+        this.passwordResetCodeExpiresAt = passwordResetCodeExpiresAt;
+    }
+
+    @JsonIgnore
+    public short getPasswordResetAttempts() {
+        return passwordResetAttempts;
+    }
+
+    public void setPasswordResetAttempts(short passwordResetAttempts) {
+        this.passwordResetAttempts = passwordResetAttempts;
+    }
+
+    @JsonIgnore
+    public short getPasswordResetFailedTotal() {
+        return passwordResetFailedTotal;
+    }
+
+    public void setPasswordResetFailedTotal(short passwordResetFailedTotal) {
+        this.passwordResetFailedTotal = passwordResetFailedTotal;
+    }
+
+    @JsonIgnore
+    public Instant getPasswordResetLockedUntil() {
+        return passwordResetLockedUntil;
+    }
+
+    public void setPasswordResetLockedUntil(Instant passwordResetLockedUntil) {
+        this.passwordResetLockedUntil = passwordResetLockedUntil;
     }
 
     public UUID getSalonId() {

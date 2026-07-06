@@ -142,39 +142,41 @@ public class EmailNotificationService {
     }
 
     /**
-     * Sends a password-reset link email.
+     * Sends a password-reset 6-digit OTP email (Phase A4 — replaces
+     * {@code sendPasswordResetEmail}'s emailed reset-link with an OTP, mirroring
+     * {@link #sendVerificationEmail} exactly).
      *
      * <p>Delivery failures are non-fatal and are swallowed after logging (template + exception
-     * class only — {@code to} is PII and is never logged). The caller dispatches this method
-     * via {@code emailExecutor} in an {@code afterCommit} synchronization so the email is
-     * never sent if the DB transaction rolls back.
+     * class only — {@code user}'s email is PII and is never logged). The caller dispatches
+     * this method via {@code emailExecutor} in an {@code afterCommit} synchronization so the
+     * email is never sent if the DB transaction rolls back.
      *
-     * @param to       recipient address — never logged
-     * @param resetUrl absolute https URL containing the raw reset token as a query param;
-     *                 must pass {@link com.beautica.common.util.SchemeGuard#isAllowedScheme}
-     * @throws IllegalArgumentException if {@code resetUrl} fails the scheme guard (caller bug)
+     * @param user   the account requesting the reset — {@code user.getEmail()} is the
+     *               recipient; never logged. {@code reset-password-otp.html} does not
+     *               reference the user's name, so it is deliberately NOT passed into the
+     *               template context here (avoids exposing PII to a future template edit
+     *               that adds a {@code ${firstName}} reference without re-auditing this
+     *               method)
+     * @param rawOtp the 6-digit code — passed ONLY as a template variable, never logged
      */
-    public void sendPasswordResetEmail(String to, String resetUrl) {
-        if (!SchemeGuard.isAllowedScheme(resetUrl)) {
-            throw new IllegalArgumentException(
-                    "resetUrl must use https:// scheme or http://localhost — got an unsafe scheme");
-        }
+    public void sendPasswordResetOtpEmail(User user, String rawOtp) {
         try {
-            var helper = buildMimeHelper(to, true);
-            helper.setSubject("Скидання паролю Beautica");
+            var helper = buildMimeHelper(user.getEmail(), true);
+            helper.setSubject("Код для скидання паролю Beautica");
 
             var ctx = new Context();
-            ctx.setVariable("resetUrl", resetUrl);
-            String html = templateEngine.process("email/reset-password", ctx);
+            ctx.setVariable("code", rawOtp);
+            String html = templateEngine.process("email/reset-password-otp", ctx);
             helper.setText(html, true);
 
             addLogoInline(helper);
 
             mailSender.send(helper.getMimeMessage());
         } catch (MessagingException | MailException e) {
-            // Non-fatal: delivery failure is acceptable; the user can request a new link.
-            // 'to' is PII — never log it. Log template + exception type only.
-            log.error("sendPasswordResetEmail failed: template=email/reset-password exception={}", e.getClass().getSimpleName());
+            // Non-fatal: delivery failure is acceptable; the user can request a new code.
+            // The email is PII — never log it. Log template + exception type only.
+            log.error("sendPasswordResetOtpEmail failed: template=email/reset-password-otp exception={}",
+                    e.getClass().getSimpleName());
         }
     }
 

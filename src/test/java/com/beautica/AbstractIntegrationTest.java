@@ -82,10 +82,11 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM invite_tokens");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
-        // Phase 11.1: password_reset_tokens has FK to users (ON DELETE CASCADE) but we
-        // delete it explicitly before users to stay consistent with FK ordering and make
-        // the cleanup intent clear. Must precede the users DELETE.
-        jdbcTemplate.execute("DELETE FROM password_reset_tokens");
+        // Phase 11.1 / A1: password_reset_tickets (renamed from password_reset_tokens) has FK
+        // to users (ON DELETE CASCADE) but we delete it explicitly before users to stay
+        // consistent with FK ordering and make the cleanup intent clear. Must precede the
+        // users DELETE.
+        jdbcTemplate.execute("DELETE FROM password_reset_tickets");
         jdbcTemplate.execute("DELETE FROM device_tokens");
         // Phase 13.2: phone_otps has no FK (guest flow, no user row) — delete anywhere,
         // kept here with the other side tables so a fresh DB is left for the next test.
