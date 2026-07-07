@@ -275,6 +275,49 @@ public class SalonService {
     }
 
     /**
+     * Unassigns a {@code SALON_ADMIN} from a salon (Phase 21.2). {@code actorId} is a
+     * SALON_OWNER acting on any salon they own, or a SALON_ADMIN acting on their own salon —
+     * both halves already enforced by {@code @PreAuthorize} on the controller
+     * ({@code canManageSalon} for salon scoping, {@code adminBelongsToSalon} for confirming
+     * {@code userId} is actually an admin of {@code salonId}).
+     *
+     * <p>This only clears the admin's {@code salon_id} — it is NOT an account deactivation.
+     * {@code role} stays {@code SALON_ADMIN} and {@code isActive} stays {@code true}, so the
+     * user can be invited to (and reassigned to) a salon again later.
+     *
+     * <p>Removing the last admin from a salon is intentionally unguarded: owner access is
+     * ownership-based, never admin-count-based, so a salon is never left "unmanageable."
+     *
+     * @throws NotFoundException   if {@code userId} does not resolve to a user
+     * @throws ForbiddenException  if the reloaded user is not a SALON_ADMIN assigned to
+     *                             {@code salonId} (defense-in-depth re-check of the
+     *                             {@code @PreAuthorize} gate — see {@link
+     *                             com.beautica.common.security.AuthorizationService#adminBelongsToSalon}),
+     *                             or if the actor attempts to remove themselves
+     */
+    @Transactional
+    public void removeAdmin(UUID actorId, UUID salonId, UUID userId) {
+        if (actorId.equals(userId)) {
+            throw new ForbiddenException("Cannot remove yourself — ask another admin or the owner");
+        }
+
+        var admin = userRepository.findById(userId)
+                .orElseThrow(() -> new NotFoundException("User not found: " + userId));
+
+        // Defense-in-depth: redundant with @authz.adminBelongsToSalon on the controller,
+        // but matches the existing pattern of service-layer re-validation (e.g.
+        // enforceCanManageMaster) rather than trusting the SpEL gate alone.
+        if (admin.getRole() != Role.SALON_ADMIN || !salonId.equals(admin.getSalonId())) {
+            throw new ForbiddenException("User is not an admin of this salon");
+        }
+
+        // `admin` was loaded via findById in THIS @Transactional, so it is a managed entity —
+        // Hibernate dirty-checking flushes the salonId mutation on commit (mirrors
+        // deactivateSalon/updateSalon — no redundant explicit save()).
+        admin.setSalonId(null);
+    }
+
+    /**
      * Normalises a raw Instagram value before persistence: trims surrounding
      * whitespace and strips a single leading {@code @} so the stored form is the
      * bare handle (or full URL) — mirroring {@code UserService.normalizeInstagram},

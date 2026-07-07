@@ -82,6 +82,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // independent masters, so an unthrottled crawler could bulk-harvest home addresses;
     // this is the IP-layer defence against that scraping.
     private static final String SEARCH_PATH_PREFIX = "/api/v1/search/";
+    // Remove-admin DELETE carries both {salonId} and {userId} path variables, with the literal
+    // "/admins/" segment between them: /api/v1/salons/{salonId}/admins/{userId}. Neither variable
+    // can itself contain a "/" (both are UUIDs), so prefix + contains(segment) uniquely identifies
+    // this route — it does not collide with the sibling DELETE /api/v1/salons/{salonId}
+    // (deactivateSalon), which has no "/admins/" segment at all.
+    private static final String REMOVE_ADMIN_PATH_PREFIX = "/api/v1/salons/";
+    private static final String REMOVE_ADMIN_PATH_SEGMENT = "/admins/";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
@@ -179,6 +186,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // slice/regression tests — stays unchanged.
     private static final long LOGOUT_CAPACITY = 30;
     private static final Duration LOGOUT_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for DELETE /api/v1/salons/{salonId}/admins/{userId} (10 / 60 s) — Phase 21.2
+    // SEC-fix regression net. This is the actual HTTP path SalonController.removeAdmin exposes to
+    // SALON_OWNER and SALON_ADMIN callers (canManageSalon + adminBelongsToSalon compose correctly
+    // in the @PreAuthorize SpEL, so cross-salon IDOR is not the concern here); without this bucket
+    // it fell through to the unmatched-DELETE branch with zero throttling, letting an authorized
+    // actor script rapid-fire admin removals or probe many {userId} values within their own salon.
+    // Mirrors the salonInviteBuckets pattern (Phase 21.1): built internally (not an injected
+    // @Qualifier bean) so the public 16-arg constructor — depended on by several slice/regression
+    // tests — stays unchanged.
+    private static final long REMOVE_ADMIN_CAPACITY = 10;
+    private static final Duration REMOVE_ADMIN_WINDOW = Duration.ofMinutes(1);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -266,6 +284,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // the public 16-arg constructor stays stable for the slice/regression tests that
     // construct this filter directly.
     private final LoadingCache<String, Bucket> logoutBuckets;
+    // Per-IP bucket for DELETE /api/v1/salons/{salonId}/admins/{userId} — the SEC-fix compensating
+    // control closing the gap left when this destructive route (Phase 21.2) fell through to the
+    // unmatched-DELETE branch with no throttle at all. Built internally rather than injected so
+    // the public 16-arg constructor stays stable for the slice/regression tests that construct
+    // this filter directly.
+    private final LoadingCache<String, Bucket> removeAdminBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -346,6 +370,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(logoutBandwidth())
                         .build());
+        this.removeAdminBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(REMOVE_ADMIN_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(removeAdminBandwidth())
+                        .build());
     }
 
     private static Bandwidth otpVerifyBandwidth() {
@@ -394,6 +424,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(LOGOUT_CAPACITY)
                 .refillIntervally(LOGOUT_CAPACITY, LOGOUT_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth removeAdminBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(REMOVE_ADMIN_CAPACITY)
+                .refillIntervally(REMOVE_ADMIN_CAPACITY, REMOVE_ADMIN_WINDOW)
                 .build();
     }
 
@@ -507,6 +544,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.endsWith(GUEST_BOOKING_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, guestBookingBuckets,
                     GUEST_BOOKING_RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Remove-admin rate-limit: DELETE /api/v1/salons/{salonId}/admins/{userId} — Phase 21.2
+        // SEC-fix regression net. Checked before the POST-only guard below so this DELETE is
+        // covered; without it, this destructive endpoint fell through to the unmatched-DELETE
+        // branch with zero throttling. Cap: 10 / 60 s per IP (removeAdminBuckets).
+        if (HttpMethod.DELETE.matches(method)
+                && path.startsWith(REMOVE_ADMIN_PATH_PREFIX)
+                && path.contains(REMOVE_ADMIN_PATH_SEGMENT)) {
+            applyRateLimit(request, response, filterChain, removeAdminBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 

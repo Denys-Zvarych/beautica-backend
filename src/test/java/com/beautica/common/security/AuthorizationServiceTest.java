@@ -485,6 +485,58 @@ class AuthorizationServiceTest {
         verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
     }
 
+    // ── adminBelongsToSalon ────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("adminBelongsToSalon returns true when the user is a SALON_ADMIN of the salon")
+    void should_returnTrue_when_adminBelongsToSalon() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(userRepository.existsByIdAndSalonIdAndRole(userId, salonId, Role.SALON_ADMIN)).thenReturn(true);
+
+        boolean result = authorizationService.adminBelongsToSalon(userId, salonId);
+
+        assertThat(result).isTrue();
+        verify(userRepository).existsByIdAndSalonIdAndRole(userId, salonId, Role.SALON_ADMIN);
+    }
+
+    @Test
+    @DisplayName("adminBelongsToSalon returns false when the user is not a SALON_ADMIN of the salon")
+    void should_returnFalse_when_adminDoesNotBelongToSalon() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(userRepository.existsByIdAndSalonIdAndRole(userId, salonId, Role.SALON_ADMIN)).thenReturn(false);
+
+        boolean result = authorizationService.adminBelongsToSalon(userId, salonId);
+
+        assertThat(result).isFalse();
+        verify(userRepository).existsByIdAndSalonIdAndRole(userId, salonId, Role.SALON_ADMIN);
+    }
+
+    @Test
+    @DisplayName("adminBelongsToSalon returns false immediately when userId is null")
+    void should_returnFalse_when_adminUserIdIsNull() {
+        UUID salonId = UUID.randomUUID();
+
+        boolean result = authorizationService.adminBelongsToSalon(null, salonId);
+
+        assertThat(result).isFalse();
+        verify(userRepository, never()).existsByIdAndSalonIdAndRole(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("adminBelongsToSalon returns false immediately when salonId is null")
+    void should_returnFalse_when_adminSalonIdIsNull() {
+        UUID userId = UUID.randomUUID();
+
+        boolean result = authorizationService.adminBelongsToSalon(userId, null);
+
+        assertThat(result).isFalse();
+        verify(userRepository, never()).existsByIdAndSalonIdAndRole(any(), any(), any());
+    }
+
     // ── canManageServiceDefinition ─────────────────────────────────────────────
 
     @Test

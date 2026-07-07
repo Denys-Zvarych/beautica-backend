@@ -110,4 +110,23 @@ public class SalonController {
         salonService.deactivateSalon(ownerId, salonId);
         return ResponseEntity.noContent().build();
     }
+
+    // SALON_OWNER may remove any admin from a salon they own; SALON_ADMIN may remove another
+    // admin from their own salon only. canManageSalon enforces the salon-scoping half of that;
+    // adminBelongsToSalon additionally confirms #userId is actually a SALON_ADMIN assigned to
+    // #salonId — without it a caller with management access to Salon A could probe arbitrary
+    // user UUIDs and distinguish "exists elsewhere" from "not an admin" via 403 vs 404 (IDOR).
+    @DeleteMapping("/{salonId}/admins/{userId}")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') "
+            + "and @authz.canManageSalon(authentication, #salonId) "
+            + "and @authz.adminBelongsToSalon(#userId, #salonId)")
+    public ResponseEntity<Void> removeAdmin(
+            @PathVariable UUID salonId,
+            @PathVariable UUID userId,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        salonService.removeAdmin(actorId, salonId, userId);
+        return ResponseEntity.noContent().build();
+    }
 }

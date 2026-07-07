@@ -248,6 +248,20 @@ public class AuthorizationService {
     }
 
     /**
+     * Returns true iff the given user is a {@code SALON_ADMIN} currently assigned to the
+     * given salon. Mirrors {@link #masterBelongsToSalon} — used in {@code @PreAuthorize} on
+     * {@code DELETE /salons/{salonId}/admins/{userId}} to prevent a timing-oracle IDOR where a
+     * caller with management access to Salon A could probe whether a user UUID is a
+     * SALON_ADMIN of Salon B by observing 403 vs 404/204 responses.
+     *
+     * <p>Returns false immediately when either argument is null.
+     */
+    public boolean adminBelongsToSalon(UUID userId, UUID salonId) {
+        if (userId == null || salonId == null) return false;
+        return userRepository.existsByIdAndSalonIdAndRole(userId, salonId, Role.SALON_ADMIN);
+    }
+
+    /**
      * Returns true iff the authenticated actor owns the parent entity of the given
      * ServiceDefinition:
      *   ownerType == SALON              → actor must own the salon (ownerId is salonId)
