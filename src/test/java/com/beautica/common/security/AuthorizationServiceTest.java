@@ -2,6 +2,7 @@ package com.beautica.common.security;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.BookingCompletionAccess;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingViewAccess;
 import com.beautica.common.exception.ForbiddenException;
@@ -815,6 +816,184 @@ class AuthorizationServiceTest {
         Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
 
         assertThat(authorizationService.canManageBooking(auth, bookingId)).isFalse();
+    }
+
+    // ── enforceCanCompleteBooking (Phase 18.4 — admits SALON_ADMIN) ────────────
+
+    /** Builds a Booking whose master is a salon master bound to the given salon. */
+    private Booking salonBooking(UUID salonId) {
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        return booking;
+    }
+
+    /** Builds a Booking whose master is an independent master owned by masterUserId. */
+    private Booking independentBooking(UUID masterUserId) {
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(masterUserId);
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(master.getUser()).thenReturn(masterUser);
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+        return booking;
+    }
+
+    @Test
+    @DisplayName("enforceCanCompleteBooking does not throw when the salon owner completes a salon booking")
+    void should_notThrow_when_salonOwnerCompletesSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        assertThatCode(() -> authorizationService.enforceCanCompleteBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanCompleteBooking does not throw when an assigned SALON_ADMIN completes a salon booking (new capability)")
+    void should_notThrow_when_assignedSalonAdminCompletesSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_ADMIN"));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        assertThatCode(() -> authorizationService.enforceCanCompleteBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanCompleteBooking does not throw when an independent master completes their own booking")
+    void should_notThrow_when_independentMasterCompletesOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = independentBooking(actorId);
+
+        assertThatCode(() -> authorizationService.enforceCanCompleteBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanCompleteBooking throws ForbiddenException when a SALON_MASTER tries to complete a salon booking")
+    void should_throwForbidden_when_salonMasterCompletesSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        // SALON_MASTER is neither owner nor assigned admin → hasManagementAccess returns false.
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanCompleteBooking(actorId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanCompleteBooking throws ForbiddenException when a CLIENT tries to complete a salon booking")
+    void should_throwForbidden_when_clientCompletesSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_CLIENT"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanCompleteBooking(actorId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanCompleteBooking throws ForbiddenException when an independent master completes another master's booking")
+    void should_throwForbidden_when_independentMasterCompletesAnotherMastersBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+        Booking booking = independentBooking(otherMasterUserId);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanCompleteBooking(actorId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── canCompleteBooking (Phase 18.4 SpEL predicate) ─────────────────────────
+
+    @Test
+    @DisplayName("canCompleteBooking returns false without DB hit when actor has ROLE_SALON_MASTER")
+    void should_returnFalseWithoutDbHit_when_salonMasterCallsCanCompleteBooking() {
+        UUID bookingId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canCompleteBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findCompletionAccessById(any());
+    }
+
+    @Test
+    @DisplayName("canCompleteBooking returns false without DB hit when actor has ROLE_CLIENT")
+    void should_returnFalseWithoutDbHit_when_clientCallsCanCompleteBooking() {
+        UUID bookingId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_CLIENT");
+
+        boolean result = authorizationService.canCompleteBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findCompletionAccessById(any());
+    }
+
+    @Test
+    @DisplayName("canCompleteBooking returns true when an assigned SALON_ADMIN completes a salon booking")
+    void should_returnTrue_when_assignedSalonAdminCallsCanCompleteBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingCompletionAccess(masterUserId, salonId)));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
+
+        boolean result = authorizationService.canCompleteBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canCompleteBooking returns true when an independent master completes their own booking (salonId null)")
+    void should_returnTrue_when_independentMasterCallsCanCompleteBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingCompletionAccess(actorId, null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        boolean result = authorizationService.canCompleteBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canCompleteBooking returns false when the booking does not exist (no existence oracle)")
+    void should_returnFalse_when_completionBookingMissing() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId)).thenReturn(Optional.empty());
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canCompleteBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
     }
 
     // ── canViewBooking ─────────────────────────────────────────────────────────

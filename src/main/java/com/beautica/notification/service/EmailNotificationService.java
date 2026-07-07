@@ -133,6 +133,31 @@ public class EmailNotificationService {
         send(to, "Бронювання підтверджено", "email/booking-confirmed", ctx);
     }
 
+    /**
+     * Sends the client a "please leave a review" email after a booking is completed (Phase 18.5).
+     *
+     * <p>The {@code reviewUrl} deep link is scheme-guarded via {@link SchemeGuard#isAllowedScheme}
+     * <em>before</em> the template is rendered (mirrors {@link #sendInviteEmail}) so an unsafe scheme
+     * can never reach the CTA. All template variables are system-derived — no free-text user input.
+     *
+     * @param to        the client's email address (CR/LF stripped by the shared {@code send} helper)
+     * @param booking   the completed booking (client, master, service, startsAt read server-side)
+     * @param reviewUrl the fully-built {@code https://.../bookings/{id}/review} deep link
+     */
+    public void sendReviewRequestEmail(String to, Booking booking, String reviewUrl) {
+        if (!SchemeGuard.isAllowedScheme(reviewUrl)) {
+            throw new IllegalArgumentException(
+                    "reviewUrl must use https:// scheme or http://localhost — caller must validate before reaching email transport");
+        }
+        var ctx = new Context();
+        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        ctx.setVariable("reviewUrl", reviewUrl);
+        send(to, "Оцініть візит", "email/review-request", ctx);
+    }
+
     public void sendBookingDeclinedEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));

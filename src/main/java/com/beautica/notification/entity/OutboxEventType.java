@@ -4,7 +4,9 @@ package com.beautica.notification.entity;
  * Domain event types that may appear in the notification outbox.
  *
  * <p>Values must match the DB CHECK constraint {@code chk_outbox_event}
- * defined in {@code V32__create_notification_outbox.sql}.
+ * defined in {@code V32__create_notification_outbox.sql} and last widened in
+ * {@code V109} (via {@code V94}) — keep this enum in lockstep with the current
+ * CHECK, not just the V32 original.
  * Any divergence causes an {@link IllegalArgumentException} during Hibernate hydration.
  *
  * <p>Using a typed enum instead of a raw {@code String} prevents unknown event names
@@ -29,5 +31,8 @@ public enum OutboxEventType {
      * The booking is back in PENDING awaiting the provider's re-approval; the provider
      * (master / salon-admin) is notified to re-confirm or decline at the new time.
      */
-    BOOKING_RESCHEDULED
+    BOOKING_RESCHEDULED,
+
+    /** A booking was completed; prompt the client to leave a rating + comment (Phase 18.1). */
+    REVIEW_REQUESTED
 }

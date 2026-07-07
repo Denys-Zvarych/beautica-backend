@@ -422,6 +422,25 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """)
     Optional<BookingViewAccess> findViewAccessById(@Param("bookingId") UUID bookingId);
 
+    /**
+     * Completion-authorization projection (Phase 18.4). Mirrors {@link #findViewAccessById}
+     * but returns the booking's {@code salonId} (null for an independent-master booking) so
+     * {@code AuthorizationService.canCompleteBooking} can admit a {@code SALON_ADMIN} assigned
+     * to that salon — not only the owner. Returns empty when the booking does not exist.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingCompletionAccess(
+                bm.user.id,
+                bs.id
+            )
+            FROM Booking b
+            JOIN b.master bm
+            JOIN bm.user
+            LEFT JOIN bm.salon bs
+            WHERE b.id = :bookingId
+            """)
+    Optional<BookingCompletionAccess> findCompletionAccessById(@Param("bookingId") UUID bookingId);
+
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
     // but should be revisited if the platform scales significantly.

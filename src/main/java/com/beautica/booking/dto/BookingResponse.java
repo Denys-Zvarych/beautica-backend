@@ -39,7 +39,9 @@ public record BookingResponse(
     public static BookingResponse from(Booking booking) {
         return new BookingResponse(
                 booking.getId(),
-                booking.getClient().getId(),
+                // Guest (LINK) bookings have no registered client (V89 chk_bookings_guest_fields) —
+                // clientId is null for them; only account-bound (APP) bookings carry a client UUID.
+                booking.getClient() != null ? booking.getClient().getId() : null,
                 booking.getMaster().getId(),
                 booking.getMasterService().getId(),
                 booking.getMasterService().getServiceDefinition().getName(),

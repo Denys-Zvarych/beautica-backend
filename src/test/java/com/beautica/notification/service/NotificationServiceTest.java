@@ -32,6 +32,8 @@ import static org.mockito.Mockito.when;
 @DisplayName("NotificationService — unit")
 class NotificationServiceTest {
 
+    private static final String FRONTEND_BASE_URL = "https://app.beautica.ua";
+
     @Mock
     private EmailNotificationService emailService;
     @Mock
@@ -41,7 +43,7 @@ class NotificationServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new NotificationService(emailService, pushService);
+        service = new NotificationService(emailService, pushService, FRONTEND_BASE_URL);
     }
 
     // -------------------------------------------------------------------------
@@ -171,6 +173,66 @@ class NotificationServiceTest {
                 anyString(),
                 eq(Map.of("type", "CLIENT_CANCELLED", "bookingId", bookingId))
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // notifyReviewRequested (Phase 18.5)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("notifyReviewRequested targets the CLIENT (email + push) with a scheme-valid review URL")
+    void should_targetClientWithReviewUrl_when_notifyReviewRequestedCalled() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.COMPLETED);
+        String bookingId = booking.getId().toString();
+        String expectedUrl = FRONTEND_BASE_URL + "/bookings/" + bookingId + "/review";
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyReviewRequested(booking);
+
+        // Email is addressed to the client, carries the booking, and the scheme-valid review URL.
+        verify(emailService).sendReviewRequestEmail(eq("client@example.com"), eq(booking), urlCaptor.capture());
+        assertThat(urlCaptor.getValue()).isEqualTo(expectedUrl);
+        assertThat(urlCaptor.getValue()).startsWith("https://");
+
+        // Push is delivered to the CLIENT user id (not the master) with the REVIEW_REQUESTED payload.
+        verify(pushService).sendToUser(
+                eq(clientUserId),
+                eq("Оцініть візит"),
+                anyString(),
+                eq(Map.of("type", "REVIEW_REQUESTED", "bookingId", bookingId))
+        );
+    }
+
+    @Test
+    @DisplayName("notifyReviewRequested is a safe no-op (no email/push, no throw) for a null-client guest booking")
+    void should_noOp_when_notifyReviewRequestedForGuestBooking() {
+        // Guest (LINK) booking: null client (V89 chk_bookings_guest_fields). If a REVIEW_REQUESTED
+        // row ever reaches the drain route for such a booking, dispatch must be a clean no-op —
+        // no NPE on booking.getClient(), no email/push — so the outbox entry settles SENT, not DEAD.
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(UUID.randomUUID());
+        when(booking.getClient()).thenReturn(null);
+
+        service.notifyReviewRequested(booking);
+
+        verify(emailService, never()).sendReviewRequestEmail(anyString(), any(), anyString());
+        verify(pushService, never()).sendToUser(any(), anyString(), anyString(), any());
+    }
+
+    @Test
+    @DisplayName("notifyReviewRequested truncates the push body when the service name is very long")
+    void should_truncatePushBody_when_notifyReviewRequestedServiceNameExceeds256Chars() {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.COMPLETED);
+        when(booking.getMasterService().getServiceDefinition().getName()).thenReturn("А".repeat(500));
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyReviewRequested(booking);
+
+        verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
+        String body = bodyCaptor.getValue();
+        assertThat(body.length()).isLessThanOrEqualTo(256);
+        assertThat(body).endsWith("…");
     }
 
     // -------------------------------------------------------------------------

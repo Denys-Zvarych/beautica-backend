@@ -2,6 +2,7 @@ package com.beautica.common.security;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.BookingCompletionAccess;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingViewAccess;
 import com.beautica.common.exception.ForbiddenException;
@@ -373,6 +374,68 @@ public class AuthorizationService {
         if (!isAuthorizedToManageBooking(actorUserId, booking)) {
             throw new ForbiddenException("Access denied");
         }
+    }
+
+    /**
+     * Service-layer completion guard (Phase 18.4) — the entity-based twin of
+     * {@link #canCompleteBooking}.
+     *
+     * <p><strong>Intentional divergence from {@link #isAuthorizedToManageBooking}:</strong> this
+     * predicate <em>admits</em> a {@code SALON_ADMIN} assigned to the booking's salon, whereas
+     * {@code isAuthorizedToManageBooking} (used by confirm/decline/not-complete) deliberately
+     * excludes admins and keeps those transitions owner-level. The relaxation is scoped to the
+     * <em>completion</em> action only — do NOT "fix" the difference by pointing completion back at
+     * {@code enforceCanManageBooking}, and do NOT broaden {@code isAuthorizedToManageBooking}.
+     *
+     * <ul>
+     *   <li>INDEPENDENT_MASTER booking → actor must be the master's user.</li>
+     *   <li>Salon booking → {@code hasManagementAccess(salonId, actor)} — grants BOTH the salon
+     *       OWNER (by ownership) and the assigned SALON_ADMIN (by salon assignment).</li>
+     *   <li>SALON_MASTER / CLIENT → never satisfy either branch → {@link ForbiddenException}.</li>
+     * </ul>
+     */
+    public void enforceCanCompleteBooking(UUID actorUserId, Booking booking) {
+        Master master = booking.getMaster();
+        boolean allowed;
+        if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+            allowed = master.getUser().getId().equals(actorUserId);
+        } else {
+            // SALON_OWNER-type and SALON_MASTER-type masters both resolve authority via salon
+            // management access, which admits the owner AND the assigned SALON_ADMIN (Phase 18.4).
+            allowed = master.getSalon() != null
+                    && hasManagementAccess(master.getSalon().getId(), actorUserId);
+        }
+        if (!allowed) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} completion predicate (Phase 18.4), mirroring
+     * {@link #canManageBooking} but on the lightweight {@link BookingCompletionAccess} projection
+     * (which carries the booking's {@code salonId}) so a {@code SALON_ADMIN} assigned to the
+     * booking's salon is admitted — see {@link #enforceCanCompleteBooking} for the intentional
+     * divergence from the manage predicate.
+     *
+     * <p>Role fast path: {@code SALON_MASTER} (read-only) and {@code CLIENT} can never complete a
+     * booking, so they are rejected immediately with no DB round-trip (timing-oracle hygiene).
+     * A missing booking maps to {@code false} (403, no existence oracle).
+     */
+    public boolean canCompleteBooking(Authentication auth, UUID bookingId) {
+        boolean cannotComplete = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotComplete) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findCompletionAccessById(bookingId).map(v -> {
+            if (v.salonId() == null) {
+                // Independent-master booking: actor must be the master's user.
+                return v.masterUserId().equals(actorId);
+            }
+            // Salon booking: owner (ownership) or assigned SALON_ADMIN (salon assignment).
+            return hasManagementAccess(v.salonId(), actorId, actorRole);
+        }).orElse(false);
     }
 
     public void enforceCanViewBooking(UUID actorUserId, Booking booking) {

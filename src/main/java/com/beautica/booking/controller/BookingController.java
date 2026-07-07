@@ -114,7 +114,7 @@ public class BookingController {
     }
 
     @PatchMapping("/{bookingId}/complete")
-    @PreAuthorize("hasAnyRole('SALON_OWNER', 'INDEPENDENT_MASTER')")
+    @PreAuthorize("hasAnyRole('SALON_OWNER', 'SALON_ADMIN', 'INDEPENDENT_MASTER') and @authz.canCompleteBooking(authentication, #bookingId)")
     public ResponseEntity<Void> completeBooking(
             @PathVariable UUID bookingId,
             Authentication auth

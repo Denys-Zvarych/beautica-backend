@@ -613,6 +613,26 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.COMPLETED);
         verify(outboxService).enqueueStatusChanged(bookingId);
+        // Phase 18.3: the review prompt is enqueued in the same completion transaction.
+        verify(outboxService).enqueueReviewRequested(bookingId);
+    }
+
+    @Test
+    @DisplayName("guest (LINK / null-client) completion enqueues STATUS_CHANGED but never REVIEW_REQUESTED")
+    void should_notEnqueueReviewRequested_when_completingGuestBooking() {
+        UUID actorId = UUID.randomUUID();
+        // Guest booking: CONFIRMED with a null client (V89 chk_bookings_guest_fields). A guest has
+        // no account to review with, so completion must not enqueue the review prompt (which would
+        // NPE on booking.getClient() at drain time and dead-letter the outbox row).
+        Booking booking = buildBooking(bookingId, null, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.completeBooking(actorId, bookingId);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.COMPLETED);
+        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService, never()).enqueueReviewRequested(bookingId);
     }
 
     @Test
@@ -621,8 +641,10 @@ class BookingServiceTest {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Phase 18.4: completion authorization goes through enforceCanCompleteBooking
+        // (admits SALON_ADMIN), not enforceCanManageBooking.
         org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
-                .when(authz).enforceCanManageBooking(actorId, booking);
+                .when(authz).enforceCanCompleteBooking(actorId, booking);
 
         assertThatThrownBy(() -> bookingService.completeBooking(actorId, bookingId))
                 .isInstanceOf(ForbiddenException.class);
