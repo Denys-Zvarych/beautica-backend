@@ -262,6 +262,29 @@ public class AuthorizationService {
     }
 
     /**
+     * Returns {@code true} iff {@code sourceSalonId} and {@code destSalonId} are both salons
+     * owned by the same {@code SALON_OWNER}. Used by the Phase 21.3 rotate-admin/rotate-master
+     * flows as a service-layer (not {@code @PreAuthorize} SpEL) guard: rotation is legal only
+     * within a single owner's portfolio of salons — an admin or owner acting on Salon A must
+     * never be able to move staff into a salon they have no visibility into.
+     *
+     * <p>Uses {@link SalonRepository#findOwnerIdById} — a single-column owner-id projection —
+     * instead of hydrating the full {@code Salon} entity (~20 columns) just to read
+     * {@code owner.getId()} (Perf MEDIUM-3). Combined with {@link SalonRepository#existsByIdAndOwnerId}
+     * this resolves the same-owner check in two narrow queries with no full entity load.
+     * Returns {@code false} immediately when either argument is {@code null}, when
+     * {@code sourceSalonId} does not resolve to a salon, or when that salon has no owner
+     * (should not happen in practice — {@code Salon.owner} is {@code nullable = false} —
+     * but treated as a safe deny rather than an NPE).
+     */
+    public boolean salonsShareOwner(UUID sourceSalonId, UUID destSalonId) {
+        if (sourceSalonId == null || destSalonId == null) return false;
+        return salonRepository.findOwnerIdById(sourceSalonId)
+                .map(ownerId -> salonRepository.existsByIdAndOwnerId(destSalonId, ownerId))
+                .orElse(false);
+    }
+
+    /**
      * Returns true iff the authenticated actor owns the parent entity of the given
      * ServiceDefinition:
      *   ownerType == SALON              → actor must own the salon (ownerId is salonId)

@@ -9,6 +9,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
@@ -26,6 +27,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
@@ -50,6 +52,7 @@ import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class MasterService {
@@ -62,6 +65,7 @@ public class MasterService {
     private final CacheManager cacheManager;
     private final CityRepository cityRepository;
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
+    private final AuthorizationService authorizationService;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -433,6 +437,145 @@ public class MasterService {
                 }
             });
         }
+    }
+
+    /**
+     * Rotates (reassigns) a {@code SALON_MASTER} from their current salon to
+     * {@code destinationSalonId} (Phase 21.3). {@code actorId}'s management authority over the
+     * master's CURRENT salon is already enforced by
+     * {@code @PreAuthorize("@authz.canManageMaster(...)")} on the controller.
+     *
+     * <p>Restricted to {@code masterType == SALON_MASTER}: an {@code INDEPENDENT_MASTER} has no
+     * salon to rotate from, and rotating the owner's own {@code SALON_OWNER}-type master row
+     * (moving the owner's personal service-provider profile between their salons) is a separate,
+     * unaddressed product question left out of scope here.
+     *
+     * <p>The destination salon MUST belong to the SAME owner as the master's current salon — this
+     * mirrors {@code SalonService.rotateAdmin} and is enforced via the same
+     * {@link AuthorizationService#salonsShareOwner} primitive.
+     *
+     * <p><b>Known limitation (documented, not fixed here):</b> this only reassigns
+     * {@code master.salon_id}. There is no booking-conflict guard — a master with existing
+     * future {@code PENDING}/{@code CONFIRMED} bookings will silently appear under the new salon
+     * everywhere post-rotation, exactly like the already-deferred "block deactivation until
+     * futureBookingCount is exposed" item for {@link #deactivateMaster}. Do not block callers on
+     * this; track it as a follow-up once {@code futureBookingCount} exists.
+     *
+     * <p>Destination validation (Sec LOW-1): all destination-related denial reasons — cross-owner,
+     * inactive, and not-found — collapse to the SAME {@link ForbiddenException} (403).
+     * Distinguishing them via status code would let an actor with legitimate authority over the
+     * current salon probe an arbitrary owner's full salon portfolio (including inactive salons a
+     * public endpoint would 404 on) by observing 404 vs 403 vs 400 responses. The same-salon
+     * no-op check stays a distinct 400 — the actor already knows the current salon's identity, so
+     * it carries no oracle risk. The destination {@code Salon} entity is still loaded via
+     * {@code findById} (not a projection) — {@link Master#setSalon} needs the actual managed
+     * entity, unlike {@code SalonService.rotateAdmin} which only ever writes a raw UUID.
+     *
+     * @throws NotFoundException  if {@code masterId} does not resolve to a master
+     * @throws ForbiddenException if the master is not a {@code SALON_MASTER} (i.e. is
+     *                            {@code INDEPENDENT_MASTER} or {@code SALON_OWNER}-type), or if
+     *                            the destination salon does not exist, is not owned by the same
+     *                            owner as the master's current salon, or is inactive
+     *                            (soft-deleted)
+     * @throws BusinessException  (400) if {@code destinationSalonId} equals the master's current
+     *                            salon (no-op rotation)
+     */
+    @Transactional
+    public MasterSummaryResponse rotateMasterToSalon(UUID actorId, UUID masterId, UUID destinationSalonId) {
+        // actorId's management authority over the CURRENT salon is already enforced by
+        // @PreAuthorize("@authz.canManageMaster(...)") on the controller — no redundant
+        // re-derivation needed here (mirrors upsertWorkingHours / deactivateMaster).
+        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+                .orElseThrow(() -> new NotFoundException("Master not found"));
+
+        if (master.getMasterType() != MasterType.SALON_MASTER) {
+            throw new ForbiddenException(
+                    "Only a SALON_MASTER may be rotated between salons — "
+                            + "INDEPENDENT_MASTER has no salon, and the owner's own master profile "
+                            + "is a separate, unsupported operation");
+        }
+
+        UUID currentSalonId = master.getSalon() != null ? master.getSalon().getId() : null;
+        if (currentSalonId == null) {
+            // Defensive — a SALON_MASTER row should always carry a salon FK. Treated as
+            // not-found rather than a 500 if data ever drifts.
+            throw new NotFoundException("Master has no current salon assignment");
+        }
+
+        if (destinationSalonId.equals(currentSalonId)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Already assigned to this salon");
+        }
+
+        // Same-owner requirement (product decision 2026-07-06): rotation is legal only within a
+        // single owner's portfolio of salons — never across owners. salonsShareOwner also returns
+        // false when destinationSalonId does not resolve to a salon at all, so "not found"
+        // collapses into this same 403 (Sec LOW-1 status-code oracle fix).
+        //
+        // Both lookups below are evaluated unconditionally (not short-circuited) — Sec LOW-2:
+        // without this, the "same-owner but inactive" branch would run one extra DB round-trip
+        // (the destination-salon load) beyond what "cross-owner" and "not-found" execute, since
+        // those already deny inside salonsShareOwner. That asymmetry is itself a timing oracle
+        // letting an actor distinguish "in my owner's portfolio but soft-deleted" from "not in my
+        // portfolio at all" by sampling latency. Assigning to locals before the branch forces
+        // identical query shape/count across all three denial reasons.
+        boolean sameOwner = authorizationService.salonsShareOwner(currentSalonId, destinationSalonId);
+        // Full-entity load retained here (unlike SalonService.rotateAdmin's projection-based
+        // check) because master.setSalon(...) below needs the actual managed Salon entity, not
+        // just its UUID. A missing OR inactive destination denies with the SAME 403 as the
+        // cross-owner case above (Sec LOW-1) — never a distinct 404/400 that would let the actor
+        // fingerprint which specific denial reason applied.
+        var destinationSalonLookup = salonRepository.findById(destinationSalonId).filter(Salon::isActive);
+        if (!sameOwner || destinationSalonLookup.isEmpty()) {
+            throw new ForbiddenException("Destination salon is not available for rotation");
+        }
+        var destinationSalon = destinationSalonLookup.get();
+
+        // `master` was loaded via findByIdWithSalonAndOwner in THIS @Transactional, so it is a
+        // managed entity — Hibernate dirty-checking flushes the salon mutation on commit.
+        master.setSalon(destinationSalon);
+
+        // Evict the public master-detail cache (mirrors deactivateMaster) so GET
+        // /api/v1/masters/{masterId} reflects the new salon immediately instead of serving the
+        // stale salon for up to the cache TTL (Anti-Bug §F rule 2).
+        final UUID rotatedMasterId = master.getId();
+        // Captured while the transaction is still open — master.getUser() is JOIN FETCH-ed by
+        // findByIdWithSalonAndOwner, so this is an initialized reference, not a lazy proxy.
+        final UUID rotatedMasterUserId = master.getUser().getId();
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    Cache detail = cacheManager.getCache("master-detail");
+                    if (detail != null) {
+                        detail.evict(rotatedMasterId);
+                    }
+                    // Evict the userId-keyed twin of master-detail (backs GET /masters/me, 10-min
+                    // TTL) — both caches store a MasterDetailResponse embedding `salon`, the exact
+                    // field this method mutates (HIGH fix). Without this a rotated SALON_MASTER
+                    // calling GET /masters/me within the TTL would see their pre-rotation salon.
+                    Cache detailByUser = cacheManager.getCache("master-detail-by-user");
+                    if (detailByUser != null) {
+                        detailByUser.evict(rotatedMasterUserId);
+                    }
+                    // Evict the raw-entity master-by-user cache too (MEDIUM fix) — mirrors the
+                    // eviction deactivateMaster/deactivateOwnerMaster/createMasterForOwner already
+                    // perform on every other write path that mutates this row.
+                    Cache byUser = cacheManager.getCache("master-by-user");
+                    if (byUser != null) {
+                        byUser.evict(rotatedMasterUserId);
+                    }
+                }
+            });
+        }
+        evictMasterCalendarAfterCommit(masterId);
+
+        // Audit trail (LOW-fix): no dedicated audit-log subsystem exists in this codebase yet —
+        // a structured INFO log line is the established minimal pattern for sensitive mutations.
+        // UUIDs only, no PII.
+        log.info("Salon rotation: master {} moved from salon {} to {} by actor {}",
+                masterId, currentSalonId, destinationSalonId, actorId);
+
+        return MasterSummaryResponse.from(master);
     }
 
     /**
