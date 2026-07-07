@@ -6,7 +6,6 @@ import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.SchemeGuard;
@@ -108,11 +107,14 @@ public class InviteService {
      * <p><strong>Residual timing side-channel:</strong> the already-registered and
      * active-invite branches skip token generation, hashing, persistence and outbox
      * encryption, so they complete measurably faster than the brand-new branch. Full timing
-     * equalization is intentionally not attempted here; the compensating control is the
-     * per-IP rate limit on {@code POST /api/v1/auth/invite} (see {@code AuthRateLimitFilter}),
-     * which bounds how many timing samples an attacker can collect. The endpoint also
-     * requires an authenticated {@code SALON_OWNER}, so any abuse is attributable to a known
-     * principal.
+     * equalization is intentionally not attempted here; the compensating control is a per-IP
+     * rate limit in {@code AuthRateLimitFilter}, applied independently on <em>both</em> HTTP
+     * paths that reach this method: {@code POST /api/v1/auth/invite} ({@code inviteBuckets},
+     * SALON_OWNER-only) and {@code POST /api/v1/salons/{salonId}/invite}
+     * ({@code salonInviteBuckets}, SALON_OWNER + SALON_ADMIN since the Phase 21.1 multi-admin
+     * relaxation). Each bucket bounds how many timing samples an attacker can collect on its
+     * respective path. Both paths also require authentication ({@code SALON_OWNER} or
+     * {@code SALON_ADMIN}), so any abuse is attributable to a known principal.
      */
     @Transactional(readOnly = true)
     public InviteResponse sendInvite(InviteRequest request, UUID callerId) {
@@ -142,8 +144,14 @@ public class InviteService {
             throw new ForbiddenException("Role " + targetRole + " cannot be assigned via invite");
         }
 
-        if (targetRole == Role.SALON_ADMIN && caller.getRole() != Role.SALON_OWNER) {
-            throw new ForbiddenException("Only SALON_OWNER may invite a SALON_ADMIN");
+        // Phase 21.1 (multi-admin relaxation): an existing SALON_ADMIN may now also invite
+        // a new SALON_ADMIN into their own salon. The salon-scoping branch below (SALON_ADMIN
+        // callers verify request.salonId() == caller.getSalonId()) still fully applies, so a
+        // SALON_ADMIN can never invite an admin into a salon other than their own.
+        if (targetRole == Role.SALON_ADMIN
+                && caller.getRole() != Role.SALON_OWNER
+                && caller.getRole() != Role.SALON_ADMIN) {
+            throw new ForbiddenException("Only SALON_OWNER or SALON_ADMIN may invite a SALON_ADMIN");
         }
 
         // Fix MEDIUM-2: SALON_ADMIN is assigned to a salon but is NOT its owner, so
@@ -162,12 +170,6 @@ public class InviteService {
                     .orElseThrow(() -> new NotFoundException("Salon not found"));
         } else {
             throw new ForbiddenException("Role " + caller.getRole() + " cannot send invites");
-        }
-
-        if (targetRole == Role.SALON_ADMIN) {
-            if (userRepository.existsBySalonIdAndRole(request.salonId(), Role.SALON_ADMIN)) {
-                throw new ConflictException("This salon already has a SALON_ADMIN");
-            }
         }
 
         Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
