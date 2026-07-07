@@ -1,6 +1,7 @@
 package com.beautica.master;
 
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.config.CacheConfig;
 import com.beautica.master.dto.WorkingHoursRequest;
@@ -84,6 +85,9 @@ class MasterServiceCacheTest {
     // Phase 13.1: MasterService now constructor-depends on BookingSlugService.
     // This slice does not exercise the creation paths, so a mock satisfies the wiring.
     @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
+    // Phase 21.3: MasterService now constructor-depends on AuthorizationService (rotateMasterToSalon).
+    // This slice does not exercise that path, so a mock satisfies the wiring.
+    @MockBean AuthorizationService authorizationService;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

@@ -8,6 +8,8 @@ import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.InviteRequest;
 import com.beautica.salon.dto.PublicSalonResponse;
+import com.beautica.salon.dto.RotateAdminRequest;
+import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
@@ -128,5 +130,28 @@ public class SalonController {
         UUID actorId = AuthenticationUtils.userId(authentication);
         salonService.removeAdmin(actorId, salonId, userId);
         return ResponseEntity.noContent().build();
+    }
+
+    // Phase 21.3 — rotate a SALON_ADMIN from #salonId to another salon owned by the SAME owner.
+    // canManageSalon enforces salon-scoping for the source salon (owner-of-any-salon or
+    // admin-of-this-salon); adminBelongsToSalon confirms #userId is actually a SALON_ADMIN
+    // assigned to #salonId (same IDOR guard as removeAdmin — see its Javadoc). The destination
+    // salon's same-owner requirement is NOT expressible in this SpEL gate (it depends on the
+    // request body, not a path variable) — SalonService.rotateAdmin enforces it via
+    // AuthorizationService.salonsShareOwner before mutating anything.
+    @PatchMapping("/{salonId}/admins/{userId}/salon")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') "
+            + "and @authz.canManageSalon(authentication, #salonId) "
+            + "and @authz.adminBelongsToSalon(#userId, #salonId)")
+    public ResponseEntity<ApiResponse<SalonAdminResponse>> rotateAdmin(
+            @PathVariable UUID salonId,
+            @PathVariable UUID userId,
+            @Valid @RequestBody RotateAdminRequest request,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        SalonAdminResponse response =
+                salonService.rotateAdmin(actorId, salonId, userId, request.destinationSalonId());
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 }

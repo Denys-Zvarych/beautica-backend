@@ -37,6 +37,25 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
 
     boolean existsByIdAndOwnerId(UUID id, UUID ownerId);
 
+    /**
+     * Lightweight owner-id projection (Phase 21.3 rotation PERF fix). Used by
+     * {@code AuthorizationService.salonsShareOwner} to resolve the source salon's owner without
+     * hydrating the full {@code Salon} entity (~20 columns) for a single FK read — mirrors the
+     * existing {@code findOwnerUserId}-style projection pattern used elsewhere in this repository
+     * layer (e.g. {@code ServiceRepository.findOwnerUserId}).
+     */
+    @Query("SELECT s.owner.id FROM Salon s WHERE s.id = :salonId")
+    Optional<UUID> findOwnerIdById(@Param("salonId") UUID salonId);
+
+    /**
+     * Lightweight existence + active-flag check (Phase 21.3 rotation PERF fix). Used by
+     * {@code SalonService.rotateAdmin} to validate the destination salon without loading the full
+     * entity — the destination UUID is written directly onto {@code User.salonId} and no entity
+     * fields are otherwise needed. Returns {@code false} for both "does not exist" and "exists but
+     * inactive", which the caller treats identically (Anti-Bug §D — no destination-status oracle).
+     */
+    boolean existsByIdAndIsActiveTrue(UUID id);
+
     // True iff the given owner already has at least one salon (primary or not).
     // Used in SalonService.createSalon to decide is_primary = true/false.
     boolean existsByOwnerId(UUID ownerId);

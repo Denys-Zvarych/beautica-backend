@@ -537,6 +537,74 @@ class AuthorizationServiceTest {
         verify(userRepository, never()).existsByIdAndSalonIdAndRole(any(), any(), any());
     }
 
+    // ── salonsShareOwner (Phase 21.3) ──────────────────────────────────────────
+
+    @Test
+    @DisplayName("salonsShareOwner returns true when both salons are owned by the same owner")
+    void should_returnTrue_when_bothSalonsShareTheSameOwner() {
+        UUID ownerId = UUID.randomUUID();
+        UUID sourceSalonId = UUID.randomUUID();
+        UUID destSalonId = UUID.randomUUID();
+
+        when(salonRepository.findOwnerIdById(sourceSalonId)).thenReturn(Optional.of(ownerId));
+        when(salonRepository.existsByIdAndOwnerId(destSalonId, ownerId)).thenReturn(true);
+
+        boolean result = authorizationService.salonsShareOwner(sourceSalonId, destSalonId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("salonsShareOwner returns false when the destination salon is owned by someone else")
+    void should_returnFalse_when_destinationSalonIsOwnedByAnotherOwner() {
+        UUID ownerId = UUID.randomUUID();
+        UUID sourceSalonId = UUID.randomUUID();
+        UUID destSalonId = UUID.randomUUID();
+
+        when(salonRepository.findOwnerIdById(sourceSalonId)).thenReturn(Optional.of(ownerId));
+        when(salonRepository.existsByIdAndOwnerId(destSalonId, ownerId)).thenReturn(false);
+
+        boolean result = authorizationService.salonsShareOwner(sourceSalonId, destSalonId);
+
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    @DisplayName("salonsShareOwner returns false when the source salon does not exist")
+    void should_returnFalse_when_sourceSalonDoesNotExist() {
+        UUID sourceSalonId = UUID.randomUUID();
+        UUID destSalonId = UUID.randomUUID();
+
+        when(salonRepository.findOwnerIdById(sourceSalonId)).thenReturn(Optional.empty());
+
+        boolean result = authorizationService.salonsShareOwner(sourceSalonId, destSalonId);
+
+        assertThat(result).isFalse();
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("salonsShareOwner returns false immediately when sourceSalonId is null")
+    void should_returnFalse_when_sourceSalonIdIsNull() {
+        UUID destSalonId = UUID.randomUUID();
+
+        boolean result = authorizationService.salonsShareOwner(null, destSalonId);
+
+        assertThat(result).isFalse();
+        verify(salonRepository, never()).findOwnerIdById(any());
+    }
+
+    @Test
+    @DisplayName("salonsShareOwner returns false immediately when destSalonId is null")
+    void should_returnFalse_when_destSalonIdIsNull() {
+        UUID sourceSalonId = UUID.randomUUID();
+
+        boolean result = authorizationService.salonsShareOwner(sourceSalonId, null);
+
+        assertThat(result).isFalse();
+        verify(salonRepository, never()).findOwnerIdById(any());
+    }
+
     // ── canManageServiceDefinition ─────────────────────────────────────────────
 
     @Test

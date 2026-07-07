@@ -14,6 +14,7 @@ import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterWorkingDayResponse;
+import com.beautica.master.dto.RotateMasterRequest;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
 import com.beautica.master.dto.WeeklyScheduleRequest;
@@ -255,6 +256,26 @@ public class MasterController {
         UUID actorId = AuthenticationUtils.userId(authentication);
         masterService.deactivateMaster(actorId, masterId);
         return ResponseEntity.noContent().build();
+    }
+
+    // Phase 21.3 — rotate a SALON_MASTER (or SALON_ADMIN-managed staff master) from their
+    // current salon to another salon owned by the SAME owner. canManageMaster already enforces
+    // that the actor (SALON_OWNER or SALON_ADMIN) has management authority over #masterId's
+    // CURRENT salon. The destination salon's same-owner requirement is NOT expressible in this
+    // SpEL gate (it depends on the request body, not a path variable) — MasterService
+    // .rotateMasterToSalon enforces it via AuthorizationService.salonsShareOwner, and also
+    // rejects INDEPENDENT_MASTER / the owner's own SALON_OWNER-type master row (out of scope).
+    @PatchMapping("/{masterId}/salon")
+    @PreAuthorize("@authz.canManageMaster(authentication, #masterId)")
+    public ResponseEntity<ApiResponse<MasterSummaryResponse>> rotateMasterSalon(
+            @PathVariable UUID masterId,
+            @Valid @RequestBody RotateMasterRequest request,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        MasterSummaryResponse response =
+                masterService.rotateMasterToSalon(actorId, masterId, request.destinationSalonId());
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     @GetMapping("/me/calendar")

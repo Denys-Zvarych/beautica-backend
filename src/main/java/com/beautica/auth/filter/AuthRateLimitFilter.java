@@ -89,6 +89,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // (deactivateSalon), which has no "/admins/" segment at all.
     private static final String REMOVE_ADMIN_PATH_PREFIX = "/api/v1/salons/";
     private static final String REMOVE_ADMIN_PATH_SEGMENT = "/admins/";
+    // Phase 21.3 staff-rotation PATCH endpoints share ONE bucket (rotateStaffBuckets below) — both
+    // are the same class of low-frequency admin action. PATCH /api/v1/salons/{salonId}/admins/{userId}/salon
+    // (SalonController#rotateAdmin) carries both {salonId} and {userId} variables with the literal
+    // "/admins/" segment between them, same as REMOVE_ADMIN above, plus a literal "/salon" suffix —
+    // matched by prefix + REMOVE_ADMIN_PATH_SEGMENT + suffix so it does not collide with the sibling
+    // DELETE /api/v1/salons/{salonId}/admins/{userId} (no suffix) nor with PATCH /api/v1/salons/{salonId}
+    // (updateSalon — a bare UUID path, which can never contain the literal substring "salon" since
+    // UUIDs are hex-only). PATCH /api/v1/masters/{masterId}/salon (MasterController#rotateMasterSalon)
+    // carries the {masterId} variable, matched by prefix + suffix only (no "/admins/" segment applies).
+    private static final String ROTATE_ADMIN_SALON_PATH_PREFIX = "/api/v1/salons/";
+    private static final String ROTATE_MASTER_SALON_PATH_PREFIX = "/api/v1/masters/";
+    private static final String ROTATE_STAFF_SALON_PATH_SUFFIX = "/salon";
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
@@ -197,6 +209,20 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // tests — stays unchanged.
     private static final long REMOVE_ADMIN_CAPACITY = 10;
     private static final Duration REMOVE_ADMIN_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for the two Phase 21.3 staff-rotation PATCH endpoints, SHARED as one bucket
+    // (30 / 60 s) — mirrors logoutBuckets' reasoning (30/min, "generous cap, at or above the
+    // refreshBuckets ceiling") rather than the tighter removeAdminBuckets/salonInviteBuckets
+    // ceilings (10-15/min). The security audit that requested this bucket assessed it as
+    // LOW/optional defense-in-depth, not a strict abuse-prevention requirement — staff rotation
+    // has no email/SMS cost and is bounded by the same-owner authorization check regardless of
+    // request volume, so 10/min was too tight: a SALON_OWNER doing a busy day of reshuffling
+    // staff across several owned salons can easily exceed 10 combined admin+master rotations
+    // within 60 s, and clients that honour Retry-After (Apache HttpClient5's default retry
+    // strategy, common in Retrofit/OkHttp mobile stacks) will block for the full 60 s window
+    // rather than failing fast. 30/min comfortably absorbs a realistic bulk-reshuffle session
+    // while still bounding a scripted rapid-fire probe of destination-salon ids.
+    private static final long ROTATE_STAFF_CAPACITY = 30;
+    private static final Duration ROTATE_STAFF_WINDOW = Duration.ofMinutes(1);
 
     private final LoadingCache<String, Bucket> registerBuckets;
     private final LoadingCache<String, Bucket> loginBuckets;
@@ -290,6 +316,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // the public 16-arg constructor stays stable for the slice/regression tests that construct
     // this filter directly.
     private final LoadingCache<String, Bucket> removeAdminBuckets;
+    // Per-IP bucket shared by BOTH Phase 21.3 staff-rotation PATCH endpoints — the SEC-fix
+    // compensating control closing the gap left when these routes fell through to the
+    // unmatched-PATCH branch with no throttle at all. Built internally (like removeAdminBuckets)
+    // so the public 18-arg constructor stays stable for the slice/regression tests that
+    // construct this filter directly. Cap is 30/60s — see ROTATE_STAFF_CAPACITY for the
+    // reasoning behind the generous ceiling (raised from an initial 10/60s that regressed both
+    // realistic bulk-reshuffle usage and CI test isolation).
+    private final LoadingCache<String, Bucket> rotateStaffBuckets;
 
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -376,6 +410,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(removeAdminBandwidth())
                         .build());
+        this.rotateStaffBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(ROTATE_STAFF_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(rotateStaffBandwidth())
+                        .build());
     }
 
     private static Bandwidth otpVerifyBandwidth() {
@@ -431,6 +471,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(REMOVE_ADMIN_CAPACITY)
                 .refillIntervally(REMOVE_ADMIN_CAPACITY, REMOVE_ADMIN_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth rotateStaffBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(ROTATE_STAFF_CAPACITY)
+                .refillIntervally(ROTATE_STAFF_CAPACITY, ROTATE_STAFF_WINDOW)
                 .build();
     }
 
@@ -555,6 +602,24 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(REMOVE_ADMIN_PATH_PREFIX)
                 && path.contains(REMOVE_ADMIN_PATH_SEGMENT)) {
             applyRateLimit(request, response, filterChain, removeAdminBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Staff-rotation rate-limit: PATCH /api/v1/salons/{salonId}/admins/{userId}/salon
+        // (SalonController#rotateAdmin) and PATCH /api/v1/masters/{masterId}/salon
+        // (MasterController#rotateMasterSalon) — Phase 21.3 SEC-fix regression net, mirroring the
+        // removeAdminBuckets pattern (Phase 21.2). Both routes are the same class of
+        // low-frequency admin action, so they share ONE bucket rather than two. Checked before
+        // the POST-only guard so these PATCHes are covered; without this bucket they fell through
+        // to the unmatched branch below with zero throttling. Cap: 30 / 60 s per IP (raised from
+        // an initial 10/60s — see ROTATE_STAFF_CAPACITY).
+        if (HttpMethod.PATCH.matches(method)
+                && ((path.startsWith(ROTATE_ADMIN_SALON_PATH_PREFIX)
+                        && path.contains(REMOVE_ADMIN_PATH_SEGMENT)
+                        && path.endsWith(ROTATE_STAFF_SALON_PATH_SUFFIX))
+                    || (path.startsWith(ROTATE_MASTER_SALON_PATH_PREFIX)
+                        && path.endsWith(ROTATE_STAFF_SALON_PATH_SUFFIX)))) {
+            applyRateLimit(request, response, filterChain, rotateStaffBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 

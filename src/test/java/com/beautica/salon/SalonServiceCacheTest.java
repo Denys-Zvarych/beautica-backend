@@ -2,6 +2,7 @@ package com.beautica.salon;
 
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.CacheConfig;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.repository.MasterRepository;
@@ -90,6 +91,9 @@ class SalonServiceCacheTest {
     @MockBean MasterRepository masterRepository;
     @MockBean LocalityWriteValidator localityWriteValidator;
     @MockBean MasterService masterService;
+    // Phase 21.3: SalonService now constructor-depends on AuthorizationService (rotateAdmin).
+    // This slice does not exercise that path, so a mock satisfies the wiring.
+    @MockBean AuthorizationService authorizationService;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;

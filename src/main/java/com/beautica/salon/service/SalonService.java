@@ -4,24 +4,29 @@ import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -30,6 +35,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.util.List;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class SalonService {
@@ -41,6 +47,7 @@ public class SalonService {
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
     private final CacheManager cacheManager;
+    private final AuthorizationService authorizationService;
 
     @Transactional
     public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
@@ -315,6 +322,90 @@ public class SalonService {
         // Hibernate dirty-checking flushes the salonId mutation on commit (mirrors
         // deactivateSalon/updateSalon — no redundant explicit save()).
         admin.setSalonId(null);
+    }
+
+    /**
+     * Rotates (reassigns) a {@code SALON_ADMIN} from {@code salonId} to
+     * {@code destinationSalonId} (Phase 21.3). {@code actorId} is a SALON_OWNER acting on any
+     * salon they own, or a SALON_ADMIN acting on their own salon — both halves already enforced
+     * by {@code @PreAuthorize} on the controller ({@code canManageSalon} for source-salon
+     * scoping, {@code adminBelongsToSalon} for confirming {@code userId} is actually an admin of
+     * {@code salonId}).
+     *
+     * <p>The destination salon MUST belong to the SAME owner as the source salon — an admin has
+     * no visibility into other owners' salons, and this must never allow a cross-owner transfer.
+     * That check is NOT expressible in the controller's {@code @PreAuthorize} SpEL (it depends
+     * on the request body, not a path variable), so it is enforced here via
+     * {@link AuthorizationService#salonsShareOwner}.
+     *
+     * <p>Destination validation (Perf MEDIUM-4 / Sec LOW-1): the destination's active-flag is
+     * checked via the lightweight {@link SalonRepository#existsByIdAndIsActiveTrue} projection —
+     * no full {@code Salon} entity is ever loaded here, since only the raw
+     * {@code destinationSalonId} UUID is written onto {@code User.salonId}. All three destination
+     * denial reasons — cross-owner, inactive, and not-found — collapse to the SAME
+     * {@link ForbiddenException} (403). Distinguishing them via status code would let an actor
+     * with legitimate authority over the source salon probe an arbitrary owner's full salon
+     * portfolio (including inactive salons a public endpoint would 404 on) by observing
+     * 404 vs 403 vs 400 responses. The same-salon no-op check stays a distinct 400 — the actor
+     * already knows the source salon's identity, so it carries no oracle risk.
+     *
+     * @throws NotFoundException  if {@code userId} does not resolve to a user
+     * @throws ForbiddenException if the reloaded user is not a SALON_ADMIN assigned to
+     *                            {@code salonId} (defense-in-depth re-check of the
+     *                            {@code @PreAuthorize} gate), or if the destination salon does not
+     *                            exist, is not owned by the same owner as the source salon, or is
+     *                            inactive (soft-deleted)
+     * @throws BusinessException  (400) if {@code destinationSalonId} equals {@code salonId}
+     *                            (no-op rotation)
+     */
+    @Transactional
+    public SalonAdminResponse rotateAdmin(UUID actorId, UUID salonId, UUID userId, UUID destinationSalonId) {
+        var admin = userRepository.findById(userId)
+                .orElseThrow(() -> new NotFoundException("User not found: " + userId));
+
+        // Defense-in-depth: redundant with @authz.adminBelongsToSalon on the controller,
+        // but matches the existing pattern of service-layer re-validation (mirrors removeAdmin).
+        if (admin.getRole() != Role.SALON_ADMIN || !salonId.equals(admin.getSalonId())) {
+            throw new ForbiddenException("User is not an admin of this salon");
+        }
+
+        if (destinationSalonId.equals(salonId)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Already assigned to this salon");
+        }
+
+        // Same-owner requirement (product decision 2026-07-06): an admin/owner may only rotate
+        // staff within a single owner's portfolio of salons — never across owners. salonsShareOwner
+        // also returns false when destinationSalonId does not resolve to a salon at all, so
+        // "not found" collapses into this same 403 (Sec LOW-1 status-code oracle fix).
+        //
+        // Both checks below are evaluated unconditionally (not short-circuited) — Sec LOW-2:
+        // without this, the "same-owner but inactive" branch would run one extra DB round-trip
+        // (the active-check query) beyond what "cross-owner" and "not-found" execute, since those
+        // already deny inside salonsShareOwner. That asymmetry is itself a timing oracle letting an
+        // actor distinguish "in my owner's portfolio but soft-deleted" from "not in my portfolio at
+        // all" by sampling latency. Assigning to locals before the branch forces identical query
+        // shape/count across all three denial reasons.
+        boolean sameOwner = authorizationService.salonsShareOwner(salonId, destinationSalonId);
+        // Lightweight existence+active check (Perf MEDIUM-4) — no full Salon entity load. Inactive
+        // destinations also deny with 403, not 400 (Sec LOW-1): distinguishing "inactive" from
+        // "cross-owner" via status code would leak which salons an owner's portfolio contains.
+        boolean destinationActive = salonRepository.existsByIdAndIsActiveTrue(destinationSalonId);
+        if (!sameOwner || !destinationActive) {
+            throw new ForbiddenException("Destination salon is not available for rotation");
+        }
+
+        // `admin` was loaded via findById in THIS @Transactional, so it is a managed entity —
+        // Hibernate dirty-checking flushes the salonId mutation on commit (mirrors removeAdmin —
+        // no redundant explicit save()).
+        admin.setSalonId(destinationSalonId);
+
+        // Audit trail (LOW-fix): no dedicated audit-log subsystem exists in this codebase yet —
+        // a structured INFO log line is the established minimal pattern for sensitive mutations
+        // (mirrors the debug-level trail in InviteService). UUIDs only, no PII.
+        log.info("Salon rotation: admin {} moved from salon {} to {} by actor {}",
+                userId, salonId, destinationSalonId, actorId);
+
+        return SalonAdminResponse.from(admin);
     }
 
     /**
