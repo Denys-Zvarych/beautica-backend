@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.auth.Role;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
@@ -19,6 +20,13 @@ public interface UserRepository extends JpaRepository<User, UUID> {
 
     @Query("SELECT u.salonId FROM User u WHERE u.id = :userId")
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
+
+    /**
+     * Backs {@link com.beautica.common.security.AuthorizationService#adminBelongsToSalon} —
+     * mirrors {@code MasterRepository.existsByIdAndSalonId}, scoped additionally by role so a
+     * caller cannot use this predicate to probe non-admin users assigned to a salon.
+     */
+    boolean existsByIdAndSalonIdAndRole(UUID id, UUID salonId, Role role);
 
     /**
      * Scalar projection backing {@link com.beautica.auth.TokensValidAfterCache} — avoids
