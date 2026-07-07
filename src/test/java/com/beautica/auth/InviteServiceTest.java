@@ -5,7 +5,6 @@ import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.service.MasterService;
@@ -577,7 +576,6 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(userRepository.existsBySalonIdAndRole(salonId, Role.SALON_ADMIN)).thenReturn(false);
         when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("admin@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-admin-token");
@@ -590,7 +588,6 @@ class InviteServiceTest {
         verify(invitePersistenceService).persistInviteAndEnqueue(
                 any(), any(), roleCaptor.capture(), any(), any(), any(), any());
         assertThat(roleCaptor.getValue()).isEqualTo(Role.SALON_ADMIN);
-        verify(userRepository).existsBySalonIdAndRole(salonId, Role.SALON_ADMIN);
     }
 
     @Test
@@ -616,26 +613,31 @@ class InviteServiceTest {
     }
 
     @Test
-    @DisplayName("sendInvite throws ConflictException when salon already has a SALON_ADMIN")
-    void should_throwConflictException_when_salonAlreadyHasAdmin() {
+    @DisplayName("Phase 21.1: sendInvite succeeds when the salon already has a SALON_ADMIN (uniqueness relaxed)")
+    void should_sendAdminInvite_when_salonAlreadyHasAdmin() {
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var request = new InviteRequest("admin2@example.com", salonId, Role.SALON_ADMIN);
         var caller = buildCallerWithSalon(callerId, salonId);
+        var salonStub = mock(Salon.class);
+        when(salonStub.getName()).thenReturn("Test Salon");
         log.debug("Arrange: salon already has a SALON_ADMIN, salonId={}", salonId);
 
         when(userRepository.existsByEmail("admin2@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(userRepository.existsBySalonIdAndRole(salonId, Role.SALON_ADMIN)).thenReturn(true);
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("admin2@example.com", salonId))
+                .thenReturn(Optional.empty());
+        when(tokenGenerator.generateToken()).thenReturn("raw-second-admin-token");
 
-        log.debug("Act: sendInvite with SALON_ADMIN role for salonId={} that already has an admin — must throw ConflictException", salonId);
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ConflictException.class)
-                .hasMessageContaining("already has a SALON_ADMIN");
+        log.debug("Act: sendInvite with SALON_ADMIN role for salonId={} that already has an admin — must now succeed", salonId);
+        var response = inviteService.sendInvite(request, callerId);
 
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        assertThat(response.invitedEmail()).isEqualTo("admin2@example.com");
+        ArgumentCaptor<Role> roleCaptor = ArgumentCaptor.forClass(Role.class);
+        verify(invitePersistenceService).persistInviteAndEnqueue(
+                any(), any(), roleCaptor.capture(), any(), any(), any(), any());
+        assertThat(roleCaptor.getValue()).isEqualTo(Role.SALON_ADMIN);
     }
 
     @Test

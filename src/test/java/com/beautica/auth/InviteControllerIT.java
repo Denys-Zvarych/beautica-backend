@@ -171,6 +171,45 @@ class InviteControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("SALON_ADMIN sends invite directly via /auth/invite → 403 (split-gate regression net)")
+    void should_return403_when_salonAdminSendsInviteViaAuthInvite() throws Exception {
+        // REGRESSION NET (Phase 21.1 multi-admin relaxation): AuthController.sendInvite is gated
+        // @PreAuthorize("hasRole('SALON_OWNER')") and is INTENTIONALLY untouched by this phase — a
+        // SALON_ADMIN's only authorized invite surface is POST /api/v1/salons/{salonId}/invite (see
+        // should_return201_when_salonAdminInvitesNewAdminIntoOwnSalon below). Nothing previously
+        // pinned that hasRole('SALON_OWNER') still rejects a SALON_ADMIN caller on THIS path; a
+        // future refactor could silently widen it to hasAnyRole('SALON_OWNER','SALON_ADMIN') and
+        // reopen the split-gate risk (a SALON_ADMIN issuing invites for a salon it does not manage)
+        // with no CI signal.
+        String ownerEmail = uniqueEmail("owner-split-gate");
+        String adminEmail = uniqueEmail("admin-split-gate");
+        createdEmails.add(ownerEmail);
+        createdEmails.add(adminEmail);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: SALON_ADMIN ({}) of salonId={} attempts POST /auth/invite directly", adminEmail, salonId);
+
+        String ownerRegistrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        promoteToSalonOwnerWithSalon(ownerEmail, ownerRegistrationToken, salonId);
+        registerAndGetToken(adminEmail, Role.CLIENT);
+        String adminAccessToken = promoteToSalonAdmin(adminEmail, salonId);
+
+        HttpHeaders headers = bearerHeaders(adminAccessToken);
+        var request = new InviteRequest(uniqueEmail("target-split-gate"), salonId, null);
+
+        log.debug("Act: POST /auth/invite as SALON_ADMIN — must still be rejected with 403");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/auth/invite",
+                HttpMethod.POST,
+                new HttpEntity<>(request, headers),
+                String.class
+        );
+
+        assertThat(response.getStatusCode())
+                .as("SALON_ADMIN must still receive 403 on POST /auth/invite — only SALON_OWNER may use this path")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
     @DisplayName("Unauthenticated request to send invite → 401")
     void should_return401_when_unauthenticatedSendsInvite() {
         log.debug("Arrange: no Authorization header");
@@ -270,6 +309,189 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 second.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
         assertThat(secondBody.success()).isTrue();
         assertThat(secondBody.data().invitedEmail()).isEqualTo(firstBody.data().invitedEmail());
+    }
+
+    // ── Phase 21.1 — multi-admin relaxation ───────────────────────────────────
+
+    @Test
+    @DisplayName("Phase 21.1: SALON_OWNER invites a second SALON_ADMIN into a salon that already has one → 201 (uniqueness relaxed)")
+    void should_return201_when_secondAdminInviteSentToSalonWithExistingAdmin() throws Exception {
+        String ownerEmail = uniqueEmail("owner-multi-admin");
+        String firstAdminEmail = uniqueEmail("first-admin");
+        String secondAdminEmail = uniqueEmail("second-admin");
+        createdEmails.add(ownerEmail);
+        createdEmails.add(firstAdminEmail);
+        createdEmails.add(secondAdminEmail);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: salon={} already has one SALON_ADMIN ({}); inviting a second", salonId, firstAdminEmail);
+
+        String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
+        registerAndGetToken(firstAdminEmail, Role.CLIENT);
+        promoteToSalonAdmin(firstAdminEmail, salonId);
+
+        HttpHeaders headers = bearerHeaders(ownerAccessToken);
+        var request = new InviteRequest(secondAdminEmail, salonId, Role.SALON_ADMIN);
+
+        log.debug("Act: POST /auth/invite for a second SALON_ADMIN in salonId={}", salonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/auth/invite",
+                HttpMethod.POST,
+                new HttpEntity<>(request, headers),
+                String.class
+        );
+
+        assertThat(response.getStatusCode())
+                .as("a second SALON_ADMIN invite to the same salon must succeed with 201 (no more uniqueness conflict)")
+                .isEqualTo(HttpStatus.CREATED);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().invitedEmail()).isEqualTo(secondAdminEmail);
+    }
+
+    @Test
+    @DisplayName("Phase 21.1: a SALON_ADMIN caller invites a new SALON_ADMIN into their own salon via POST /salons/{salonId}/invite → 201")
+    void should_return201_when_salonAdminInvitesNewAdminIntoOwnSalon() throws Exception {
+        // NOTE: /api/v1/auth/invite is gated `@PreAuthorize("hasRole('SALON_OWNER')")` at the
+        // controller layer and is unrelated to this phase (untouched, pre-existing SALON_OWNER-
+        // only onboarding surface). The reachable, already-authorized HTTP surface for a
+        // SALON_ADMIN caller is POST /api/v1/salons/{salonId}/invite (SalonController — controller
+        // gate hasAnyRole('SALON_OWNER','SALON_ADMIN') + @authz.canManageSalon), which delegates
+        // to the same InviteService.sendInvite this phase relaxes.
+        String ownerEmail = uniqueEmail("owner-admin-invites-admin");
+        String firstAdminEmail = uniqueEmail("first-admin-caller");
+        String secondAdminEmail = uniqueEmail("second-admin-target");
+        createdEmails.add(ownerEmail);
+        createdEmails.add(firstAdminEmail);
+        createdEmails.add(secondAdminEmail);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: SALON_ADMIN ({}) of salonId={} invites a new SALON_ADMIN", firstAdminEmail, salonId);
+
+        String ownerRegistrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        promoteToSalonOwnerWithSalon(ownerEmail, ownerRegistrationToken, salonId);
+        registerAndGetToken(firstAdminEmail, Role.CLIENT);
+        String adminAccessToken = promoteToSalonAdmin(firstAdminEmail, salonId);
+
+        HttpHeaders headers = bearerHeaders(adminAccessToken);
+        var request = new com.beautica.salon.dto.InviteRequest(secondAdminEmail, Role.SALON_ADMIN);
+
+        log.debug("Act: POST /salons/{}/invite as SALON_ADMIN caller for a new SALON_ADMIN target={}", salonId, secondAdminEmail);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/invite",
+                HttpMethod.POST,
+                new HttpEntity<>(request, headers),
+                String.class
+        );
+
+        assertThat(response.getStatusCode())
+                .as("a SALON_ADMIN caller must be able to invite a new SALON_ADMIN into their own salon")
+                .isEqualTo(HttpStatus.CREATED);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().invitedEmail()).isEqualTo(secondAdminEmail);
+    }
+
+    @Test
+    @DisplayName("Phase 21.1: a SALON_ADMIN caller inviting a SALON_ADMIN into a different salon via POST /salons/{salonId}/invite still → 403")
+    void should_return403_when_salonAdminInvitesAdminIntoDifferentSalon() throws Exception {
+        String ownerEmail = uniqueEmail("owner-cross-salon");
+        String adminEmail = uniqueEmail("admin-cross-salon");
+        String targetEmail = uniqueEmail("target-cross-salon");
+        createdEmails.add(ownerEmail);
+        createdEmails.add(adminEmail);
+        createdEmails.add(targetEmail);
+        UUID adminSalonId = UUID.randomUUID();
+        UUID otherSalonId = UUID.randomUUID();
+        log.debug("Arrange: SALON_ADMIN of salonId={} attempts to invite into unrelated salonId={}", adminSalonId, otherSalonId);
+
+        String ownerRegistrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        promoteToSalonOwnerWithSalon(ownerEmail, ownerRegistrationToken, adminSalonId);
+        registerAndGetToken(adminEmail, Role.CLIENT);
+        String adminAccessToken = promoteToSalonAdmin(adminEmail, adminSalonId);
+
+        // otherSalonId must exist as a real salon row for FK/lookups further down the flow —
+        // registered under a second throwaway owner so cleanUp() can tear it down too.
+        String otherOwnerEmail = uniqueEmail("owner-other-salon");
+        createdEmails.add(otherOwnerEmail);
+        String otherOwnerRegistrationToken = registerAndGetToken(otherOwnerEmail, Role.CLIENT);
+        promoteToSalonOwnerWithSalon(otherOwnerEmail, otherOwnerRegistrationToken, otherSalonId);
+
+        HttpHeaders headers = bearerHeaders(adminAccessToken);
+        var request = new com.beautica.salon.dto.InviteRequest(targetEmail, Role.SALON_ADMIN);
+
+        log.debug("Act: POST /salons/{}/invite as SALON_ADMIN caller targeting a different salonId — must be rejected with 403", otherSalonId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + otherSalonId + "/invite",
+                HttpMethod.POST,
+                new HttpEntity<>(request, headers),
+                String.class
+        );
+
+        assertThat(response.getStatusCode())
+                .as("a SALON_ADMIN caller must never be able to invite into a salon other than their own")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 21.1: accepting a SALON_ADMIN invite when the salon already has an admin → 201, both admin rows persisted")
+    void should_return201AndCreateSecondSalonAdmin_when_acceptingInviteForSalonThatAlreadyHasAnAdmin() throws Exception {
+        // GAP CLOSED: every other Phase 21.1 test exercises invite CREATION only — the second
+        // admin's `users` row never actually gets persisted in those flows (an invite_tokens row
+        // is created, but nothing accepts it). This test drives the full invite→accept round trip
+        // through the real HTTP + service + JPA path (not a raw JDBC bypass — see
+        // V108DropSalonAdminUniquenessMigrationTest for that layer) so that the application code
+        // itself, not just Postgres, is proven compatible with two SALON_ADMIN rows sharing a
+        // salon_id now that uq_users_salon_admin (V8) is dropped by V108.
+        String ownerEmail = uniqueEmail("owner-accept-second-admin");
+        String firstAdminEmail = uniqueEmail("first-admin-accept");
+        String secondAdminEmail = uniqueEmail("second-admin-accept");
+        createdEmails.add(ownerEmail);
+        createdEmails.add(firstAdminEmail);
+        createdEmails.add(secondAdminEmail);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: salon={} already has a persisted SALON_ADMIN ({}); accepting an invite for a second", salonId, firstAdminEmail);
+
+        String ownerRegistrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        promoteToSalonOwnerWithSalon(ownerEmail, ownerRegistrationToken, salonId);
+        registerAndGetToken(firstAdminEmail, Role.CLIENT);
+        promoteToSalonAdmin(firstAdminEmail, salonId);
+
+        String rawToken = UUID.randomUUID().toString();
+        saveValidAdminInviteToken(secondAdminEmail, salonId, rawToken);
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Second", "Admin", "+380501234567");
+
+        log.debug("Act: POST /auth/invite/accept for a SECOND SALON_ADMIN of an already-admin'd salonId={}", salonId);
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept", request, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("accepting a second SALON_ADMIN invite for a salon that already has one must succeed with 201")
+                .isEqualTo(HttpStatus.CREATED);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        assertThat(body.success()).isTrue();
+        assertThat(body.data().role()).isEqualTo(Role.SALON_ADMIN);
+        assertThat(body.data().email()).isEqualTo(secondAdminEmail);
+        assertThat(body.data().salonId()).isEqualTo(salonId);
+
+        var persistedSecondAdmin = userRepository.findByEmail(secondAdminEmail);
+        assertThat(persistedSecondAdmin).isPresent();
+        assertThat(persistedSecondAdmin.get().getRole()).isEqualTo(Role.SALON_ADMIN);
+        assertThat(persistedSecondAdmin.get().getSalonId()).isEqualTo(salonId);
+
+        // The decisive assertion: TWO real, application-persisted SALON_ADMIN rows now coexist
+        // for the same salon_id — the exact row shape uq_users_salon_admin used to forbid.
+        Integer adminCountForSalon = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM users WHERE salon_id = ? AND role = 'SALON_ADMIN'",
+                Integer.class, salonId);
+        assertThat(adminCountForSalon)
+                .as("salonId=%s must now have two persisted SALON_ADMIN rows after the second invite is accepted", salonId)
+                .isEqualTo(2);
     }
 
     @Test
@@ -646,12 +868,47 @@ class InviteControllerIT extends AbstractIntegrationTest {
         return body.data().accessToken();
     }
 
+    /**
+     * Directly manipulates an already-registered user's role/salon in the DB to become a
+     * SALON_ADMIN of the given (already-existing) salon, without a dedicated promote endpoint —
+     * mirrors {@link #promoteToSalonOwnerWithSalon}. The caller is responsible for ensuring the
+     * salon row already exists (e.g. via {@link #promoteToSalonOwnerWithSalon}).
+     */
+    private String promoteToSalonAdmin(String email, UUID salonId) throws Exception {
+        transactionTemplate.executeWithoutResult(status ->
+                userRepository.findByEmail(email).ifPresent(user -> {
+                    org.springframework.test.util.ReflectionTestUtils.setField(user, "role", Role.SALON_ADMIN);
+                    org.springframework.test.util.ReflectionTestUtils.setField(user, "salonId", salonId);
+                    userRepository.save(user);
+                })
+        );
+        var loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, "Str0ngP@ss1!"),
+                String.class
+        );
+        var body = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
     private InviteToken saveValidInviteToken(String email, UUID salonId, String rawToken) {
         var token = new InviteToken(
                 sha256Hex(rawToken),
                 email,
                 salonId,
                 Role.SALON_MASTER,
+                Instant.now().plusSeconds(3600)
+        );
+        return inviteTokenRepository.save(token);
+    }
+
+    private InviteToken saveValidAdminInviteToken(String email, UUID salonId, String rawToken) {
+        var token = new InviteToken(
+                sha256Hex(rawToken),
+                email,
+                salonId,
+                Role.SALON_ADMIN,
                 Instant.now().plusSeconds(3600)
         );
         return inviteTokenRepository.save(token);

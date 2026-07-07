@@ -52,6 +52,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String BULK_IM_SERVICES_PATH = "/api/v1/independent-masters/me/services/bulk";
     private static final String BULK_SALON_SERVICES_PREFIX = "/api/v1/salons/";
     private static final String BULK_SALON_SERVICES_SUFFIX = "/services/bulk";
+    // Salon-scoped invite POST carries the {salonId} variable, so it is matched by prefix +
+    // suffix (same technique as BULK_SALON_SERVICES above): /api/v1/salons/{salonId}/invite.
+    // This is the actual HTTP path SalonController.inviteMaster exposes to SALON_OWNER and
+    // (Phase 21.1 multi-admin relaxation) SALON_ADMIN callers; it delegates to the same
+    // InviteService.sendInvite as POST /api/v1/auth/invite (see INVITE_PATH below) and so
+    // carries the identical residual timing/enumeration side-channel — it needs its own bucket
+    // because it is a distinct HTTP path.
+    private static final String SALON_INVITE_PATH_PREFIX = "/api/v1/salons/";
+    private static final String SALON_INVITE_PATH_SUFFIX = "/invite";
     private static final String SUPPORT_CONTACT_PATH = "/api/v1/support/contact";
     private static final String OTP_SEND_PATH = "/api/v1/book/otp/send";
     private static final String OTP_VERIFY_PATH = "/api/v1/book/otp/verify";
@@ -148,6 +157,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // slice/regression tests — stays unchanged.
     private static final long INVITE_CAPACITY = 15;
     private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for POST /api/v1/salons/{salonId}/invite (15 / 60 s) — mirrors INVITE_CAPACITY
+    // / INVITE_WINDOW above (kept as its own dedicated constants, not shared, so the two
+    // endpoints can be tuned independently). Phase 21.1 (multi-admin relaxation) widened the
+    // population that can reach InviteService.sendInvite through this path from SALON_OWNER-only
+    // to SALON_OWNER + SALON_ADMIN, so the residual already-registered/active-invite timing
+    // side-channel documented on InviteService.sendInvite is now reachable by more principals.
+    // This bucket is the compensating control for that path, exactly as inviteBuckets is for
+    // POST /api/v1/auth/invite.
+    private static final long SALON_INVITE_CAPACITY = 15;
+    private static final Duration SALON_INVITE_WINDOW = Duration.ofMinutes(1);
     // Per-IP cap for POST /api/v1/auth/logout (30 / 60 s) — SEC-fix regression net: logout
     // was previously not covered by this filter at all, an unbounded surface on an otherwise
     // fully-throttled /auth/* namespace. Logout carries no email/SMS cost and is the
@@ -234,6 +253,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // branches return fast). Built internally rather than injected so the public 16-arg
     // constructor stays stable for the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> inviteBuckets;
+    // Per-IP bucket for POST /api/v1/salons/{salonId}/invite — the SEC-fix compensating control
+    // closing the gap left when this path (the actual HTTP surface for SalonController.inviteMaster,
+    // reachable by SALON_OWNER and, since Phase 21.1, SALON_ADMIN) fell through to the unmatched
+    // else branch with no throttle at all, even though it delegates to the same
+    // InviteService.sendInvite timing-oracle surface as inviteBuckets above. Built internally
+    // rather than injected so the public 16-arg constructor stays stable for the slice/regression
+    // tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> salonInviteBuckets;
     // Per-IP bucket for POST /api/v1/auth/logout — the SEC-fix regression net closing the
     // previously-unthrottled /auth/logout surface. Built internally rather than injected so
     // the public 16-arg constructor stays stable for the slice/regression tests that
@@ -307,6 +334,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(inviteBandwidth())
                         .build());
+        this.salonInviteBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SALON_INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(salonInviteBandwidth())
+                        .build());
         this.logoutBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(LOGOUT_WINDOW.plusMinutes(5))
@@ -347,6 +380,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(INVITE_CAPACITY)
                 .refillIntervally(INVITE_CAPACITY, INVITE_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth salonInviteBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SALON_INVITE_CAPACITY)
+                .refillIntervally(SALON_INVITE_CAPACITY, SALON_INVITE_WINDOW)
                 .build();
     }
 
@@ -427,6 +467,20 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         || (path.startsWith(BULK_SALON_SERVICES_PREFIX)
                                 && path.endsWith(BULK_SALON_SERVICES_SUFFIX)))) {
             applyRateLimit(request, response, filterChain, bulkServiceSetupBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Salon-invite rate-limit: POST /api/v1/salons/{salonId}/invite — matched by prefix +
+        // suffix (the {salonId} is one path segment, same technique as the bulk-service-setup
+        // branch above). This is the actual HTTP path through which SalonController.inviteMaster
+        // reaches InviteService.sendInvite for SALON_OWNER and (Phase 21.1 multi-admin relaxation)
+        // SALON_ADMIN callers; without this bucket it fell through to the unmatched else branch
+        // below with no throttle at all, unlike its sibling POST /api/v1/auth/invite. Cap: 15 / 60 s
+        // per IP (salonInviteBuckets).
+        if (HttpMethod.POST.matches(method)
+                && path.startsWith(SALON_INVITE_PATH_PREFIX)
+                && path.endsWith(SALON_INVITE_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, salonInviteBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
