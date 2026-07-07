@@ -73,6 +73,26 @@ public class NotificationOutboxService {
     }
 
     /**
+     * Enqueues a {@code REVIEW_REQUESTED} notification entry (Phase 18.2).
+     *
+     * <p>Fired AFTER the booking's {@code CONFIRMED → COMPLETED} transition, inside the same
+     * completion transaction (MANDATORY propagation — rolls back with the booking if the
+     * completion fails). Carries only {@code aggregateId = bookingId}; the drain worker
+     * re-hydrates the full {@code Booking} graph at send time, so no client PII is duplicated
+     * into the outbox payload.
+     *
+     * <p>The recipient is the <strong>client</strong> (not the provider) — recipient resolution
+     * lives in {@code NotificationService.notifyReviewRequested}, not here.
+     *
+     * @param bookingId the UUID of the booking that was just completed
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueReviewRequested(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.REVIEW_REQUESTED, bookingId, null);
+    }
+
+    /**
      * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2).
      *
      * <p>The drained event notifies the provider (master / salon-admin) that the client

@@ -229,7 +229,8 @@ class BookingServiceCacheTest {
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
-        doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
+        // Phase 18.4: completion authorization goes through enforceCanCompleteBooking.
+        doNothing().when(authz).enforceCanCompleteBooking(actorUserId, booking);
 
         // Act — wrap in transaction so afterCommit() fires
         transactionTemplate.execute(status -> {

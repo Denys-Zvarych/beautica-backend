@@ -213,6 +213,49 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
                 .isInstanceOf(ConstraintViolationException.class);
     }
 
+    // ── Phase 18.1 — REVIEW_REQUESTED event type + chk_outbox_event (V109) ──────
+
+    /**
+     * V109 widened {@code chk_outbox_event} to admit {@code REVIEW_REQUESTED}. This test proves
+     * a {@code REVIEW_REQUESTED} row with a non-null {@code aggregate_id} both satisfies the CHECK
+     * and round-trips through the {@code @Enumerated(STRING)} mapping unchanged.
+     */
+    @Test
+    @DisplayName("should_persistReviewRequestedEntry_when_eventTypeIsReviewRequested")
+    void should_persistReviewRequestedEntry_when_eventTypeIsReviewRequested() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry entry = NotificationOutboxEntry.builder()
+                .eventType(OutboxEventType.REVIEW_REQUESTED)
+                .aggregateId(bookingId)
+                .build();
+
+        // Act
+        NotificationOutboxEntry persisted = em.persistAndFlush(entry);
+        em.clear();
+
+        NotificationOutboxEntry reloaded = em.find(NotificationOutboxEntry.class, persisted.getId());
+
+        // Assert
+        assertThat(reloaded).isNotNull();
+        assertThat(reloaded.getEventType()).isEqualTo(OutboxEventType.REVIEW_REQUESTED);
+        assertThat(reloaded.getAggregateId()).isEqualTo(bookingId);
+    }
+
+    /**
+     * The {@code chk_outbox_event} CHECK must still reject an unknown event_type value — proving
+     * V109 replaced the constraint rather than dropping it. A raw JDBC insert with a bogus value
+     * must fail with a data-integrity violation.
+     */
+    @Test
+    @DisplayName("should_rejectBogusEventType_when_insertViolatesChkOutboxEvent")
+    void should_rejectBogusEventType_when_insertViolatesChkOutboxEvent() {
+        assertThatThrownBy(() -> jdbcTemplate.update(
+                "INSERT INTO notification_outbox (id, event_type, aggregate_id, status, attempts) "
+                        + "VALUES (gen_random_uuid(), 'BOGUS_EVENT', gen_random_uuid(), 'PENDING', 0)"))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+    }
+
     // ── LOW-1 ─────────────────────────────────────────────────────────────────
 
     /**

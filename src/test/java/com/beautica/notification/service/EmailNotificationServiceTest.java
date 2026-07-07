@@ -200,6 +200,79 @@ class EmailNotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // sendReviewRequestEmail (Phase 18.5)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("sendReviewRequestEmail renders the review-request template with all vars and a formatted startsAt")
+    void should_callMailSenderSend_when_sendReviewRequestEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>review</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+        String reviewUrl = "https://app.beautica.ua/bookings/abc-123/review";
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendReviewRequestEmail("client@example.com", booking, reviewUrl);
+
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
+        verify(mailSender).send(realMessage);
+
+        assertThat(templateCaptor.getValue()).isEqualTo("email/review-request");
+        assertThat(realMessage.getSubject()).isEqualTo("Оцініть візит");
+
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
+        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
+        assertThat(captured.getVariable("reviewUrl")).isEqualTo(reviewUrl);
+        // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date — pre-formatted, never a raw datetime.
+        assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
+    }
+
+    @Test
+    @DisplayName("sendReviewRequestEmail rejects an unsafe reviewUrl scheme before any render or send")
+    void should_throwIllegalArgument_when_sendReviewRequestEmailReviewUrlSchemeUnsafe() {
+        // The scheme guard rejects before the booking graph is touched, so a bare mock suffices
+        // (a full buildBookingMock would trip Mockito's strict UnnecessaryStubbingException).
+        Booking booking = mock(Booking.class);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                        service.sendReviewRequestEmail("client@example.com", booking, "javascript:alert(1)"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scheme");
+
+        org.mockito.Mockito.verifyNoInteractions(mailSender);
+    }
+
+    @Test
+    @DisplayName("sendReviewRequestEmail strips CRLF from the To address before setTo is called")
+    void should_stripCrlf_when_sendReviewRequestEmailCalledWithInjectedNewline() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>review</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+
+        service.sendReviewRequestEmail(
+                "client@example.com\r\n", booking, "https://app.beautica.ua/bookings/abc/review");
+
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
+                .isNotNull()
+                .hasSize(1);
+        String toHeader = realMessage.getRecipients(Message.RecipientType.TO)[0].toString();
+        assertThat(toHeader).doesNotContain("\r");
+        assertThat(toHeader).doesNotContain("\n");
+        assertThat(toHeader).contains("client@example.com");
+    }
+
+    // -------------------------------------------------------------------------
     // sendBookingDeclinedEmail
     // -------------------------------------------------------------------------
 

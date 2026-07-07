@@ -351,11 +351,21 @@ public class BookingService {
     @Transactional
     public BookingResponse completeBooking(UUID actorUserId, UUID bookingId) {
         Booking booking = loadBookingOrThrow(bookingId);
-        authz.enforceCanManageBooking(actorUserId, booking);
+        // Phase 18.4: completion admits SALON_ADMIN (unlike confirm/decline/not-complete, which
+        // stay owner-level on enforceCanManageBooking). See AuthorizationService.enforceCanCompleteBooking.
+        authz.enforceCanCompleteBooking(actorUserId, booking);
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.COMPLETED);
         booking.setStatus(BookingStatus.COMPLETED);
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 18.3: enqueue the client review prompt in the same transaction. At-most-once by
+        // construction — a second complete throws (assertTransition). The COMPLETED state is the
+        // gate ReviewService.createReview enforces before a review may be left.
+        // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) and no account
+        // to leave a review with — skip the review prompt so the drain path never NPEs on getClient().
+        if (saved.getClient() != null) {
+            outboxService.enqueueReviewRequested(saved.getId());
+        }
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit(actorUserId);
         return BookingResponse.from(saved);

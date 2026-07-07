@@ -608,6 +608,9 @@ class BookingControllerTest {
     void should_return204_when_authorizedCompleteBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
+        // Slice test: the @authz SpEL gate in @PreAuthorize is the predicate under test here —
+        // the service ownership guard is mocked out, so admit this owner explicitly.
+        when(authorizationService.canCompleteBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.completeBooking(any(), eq(bookingId))).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/complete")
@@ -621,6 +624,9 @@ class BookingControllerTest {
     void should_return204_when_independentMasterCompletesBooking() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
+        // Slice test: the @authz SpEL gate in @PreAuthorize is the predicate under test here —
+        // the service ownership guard is mocked out, so admit this master explicitly.
+        when(authorizationService.canCompleteBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.completeBooking(any(), eq(bookingId))).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/complete")

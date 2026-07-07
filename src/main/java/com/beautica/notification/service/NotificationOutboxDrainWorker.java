@@ -198,6 +198,7 @@ public class NotificationOutboxDrainWorker {
             case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(getBooking(entry, bookingCache));
             case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
             case BOOKING_RESCHEDULED -> notificationService.notifyBookingRescheduled(getBooking(entry, bookingCache));
+            case REVIEW_REQUESTED -> notificationService.notifyReviewRequested(getBooking(entry, bookingCache));
             case INVITE -> {
                 Map<String, String> p = readJson(entry.getPayload());
                 // Decrypt inviteUrlSealed from payload (Phase 5.4a cipher); aggregateId is the

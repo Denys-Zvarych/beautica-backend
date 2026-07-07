@@ -101,6 +101,37 @@ class NotificationOutboxServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // enqueueReviewRequested (Phase 18.2)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("enqueueReviewRequested saves exactly one REVIEW_REQUESTED entry with PENDING status, 0 attempts, correct aggregateId and null payload")
+    void should_saveReviewRequestedEntry_when_enqueueReviewRequestedCalled() {
+        UUID bookingId = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor =
+                ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        service.enqueueReviewRequested(bookingId);
+
+        verify(outboxRepository, times(1)).save(captor.capture());
+        NotificationOutboxEntry saved = captor.getValue();
+        assertThat(saved.getEventType()).isEqualTo(OutboxEventType.REVIEW_REQUESTED);
+        assertThat(saved.getAggregateId()).isEqualTo(bookingId);
+        assertThat(saved.getPayload()).isNull();
+        assertThat(saved.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(saved.getAttempts()).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("enqueueReviewRequested throws NullPointerException with message when bookingId is null — no save")
+    void should_throwNullPointerException_when_enqueueReviewRequestedCalledWithNull() {
+        assertThatThrownBy(() -> service.enqueueReviewRequested(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("bookingId must not be null");
+        verify(outboxRepository, never()).save(any());
+    }
+
+    // -------------------------------------------------------------------------
     // enqueueClientCancelled
     // -------------------------------------------------------------------------
 
