@@ -153,7 +153,7 @@ class SalonMasterProfileUpdateTest {
         var instagram = "@nail_master";
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(new MasterPublicProfileResponse(null, null, phone, bio, instagram));
+                .thenReturn(new MasterPublicProfileResponse(null, null, phone, bio, instagram, null));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "smaster@beautica.test", Role.SALON_MASTER))

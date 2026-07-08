@@ -146,7 +146,7 @@ class MasterControllerTest {
     private MasterDetailResponse stubMasterDetail(UUID masterId, UUID userId) {
         return new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", null, null, null, null, null,
-                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 null, null, null);
     }
 
@@ -192,7 +192,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 cityUuid, oblastUuid, districtUuid);
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
@@ -223,7 +223,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_MASTER, null, List.of(),
+                null, null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_MASTER, null, List.of(),
                 cityUuid, oblastUuid, districtUuid);
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
@@ -251,7 +251,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_OWNER, null, List.of(),
+                null, null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_OWNER, null, List.of(),
                 cityUuid, oblastUuid, districtUuid);
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
@@ -279,7 +279,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 null, null, null);
         when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
 
@@ -304,7 +304,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
+                null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 cityUuid, oblastUuid, null);
         when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
 
@@ -335,7 +335,7 @@ class MasterControllerTest {
         MasterDetailResponse fullDetail = new MasterDetailResponse(
                 masterId, "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                "Nail artist", "@oksana.nails", "https://cdn.beautica.test/a.png",
+                "Nail artist", "@oksana.nails", "Майстер манікюру", "https://cdn.beautica.test/a.png",
                 new BigDecimal("4.75"), 12, MasterType.INDEPENDENT_MASTER, null,
                 List.of(workingHoursRow),
                 cityUuid, oblastUuid, districtUuid);
@@ -360,6 +360,7 @@ class MasterControllerTest {
                 .andExpect(jsonPath("$.data.locationNote").value("green door"))
                 .andExpect(jsonPath("$.data.bio").value("Nail artist"))
                 .andExpect(jsonPath("$.data.instagram").value("@oksana.nails"))
+                .andExpect(jsonPath("$.data.professionalTitle").value("Майстер манікюру"))
                 .andExpect(jsonPath("$.data.avatarUrl").value("https://cdn.beautica.test/a.png"))
                 .andExpect(jsonPath("$.data.avgRating").value(4.75))
                 .andExpect(jsonPath("$.data.reviewCount").value(12))
@@ -466,7 +467,7 @@ class MasterControllerTest {
         var clientId = UUID.randomUUID();
 
         var summary = new MasterSummaryResponse(
-                masterId, "Oksana", "Kovalenko", null,
+                masterId, "Oksana", "Kovalenko", "Майстер манікюру", null,
                 BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER);
         Page<MasterSummaryResponse> page =
                 new PageImpl<>(List.of(summary), PageRequest.of(0, 20), 1);
@@ -482,6 +483,7 @@ class MasterControllerTest {
                 .andExpect(jsonPath("$.data.data").isArray())
                 .andExpect(jsonPath("$.data.data[0].masterId").value(masterId.toString()))
                 .andExpect(jsonPath("$.data.data[0].firstName").value("Oksana"))
+                .andExpect(jsonPath("$.data.data[0].professionalTitle").value("Майстер манікюру"))
                 .andExpect(jsonPath("$.data.totalElements").value(1));
     }
 

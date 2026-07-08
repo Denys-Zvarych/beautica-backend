@@ -17,5 +17,6 @@ public record MasterPublicProfileResponse(
         String lastName,
         String phoneNumber,
         String bio,
-        String instagram
+        String instagram,
+        String professionalTitle
 ) {}

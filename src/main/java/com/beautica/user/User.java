@@ -154,6 +154,14 @@ public class User extends AuditableEntity {
     @Column(name = "instagram", length = 100)
     private String instagram;
 
+    // Free-text professional headline/label (e.g. "Майстер манікюру", "Візажист").
+    // Distinct from bio (long-form description) and from the role enum. Every role
+    // EXCEPT CLIENT may set it — the CLIENT guard lives in UserService.updateProfile,
+    // not here. Nullable: a provider with no title set returns null (mobile falls back
+    // to the role label). Length mirrors V110 VARCHAR(100).
+    @Column(name = "professional_title", length = 100)
+    private String professionalTitle;
+
     @Column(name = "business_name", length = 255)
     private String businessName;
 
@@ -495,5 +503,13 @@ public class User extends AuditableEntity {
 
     public void setInstagram(String instagram) {
         this.instagram = instagram;
+    }
+
+    public String getProfessionalTitle() {
+        return professionalTitle;
+    }
+
+    public void setProfessionalTitle(String professionalTitle) {
+        this.professionalTitle = professionalTitle;
     }
 }

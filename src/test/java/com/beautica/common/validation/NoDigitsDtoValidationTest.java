@@ -204,7 +204,7 @@ class NoDigitsDtoValidationTest {
     class MasterProfileUpdate {
 
         private MasterProfileUpdateRequest with(String firstName, String lastName) {
-            return new MasterProfileUpdateRequest(firstName, lastName, null, null, null);
+            return new MasterProfileUpdateRequest(firstName, lastName, null, null, null, null);
         }
 
         @Test

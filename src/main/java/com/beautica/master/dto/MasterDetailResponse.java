@@ -20,6 +20,7 @@ public record MasterDetailResponse(
         String locationNote,
         String bio,
         String instagram,
+        String professionalTitle,
         String avatarUrl,
         BigDecimal avgRating,
         int reviewCount,
@@ -52,6 +53,7 @@ public record MasterDetailResponse(
                 master.getUser().getLocationNote(),
                 master.getUser().getBio(),
                 master.getUser().getInstagram(),
+                master.getUser().getProfessionalTitle(),
                 master.getUser().getAvatarUrl(),
                 master.getAvgRating(),
                 master.getReviewCount(),
@@ -85,6 +87,9 @@ public record MasterDetailResponse(
                 isIndependent ? full.buildingNo() : null,
                 isIndependent ? full.locationNote() : null,
                 full.bio(), full.instagram(),
+                // professionalTitle is a public-facing headline (like bio/instagram) — surfaced
+                // unmasked to unauthenticated callers so master cards can render it.
+                full.professionalTitle(),
                 full.avatarUrl(), full.avgRating(), full.reviewCount(),
                 full.masterType(), full.salon(), full.workingHours(),
                 isIndependent ? full.cityId() : null,

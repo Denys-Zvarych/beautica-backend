@@ -107,7 +107,7 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
         transactionTemplate.executeWithoutResult(status ->
                 userService.updateMasterProfile(
                         userId,
-                        new MasterProfileUpdateRequest(null, null, null, NEW_BIO, null)));
+                        new MasterProfileUpdateRequest(null, null, null, NEW_BIO, null, null)));
 
         // ── 3. Re-read — a fresh DB query (not the stale cache) must surface NEW_BIO ──
         log.debug("Assert: re-read getMyMasterDetail — fresh bio proves the cache entry was evicted after commit");
@@ -157,7 +157,7 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
         transactionTemplate.executeWithoutResult(status ->
                 userService.updateMasterProfile(
                         userId,
-                        new MasterProfileUpdateRequest("Iryna-Renamed", null, null, null, null)));
+                        new MasterProfileUpdateRequest("Iryna-Renamed", null, null, null, null, null)));
 
         // ── 3. The whole discovery cache must now be empty. If the eviction branch were
         //        removed (or its role/searchAffected gate broke), this entry would survive

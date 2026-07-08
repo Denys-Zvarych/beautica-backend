@@ -91,7 +91,7 @@ class UserDynamicUpdateShapeIT extends AbstractIntegrationTest {
                 null, null,                 // cityId, districtId
                 "вул. Хрещатик",            // street  ← the only dirtied column
                 null, null,                 // buildingNo, locationNote
-                null);                      // instagram
+                null, null);                      // instagram
         userService.updateProfile(userId, request);
 
         // Assert — exactly one UPDATE on users was prepared, and its dynamic

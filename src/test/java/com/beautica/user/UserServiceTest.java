@@ -227,7 +227,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest("Robert", "New", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -246,7 +246,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -266,7 +266,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, "+380991234567",
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -292,7 +292,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, "Lesi Ukrainky", "7", "Blue door", null);
+                cityId, districtId, "Lesi Ukrainky", "7", "Blue door", null, null);
 
         userService.updateProfile(userId, request);
 
@@ -324,7 +324,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, "Shevchenka", "12A", "ring twice", null);
+                cityId, districtId, "Shevchenka", "12A", "ring twice", null, null);
 
         userService.updateProfile(userId, request);
 
@@ -354,7 +354,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, "вул. Дерибасівська", "5", "yellow building", null);
+                cityId, null, "вул. Дерибасівська", "5", "yellow building", null, null);
 
         userService.updateProfile(userId, request);
 
@@ -389,7 +389,7 @@ class UserServiceTest {
         // PATCH carries NO cityId (CLIENT city is optional) — only the locality validator runs;
         // the FK write path is skipped entirely.
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -433,7 +433,7 @@ class UserServiceTest {
 
         // cityId omitted (null); only a new street is supplied.
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, "вул. Нова", null, null, null);
+                null, null, "вул. Нова", null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -467,7 +467,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, null, null, null, null);
+                cityId, districtId, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -504,7 +504,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null, null);
+                cityId, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -536,7 +536,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, "вул. Хрещатик", null, null, null);
+                null, null, "вул. Хрещатик", null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -566,7 +566,7 @@ class UserServiceTest {
 
         // PATCH sends only cityId — street, buildingNo, locationNote all null.
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null, null);
+                cityId, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -586,7 +586,7 @@ class UserServiceTest {
 
         // PATCH sends cityId and street but omits buildingNo — null-guard must retain the pre-existing value.
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, "Lesi Ukrainky", null, null, null);
+                cityId, null, "Lesi Ukrainky", null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -602,7 +602,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Sal", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null, null);
 
         userService.updateProfile(userId, request);
 
@@ -620,7 +620,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("No", "Loc", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -643,7 +643,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null, null);
+                cityId, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -666,7 +666,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null, null);
+                cityId, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -687,7 +687,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Own", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null, null);
 
         userService.updateProfile(userId, request);
 
@@ -708,7 +708,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest("Adm", null, null,
-                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null);
+                UUID.randomUUID(), UUID.randomUUID(), "St", "1", "note", null, null);
 
         userService.updateProfile(userId, request);
 
@@ -732,7 +732,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         MasterProfileUpdateRequest request =
-                new MasterProfileUpdateRequest(null, null, "+380671112233", "bio text", "@instagram");
+                new MasterProfileUpdateRequest(null, null, "+380671112233", "bio text", "@instagram", null);
 
         MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
 
@@ -753,7 +753,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         assertThatThrownBy(() -> userService.updateMasterProfile(
-                userId, new MasterProfileUpdateRequest(null, null, "+380671112233", null, null)))
+                userId, new MasterProfileUpdateRequest(null, null, "+380671112233", null, null, null)))
                 .isInstanceOf(ForbiddenException.class);
 
         verify(userRepository, never()).save(any());
@@ -767,7 +767,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> userService.updateMasterProfile(
-                userId, new MasterProfileUpdateRequest(null, null, "+380671112233", null, null)))
+                userId, new MasterProfileUpdateRequest(null, null, "+380671112233", null, null, null)))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessage("User not found");
 
@@ -785,7 +785,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, "+380671111111", null, null));
+                new MasterProfileUpdateRequest(null, null, "+380671111111", null, null, null));
 
         assertThat(user.getBio()).isEqualTo("existing bio");
     }
@@ -801,7 +801,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, "+380671111111", null, null));
+                new MasterProfileUpdateRequest(null, null, "+380671111111", null, null, null));
 
         assertThat(user.getInstagram()).isEqualTo("@old_handle");
     }
@@ -818,7 +818,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, "+380679999999", null, null));
+                new MasterProfileUpdateRequest(null, null, "+380679999999", null, null, null));
 
         assertThat(user.getPhoneNumber()).isEqualTo("+380679999999");
         assertThat(user.getBio()).isEqualTo("original bio");
@@ -835,7 +835,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         MasterProfileUpdateRequest request =
-                new MasterProfileUpdateRequest("Нова", "Назва", null, null, null);
+                new MasterProfileUpdateRequest("Нова", "Назва", null, null, null, null);
 
         MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
 
@@ -855,7 +855,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, null, null, null));
+                new MasterProfileUpdateRequest(null, null, null, null, null, null));
 
         assertThat(user.getFirstName()).isEqualTo("Існуюче");
     }
@@ -870,7 +870,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest("   ", null, null, null, null));
+                new MasterProfileUpdateRequest("   ", null, null, null, null, null));
 
         assertThat(user.getFirstName()).isEqualTo("Існуюче");
     }
@@ -885,7 +885,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, null, null, null));
+                new MasterProfileUpdateRequest(null, null, null, null, null, null));
 
         assertThat(user.getLastName()).isEqualTo("Прізвище");
     }
@@ -900,7 +900,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, "   ", null, null, null));
+                new MasterProfileUpdateRequest(null, "   ", null, null, null, null));
 
         assertThat(user.getLastName()).isEqualTo("Прізвище");
     }
@@ -915,9 +915,87 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, null, null, null));
+                new MasterProfileUpdateRequest(null, null, null, null, null, null));
 
         assertThat(user.getPhoneNumber()).isEqualTo("+380670000000");
+    }
+
+    // ── updateMasterProfile — professionalTitle (V110) ────────────────────────
+
+    @Test
+    @DisplayName("updateMasterProfile (INDEPENDENT_MASTER) persists professionalTitle and echoes it in MasterPublicProfileResponse")
+    void should_persistProfessionalTitle_when_updateMasterProfileCalled() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-master@example.com", Role.INDEPENDENT_MASTER,
+                "Olena", "Koval", "+380630000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        MasterProfileUpdateRequest request =
+                new MasterProfileUpdateRequest(null, null, "+380671112233", null, null, "Візажист");
+
+        MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
+
+        assertThat(user.getProfessionalTitle())
+                .as("professionalTitle is persisted on the master profile write path")
+                .isEqualTo("Візажист");
+        assertThat(response.professionalTitle())
+                .as("MasterPublicProfileResponse echoes the persisted professionalTitle")
+                .isEqualTo("Візажист");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile (SALON_MASTER) persists professionalTitle for the salon-bound master role")
+    void should_persistProfessionalTitle_when_salonMasterUpdatesProfile() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-salonmaster@example.com", Role.SALON_MASTER,
+                "Sal", "Master", "+380630000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        MasterProfileUpdateRequest request =
+                new MasterProfileUpdateRequest(null, null, null, null, null, "Майстер манікюру");
+
+        MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
+
+        assertThat(user.getProfessionalTitle()).isEqualTo("Майстер манікюру");
+        assertThat(response.professionalTitle()).isEqualTo("Майстер манікюру");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile clears professionalTitle to null when a blank value is supplied")
+    void should_clearProfessionalTitle_when_blankSuppliedToUpdateMasterProfile() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-master-clear@example.com", Role.INDEPENDENT_MASTER,
+                "Olena", "Koval", "+380630000000");
+        user.setProfessionalTitle("Old title");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, null, null, null, null, "  "));
+
+        assertThat(user.getProfessionalTitle())
+                .as("a blank professionalTitle trims to null (clear-field contract)")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile does not overwrite professionalTitle when the field is null (partial-update semantics)")
+    void should_notOverwriteProfessionalTitle_when_nullInMasterProfilePatch() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-master-keep@example.com", Role.INDEPENDENT_MASTER,
+                "Olena", "Koval", "+380630000000");
+        user.setProfessionalTitle("Kept title");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, null, "+380670000000", null, null, null));
+
+        assertThat(user.getProfessionalTitle())
+                .as("a null professionalTitle in the patch leaves the stored title unchanged")
+                .isEqualTo("Kept title");
     }
 
     // ── updateProfile — Phase 19.6 instagram normalisation ────────────────────
@@ -935,7 +1013,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "beauty_studio");
+                null, null, null, null, null, "beauty_studio", null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
@@ -957,7 +1035,7 @@ class UserServiceTest {
 
         // Surrounding spaces + a single leading @ — normalizeInstagram strips both.
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "  @beauty.master  ");
+                null, null, null, null, null, "  @beauty.master  ", null);
 
         userService.updateProfile(userId, request);
 
@@ -976,7 +1054,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
@@ -996,7 +1074,7 @@ class UserServiceTest {
 
         // Blank (whitespace-only) is the mobile client's CLEAR signal — normalises to null.
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "   ");
+                null, null, null, null, null, "   ", null);
 
         userService.updateProfile(userId, request);
 
@@ -1017,7 +1095,7 @@ class UserServiceTest {
         // "@" alone → strip the @ → blank → null. This is the boundary between
         // "clear" and a one-char handle, and the V61 CHECK never sees an empty string.
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "@");
+                null, null, null, null, null, "@", null);
 
         userService.updateProfile(userId, request);
 
@@ -1035,13 +1113,135 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "https://www.instagram.com/beauty.studio/");
+                null, null, null, null, null, "https://www.instagram.com/beauty.studio/", null);
 
         userService.updateProfile(userId, request);
 
         assertThat(user.getInstagram())
                 .as("a full instagram.com URL has no leading @ — stored verbatim")
                 .isEqualTo("https://www.instagram.com/beauty.studio/");
+    }
+
+    // ── updateProfile — professionalTitle (V110) ──────────────────────────────
+    // The service mutates the real User entity in place; user.getProfessionalTitle()
+    // reflects exactly what was handed to setProfessionalTitle, and the returned
+    // UserProfileResponse echoes it via UserProfileResponse.from(user).
+
+    @Test
+    @DisplayName("updateProfile (INDEPENDENT_MASTER) persists professionalTitle and echoes it in the response")
+    void should_persistProfessionalTitle_when_nonClientRoleSuppliesIt() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-im@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, "Майстер манікюру");
+
+        UserProfileResponse response = userService.updateProfile(userId, request);
+
+        assertThat(user.getProfessionalTitle())
+                .as("a non-CLIENT role's professionalTitle is persisted verbatim")
+                .isEqualTo("Майстер манікюру");
+        assertThat(response.professionalTitle())
+                .as("the UserProfileResponse echoes the persisted professionalTitle")
+                .isEqualTo("Майстер манікюру");
+    }
+
+    @Test
+    @DisplayName("updateProfile (SALON_OWNER) persists professionalTitle — every role except CLIENT may set it")
+    void should_persistProfessionalTitle_when_salonOwnerSuppliesIt() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-owner@example.com", Role.SALON_OWNER, "Own", "Er", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, "Власниця салону");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getProfessionalTitle())
+                .as("SALON_OWNER is not a CLIENT, so the professionalTitle write is allowed")
+                .isEqualTo("Власниця салону");
+    }
+
+    @Test
+    @DisplayName("updateProfile trims surrounding whitespace from professionalTitle before persisting")
+    void should_trimProfessionalTitle_when_surroundingWhitespaceSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-trim@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, "  Візажист  ");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getProfessionalTitle())
+                .as("surrounding whitespace is stripped so the stored value is canonical")
+                .isEqualTo("Візажист");
+    }
+
+    @Test
+    @DisplayName("updateProfile clears professionalTitle to null when a blank value is supplied (clear-field contract)")
+    void should_clearProfessionalTitle_when_blankValueSupplied() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-clear@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
+        user.setProfessionalTitle("Old title");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        // Whitespace-only is the mobile client's CLEAR signal — trim → blank → null.
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, "   ");
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getProfessionalTitle())
+                .as("a blank professionalTitle trims to null and clears the stored column")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("updateProfile leaves an existing professionalTitle unchanged when the field is null in the patch (partial-update semantics)")
+    void should_notOverwriteProfessionalTitle_when_nullInPatch() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-keep@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
+        user.setProfessionalTitle("Kept title");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, null);
+
+        userService.updateProfile(userId, request);
+
+        assertThat(user.getProfessionalTitle())
+                .as("a null professionalTitle in the patch must leave the stored title untouched")
+                .isEqualTo("Kept title");
+    }
+
+    @Test
+    @DisplayName("updateProfile (CLIENT) rejects a supplied professionalTitle with BusinessException and does not mutate the entity")
+    void should_throwBusinessException_when_clientSuppliesProfessionalTitle() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "pt-client@example.com", Role.CLIENT, "Cli", "Ent", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var request = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, "Майстер манікюру");
+
+        assertThatThrownBy(() -> userService.updateProfile(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Clients cannot set a professional title");
+
+        assertThat(user.getProfessionalTitle())
+                .as("the rejected write must not leak a title onto the CLIENT entity")
+                .isNull();
+        verify(userRepository, never()).save(any());
     }
 
     // ── updateProfile — propagate from validator ──────────────────────────────
@@ -1055,7 +1255,7 @@ class UserServiceTest {
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
         var request = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null, null);
+                cityId, null, null, null, null, null, null);
         doThrow(new BusinessException("District is required for the selected city"))
                 .when(localityWriteValidator).validateProviderLocality(new LocalityWriteInput(cityId, null));
 

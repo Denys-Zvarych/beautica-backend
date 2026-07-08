@@ -156,7 +156,7 @@ class UserControllerIT extends AbstractIntegrationTest {
     void should_return401_when_noTokenOnPatch() {
         log.debug("Arrange: no Authorization header prepared");
         var request = new UpdateProfileRequest("Ivan", "Petrenko", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me without credentials — unauthenticated request must be rejected");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -178,7 +178,7 @@ class UserControllerIT extends AbstractIntegrationTest {
                 "patch@beautica.com", "Str0ngP@ss1!", "Stara", "Familiya", "+380671111111");
 
         var patchRequest = new UpdateProfileRequest("Nova", "Familiya", "+380672222222",
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
         log.debug("Act: PATCH /api/v1/users/me changing firstName='Nova', lastName, and phoneNumber");
@@ -209,7 +209,7 @@ class UserControllerIT extends AbstractIntegrationTest {
                 "nullpatch@beautica.com", "Str0ngP@ss1!", "Kept", "Name", "+380633333333");
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
         log.debug("Act: PATCH /api/v1/users/me with all-null fields — existing values must be preserved");
@@ -241,7 +241,7 @@ class UserControllerIT extends AbstractIntegrationTest {
                 "blank-fn@beautica.com", "Str0ngP@ss1!", "Valid", "Name", null);
 
         var patchRequest = new UpdateProfileRequest("", null, null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
         log.debug("Act: PATCH /api/v1/users/me with empty string firstName — must be rejected");
@@ -265,7 +265,7 @@ class UserControllerIT extends AbstractIntegrationTest {
 
         String tooLong = "A".repeat(101);
         var patchRequest = new UpdateProfileRequest(tooLong, null, null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
         log.debug("Act: PATCH /api/v1/users/me with 101-character firstName — must exceed max length and be rejected");
@@ -288,7 +288,7 @@ class UserControllerIT extends AbstractIntegrationTest {
                 "bad-phone@beautica.com", "Str0ngP@ss1!", "Valid", "Name", null);
 
         var patchRequest = new UpdateProfileRequest(null, null, "not-a-phone!@#",
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
         log.debug("Act: PATCH /api/v1/users/me with phoneNumber='not-a-phone!@#' — must fail validation");
@@ -315,7 +315,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         // @-prefixed handle: the service strips the @, and the V61 chk_users_instagram
         // CHECK must accept the normalized "beauty_studio" without raising a 23514 → 500.
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "@beauty_studio");
+                null, null, null, null, null, "@beauty_studio", null);
 
         log.debug("Act: PATCH /api/v1/users/me with instagram='@beauty_studio' — must persist normalized");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -342,14 +342,14 @@ class UserControllerIT extends AbstractIntegrationTest {
                 "ig-clear@beautica.com", "Str0ngP@ss1!", "Iga", "Han", "+380501234567");
 
         var setRequest = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "to_be_cleared");
+                null, null, null, null, null, "to_be_cleared", null);
         restTemplate.exchange("/api/v1/users/me", HttpMethod.PATCH,
                 new HttpEntity<>(setRequest, bearerHeaders(accessToken)), String.class);
 
         // Blank is the CLEAR signal — normalizeInstagram returns null so the column is
         // set to NULL (not "") and the V61 CHECK (NULL or valid handle) is satisfied.
         var clearRequest = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "");
+                null, null, null, null, null, "", null);
 
         log.debug("Act: PATCH /api/v1/users/me with a blank instagram — must clear the column to null");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -376,7 +376,7 @@ class UserControllerIT extends AbstractIntegrationTest {
                 "ig-bad@beautica.com", "Str0ngP@ss1!", "Iga", "Han", "+380501234567");
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "beauty studio");
+                null, null, null, null, null, "beauty studio", null);
 
         log.debug("Act: PATCH /api/v1/users/me with an illegal instagram value — must fail validation");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -386,6 +386,104 @@ class UserControllerIT extends AbstractIntegrationTest {
 
         assertThat(response.getStatusCode())
                 .as("an instagram with an illegal character must be rejected at the boundary as 400")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    // ── professionalTitle (V110) — persistence, read-back, CLIENT rejection ──
+
+    @Test
+    @DisplayName("PATCH /me (SALON_OWNER) — professionalTitle is persisted, read back on GET, and a null-field PATCH leaves it unchanged")
+    void should_persistAndReadBackProfessionalTitle_when_salonOwnerPatchesUsersMe() throws Exception {
+        log.debug("Arrange: seed + log in a SALON_OWNER (no personal-locality write path, so professionalTitle is the only mutation)");
+        String token = createUserWithRoleAndGetToken("pt-owner@beautica.com", "SALON_OWNER");
+
+        // 1) Set the professionalTitle and assert the PATCH response echoes it.
+        var setTitle = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, "Власниця салону");
+        log.debug("Act: PATCH /api/v1/users/me setting professionalTitle='Власниця салону'");
+        ResponseEntity<String> setResponse = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(setTitle, bearerHeaders(token)), String.class);
+
+        assertThat(setResponse.getStatusCode())
+                .as("a non-CLIENT role may set professionalTitle — must be a clean 200")
+                .isEqualTo(HttpStatus.OK);
+        var setBody = objectMapper.readValue(
+                setResponse.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(setBody.data().professionalTitle())
+                .as("the PATCH response echoes the persisted professionalTitle")
+                .isEqualTo("Власниця салону");
+
+        // 2) Read-back via a fresh GET proves the value reached the database (not just the echo).
+        log.debug("Act: GET /api/v1/users/me — the persisted professionalTitle must survive the round-trip");
+        ResponseEntity<String> getResponse = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(token)), String.class);
+        var getBody = objectMapper.readValue(
+                getResponse.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(getBody.data().professionalTitle())
+                .as("professionalTitle is persisted to Postgres and read back on GET /me")
+                .isEqualTo("Власниця салону");
+
+        // 3) Partial-update semantics: a PATCH that omits professionalTitle must NOT clear it.
+        var patchOtherField = new UpdateProfileRequest("Оновлена", null, null,
+                null, null, null, null, null, null, null);
+        log.debug("Act: PATCH /api/v1/users/me changing only firstName — professionalTitle (omitted, null) must be retained");
+        ResponseEntity<String> retainResponse = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchOtherField, bearerHeaders(token)), String.class);
+        var retainBody = objectMapper.readValue(
+                retainResponse.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(retainBody.data().professionalTitle())
+                .as("omitting professionalTitle (null) leaves the stored value unchanged — partial-update contract")
+                .isEqualTo("Власниця салону");
+        assertThat(retainBody.data().firstName())
+                .as("the firstName edit DID land alongside the retained title")
+                .isEqualTo("Оновлена");
+    }
+
+    @Test
+    @DisplayName("PATCH /me (CLIENT) — 400 when a professionalTitle is supplied (clients cannot set a professional title)")
+    void should_return400_when_clientSuppliesProfessionalTitle() throws Exception {
+        log.debug("Arrange: register a CLIENT and obtain an access token");
+        String accessToken = registerAndGetToken(
+                "pt-client@beautica.com", "Str0ngP@ss1!", "Kli", "Ent", "+380501234567");
+
+        var patchRequest = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, "Майстер манікюру");
+
+        log.debug("Act: PATCH /api/v1/users/me as CLIENT with a professionalTitle — must be rejected, not silently ignored");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(accessToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("a CLIENT supplying professionalTitle must get a 400 BusinessException, not a no-op save")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<Object>>() {});
+        assertThat(apiResponse.success())
+                .as("the error envelope reports success=false")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 400 when professionalTitle exceeds 100 characters (§A size cap, clean 400 not 500)")
+    void should_return400_when_professionalTitleExceeds100Characters() throws Exception {
+        log.debug("Arrange: seed + log in a SALON_OWNER");
+        String token = createUserWithRoleAndGetToken("pt-long@beautica.com", "SALON_OWNER");
+
+        String tooLongTitle = "Х".repeat(101);
+        var patchRequest = new UpdateProfileRequest(null, null, null,
+                null, null, null, null, null, null, tooLongTitle);
+
+        log.debug("Act: PATCH /api/v1/users/me with a 101-char professionalTitle — must be a clean 400");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(patchRequest, bearerHeaders(token)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("professionalTitle over the 100 @Size/@Column bound must be rejected at the boundary")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
@@ -420,7 +518,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         // required even when the city defines urban districts (most-specific-
         // node rule applies to providers, not to the client filter).
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                cityId, null, null, null, null, null);
+                cityId, null, null, null, null, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me with cityId={} as a discovery default", cityId);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -454,7 +552,7 @@ class UserControllerIT extends AbstractIntegrationTest {
 
         // First PATCH: persist the city (and a child district) — the saved discovery default.
         var setCity = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, null, null, null, null);
+                cityId, districtId, null, null, null, null, null);
         restTemplate.exchange("/api/v1/users/me", HttpMethod.PATCH,
                 new HttpEntity<>(setCity, bearerHeaders(accessToken)), String.class);
 
@@ -462,7 +560,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         // CLIENT city is optional. Pre-fix this wiped users.city_id; post-fix it must be retained.
         log.debug("Act: PATCH /api/v1/users/me with street only and cityId=null — must NOT wipe the saved city FK");
         var streetOnly = new UpdateProfileRequest(null, null, null,
-                null, null, "вул. Нова", null, null, null);
+                null, null, "вул. Нова", null, null, null, null);
         ResponseEntity<String> patchResponse = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.PATCH,
                 new HttpEntity<>(streetOnly, bearerHeaders(accessToken)), String.class);
@@ -504,7 +602,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         UUID districtId = anyDistrictOfCity(cityId);
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                cityId, districtId, null, null, null, null);
+                cityId, districtId, null, null, null, null, null);
         restTemplate.exchange("/api/v1/users/me", HttpMethod.PATCH,
                 new HttpEntity<>(patchRequest, bearerHeaders(accessToken)), String.class);
 
@@ -573,7 +671,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         String token = createIndependentMasterAndGetToken("im-nocity@beautica.com");
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                null, null, "Some St", "1", null, null);
+                null, null, "Some St", "1", null, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me with no city — provider save must be rejected");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -594,7 +692,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         UUID cityWithDistricts = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                cityWithDistricts, null, "Some St", "1", null, null);
+                cityWithDistricts, null, "Some St", "1", null, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me — city defines districts, district omitted → reject");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -616,7 +714,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         UUID alienDistrictId = UUID.randomUUID(); // not a child of the city
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                cityWithDistricts, alienDistrictId, "Some St", "1", null, null);
+                cityWithDistricts, alienDistrictId, "Some St", "1", null, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me — district is not a child of the supplied city → reject");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -637,7 +735,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         UUID districtlessCity = anyCityWithoutDistricts();
 
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                districtlessCity, null, "Lesi Ukrainky", "7", "Blue door", null);
+                districtlessCity, null, "Lesi Ukrainky", "7", "Blue door", null, null);
 
         log.debug("Act: PATCH /api/v1/users/me — districtless city is the leaf, null district is valid");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -672,7 +770,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         // may now write street/buildingNo/locationNote in addition to the
         // discovery fields city_id/district_id. All 5 fields must round-trip.
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                cityId, null, "Provider Street", "42", "Hidden entrance", null);
+                cityId, null, "Provider Street", "42", "Hidden entrance", null, null);
 
         log.debug("Act: PATCH /api/v1/users/me as CLIENT supplying all locality fields");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -706,7 +804,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
 
         var patchRequest = new UpdateProfileRequest("Sal", "Master", null,
-                cityId, null, "Some St", "1", "note", null);
+                cityId, null, "Some St", "1", "note", null, null);
 
         log.debug("Act: PATCH /api/v1/users/me as SALON_MASTER supplying locality — must be ignored, not persisted");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -737,7 +835,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         UUID cityId = cityIdByKatotth(CITY_WITH_DISTRICTS_KATOTTH);
 
         var patchRequest = new UpdateProfileRequest("Adm", "In", null,
-                cityId, null, "Admin St", "2", "note", null);
+                cityId, null, "Admin St", "2", "note", null, null);
 
         log.debug("Act: PATCH /api/v1/users/me as SALON_ADMIN supplying locality — must be ignored");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -767,7 +865,7 @@ class UserControllerIT extends AbstractIntegrationTest {
 
         String tooLongStreet = "S".repeat(256);
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                null, null, tooLongStreet, null, null, null);
+                null, null, tooLongStreet, null, null, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me with a 256-char street — must be a clean 400, not a 500");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -788,7 +886,7 @@ class UserControllerIT extends AbstractIntegrationTest {
 
         String tooLongBuildingNo = "9".repeat(51);
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                null, null, null, tooLongBuildingNo, null, null);
+                null, null, null, tooLongBuildingNo, null, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me with a 51-char buildingNo — must be a clean 400");
         ResponseEntity<String> response = restTemplate.exchange(
@@ -809,7 +907,7 @@ class UserControllerIT extends AbstractIntegrationTest {
 
         String tooLongNote = "N".repeat(1001);
         var patchRequest = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, tooLongNote, null);
+                null, null, null, null, tooLongNote, null, null);
 
         log.debug("Act: PATCH /api/v1/users/me with a 1001-char locationNote — must be a clean 400");
         ResponseEntity<String> response = restTemplate.exchange(
