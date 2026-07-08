@@ -123,7 +123,7 @@ class UserControllerTest {
                 null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
-                null, null,                   // bio, instagram
+                null, null, null,                   // bio, instagram
                 true, false, null
         );
         when(userService.getProfile(userId)).thenReturn(profile);
@@ -161,14 +161,14 @@ class UserControllerTest {
                 null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
-                null, null,                   // bio, instagram
+                null, null, null,                   // bio, instagram
                 true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
 
         var body = new UpdateProfileRequest("Oksana", "Kovalenko", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -188,7 +188,7 @@ class UserControllerTest {
         // 101 characters — violates @Size(max = 100)
         var tooLong = "A".repeat(101);
         var body = new UpdateProfileRequest(tooLong, "Doe", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -212,7 +212,7 @@ class UserControllerTest {
         // fires at the controller boundary.
         var locationNoteWithControlChar = "near the park  ";
         var body = new UpdateProfileRequest("Jane", "Doe", null,
-                null, null, null, null, locationNoteWithControlChar, null);
+                null, null, null, null, locationNoteWithControlChar, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -257,7 +257,7 @@ class UserControllerTest {
         // street is index 5: (firstName, lastName, phoneNumber, cityId, districtId, street, buildingNo, locationNote)
         var tooLongStreet = "A".repeat(256);
         var body = new UpdateProfileRequest("Jane", "Doe", null,
-                null, null, tooLongStreet, null, null, null);
+                null, null, tooLongStreet, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -302,7 +302,7 @@ class UserControllerTest {
     void should_return400WithFirstNameError_when_firstNameContainsDigit() throws Exception {
         var userId = UUID.randomUUID();
         var body = new UpdateProfileRequest("Oksana2", "Kovalenko", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -322,7 +322,7 @@ class UserControllerTest {
     void should_return400WithLastNameError_when_lastNameContainsDigit() throws Exception {
         var userId = UUID.randomUUID();
         var body = new UpdateProfileRequest("Oksana", "Kovalenko9", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -348,14 +348,14 @@ class UserControllerTest {
                 null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
-                null, null,                   // bio, instagram
+                null, null, null,                   // bio, instagram
                 true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
 
         var body = new UpdateProfileRequest("Анна-Марія", "О’Коннор", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -379,7 +379,7 @@ class UserControllerTest {
                 null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
-                null, null,                   // bio, instagram
+                null, null, null,                   // bio, instagram
                 true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
@@ -388,7 +388,7 @@ class UserControllerTest {
         // A null first/last name pair is a valid no-op for these fields — @NoDigits
         // (like @Size) must not fire on null, so the request reaches the service.
         var body = new UpdateProfileRequest(null, null, "+380671234567",
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -419,7 +419,7 @@ class UserControllerTest {
                 null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
-                null, "beauty_studio",        // bio, instagram (normalized — @ stripped by the service)
+                null, "beauty_studio", null,        // bio, instagram (normalized — @ stripped by the service)
                 true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
@@ -428,7 +428,7 @@ class UserControllerTest {
         // Client sends the @-prefixed form; the service strips the @ and the
         // response carries the canonical handle the slice asserts on.
         var body = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "@beauty_studio");
+                null, null, null, null, null, "@beauty_studio", null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -451,14 +451,14 @@ class UserControllerTest {
                 null,                         // oblastId
                 null, null, null,             // cityName, oblastName, districtName
                 null, null, null,             // street, buildingNo, locationNote
-                null, null,                   // instagram cleared by the service (blank → null)
+                null, null, null,                   // instagram cleared by the service (blank → null)
                 true, false, null
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
 
         var body = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "");
+                null, null, null, null, null, "", null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -479,7 +479,7 @@ class UserControllerTest {
         // A space is not in [A-Za-z0-9._]; the @Pattern handle arm rejects it and the
         // URL arm does not match either → clean 400 at the controller boundary.
         var body = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "@beauty studio");
+                null, null, null, null, null, "@beauty studio", null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -501,7 +501,7 @@ class UserControllerTest {
         // '<' is outside the handle char class [A-Za-z0-9._] and does not begin a valid
         // URL form either; the @Pattern rejects it at the controller boundary → clean 400.
         var body = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, "beauty<studio");
+                null, null, null, null, null, "beauty<studio", null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -524,7 +524,7 @@ class UserControllerTest {
         // intent but violates @Size(max=100); must be a clean 400, not a 500 (§A).
         var tooLong = "a".repeat(101);
         var body = new UpdateProfileRequest(null, null, null,
-                null, null, null, null, null, tooLong);
+                null, null, null, null, null, tooLong, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
@@ -563,7 +563,7 @@ class UserControllerTest {
     @DisplayName("PATCH /me with no JWT → 401")
     void should_return401_when_patchProfileWithoutJwt() throws Exception {
         var body = new UpdateProfileRequest("Jane", "Doe", null,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
 
         mockMvc.perform(patch("/api/v1/users/me")
                         .with(csrf())

@@ -138,7 +138,7 @@ class IndependentMasterProfileUpdateTest {
      * JSON fields under {@code $.data} must match the slim DTO shape.
      */
     private MasterPublicProfileResponse stubProfile(String phone, String bio, String instagram) {
-        return new MasterPublicProfileResponse(null, null, phone, bio, instagram);
+        return new MasterPublicProfileResponse(null, null, phone, bio, instagram, null);
     }
 
     /**
@@ -147,7 +147,7 @@ class IndependentMasterProfileUpdateTest {
      */
     private MasterPublicProfileResponse stubProfile(String firstName, String lastName,
             String phone, String bio, String instagram) {
-        return new MasterPublicProfileResponse(firstName, lastName, phone, bio, instagram);
+        return new MasterPublicProfileResponse(firstName, lastName, phone, bio, instagram, null);
     }
 
     // ── PATCH /me/profile — happy path ────────────────────────────────────────
@@ -286,7 +286,7 @@ class IndependentMasterProfileUpdateTest {
         var body = objectMapper.writeValueAsString(java.util.Map.of("bio", "Some bio text"));
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(new MasterPublicProfileResponse(null, null, "+380670000000", "Some bio text", null));
+                .thenReturn(new MasterPublicProfileResponse(null, null, "+380670000000", "Some bio text", null, null));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -718,7 +718,7 @@ class IndependentMasterProfileUpdateTest {
         var body = objectMapper.writeValueAsString(java.util.Map.of("bio", "Just a bio update"));
 
         when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
-                .thenReturn(new MasterPublicProfileResponse(null, null, "+380670000000", "Just a bio update", null));
+                .thenReturn(new MasterPublicProfileResponse(null, null, "+380670000000", "Just a bio update", null, null));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -750,5 +750,116 @@ class IndependentMasterProfileUpdateTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.bio").value(bio));
+    }
+
+    // ── professionalTitle (V110) — validation + echo ─────────────────────────
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 and professionalTitle echoed when a valid title is sent")
+    void should_return200AndEchoProfessionalTitle_when_validTitleSent() throws Exception {
+        var userId = UUID.randomUUID();
+        var title = "Майстер манікюру";
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("phoneNumber", "+380671234567");
+        body.put("professionalTitle", title);
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(new MasterPublicProfileResponse(null, null, "+380671234567", null, null, title));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.professionalTitle").value(title));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 when professionalTitle is exactly 100 characters (max boundary)")
+    void should_return200_when_professionalTitleIsExactly100Characters() throws Exception {
+        var userId = UUID.randomUUID();
+        String title = "Х".repeat(100);
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("phoneNumber", "+380671234567");
+        body.put("professionalTitle", title);
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(new MasterPublicProfileResponse(null, null, "+380671234567", null, null, title));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.professionalTitle").value(title));
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 when professionalTitle exceeds 100 characters (max boundary + 1)")
+    void should_return400_when_professionalTitleExceeds100Characters() throws Exception {
+        var userId = UUID.randomUUID();
+        // 101 chars — one over the @Size(max = 100) cap; must be a clean 400, not a 500.
+        String title = "Х".repeat(101);
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("phoneNumber", "+380671234567");
+        body.put("professionalTitle", title);
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 400 when professionalTitle contains a control character (§A @Pattern guard)")
+    void should_return400_when_professionalTitleContainsControlCharacter() throws Exception {
+        var userId = UUID.randomUUID();
+        // Embedded NUL byte — the ^[^\p{Cntrl}]*$ pattern must reject it at the boundary.
+        String title = "Майстер манікюру";
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("phoneNumber", "+380671234567");
+        body.put("professionalTitle", title);
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    @Test
+    @DisplayName("PATCH /me/profile — 200 when professionalTitle is empty string (clear-field contract)")
+    void should_return200_when_professionalTitleIsEmptyString() throws Exception {
+        var userId = UUID.randomUUID();
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("phoneNumber", "+380671234567");
+        body.put("professionalTitle", "");
+
+        when(userService.updateMasterProfile(eq(userId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(new MasterPublicProfileResponse(null, null, "+380671234567", null, null, null));
+
+        mockMvc.perform(patch(PATCH_PROFILE_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
     }
 }

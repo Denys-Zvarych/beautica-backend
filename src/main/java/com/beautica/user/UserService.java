@@ -1,6 +1,7 @@
 package com.beautica.user;
 
 import com.beautica.auth.Role;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
@@ -85,6 +86,19 @@ public class UserService {
             user.setInstagram(normalizeInstagram(request.instagram()));
         }
 
+        // Custom professional title: a provider-only headline (e.g. "Майстер манікюру").
+        // Every role EXCEPT CLIENT may set it. A CLIENT that supplies the field is
+        // rejected outright (400) rather than silently ignored, so the mobile client
+        // gets a clear signal instead of a no-op save. A null value leaves the stored
+        // title unchanged (PATCH semantics); a blank value clears it (trim → null).
+        if (request.professionalTitle() != null) {
+            if (user.getRole() == Role.CLIENT) {
+                throw new BusinessException("Clients cannot set a professional title");
+            }
+            String trimmed = request.professionalTitle().strip();
+            user.setProfessionalTitle(trimmed.isBlank() ? null : trimmed);
+        }
+
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
         // Mirror updateMasterProfile's narrow searchAffected gate: the search:masters projection
         // is fed by the master's DISPLAY NAME (firstName/lastName) and LOCALITY filter keys
@@ -128,6 +142,14 @@ public class UserService {
                 .orElseThrow(() -> new NotFoundException("User not found"));
 
         Role role = user.getRole();
+        // Load-bearing UNION backstop — do NOT delete as "redundant with @PreAuthorize".
+        // This single service method serves TWO single-role controllers:
+        // IndependentMasterController gates INDEPENDENT_MASTER, MasterController gates
+        // SALON_MASTER. Neither controller alone admits the other's role, so only the
+        // union {INDEPENDENT_MASTER, SALON_MASTER} may write here — and only the service,
+        // seeing both call sites, can enforce that union. It is the intentional
+        // defence-in-depth guard (§D / B14) that keeps CLIENT (and any future role wired
+        // to a third caller) out of this write path.
         if (role != Role.INDEPENDENT_MASTER && role != Role.SALON_MASTER) {
             throw new ForbiddenException("Profile update not permitted for role: " + role);
         }
@@ -154,6 +176,13 @@ public class UserService {
             // "clear" mean "remove". MasterProfileUpdateContractIT pins this end-to-end.
             user.setInstagram(request.instagram().isBlank() ? null : request.instagram());
         }
+        if (request.professionalTitle() != null) {
+            // Clear-field semantics: the mobile edit screen sends "" to remove a stored
+            // title. This path is already gated to INDEPENDENT_MASTER / SALON_MASTER, so
+            // no CLIENT can reach it — the role guard needed on /users/me is unnecessary here.
+            String trimmed = request.professionalTitle().strip();
+            user.setProfessionalTitle(trimmed.isBlank() ? null : trimmed);
+        }
 
         // Hibernate dirty-checking flushes the mutation on commit — no explicit save() needed.
         // firstName/lastName appear in search result display values — changing them makes cached
@@ -167,7 +196,8 @@ public class UserService {
                 user.getLastName(),
                 user.getPhoneNumber(),
                 user.getBio(),
-                user.getInstagram()
+                user.getInstagram(),
+                user.getProfessionalTitle()
         );
     }
 

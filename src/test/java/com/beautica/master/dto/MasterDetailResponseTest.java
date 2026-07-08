@@ -1,6 +1,8 @@
 package com.beautica.master.dto;
 
+import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -9,6 +11,8 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Pure unit coverage for {@link MasterDetailResponse#fromPublic(MasterDetailResponse)} —
@@ -24,12 +28,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("MasterDetailResponse.fromPublic — conditional address masking by MasterType")
 class MasterDetailResponseTest {
 
+    private static final String PROFESSIONAL_TITLE = "Майстер манікюру";
+
     private static MasterDetailResponse fullDetailFor(MasterType masterType, UUID cityUuid, UUID oblastUuid,
             UUID districtUuid) {
         return new MasterDetailResponse(
                 UUID.randomUUID(), "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door",
-                "Nail artist", "@oksana.nails", "https://cdn.beautica.test/a.png",
+                "Nail artist", "@oksana.nails", PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
                 new BigDecimal("4.75"), 12, masterType, null, List.of(),
                 cityUuid, oblastUuid, districtUuid);
     }
@@ -109,11 +115,55 @@ class MasterDetailResponseTest {
         assertThat(publicView.city()).isEqualTo(full.city());
         assertThat(publicView.bio()).isEqualTo(full.bio());
         assertThat(publicView.instagram()).isEqualTo(full.instagram());
+        assertThat(publicView.professionalTitle()).isEqualTo(full.professionalTitle());
         assertThat(publicView.avatarUrl()).isEqualTo(full.avatarUrl());
         assertThat(publicView.avgRating()).isEqualTo(full.avgRating());
         assertThat(publicView.reviewCount()).isEqualTo(full.reviewCount());
         assertThat(publicView.masterType()).isEqualTo(full.masterType());
         assertThat(publicView.salon()).isEqualTo(full.salon());
         assertThat(publicView.workingHours()).isEqualTo(full.workingHours());
+    }
+
+    // ── professionalTitle (V110) — public-facing headline, never masked ────────
+
+    @Test
+    @DisplayName("professionalTitle survives fromPublic() unmasked for INDEPENDENT_MASTER (public headline like bio/instagram)")
+    void should_keepProfessionalTitleUnmasked_when_masterTypeIsIndependentMaster() {
+        MasterDetailResponse full = fullDetailFor(MasterType.INDEPENDENT_MASTER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+        MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+        assertThat(publicView.professionalTitle())
+                .as("professionalTitle is a public-facing headline — it must survive fromPublic() unmasked")
+                .isEqualTo(PROFESSIONAL_TITLE);
+    }
+
+    @Test
+    @DisplayName("professionalTitle survives fromPublic() unmasked even for SALON_MASTER (headline, not address PII)")
+    void should_keepProfessionalTitleUnmasked_when_masterTypeIsSalonMaster() {
+        MasterDetailResponse full = fullDetailFor(MasterType.SALON_MASTER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+        MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+        assertThat(publicView.professionalTitle())
+                .as("professionalTitle is not address PII — it stays visible on the public salon-master card")
+                .isEqualTo(PROFESSIONAL_TITLE);
+    }
+
+    @Test
+    @DisplayName("MasterDetailResponse.from carries professionalTitle from the linked User")
+    void should_carryProfessionalTitle_when_builtFromMasterEntity() {
+        User user = mock(User.class);
+        when(user.getProfessionalTitle()).thenReturn("Візажист");
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(user);
+
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+
+        assertThat(response.professionalTitle())
+                .as("MasterDetailResponse.from reads professionalTitle off the linked User")
+                .isEqualTo("Візажист");
     }
 }

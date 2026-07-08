@@ -182,7 +182,7 @@ class IndependentMasterControllerTest {
                 null,         // buildingNo
                 null,         // locationNote
                 null,         // bio
-                null,         // instagram
+                null, null,         // instagram
                 true,         // isActive
                 true,         // emailVerified
                 null          // salonId

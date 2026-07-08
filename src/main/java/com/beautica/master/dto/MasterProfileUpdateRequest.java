@@ -93,6 +93,31 @@ public record MasterProfileUpdateRequest(
                 regexp = "^$|^@?[A-Za-z0-9._]{1,30}$|^https://(www\\.)?instagram\\.com/[A-Za-z0-9._]+/?$",
                 message = "Instagram must be a handle (e.g. @username) or a full instagram.com URL"
         )
-        String instagram
+        String instagram,
+
+        // Custom free-text professional headline/label (e.g. "Майстер манікюру").
+        // Optional clearable single-line field: the mobile edit screen sends "" to
+        // clear a previously stored title, and updateMasterProfile treats any non-null
+        // value (including "") as an overwrite (blank → null). The empty-string arm of
+        // ^[^\p{Cntrl}]*$ makes "" valid; the control-char guard still fires for any
+        // non-empty value. @Size(max = 100) mirrors User.professionalTitle's
+        // @Column(length = 100) / V110 VARCHAR(100) so an oversized payload yields a
+        // clean 400, not a 500 (§A). This endpoint is gated to INDEPENDENT_MASTER /
+        // SALON_MASTER, so no CLIENT can reach this write path.
+        //
+        // Because professionalTitle renders UNMASKED on PUBLIC master cards, the guard is
+        // stricter than the plain \p{Cntrl} used on firstName: it also rejects visual-spoofing
+        // invisibles that \p{Cntrl} misses — bidi override/isolate (U+202A–U+202E,
+        // U+2066–U+2069), zero-width & bidi marks (U+200B–U+200F, U+FEFF) and line/paragraph
+        // separators (U+2028, U+2029). Kept byte-for-byte identical to
+        // UpdateProfileRequest#professionalTitle so path A (/users/me) and path B
+        // (/independent-masters/me/profile) validate the public title identically. The
+        // empty-string arm still makes "" valid (clear-field intent → UserService null).
+        @Size(max = 100, message = "Professional title must not exceed 100 characters")
+        @Pattern(
+                regexp = "^[^\\p{Cntrl}\\u200B-\\u200F\\u2028\\u2029\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]*$",
+                message = "Professional title must not contain control, zero-width or bidirectional characters"
+        )
+        String professionalTitle
 
 ) {}

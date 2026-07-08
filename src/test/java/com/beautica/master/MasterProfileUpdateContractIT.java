@@ -179,6 +179,110 @@ class MasterProfileUpdateContractIT extends AbstractIntegrationTest {
                 .isEqualTo("Me");
     }
 
+    // ── professionalTitle (V110) — full-stack persistence + read-back from DB ──
+
+    @Test
+    @DisplayName("PATCH /me/profile — professionalTitle is PERSISTED to Postgres, retained on a null-field PATCH, and cleared by \"\"")
+    void should_persistProfessionalTitleToPostgres_when_masterPatchesProfile() throws Exception {
+        log.debug("Arrange: seed an INDEPENDENT_MASTER with no professional_title");
+        UUID userId = UUID.randomUUID();
+        seedIndependentMaster(userId, "pt-master@beautica.test",
+                "Olena", "Koval", null, null);
+        String token = login("pt-master@beautica.test");
+
+        // 1) Set professionalTitle and read the column back FROM THE DATABASE (not the echo).
+        var setBody = new LinkedHashMap<String, Object>();
+        setBody.put("phoneNumber", "+380671234567");
+        setBody.put("professionalTitle", "Візажист");
+
+        log.debug("Act: PATCH /me/profile setting professionalTitle='Візажист'");
+        ResponseEntity<String> setResponse = restTemplate.exchange(
+                PATCH_PROFILE_URL, HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(setBody), bearerHeaders(token)),
+                String.class);
+        assertThat(setResponse.getStatusCode())
+                .as("setting professionalTitle must be a clean 200, body=%s", setResponse.getBody())
+                .isEqualTo(HttpStatus.OK);
+
+        assertThat(professionalTitleInDb(userId))
+                .as("professionalTitle must be PERSISTED to Postgres — the crux the slice cannot observe")
+                .isEqualTo("Візажист");
+
+        // 2) A PATCH that omits professionalTitle must NOT clear it (partial-update semantics).
+        var bioOnly = new LinkedHashMap<String, Object>();
+        bioOnly.put("bio", "Updated bio");
+        log.debug("Act: PATCH /me/profile changing only bio — professionalTitle (omitted) must be retained in the DB");
+        restTemplate.exchange(PATCH_PROFILE_URL, HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(bioOnly), bearerHeaders(token)), String.class);
+        assertThat(professionalTitleInDb(userId))
+                .as("omitting professionalTitle leaves the stored value unchanged in Postgres")
+                .isEqualTo("Візажист");
+
+        // 3) An empty string clears the column to null (clear-field contract), verified in the DB.
+        var clearTitle = new LinkedHashMap<String, Object>();
+        clearTitle.put("professionalTitle", "");
+        log.debug("Act: PATCH /me/profile with professionalTitle=\"\" — must clear the column to null");
+        restTemplate.exchange(PATCH_PROFILE_URL, HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(clearTitle), bearerHeaders(token)), String.class);
+        assertThat(professionalTitleInDb(userId))
+                .as("a blank professionalTitle clears the stored column to null in Postgres")
+                .isNull();
+    }
+
+    /** Reads the persisted professional_title column straight from Postgres for the given user. */
+    private String professionalTitleInDb(UUID userId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT professional_title FROM users WHERE id = ?", String.class, userId);
+    }
+
+    // ── professionalTitle (V110) — FULL public READ chain end-to-end ───────────
+
+    @Test
+    @DisplayName("PATCH sets professionalTitle → GET /api/v1/masters/{id} returns it UNMASKED in the public JSON")
+    void should_exposeProfessionalTitleOnPublicMasterDetail_when_titleSetViaPatch() throws Exception {
+        log.debug("Arrange: seed an INDEPENDENT_MASTER user + its public masters row");
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        seedIndependentMaster(userId, "pt-public@beautica.test", "Olena", "Koval", null, null);
+        seedIndependentMasterRow(masterId, userId);
+        String token = login("pt-public@beautica.test");
+
+        // WRITE leg: set the title through the real PATCH chain (HTTP → validation → Postgres).
+        var setBody = new LinkedHashMap<String, Object>();
+        setBody.put("professionalTitle", "Візажист");
+        ResponseEntity<String> setResponse = restTemplate.exchange(
+                PATCH_PROFILE_URL, HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(setBody), bearerHeaders(token)),
+                String.class);
+        assertThat(setResponse.getStatusCode())
+                .as("setting professionalTitle must be a clean 200, body=%s", setResponse.getBody())
+                .isEqualTo(HttpStatus.OK);
+
+        log.debug("Act: GET /api/v1/masters/{} UNAUTHENTICATED — the public read chain", masterId);
+        ResponseEntity<String> getResponse = restTemplate.getForEntity(
+                "/api/v1/masters/" + masterId, String.class);
+
+        assertThat(getResponse.getStatusCode())
+                .as("public master detail must be reachable without auth, body=%s", getResponse.getBody())
+                .isEqualTo(HttpStatus.OK);
+
+        // CRUX: the field survives the entity → MasterDetailResponse.fromPublic → JSON serialization
+        // and reaches an unauthenticated caller unmasked — the piece unit + slice tests never proved.
+        String publicTitle = objectMapper.readTree(getResponse.getBody())
+                .path("data").path("professionalTitle").asText(null);
+        assertThat(publicTitle)
+                .as("professionalTitle must appear UNMASKED in the public GET /masters/{id} JSON")
+                .isEqualTo("Візажист");
+    }
+
+    /** Seeds the public {@code masters} row for an INDEPENDENT_MASTER, linked to the given user. */
+    private void seedIndependentMasterRow(UUID masterId, UUID userId) {
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, NOW(), NOW())",
+                masterId, userId);
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /**
