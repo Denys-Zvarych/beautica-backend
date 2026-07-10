@@ -46,13 +46,30 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
     // ── Phase 20.1–20.3 — per-service filter fixtures ────────────────────────
     // Two real, Flyway-seeded (V75/V81) platform service-type slugs with
-    // distinctive, collision-free Ukrainian display names. The hybrid match
-    // resolves a slug to (service_type_id, name_uk); the name branch wraps name_uk
-    // in %…% so a service_definition whose NAME contains it matches even when its
-    // service_type_id FK is NULL (the legacy-recovery branch).
+    // distinctive, collision-free Ukrainian display names. Matching is FK-only:
+    // a slug resolves to its service_type_id and a service_definition qualifies
+    // only when its service_type_id FK equals it. The former name-substring
+    // fallback was removed (it produced false positives — a type name_uk is a
+    // substring of unrelated service names); NULL-FK legacy rows are recovered by
+    // the deferred Phase 20.4 backfill, not by name.
     private static final String SLUG_A = "hair-treatment-keratin";   // name_uk "Кератин"
     private static final String NAME_UK_A = "Кератин";
     private static final String SLUG_B = "injection-mesotherapy";    // name_uk "Мезотерапія"
+
+    // ── Substring-name false-positive regression pair (V75 seed vocabulary) ──────
+    // The reported bug: the match predicate carried a substring fallback
+    // (service_type_id = :stId OR name ILIKE '%<searched type name_uk>%'). Because a
+    // service-type name_uk is a substring of another type's real service name, that
+    // fallback returned providers that do not offer the searched type (149 salons vs
+    // 26 correct — 123 false positives). "brows-correction" seeds name_uk "Корекція"
+    // (bound as '%Корекція%' on the old code); "beard-correction" seeds name_uk
+    // "Корекція бороди" — a real service literally named that CONTAINS "Корекція",
+    // so the old ILIKE branch matched it even though its FK is beard, not brows.
+    private static final String SLUG_SEARCH = "brows-correction";        // name_uk "Корекція"
+    private static final String NAME_UK_SEARCH = "Корекція";
+    private static final String SLUG_SUBSTRING_SIBLING = "beard-correction"; // name_uk "Корекція бороди"
+    private static final String NAME_SUBSTRING_SIBLING = "Корекція бороди";   // CONTAINS "Корекція"
+    private static final String NAME_TRUE_POSITIVE = "Корекція брів";         // genuine brows service
 
     @org.springframework.boot.test.web.server.LocalServerPort
     private int port;
@@ -1992,7 +2009,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(inKyiv.toString());
     }
 
-    // ── Phase 20.1 — master per-service filter (hybrid FK-or-name, AND) ──────
+    // ── Phase 20.1 — master per-service filter (FK-only, OR/union) ──────────
 
     @Test
     @DisplayName("GET /search/masters — FK-only match: a master whose service has service_type_id set (NAME does NOT contain the type name) is returned for that slug")
@@ -2017,10 +2034,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/masters — name-only match (legacy recovery): a master whose service has NULL service_type_id but a NAME matching name_uk is returned")
-    void should_returnMaster_when_serviceMatchesByNameOnly_withNullFk() throws Exception {
+    @DisplayName("GET /search/masters — FK-only: a master whose service has NULL service_type_id is NOT returned even when its NAME contains name_uk (substring fallback removed)")
+    void should_notReturnMaster_when_serviceMatchesByNameOnly_withNullFk() throws Exception {
         ensureHttpClient();
-        // FK is NULL (legacy / single-create row) — recovery is via the name branch.
+        // FK is NULL (legacy / single-create row). The former name-substring
+        // fallback is gone, so a name-only match no longer qualifies — such rows
+        // are recovered in prod by the deferred Phase 20.4 FK backfill, not by name.
         UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
         seedTypedServiceForMaster(nameMaster, NAME_UK_A + " преміум", "HAIRCUT",
                 new BigDecimal("300.00"), null, true, true);
@@ -2030,28 +2049,27 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("name branch recovers a NULL-FK row whose name contains the resolved name_uk")
-                .isEqualTo(1L);
-        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(nameMaster.toString());
+                .as("NULL-FK name-only row must NOT match under FK-only matching")
+                .isEqualTo(0L);
     }
 
     @Test
-    @DisplayName("GET /search/masters — both branches: one master matched via FK, another via NAME for the same slug — BOTH returned")
-    void should_returnBothMasters_when_oneMatchesByFk_andOneByName() throws Exception {
+    @DisplayName("GET /search/masters — FK-only: only the FK-tagged master is returned; a NULL-FK master whose NAME contains name_uk is excluded")
+    void should_returnOnlyFkMaster_when_otherMatchesByNameOnly() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID fkMaster = seedNamedIndependentMaster("Київ", "4.50", "Fk", "Master");
         seedTypedServiceForMaster(fkMaster, "Догляд за волоссям", "HAIRCUT",
-                new BigDecimal("300.00"), typeIdA, true, true);   // FK only (no name match)
+                new BigDecimal("300.00"), typeIdA, true, true);   // FK match
         UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
         seedTypedServiceForMaster(nameMaster, NAME_UK_A + " класичний", "HAIRCUT",
-                new BigDecimal("320.00"), null, true, true);      // name only (NULL FK)
+                new BigDecimal("320.00"), null, true, true);      // name only (NULL FK) — excluded
 
         JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
-        assertThat(data.path("totalElements").asLong()).isEqualTo(2L);
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
         assertThat(masterIds(data))
-                .as("the hybrid OR matches FK rows AND legacy name rows for the same slug")
-                .containsExactlyInAnyOrder(fkMaster.toString(), nameMaster.toString());
+                .as("FK-only matching returns the FK-tagged master and excludes the NULL-FK name-only row")
+                .containsExactly(fkMaster.toString());
     }
 
     @Test
@@ -2269,7 +2287,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     // ── Phase 20.2/20.3 — salon per-service filter ───────────────────────────
 
     @Test
-    @DisplayName("GET /search/salons — a salon whose active master offers a matching service (FK or name) is returned")
+    @DisplayName("GET /search/salons — FK-only: a salon whose active master offers a service tagged with the type FK is returned; a NULL-FK name-only match is excluded")
     void should_returnSalon_when_activeMasterOffersMatchingService() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
@@ -2278,7 +2296,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID masterFk = seedSalonMasterFor(salonFk, "Київ", "4.00");
         seedTypedSalonServiceForMaster(masterFk, salonFk, "Догляд за волоссям", "HAIRCUT",
                 new BigDecimal("300.00"), typeIdA, true, true);
-        // Salon matched via name only (NULL FK).
+        // Salon whose match would ONLY be by name (NULL FK) — excluded under FK-only.
         UUID salonName = seedActiveSalon("Київ", null);
         UUID masterName = seedSalonMasterFor(salonName, "Київ", "4.00");
         seedTypedSalonServiceForMaster(masterName, salonName, NAME_UK_A + " Lux", "HAIRCUT",
@@ -2291,9 +2309,101 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("salon filter matches via the master's service FK OR name; the control salon is excluded")
-                .isEqualTo(2L);
-        assertThat(salonIds(data)).containsExactlyInAnyOrder(salonFk.toString(), salonName.toString());
+                .as("salon filter matches via the master's service FK only; the name-only and control salons are excluded")
+                .isEqualTo(1L);
+        assertThat(salonIds(data)).containsExactly(salonFk.toString());
+    }
+
+    // ── Substring-name false-positive regression (the reported bug) ──────────────
+    // On the OLD substring-fallback code the per-slug predicate was
+    //   sd.service_type_id = :stId  OR  sd.name ILIKE :stName   (:stName = '%Корекція%')
+    // so a salon whose ONLY service was a beard-correction service literally named
+    // "Корекція бороди" (FK = beard-correction, NOT brows-correction) matched the
+    // '%Корекція%' branch and was wrongly returned for a brows-correction search.
+    // The fix made the predicate FK-only, so that salon is now correctly excluded.
+    // These two tests would FAIL on the old code (asserting ABSENT) and pass on fixed.
+
+    @Test
+    @DisplayName("GET /search/salons — false-positive regression: a salon whose only service is beard-correction ('Корекція бороди', FK≠brows) is EXCLUDED from a brows-correction search (name substring '%Корекція%' no longer leaks); the genuine brows-correction salon is returned with the correct matched line")
+    void should_excludeSubstringNameFalsePositiveSalon_when_filteringBySiblingCorrectionSlug() throws Exception {
+        ensureHttpClient();
+        UUID browsTypeId = serviceTypeIdBySlug(SLUG_SEARCH);            // "Корекція"
+        UUID beardTypeId = serviceTypeIdBySlug(SLUG_SUBSTRING_SIBLING); // "Корекція бороди"
+        // Sanity: the two slugs resolve to DIFFERENT service types (FK must diverge
+        // for the exclusion to be meaningful — otherwise there is no false positive).
+        assertThat(beardTypeId)
+                .as("brows-correction and beard-correction must be distinct seeded types")
+                .isNotEqualTo(browsTypeId);
+
+        // FALSE POSITIVE: only service is beard-correction, name literally contains
+        // the searched type's name_uk ("Корекція"). Old ILIKE '%Корекція%' matched it.
+        UUID falsePositive = seedActiveSalon("Київ", null);
+        UUID fpMaster = seedSalonMasterFor(falsePositive, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(fpMaster, falsePositive, NAME_SUBSTRING_SIBLING, "HAIRCUT",
+                new BigDecimal("300.00"), beardTypeId, true, true);
+
+        // TRUE POSITIVE (control): genuinely offers a brows-correction service via FK.
+        UUID truePositive = seedActiveSalon("Київ", null);
+        UUID tpMaster = seedSalonMasterFor(truePositive, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(tpMaster, truePositive, NAME_TRUE_POSITIVE, "HAIRCUT",
+                new BigDecimal("320.00"), browsTypeId, true, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_SEARCH + "&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("FK-only matching returns only the genuine brows salon; the beard-correction "
+                        + "salon whose name contains 'Корекція' is no longer a false positive")
+                .isEqualTo(1L);
+        assertThat(salonIds(data))
+                .as("the substring-name false-positive salon is EXCLUDED; the FK-true salon is returned")
+                .containsExactly(truePositive.toString());
+
+        // Matched-names lateral shares the same helper as the selection predicate, so
+        // it must agree: the true-positive salon's line reflects its brows service, and
+        // the excluded salon (and its 'Корекція бороди' name) never appears.
+        java.util.List<String> matchedNames = new java.util.ArrayList<>();
+        data.path("data").get(0).path("matchedServiceNames").forEach(n -> matchedNames.add(n.asText()));
+        assertThat(matchedNames)
+                .as("matched line reflects the FK-matched brows service, never the excluded beard one")
+                .containsExactly(NAME_TRUE_POSITIVE)
+                .doesNotContain(NAME_SUBSTRING_SIBLING);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — false-positive regression (master analog): a master whose only service is beard-correction ('Корекція бороди', FK≠brows) is EXCLUDED from a brows-correction search; the genuine brows-correction master is returned (master search shares the FK-only helper)")
+    void should_excludeSubstringNameFalsePositiveMaster_when_filteringBySiblingCorrectionSlug() throws Exception {
+        ensureHttpClient();
+        UUID browsTypeId = serviceTypeIdBySlug(SLUG_SEARCH);            // "Корекція"
+        UUID beardTypeId = serviceTypeIdBySlug(SLUG_SUBSTRING_SIBLING); // "Корекція бороди"
+        assertThat(beardTypeId)
+                .as("brows-correction and beard-correction must be distinct seeded types")
+                .isNotEqualTo(browsTypeId);
+
+        // FALSE POSITIVE: only service is beard-correction, name contains "Корекція".
+        UUID falsePositive = seedNamedIndependentMaster("Київ", "4.50", "Beard", "Master");
+        seedTypedServiceForMaster(falsePositive, NAME_SUBSTRING_SIBLING, "HAIRCUT",
+                new BigDecimal("300.00"), beardTypeId, true, true);
+        // TRUE POSITIVE (control): genuinely offers brows-correction via FK.
+        UUID truePositive = seedNamedIndependentMaster("Київ", "4.50", "Brows", "Master");
+        seedTypedServiceForMaster(truePositive, NAME_TRUE_POSITIVE, "HAIRCUT",
+                new BigDecimal("320.00"), browsTypeId, true, true);
+
+        JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_SEARCH + "&page=0&size=20");
+
+        assertThat(data.path("totalElements").asLong())
+                .as("FK-only matching returns only the genuine brows master; the beard-correction "
+                        + "master whose name contains 'Корекція' is no longer a false positive")
+                .isEqualTo(1L);
+        assertThat(masterIds(data))
+                .as("the substring-name false-positive master is EXCLUDED; the FK-true master is returned")
+                .containsExactly(truePositive.toString());
+
+        java.util.List<String> matchedNames = new java.util.ArrayList<>();
+        data.path("data").get(0).path("matchedServiceNames").forEach(n -> matchedNames.add(n.asText()));
+        assertThat(matchedNames)
+                .as("matched line reflects the FK-matched brows service, never the excluded beard one")
+                .containsExactly(NAME_TRUE_POSITIVE)
+                .doesNotContain(NAME_SUBSTRING_SIBLING);
     }
 
     @Test
@@ -2745,7 +2855,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     /**
      * Seeds an active (or inactive) INDEPENDENT_MASTER-owned service definition
      * with a controllable {@code service_type_id} (nullable — pass {@code null}
-     * for the legacy/name-only path) plus a {@code master_services} link, then
+     * for the legacy NULL-FK path, which no longer matches a service-type slug)
+     * plus a {@code master_services} link, then
      * refreshes {@code masters.min_effective_price} so per-service + price
      * composition tests see the pre-computed column.
      */
