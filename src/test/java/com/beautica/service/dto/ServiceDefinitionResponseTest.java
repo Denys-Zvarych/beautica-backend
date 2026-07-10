@@ -55,6 +55,9 @@ class ServiceDefinitionResponseTest {
         assertThat(response.serviceTypeNameUk())
                 .as("serviceTypeNameUk must be null when no ServiceType is linked")
                 .isNull();
+        assertThat(response.serviceTypeSlug())
+                .as("serviceTypeSlug must be null when no ServiceType is linked")
+                .isNull();
         assertThat(response.photoUrl())
                 .as("photoUrl must be null when no photo has been set")
                 .isNull();
@@ -153,13 +156,14 @@ class ServiceDefinitionResponseTest {
     }
 
     @Test
-    @DisplayName("service type id and name are mapped when a ServiceType is linked to the definition")
+    @DisplayName("service type id, name and slug are mapped when a ServiceType is linked to the definition")
     void should_mapServiceTypeFields_when_serviceTypeIsSet() {
         UUID serviceTypeId = UUID.randomUUID();
 
         ServiceType serviceType = mock(ServiceType.class);
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Манікюр");
+        when(serviceType.getSlug()).thenReturn("manicure");
 
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -175,10 +179,13 @@ class ServiceDefinitionResponseTest {
 
         assertThat(response.serviceTypeId()).isEqualTo(serviceTypeId);
         assertThat(response.serviceTypeNameUk()).isEqualTo("Манікюр");
+        assertThat(response.serviceTypeSlug())
+                .as("serviceTypeSlug must map the linked ServiceType.slug (matches the client's CategoryServiceOption.key)")
+                .isEqualTo("manicure");
     }
 
     @Test
-    @DisplayName("service type id and name are null when no ServiceType is linked to the definition")
+    @DisplayName("service type id, name and slug are null when no ServiceType is linked to the definition")
     void should_returnNullServiceTypeFields_when_serviceTypeIsNull() {
         ServiceDefinition sd = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -193,5 +200,8 @@ class ServiceDefinitionResponseTest {
 
         assertThat(response.serviceTypeId()).isNull();
         assertThat(response.serviceTypeNameUk()).isNull();
+        assertThat(response.serviceTypeSlug())
+                .as("serviceTypeSlug must be null on the nullable-link case (no service type chosen)")
+                .isNull();
     }
 }

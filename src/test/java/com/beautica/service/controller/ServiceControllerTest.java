@@ -13,6 +13,8 @@ import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -92,6 +94,7 @@ class ServiceControllerTest {
                     .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                     .authorizeHttpRequests(auth -> auth
                             .requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll()
+                            .requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services").permitAll()
                             .anyRequest().authenticated())
                     .exceptionHandling(ex -> ex
                             .authenticationEntryPoint((req, res, exc) ->
@@ -128,7 +131,7 @@ class ServiceControllerTest {
     }
 
     private ServiceDefinitionResponse stubServiceDefResponse(UUID id, String name) {
-        return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null,
+        return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null, null,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
     }
 
@@ -137,7 +140,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
-                null, null);
+                null, null, null);
     }
 
     /** Phase 16.4: variant carrying the lifted serviceTypeId + serviceTypeNameUk so the JSON shape can be asserted. */
@@ -145,12 +148,36 @@ class ServiceControllerTest {
             UUID id, UUID masterId, String name, UUID serviceTypeId, String serviceTypeNameUk) {
         var sdResponse = new ServiceDefinitionResponse(
                 UUID.randomUUID(), name, null, null, 60, 10, true,
-                serviceTypeId, serviceTypeNameUk, null,
+                serviceTypeId, serviceTypeNameUk, null, null,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
-                serviceTypeId, serviceTypeNameUk);
+                serviceTypeId, serviceTypeNameUk, null);
+    }
+
+    /**
+     * Variant carrying the lifted serviceTypeSlug on BOTH the top-level MasterServiceResponse
+     * and its nested ServiceDefinitionResponse, so the read-path JSON shape can be asserted end-to-end.
+     */
+    private MasterServiceResponse stubMasterServiceResponseWithSlug(
+            UUID id, UUID masterId, String name, UUID serviceTypeId, String serviceTypeNameUk, String serviceTypeSlug) {
+        var sdResponse = new ServiceDefinitionResponse(
+                UUID.randomUUID(), name, null, null, 60, 10, true,
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+        return new MasterServiceResponse(id, masterId, sdResponse,
+                null, null, new BigDecimal("350.00"), 60, true,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug);
+    }
+
+    /** Leaf ServiceDefinitionResponse carrying a serviceTypeSlug, for the salon-catalogue read path. */
+    private ServiceDefinitionResponse stubServiceDefResponseWithSlug(
+            UUID id, String name, UUID serviceTypeId, String serviceTypeNameUk, String serviceTypeSlug) {
+        return new ServiceDefinitionResponse(id, name, null, "MANICURE", 60, 10, true,
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
     }
 
     // ── POST /api/v1/salons/{salonId}/services ─────────────────────────────────
@@ -332,6 +359,63 @@ class ServiceControllerTest {
         mockMvc.perform(get("/api/v1/masters/" + unknownMasterId + "/services")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 read-path JSON carries serviceTypeSlug on the row and the nested definition when a type is linked")
+    void should_emitServiceTypeSlug_when_masterServicesReadPathHasType() throws Exception {
+        UUID masterId = UUID.randomUUID();
+        UUID rowId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        var stub = List.of(stubMasterServiceResponseWithSlug(
+                rowId, masterId, "Manicure", serviceTypeId, "Манікюр", "manicure"));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(stub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services — read-path JSON must expose serviceTypeSlug (populated)", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].serviceTypeSlug").value("manicure"))
+                .andExpect(jsonPath("$.data[0].serviceDefinition.serviceTypeSlug").value("manicure"));
+    }
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 read-path JSON has null serviceTypeSlug when no type is linked (nullable-link case)")
+    void should_emitNullServiceTypeSlug_when_masterServicesReadPathHasNoType() throws Exception {
+        UUID masterId = UUID.randomUUID();
+        // stubMasterServiceResponse leaves all serviceType fields null — the picker was not used.
+        var stub = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Gel Nails"));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(stub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services — read-path JSON serviceTypeSlug must be null", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].serviceTypeSlug").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data[0].serviceDefinition.serviceTypeSlug").value(org.hamcrest.Matchers.nullValue()));
+    }
+
+    // ── GET /api/v1/salons/{salonId}/services — public salon catalogue ─────────
+
+    @Test
+    @DisplayName("GET /salons/{id}/services — 200 salon-catalogue leaf JSON carries serviceTypeSlug when a type is linked")
+    void should_emitServiceTypeSlug_when_salonCatalogueLeafHasType() throws Exception {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        var leaf = stubServiceDefResponseWithSlug(
+                UUID.randomUUID(), "Manicure", serviceTypeId, "Манікюр", "manicure");
+        var catalogue = new SalonServiceCatalogResponse(List.of(
+                new SalonServiceCategoryGroup("MANICURE", "Манікюр", 1, List.of(leaf))));
+        when(serviceCatalogService.getSalonServiceCatalog(salonId)).thenReturn(catalogue);
+
+        log.debug("Act: GET /api/v1/salons/{}/services — salon-catalogue leaf JSON must expose serviceTypeSlug", salonId);
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/services")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.categories[0].services[0].serviceTypeSlug").value("manicure"));
     }
 
     // ── POST /api/v1/independent-masters/me/services ───────────────────────────
@@ -658,7 +742,7 @@ class ServiceControllerTest {
         // Stub: service layer returns a RANGE ServiceDefinitionResponse
         var rangeStub = new ServiceDefinitionResponse(
                 serviceId, "Range Manicure", null, "MANICURE", 60, 0, true,
-                null, null, null,
+                null, null, null, null,
                 PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"),
                 "від 500 до 800 грн");
 
@@ -1106,7 +1190,7 @@ class ServiceControllerTest {
         var serviceDefId = UUID.randomUUID();
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
         var stub = new ServiceDefinitionResponse(
-                serviceDefId, "Manicure", null, null, 60, 10, true, null, null, photoUrl,
+                serviceDefId, "Manicure", null, null, 60, 10, true, null, null, null, photoUrl,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);

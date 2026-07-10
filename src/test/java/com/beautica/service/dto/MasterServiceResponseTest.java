@@ -190,7 +190,7 @@ class MasterServiceResponseTest {
     // ── Phase 16.4: serviceTypeId + serviceTypeNameUk lifted from the nested definition ──
 
     @Test
-    @DisplayName("serviceTypeId + serviceTypeNameUk are lifted from the nested ServiceDefinition's ServiceType")
+    @DisplayName("serviceTypeId + serviceTypeNameUk + serviceTypeSlug are lifted from the nested ServiceDefinition's ServiceType")
     void should_mapServiceTypeFields_when_serviceDefinitionHasServiceType() {
         UUID serviceTypeId = UUID.randomUUID();
         var serviceType = ServiceType.builder()
@@ -209,10 +209,16 @@ class MasterServiceResponseTest {
         assertThat(response.serviceTypeNameUk())
                 .as("serviceTypeNameUk must be the chosen type's Ukrainian display name")
                 .isEqualTo("Манікюр");
+        assertThat(response.serviceTypeSlug())
+                .as("serviceTypeSlug must be lifted from the nested ServiceDefinition's ServiceType.slug")
+                .isEqualTo("manicure");
+        assertThat(response.serviceDefinition().serviceTypeSlug())
+                .as("the nested ServiceDefinitionResponse must also carry the slug it was lifted from")
+                .isEqualTo("manicure");
     }
 
     @Test
-    @DisplayName("serviceTypeId + serviceTypeNameUk are both null when the ServiceDefinition has no ServiceType")
+    @DisplayName("serviceTypeId + serviceTypeNameUk + serviceTypeSlug are all null when the ServiceDefinition has no ServiceType")
     void should_mapNullServiceTypeFields_when_serviceDefinitionHasNoServiceType() {
         var response = MasterServiceResponse.from(buildAssignmentWithType(null));
 
@@ -221,6 +227,12 @@ class MasterServiceResponseTest {
                 .isNull();
         assertThat(response.serviceTypeNameUk())
                 .as("serviceTypeNameUk must be null when no service type was chosen")
+                .isNull();
+        assertThat(response.serviceTypeSlug())
+                .as("serviceTypeSlug must be null when no service type was chosen (nullable-link case)")
+                .isNull();
+        assertThat(response.serviceDefinition().serviceTypeSlug())
+                .as("the nested ServiceDefinitionResponse slug must also be null")
                 .isNull();
     }
 

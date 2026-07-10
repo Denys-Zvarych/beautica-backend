@@ -34,6 +34,10 @@ public record ServiceDefinitionResponse(
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Ukrainian display name of the chosen service type; null when none was selected.")
         String serviceTypeNameUk,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Stable slug of the chosen platform service type (matches "
+                        + "CategoryServiceOption.key on the client); null when none was selected.")
+        String serviceTypeSlug,
         String photoUrl,
         PriceType priceType,
         BigDecimal priceMin,
@@ -56,6 +60,7 @@ public record ServiceDefinitionResponse(
                 sd.isActive(),
                 sd.getServiceType() != null ? sd.getServiceType().getId() : null,
                 sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null,
+                sd.getServiceType() != null ? sd.getServiceType().getSlug() : null,
                 sd.getPhotoUrl(),
                 sd.getPriceType(),
                 sd.getBasePrice(),
