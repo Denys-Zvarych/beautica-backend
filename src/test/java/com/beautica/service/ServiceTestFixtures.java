@@ -124,9 +124,28 @@ class ServiceTestFixtures {
     }
 
     UUID createServiceDefinition(String ownerToken, UUID salonId, String name) throws Exception {
+        UUID serviceTypeId = resolveServiceTypeIdForCategory("NAIL_SERVICE");
         return createServiceDefinition(ownerToken, salonId,
                 new CreateServiceDefinitionRequest(name, null, "NAIL_SERVICE", 60, 0,
-                        PriceType.FIXED, new BigDecimal("500.00"), null, null, null));
+                        PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId));
+    }
+
+    /**
+     * Resolves a real, selectable {@code service_types.id} whose {@code platform_category_name}
+     * equals {@code category} and whose parent platform category is APPROVED + active. Since
+     * Phase 16.x / V111, {@code service_type_id} is MANDATORY on every create path and must
+     * belong to the request's category (Phase 16.3 cross-field guard). Fixtures resolve the
+     * FK here so the create request satisfies both the {@code @NotNull} DTO constraint and the
+     * category-consistency check with a genuinely seeded type — never a fabricated UUID.
+     */
+    UUID resolveServiceTypeIdForCategory(String category) {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.platform_category_name = ? AND st.is_active = TRUE "
+                        + "AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class, category);
     }
 
     String createIndependentMasterAndGetToken(String email) throws Exception {
@@ -144,8 +163,9 @@ class ServiceTestFixtures {
     }
 
     UUID createIndependentMasterService(String indepToken, String name) throws Exception {
+        UUID serviceTypeId = resolveServiceTypeIdForCategory("NAIL_SERVICE");
         var request = new CreateServiceDefinitionRequest(name, null, "NAIL_SERVICE", 60, 0,
-                PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/independent-masters/me/services", HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(indepToken)),

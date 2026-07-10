@@ -3,9 +3,11 @@ package com.beautica.service.repository;
 import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
 import com.beautica.salon.entity.Salon;
+import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.entity.ServiceType;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -28,6 +30,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
     private TestEntityManager em;
 
     private UUID salonOwnerId;
+    private ServiceType defaultServiceType;
 
     @BeforeEach
     void setUp() {
@@ -48,9 +51,33 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .build();
         em.persist(salon);
 
+        // service_type_id is mandatory (NOT NULL). Persist one shared ServiceType and
+        // attach it to every fixture ServiceDefinition via the builder.
+        defaultServiceType = persistServiceType();
+
         em.flush();
 
         salonOwnerId = salon.getId();
+    }
+
+    /** Persists a CatalogCategory + ServiceType so fixture ServiceDefinitions satisfy the NOT NULL service_type_id FK. */
+    private ServiceType persistServiceType() {
+        CatalogCategory category = CatalogCategory.builder()
+                .nameUk("Нігті")
+                .nameEn("Nails")
+                .sortOrder(999)
+                .build();
+        em.persist(category);
+
+        ServiceType serviceType = ServiceType.builder()
+                .category(category)
+                .nameUk("Манікюр")
+                .nameEn("Manicure")
+                .slug("type-" + UUID.randomUUID())
+                .platformCategoryName("NAIL_SERVICE")
+                .build();
+        em.persist(serviceType);
+        return serviceType;
     }
 
     @Test
@@ -64,6 +91,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("550.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(activeService);
@@ -76,6 +104,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(75)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("400.00"))
+                .serviceType(defaultServiceType)
                 .isActive(false)
                 .build();
         em.persist(inactiveService);
@@ -100,6 +129,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(30)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("200.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(salonService);
@@ -123,6 +153,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("550.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(salonService);
@@ -135,6 +166,7 @@ class ServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(120)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("900.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(independentMasterService);

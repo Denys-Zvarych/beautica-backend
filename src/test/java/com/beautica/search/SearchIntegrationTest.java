@@ -1252,9 +1252,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'SALON', ?, ?, ?, 60, ?, 'FIXED', 0, true, NOW(), NOW())",
-                serviceDefId, salonId, serviceName, category, basePrice);
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, 'FIXED', 0, true, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, category, unrelatedServiceTypeId(), basePrice);
 
         UUID msId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -1322,10 +1322,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'SALON', ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
                 serviceDefId, salonId, "Priced Service " + serviceDefId, category,
-                basePrice, priceType, priceMax, defActive);
+                unrelatedServiceTypeId(), basePrice, priceType, priceMax, defActive);
 
         UUID msId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -2034,12 +2034,14 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/masters — FK-only: a master whose service has NULL service_type_id is NOT returned even when its NAME contains name_uk (substring fallback removed)")
+    @DisplayName("GET /search/masters — FK-only: a master whose service carries an UNRELATED service_type_id is NOT returned even when its NAME contains name_uk (substring fallback removed)")
     void should_notReturnMaster_when_serviceMatchesByNameOnly_withNullFk() throws Exception {
         ensureHttpClient();
-        // FK is NULL (legacy / single-create row). The former name-substring
-        // fallback is gone, so a name-only match no longer qualifies — such rows
-        // are recovered in prod by the deferred Phase 20.4 FK backfill, not by name.
+        // The service carries an unrelated service_type_id (differs from SLUG_A).
+        // The former name-substring fallback is gone, so a name-only match no
+        // longer qualifies — only a matching FK does. (Under the pre-V111 schema
+        // this row carried a NULL FK; a null argument now resolves to an
+        // unrelated seeded type, preserving the FK-only NON-match intent.)
         UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
         seedTypedServiceForMaster(nameMaster, NAME_UK_A + " преміум", "HAIRCUT",
                 new BigDecimal("300.00"), null, true, true);
@@ -2049,12 +2051,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("NULL-FK name-only row must NOT match under FK-only matching")
+                .as("unrelated-FK name-only row must NOT match under FK-only matching")
                 .isEqualTo(0L);
     }
 
     @Test
-    @DisplayName("GET /search/masters — FK-only: only the FK-tagged master is returned; a NULL-FK master whose NAME contains name_uk is excluded")
+    @DisplayName("GET /search/masters — FK-only: only the FK-tagged master is returned; an unrelated-FK master whose NAME contains name_uk is excluded")
     void should_returnOnlyFkMaster_when_otherMatchesByNameOnly() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
@@ -2063,12 +2065,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 new BigDecimal("300.00"), typeIdA, true, true);   // FK match
         UUID nameMaster = seedNamedIndependentMaster("Київ", "4.50", "Name", "Master");
         seedTypedServiceForMaster(nameMaster, NAME_UK_A + " класичний", "HAIRCUT",
-                new BigDecimal("320.00"), null, true, true);      // name only (NULL FK) — excluded
+                new BigDecimal("320.00"), null, true, true);      // name only (unrelated FK) — excluded
 
         JsonNode data = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
         assertThat(masterIds(data))
-                .as("FK-only matching returns the FK-tagged master and excludes the NULL-FK name-only row")
+                .as("FK-only matching returns the FK-tagged master and excludes the unrelated-FK name-only row")
                 .containsExactly(fkMaster.toString());
     }
 
@@ -2210,7 +2212,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID m3 = seedNamedIndependentMaster("Київ", "4.50", "Too", "Cheap");
         seedTypedServiceForMaster(m3, "Догляд дешевий", "HAIRCUT",
                 new BigDecimal("50.00"), typeIdA, true, true);
-        // m4 — right category + price, NO slug match (NULL FK, neutral name).
+        // m4 — right category + price, NO slug match (unrelated FK, neutral name).
         UUID m4 = seedNamedIndependentMaster("Київ", "4.50", "No", "Slug");
         seedTypedServiceForMaster(m4, "Стрижка проста", "HAIRCUT",
                 new BigDecimal("300.00"), null, true, true);
@@ -2287,7 +2289,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     // ── Phase 20.2/20.3 — salon per-service filter ───────────────────────────
 
     @Test
-    @DisplayName("GET /search/salons — FK-only: a salon whose active master offers a service tagged with the type FK is returned; a NULL-FK name-only match is excluded")
+    @DisplayName("GET /search/salons — FK-only: a salon whose active master offers a service tagged with the type FK is returned; an unrelated-FK name-only match is excluded")
     void should_returnSalon_when_activeMasterOffersMatchingService() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
@@ -2296,7 +2298,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID masterFk = seedSalonMasterFor(salonFk, "Київ", "4.00");
         seedTypedSalonServiceForMaster(masterFk, salonFk, "Догляд за волоссям", "HAIRCUT",
                 new BigDecimal("300.00"), typeIdA, true, true);
-        // Salon whose match would ONLY be by name (NULL FK) — excluded under FK-only.
+        // Salon whose match would ONLY be by name (unrelated FK) — excluded under FK-only.
         UUID salonName = seedActiveSalon("Київ", null);
         UUID masterName = seedSalonMasterFor(salonName, "Київ", "4.00");
         seedTypedSalonServiceForMaster(masterName, salonName, NAME_UK_A + " Lux", "HAIRCUT",
@@ -2764,8 +2766,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID salonWithType = seedActiveSalon("Київ", null);
         seedSalonOwnedServiceNoMaster(salonWithType, "Кератинове відновлення", "HAIRCUT",
                 "FIXED", new BigDecimal("800.00"), null, typeIdA, true);
-        // A second salon whose owned def is type-less (legacy NULL service_type_id)
-        // and NO master link → must NOT surface under the typed slug filter.
+        // A second salon whose owned def carries an unrelated service_type_id (the
+        // pre-V111 "type-less / legacy NULL" case; a null argument now resolves to
+        // an unrelated seeded type) and NO master link → must NOT surface under the
+        // SLUG_A slug filter.
         UUID salonNoType = seedActiveSalon("Київ", null);
         seedSalonOwnedServiceNoMaster(salonNoType, "Звичайна стрижка", "HAIRCUT",
                 "FIXED", new BigDecimal("300.00"), null, null, true);
@@ -2800,18 +2804,21 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * <p>Honours the V67 {@code chk_service_def_price_mode} CHECK: FIXED →
      * {@code price_max} NULL; RANGE → {@code price_max} >= {@code base_price}.</p>
      *
-     * @param serviceTypeId optional platform service-type FK (nullable for the
-     *                      category-only / legacy path)
+     * @param serviceTypeId platform service-type FK. A {@code null} is substituted
+     *                      with an {@link #unrelatedServiceTypeId() unrelated seeded
+     *                      type} (V111 made the FK mandatory) so the category-only /
+     *                      legacy row stays a FK-only NON-match for any asserted slug.
      */
     private void seedSalonOwnedServiceNoMaster(UUID salonId, String serviceName, String category,
                                                String priceType, BigDecimal basePrice,
                                                BigDecimal priceMax, UUID serviceTypeId,
                                                boolean defActive) {
+        UUID typeId = serviceTypeId != null ? serviceTypeId : unrelatedServiceTypeId();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
                         "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
                         "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
-                UUID.randomUUID(), salonId, serviceName, category, serviceTypeId,
+                UUID.randomUUID(), salonId, serviceName, category, typeId,
                 basePrice, priceType, priceMax, defActive);
         // Deliberately NO master_services INSERT — that absence is the test fixture.
     }
@@ -2853,12 +2860,38 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
+     * Resolves an arbitrary Flyway-seeded {@code service_type_id} that is NEVER
+     * used as a search predicate anywhere in this suite (the {@code beard-correction}
+     * trap slug — only ever seeded to assert it is absent, never searched via
+     * {@code serviceTypeSlugs}).
+     *
+     * <p>Since V111 made {@code service_definitions.service_type_id} mandatory
+     * (NOT NULL), fixture rows can no longer carry a NULL FK. This id is the
+     * substitute for the historical "type-less / legacy NULL" fixtures:
+     * <ul>
+     *   <li>type-agnostic rows (name / price / category paths) that never assert
+     *       on the FK at all; and</li>
+     *   <li>explicit FK-only <em>NON-match</em> rows — an "unrelated" type that is
+     *       guaranteed distinct from every slug under assertion ({@code SLUG_A},
+     *       {@code SLUG_B}, {@code SLUG_SEARCH}), so the row stays correctly
+     *       excluded from those searches exactly as the NULL FK once did.</li>
+     * </ul>
+     */
+    private UUID unrelatedServiceTypeId() {
+        return serviceTypeIdBySlug(SLUG_SUBSTRING_SIBLING);
+    }
+
+    /**
      * Seeds an active (or inactive) INDEPENDENT_MASTER-owned service definition
-     * with a controllable {@code service_type_id} (nullable — pass {@code null}
-     * for the legacy NULL-FK path, which no longer matches a service-type slug)
-     * plus a {@code master_services} link, then
+     * with a controllable {@code service_type_id} plus a {@code master_services}
+     * link, then
      * refreshes {@code masters.min_effective_price} so per-service + price
      * composition tests see the pre-computed column.
+     *
+     * <p>A {@code null} {@code serviceTypeId} is substituted with an
+     * {@link #unrelatedServiceTypeId() unrelated seeded type} (V111 made the FK
+     * mandatory): the row stays a FK-only NON-match for any asserted slug, exactly
+     * as a legacy NULL FK once did.</p>
      */
     private void seedTypedServiceForMaster(UUID masterId, String serviceName, String category,
                                            BigDecimal basePrice, UUID serviceTypeId,
@@ -2883,12 +2916,17 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     private void seedTypedServiceForMaster(UUID masterId, String serviceName, String category,
                                            String priceType, BigDecimal basePrice, BigDecimal priceMax,
                                            UUID serviceTypeId, boolean defActive, boolean msActive) {
+        // service_type_id is mandatory (V111 NOT NULL). A null argument marks the
+        // historical "type-less / FK-only NON-match" intent — substitute an
+        // unrelated seeded type that differs from every asserted slug, so the row
+        // stays excluded from any serviceTypeSlugs search exactly as NULL once did.
+        UUID typeId = serviceTypeId != null ? serviceTypeId : unrelatedServiceTypeId();
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
                         "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
                         "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
-                serviceDefId, masterId, serviceName, category, serviceTypeId,
+                serviceDefId, masterId, serviceName, category, typeId,
                 basePrice, priceType, priceMax, defActive);
 
         jdbcTemplate.update(
@@ -2908,20 +2946,26 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
     /**
      * Seeds a SALON-owned FIXED-priced service definition with a controllable
-     * {@code service_type_id} (nullable) and {@code is_active} flags, plus a
+     * {@code service_type_id} and {@code is_active} flags, plus a
      * {@code master_services} link for the given salon master. Backs the salon
      * per-service-filter tests (the salon EXISTS reaches active masters' active
      * services).
+     *
+     * <p>A {@code null} {@code serviceTypeId} is substituted with an
+     * {@link #unrelatedServiceTypeId() unrelated seeded type} (V111 made the FK
+     * mandatory): the row stays a FK-only NON-match for any asserted slug, exactly
+     * as a legacy NULL FK once did.</p>
      */
     private void seedTypedSalonServiceForMaster(UUID masterId, UUID salonId, String serviceName,
                                                 String category, BigDecimal basePrice, UUID serviceTypeId,
                                                 boolean defActive, boolean msActive) {
+        UUID typeId = serviceTypeId != null ? serviceTypeId : unrelatedServiceTypeId();
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
                         "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
                         "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, 'FIXED', 0, ?, NOW(), NOW())",
-                serviceDefId, salonId, serviceName, category, serviceTypeId, basePrice, defActive);
+                serviceDefId, salonId, serviceName, category, typeId, basePrice, defActive);
 
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
@@ -2931,8 +2975,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
     /**
      * Seeds an active salon in {@code city} whose active SALON_MASTER offers a
-     * single active FIXED service in {@code category} (service_type_id NULL —
-     * category-only). Backs the salon category-filter regression tests where each
+     * single active FIXED service in {@code category} (carrying an unrelated
+     * seeded service_type_id — this path asserts on category only, never on the
+     * type FK). Backs the salon category-filter regression tests where each
      * salon's discovery eligibility hinges solely on the category of its one
      * offered service.
      */
@@ -2979,9 +3024,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 0, true, NOW(), NOW())",
-                serviceDefId, masterId, serviceName, category, basePrice);
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, 0, true, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, unrelatedServiceTypeId(), basePrice);
 
         UUID msId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -3013,9 +3058,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 'RANGE', ?, 0, true, NOW(), NOW())",
-                serviceDefId, masterId, serviceName, category, basePrice, priceMax);
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, 'RANGE', ?, 0, true, NOW(), NOW())",
+                serviceDefId, masterId, serviceName, category, unrelatedServiceTypeId(), basePrice, priceMax);
 
         UUID msId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -3081,9 +3126,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'SALON', ?, ?, 'EYEBROW', 60, 300.00, 'FIXED', 0, ?, NOW(), NOW())",
-                serviceDefId, salonId, serviceName, defActive);
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, 'EYEBROW', ?, 60, 300.00, 'FIXED', 0, ?, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, unrelatedServiceTypeId(), defActive);
 
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) " +
@@ -3489,9 +3534,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                        "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, ?, 0, ?, NOW(), NOW())",
-                serviceDefId, ownerId, "Test Service " + serviceDefId, category, basePrice, defActive);
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, 0, ?, NOW(), NOW())",
+                serviceDefId, ownerId, "Test Service " + serviceDefId, category, unrelatedServiceTypeId(), basePrice, defActive);
 
         UUID msId = UUID.randomUUID();
         jdbcTemplate.update(

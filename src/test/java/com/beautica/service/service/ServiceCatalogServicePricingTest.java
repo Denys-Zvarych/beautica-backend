@@ -83,15 +83,31 @@ class ServiceCatalogServicePricingTest {
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 
+    /**
+     * Stubs an active MANICURE {@link com.beautica.service.entity.ServiceType} so a create request
+     * carrying {@code serviceTypeId} + category "MANICURE" passes the mandatory-type guard and the
+     * Phase 16.3 cross-field category check. Since V111 every create path requires a service type;
+     * these pricing tests assert only the price columns, so any valid type suffices.
+     */
+    private void stubActiveManicureType(UUID serviceTypeId) {
+        var serviceType = org.mockito.Mockito.mock(com.beautica.service.entity.ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+    }
+
     // ── Create FIXED ──────────────────────────────────────────────────────────
 
     @Test
     @DisplayName("creates FIXED service — base_price=price, price_max=null saved")
     void should_saveFixedPricing_when_createRequestIsFixed() {
         UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Manicure", null, null, 60, 0,
-                PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
+                "Manicure", null, "MANICURE", 60, 0,
+                PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId);
 
         ServiceDefinition saved = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -106,6 +122,7 @@ class ServiceCatalogServicePricingTest {
                 .build();
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
+        stubActiveManicureType(serviceTypeId);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
 
         ServiceDefinitionResponse result = serviceCatalogService.addServiceToSalon(salonId, request);
@@ -136,9 +153,10 @@ class ServiceCatalogServicePricingTest {
     @DisplayName("creates RANGE service — base_price=priceMin, price_max=priceMax saved")
     void should_saveRangePricing_when_createRequestIsRange() {
         UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Highlights", null, null, 120, 15,
-                PriceType.RANGE, null, new BigDecimal("800.00"), new BigDecimal("1500.00"), null);
+                "Highlights", null, "MANICURE", 120, 15,
+                PriceType.RANGE, null, new BigDecimal("800.00"), new BigDecimal("1500.00"), serviceTypeId);
 
         ServiceDefinition saved = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -153,6 +171,7 @@ class ServiceCatalogServicePricingTest {
                 .build();
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
+        stubActiveManicureType(serviceTypeId);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
 
         ServiceDefinitionResponse result = serviceCatalogService.addServiceToSalon(salonId, request);
@@ -309,9 +328,10 @@ class ServiceCatalogServicePricingTest {
         when(master.getId()).thenReturn(masterId);
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
 
+        UUID serviceTypeId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
-                "Hair Coloring", null, null, 90, 15,
-                PriceType.RANGE, null, new BigDecimal("600.00"), new BigDecimal("1200.00"), null);
+                "Hair Coloring", null, "MANICURE", 90, 15,
+                PriceType.RANGE, null, new BigDecimal("600.00"), new BigDecimal("1200.00"), serviceTypeId);
 
         ServiceDefinition savedDef = ServiceDefinition.builder()
                 .id(UUID.randomUUID())
@@ -332,6 +352,7 @@ class ServiceCatalogServicePricingTest {
         when(savedAssignment.isActive()).thenReturn(true);
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        stubActiveManicureType(serviceTypeId);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any())).thenReturn(savedAssignment);
 

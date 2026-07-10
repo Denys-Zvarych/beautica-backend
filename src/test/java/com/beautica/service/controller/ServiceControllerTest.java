@@ -190,7 +190,7 @@ class ServiceControllerTest {
         var serviceId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
                 "Classic Manicure", "Basic nail care", "MANICURE", 60, 10,
-                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, UUID.randomUUID());
         var stub = stubServiceDefResponse(serviceId, "Classic Manicure");
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
@@ -209,20 +209,53 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.data.name").value("Classic Manicure"));
     }
 
+    // ── V111 mandatory service type — HTTP-tier guarantee ──────────────────────
+    // The user-facing rule: a service can never be created without a service type. At the
+    // web tier the @NotNull(serviceTypeId) bean-validation guard rejects the request with 400
+    // before it reaches the service, on BOTH single-create entry points. Paired with the
+    // service-layer "Service type is required" BusinessException (ServiceCatalogServiceTest)
+    // and the DB NOT NULL constraint (V111), this pins the guarantee end-to-end.
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when serviceTypeId is omitted (mandatory since V111); service is never invoked")
+    void should_return400_when_ownerCreatesSalonServiceWithoutServiceType() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        // Fully valid body EXCEPT the omitted serviceTypeId — isolates the mandatory-type guard.
+        var body = "{\"name\":\"Classic Manicure\",\"category\":\"MANICURE\","
+                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":10,"
+                + "\"priceType\":\"FIXED\",\"price\":350.00}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services without a serviceTypeId — must return 400", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.serviceTypeId").value("Service type id is required"));
+
+        verify(serviceCatalogService, never()).addServiceToSalon(any(), any());
+    }
+
     @Test
     @DisplayName("POST /salons/{id}/services — 403 when SALON_MASTER attempts to create a service (read-only role)")
     void should_return403_when_salonMasterAttemptsToCreateService() throws Exception {
         var masterUserId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         // SALON_MASTER is a read-only role: @PreAuthorize on the controller method denies the request
-        // before AuthorizationService is consulted, so no stub is needed.
-
+        // before AuthorizationService is consulted, so no stub is needed. The body is fully valid
+        // (serviceTypeId present) so the 403 proves the ROLE gate — not bean validation — rejects it.
         log.debug("Act: POST /api/v1/salons/{}/services as SALON_MASTER — read-only role must be denied with 403", salonId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
                         .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Hair Cut\",\"category\":\"MANICURE\",\"baseDurationMinutes\":30,\"priceType\":\"FIXED\",\"price\":50.00,\"bufferMinutesAfter\":0}"))
+                        .content("{\"name\":\"Hair Cut\",\"category\":\"MANICURE\",\"serviceTypeId\":\"" + UUID.randomUUID()
+                                + "\",\"baseDurationMinutes\":30,\"priceType\":\"FIXED\",\"price\":50.00,\"bufferMinutesAfter\":0}"))
                 .andExpect(status().isForbidden());
     }
 
@@ -234,9 +267,11 @@ class ServiceControllerTest {
         // authz denies — different owner
         when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(false);
 
+        // Valid body (serviceTypeId present) so the 403 proves the cross-owner canManageSalon
+        // guard denies — not bean validation on a missing service type.
         var request = new CreateServiceDefinitionRequest(
                 "Hijack Service", null, "MANICURE", 30, 0,
-                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("100.00"), null, null, UUID.randomUUID());
 
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — cross-owner must be denied", salonAId);
         mockMvc.perform(post("/api/v1/salons/" + salonAId + "/services")
@@ -427,7 +462,7 @@ class ServiceControllerTest {
         var masterId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
                 "Lash Extensions", "Volume set", "MANICURE", 120, 15,
-                PriceType.FIXED, new BigDecimal("900.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("900.00"), null, null, UUID.randomUUID());
         var stub = stubMasterServiceResponse(UUID.randomUUID(), masterId, "Lash Extensions");
 
         when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
@@ -474,29 +509,27 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("POST /independent-masters/me/services — 201 response JSON has null serviceTypeId + serviceTypeNameUk when no type is chosen")
-    void should_returnNullServiceTypeFieldsInJson_when_independentMasterCreatesWithoutServiceType() throws Exception {
+    @DisplayName("POST /independent-masters/me/services — 400 when serviceTypeId is omitted (mandatory since V111); service is never invoked")
+    void should_return400_when_independentMasterCreatesWithoutServiceType() throws Exception {
         var userId = UUID.randomUUID();
-        var masterId = UUID.randomUUID();
-        var request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", "MANICURE", 60, 10,
-                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
-        // stubMasterServiceResponse leaves both new fields null — the picker was not used.
-        var stub = stubMasterServiceResponse(UUID.randomUUID(), masterId, "Manicure");
+        // Body omits serviceTypeId entirely — the @NotNull bean-validation guard rejects it at
+        // argument resolution, so the request never reaches the service. This is the user-facing
+        // guarantee that an untyped service cannot be created via the independent-master path.
+        var body = "{\"name\":\"Manicure\",\"description\":\"Classic manicure\",\"category\":\"MANICURE\","
+                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":10,"
+                + "\"priceType\":\"FIXED\",\"price\":350.00}";
 
-        when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
-                .thenReturn(stub);
-
-        log.debug("Act: POST /api/v1/independent-masters/me/services without a serviceTypeId — response fields must be null");
+        log.debug("Act: POST /api/v1/independent-masters/me/services without a serviceTypeId — must return 400");
         mockMvc.perform(post("/api/v1/independent-masters/me/services")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.serviceTypeId").value(org.hamcrest.Matchers.nullValue()))
-                .andExpect(jsonPath("$.data.serviceTypeNameUk").value(org.hamcrest.Matchers.nullValue()));
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.serviceTypeId").value("Service type id is required"));
+
+        verify(serviceCatalogService, never()).addIndependentMasterService(any(), any());
     }
 
     // ── Phase 16.3 cross-field reject — HTTP envelope (16.3 + GlobalExceptionHandler seam) ──
@@ -567,9 +600,11 @@ class ServiceControllerTest {
     @DisplayName("POST /independent-masters/me/services — 403 when CLIENT attempts the call")
     void should_return403_when_clientAddsIndependentMasterService() throws Exception {
         var userId = UUID.randomUUID();
+        // Valid body (serviceTypeId present) so the 403 proves the INDEPENDENT_MASTER role gate
+        // denies a CLIENT — not bean validation on a missing service type.
         var request = new CreateServiceDefinitionRequest(
                 "Sneaky Service", null, "MANICURE", 30, 0,
-                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("100.00"), null, null, UUID.randomUUID());
 
         log.debug("Act: POST /api/v1/independent-masters/me/services as CLIENT — must be denied");
         mockMvc.perform(post("/api/v1/independent-masters/me/services")
@@ -750,9 +785,10 @@ class ServiceControllerTest {
         when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
                 .thenReturn(rangeStub);
 
-        // RANGE request: priceType=RANGE, priceMin=500, priceMax=800; no price field
-        String body = "{\"name\":\"Range Manicure\",\"category\":\"MANICURE\","
-                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
+        // RANGE request: priceType=RANGE, priceMin=500, priceMax=800; no price field.
+        // serviceTypeId is mandatory (V111) so it must be present for a 201.
+        String body = "{\"name\":\"Range Manicure\",\"category\":\"MANICURE\",\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
                 + "\"priceType\":\"RANGE\",\"priceMin\":500.00,\"priceMax\":800.00}";
 
         log.debug("Act: POST /api/v1/salons/{}/services with RANGE pricing — must return 201 with RANGE fields", salonId);
@@ -1031,8 +1067,9 @@ class ServiceControllerTest {
         when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
                 .thenReturn(stubServiceDefResponse(serviceId, "Manicure"));
         // Tab (\t) and line breaks (\n) are now legal in description — long-form copy legitimately
-        // contains them. Valid category supplied so the only field under test is description.
-        var body = "{\"name\":\"Manicure\",\"category\":\"MANICURE\""
+        // contains them. Valid category + mandatory serviceTypeId supplied so the only field under
+        // test is description.
+        var body = "{\"name\":\"Manicure\",\"category\":\"MANICURE\",\"serviceTypeId\":\"" + UUID.randomUUID() + "\""
                 + ",\"description\":\"Line one\\nLine two\\tindented\""
                 + ",\"baseDurationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"bufferMinutesAfter\":0}";
 

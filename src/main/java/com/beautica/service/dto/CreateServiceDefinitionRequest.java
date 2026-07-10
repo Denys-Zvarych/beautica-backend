@@ -4,7 +4,6 @@ import com.beautica.service.entity.PriceType;
 import com.beautica.service.validation.PricedRequest;
 import com.beautica.service.validation.ServicePriceValid;
 import io.swagger.v3.oas.annotations.media.Schema;
-import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
@@ -110,13 +109,14 @@ public record CreateServiceDefinitionRequest(
         @Digits(integer = 8, fraction = 2, message = "Maximum price must have at most 8 integer digits and 2 decimal places")
         BigDecimal priceMax,
 
-        @Nullable
+        @NotNull(message = "Service type id is required")
         @Schema(
-                types = {"string", "null"},
                 format = "uuid",
-                nullable = true,
-                description = "Optional id of the chosen platform service type. "
-                        + "Omit or send null when the master skips the (optional) service-type picker.")
+                requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Id of the chosen platform service type. Required — the service-type "
+                        + "picker cannot be skipped. The type must be active and belong to the "
+                        + "selected category. Persisted service_type_id is NOT NULL at the DB level, "
+                        + "so an untyped service can never be created (search filters on this column).")
         UUID serviceTypeId
 ) implements PricedRequest {
 }

@@ -81,7 +81,7 @@ public class ServiceCatalogService {
 
         validateCategoryActive(request.category());
 
-        ServiceType serviceType = resolveServiceType(request.serviceTypeId(), request.category());
+        ServiceType serviceType = resolveRequiredServiceType(request.serviceTypeId(), request.category());
 
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.SALON)
@@ -95,9 +95,7 @@ public class ServiceCatalogService {
                 .build();
 
         applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
-        if (serviceType != null) {
-            definition.setServiceType(serviceType);
-        }
+        definition.setServiceType(serviceType);
 
         ServiceDefinition saved = serviceRepository.save(definition);
         return ServiceDefinitionResponse.from(saved);
@@ -165,7 +163,7 @@ public class ServiceCatalogService {
 
         validateCategoryActive(request.category());
 
-        ServiceType serviceType = resolveServiceType(request.serviceTypeId(), request.category());
+        ServiceType serviceType = resolveRequiredServiceType(request.serviceTypeId(), request.category());
 
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
@@ -179,9 +177,7 @@ public class ServiceCatalogService {
                 .build();
 
         applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
-        if (serviceType != null) {
-            definition.setServiceType(serviceType);
-        }
+        definition.setServiceType(serviceType);
 
         ServiceDefinition savedDef = serviceRepository.save(definition);
 
@@ -986,6 +982,24 @@ public class ServiceCatalogService {
                     "service type does not belong to the selected category");
         }
         return type;
+    }
+
+    /**
+     * Create-path variant of {@link #resolveServiceType(UUID, String)} that mandates a
+     * non-null service type. Every service-creation path must persist a
+     * {@code service_type_id} (the finer taxonomy the SEARCH filters on); an untyped
+     * service is silently dropped by service-type search. The DTO carries {@code @NotNull},
+     * but this guard is defense-in-depth so no code path can persist a null type even if
+     * validation is bypassed. The returned type is always non-null.
+     *
+     * @throws BusinessException (400) when {@code serviceTypeId} is null, inactive, or in
+     *                           another category
+     */
+    private ServiceType resolveRequiredServiceType(@Nullable UUID serviceTypeId, String targetCategory) {
+        if (serviceTypeId == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is required");
+        }
+        return resolveServiceType(serviceTypeId, targetCategory);
     }
 
     /**
