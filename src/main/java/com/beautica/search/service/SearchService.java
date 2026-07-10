@@ -1123,6 +1123,29 @@ public class SearchService {
         }
     }
 
+    /**
+     * Appends the <em>bookable gate</em> for a salon-owned {@code service_definitions}
+     * row aliased {@code defAlias}: an {@code EXISTS} that the def is actively
+     * performed by at least one active master. This mirrors — byte-for-byte in
+     * semantics — the catalogue's canonical gate
+     * {@code ServiceRepository.findBookableServicesBySalon}
+     * ({@code EXISTS(MasterServiceAssignment WHERE serviceDefinition = sd AND
+     * isActive AND master.isActive)}), so salon <em>search</em> and the salon
+     * <em>booking catalogue</em> never diverge on what a salon offers.
+     *
+     * <p>Deliberately does NOT add a {@code masters.salon_id = s.id} check: the
+     * {@code master_services} assignment only ever links the owning salon's own
+     * masters, exactly as the catalogue query relies on. Adding a stricter
+     * {@code salon_id} predicate here would make search stricter than the
+     * catalogue.
+     */
+    private static void appendSalonBookableGate(StringBuilder sb, String defAlias) {
+        sb.append("AND EXISTS (SELECT 1 FROM master_services msx ")
+                .append("JOIN masters mx ON mx.id = msx.master_id AND mx.is_active = true ")
+                .append("WHERE msx.service_def_id = ").append(defAlias).append(".id ")
+                .append("AND msx.is_active = true) ");
+    }
+
     private static void bind(Query query, Map<String, Object> params) {
         params.forEach(query::setParameter);
     }
@@ -1266,12 +1289,23 @@ public class SearchService {
      */
     private static void appendSalonPriceAggregateLateral(
             StringBuilder sb, boolean hasCategory, List<ResolvedServiceType> serviceTypes) {
+        // Bookable price band (salon service-type fix): the band is the MIN–MAX of
+        // the PERFORMING masters' EFFECTIVE prices, not the salon-owned base_price.
+        // Effective price = COALESCE(price_override, base_price) for the floor and
+        // COALESCE(price_override, RANGE ceiling) for the ceiling — identical to the
+        // master path (appendPriceBandExists / the master serviceNames lateral).
+        // Rows are gated to active master_services on active masters (mirrors
+        // ServiceRepository.findBookableServicesBySalon), so an unbookable owned
+        // service never drags the band and a per-master override shows through.
         sb.append("LEFT JOIN LATERAL (")
-                .append("SELECT MIN(sd.base_price) AS pmin, ")
-                .append("MAX(CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END) AS pmax ")
-                .append("FROM service_definitions sd ")
+                .append("SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin, ")
+                .append("MAX(COALESCE(ms.price_override, ")
+                .append("CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END)) AS pmax ")
+                .append("FROM master_services ms ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                .append("JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true ")
                 .append("WHERE sd.owner_type = 'SALON' AND sd.owner_id = s.id ")
-                .append("AND sd.is_active = true ");
+                .append("AND ms.is_active = true ");
         // Slug precedence: scope the price band to the matched services. Category
         // narrows only when no slug filter is active (defensive — this path always
         // carries slugs).
@@ -1299,6 +1333,7 @@ public class SearchService {
                 .append("FROM service_definitions sd2 ")
                 .append("WHERE sd2.owner_type = 'SALON' AND sd2.owner_id = t.id ")
                 .append("AND sd2.is_active = true ");
+        appendSalonBookableGate(sb, "sd2");
         if (hasCategory) {
             sb.append("AND sd2.category = :category ");
         }
@@ -1320,7 +1355,9 @@ public class SearchService {
                 .append("SELECT DISTINCT sd3.name AS name ")
                 .append("FROM service_definitions sd3 ")
                 .append("WHERE sd3.owner_type = 'SALON' AND sd3.owner_id = t.id ")
-                .append("AND sd3.is_active = true AND (");
+                .append("AND sd3.is_active = true ");
+        appendSalonBookableGate(sb, "sd3");
+        sb.append("AND (");
         appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
         sb.append(") ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") zm) mn ON true ");
@@ -1343,7 +1380,9 @@ public class SearchService {
         sb.append("AND EXISTS (")
                 .append("SELECT 1 FROM service_definitions sdf ")
                 .append("WHERE sdf.owner_type = 'SALON' AND sdf.owner_id = s.id ")
-                .append("AND sdf.is_active = true AND (");
+                .append("AND sdf.is_active = true ");
+        appendSalonBookableGate(sb, "sdf");
+        sb.append("AND (");
         appendServiceTypeMatchDisjunction(sb, "sdf", serviceTypes.size());
         sb.append(")) ");
         bindServiceTypeParams(serviceTypes, params);

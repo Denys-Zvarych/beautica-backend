@@ -1150,9 +1150,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Only an INACTIVE service exists — it must not contribute to the band.
         // Salon-owned def is itself inactive (is_active = false) → it must not
-        // contribute to the salon's price band / serviceNames. (master_services
-        // is no longer consulted for salon search; the def's own is_active is the
-        // gate — see SalonRepository salon row-source fix.)
+        // contribute to the salon's price band / serviceNames. (The bookable gate
+        // additionally requires an active master_services link on an active master;
+        // here the link is inactive too, so the salon prices to null either way.)
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
                 new BigDecimal("300.00"), null, false, false);
 
@@ -1226,9 +1226,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Only an INACTIVE service — it must not contribute to serviceNames.
         // Salon-owned def is itself inactive (is_active = false) → it must not
-        // contribute to the salon's price band / serviceNames. (master_services
-        // is no longer consulted for salon search; the def's own is_active is the
-        // gate — see SalonRepository salon row-source fix.)
+        // contribute to the salon's price band / serviceNames. (The bookable gate
+        // additionally requires an active master_services link on an active master;
+        // here the link is inactive too, so the salon prices to null either way.)
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
                 new BigDecimal("300.00"), null, false, false);
 
@@ -1702,18 +1702,18 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — ?q matches a salon via its ACTIVE salon-owned service_definition regardless of master/master_services state; an inactive def never surfaces (def is_active is the sole gate)")
-    void should_matchSalonByServiceName_onActiveDefOnly_ignoringMasterLayers() throws Exception {
+    @DisplayName("GET /search/salons — ?q matches a salon via a BOOKABLE salon-owned service_definition (active def + active master + active link); an inactive def never surfaces")
+    void should_matchSalonByServiceName_onBookableActiveDef() throws Exception {
         ensureHttpClient();
-        // Salon search resolves a salon's catalog through its owner-scoped
-        // service_definitions (owner_type='SALON'); master / master_services are
-        // NOT consulted. The sole gate is the def's own is_active:
-        //   • active def + inactive master + inactive link → MUST surface
-        //   • inactive def + active master + active link    → MUST NOT surface
-        UUID active = seedSalonWithNamedService("Київ", "Active Def Salon", "Microblading",
-                false, false, true);    // def active (master & link inactive — irrelevant)
+        // Bookable-gate contract (mirrors ServiceRepository.findBookableServicesBySalon):
+        // a salon matches ?q via one of its owned services only when that service is
+        // actively performed by an active master. Gates:
+        //   • active def + active master + active link → MUST surface (bookable)
+        //   • inactive def + active master + active link → MUST NOT surface (def is_active)
+        UUID bookable = seedSalonWithNamedService("Київ", "Bookable Def Salon", "Microblading",
+                true, true, true);      // active def + active master + active link → bookable
         seedSalonWithNamedService("Київ", "Inactive Def Salon", "Microblading",
-                true, true, false);     // def inactive → excluded
+                true, true, false);     // def inactive → excluded despite active master/link
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?q=microblading&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
@@ -1721,12 +1721,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
         assertThat(data.path("totalElements").asLong())
-                .as("only the salon with an ACTIVE owner-scoped service_definition "
-                        + "surfaces via ?q; master/master_services activity is irrelevant")
+                .as("only the salon whose owned service is BOOKABLE (active master performs it) "
+                        + "surfaces via ?q; an inactive def never surfaces")
                 .isEqualTo(1L);
         assertThat(data.path("data").get(0).path("salonId").asText())
-                .as("the surfaced salon is the active-def one")
-                .isEqualTo(active.toString());
+                .as("the surfaced salon is the bookable-def one")
+                .isEqualTo(bookable.toString());
     }
 
     // ── Item A — server-side location filtering proof ────────────────────────
@@ -2479,19 +2479,17 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — per-slug EXISTS surfaces a salon via its ACTIVE salon-owned service_definition regardless of master/master_services state; an inactive def is excluded (def is_active is the sole gate)")
-    void should_surfaceSalonBySlug_onActiveDefOnly_ignoringMasterLayers() throws Exception {
+    @DisplayName("GET /search/salons — per-slug EXISTS surfaces a salon via a BOOKABLE salon-owned service_definition (active def + active master + active link); an inactive def is excluded")
+    void should_surfaceSalonBySlug_onBookableActiveDef() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
-        // Active def, but master inactive + link inactive → MUST surface (salon
-        // search reads owner-scoped defs directly; master/master_services are not
-        // consulted — only the def's own is_active gates).
-        UUID salonActiveDef = seedActiveSalon("Київ", null);
-        UUID inactiveMaster = seedSalonMasterFor(salonActiveDef, "Київ", "4.00");
-        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactiveMaster);
-        seedTypedSalonServiceForMaster(inactiveMaster, salonActiveDef, "Догляд за волоссям",
-                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, false); // defActive=true, msActive=false
-        // Inactive def, master active + link active → MUST NOT surface.
+        // Active def + active master + active link → bookable → MUST surface
+        // (mirrors ServiceRepository.findBookableServicesBySalon).
+        UUID salonBookable = seedActiveSalon("Київ", null);
+        UUID bookableMaster = seedSalonMasterFor(salonBookable, "Київ", "4.00");
+        seedTypedSalonServiceForMaster(bookableMaster, salonBookable, "Догляд за волоссям",
+                "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, true); // defActive=true, msActive=true
+        // Inactive def, master active + link active → MUST NOT surface (def is_active gate).
         UUID salonInactiveDef = seedActiveSalon("Київ", null);
         UUID activeMaster = seedSalonMasterFor(salonInactiveDef, "Київ", "4.00");
         seedTypedSalonServiceForMaster(activeMaster, salonInactiveDef, "Догляд за волоссям",
@@ -2499,12 +2497,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
         assertThat(data.path("totalElements").asLong())
-                .as("only the salon with an ACTIVE owner-scoped service_definition "
-                        + "surfaces via the per-slug EXISTS; master/master_services "
-                        + "activity is irrelevant")
+                .as("only the salon whose owned service is BOOKABLE (active master performs it) "
+                        + "surfaces via the per-slug EXISTS; an inactive def is excluded")
                 .isEqualTo(1L);
         assertThat(data.path("data").get(0).path("salonId").asText())
-                .isEqualTo(salonActiveDef.toString());
+                .isEqualTo(salonBookable.toString());
     }
 
     @Test
@@ -2541,14 +2538,19 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
-        // ONE salon owning two ACTIVE owner-scoped defs under two distinct slugs:
-        // a FIXED 500 (slug A) and a RANGE 800..4000 (slug B). The appendSalonPrice
-        // AggregateLateral got the same slug-scoping fix as the master path.
+        // ONE salon owning two BOOKABLE defs (each performed by an active master, no
+        // per-master override → effective price = base_price) under two distinct
+        // slugs: a FIXED 500 (slug A) and a RANGE 800..4000 (slug B). The
+        // appendSalonPriceAggregateLateral scopes the band to the matched slug AND
+        // to the performing masters' effective prices.
         UUID salon = seedActiveSalon("Київ", null);
-        seedSalonOwnedServiceNoMaster(salon, "Салон Фікс A", "HAIRCUT",
+        UUID master = seedSalonMasterFor(salon, "Київ", "4.00");
+        UUID defA = seedTypedSalonOwnedDef(salon, "Салон Фікс A", "HAIRCUT",
                 "FIXED", new BigDecimal("500.00"), null, typeIdA, true);
-        seedSalonOwnedServiceNoMaster(salon, "Салон Діапазон B", "INJECTION",
+        UUID defB = seedTypedSalonOwnedDef(salon, "Салон Діапазон B", "INJECTION",
                 "RANGE", new BigDecimal("800.00"), new BigDecimal("4000.00"), typeIdB, true);
+        linkMasterToOwnedDef(master, defA, null, true);
+        linkMasterToOwnedDef(master, defB, null, true);
 
         // ── slug A → the FIXED service band: 500 / 500 ───────────────────────
         JsonNode aRow = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
@@ -2679,97 +2681,95 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .doesNotContain(manicureOnly.toString());
     }
 
-    // ── Regression — salon-owned def with NO master_services row surfaces ─────
+    // ── Regression (reconciled to the BOOKABLE contract) — a salon surfaces on ─
+    //    an owned def only when an active master actively performs it.
     //
-    // Bug (just fixed): salon search resolved each salon's offered services via
-    // `master_services → masters → service_definitions` (the salon's MASTERS'
-    // assignments). But a salon's catalog is `service_definitions WHERE
-    // owner_type='SALON' AND owner_id = salonId` — created via
-    // `POST /salons/{id}/services` — which are NOT necessarily assigned to any
-    // master. A salon whose owned def has NO `master_services` row therefore
-    // matched 0 under a category filter, returned null priceMin/priceMax, and
-    // an empty serviceNames card. Fixed by switching the row-source of the 6
-    // SalonRepository projection queries + the 5 SearchService salon laterals to
-    // `service_definitions WHERE owner_type='SALON' AND owner_id = s.id AND
-    // is_active = true` (no master_services hop).
+    // Product model: a salon's client-visible offering = master-performed services
+    // only (it mirrors the booking catalogue, ServiceRepository
+    // .findBookableServicesBySalon: EXISTS(active master_services on an active
+    // master)). An earlier iteration read salon-owned service_definitions directly
+    // (owner_type='SALON', no master_services hop), which surfaced UNBOOKABLE owned
+    // services a client could never book. The fix re-adds the bookable gate to the
+    // 6 SalonRepository projection queries + the SearchService salon laterals.
     //
-    // These tests PIN that row-source: they seed an ACTIVE salon-owned def with
-    // NO `master_services` row whatsoever (no salon master) — the exact gap the
-    // pre-existing helpers (seedSalonServiceForMaster / seedTypedSalonServiceForMaster /
-    // seedSalonWithNamedService) could never express, because they ALWAYS insert
-    // a master_services link alongside the def. They FAIL against the old
-    // master_services-join logic (salon invisible / null band / empty names) and
-    // PASS against the owner-scoped fix.
+    // These tests seed a BOOKABLE owned def (active def + active master + active
+    // link) as the positive control and pin that (a) it surfaces under
+    // category / per-slug filters, (b) its price band = the performing master's
+    // effective price, (c) serviceNames lists it — while off-category / unrelated
+    // masterless defs stay excluded.
 
     @Test
-    @DisplayName("GET /search/salons?category=NAIL_SERVICE — regression: a salon whose ACTIVE owned def has NO master_services row STILL surfaces with the owned def's price band + category-scoped names; a different-category owned salon is excluded (pins owner-scoped row-source, not the master_services join)")
-    void should_surfaceSalonByOwnedDef_when_noMasterServicesRowExists() throws Exception {
+    @DisplayName("GET /search/salons?category=NAIL_SERVICE — a salon surfaces via a BOOKABLE owned NAIL_SERVICE def (active master performs it) with the performing master's price band + category-scoped names; an unbookable off-category owned def never leaks, and a different-category salon is excluded")
+    void should_surfaceSalonByBookableOwnedDef_underCategoryFilter() throws Exception {
         ensureHttpClient();
-        // Salon A — an active salon with NO master at all. Two ACTIVE salon-owned
-        // defs created directly (as POST /salons/{id}/services would): a
-        // NAIL_SERVICE RANGE 150..600 and an off-category HAIRCUT FIXED 900.
-        // NO master_services row exists for either → the pre-fix master_services
-        // join finds nothing and the salon vanishes from a category search.
+        // Salon A — an active salon with an active master who actively performs a
+        // NAIL_SERVICE RANGE 150..600 (no override → effective band 150..600). It
+        // also owns an off-category HAIRCUT FIXED 900 that NO master performs
+        // (unbookable) → it must never leak into the band or names.
         UUID salonA = seedActiveSalon("Київ", null);
-        seedSalonOwnedServiceNoMaster(salonA, "Манікюр гель-лак", "NAIL_SERVICE",
+        UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
+        UUID nailDef = seedTypedSalonOwnedDef(salonA, "Манікюр гель-лак", "NAIL_SERVICE",
                 "RANGE", new BigDecimal("150.00"), new BigDecimal("600.00"), null, true);
+        linkMasterToOwnedDef(masterA, nailDef, null, true);
         seedSalonOwnedServiceNoMaster(salonA, "Стрижка жіноча", "HAIRCUT",
-                "FIXED", new BigDecimal("900.00"), null, null, true);
-        // Salon B — an active salon whose ONLY active owned def is in a DIFFERENT
-        // category (HAIRCUT), also with NO master_services row. It must be
-        // EXCLUDED under ?category=NAIL_SERVICE (negative guard).
+                "FIXED", new BigDecimal("900.00"), null, null, true); // unbookable, off-category
+        // Salon B — an active salon whose ONLY owned def is in a DIFFERENT category
+        // (HAIRCUT). It must be EXCLUDED under ?category=NAIL_SERVICE (negative guard).
         UUID salonB = seedActiveSalon("Київ", null);
-        seedSalonOwnedServiceNoMaster(salonB, "Фарбування волосся", "HAIRCUT",
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        UUID hairDefB = seedTypedSalonOwnedDef(salonB, "Фарбування волосся", "HAIRCUT",
                 "FIXED", new BigDecimal("700.00"), null, null, true);
+        linkMasterToOwnedDef(masterB, hairDefB, null, true);
 
         JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
                 + "&category=NAIL_SERVICE&page=0&size=20");
 
-        // (1) The masterless salon-owned def surfaces — totalElements must NOT be 0.
+        // (1) The bookable NAIL_SERVICE def surfaces — totalElements must NOT be 0.
         assertThat(data.path("totalElements").asLong())
-                .as("salon A surfaces via its ACTIVE owner-scoped NAIL_SERVICE def despite having NO master_services row; pre-fix the master_services join returned 0")
+                .as("salon A surfaces via its BOOKABLE NAIL_SERVICE def (an active master performs it)")
                 .isEqualTo(1L);
         assertThat(salonIds(data))
-                .as("the single returned salon is salon A; salon B (HAIRCUT-only owned def) is excluded under category=NAIL_SERVICE")
+                .as("the single returned salon is salon A; salon B (HAIRCUT-only) is excluded under category=NAIL_SERVICE")
                 .containsExactly(salonA.toString());
 
         JsonNode row = data.path("data").get(0);
-        // (2) Non-null priceMin/priceMax derived from the owned def's RANGE pricing,
-        // category-scoped to NAIL_SERVICE (the off-category HAIRCUT 900 must not leak).
+        // (2) Non-null priceMin/priceMax derived from the performing master's effective
+        // price, category-scoped to NAIL_SERVICE (the unbookable HAIRCUT 900 never leaks).
         assertThat(row.path("priceMin").isNull())
-                .as("priceMin is derived from the owned def — never null when an active NAIL_SERVICE def exists")
+                .as("priceMin is derived from the bookable NAIL_SERVICE def — never null")
                 .isFalse();
         assertThat(new BigDecimal(row.path("priceMin").asText()))
-                .as("category-scoped priceMin = the NAIL_SERVICE RANGE floor 150.00 (NOT the off-category HAIRCUT 900)")
+                .as("category-scoped priceMin = the NAIL_SERVICE RANGE floor 150.00 (NOT the unbookable HAIRCUT 900)")
                 .isEqualByComparingTo(new BigDecimal("150.00"));
         assertThat(new BigDecimal(row.path("priceMax").asText()))
                 .as("category-scoped priceMax = the NAIL_SERVICE RANGE ceiling 600.00")
                 .isEqualByComparingTo(new BigDecimal("600.00"));
 
-        // (3)/(4) serviceNames is non-empty and lists ONLY the NAIL_SERVICE name —
-        // the off-category HAIRCUT owned def on the same salon never leaks in.
+        // (3)/(4) serviceNames is non-empty and lists ONLY the bookable NAIL_SERVICE
+        // name — the unbookable off-category HAIRCUT owned def never leaks in.
         java.util.List<String> names = new java.util.ArrayList<>();
         row.path("serviceNames").forEach(n -> names.add(n.asText()));
         assertThat(names)
-                .as("serviceNames is non-empty and category-scoped to the owned NAIL_SERVICE def only — no different-category leak")
+                .as("serviceNames is category-scoped to the bookable NAIL_SERVICE def only — no unbookable / different-category leak")
                 .containsExactly("Манікюр гель-лак");
     }
 
     @Test
-    @DisplayName("GET /search/salons?serviceTypeSlugs=… — regression: the per-slug EntityManager lateral surfaces a salon via its ACTIVE owned def carrying the slug's service_type_id even with NO master_services row; matchedServiceNames carries the owned def's name (pins owner-scoped row-source on the SearchService salon path)")
-    void should_surfaceSalonBySlug_when_ownedDefHasNoMasterServicesRow() throws Exception {
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — the per-slug EXISTS surfaces a salon via a BOOKABLE owned def carrying the slug's service_type_id (active master performs it); matchedServiceNames carries that def's name; an unrelated-type / unbookable salon is excluded")
+    void should_surfaceSalonBySlug_onBookableOwnedDef() throws Exception {
         ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
-        // Salon with an ACTIVE owned def carrying SLUG_A's service_type_id and NO
-        // master_services row. The SearchService EntityManager builder's salon
-        // per-slug EXISTS must read owner-scoped defs directly.
+        // Salon with a BOOKABLE owned def carrying SLUG_A's service_type_id: an
+        // active master actively performs it → the SearchService per-slug EXISTS
+        // (bookable-gated) surfaces it.
         UUID salonWithType = seedActiveSalon("Київ", null);
-        seedSalonOwnedServiceNoMaster(salonWithType, "Кератинове відновлення", "HAIRCUT",
+        UUID masterWithType = seedSalonMasterFor(salonWithType, "Київ", "4.00");
+        UUID typedDef = seedTypedSalonOwnedDef(salonWithType, "Кератинове відновлення", "HAIRCUT",
                 "FIXED", new BigDecimal("800.00"), null, typeIdA, true);
-        // A second salon whose owned def carries an unrelated service_type_id (the
-        // pre-V111 "type-less / legacy NULL" case; a null argument now resolves to
-        // an unrelated seeded type) and NO master link → must NOT surface under the
-        // SLUG_A slug filter.
+        linkMasterToOwnedDef(masterWithType, typedDef, null, true);
+        // A second salon whose owned def carries an unrelated service_type_id and
+        // has NO master link → must NOT surface under the SLUG_A filter (both a
+        // type mismatch AND unbookable).
         UUID salonNoType = seedActiveSalon("Київ", null);
         seedSalonOwnedServiceNoMaster(salonNoType, "Звичайна стрижка", "HAIRCUT",
                 "FIXED", new BigDecimal("300.00"), null, null, true);
@@ -2777,20 +2777,265 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
 
         assertThat(data.path("totalElements").asLong())
-                .as("the masterless salon surfaces via the owner-scoped per-slug EXISTS; pre-fix the master_services join returned 0")
+                .as("the salon whose SLUG_A def is BOOKABLE surfaces via the per-slug EXISTS")
                 .isEqualTo(1L);
         assertThat(salonIds(data))
-                .as("only the salon whose owned def carries SLUG_A's service_type_id is returned")
+                .as("only the salon whose bookable owned def carries SLUG_A's service_type_id is returned")
                 .containsExactly(salonWithType.toString());
 
         java.util.List<String> matched = new java.util.ArrayList<>();
         data.path("data").get(0).path("matchedServiceNames").forEach(n -> matched.add(n.asText()));
         assertThat(matched)
-                .as("matchedServiceNames carries the owned def's name even with no master_services row")
+                .as("matchedServiceNames carries the bookable owned def's name")
                 .containsExactly("Кератинове відновлення");
     }
 
+    // ── TARGET (TDD, RED) — salon service-type search must gate on the BOOKABLE ──
+    //    master assignment, mirroring ServiceRepository.findBookableServicesBySalon.
+    //
+    // BUG (root-caused by backend-debugger): the salon service-type builders in
+    // SearchService query salon-owned service_definitions (owner_type='SALON')
+    // WITHOUT joining master_services, so they (1) MATCH salons on services no
+    // active master performs (unbookable → false positives); (2) build
+    // matchedServiceNames from salon-owned services regardless of master
+    // assignment; (3) compute the price band as MIN/MAX(base_price) over
+    // salon-owned services, ignoring master_services.price_override and unbookable
+    // services. The booking catalogue is correct — it gates on
+    //   EXISTS(MasterServiceAssignment msa
+    //          WHERE msa.serviceDefinition=sd AND msa.isActive AND msa.master.isActive).
+    //
+    // These tests encode the CORRECT target behaviour and are RED against the
+    // current (unfixed) code. They deliberately CONTRADICT the pre-existing
+    // "owner-scoped, ignore master layers" tests above — reconciling those is the
+    // fix's job (backend-dev), not this test-first step. Fixtures diverge the
+    // correct vs current output observably: salons owning a type-T service but with
+    // NO / inactive master assignment, and a salon whose masters' effective prices
+    // (price_override) differ from the salon-owned base_price.
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable gate): a salon that OWNS an active type-T service but has NO active master performing it is ABSENT; a salon whose active master performs it IS returned")
+    void should_excludeSalonWithNoActiveMasterPerformingType_when_filteringByServiceType() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        // Salon A — owns an ACTIVE type-A service_definition but NO master_services
+        // row at all (no master performs it → unbookable). Target: ABSENT (mirror
+        // findBookableServicesBySalon's EXISTS(MasterServiceAssignment) gate).
+        UUID salonA = seedActiveSalon("Київ", null);
+        seedTypedSalonOwnedDef(salonA, "Кератин без майстра", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+
+        // Salon B — owns the type-A def AND has an active master actively performing
+        // it (active master_services link, active master) → PRESENT (bookable).
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID defB = seedTypedSalonOwnedDef(salonB, "Кератин з майстром", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        linkMasterToOwnedDef(masterB, defB, null, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("bookable gate: only salon B (an active master performs the type-A service) is "
+                        + "returned; salon A (owns the service but no active master performs it) must be ABSENT")
+                .containsExactly(salonB.toString());
+        assertThat(data.path("totalElements").asLong())
+                .as("exactly one salon has an active master performing type-A")
+                .isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable gate): an INACTIVE master_services assignment (is_active=false) does NOT make the salon bookable — it is EXCLUDED")
+    void should_excludeSalon_when_onlyTypeServiceAssignmentIsInactive() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        // Salon D — owns an ACTIVE type-A def; its ONLY master_services link is
+        // is_active=false. Mirrors the catalogue's msa.isActive gate → ABSENT.
+        UUID salonD = seedActiveSalon("Київ", null);
+        UUID defD = seedTypedSalonOwnedDef(salonD, "Кератин неактивне призначення", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID masterD = seedSalonMasterFor(salonD, "Київ", "4.00");
+        linkMasterToOwnedDef(masterD, defD, null, false); // inactive assignment
+
+        // Control — an active master actively performing the type-A def → PRESENT.
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID defB = seedTypedSalonOwnedDef(salonB, "Кератин активне призначення", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        linkMasterToOwnedDef(masterB, defB, null, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("an inactive master_services assignment does not make the salon bookable; "
+                        + "only the active-assignment salon B is returned")
+                .containsExactly(salonB.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable gate): an assignment on an INACTIVE master (masters.is_active=false) does NOT make the salon bookable — it is EXCLUDED")
+    void should_excludeSalon_when_onlyPerformingMasterIsInactive() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        // Salon D — owns an ACTIVE type-A def with an ACTIVE assignment, but the
+        // performing master is is_active=false → not bookable → ABSENT
+        // (mirrors the catalogue's msa.master.isActive gate).
+        UUID salonD = seedActiveSalon("Київ", null);
+        UUID defD = seedTypedSalonOwnedDef(salonD, "Кератин неактивний майстер", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID masterD = seedSalonMasterFor(salonD, "Київ", "4.00");
+        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", masterD);
+        linkMasterToOwnedDef(masterD, defD, null, true); // active link, inactive master
+
+        // Control — active master actively performing the type-A def → PRESENT.
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID defB = seedTypedSalonOwnedDef(salonB, "Кератин активний майстер", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID masterB = seedSalonMasterFor(salonB, "Київ", "4.00");
+        linkMasterToOwnedDef(masterB, defB, null, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("an assignment on an inactive master does not make the salon bookable; "
+                        + "only the active-master salon B is returned")
+                .containsExactly(salonB.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable price band): priceMin/priceMax = min–max of the PERFORMING masters' EFFECTIVE prices (price_override), NOT the salon-owned base_price")
+    void should_computeSalonPriceBand_fromPerformingMastersEffectivePrices() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        // Salon B — ONE salon-owned type-A def with base_price 4000. TWO active
+        // masters perform it with per-master overrides 500 and 900. Target band =
+        // MIN(effective)=500 .. MAX(effective)=900 (base_price 4000 must NOT show).
+        UUID salonB = seedActiveSalon("Київ", null);
+        UUID defB = seedTypedSalonOwnedDef(salonB, "Кератин", "HAIRCUT",
+                "FIXED", new BigDecimal("4000.00"), null, typeIdA, true);
+        UUID master1 = seedSalonMasterFor(salonB, "Київ", "4.00");
+        UUID master2 = seedSalonMasterFor(salonB, "Київ", "4.00");
+        linkMasterToOwnedDef(master1, defB, new BigDecimal("500.00"), true);
+        linkMasterToOwnedDef(master2, defB, new BigDecimal("900.00"), true);
+
+        JsonNode row = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0);
+
+        assertThat(new BigDecimal(row.path("priceMin").asText()))
+                .as("priceMin = MIN of the performing masters' effective prices (override 500), "
+                        + "NOT the salon-owned base_price 4000")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("priceMax = MAX of the performing masters' effective prices (override 900), "
+                        + "NOT the salon-owned base_price 4000")
+                .isEqualByComparingTo(new BigDecimal("900.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable price band): with a single performing master and no override the band collapses to that master's base_price; an UNBOOKABLE owned type-T service does NOT drag the band")
+    void should_collapseSalonPriceBand_toBasePrice_ignoringUnbookableOwnedService() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        UUID salonC = seedActiveSalon("Київ", null);
+        // Performed type-A def: base 1500, one active master, no override → effective 1500.
+        UUID performed = seedTypedSalonOwnedDef(salonC, "Кератин виконуваний", "HAIRCUT",
+                "FIXED", new BigDecimal("1500.00"), null, typeIdA, true);
+        UUID masterC = seedSalonMasterFor(salonC, "Київ", "4.00");
+        linkMasterToOwnedDef(masterC, performed, null, true);
+        // Unbookable type-A def: base 100, NO master performs it → must NOT count in the band.
+        seedTypedSalonOwnedDef(salonC, "Кератин без майстра", "HAIRCUT",
+                "FIXED", new BigDecimal("100.00"), null, typeIdA, true);
+
+        JsonNode row = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0);
+
+        assertThat(new BigDecimal(row.path("priceMin").asText()))
+                .as("priceMin = the performing master's base_price 1500 — the unbookable owned 100 "
+                        + "service must NOT lower the band")
+                .isEqualByComparingTo(new BigDecimal("1500.00"));
+        assertThat(new BigDecimal(row.path("priceMax").asText()))
+                .as("priceMax collapses to the same 1500 (single performing master, no override)")
+                .isEqualByComparingTo(new BigDecimal("1500.00"));
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (matched lines): matchedServiceNames reflects ONLY master-performed type-T services; an unbookable owned type-T service is NOT listed")
+    void should_limitSalonMatchedServiceNames_toMasterPerformedServices() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        UUID salon = seedActiveSalon("Київ", null);
+        // Performed type-A def — an active master performs it → must appear.
+        UUID performed = seedTypedSalonOwnedDef(salon, "Кератин виконуваний", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID master = seedSalonMasterFor(salon, "Київ", "4.00");
+        linkMasterToOwnedDef(master, performed, null, true);
+        // Unbookable type-A def — same salon, NO master performs it → must NOT appear.
+        seedTypedSalonOwnedDef(salon, "Кератин недоступний", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+
+        JsonNode row = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0);
+        java.util.List<String> matched = new java.util.ArrayList<>();
+        row.path("matchedServiceNames").forEach(n -> matched.add(n.asText()));
+
+        assertThat(matched)
+                .as("matchedServiceNames lists ONLY the master-performed type-A service; "
+                        + "the unbookable owned one is excluded")
+                .containsExactly("Кератин виконуваний");
+        assertThat(matched)
+                .as("the unbookable owned type-A service name must not appear in the matched line")
+                .doesNotContain("Кератин недоступний");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Seeds a SALON-owned {@code service_definitions} row (FIXED or RANGE) and
+     * returns its id, with <b>NO {@code master_services} row</b> — the caller
+     * attaches performing masters via {@link #linkMasterToOwnedDef}. Backs the
+     * TARGET (bookable-gate) salon tests, which must control the master assignment
+     * (present / inactive-link / inactive-master) and per-master
+     * {@code price_override} independently of the owned def. Honours the V67
+     * {@code chk_service_def_price_mode} CHECK: FIXED → {@code price_max} NULL;
+     * RANGE → {@code price_max} >= {@code base_price}.
+     */
+    private UUID seedTypedSalonOwnedDef(UUID salonId, String serviceName, String category,
+                                        String priceType, BigDecimal basePrice, BigDecimal priceMax,
+                                        UUID serviceTypeId, boolean defActive) {
+        UUID typeId = serviceTypeId != null ? serviceTypeId : unrelatedServiceTypeId();
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, price_type, price_max, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, ?, ?, ?, 60, ?, ?, ?, 0, ?, NOW(), NOW())",
+                serviceDefId, salonId, serviceName, category, typeId,
+                basePrice, priceType, priceMax, defActive);
+        return serviceDefId;
+    }
+
+    /**
+     * Links an existing master to an existing {@code service_definitions} row via
+     * a {@code master_services} row, with an optional per-master
+     * {@code price_override} ({@code null} → the def's base_price is the effective
+     * price) and a controllable {@code is_active} flag. Two DIFFERENT masters may
+     * link to the same def (the UNIQUE key is on {@code (master_id, service_def_id)}).
+     * Backs the TARGET salon price-band tests where performing masters' effective
+     * prices diverge from the salon-owned base_price.
+     */
+    private void linkMasterToOwnedDef(UUID masterId, UUID serviceDefId,
+                                      BigDecimal priceOverride, boolean msActive) {
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, price_override, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, priceOverride, msActive);
+    }
 
     /**
      * Seeds an ACTIVE-or-inactive SALON-owned {@code service_definitions} row
