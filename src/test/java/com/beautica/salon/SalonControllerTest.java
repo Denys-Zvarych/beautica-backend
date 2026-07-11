@@ -103,6 +103,9 @@ class SalonControllerTest {
                     .authorizeHttpRequests(auth -> auth
                             .requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}").permitAll()
                             .requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll()
+                            // Phase 23.x: mirrors the production SecurityConfig public GET matcher for
+                            // the booking-selection endpoint.
+                            .requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services/{serviceDefId}/masters").permitAll()
                             .anyRequest().authenticated())
                     .exceptionHandling(ex -> ex
                             .authenticationEntryPoint((req, res, exc) ->
@@ -128,6 +131,13 @@ class SalonControllerTest {
 
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
+
+    // Phase 23.x: SalonController now constructor-injects BookingMasterService for the
+    // GET /{salonId}/services/{serviceDefId}/masters booking-selection endpoint. Without this
+    // @MockBean the @WebMvcTest context fails to load (no bean of type BookingMasterService),
+    // which previously took down all 33 tests in this class.
+    @MockBean
+    private com.beautica.booking.service.BookingMasterService bookingMasterService;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -238,6 +248,72 @@ class SalonControllerTest {
         mockMvc.perform(get(SALONS_URL + "/" + unknownId)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isNotFound());
+    }
+
+    // ── GET /api/v1/salons/{salonId}/services/{serviceDefId}/masters ──────────
+    // Phase 23.x booking-selection endpoint. The @WebMvcTest slice proves only the HTTP
+    // contract (public access, JSON shape, 404 passthrough); the schedule-usability filter
+    // itself lives in BookingMasterService (a @MockBean here) and is covered end-to-end by
+    // BookingMasterServiceIT against a real Postgres.
+
+    @Test
+    @DisplayName("GET /{salonId}/services/{serviceDefId}/masters — 200 with bookable master list, no authentication (public)")
+    void should_return200WithBookableMasters_when_publicRequest() throws Exception {
+        var salonId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var masterServiceId = UUID.randomUUID();
+        var bookable = new com.beautica.booking.dto.BookableMasterResponse(
+                masterId, masterServiceId, "Олена", "Коваль", "Майстер манікюру",
+                "https://cdn.example/a.jpg", new java.math.BigDecimal("4.80"), 12);
+        when(bookingMasterService.getBookableMasters(salonId, serviceDefId))
+                .thenReturn(List.of(bookable));
+
+        log.debug("Act: GET {}/{}/services/{}/masters without credentials — public booking-selection endpoint",
+                SALONS_URL, salonId, serviceDefId);
+        mockMvc.perform(get(SALONS_URL + "/" + salonId + "/services/" + serviceDefId + "/masters")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(1))
+                .andExpect(jsonPath("$.data[0].masterId").value(masterId.toString()))
+                .andExpect(jsonPath("$.data[0].masterServiceId").value(masterServiceId.toString()))
+                .andExpect(jsonPath("$.data[0].firstName").value("Олена"))
+                .andExpect(jsonPath("$.data[0].lastName").value("Коваль"))
+                .andExpect(jsonPath("$.data[0].avgRating").value(4.80))
+                .andExpect(jsonPath("$.data[0].reviewCount").value(12));
+    }
+
+    @Test
+    @DisplayName("GET /{salonId}/services/{serviceDefId}/masters — 200 with [] when no candidate is schedule-usable")
+    void should_return200EmptyList_when_noBookableMasters() throws Exception {
+        var salonId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        when(bookingMasterService.getBookableMasters(salonId, serviceDefId)).thenReturn(List.of());
+
+        log.debug("Act: GET {}/{}/services/{}/masters — all candidates scheduleless, expect 200 []",
+                SALONS_URL, salonId, serviceDefId);
+        mockMvc.perform(get(SALONS_URL + "/" + salonId + "/services/" + serviceDefId + "/masters")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.length()").value(0));
+    }
+
+    @Test
+    @DisplayName("GET /{salonId}/services/{serviceDefId}/masters — 404 when salon/service does not resolve (service NotFoundException)")
+    void should_return404_when_serviceDoesNotResolve() throws Exception {
+        var salonId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        when(bookingMasterService.getBookableMasters(salonId, serviceDefId))
+                .thenThrow(new com.beautica.common.exception.NotFoundException("Service not found: " + serviceDefId));
+
+        log.debug("Act: GET {}/{}/services/{}/masters for a service that does not resolve to this salon",
+                SALONS_URL, salonId, serviceDefId);
+        mockMvc.perform(get(SALONS_URL + "/" + salonId + "/services/" + serviceDefId + "/masters")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false));
     }
 
     // ── PATCH /api/v1/salons/{id} ─────────────────────────────────────────────

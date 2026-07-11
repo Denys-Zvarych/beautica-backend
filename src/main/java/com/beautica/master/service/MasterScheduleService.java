@@ -280,6 +280,57 @@ public class MasterScheduleService {
                 .toList();
     }
 
+    // ---- Step 8 (Phase 23.x perf follow-up): short-circuiting boolean usability gate -----
+
+    /**
+     * Boolean equivalent of {@code getClientWorkingDays(masterId, from,
+     * to).stream().anyMatch(MasterWorkingDayResponse::working)} that stops at the first working day
+     * instead of materializing the full {@code [from, to]} projection first. {@link #getClientWorkingDays}
+     * always resolves every date in the requested range via {@link #resolveEffectiveRange} before a
+     * caller's {@code anyMatch} can short-circuit the final scan — so a 181-day booking-horizon check
+     * paid the full 181-date resolution even when the very first date was already a working day. This
+     * method short-circuits the day-walk itself: it returns as soon as a working day is found.
+     *
+     * <p><b>Same resolver, identical verdict.</b> Not a parallel/divergent predicate — it bulk-loads the
+     * exact same {@code overridesByDate}/{@code windows} data {@link #resolveEffectiveRange} loads, folds
+     * each date via the exact same {@link #resolveFromOverride}/{@link #resolveFromTemplate}/
+     * {@link #firstCovering} helpers, and reduces each result via the exact same
+     * {@link EffectiveDayResponse#isWorkingDay()} that {@link #getClientWorkingDays} does. Because every
+     * step is the same code, not a reimplementation, this returns {@code true} for a date range iff
+     * {@code getClientWorkingDays(...).anyMatch(...)} would — for every schedule shape (no schedule, an
+     * expired {@code valid_to}, a zero-interval template row, an EXPLICIT_TIMES-only day, a future-only
+     * window). Only the loop control differs: an early {@code return true} instead of continuing to fold
+     * every remaining date.
+     *
+     * <p><b>Caching.</b> Mirrors {@link #getClientWorkingDays}: cached in {@code master-usable-schedule}
+     * (60 sec TTL, {@code sync=true} to collapse a thundering herd), keyed identically
+     * {@code {#masterId, #from, #to}}, and evicted by master prefix from {@link #evictSlotsAfterCommit}
+     * alongside {@code available-slots} and {@code master-working-days} on every schedule write.
+     */
+    @Transactional(readOnly = true)
+    @Cacheable(value = "master-usable-schedule", key = "{#masterId, #from, #to}", sync = true)
+    public boolean hasUsableSchedule(UUID masterId, LocalDate from, LocalDate to) {
+        dateMath.assertExpandable(from, to);
+        List<LocalDate> dates = dateMath.expandInclusive(from, to);
+
+        Map<LocalDate, ScheduleException> overridesByDate = scheduleExceptionRepository
+                .findByMasterIdAndDateBetweenWithIntervals(masterId, from, to).stream()
+                .collect(Collectors.toMap(ScheduleException::getDate, e -> e, (a, b) -> a));
+        List<WeeklySchedule> windows =
+                weeklyScheduleRepository.findOverlappingRangeWithIntervals(masterId, from, to);
+
+        for (LocalDate date : dates) {
+            ScheduleException override = overridesByDate.get(date);
+            EffectiveDayResponse day = override != null
+                    ? resolveFromOverride(date, override)
+                    : resolveFromTemplate(date, firstCovering(windows, date));
+            if (day.isWorkingDay()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ---- resolver helpers ---------------------------------------------------------------
 
     private EffectiveDayResponse resolveFromOverride(LocalDate date, ScheduleException override) {
@@ -571,6 +622,7 @@ public class MasterScheduleService {
             public void afterCommit() {
                 doEvictAvailableSlotsByMaster(masterId);
                 doEvictWorkingDaysByMaster(masterId);
+                doEvictUsableScheduleByMaster(masterId);
             }
         });
     }
@@ -585,6 +637,15 @@ public class MasterScheduleService {
      */
     private void doEvictWorkingDaysByMaster(UUID masterId) {
         evictByMasterPrefix("master-working-days", masterId);
+    }
+
+    /**
+     * Mirrors {@link #doEvictWorkingDaysByMaster}: {@code master-usable-schedule} (backing
+     * {@link #hasUsableSchedule}) is keyed identically {@code {#masterId, #from, #to}}, so the same
+     * masterId-prefix Caffeine key scan applies.
+     */
+    private void doEvictUsableScheduleByMaster(UUID masterId) {
+        evictByMasterPrefix("master-usable-schedule", masterId);
     }
 
     /**

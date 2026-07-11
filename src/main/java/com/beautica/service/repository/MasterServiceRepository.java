@@ -146,4 +146,38 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))) sub
             """, nativeQuery = true)
     Integer acquireBulkSetupLock(@Param("masterId") UUID masterId);
+
+    /**
+     * Booking-selection candidates (Phase 23.x): the active {@link MasterServiceAssignment}s for
+     * {@code serviceDefId} belonging to active masters of {@code salonId}. Returns the assignment
+     * (not the bare master) so both the master's display fields and the assignment id
+     * ({@code msa.id} — the {@code masterServiceId} the downstream slot/booking calls require)
+     * are available in one round-trip, letting the mobile client drop its per-master
+     * {@code getMasterServices} fan-out.
+     *
+     * <p>{@code JOIN FETCH msa.master m} and {@code JOIN FETCH m.user} initialise everything
+     * {@code BookableMasterResponse#from} reads (Anti-Bug §E — no N+1 / lazy load outside the
+     * transaction). The DB {@code UNIQUE (master_id, service_def_id)} constraint (V7) guarantees
+     * at most one row per (master, service), so no {@code DISTINCT} is needed.
+     *
+     * <p><strong>Schedule usability is intentionally NOT filtered here.</strong> Whether a
+     * candidate has a usable schedule is resolved in-memory by
+     * {@code com.beautica.booking.service.BookingMasterService}, which reuses
+     * {@code MasterScheduleService.hasUsableSchedule} — the short-circuiting boolean gate over the
+     * same override/template/gap resolver the client calendar reads
+     * ({@code getClientWorkingDays}, Phase 15.11) — so the master list and the calendar can never
+     * disagree (see that class's Javadoc).
+     */
+    @Query("""
+            SELECT msa FROM MasterServiceAssignment msa
+            JOIN FETCH msa.master m
+            JOIN FETCH m.user
+            WHERE m.salon.id = :salonId
+              AND m.isActive = true
+              AND msa.serviceDefinition.id = :serviceDefId
+              AND msa.isActive = true
+            """)
+    List<MasterServiceAssignment> findBookableAssignmentsBySalonAndServiceDef(
+            @Param("salonId") UUID salonId,
+            @Param("serviceDefId") UUID serviceDefId);
 }

@@ -1,6 +1,8 @@
 package com.beautica.salon.controller;
 
 import com.beautica.auth.dto.InviteResponse;
+import com.beautica.booking.dto.BookableMasterResponse;
+import com.beautica.booking.service.BookingMasterService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.security.AuthenticationUtils;
@@ -38,6 +40,7 @@ import java.util.UUID;
 public class SalonController {
 
     private final SalonService salonService;
+    private final BookingMasterService bookingMasterService;
 
     @PostMapping
     @PreAuthorize("hasRole('SALON_OWNER')")
@@ -100,6 +103,25 @@ public class SalonController {
                 page.getTotalElements(),
                 page.getTotalPages()
         ));
+    }
+
+    /**
+     * Masters actually bookable for {@code serviceDefId} within {@code salonId} — booking-flow
+     * master selection (Phase 23.x), distinct from {@link #getMastersBySalon} (the salon-profile
+     * roster). Public/unauthenticated, matching the existing {@code GET /{salonId}/masters} and
+     * {@code GET /masters/{masterId}/services} read config in {@code SecurityConfig}: clients
+     * browse and pick a master before authenticating to book.
+     *
+     * <p>Filtering (active + actively assigned to the service + schedule-usable) is entirely
+     * delegated to {@link BookingMasterService} — see its Javadoc for why a master with no usable
+     * schedule must never appear here.
+     */
+    @GetMapping("/{salonId}/services/{serviceDefId}/masters")
+    public ApiResponse<List<BookableMasterResponse>> getBookableMasters(
+            @PathVariable UUID salonId,
+            @PathVariable UUID serviceDefId
+    ) {
+        return ApiResponse.ok(bookingMasterService.getBookableMasters(salonId, serviceDefId));
     }
 
     @DeleteMapping("/{salonId}")

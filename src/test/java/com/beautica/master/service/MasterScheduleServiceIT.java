@@ -1276,6 +1276,120 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════════════
+    // hasUsableSchedule — short-circuiting boolean gate (Phase 23.x perf follow-up)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * {@link MasterScheduleService#hasUsableSchedule} must agree with
+     * {@code getClientWorkingDays(...).anyMatch(...)} for every schedule shape, and must not
+     * false-negative when the only working day sits at the far end of a wide range (proving the
+     * early-return loop still walks every date rather than stopping too soon).
+     */
+    @Nested
+    @DisplayName("hasUsableSchedule — short-circuit correctness (Phase 23.x)")
+    class UsableScheduleShortCircuit {
+
+        private boolean anyWorkingDay(UUID masterId, LocalDate from, LocalDate to) {
+            return scheduleService.getClientWorkingDays(masterId, from, to).stream()
+                    .anyMatch(MasterWorkingDayResponse::working);
+        }
+
+        @Test
+        @DisplayName("returns true and agrees with getClientWorkingDays when the working day is the FIRST date in range")
+        void should_returnTrue_when_workingDayIsFirstDateInRange() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(FUTURE_FROM.getDayOfWeek().getValue(), iv(9, 17))));
+            LocalDate to = FUTURE_FROM.plusDays(180);
+
+            boolean result = scheduleService.hasUsableSchedule(m.masterId(), FUTURE_FROM, to);
+
+            assertThat(result).isTrue();
+            assertThat(result)
+                    .as("must agree with the anyMatch(getClientWorkingDays) verdict")
+                    .isEqualTo(anyWorkingDay(m.masterId(), FUTURE_FROM, to));
+        }
+
+        @Test
+        @DisplayName("returns true and agrees with getClientWorkingDays when the only working day is the LAST date in range")
+        void should_returnTrue_when_workingDayIsLastDateInRange() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate to = FUTURE_FROM.plusDays(180);
+            // Only working weekday in the whole window is `to`'s ISO weekday, and the window is scoped
+            // so no earlier date in [FUTURE_FROM, to] shares that weekday — proves the loop walks the
+            // full range instead of stopping early on a false negative.
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(to, null, day(to.getDayOfWeek().getValue(), iv(9, 17))));
+
+            boolean result = scheduleService.hasUsableSchedule(m.masterId(), FUTURE_FROM, to);
+
+            assertThat(result)
+                    .as("a working day at the far end of the range must still be found, not skipped")
+                    .isTrue();
+            assertThat(result)
+                    .as("must agree with the anyMatch(getClientWorkingDays) verdict")
+                    .isEqualTo(anyWorkingDay(m.masterId(), FUTURE_FROM, to));
+        }
+
+        @Test
+        @DisplayName("returns false and agrees with getClientWorkingDays when no date in range is a working day")
+        void should_returnFalse_when_noWorkingDayInRange() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate to = FUTURE_FROM.plusDays(30);
+            // No schedule at all → every date resolves to NO_SCHEDULE.
+
+            boolean result = scheduleService.hasUsableSchedule(m.masterId(), FUTURE_FROM, to);
+
+            assertThat(result).isFalse();
+            assertThat(result)
+                    .as("must agree with the anyMatch(getClientWorkingDays) verdict")
+                    .isEqualTo(anyWorkingDay(m.masterId(), FUTURE_FROM, to));
+        }
+
+        @Test
+        @DisplayName("returns true and agrees with getClientWorkingDays for an EXPLICIT_TIMES-only working day")
+        void should_returnTrue_when_scheduleUsesExplicitTimesOnly() {
+            SeededMaster m = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(FUTURE_FROM, null,
+                            explicitDay(FUTURE_FROM.getDayOfWeek().getValue(), t(10, 0), t(11, 30))));
+            LocalDate to = FUTURE_FROM.plusDays(7);
+
+            boolean result = scheduleService.hasUsableSchedule(m.masterId(), FUTURE_FROM, to);
+
+            assertThat(result).isTrue();
+            assertThat(result)
+                    .as("must agree with the anyMatch(getClientWorkingDays) verdict")
+                    .isEqualTo(anyWorkingDay(m.masterId(), FUTURE_FROM, to));
+        }
+
+        /**
+         * Cache regression mirroring {@code PerformanceGuards#should_reflectFreshSchedule_when_
+         * readThroughRealCacheableProxy_afterWrite}: {@code master-usable-schedule} must be evicted
+         * after commit, not silently no-opped by a stale key-shape assumption.
+         */
+        @Test
+        @DisplayName("Cache regression — master-usable-schedule reflects a schedule write, not a stale pre-write result")
+        void should_reflectFreshSchedule_when_readThroughRealCacheableProxy_afterWrite() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate to = FUTURE_FROM.plusDays(7);
+
+            boolean before = scheduleService.hasUsableSchedule(m.masterId(), FUTURE_FROM, to);
+            assertThat(before).as("no schedule yet").isFalse();
+
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM, ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(9, 17))));
+
+            boolean after = scheduleService.hasUsableSchedule(m.masterId(), FUTURE_FROM, to);
+            assertThat(after)
+                    .as("the cache must be evicted after commit — must reflect the new CUSTOM_HOURS "
+                            + "override, not the stale pre-write false result")
+                    .isTrue();
+        }
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────────────
 
     private static EffectiveDayResponse byDate(List<EffectiveDayResponse> days, LocalDate date) {
