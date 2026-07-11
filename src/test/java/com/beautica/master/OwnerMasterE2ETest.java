@@ -177,9 +177,19 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         log.debug("Step 4 complete — working hours set for masterId={}", masterId);
 
         // ── Step 5: create a service definition ───────────────────────────────
+        // Since Phase 16.x / V111, service_type_id is mandatory (@NotNull) and must belong to
+        // the request's category — resolve a real seeded HAIRDRESSING service type via the same
+        // canonical query as ServiceTestFixtures#resolveServiceTypeIdForCategory.
+        UUID hairServiceTypeId = jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.platform_category_name = ? AND st.is_active = TRUE "
+                        + "AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class, "HAIRDRESSING");
         var createSvcReq = new CreateServiceDefinitionRequest(
                 "E2E Hair Treatment", null, "HAIRDRESSING", 60, 0,
-                PriceType.FIXED, new BigDecimal("450.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("450.00"), null, null, hairServiceTypeId);
         ResponseEntity<String> svcResp = restTemplate.exchange(
                 SALONS_URL + "/" + salonId + "/services", HttpMethod.POST,
                 new HttpEntity<>(createSvcReq, bearerHeaders(ownerToken)),
