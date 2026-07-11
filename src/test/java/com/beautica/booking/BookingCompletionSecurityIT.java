@@ -313,9 +313,9 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
     private UUID createSalonService(UUID salonId) {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'SALON', ?, 'Test Service', 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId);
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, resolveServiceTypeId());
         UUID masterServiceId = UUID.randomUUID();
         UUID masterId = jdbcTemplate.queryForObject("SELECT id FROM masters WHERE salon_id = ? LIMIT 1", UUID.class, salonId);
         jdbcTemplate.update(
@@ -328,14 +328,26 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
         UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
-                        "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId);
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, userId, resolveServiceTypeId());
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
                 masterServiceId, masterId, serviceDefId);
         return masterServiceId;
+    }
+
+    /**
+     * Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL).
+     */
+    private UUID resolveServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class);
     }
 
     private UUID insertConfirmedSalonBooking(Salon salon) {

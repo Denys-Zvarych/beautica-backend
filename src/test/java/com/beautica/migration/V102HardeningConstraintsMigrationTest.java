@@ -305,10 +305,24 @@ class V102HardeningConstraintsMigrationTest extends AbstractIntegrationTest {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions "
-                        + "(id, owner_type, owner_id, name, base_duration_minutes, base_price, price_type, is_active) "
-                        + "VALUES (?, 'SALON', ?, 'V102 Test Service', 60, 350.00, 'FIXED', true)",
-                id, salonId);
+                        + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, price_type, is_active) "
+                        + "VALUES (?, 'SALON', ?, 'V102 Test Service', ?, 60, 350.00, 'FIXED', true)",
+                id, salonId, resolveServiceTypeId());
         return id;
+    }
+
+    /**
+     * Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL).
+     * The specific category is irrelevant to V102's free-text/CHECK contract, so any active,
+     * APPROVED-category type satisfies the FK.
+     */
+    private UUID resolveServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class);
     }
 
     private UUID insertMasterService(UUID masterId, UUID serviceDefId) {

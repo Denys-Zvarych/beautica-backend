@@ -64,6 +64,20 @@ class ServicePricingMigrationTest extends AbstractIntegrationTest {
         return salonId;
     }
 
+    /**
+     * Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL).
+     * V67's price-range CHECK contract is orthogonal to which service type is used, so any
+     * active, APPROVED-category type satisfies the FK.
+     */
+    private UUID resolveServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class);
+    }
+
     // ── HIGH-1: backfill ──────────────────────────────────────────────────────
 
     @Nested
@@ -81,9 +95,9 @@ class ServicePricingMigrationTest extends AbstractIntegrationTest {
             UUID sdId = UUID.randomUUID();
             jdbcTemplate.update(
                     "INSERT INTO service_definitions "
-                    + "(id, owner_type, owner_id, name, base_duration_minutes, base_price, is_active) "
-                    + "VALUES (?, 'SALON', ?, 'Backfill Test Service', 60, 350.00, true)",
-                    sdId, salonId);
+                    + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, is_active) "
+                    + "VALUES (?, 'SALON', ?, 'Backfill Test Service', ?, 60, 350.00, true)",
+                    sdId, salonId, resolveServiceTypeId());
 
             String priceType = jdbcTemplate.queryForObject(
                     "SELECT price_type FROM service_definitions WHERE id = ?",
@@ -113,10 +127,10 @@ class ServicePricingMigrationTest extends AbstractIntegrationTest {
             assertThatThrownBy(() ->
                     jdbcTemplate.update(
                             "INSERT INTO service_definitions "
-                            + "(id, owner_type, owner_id, name, base_duration_minutes, "
+                            + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, "
                             + " price_type, base_price, price_max, is_active) "
-                            + "VALUES (?, 'SALON', ?, 'Bad Fixed Service', 60, 'FIXED', 500.00, 200.00, true)",
-                            sdId, salonId))
+                            + "VALUES (?, 'SALON', ?, 'Bad Fixed Service', ?, 60, 'FIXED', 500.00, 200.00, true)",
+                            sdId, salonId, resolveServiceTypeId()))
                     .isInstanceOf(DataIntegrityViolationException.class)
                     .as("chk_service_def_price_mode must reject FIXED row with non-null price_max "
                             + "(price_max must be NULL for FIXED)");
@@ -139,10 +153,10 @@ class ServicePricingMigrationTest extends AbstractIntegrationTest {
             assertThatThrownBy(() ->
                     jdbcTemplate.update(
                             "INSERT INTO service_definitions "
-                            + "(id, owner_type, owner_id, name, base_duration_minutes, "
+                            + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, "
                             + " price_type, base_price, price_max, is_active) "
-                            + "VALUES (?, 'SALON', ?, 'Bad Range Service', 60, 'RANGE', 800.00, 500.00, true)",
-                            sdId, salonId))
+                            + "VALUES (?, 'SALON', ?, 'Bad Range Service', ?, 60, 'RANGE', 800.00, 500.00, true)",
+                            sdId, salonId, resolveServiceTypeId()))
                     .isInstanceOf(DataIntegrityViolationException.class)
                     .as("chk_service_def_price_mode must reject RANGE row where price_max (500) "
                             + "< base_price (800); the constraint requires price_max >= base_price");
@@ -158,10 +172,10 @@ class ServicePricingMigrationTest extends AbstractIntegrationTest {
             // Must not throw — well-formed RANGE row
             jdbcTemplate.update(
                     "INSERT INTO service_definitions "
-                    + "(id, owner_type, owner_id, name, base_duration_minutes, "
+                    + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, "
                     + " price_type, base_price, price_max, is_active) "
-                    + "VALUES (?, 'SALON', ?, 'Valid Range Service', 60, 'RANGE', 500.00, 800.00, true)",
-                    sdId, salonId);
+                    + "VALUES (?, 'SALON', ?, 'Valid Range Service', ?, 60, 'RANGE', 500.00, 800.00, true)",
+                    sdId, salonId, resolveServiceTypeId());
 
             Integer count = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_definitions WHERE id = ?",
@@ -183,10 +197,10 @@ class ServicePricingMigrationTest extends AbstractIntegrationTest {
             // at the service layer. This test confirms the DB boundary is >= as documented.
             jdbcTemplate.update(
                     "INSERT INTO service_definitions "
-                    + "(id, owner_type, owner_id, name, base_duration_minutes, "
+                    + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, "
                     + " price_type, base_price, price_max, is_active) "
-                    + "VALUES (?, 'SALON', ?, 'Equal Range Service', 60, 'RANGE', 600.00, 600.00, true)",
-                    sdId, salonId);
+                    + "VALUES (?, 'SALON', ?, 'Equal Range Service', ?, 60, 'RANGE', 600.00, 600.00, true)",
+                    sdId, salonId, resolveServiceTypeId());
 
             Integer count = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM service_definitions WHERE id = ?",
