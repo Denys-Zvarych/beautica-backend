@@ -9,10 +9,12 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.review.entity.Review;
 import com.beautica.salon.entity.Salon;
+import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.entity.ServiceType;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -87,6 +89,8 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
                 .build();
         em.persist(master);
 
+        ServiceType defaultServiceType = persistServiceType();
+
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
@@ -95,6 +99,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("450.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(serviceDefinition);
@@ -120,6 +125,34 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
         em.persist(completedBooking);
 
         em.flush();
+    }
+
+    private static final java.util.concurrent.atomic.AtomicInteger SORT_ORDER_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger(90_000);
+
+    /**
+     * Persists a CatalogCategory + ServiceType so fixture ServiceDefinitions satisfy the
+     * NOT NULL service_type_id FK. sortOrder is unique per call (uq_service_categories_sort_order) —
+     * some tests call this helper more than once per transaction (e.g. a second master's
+     * ServiceDefinition), so a fixed sortOrder would collide.
+     */
+    private ServiceType persistServiceType() {
+        CatalogCategory category = CatalogCategory.builder()
+                .nameUk("Нігті")
+                .nameEn("Nails")
+                .sortOrder(SORT_ORDER_SEQ.getAndIncrement())
+                .build();
+        em.persist(category);
+
+        ServiceType serviceType = ServiceType.builder()
+                .category(category)
+                .nameUk("Манікюр")
+                .nameEn("Manicure")
+                .slug("type-" + UUID.randomUUID())
+                .platformCategoryName("NAIL_SERVICE")
+                .build();
+        em.persist(serviceType);
+        return serviceType;
     }
 
     @Test
@@ -200,6 +233,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(45)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
+                .serviceType(persistServiceType())
                 .isActive(true)
                 .build();
         em.persist(sd2);
