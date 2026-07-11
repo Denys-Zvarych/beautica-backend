@@ -167,8 +167,8 @@ class ServiceTypeOpenApiContractTest extends AbstractIntegrationTest {
     // ── 2. CreateServiceDefinitionRequest schema ──────────────────────────────
 
     @Test
-    @DisplayName("CreateServiceDefinitionRequest — serviceTypeId present, nullable, and NOT in required[]")
-    void should_documentServiceTypeIdAsOptionalNullable_when_createRequestSchemaPublished() {
+    @DisplayName("CreateServiceDefinitionRequest — serviceTypeId present, non-nullable, and IN required[] (mandatory since V111)")
+    void should_documentServiceTypeIdAsRequired_when_createRequestSchemaPublished() {
         JsonNode schema = schema("CreateServiceDefinitionRequest");
 
         JsonNode serviceTypeId = schema.path("properties").path("serviceTypeId");
@@ -176,21 +176,24 @@ class ServiceTypeOpenApiContractTest extends AbstractIntegrationTest {
                 .as("CreateServiceDefinitionRequest.serviceTypeId property must be present; schema=%s", schema)
                 .isFalse();
 
+        // Phase 16.x / V111: the picker can no longer be skipped. The DTO carries @NotNull and
+        // Schema.RequiredMode.REQUIRED, so SpringDoc must NOT mark the field nullable and MUST
+        // list it in required[]. Mobile codegen keys off both signals to make the field mandatory.
         assertThat(typeContainsNull(serviceTypeId))
-                .as("CreateServiceDefinitionRequest.serviceTypeId must be nullable "
-                        + "(type contains \"null\") in OpenAPI 3.1; type node=%s", serviceTypeId.path("type"))
-                .isTrue();
+                .as("CreateServiceDefinitionRequest.serviceTypeId must NOT be nullable now that a "
+                        + "service type is mandatory; type node=%s", serviceTypeId.path("type"))
+                .isFalse();
 
         List<String> required = requiredFieldNames(schema);
 
         assertThat(required)
-                .as("serviceTypeId must NOT be in the schema required[] — the picker is optional; required=%s",
+                .as("serviceTypeId MUST be in the schema required[] — the picker is mandatory since V111; required=%s",
                         required)
-                .doesNotContain("serviceTypeId");
+                .contains("serviceTypeId");
 
-        // name is now OPTIONAL on create: when blank, the service layer defaults it to the
-        // selected service type's Ukrainian name. @NotBlank was removed, so SpringDoc no
-        // longer lists name in required[]. The mobile create form lets masters leave it blank.
+        // name is still OPTIONAL on create: when blank, the service layer defaults it to the
+        // selected service type's Ukrainian name. @NotBlank was removed, so SpringDoc must not
+        // list name in required[]. The mobile create form lets masters leave it blank.
         assertThat(required)
                 .as("name must NOT be in the schema required[] — it is optional and defaults to "
                         + "the service-type name when blank; required=%s", required)

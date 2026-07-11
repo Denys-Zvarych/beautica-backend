@@ -6,10 +6,12 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.entity.ServiceType;
 import com.beautica.user.User;
 import jakarta.persistence.PersistenceException;
 import org.junit.jupiter.api.BeforeEach;
@@ -71,6 +73,8 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
                 .build();
         em.persist(master);
 
+        ServiceType serviceType = persistServiceType();
+
         ServiceDefinition serviceDefinition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
@@ -79,6 +83,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("450.00"))
+                .serviceType(serviceType)
                 .isActive(true)
                 .build();
         em.persist(serviceDefinition);
@@ -91,6 +96,32 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
         em.persist(masterService);
 
         em.flush();
+    }
+
+    private static final java.util.concurrent.atomic.AtomicInteger SORT_ORDER_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger(90_000);
+
+    /**
+     * Persists a CatalogCategory + ServiceType so fixture ServiceDefinitions satisfy the
+     * NOT NULL service_type_id FK. sortOrder is unique per call (uq_service_categories_sort_order).
+     */
+    private ServiceType persistServiceType() {
+        CatalogCategory category = CatalogCategory.builder()
+                .nameUk("Нігті")
+                .nameEn("Nails")
+                .sortOrder(SORT_ORDER_SEQ.getAndIncrement())
+                .build();
+        em.persist(category);
+
+        ServiceType serviceType = ServiceType.builder()
+                .category(category)
+                .nameUk("Манікюр")
+                .nameEn("Manicure")
+                .slug("type-" + UUID.randomUUID())
+                .platformCategoryName("NAIL_SERVICE")
+                .build();
+        em.persist(serviceType);
+        return serviceType;
     }
 
     @Test

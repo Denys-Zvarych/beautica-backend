@@ -119,7 +119,13 @@ public class ServiceDefinition extends AuditableEntity {
     @Column(name = "photo_url", length = 2048)
     private String photoUrl;
 
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "service_type_id")
+    /**
+     * The finer service taxonomy (the column service-type search filters on). Mandatory on
+     * every creation path — DB column {@code service_type_id} is NOT NULL with an
+     * {@code ON DELETE RESTRICT} FK (V111), so an untyped service can never be persisted and a
+     * referenced service type cannot be deleted.
+     */
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "service_type_id", nullable = false)
     private ServiceType serviceType;
 }

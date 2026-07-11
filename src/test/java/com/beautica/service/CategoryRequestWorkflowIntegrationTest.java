@@ -90,13 +90,28 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
         // plain string), so order between these two deletes is irrelevant.
         jdbcTemplate.update(
                 "DELETE FROM service_type_suggestion WHERE category_name = ?", CATEGORY_NAME);
+        // Remove any service_type seeded by the round-trip test for this runtime category, plus the
+        // service_definitions that FK-reference it (service_definitions_service_type_id_fkey). This
+        // @AfterEach runs BEFORE the superclass cleanDb(), so the definitions must be cleared here in
+        // FK order first. platform_category_name itself is a plain slug (no FK to platform_categories).
+        jdbcTemplate.update(
+                "DELETE FROM service_definitions WHERE service_type_id IN "
+                        + "(SELECT id FROM service_types WHERE platform_category_name = ?)", CATEGORY_NAME);
+        jdbcTemplate.update(
+                "DELETE FROM service_types WHERE platform_category_name = ?", CATEGORY_NAME);
         jdbcTemplate.update("DELETE FROM platform_categories WHERE name = ?", CATEGORY_NAME);
     }
 
     private CreateServiceDefinitionRequest serviceWithCategory(String category) {
+        // serviceTypeId null: used by the negative paths (PENDING / retired OTHER) that are
+        // rejected by validateCategoryActive BEFORE the mandatory-type guard is reached.
+        return serviceWithCategory(category, null);
+    }
+
+    private CreateServiceDefinitionRequest serviceWithCategory(String category, UUID serviceTypeId) {
         return new CreateServiceDefinitionRequest(
                 "Workflow Service", "desc", category, 60, 0,
-                PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId);
     }
 
     @Test
@@ -163,7 +178,19 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
                 .isNull();
 
         // Assert 4 — service creation now succeeds (was rejected while PENDING).
-        var created = serviceCatalogService.addServiceToSalon(salonId, serviceWithCategory(CATEGORY_NAME));
+        // V111 makes service_type_id mandatory and category-consistent (Phase 16.3), so seed an
+        // active service_type under the now-APPROVED runtime category. platform_category_name is a
+        // plain slug column (V73: no FK to platform_categories), so this row does not block the
+        // @AfterEach platform_categories delete; it is removed by cleanCategory() in FK-free order.
+        jdbcTemplate.update(
+                "INSERT INTO service_types (id, category_id, name_uk, name_en, slug, is_active, "
+                        + "platform_category_name) "
+                        + "SELECT ?, sc.id, ?, ?, ?, TRUE, ? FROM service_categories sc LIMIT 1",
+                UUID.randomUUID(), "Воркфлоу тип", "Workflow type",
+                "itworkflow-nailart-" + System.nanoTime(), CATEGORY_NAME);
+        UUID seededTypeId = fixtures.resolveServiceTypeIdForCategory(CATEGORY_NAME);
+        var created = serviceCatalogService.addServiceToSalon(
+                salonId, serviceWithCategory(CATEGORY_NAME, seededTypeId));
         assertThat(created.category())
                 .as("category accepted by the service-create gate once APPROVED + active")
                 .isEqualTo(CATEGORY_NAME);

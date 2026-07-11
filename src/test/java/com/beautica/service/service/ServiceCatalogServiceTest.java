@@ -95,6 +95,12 @@ class ServiceCatalogServiceTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
+    /**
+     * A create request WITHOUT a service type (serviceTypeId + category both null). Since Phase
+     * 16.x / V111 the service type is MANDATORY on every create path, so this request is now the
+     * canonical INVALID one — every create entry point rejects it with 400 "Service type is
+     * required" before touching the repository. Kept for the missing-type negative tests.
+     */
     private CreateServiceDefinitionRequest buildCreateRequest() {
         return new CreateServiceDefinitionRequest(
                 "Manicure",
@@ -108,6 +114,42 @@ class ServiceCatalogServiceTest {
                 null,
                 null
         );
+    }
+
+    /**
+     * A valid create request carrying a MANICURE service type — the happy-path shape now that
+     * a service type is mandatory. The category matches the type's platform category so the
+     * Phase 16.3 cross-field guard passes.
+     */
+    private CreateServiceDefinitionRequest buildTypedCreateRequest(UUID serviceTypeId) {
+        return new CreateServiceDefinitionRequest(
+                "Manicure",
+                "Classic manicure",
+                "MANICURE",
+                60,
+                10,
+                PriceType.FIXED,
+                new BigDecimal("350.00"),
+                null,
+                null,
+                serviceTypeId
+        );
+    }
+
+    /**
+     * Stubs {@code serviceTypeLookup}/{@code platformCategoryRepository} for a valid, active MANICURE
+     * type. Only the calls the create flow actually makes are stubbed (active + category checks +
+     * lookup) so strict stubbing stays satisfied when the request name is non-blank and the saved
+     * mock carries no serviceType.
+     */
+    private ServiceType stubActiveManicureType(UUID serviceTypeId) {
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+        return serviceType;
     }
 
     private ServiceDefinition buildSavedDefinition(UUID salonId) {
@@ -125,17 +167,19 @@ class ServiceCatalogServiceTest {
     // ── addServiceToSalon ──────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("creates ServiceDefinition when owner adds a salon service")
+    @DisplayName("creates ServiceDefinition when owner adds a salon service (with mandatory service type)")
     void should_createServiceDefinition_when_ownerAddsSalonService() {
         UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
 
         ServiceDefinition savedDef = buildSavedDefinition(salonId);
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
+        stubActiveManicureType(serviceTypeId);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
 
         ServiceDefinitionResponse result = serviceCatalogService.addServiceToSalon(
-                salonId, buildCreateRequest());
+                salonId, buildTypedCreateRequest(serviceTypeId));
 
         assertThat(result).isNotNull();
         assertThat(result.id()).as("id must be populated from the saved entity").isNotNull();
@@ -377,11 +421,12 @@ class ServiceCatalogServiceTest {
     // ── addIndependentMasterService ────────────────────────────────────────────
 
     @Test
-    @DisplayName("creates both ServiceDefinition and MasterServiceAssignment when independent master adds a service")
+    @DisplayName("creates both ServiceDefinition and MasterServiceAssignment when independent master adds a service (with mandatory service type)")
     void should_createBothDefinitionAndAssignment_when_independentMasterAddsService() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID savedDefId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
 
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(masterId);
@@ -404,11 +449,12 @@ class ServiceCatalogServiceTest {
         when(savedAssignment.isActive()).thenReturn(true);
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        stubActiveManicureType(serviceTypeId);
         when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(
-                userId, buildCreateRequest());
+                userId, buildTypedCreateRequest(serviceTypeId));
 
         assertThat(result).isNotNull();
         assertThat(result.masterId())
@@ -679,18 +725,23 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("does not call ServiceTypeRepository when serviceTypeId is null")
-    void should_notSetServiceType_when_serviceTypeIdIsNull() {
+    @DisplayName("throws 400 'Service type is required' and never persists when serviceTypeId is null — addServiceToSalon")
+    void should_throw400_when_serviceTypeIdIsNull_addServiceToSalon() {
         UUID salonId = UUID.randomUUID();
 
-        ServiceDefinition savedDef = buildSavedDefinition(salonId);
-
+        // Mandatory-type contract (V111): a null serviceTypeId is rejected at resolveRequiredServiceType
+        // before the type lookup or the repository save is ever reached.
         when(salonRepository.existsById(salonId)).thenReturn(true);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
 
-        serviceCatalogService.addServiceToSalon(salonId, buildCreateRequest());
+        assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, buildCreateRequest()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Service type is required")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .as("missing service type must surface as 400 BAD_REQUEST")
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceTypeLookup, never()).getById(any());
+        verify(serviceRepository, never()).save(any());
     }
 
     @Test
@@ -948,48 +999,26 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("addIndependentMasterService response has null serviceTypeId + serviceTypeNameUk when no type is chosen")
-    void should_nullServiceTypeFieldsOnResponse_when_independentMasterCreatesWithoutServiceType() {
+    @DisplayName("throws 400 'Service type is required' and never persists when serviceTypeId is null — addIndependentMasterService")
+    void should_throw400_when_serviceTypeIdIsNull_addIndependentMasterService() {
         UUID userId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
 
         Master master = mock(Master.class);
-        when(master.getId()).thenReturn(masterId);
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
-
-        // buildCreateRequest() has a null serviceTypeId — the picker was not used.
-        ServiceDefinition savedDef = ServiceDefinition.builder()
-                .id(UUID.randomUUID())
-                .ownerType(OwnerType.INDEPENDENT_MASTER)
-                .ownerId(masterId)
-                .name("Manicure")
-                .baseDurationMinutes(60)
-                .bufferMinutesAfter(10)
-                .priceType(PriceType.FIXED)
-                .basePrice(new BigDecimal("350.00"))
-                .isActive(true)
-                .build();
-
-        MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
-        when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
-        when(savedAssignment.getMaster()).thenReturn(master);
-        when(savedAssignment.getServiceDefinition()).thenReturn(savedDef);
-        when(savedAssignment.isActive()).thenReturn(true);
-
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
-        when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
-        MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(
-                userId, buildCreateRequest());
+        // buildCreateRequest() has a null serviceTypeId — the mandatory-type guard rejects it
+        // before any ServiceDefinition or MasterServiceAssignment is saved.
+        assertThatThrownBy(() -> serviceCatalogService.addIndependentMasterService(userId, buildCreateRequest()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Service type is required")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .as("missing service type must surface as 400 BAD_REQUEST")
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
 
-        assertThat(result.serviceTypeId())
-                .as("serviceTypeId must be null when no service type was chosen")
-                .isNull();
-        assertThat(result.serviceTypeNameUk())
-                .as("serviceTypeNameUk must be null when no service type was chosen")
-                .isNull();
         verify(serviceTypeLookup, never()).getById(any());
+        verify(serviceRepository, never()).save(any());
+        verify(masterServiceRepository, never()).save(any());
     }
 
     @Test
@@ -1094,11 +1123,13 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("throws 400 'Name or service type is required' when name is blank and no service type is supplied on create")
+    @DisplayName("throws 400 'Service type is required' when name is blank and no service type is supplied on create")
     void should_throw400_when_blankNameAndNoServiceType_onCreate() {
         UUID salonId = UUID.randomUUID();
 
-        // Blank name + null serviceTypeId — nothing to derive a name from.
+        // Blank name + null serviceTypeId. Since V111 the mandatory-type guard
+        // (resolveRequiredServiceType) fires BEFORE the name-defaulting step, so the missing
+        // type — not the blank name — is what the caller is told to fix.
         CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
                 "   ", "Classic manicure", "MANICURE", 60, 10,
                 PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
@@ -1109,7 +1140,7 @@ class ServiceCatalogServiceTest {
 
         assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
                 .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("Name or service type is required")
+                .hasMessageContaining("Service type is required")
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 

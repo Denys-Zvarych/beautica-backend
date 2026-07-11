@@ -191,15 +191,31 @@ class V80MigrationIntegrationTest {
         try {
             jdbc.update(
                     "INSERT INTO service_definitions "
-                            + "(id, owner_type, owner_id, name, base_duration_minutes, base_price, price_type, "
+                            + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, price_type, "
                             + " buffer_minutes_after, is_active, created_at, updated_at) "
-                            + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Strict Check Probe', 0, 10, 'FIXED', 0, true, now(), now())",
-                    probeId, LEGACY_MASTER_ID);
+                            + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Strict Check Probe', ?, 0, 10, 'FIXED', 0, true, now(), now())",
+                    probeId, LEGACY_MASTER_ID, resolveServiceTypeId());
             // Insert unexpectedly succeeded — strict CHECK not enforced. Roll back the probe.
             jdbc.update("DELETE FROM service_definitions WHERE id = ?", probeId);
             return false;
         } catch (org.springframework.dao.DataIntegrityViolationException expected) {
             return true;
         }
+    }
+
+    /**
+     * Resolves a real, selectable {@code service_types.id} from THIS test's private container.
+     * By the time this probe runs, the full migration set (through latest, including V111's
+     * NOT NULL + V13/V64/V73-V75/V81's taxonomy seed data) has already applied, so a real,
+     * active, APPROVED-category type is available — the specific category is irrelevant to the
+     * base_duration_minutes CHECK this probe exercises.
+     */
+    private static UUID resolveServiceTypeId() {
+        return jdbc.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class);
     }
 }

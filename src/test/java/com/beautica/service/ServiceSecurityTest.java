@@ -89,7 +89,8 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
 
         var request = new CreateServiceDefinitionRequest(
                 "IDOR Service", null, "NAIL_SERVICE", 30, 0,
-                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("100.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
 
         // Act
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — IDOR must be blocked", salonAId);

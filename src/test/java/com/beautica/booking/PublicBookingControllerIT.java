@@ -87,15 +87,27 @@ class PublicBookingControllerIT extends AbstractIntegrationTest {
 
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update("""
-                INSERT INTO service_definitions (id, owner_type, owner_id, name, base_duration_minutes,
+                INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes,
                                                  base_price, buffer_minutes_after, is_active, created_at, updated_at)
-                VALUES (?, 'INDEPENDENT_MASTER', ?, 'Маникюр', 60, 500.00, 0, true, NOW(), NOW())
-                """, serviceDefId, masterId);
+                VALUES (?, 'INDEPENDENT_MASTER', ?, 'Маникюр', ?, 60, 500.00, 0, true, NOW(), NOW())
+                """, serviceDefId, masterId, resolveServiceTypeId());
 
         jdbcTemplate.update("""
                 INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at)
                 VALUES (?, ?, ?, true, NOW(), NOW())
                 """, UUID.randomUUID(), masterId, serviceDefId);
+    }
+
+    /**
+     * Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL).
+     */
+    private UUID resolveServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class);
     }
 
     /** Seeds a user + a {@code masters} row with the given slug, type, and active flag; returns the master id. */

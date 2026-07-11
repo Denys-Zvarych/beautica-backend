@@ -186,7 +186,10 @@ class ServiceValidationMessageContractTest {
     @DisplayName("POST /salons/{id}/services — a blank name passes validation (no @NotBlank on name)")
     void should_acceptBlankName_when_nameIsOptional() throws Exception {
         var salonId = UUID.randomUUID();
-        String body = "{\"name\":\"   \",\"category\":\"MANICURE\","
+        // serviceTypeId is now @NotNull, so it must be present for the request to reach the
+        // controller body — otherwise a missing-type violation would mask the point of this
+        // test, which is that a BLANK NAME is not itself a Bean Validation violation.
+        String body = "{\"name\":\"   \",\"category\":\"MANICURE\",\"serviceTypeId\":\"" + UUID.randomUUID() + "\","
                 + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
                 + "\"priceType\":\"FIXED\",\"price\":350.00}";
 

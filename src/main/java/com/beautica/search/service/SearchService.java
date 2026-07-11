@@ -153,9 +153,6 @@ public class SearchService {
     /** Named-parameter prefix for the resolved {@code service_type_id} of slug {@code n}. */
     private static final String SERVICE_TYPE_ID_PARAM = "stId";
 
-    /** Named-parameter prefix for the resolved {@code %nameUk%} ILIKE pattern of slug {@code n}. */
-    private static final String SERVICE_TYPE_NAME_PARAM = "stName";
-
     /** Projection index of the {@code service_names} {@code array_agg} column. */
     private static final int SERVICE_NAMES_IDX = 10;
 
@@ -362,7 +359,7 @@ public class SearchService {
      * native query — locality dispatch, optional {@code q} / price / category
      * predicates, and <b>one correlated {@code EXISTS} per selected slug</b>
      * (AND semantics) reaching into the salon's active masters' active services
-     * via the hybrid {@code service_type_id = :id OR name ILIKE :name} match —
+     * via the {@code service_type_id = :id} FK match —
      * plus a {@code COUNT(*) OVER()} window for single-query pagination
      * (PERF-M1) and the {@code matchedServiceNames} lateral (Phase 20.3). Bound
      * params are typed objects (UUID / BigDecimal) so no {@code CAST(:p …)} idiom
@@ -507,22 +504,28 @@ public class SearchService {
     }
 
     /**
-     * A selected {@code serviceTypeSlug} resolved to its hybrid match operands:
-     * the {@code service_type_id} FK target and the pre-escaped {@code %nameUk%}
-     * containment pattern. Both branches are ORed in the per-slug predicate
-     * ({@code sd.service_type_id = :id OR sd.name ILIKE :name}) so legacy /
-     * single-create rows whose FK is still {@code NULL} are recovered by name
-     * (Phase 20.x; FK backfill is the deferred Phase 20.4). Only ever built for
-     * a slug that resolved to an active service-type, so {@code serviceTypeId}
-     * is non-null and bound as a plain {@code UUID} (no {@code CAST}).
+     * A selected {@code serviceTypeSlug} resolved to its {@code service_type_id}
+     * FK target. The per-slug predicate matches strictly on this FK
+     * ({@code sd.service_type_id = :id}) — the former {@code name ILIKE} substring
+     * fallback was removed because service-type {@code name_uk} values are
+     * substrings of unrelated service names and produced false positives. Only
+     * ever built for a slug that resolved to an active service-type, so
+     * {@code serviceTypeId} is non-null and bound as a plain {@code UUID} (no
+     * {@code CAST}).
+     *
+     * <p><b>Prod precondition:</b> {@code service_definitions.service_type_id} is
+     * nullable and the existing-row backfill is the deferred Phase 20.4. Rows with
+     * a {@code NULL} FK match no service-type filter under FK-only matching, so
+     * Phase 20.4 must run before deploying this change to any dataset that still
+     * has untyped rows (local/demo data is fully typed — 0 NULL FKs).
      */
-    private record ResolvedServiceType(UUID serviceTypeId, String namePattern) {}
+    private record ResolvedServiceType(UUID serviceTypeId) {}
 
     /** Carrier for {@code (sql, params)} pairs returned by {@link #buildMasterSearchSql}. */
     private record SqlAndParams(String sql, Map<String, Object> params) {}
 
     /**
-     * Resolves the normalized {@code serviceTypeSlugs} to their hybrid match
+     * Resolves the normalized {@code serviceTypeSlugs} to their FK match
      * operands through the cached {@link ServiceTypeSlugResolver}, under the
      * <b>OR / union</b> per-service filter semantics (Phase 20.x): a provider
      * matches if it offers <em>any</em> selected service type.
@@ -561,7 +564,7 @@ public class SearchService {
                 continue;
             }
             ServiceTypeMatch type = match.get();
-            resolved.add(new ResolvedServiceType(type.serviceTypeId(), likeContains(type.nameUk())));
+            resolved.add(new ResolvedServiceType(type.serviceTypeId()));
         }
         if (resolved.isEmpty()) {
             // Case 4: every selected slug is unknown/inactive. The user DID filter
@@ -762,7 +765,7 @@ public class SearchService {
         // Search-price bug fix: scope the price aggregate to the active filter so
         // the card shows the MATCHED service's price, not the whole catalogue.
         // Slug takes precedence over category (mirrors matched_names). Reuses
-        // :stId{n}/:stName{n} / :category already bound by appendWhereClause — no
+        // :stId{n} / :category already bound by appendWhereClause — no
         // new params, no CAST idiom. Whole-catalogue (no filter) = no predicate.
         if (hasServiceFilter) {
             sb.append("AND (");
@@ -776,7 +779,7 @@ public class SearchService {
         // ONLY the paged masters, mirroring the serviceNames lateral's shape (no
         // GROUP BY/HAVING). DISTINCT active service names matching ANY selected
         // slug (OR across slugs — the card shows what matched), capped to
-        // SERVICE_NAME_CAP. Reuses the :stId{n}/:stName{n} params already bound by
+        // SERVICE_NAME_CAP. Reuses the :stId{n} params already bound by
         // appendWhereClause. Only emitted when a per-service filter is active.
         if (hasServiceFilter) {
             appendMatchedNamesLateral(sb, serviceTypes);
@@ -955,10 +958,9 @@ public class SearchService {
         // Phase 20.1 — per-service filter: ONE correlated EXISTS whose inner WHERE
         // OR-matches ANY selected slug (OR/union semantics — a master qualifies if
         // it offers a service matching AT LEAST ONE of the selected slugs). The
-        // per-slug branch hybrid-matches on the FK (sd.service_type_id = :stId{n})
-        // OR the resolved name (sd.name ILIKE :stName{n}), recovering legacy rows
-        // whose FK is NULL. The :stId{n} param is bound as a plain UUID object
-        // (no CAST). The OR disjunction mirrors the matched-names lateral exactly.
+        // per-slug branch matches strictly on the FK (sd.service_type_id = :stId{n}).
+        // The :stId{n} param is bound as a plain UUID object (no CAST). The OR
+        // disjunction mirrors the matched-names lateral exactly.
         appendServiceTypeExists(sb, filters.serviceTypes(), params);
         if (filters.minRating() != null) {
             sb.append("AND m.avg_rating >= :minRating ");
@@ -986,7 +988,7 @@ public class SearchService {
      * the price band matches the displayed (scoped) card band: the serviceTypes
      * disjunction ({@link #appendServiceTypeMatchDisjunction}) takes precedence,
      * else the {@code sd.category = :category} equality. Both reuse params already
-     * bound by {@link #appendWhereClause} ({@code :stId{n}}/{@code :stName{n}} or
+     * bound by {@link #appendWhereClause} ({@code :stId{n}} or
      * {@code :category}) — no new scope params, no {@code CAST(:p AS ...)} idiom.
      *
      * <p>{@code HAVING} without {@code GROUP BY} aggregates the whole correlated set
@@ -1049,8 +1051,8 @@ public class SearchService {
      * Appends a SINGLE correlated {@code EXISTS} to the master WHERE clause whose
      * inner WHERE OR-matches ANY selected slug (OR/union semantics — the master
      * qualifies if it offers a service matching at least one selected slug) and
-     * binds each slug's {@code service_type_id} (plain UUID, no CAST) +
-     * {@code %nameUk%} pattern. The inner OR disjunction reuses
+     * binds each slug's {@code service_type_id} (plain UUID, no CAST). The inner
+     * OR disjunction reuses
      * {@link #appendServiceTypeMatchDisjunction} so the per-slug match clause is
      * identical to the matched-names lateral. Emits nothing when no slug is
      * selected; the single-slug case produces one OR branch.
@@ -1070,17 +1072,15 @@ public class SearchService {
     }
 
     /**
-     * Binds each selected slug's {@code :stId{n}} (plain UUID, no CAST) and
-     * {@code :stName{n}} ({@code %nameUk%}) params. Shared by the master and salon
-     * service-type {@code EXISTS} builders; the matched-names laterals reuse the
-     * already-bound params without rebinding.
+     * Binds each selected slug's {@code :stId{n}} (plain UUID, no CAST) param.
+     * Shared by the master and salon service-type {@code EXISTS} builders; the
+     * matched-names laterals reuse the already-bound params without rebinding.
      */
     private static void bindServiceTypeParams(
             List<ResolvedServiceType> serviceTypes, Map<String, Object> params) {
         for (int i = 0; i < serviceTypes.size(); i++) {
             ResolvedServiceType st = serviceTypes.get(i);
             params.put(SERVICE_TYPE_ID_PARAM + i, st.serviceTypeId());
-            params.put(SERVICE_TYPE_NAME_PARAM + i, st.namePattern());
         }
     }
 
@@ -1088,7 +1088,7 @@ public class SearchService {
      * Appends the master matched-names lateral (Phase 20.3): DISTINCT active
      * service names matching ANY selected slug (OR across slugs), capped, over
      * only the paged masters ({@code t.master_id}). Reuses the already-bound
-     * {@code :stId{n}}/{@code :stName{n}} params.
+     * {@code :stId{n}} params.
      */
     private static void appendMatchedNamesLateral(StringBuilder sb, List<ResolvedServiceType> serviceTypes) {
         sb.append("LEFT JOIN LATERAL (")
@@ -1103,20 +1103,47 @@ public class SearchService {
     }
 
     /**
-     * Appends the OR-chain of per-slug hybrid match predicates
-     * ({@code (alias.service_type_id = :stId{n} OR alias.name ILIKE :stName{n}) OR …})
-     * used by the matched-names laterals. {@code count} is always {@code >= 1}
-     * (callers only invoke this with an active filter).
+     * Appends the OR-chain of per-slug FK match predicates
+     * ({@code alias.service_type_id = :stId{n} OR …}) used by the selection
+     * {@code EXISTS} builders and the matched-names laterals. {@code count} is
+     * always {@code >= 1} (callers only invoke this with an active filter).
+     *
+     * <p>Matches strictly on the {@code service_type_id} FK. The former
+     * {@code name ILIKE '%nameUk%'} containment fallback was removed: service-type
+     * {@code name_uk} values are substrings of unrelated service names (e.g.
+     * "Корекція" matched beard/lash/permanent-makeup correction), which returned
+     * providers that do not offer the selected type. FK-only is exact.
      */
     private static void appendServiceTypeMatchDisjunction(StringBuilder sb, String alias, int count) {
         for (int i = 0; i < count; i++) {
             if (i > 0) {
                 sb.append("OR ");
             }
-            sb.append("(").append(alias).append(".service_type_id = :").append(SERVICE_TYPE_ID_PARAM).append(i)
-                    .append(" OR ").append(alias).append(".name ILIKE :")
-                    .append(SERVICE_TYPE_NAME_PARAM).append(i).append(") ");
+            sb.append(alias).append(".service_type_id = :").append(SERVICE_TYPE_ID_PARAM).append(i).append(" ");
         }
+    }
+
+    /**
+     * Appends the <em>bookable gate</em> for a salon-owned {@code service_definitions}
+     * row aliased {@code defAlias}: an {@code EXISTS} that the def is actively
+     * performed by at least one active master. This mirrors — byte-for-byte in
+     * semantics — the catalogue's canonical gate
+     * {@code ServiceRepository.findBookableServicesBySalon}
+     * ({@code EXISTS(MasterServiceAssignment WHERE serviceDefinition = sd AND
+     * isActive AND master.isActive)}), so salon <em>search</em> and the salon
+     * <em>booking catalogue</em> never diverge on what a salon offers.
+     *
+     * <p>Deliberately does NOT add a {@code masters.salon_id = s.id} check: the
+     * {@code master_services} assignment only ever links the owning salon's own
+     * masters, exactly as the catalogue query relies on. Adding a stricter
+     * {@code salon_id} predicate here would make search stricter than the
+     * catalogue.
+     */
+    private static void appendSalonBookableGate(StringBuilder sb, String defAlias) {
+        sb.append("AND EXISTS (SELECT 1 FROM master_services msx ")
+                .append("JOIN masters mx ON mx.id = msx.master_id AND mx.is_active = true ")
+                .append("WHERE msx.service_def_id = ").append(defAlias).append(".id ")
+                .append("AND msx.is_active = true) ");
     }
 
     private static void bind(Query query, Map<String, Object> params) {
@@ -1156,7 +1183,7 @@ public class SearchService {
      * </ol>
      *
      * <p>A single correlated {@code EXISTS} (OR/union semantics — inner WHERE
-     * OR-matches ANY selected slug, salon→active masters→active services hybrid
+     * OR-matches ANY selected slug, salon→active masters→active services FK
      * match) lives in the inner WHERE. All params are typed objects — no
      * {@code CAST(:p …)} idiom (guard).
      */
@@ -1256,18 +1283,29 @@ public class SearchService {
      * scoped to the matched services via the same slug disjunction
      * {@code matched_names} uses — slug precedence over the category predicate, so
      * a «2д»-filtered salon card shows the 2д band, not its whole catalogue. The
-     * {@code :stId{n}}/{@code :stName{n}} params are already bound by
+     * {@code :stId{n}} params are already bound by
      * {@link #appendSalonServiceTypeExists}; {@code :category} is bound
      * conditionally (plain equality, no CAST).
      */
     private static void appendSalonPriceAggregateLateral(
             StringBuilder sb, boolean hasCategory, List<ResolvedServiceType> serviceTypes) {
+        // Bookable price band (salon service-type fix): the band is the MIN–MAX of
+        // the PERFORMING masters' EFFECTIVE prices, not the salon-owned base_price.
+        // Effective price = COALESCE(price_override, base_price) for the floor and
+        // COALESCE(price_override, RANGE ceiling) for the ceiling — identical to the
+        // master path (appendPriceBandExists / the master serviceNames lateral).
+        // Rows are gated to active master_services on active masters (mirrors
+        // ServiceRepository.findBookableServicesBySalon), so an unbookable owned
+        // service never drags the band and a per-master override shows through.
         sb.append("LEFT JOIN LATERAL (")
-                .append("SELECT MIN(sd.base_price) AS pmin, ")
-                .append("MAX(CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END) AS pmax ")
-                .append("FROM service_definitions sd ")
+                .append("SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin, ")
+                .append("MAX(COALESCE(ms.price_override, ")
+                .append("CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END)) AS pmax ")
+                .append("FROM master_services ms ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                .append("JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true ")
                 .append("WHERE sd.owner_type = 'SALON' AND sd.owner_id = s.id ")
-                .append("AND sd.is_active = true ");
+                .append("AND ms.is_active = true ");
         // Slug precedence: scope the price band to the matched services. Category
         // narrows only when no slug filter is active (defensive — this path always
         // carries slugs).
@@ -1295,6 +1333,7 @@ public class SearchService {
                 .append("FROM service_definitions sd2 ")
                 .append("WHERE sd2.owner_type = 'SALON' AND sd2.owner_id = t.id ")
                 .append("AND sd2.is_active = true ");
+        appendSalonBookableGate(sb, "sd2");
         if (hasCategory) {
             sb.append("AND sd2.category = :category ");
         }
@@ -1307,7 +1346,7 @@ public class SearchService {
      * names offered across the salon's active masters that match ANY selected
      * slug (OR across slugs), capped. Correlated to {@code t.id} — sits in the
      * OUTER block over only the paged rows (HIGH PERF fix). Reuses the
-     * {@code :stId{n}}/{@code :stName{n}} params bound by
+     * {@code :stId{n}} params bound by
      * {@link #appendSalonServiceTypeExists}.
      */
     private static void appendSalonMatchedNamesLateral(StringBuilder sb, List<ResolvedServiceType> serviceTypes) {
@@ -1316,7 +1355,9 @@ public class SearchService {
                 .append("SELECT DISTINCT sd3.name AS name ")
                 .append("FROM service_definitions sd3 ")
                 .append("WHERE sd3.owner_type = 'SALON' AND sd3.owner_id = t.id ")
-                .append("AND sd3.is_active = true AND (");
+                .append("AND sd3.is_active = true ");
+        appendSalonBookableGate(sb, "sd3");
+        sb.append("AND (");
         appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
         sb.append(") ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") zm) mn ON true ");
@@ -1325,11 +1366,11 @@ public class SearchService {
     /**
      * A SINGLE correlated {@code EXISTS} (OR/union semantics) reaching the salon's
      * active masters' active services, whose inner WHERE OR-matches ANY selected
-     * slug (FK OR name) — the salon qualifies if any active master offers a service
+     * slug (FK match) — the salon qualifies if any active master offers a service
      * matching at least one selected slug. Reuses
      * {@link #appendServiceTypeMatchDisjunction} for the inner OR and binds each
-     * slug's {@code service_type_id} (plain UUID) + {@code %nameUk%} pattern. Emits
-     * nothing when no slug is selected; the single-slug case produces one OR branch.
+     * slug's {@code service_type_id} (plain UUID). Emits nothing when no slug is
+     * selected; the single-slug case produces one OR branch.
      */
     private static void appendSalonServiceTypeExists(
             StringBuilder sb, List<ResolvedServiceType> serviceTypes, Map<String, Object> params) {
@@ -1339,7 +1380,9 @@ public class SearchService {
         sb.append("AND EXISTS (")
                 .append("SELECT 1 FROM service_definitions sdf ")
                 .append("WHERE sdf.owner_type = 'SALON' AND sdf.owner_id = s.id ")
-                .append("AND sdf.is_active = true AND (");
+                .append("AND sdf.is_active = true ");
+        appendSalonBookableGate(sb, "sdf");
+        sb.append("AND (");
         appendServiceTypeMatchDisjunction(sb, "sdf", serviceTypes.size());
         sb.append(")) ");
         bindServiceTypeParams(serviceTypes, params);

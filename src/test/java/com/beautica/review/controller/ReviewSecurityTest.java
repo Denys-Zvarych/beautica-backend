@@ -146,10 +146,10 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                "(id, owner_type, owner_id, name, base_duration_minutes, base_price, " +
+                "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, " +
                 "buffer_minutes_after, is_active, created_at, updated_at) " +
-                "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId);
+                "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, userId, resolveServiceTypeId());
 
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -237,5 +237,14 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
         return headers;
+    }
+
+    private UUID resolveServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class);
     }
 }

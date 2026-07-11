@@ -166,16 +166,28 @@ class GuestBookingConcurrencyIT {
                 "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, base_duration_minutes, base_price, "
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, "
                         + "buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Манікюр', 60, 350.00, 0, true, NOW(), NOW())",
-                serviceDefId, ownerId);
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Манікюр', ?, 60, 350.00, 0, true, NOW(), NOW())",
+                serviceDefId, ownerId, resolveServiceTypeId());
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, true, NOW(), NOW())",
                 masterServiceId, masterId, serviceDefId);
         return masterServiceId;
+    }
+
+    /**
+     * Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL).
+     */
+    private UUID resolveServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class);
     }
 
     private void addWorkingHoursForEveryDay(UUID masterId) {

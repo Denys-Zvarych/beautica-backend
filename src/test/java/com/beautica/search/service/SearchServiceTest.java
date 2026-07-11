@@ -738,7 +738,7 @@ class SearchServiceTest {
     // ── Phase 20.2 — salon per-service-filter SQL shape guard ────────────────
 
     @Test
-    @DisplayName("salon per-service-filter SQL binds :stId0/:stName0 as typed params and uses no CAST(: workaround (mirrors the master guard)")
+    @DisplayName("salon per-service-filter SQL binds :stId0 as a typed param and uses no CAST(: workaround (mirrors the master guard)")
     void should_notUseCastWorkaround_inSalonServiceFilterSql() {
         // A non-empty serviceTypeSlugs routes searchSalons into the dynamically-
         // assembled native query (buildSalonSearchSql via EntityManager). Stub the
@@ -754,10 +754,10 @@ class SearchServiceTest {
 
         String salonSql = sqlCaptor.getAllValues().get(0);
         assertThat(salonSql)
-                .as("the salon per-service EXISTS binds a typed UUID/text pair — no CAST(:p …) idiom")
+                .as("the salon per-service EXISTS binds a typed UUID — no CAST(:p …) idiom")
                 .doesNotContain("CAST(:")
                 .contains(":stId0")
-                .contains(":stName0");
+                .doesNotContain(":stName0");
         // The FK target binds as a plain UUID object (no CAST), mirroring the master path.
         verify(dataQuery).setParameter("stId0", typeId);
     }

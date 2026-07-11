@@ -502,11 +502,43 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                "(id, owner_type, owner_id, name, category, base_duration_minutes, base_price, " +
+                "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, " +
                 "buffer_minutes_after, is_active, created_at, updated_at) " +
-                "VALUES (?, 'SALON', ?, ?, ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId, name, category);
+                "VALUES (?, 'SALON', ?, ?, ?, ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, name, category, resolveServiceTypeId(category));
         return serviceDefId;
+    }
+
+    /**
+     * Resolves a real Flyway-seeded {@code service_types.id} for the FK that V111 made
+     * mandatory on {@code service_definitions} (NOT NULL, ON DELETE RESTRICT).
+     *
+     * <p>Prefers a type whose platform category equals {@code category}, keeping the row
+     * category-coherent for fixtures whose {@code category} the catalog-grouping assertions
+     * key off. Falls back to any active seeded type for legacy/unknown categories (e.g.
+     * {@code AAA_LEGACY_CATEGORY}) that have no matching platform category. The
+     * {@code service_type_id} itself is never asserted on here — grouping keys off the
+     * {@code category} column — so the fallback preserves each test's original intent.
+     */
+    private UUID resolveServiceTypeId(String category) {
+        List<UUID> matched = jdbcTemplate.queryForList(
+                "SELECT st.id FROM service_types st " +
+                "JOIN platform_categories pc ON pc.name = st.platform_category_name " +
+                "WHERE st.platform_category_name = ? AND st.is_active = TRUE " +
+                "AND pc.active = TRUE AND pc.status = 'APPROVED' " +
+                "ORDER BY st.name_uk LIMIT 1",
+                UUID.class, category);
+        if (!matched.isEmpty()) {
+            return matched.get(0);
+        }
+        return anyServiceTypeId();
+    }
+
+    /** Any active seeded {@code service_types.id} — used where the type is FK-only. */
+    private UUID anyServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM service_types WHERE is_active = TRUE ORDER BY slug LIMIT 1",
+                UUID.class);
     }
 
     private void assignServiceToMaster(UUID serviceDefId, UUID masterId) {
@@ -605,10 +637,10 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions " +
-                "(id, owner_type, owner_id, name, base_duration_minutes, base_price, " +
+                "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, " +
                 "buffer_minutes_after, is_active, created_at, updated_at) " +
-                "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Boundary Test Service', 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId);
+                "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Boundary Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, userId, anyServiceTypeId());
 
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(

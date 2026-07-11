@@ -37,9 +37,11 @@ class ServiceDefinitionDescriptionControlCharValidationTest {
     }
 
     private static CreateServiceDefinitionRequest createWithDescription(String description) {
+        // serviceTypeId is @NotNull since V111; supply one so the positive cases isolate the
+        // description @Pattern under test rather than tripping the mandatory-type constraint.
         return new CreateServiceDefinitionRequest(
                 "Classic Manicure", description, "MANICURE", 60, 0,
-                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, java.util.UUID.randomUUID());
     }
 
     private static UpdateServiceDefinitionRequest updateWithDescription(String description) {

@@ -209,8 +209,8 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
         // Insert a service definition and working hours via JDBC (bypassing full booking flow)
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Haircut', 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId);
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Haircut', ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, anyServiceTypeId());
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
@@ -284,8 +284,8 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
         // Create a service definition and master_services row so the booking FK is satisfied
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Massage', 60, 300.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId);
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Massage', ?, 60, 300.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, anyServiceTypeId());
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
@@ -370,6 +370,18 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
                 masterId, userId, salonId);
         return userId;
+    }
+
+    /**
+     * Resolves any real Flyway-seeded {@code service_types.id} to satisfy the
+     * {@code service_definitions.service_type_id} FK that V111 made mandatory (NOT NULL,
+     * ON DELETE RESTRICT). These authorization pins never assert on the service type, so
+     * any active seeded row is sufficient — the FK just has to reference an existing row.
+     */
+    private UUID anyServiceTypeId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM service_types WHERE is_active = TRUE ORDER BY slug LIMIT 1",
+                UUID.class);
     }
 
     /**

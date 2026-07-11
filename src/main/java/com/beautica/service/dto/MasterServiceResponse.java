@@ -55,7 +55,17 @@ public record MasterServiceResponse(
          */
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Ukrainian display name of the chosen service type; null when none was selected.")
-        String serviceTypeNameUk
+        String serviceTypeNameUk,
+        /**
+         * Stable slug of the chosen service type, lifted from the nested
+         * {@link ServiceDefinitionResponse}. Matches the platform search filter's service-type
+         * key ({@code CategoryServiceOption.key}) so the client can pre-check the searched
+         * service in the booking flow. {@code null} when no service type was chosen.
+         */
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Stable slug of the chosen platform service type (matches the "
+                        + "search filter's service-type key); null when none was selected.")
+        String serviceTypeSlug
 ) {
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
         var sdResponse = ServiceDefinitionResponse.from(msa.getServiceDefinition());
@@ -86,7 +96,8 @@ public record MasterServiceResponse(
                 sdResponse.priceMax(),
                 sdResponse.priceDisplay(),
                 sdResponse.serviceTypeId(),
-                sdResponse.serviceTypeNameUk()
+                sdResponse.serviceTypeNameUk(),
+                sdResponse.serviceTypeSlug()
         );
     }
 }

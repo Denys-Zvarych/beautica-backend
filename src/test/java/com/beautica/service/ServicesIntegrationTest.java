@@ -96,7 +96,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 new BigDecimal("600.00"),
                 null,
                 null,
-                null
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE")
         );
 
         log.debug("Act step 1: POST /api/v1/salons/{}/services to create service definition", salonId);
@@ -154,7 +154,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
 
         var createRequest = new CreateServiceDefinitionRequest(
                 "Pedicure", null, "NAIL_SERVICE", 90, 15,
-                PriceType.FIXED, new BigDecimal("450.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("450.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, createRequest);
 
         var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);

@@ -106,7 +106,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
 
         var request = new CreateServiceDefinitionRequest(
                 "Balayage", "Hand-painted highlights", "HAIRDRESSING", 180, 0,
-                PriceType.RANGE, null, new BigDecimal("1200.00"), new BigDecimal("2500.00"), null);
+                PriceType.RANGE, null, new BigDecimal("1200.00"), new BigDecimal("2500.00"),
+                fixtures.resolveServiceTypeIdForCategory("HAIRDRESSING"));
 
         log.debug("Act: POST a RANGE service (priceMin=1200, priceMax=2500) to salon {}", salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, request);
@@ -136,7 +137,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
 
         var request = new CreateServiceDefinitionRequest(
                 "Classic Manicure", null, "NAIL_SERVICE", 60, 0,
-                PriceType.FIXED, new BigDecimal("450.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("450.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
 
         log.debug("Act: POST a FIXED service (price=450) to salon {}", salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, request);
@@ -166,7 +168,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
         UUID salonId = fixtures.createSalon(ownerToken, "Transition Salon A");
         var fixed = new CreateServiceDefinitionRequest(
                 "Lash Lift", null, "LASH_EXTENSIONS", 60, 0,
-                PriceType.FIXED, new BigDecimal("700.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("700.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("LASH_EXTENSIONS"));
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, fixed);
 
         var patch = new LinkedHashMap<String, Object>();
@@ -202,7 +205,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
         UUID salonId = fixtures.createSalon(ownerToken, "Transition Salon B");
         var range = new CreateServiceDefinitionRequest(
                 "Brow Shape", null, "BROWS", 30, 0,
-                PriceType.RANGE, null, new BigDecimal("200.00"), new BigDecimal("400.00"), null);
+                PriceType.RANGE, null, new BigDecimal("200.00"), new BigDecimal("400.00"),
+                fixtures.resolveServiceTypeIdForCategory("BROWS"));
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, range);
 
         var patch = new LinkedHashMap<String, Object>();
@@ -319,7 +323,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
         UUID salonId = fixtures.createSalon(ownerToken, "Patch Rollback Salon");
         var fixed = new CreateServiceDefinitionRequest(
                 "Keep My Price", null, "MAKEUP", 60, 0,
-                PriceType.FIXED, new BigDecimal("999.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("999.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("MAKEUP"));
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, fixed);
 
         var patch = new LinkedHashMap<String, Object>();
@@ -412,7 +417,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
         UUID salonA = fixtures.createSalon(ownerAToken, "Owner A Salon");
         var svc = new CreateServiceDefinitionRequest(
                 "Owner A Service", null, "NAIL_SERVICE", 60, 0,
-                PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("500.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
         UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonA, svc);
 
         // Owner B (unrelated) tries to patch it.
@@ -447,7 +453,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
         UUID salonA = fixtures.createSalon(ownerAToken, "Delete IDOR Salon A");
         var svc = new CreateServiceDefinitionRequest(
                 "Protected Service", null, "NAIL_SERVICE", 60, 0,
-                PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("500.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
         UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonA, svc);
 
         String ownerBToken = fixtures.createSalonOwnerAndGetToken(
@@ -486,7 +493,8 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
 
         var request = new CreateServiceDefinitionRequest(
                 "Client Forbidden Service", null, "NAIL_SERVICE", 60, 0,
-                PriceType.FIXED, new BigDecimal("500.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("500.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
 
         log.debug("Act: a CLIENT POSTs a service to salon {}", salonId);
         ResponseEntity<String> resp = restTemplate.exchange(

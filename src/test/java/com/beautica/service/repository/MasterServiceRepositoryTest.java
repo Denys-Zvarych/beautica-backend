@@ -42,6 +42,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
 
     private Master master;
     private ServiceDefinition serviceDefinition;
+    private ServiceType defaultServiceType;
 
     @BeforeEach
     void setUp() {
@@ -64,6 +65,10 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .build();
         em.persist(master);
 
+        // service_type_id is mandatory (NOT NULL). Persist one shared ServiceType and
+        // attach it to every fixture ServiceDefinition via the builder.
+        defaultServiceType = persistServiceType("Манікюр", "Manicure");
+
         serviceDefinition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
@@ -72,11 +77,34 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("450.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(serviceDefinition);
 
         em.flush();
+    }
+
+    /** Persists a CatalogCategory + ServiceType so fixture ServiceDefinitions satisfy the NOT NULL service_type_id FK. */
+    private ServiceType persistServiceType(String nameUk, String nameEn) {
+        // sort_order has a UNIQUE constraint; keep the default helper's value distinct from
+        // the 999 used by the graph test's own category so both can coexist in one test.
+        CatalogCategory category = CatalogCategory.builder()
+                .nameUk("Нігті")
+                .nameEn("Nails")
+                .sortOrder(500)
+                .build();
+        em.persist(category);
+
+        ServiceType serviceType = ServiceType.builder()
+                .category(category)
+                .nameUk(nameUk)
+                .nameEn(nameEn)
+                .slug("type-" + UUID.randomUUID())
+                .platformCategoryName("NAIL_SERVICE")
+                .build();
+        em.persist(serviceType);
+        return serviceType;
     }
 
     @Test
@@ -90,6 +118,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(45)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(secondService);
@@ -114,6 +143,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(90)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("500.00"))
+                .serviceType(defaultServiceType)
                 .isActive(true)
                 .build();
         em.persist(inactiveServiceDef);
@@ -150,6 +180,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(45)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
+                .serviceType(defaultServiceType)
                 .isActive(false)
                 .build();
         em.persist(deactivatedDef);
@@ -329,29 +360,10 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .isEqualTo("Манікюр");
     }
 
-    @Test
-    @DisplayName("should_returnNullServiceType_when_serviceDefinitionHasNoServiceType")
-    void should_returnNullServiceType_when_serviceDefinitionHasNoServiceType() {
-        // Arrange — service definition has no service_type_id (nullable FK, legacy data scenario)
-        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
-                .master(master)
-                .serviceDefinition(serviceDefinition) // no serviceType set — null FK
-                .isActive(true)
-                .build();
-        em.persist(assignment);
-        em.flush();
-        em.clear();
-
-        // Act
-        List<MasterServiceAssignment> results =
-                masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200));
-
-        // Assert — LEFT JOIN means null serviceType is valid; query must still return the row
-        assertThat(results).hasSize(1);
-        assertThat(results.get(0).getServiceDefinition().getServiceType())
-                .as("serviceType must be null when no service_type_id is set on the definition")
-                .isNull();
-    }
+    // NOTE (V111): the former test `should_returnNullServiceType_when_serviceDefinitionHasNoServiceType`
+    // was deleted. service_definitions.service_type_id is now NOT NULL (JPA optional=false), so a
+    // ServiceDefinition with a null serviceType can no longer be persisted — the scenario it asserted
+    // (LEFT JOIN returning a row with a null type) is unreachable under the new contract.
 
     // ── ordering regression (V68 / ORDER BY msa.createdAt ASC, msa.id ASC) ───────────────────────
     //
@@ -382,6 +394,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                     .baseDurationMinutes(30 + i)
                     .priceType(PriceType.FIXED)
                     .basePrice(new BigDecimal("100.00"))
+                    .serviceType(defaultServiceType)
                     .isActive(true)
                     .build();
             em.persist(def);
@@ -464,6 +477,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                     .baseDurationMinutes(30)
                     .priceType(PriceType.FIXED)
                     .basePrice(new BigDecimal("100.00"))
+                    .serviceType(defaultServiceType)
                     .isActive(true)
                     .build();
             em.persist(def);
@@ -555,6 +569,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("500.00"))
+                .serviceType(defaultServiceType)
                 .isActive(false)
                 .build();
         em.persist(softDeletedDef);
@@ -606,6 +621,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(60)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("500.00"))
+                .serviceType(defaultServiceType)
                 .isActive(false)
                 .build();
         em.persist(softDeletedDef);

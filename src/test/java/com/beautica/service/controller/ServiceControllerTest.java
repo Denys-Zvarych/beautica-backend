@@ -13,6 +13,8 @@ import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -92,6 +94,7 @@ class ServiceControllerTest {
                     .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                     .authorizeHttpRequests(auth -> auth
                             .requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll()
+                            .requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services").permitAll()
                             .anyRequest().authenticated())
                     .exceptionHandling(ex -> ex
                             .authenticationEntryPoint((req, res, exc) ->
@@ -128,7 +131,7 @@ class ServiceControllerTest {
     }
 
     private ServiceDefinitionResponse stubServiceDefResponse(UUID id, String name) {
-        return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null,
+        return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null, null,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
     }
 
@@ -137,7 +140,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
-                null, null);
+                null, null, null);
     }
 
     /** Phase 16.4: variant carrying the lifted serviceTypeId + serviceTypeNameUk so the JSON shape can be asserted. */
@@ -145,12 +148,36 @@ class ServiceControllerTest {
             UUID id, UUID masterId, String name, UUID serviceTypeId, String serviceTypeNameUk) {
         var sdResponse = new ServiceDefinitionResponse(
                 UUID.randomUUID(), name, null, null, 60, 10, true,
-                serviceTypeId, serviceTypeNameUk, null,
+                serviceTypeId, serviceTypeNameUk, null, null,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
-                serviceTypeId, serviceTypeNameUk);
+                serviceTypeId, serviceTypeNameUk, null);
+    }
+
+    /**
+     * Variant carrying the lifted serviceTypeSlug on BOTH the top-level MasterServiceResponse
+     * and its nested ServiceDefinitionResponse, so the read-path JSON shape can be asserted end-to-end.
+     */
+    private MasterServiceResponse stubMasterServiceResponseWithSlug(
+            UUID id, UUID masterId, String name, UUID serviceTypeId, String serviceTypeNameUk, String serviceTypeSlug) {
+        var sdResponse = new ServiceDefinitionResponse(
+                UUID.randomUUID(), name, null, null, 60, 10, true,
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+        return new MasterServiceResponse(id, masterId, sdResponse,
+                null, null, new BigDecimal("350.00"), 60, true,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug);
+    }
+
+    /** Leaf ServiceDefinitionResponse carrying a serviceTypeSlug, for the salon-catalogue read path. */
+    private ServiceDefinitionResponse stubServiceDefResponseWithSlug(
+            UUID id, String name, UUID serviceTypeId, String serviceTypeNameUk, String serviceTypeSlug) {
+        return new ServiceDefinitionResponse(id, name, null, "MANICURE", 60, 10, true,
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
     }
 
     // ── POST /api/v1/salons/{salonId}/services ─────────────────────────────────
@@ -163,7 +190,7 @@ class ServiceControllerTest {
         var serviceId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
                 "Classic Manicure", "Basic nail care", "MANICURE", 60, 10,
-                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, UUID.randomUUID());
         var stub = stubServiceDefResponse(serviceId, "Classic Manicure");
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
@@ -182,20 +209,53 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.data.name").value("Classic Manicure"));
     }
 
+    // ── V111 mandatory service type — HTTP-tier guarantee ──────────────────────
+    // The user-facing rule: a service can never be created without a service type. At the
+    // web tier the @NotNull(serviceTypeId) bean-validation guard rejects the request with 400
+    // before it reaches the service, on BOTH single-create entry points. Paired with the
+    // service-layer "Service type is required" BusinessException (ServiceCatalogServiceTest)
+    // and the DB NOT NULL constraint (V111), this pins the guarantee end-to-end.
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 400 when serviceTypeId is omitted (mandatory since V111); service is never invoked")
+    void should_return400_when_ownerCreatesSalonServiceWithoutServiceType() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        // Fully valid body EXCEPT the omitted serviceTypeId — isolates the mandatory-type guard.
+        var body = "{\"name\":\"Classic Manicure\",\"category\":\"MANICURE\","
+                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":10,"
+                + "\"priceType\":\"FIXED\",\"price\":350.00}";
+
+        log.debug("Act: POST /api/v1/salons/{}/services without a serviceTypeId — must return 400", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.serviceTypeId").value("Service type id is required"));
+
+        verify(serviceCatalogService, never()).addServiceToSalon(any(), any());
+    }
+
     @Test
     @DisplayName("POST /salons/{id}/services — 403 when SALON_MASTER attempts to create a service (read-only role)")
     void should_return403_when_salonMasterAttemptsToCreateService() throws Exception {
         var masterUserId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         // SALON_MASTER is a read-only role: @PreAuthorize on the controller method denies the request
-        // before AuthorizationService is consulted, so no stub is needed.
-
+        // before AuthorizationService is consulted, so no stub is needed. The body is fully valid
+        // (serviceTypeId present) so the 403 proves the ROLE gate — not bean validation — rejects it.
         log.debug("Act: POST /api/v1/salons/{}/services as SALON_MASTER — read-only role must be denied with 403", salonId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
                         .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Hair Cut\",\"category\":\"MANICURE\",\"baseDurationMinutes\":30,\"priceType\":\"FIXED\",\"price\":50.00,\"bufferMinutesAfter\":0}"))
+                        .content("{\"name\":\"Hair Cut\",\"category\":\"MANICURE\",\"serviceTypeId\":\"" + UUID.randomUUID()
+                                + "\",\"baseDurationMinutes\":30,\"priceType\":\"FIXED\",\"price\":50.00,\"bufferMinutesAfter\":0}"))
                 .andExpect(status().isForbidden());
     }
 
@@ -207,9 +267,11 @@ class ServiceControllerTest {
         // authz denies — different owner
         when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(false);
 
+        // Valid body (serviceTypeId present) so the 403 proves the cross-owner canManageSalon
+        // guard denies — not bean validation on a missing service type.
         var request = new CreateServiceDefinitionRequest(
                 "Hijack Service", null, "MANICURE", 30, 0,
-                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("100.00"), null, null, UUID.randomUUID());
 
         log.debug("Act: POST /api/v1/salons/{}/services with Owner B token — cross-owner must be denied", salonAId);
         mockMvc.perform(post("/api/v1/salons/" + salonAId + "/services")
@@ -334,6 +396,63 @@ class ServiceControllerTest {
                 .andExpect(status().isNotFound());
     }
 
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 read-path JSON carries serviceTypeSlug on the row and the nested definition when a type is linked")
+    void should_emitServiceTypeSlug_when_masterServicesReadPathHasType() throws Exception {
+        UUID masterId = UUID.randomUUID();
+        UUID rowId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        var stub = List.of(stubMasterServiceResponseWithSlug(
+                rowId, masterId, "Manicure", serviceTypeId, "Манікюр", "manicure"));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(stub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services — read-path JSON must expose serviceTypeSlug (populated)", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].serviceTypeSlug").value("manicure"))
+                .andExpect(jsonPath("$.data[0].serviceDefinition.serviceTypeSlug").value("manicure"));
+    }
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 read-path JSON has null serviceTypeSlug when no type is linked (nullable-link case)")
+    void should_emitNullServiceTypeSlug_when_masterServicesReadPathHasNoType() throws Exception {
+        UUID masterId = UUID.randomUUID();
+        // stubMasterServiceResponse leaves all serviceType fields null — the picker was not used.
+        var stub = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Gel Nails"));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(stub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services — read-path JSON serviceTypeSlug must be null", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].serviceTypeSlug").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data[0].serviceDefinition.serviceTypeSlug").value(org.hamcrest.Matchers.nullValue()));
+    }
+
+    // ── GET /api/v1/salons/{salonId}/services — public salon catalogue ─────────
+
+    @Test
+    @DisplayName("GET /salons/{id}/services — 200 salon-catalogue leaf JSON carries serviceTypeSlug when a type is linked")
+    void should_emitServiceTypeSlug_when_salonCatalogueLeafHasType() throws Exception {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        var leaf = stubServiceDefResponseWithSlug(
+                UUID.randomUUID(), "Manicure", serviceTypeId, "Манікюр", "manicure");
+        var catalogue = new SalonServiceCatalogResponse(List.of(
+                new SalonServiceCategoryGroup("MANICURE", "Манікюр", 1, List.of(leaf))));
+        when(serviceCatalogService.getSalonServiceCatalog(salonId)).thenReturn(catalogue);
+
+        log.debug("Act: GET /api/v1/salons/{}/services — salon-catalogue leaf JSON must expose serviceTypeSlug", salonId);
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/services")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.categories[0].services[0].serviceTypeSlug").value("manicure"));
+    }
+
     // ── POST /api/v1/independent-masters/me/services ───────────────────────────
 
     @Test
@@ -343,7 +462,7 @@ class ServiceControllerTest {
         var masterId = UUID.randomUUID();
         var request = new CreateServiceDefinitionRequest(
                 "Lash Extensions", "Volume set", "MANICURE", 120, 15,
-                PriceType.FIXED, new BigDecimal("900.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("900.00"), null, null, UUID.randomUUID());
         var stub = stubMasterServiceResponse(UUID.randomUUID(), masterId, "Lash Extensions");
 
         when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
@@ -390,29 +509,27 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("POST /independent-masters/me/services — 201 response JSON has null serviceTypeId + serviceTypeNameUk when no type is chosen")
-    void should_returnNullServiceTypeFieldsInJson_when_independentMasterCreatesWithoutServiceType() throws Exception {
+    @DisplayName("POST /independent-masters/me/services — 400 when serviceTypeId is omitted (mandatory since V111); service is never invoked")
+    void should_return400_when_independentMasterCreatesWithoutServiceType() throws Exception {
         var userId = UUID.randomUUID();
-        var masterId = UUID.randomUUID();
-        var request = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", "MANICURE", 60, 10,
-                PriceType.FIXED, new BigDecimal("350.00"), null, null, null);
-        // stubMasterServiceResponse leaves both new fields null — the picker was not used.
-        var stub = stubMasterServiceResponse(UUID.randomUUID(), masterId, "Manicure");
+        // Body omits serviceTypeId entirely — the @NotNull bean-validation guard rejects it at
+        // argument resolution, so the request never reaches the service. This is the user-facing
+        // guarantee that an untyped service cannot be created via the independent-master path.
+        var body = "{\"name\":\"Manicure\",\"description\":\"Classic manicure\",\"category\":\"MANICURE\","
+                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":10,"
+                + "\"priceType\":\"FIXED\",\"price\":350.00}";
 
-        when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
-                .thenReturn(stub);
-
-        log.debug("Act: POST /api/v1/independent-masters/me/services without a serviceTypeId — response fields must be null");
+        log.debug("Act: POST /api/v1/independent-masters/me/services without a serviceTypeId — must return 400");
         mockMvc.perform(post("/api/v1/independent-masters/me/services")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.serviceTypeId").value(org.hamcrest.Matchers.nullValue()))
-                .andExpect(jsonPath("$.data.serviceTypeNameUk").value(org.hamcrest.Matchers.nullValue()));
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.serviceTypeId").value("Service type id is required"));
+
+        verify(serviceCatalogService, never()).addIndependentMasterService(any(), any());
     }
 
     // ── Phase 16.3 cross-field reject — HTTP envelope (16.3 + GlobalExceptionHandler seam) ──
@@ -483,9 +600,11 @@ class ServiceControllerTest {
     @DisplayName("POST /independent-masters/me/services — 403 when CLIENT attempts the call")
     void should_return403_when_clientAddsIndependentMasterService() throws Exception {
         var userId = UUID.randomUUID();
+        // Valid body (serviceTypeId present) so the 403 proves the INDEPENDENT_MASTER role gate
+        // denies a CLIENT — not bean validation on a missing service type.
         var request = new CreateServiceDefinitionRequest(
                 "Sneaky Service", null, "MANICURE", 30, 0,
-                PriceType.FIXED, new BigDecimal("100.00"), null, null, null);
+                PriceType.FIXED, new BigDecimal("100.00"), null, null, UUID.randomUUID());
 
         log.debug("Act: POST /api/v1/independent-masters/me/services as CLIENT — must be denied");
         mockMvc.perform(post("/api/v1/independent-masters/me/services")
@@ -658,7 +777,7 @@ class ServiceControllerTest {
         // Stub: service layer returns a RANGE ServiceDefinitionResponse
         var rangeStub = new ServiceDefinitionResponse(
                 serviceId, "Range Manicure", null, "MANICURE", 60, 0, true,
-                null, null, null,
+                null, null, null, null,
                 PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"),
                 "від 500 до 800 грн");
 
@@ -666,9 +785,10 @@ class ServiceControllerTest {
         when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
                 .thenReturn(rangeStub);
 
-        // RANGE request: priceType=RANGE, priceMin=500, priceMax=800; no price field
-        String body = "{\"name\":\"Range Manicure\",\"category\":\"MANICURE\","
-                + "\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
+        // RANGE request: priceType=RANGE, priceMin=500, priceMax=800; no price field.
+        // serviceTypeId is mandatory (V111) so it must be present for a 201.
+        String body = "{\"name\":\"Range Manicure\",\"category\":\"MANICURE\",\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,"
                 + "\"priceType\":\"RANGE\",\"priceMin\":500.00,\"priceMax\":800.00}";
 
         log.debug("Act: POST /api/v1/salons/{}/services with RANGE pricing — must return 201 with RANGE fields", salonId);
@@ -947,8 +1067,9 @@ class ServiceControllerTest {
         when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
                 .thenReturn(stubServiceDefResponse(serviceId, "Manicure"));
         // Tab (\t) and line breaks (\n) are now legal in description — long-form copy legitimately
-        // contains them. Valid category supplied so the only field under test is description.
-        var body = "{\"name\":\"Manicure\",\"category\":\"MANICURE\""
+        // contains them. Valid category + mandatory serviceTypeId supplied so the only field under
+        // test is description.
+        var body = "{\"name\":\"Manicure\",\"category\":\"MANICURE\",\"serviceTypeId\":\"" + UUID.randomUUID() + "\""
                 + ",\"description\":\"Line one\\nLine two\\tindented\""
                 + ",\"baseDurationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00,\"bufferMinutesAfter\":0}";
 
@@ -1106,7 +1227,7 @@ class ServiceControllerTest {
         var serviceDefId = UUID.randomUUID();
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
         var stub = new ServiceDefinitionResponse(
-                serviceDefId, "Manicure", null, null, 60, 10, true, null, null, photoUrl,
+                serviceDefId, "Manicure", null, null, 60, 10, true, null, null, null, photoUrl,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
