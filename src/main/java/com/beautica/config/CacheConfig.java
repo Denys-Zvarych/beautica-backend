@@ -30,6 +30,11 @@ public class CacheConfig {
      *   master-working-days — CLIENT-safe boolean working-day gating per master/from/to (Phase 15.11
      *                         GET /masters/{masterId}/working-days) — 60 sec TTL, max 500 entries; evicted
      *                         by master prefix alongside available-slots on every schedule write
+     *   master-usable-schedule — short-circuiting boolean "has ≥1 working day in [from,to]" per
+     *                         master/from/to (Phase 23.x, MasterScheduleService#hasUsableSchedule,
+     *                         backs GET /salons/{salonId}/services/{serviceDefId}/masters) — same
+     *                         60 sec TTL/500-entry sizing and master-prefix eviction as
+     *                         master-working-days, which it mirrors
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
      *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
@@ -114,6 +119,15 @@ public class CacheConfig {
         // by-master-prefix eviction technique, fired from the same 4 schedule write paths
         // (MasterScheduleService#evictSlotsAfterCommit).
         manager.registerCustomCache("master-working-days",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS)
+                        .build());
+        // Phase 23.x (perf follow-up) — short-circuiting boolean usability gate backing the
+        // bookable-masters endpoint. Mirrors master-working-days: same 60-sec TTL/500-entry sizing,
+        // same by-master-prefix eviction technique, fired from the same schedule write paths
+        // (MasterScheduleService#evictSlotsAfterCommit).
+        manager.registerCustomCache("master-usable-schedule",
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS)

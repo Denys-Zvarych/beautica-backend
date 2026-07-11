@@ -109,6 +109,10 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/reviews/summary").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/reviews").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services").permitAll();
+                    // Phase 23.x — booking-flow master selection. Mirrors the same-domain public
+                    // reads above (salon masters roster, master's service menu): clients browse
+                    // bookable masters before authenticating to book.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services/{serviceDefId}/masters").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
                     // Self-service category approval pages — token-authenticated
