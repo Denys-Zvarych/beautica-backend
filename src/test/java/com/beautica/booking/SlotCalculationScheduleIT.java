@@ -92,6 +92,9 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
     private MasterServiceRepository masterServiceRepository;
 
     @Autowired
+    private org.springframework.cache.CacheManager slotCacheManager;
+
+    @Autowired
     private JdbcTemplate jdbc;
 
     // ── fixtures ──────────────────────────────────────────────────────────────────
@@ -148,7 +151,8 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
         Instant now = date.minusDays(7).atStartOfDay(TimeZones.KYIV).toInstant();
         Clock fixed = Clock.fixed(now, ZoneOffset.UTC);
         return new SlotCalculationService(
-                bookingRepository, masterServiceRepository, masterScheduleService, timeSlotCalculator, fixed);
+                bookingRepository, masterServiceRepository, masterScheduleService, timeSlotCalculator,
+                slotCacheManager, fixed);
     }
 
     private static WeeklyScheduleRequest weekly(LocalDate from, LocalDate to, WeeklyScheduleDayRequest... days) {

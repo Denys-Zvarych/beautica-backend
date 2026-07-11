@@ -11,6 +11,7 @@ import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.sms.SmsService;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -20,6 +21,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.UUID;
@@ -55,19 +57,25 @@ public class BookingCancellationService {
     private final BookingRepository bookingRepository;
     private final NotificationOutboxService outboxService;
     private final SmsService smsService;
+    private final SlotCalculationService slotCalculationService;
     private final BookingSmsProperties smsProperties;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final Clock kyivClock;
 
     public BookingCancellationService(
             BookingRepository bookingRepository,
             NotificationOutboxService outboxService,
             SmsService smsService,
+            SlotCalculationService slotCalculationService,
             BookingSmsProperties smsProperties,
+            SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             Clock clock) {
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
         this.smsService = smsService;
+        this.slotCalculationService = slotCalculationService;
         this.smsProperties = smsProperties;
+        this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
 
@@ -151,7 +159,21 @@ public class BookingCancellationService {
     private void registerAfterCommitSms(Booking booking) {
         String phone = booking.getGuestPhone();
         String smsText = buildCancellationSms(booking);
-        Runnable task = () -> sendCancellationSms(phone, smsText);
+        UUID masterId = booking.getMaster().getId();
+        UUID masterServiceId = booking.getMasterService().getId();
+        UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
+        LocalDate date = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toLocalDate();
+        Runnable task = () -> {
+            sendCancellationSms(phone, smsText);
+            // Cancelling frees a slot → the freed slot must reappear in the picker and the master's
+            // free-slot bookability verdict may flip (un-hiding a service). Evict both.
+            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            // Un-hiding a service also changes the salon catalogue (perf/security #2).
+            if (salonId != null) {
+                salonCatalogCacheEvictor.evict(salonId);
+            }
+        };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override

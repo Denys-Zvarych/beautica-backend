@@ -1241,6 +1241,121 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isZero();
     }
 
+    // ── Phase 23.x — rotated-master leak (salon bookable gate correlation) ────────
+
+    @Test
+    @DisplayName("GET /search/salons?serviceTypeSlugs=… — a rotated-away master's stale assignment must NOT surface its OLD salon (bookable gate mx.salon_id correlation)")
+    void should_excludeRotatedMasterSalon_fromServiceFilteredSearch() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        // Salon A owns a type-A def, but its ONLY performing master rotated to salon B
+        // (masters.salon_id = B) while keeping an ACTIVE assignment to A's def. The salon bookable gate
+        // (mx.salon_id = <salon>.id, added in Phase 23.x to appendSalonBookableGate) must exclude salon A
+        // — a rotated master no longer makes its old salon bookable for that service.
+        //
+        // NOTE: free-slot bookability is deliberately NOT expressed in search SQL
+        // (see SearchService#appendSalonBookableGate) — search stays on the coarse gate. This test
+        // exercises ONLY the rotated-master correlation, never a fully-booked-out master.
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID defA = seedTypedSalonOwnedDef(salonA, "Кератин ротований майстер", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID salonB = seedActiveSalon("Львів", null);
+        UUID rotatedMaster = seedSalonMasterFor(salonB, "Львів", "4.00");
+        linkMasterToOwnedDef(rotatedMaster, defA, null, true); // active link, but master now in salon B
+
+        // Control — an in-salon active master keeps its salon bookable → PRESENT.
+        UUID salonC = seedActiveSalon("Київ", null);
+        UUID defC = seedTypedSalonOwnedDef(salonC, "Кератин місцевий майстер", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID masterC = seedSalonMasterFor(salonC, "Київ", "4.00");
+        linkMasterToOwnedDef(masterC, defC, null, true);
+
+        JsonNode data = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("a rotated master's stale assignment must not surface salon A; only the "
+                        + "in-salon-master salon C is bookable for the type-A slug")
+                .containsExactly(salonC.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons (UNFILTERED, ?location.cityId only) — a rotated-away master's stale assignment must NOT leak its OLD salon's serviceNames/price band (projection mad/mm2.salon_id = s.id correlation)")
+    void should_notLeakRotatedMasterServiceNamesOrPrice_onUnfilteredCitySearch() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        // Salon A (Kyiv) owns a def, but its ONLY performing master ROTATED to salon B (masters.salon_id = B)
+        // while keeping an ACTIVE master_services assignment to A's def. This is the exact live-reproduced
+        // HIGH leak: on a plain city search (NO slug / q / category / price filter — the projection's
+        // price-band lateral + serviceNames lateral still run) salon A must appear (it is an active Kyiv
+        // salon) but with an EMPTY serviceNames and a NULL price band — the rotated master no longer
+        // belongs to salon A (mad.salon_id = s.id / mm2.salon_id = t.id fails), so A owns no bookable
+        // offering. Pre-fix, salon A leaked "Кератин ротований" + a 300.00 band off the rotated master.
+        UUID salonA = seedActiveSalon("Київ", null);
+        UUID defA = seedTypedSalonOwnedDef(salonA, "Кератин ротований", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID salonB = seedActiveSalon("Львів", null);
+        UUID rotatedMaster = seedSalonMasterFor(salonB, "Львів", "4.00");
+        linkMasterToOwnedDef(rotatedMaster, defA, null, true); // active link, but master now in salon B
+
+        // Control — salon C (Kyiv) whose in-salon active master keeps its offering bookable. This proves
+        // the correlation does not null EVERY salon's projection — a genuine in-salon master still surfaces.
+        UUID salonC = seedActiveSalon("Київ", null);
+        UUID defC = seedTypedSalonOwnedDef(salonC, "Кератин місцевий", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID masterC = seedSalonMasterFor(salonC, "Київ", "4.00");
+        linkMasterToOwnedDef(masterC, defC, null, true);
+
+        // No slug / q / category / price filter — the unfiltered city projection.
+        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("both Kyiv salons are listed on the unfiltered city search (salon A is still an active "
+                        + "salon; only its rotated-master offering is suppressed)")
+                .containsExactlyInAnyOrder(salonA.toString(), salonC.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(2L);
+
+        JsonNode rowA = salonRowById(data, salonA);
+        assertThat(rowA.path("serviceNames").isArray())
+                .as("salon A serviceNames must be a JSON array")
+                .isTrue();
+        assertThat(rowA.path("serviceNames").size())
+                .as("rotated-master leak: salon A must expose NO serviceNames (its only performing master "
+                        + "left for salon B) — serviceNames lateral mm2.salon_id = t.id excludes it")
+                .isZero();
+        assertThat(rowA.path("priceMin").isNull())
+                .as("rotated-master leak: salon A price band floor must be NULL (no in-salon performing master)")
+                .isTrue();
+        assertThat(rowA.path("priceMax").isNull())
+                .as("rotated-master leak: salon A price band ceiling must be NULL (no in-salon performing master)")
+                .isTrue();
+
+        JsonNode rowC = salonRowById(data, salonC);
+        java.util.List<String> namesC = new java.util.ArrayList<>();
+        rowC.path("serviceNames").forEach(n -> namesC.add(n.asText()));
+        assertThat(namesC)
+                .as("control salon C (in-salon active master) still surfaces its bookable service name")
+                .containsExactly("Кератин місцевий");
+        assertThat(new BigDecimal(rowC.path("priceMin").asText()))
+                .as("control salon C prices off its in-salon master's effective price")
+                .isEqualByComparingTo(new BigDecimal("300.00"));
+        assertThat(new BigDecimal(rowC.path("priceMax").asText()))
+                .as("control salon C prices off its in-salon master's effective price")
+                .isEqualByComparingTo(new BigDecimal("300.00"));
+    }
+
+    /** Returns the single salon row in {@code data} whose {@code salonId} equals {@code salonId}. */
+    private JsonNode salonRowById(JsonNode data, UUID salonId) {
+        for (JsonNode row : data.path("data")) {
+            if (row.path("salonId").asText().equals(salonId.toString())) {
+                return row;
+            }
+        }
+        throw new AssertionError("salon row not found for id " + salonId);
+    }
+
     /**
      * Seeds an active, FIXED-priced SALON-owned service definition with an
      * explicit (custom) {@code name} plus an active {@code master_services} link

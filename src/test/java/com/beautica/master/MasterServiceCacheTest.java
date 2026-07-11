@@ -88,6 +88,12 @@ class MasterServiceCacheTest {
     // Phase 21.3: MasterService now constructor-depends on AuthorizationService (rotateMasterToSalon).
     // This slice does not exercise that path, so a mock satisfies the wiring.
     @MockBean AuthorizationService authorizationService;
+    // Bookability-eviction fix: MasterService now constructor-depends on these two collaborators.
+    // This slice only asserts master-calendar / master-by-user eviction, so mocks satisfy the wiring
+    // (their bookability-cache eviction is guarded at unit tier in MasterServiceTest and end-to-end
+    // in SalonPublicProfileIntegrationTest).
+    @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

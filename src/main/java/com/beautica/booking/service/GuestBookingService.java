@@ -17,6 +17,7 @@ import com.beautica.notification.sms.SmsService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import io.jsonwebtoken.JwtException;
 import lombok.extern.slf4j.Slf4j;
@@ -64,6 +65,7 @@ public class GuestBookingService {
     private final NotificationOutboxService outboxService;
     private final SmsService smsService;
     private final BookingSmsProperties smsProperties;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final String frontendBaseUrl;
     private final Clock kyivClock;
 
@@ -76,6 +78,7 @@ public class GuestBookingService {
             NotificationOutboxService outboxService,
             SmsService smsService,
             BookingSmsProperties smsProperties,
+            SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             Clock clock) {
         this.guestTokenProvider = guestTokenProvider;
@@ -86,6 +89,7 @@ public class GuestBookingService {
         this.outboxService = outboxService;
         this.smsService = smsService;
         this.smsProperties = smsProperties;
+        this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.frontendBaseUrl = frontendBaseUrl;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
@@ -199,10 +203,20 @@ public class GuestBookingService {
     private void registerAfterCommit(Master master, MasterServiceAssignment msa,
                                      Booking saved, String guestPhone, String cancelUrl) {
         String smsText = buildConfirmationSms(master, msa, saved, cancelUrl);
+        // Capture the salon id inside the transaction (before the afterCommit callback runs) —
+        // null for an independent master (no salon catalogue entry).
+        UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
         Runnable task = () -> {
             sendConfirmationSms(guestPhone, smsText);
             slotCalculationService.evictAvailableSlots(
                     master.getId(), saved.getStartsAt().toLocalDate(), msa.getId());
+            // A new guest booking changed occupancy → evict the master's free-slot bookability
+            // verdict (master-prefix; window keys can't be evicted per-date).
+            slotCalculationService.evictBookableFutureSlotsByMaster(master.getId());
+            // A flipped verdict can add/remove a service from the salon catalogue (perf/security #2).
+            if (salonId != null) {
+                salonCatalogCacheEvictor.evict(salonId);
+            }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {

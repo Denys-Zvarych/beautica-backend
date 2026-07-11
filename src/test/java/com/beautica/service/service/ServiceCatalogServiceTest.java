@@ -90,6 +90,12 @@ class ServiceCatalogServiceTest {
     @Mock
     private com.beautica.common.security.AuthorizationService authz;
 
+    @Mock
+    private com.beautica.booking.service.SlotCalculationService slotCalculationService;
+
+    @Mock
+    private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 
@@ -1163,6 +1169,34 @@ class ServiceCatalogServiceTest {
                 .build();
     }
 
+    /**
+     * Wraps a catalog {@link ServiceDefinition} in a bookable {@link MasterServiceAssignment} performed
+     * by a fresh master. Phase 23.x: the catalogue now loads candidate ASSIGNMENTS
+     * ({@code findBookableAssignmentsBySalon}) and runs the free-slot gate
+     * ({@code slotCalculationService.filterBookableAssignments}) per master, so each catalog fixture is
+     * an assignment rather than a bare definition.
+     */
+    private MasterServiceAssignment assignmentFor(ServiceDefinition def) {
+        Master master = Master.builder().id(UUID.randomUUID()).isActive(true).build();
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(def)
+                .isActive(true)
+                .build();
+    }
+
+    /**
+     * Stubs the batched free-slot gate as a pass-through: every candidate assignment is bookable.
+     * Exclusion/booked-out behaviour is exercised end-to-end in the Testcontainers catalogue ITs;
+     * here the unit tests focus on grouping/ordering/dedup over the bookable set.
+     */
+    private void stubAllAssignmentsBookable() {
+        org.mockito.Mockito.lenient().when(slotCalculationService.filterBookableAssignments(
+                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> inv.getArgument(1));
+    }
+
     private com.beautica.service.entity.PlatformCategory approvedCategory(String name) {
         return com.beautica.service.entity.PlatformCategory.ofApproved(name, name);
     }
@@ -1180,8 +1214,9 @@ class ServiceCatalogServiceTest {
         ServiceDefinition manicure2 = buildCatalogDefinition("MANICURE", "Gel manicure");
         ServiceDefinition haircut = buildCatalogDefinition("HAIRCUT", "Women's haircut");
 
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
-                .thenReturn(List.of(manicure1, manicure2, haircut));
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(assignmentFor(manicure1), assignmentFor(manicure2), assignmentFor(haircut)));
+        stubAllAssignmentsBookable();
         when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
@@ -1203,8 +1238,9 @@ class ServiceCatalogServiceTest {
 
         // findApprovedActive is ORDER BY displayName — MANICURE listed before HAIRCUT here
         // to prove the group order follows THIS list's index, not alphabetical category order.
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
-                .thenReturn(List.of(haircut, manicure));
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(assignmentFor(haircut), assignmentFor(manicure)));
+        stubAllAssignmentsBookable();
         when(platformCategoryOrderLookup.getApprovedActive())
                 .thenReturn(List.of(approvedCategory("MANICURE"), approvedCategory("HAIRCUT")));
 
@@ -1224,8 +1260,9 @@ class ServiceCatalogServiceTest {
         ServiceDefinition legacy = buildCatalogDefinition("ZZZ_LEGACY", "Old-style service");
         ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
 
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
-                .thenReturn(List.of(legacy, manicure));
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(assignmentFor(legacy), assignmentFor(manicure)));
+        stubAllAssignmentsBookable();
         // ZZZ_LEGACY is intentionally absent from the approved+active list.
         when(platformCategoryOrderLookup.getApprovedActive())
                 .thenReturn(List.of(approvedCategory("MANICURE")));
@@ -1245,8 +1282,9 @@ class ServiceCatalogServiceTest {
 
         ServiceDefinition haircut = buildCatalogDefinition("HAIRDRESSING", "Women's haircut");
 
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
-                .thenReturn(List.of(haircut));
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(assignmentFor(haircut)));
+        stubAllAssignmentsBookable();
         // displayName deliberately differs from the category slug, so an accidental
         // "displayName == category" implementation (e.g. reusing the map key) would fail this.
         when(platformCategoryOrderLookup.getApprovedActive())
@@ -1267,8 +1305,9 @@ class ServiceCatalogServiceTest {
 
         ServiceDefinition legacy = buildCatalogDefinition("ZZZ_LEGACY", "Old-style service");
 
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
-                .thenReturn(List.of(legacy));
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(assignmentFor(legacy)));
+        stubAllAssignmentsBookable();
         // ZZZ_LEGACY is intentionally absent from the approved+active list.
         when(platformCategoryOrderLookup.getApprovedActive())
                 .thenReturn(List.of(approvedCategory("MANICURE", "Манікюр")));
@@ -1286,7 +1325,7 @@ class ServiceCatalogServiceTest {
     void should_returnEmptyCategories_when_salonHasNoBookableServices() {
         UUID salonId = UUID.randomUUID();
 
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
                 .thenReturn(List.of());
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
@@ -1301,8 +1340,9 @@ class ServiceCatalogServiceTest {
         UUID salonId = UUID.randomUUID();
         ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
 
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId), any(Pageable.class)))
-                .thenReturn(List.of(manicure));
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(assignmentFor(manicure)));
+        stubAllAssignmentsBookable();
         when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
@@ -1311,5 +1351,28 @@ class ServiceCatalogServiceTest {
         assertThat(leaf.id()).isEqualTo(manicure.getId());
         assertThat(leaf.name()).isEqualTo("Classic manicure");
         assertThat(leaf.category()).isEqualTo("MANICURE");
+    }
+
+    @Test
+    @DisplayName("Phase 23.x — hides a service whose only performing master has NO free future slot (free-slot gate)")
+    void should_hideService_when_onlyPerformingMasterHasNoFreeSlot() {
+        UUID salonId = UUID.randomUUID();
+        ServiceDefinition manicure = buildCatalogDefinition("MANICURE", "Classic manicure");
+
+        // The candidate assignment exists, but the free-slot gate rejects it (fully booked / no schedule)
+        // → the service must NOT surface in the catalogue. This is the unit-level lock on the batched
+        // free-slot gate the Testcontainers catalogue ITs prove end-to-end.
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(assignmentFor(manicure)));
+        when(slotCalculationService.filterBookableAssignments(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenReturn(List.of());
+
+        var result = serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        assertThat(result.categories())
+                .as("a service with zero bookable performing masters must be excluded from the catalogue")
+                .isEmpty();
+        verify(platformCategoryOrderLookup, never()).getApprovedActive();
     }
 }

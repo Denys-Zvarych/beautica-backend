@@ -25,6 +25,7 @@ import com.beautica.master.entity.WorkingInterval;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WeeklyScheduleRepository;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -73,6 +74,7 @@ public class MasterScheduleService {
     private final AuthorizationService authz;
     private final ScheduleMapper scheduleMapper;
     private final CacheManager cacheManager;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     // ---- Step 2: weekly-template upsert -------------------------------------------------
 
@@ -103,7 +105,7 @@ public class MasterScheduleService {
         replaceDayCollections(schedule, days);
 
         WeeklySchedule saved = weeklyScheduleRepository.save(schedule);
-        evictSlotsAfterCommit(masterId);
+        evictSlotsAfterCommit(master);
         return scheduleMapper.toWeeklyScheduleResponse(saved);
     }
 
@@ -137,7 +139,7 @@ public class MasterScheduleService {
         replaceOverrideDiscreteTimes(override, explicitTimes ? request.times() : List.of());
 
         ScheduleException saved = scheduleExceptionRepository.save(override);
-        evictSlotsAfterCommit(masterId);
+        evictSlotsAfterCommit(master);
         return scheduleMapper.toOverrideResponse(saved);
     }
 
@@ -160,7 +162,7 @@ public class MasterScheduleService {
             throw new NotFoundException("Schedule not found");
         }
         weeklyScheduleRepository.delete(schedule);
-        evictSlotsAfterCommit(masterId);
+        evictSlotsAfterCommit(master);
     }
 
     // ---- Step 1/2 reads: list weekly templates & overrides ------------------------------
@@ -204,7 +206,7 @@ public class MasterScheduleService {
 
         scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
                 .ifPresent(scheduleExceptionRepository::delete);
-        evictSlotsAfterCommit(masterId);
+        evictSlotsAfterCommit(master);
     }
 
     // ---- Step 5: single-date resolver ---------------------------------------------------
@@ -612,17 +614,29 @@ public class MasterScheduleService {
      * (§F). A schedule/override change can affect any service's slots for the master, so we evict by
      * master prefix (the cache key's first element is the masterId) rather than per
      * {@code (date, masterServiceId)}/{@code (from, to)} — bounded to one master, not blanket.
+     *
+     * <p><b>Salon catalogue (perf/security #2).</b> A schedule change can flip whether a master has any
+     * free future slot, so it can add/remove a service from the master's SALON catalogue. When the master
+     * belongs to a salon ({@code master.salon} — JOIN-FETCHed by {@code loadActiveMaster}), the salon's
+     * {@code salon-service-catalog} entry is evicted too; an independent master (null salon) owns no salon
+     * catalogue entry. The salon id is captured before the callback, not read from the entity afterCommit.
      */
-    private void evictSlotsAfterCommit(UUID masterId) {
+    private void evictSlotsAfterCommit(Master master) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
+        UUID masterId = master.getId();
+        UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
                 doEvictAvailableSlotsByMaster(masterId);
                 doEvictWorkingDaysByMaster(masterId);
                 doEvictUsableScheduleByMaster(masterId);
+                doEvictServiceBookableByMaster(masterId);
+                if (salonId != null) {
+                    salonCatalogCacheEvictor.evict(salonId);
+                }
             }
         });
     }
@@ -646,6 +660,17 @@ public class MasterScheduleService {
      */
     private void doEvictUsableScheduleByMaster(UUID masterId) {
         evictByMasterPrefix("master-usable-schedule", masterId);
+    }
+
+    /**
+     * Mirrors {@link #doEvictUsableScheduleByMaster}: {@code master-service-bookable} (backing
+     * {@code SlotCalculationService#hasBookableFutureSlot}) is keyed {@code {#masterId,
+     * #masterServiceId, #from, #to}} whose first element is the masterId, so the same masterId-prefix
+     * Caffeine key scan applies. A schedule change can flip the free-slot verdict for any of the
+     * master's services, so it must be evicted alongside {@code master-usable-schedule}.
+     */
+    private void doEvictServiceBookableByMaster(UUID masterId) {
+        evictByMasterPrefix("master-service-bookable", masterId);
     }
 
     /**

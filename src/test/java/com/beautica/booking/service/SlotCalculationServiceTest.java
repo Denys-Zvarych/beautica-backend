@@ -69,6 +69,9 @@ class SlotCalculationServiceTest {
     @Mock
     private TimeSlotCalculator timeSlotCalculator;
 
+    @Mock
+    private org.springframework.cache.CacheManager cacheManager;
+
     private SlotCalculationService slotCalculationService;
 
     @BeforeEach
@@ -78,6 +81,7 @@ class SlotCalculationServiceTest {
                 masterServiceRepository,
                 masterScheduleService,
                 timeSlotCalculator,
+                cacheManager,
                 clock);
     }
 
@@ -766,5 +770,173 @@ class SlotCalculationServiceTest {
         // Assert — exception date → empty; calculator not called
         assertThat(slots).isEmpty();
         verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
+    }
+
+    // ── Perf #3 — occupied bookings bucketed by civil day (end-exclusive) ──────────────────────
+    //
+    // hasBookableFutureSlot's entity core buckets the window's PENDING/CONFIRMED bookings by Kyiv-civil
+    // date via loadOccupiedByDay, adding each booking to EVERY civil day it overlaps with an EXCLUSIVE
+    // end ([dateOf(start) .. dateOf(end − ε)]). These two tests pin that bucketing directly by capturing
+    // the occupied list handed to the calculator per walked day (the calculator is stubbed to return no
+    // free slot, so the whole range is walked and every working day's bucket is observed).
+
+    /** An active assignment on an active master with the given id and base duration + buffer. */
+    private static MasterServiceAssignment activeAssignment(UUID masterId, int baseMinutes, int bufferMinutes) {
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(baseMinutes)
+                .bufferMinutesAfter(bufferMinutes)
+                .isActive(true)
+                .build();
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .serviceDefinition(sd)
+                .master(master)
+                .isActive(true)
+                .build();
+    }
+
+    private static Booking bookingRange(String startIso, String endIso) {
+        Booking b = mock(Booking.class);
+        when(b.getStartsAt()).thenReturn(OffsetDateTime.parse(startIso));
+        when(b.getEndsAt()).thenReturn(OffsetDateTime.parse(endIso));
+        return b;
+    }
+
+    @Test
+    @DisplayName("occupied bucketing — a booking ending exactly at midnight does NOT occupy the next civil day")
+    void should_notOccupyNextDay_when_bookingEndsExactlyAtMidnight() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate day1 = LocalDate.of(2026, 5, 10);
+        LocalDate day2 = LocalDate.of(2026, 5, 11);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        // Booking [day1 22:00, day2 00:00) Kyiv — ends precisely at the day1→day2 civil midnight.
+        Booking midnightEnding = bookingRange("2026-05-10T22:00:00+03:00", "2026-05-11T00:00:00+03:00");
+
+        when(masterScheduleService.resolveEffectiveRange(masterId, day1, day2))
+                .thenReturn(List.of(
+                        templateDay(day1, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(day2, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of(midnightEnding));
+        // No free slot on any day → the whole range is walked, so both days' buckets are handed to the calculator.
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        boolean bookable = slotCalculationService.hasBookableFutureSlot(msa, day1, day2);
+
+        assertThat(bookable)
+                .as("calculator stubbed to no free slot → not bookable (verdict is incidental here)")
+                .isFalse();
+
+        ArgumentCaptor<LocalDate> dateCaptor = ArgumentCaptor.forClass(LocalDate.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<TimeRange>> occCaptor = ArgumentCaptor.forClass(List.class);
+        verify(timeSlotCalculator, org.mockito.Mockito.times(2))
+                .calculateAvailableSlots(dateCaptor.capture(), any(), any(), any(), any(), occCaptor.capture());
+
+        List<LocalDate> dates = dateCaptor.getAllValues();
+        List<List<TimeRange>> occupied = occCaptor.getAllValues();
+        assertThat(dates).as("both civil days are walked in order").containsExactly(day1, day2);
+        assertThat(occupied.get(0))
+                .as("day1 (the booking's start day) receives the occupied range")
+                .hasSize(1);
+        assertThat(occupied.get(1))
+                .as("day2 must NOT receive the midnight-ending booking (end is exclusive)")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("occupied bucketing — a multi-day booking occupies EVERY civil day it spans (including interior days)")
+    void should_occupyEveryCivilDay_when_bookingSpansMultipleDays() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate day1 = LocalDate.of(2026, 5, 10);
+        LocalDate day2 = LocalDate.of(2026, 5, 11);
+        LocalDate day3 = LocalDate.of(2026, 5, 12);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        // Booking [day1 22:00, day3 02:00) Kyiv — spans day1, the interior day2, and day3.
+        Booking multiDay = bookingRange("2026-05-10T22:00:00+03:00", "2026-05-12T02:00:00+03:00");
+        TimeRange expected = new TimeRange(
+                OffsetDateTime.parse("2026-05-10T22:00:00+03:00").toInstant(),
+                OffsetDateTime.parse("2026-05-12T02:00:00+03:00").toInstant());
+
+        when(masterScheduleService.resolveEffectiveRange(masterId, day1, day3))
+                .thenReturn(List.of(
+                        templateDay(day1, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(day2, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(day3, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of(multiDay));
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        slotCalculationService.hasBookableFutureSlot(msa, day1, day3);
+
+        ArgumentCaptor<LocalDate> dateCaptor = ArgumentCaptor.forClass(LocalDate.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<TimeRange>> occCaptor = ArgumentCaptor.forClass(List.class);
+        verify(timeSlotCalculator, org.mockito.Mockito.times(3))
+                .calculateAvailableSlots(dateCaptor.capture(), any(), any(), any(), any(), occCaptor.capture());
+
+        assertThat(dateCaptor.getAllValues())
+                .as("all three civil days are walked in order")
+                .containsExactly(day1, day2, day3);
+        for (int i = 0; i < 3; i++) {
+            assertThat(occCaptor.getAllValues().get(i))
+                    .as("each spanned civil day (incl. interior day2) receives the multi-day booking range")
+                    .containsExactly(expected);
+        }
+    }
+
+    // ── Perf #4 — preloaded assignment reuse (no redundant reload on cache miss) ────────────────
+    //
+    // The @Cacheable wrapper hasBookableFutureSlot(masterId, masterServiceId, preloaded, from, to) must,
+    // on a cache MISS (the AOP proxy is inactive in this unit context, so the body always runs), resolve
+    // the assignment from `preloaded` when the caller supplies it — never re-issuing
+    // findByMasterIdAndIdWithGraph. Only a caller passing null triggers the reload.
+
+    @Test
+    @DisplayName("hasBookableFutureSlot(preloaded) — a supplied assignment is reused; findByMasterIdAndIdWithGraph is NOT re-issued")
+    void should_reusePreloadedAssignment_withoutReloading_when_preloadedSupplied() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 10);
+        LocalDate to = LocalDate.of(2026, 5, 17);
+        MasterServiceAssignment preloaded = activeAssignment(masterId, 60, 0);
+
+        // No schedule in the window → verdict false, but the reload-avoidance is what this test locks.
+        when(masterScheduleService.resolveEffectiveRange(masterId, from, to)).thenReturn(List.of());
+        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any())).thenReturn(List.of());
+
+        boolean bookable = slotCalculationService.hasBookableFutureSlot(
+                masterId, masterServiceId, preloaded, from, to);
+
+        assertThat(bookable)
+                .as("no usable schedule in the window → not bookable")
+                .isFalse();
+        verify(masterServiceRepository, never()).findByMasterIdAndIdWithGraph(any(), any());
+    }
+
+    @Test
+    @DisplayName("hasBookableFutureSlot(null preloaded) — a null assignment triggers exactly one findByMasterIdAndIdWithGraph reload")
+    void should_reloadAssignmentOnce_when_preloadedNull() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 10);
+        LocalDate to = LocalDate.of(2026, 5, 17);
+        MasterServiceAssignment resolved = activeAssignment(masterId, 60, 0);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(resolved));
+        when(masterScheduleService.resolveEffectiveRange(masterId, from, to)).thenReturn(List.of());
+        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any())).thenReturn(List.of());
+
+        slotCalculationService.hasBookableFutureSlot(masterId, masterServiceId, null, from, to);
+
+        verify(masterServiceRepository, org.mockito.Mockito.times(1))
+                .findByMasterIdAndIdWithGraph(masterId, masterServiceId);
     }
 }

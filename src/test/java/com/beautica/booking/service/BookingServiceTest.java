@@ -94,6 +94,8 @@ class BookingServiceTest {
     private com.beautica.location.DiscoveryLocationResolver discoveryLocationResolver;
     @Mock
     private CacheManager cacheManager;
+    @Mock
+    private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     private Clock clock;
 
@@ -127,7 +129,8 @@ class BookingServiceTest {
                 reviewRepository,
                 discoveryLocationResolver,
                 clock,
-                cacheManager
+                cacheManager,
+                salonCatalogCacheEvictor
         );
 
         clientId = UUID.randomUUID();

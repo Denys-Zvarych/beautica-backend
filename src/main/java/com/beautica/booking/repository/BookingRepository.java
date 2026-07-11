@@ -353,6 +353,31 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("windowEnd") OffsetDateTime windowEnd
     );
 
+    /**
+     * All PENDING/CONFIRMED bookings for a master overlapping the {@code [windowStart, windowEnd)}
+     * range, ordered by start. Backs the batched free-slot bookability gate
+     * ({@code SlotCalculationService#filterBookableAssignments} / {@code hasBookableFutureSlot}):
+     * the whole booking horizon is loaded ONCE per master and sliced per-day in memory, instead of
+     * one {@link #findOverlappingByMaster} query per day. The overlap predicate ({@code starts_at <
+     * windowEnd AND ends_at > windowStart}) matches {@link #findOverlappingByMaster} so a booking whose
+     * tail spills past a day boundary is still returned. Bounded by the service layer's ≤180-day
+     * booking horizon (Anti-Bug §E-3 — not an unbounded scan), and aligned to the same
+     * {@code (master_id, status, starts_at)} access path as the per-day finder.
+     */
+    @Query(value = """
+            SELECT * FROM bookings
+            WHERE master_id = :masterId
+              AND status IN ('PENDING','CONFIRMED')
+              AND starts_at < :windowEnd
+              AND ends_at   > :windowStart
+            ORDER BY starts_at ASC
+            """, nativeQuery = true)
+    List<Booking> findActiveByMasterInRange(
+            @Param("masterId") UUID masterId,
+            @Param("windowStart") OffsetDateTime windowStart,
+            @Param("windowEnd") OffsetDateTime windowEnd
+    );
+
     @Query(value = """
             SELECT EXISTS (
               SELECT 1 FROM bookings

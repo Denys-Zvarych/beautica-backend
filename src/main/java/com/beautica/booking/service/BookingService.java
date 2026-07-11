@@ -25,6 +25,7 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -75,6 +76,7 @@ public class BookingService {
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final Clock clock;
     private final CacheManager cacheManager;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Transactional
     public BookingResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
@@ -343,7 +345,7 @@ public class BookingService {
         booking.setProviderComment(req.comment());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved);
     }
@@ -404,7 +406,7 @@ public class BookingService {
         booking.setCancellationReason(req.cancellationReason());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved);
     }
@@ -493,9 +495,9 @@ public class BookingService {
         outboxService.enqueueBookingRescheduled(saved.getId());
         // Evict the freed old-day slots and the now-occupied new-day slots, plus the
         // provider calendar — after commit, so a parallel reader cannot repopulate stale data.
-        registerSlotEviction(masterId, oldDate, saved.getMasterService().getId());
+        registerSlotEviction(masterId, salonIdOf(saved), oldDate, saved.getMasterService().getId());
         if (!oldDate.equals(newStartsAt.toLocalDate())) {
-            registerSlotEviction(masterId, newStartsAt.toLocalDate(), saved.getMasterService().getId());
+            registerSlotEviction(masterId, salonIdOf(saved), newStartsAt.toLocalDate(), saved.getMasterService().getId());
         }
         evictMasterCalendarAfterCommit(masterId);
         // A rescheduled booking is always PENDING/CONFIRMED, so canReview is false by the
@@ -572,7 +574,7 @@ public class BookingService {
         }
 
         outboxService.enqueueNewBooking(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved);
     }
 
@@ -603,17 +605,34 @@ public class BookingService {
         BookingStartsAtValidator.validate(startsAt, clock);
     }
 
-    private void registerSlotEviction(UUID masterId, LocalDate date, UUID masterServiceId) {
+    /** Discovery/catalogue salon id for a booking: the booked salon, or null for an independent master. */
+    private static UUID salonIdOf(Booking booking) {
+        Salon salon = booking.getSalon();
+        return salon != null ? salon.getId() : null;
+    }
+
+    private void registerSlotEviction(UUID masterId, UUID salonId, LocalDate date, UUID masterServiceId) {
+        Runnable task = () -> {
+            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+            // The booking changed occupancy → the master's free-slot bookability verdict may
+            // flip; evict by master prefix (window keys can't be evicted per-date).
+            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            // A flipped bookability verdict can add/remove a service from the salon catalogue
+            // (perf/security #2). Null salon (independent master) owns no catalogue entry.
+            if (salonId != null) {
+                salonCatalogCacheEvictor.evict(salonId);
+            }
+        };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+                    task.run();
                 }
             });
         } else {
             // No active transaction (e.g. unit test context) — evict directly
-            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+            task.run();
         }
     }
 

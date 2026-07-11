@@ -56,14 +56,16 @@ class BookingCancellationServiceTest {
     @Mock private BookingRepository bookingRepository;
     @Mock private NotificationOutboxService outboxService;
     @Mock private SmsService smsService;
+    @Mock private SlotCalculationService slotCalculationService;
+    @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     private BookingCancellationService service;
 
     @BeforeEach
     void setUp() {
         service = new BookingCancellationService(
-                bookingRepository, outboxService, smsService,
-                new BookingSmsProperties(),
+                bookingRepository, outboxService, smsService, slotCalculationService,
+                new BookingSmsProperties(), salonCatalogCacheEvictor,
                 Clock.fixed(NOW.toInstant(), ZoneOffset.UTC));
     }
 

@@ -22,8 +22,10 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -66,6 +68,8 @@ public class MasterService {
     private final CityRepository cityRepository;
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
     private final AuthorizationService authorizationService;
+    private final SlotCalculationService slotCalculationService;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -207,6 +211,12 @@ public class MasterService {
                         }
                     });
                 }
+
+                // Reactivation flips is_active TRUE — a sole-performer's SALON service can now
+                // (re)appear in the booking master-list and the salon catalogue. Evict both
+                // bookability caches. salon is the already-loaded caller entity (never a lazy
+                // proxy); capture its id synchronously inside the tx (Anti-Bug §E / §F rule 2).
+                evictBookabilityCachesAfterCommit(reactivatedMasterId, salon.getId());
             }
             return m; // idempotent
         }
@@ -368,6 +378,14 @@ public class MasterService {
         // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
         evictMasterCalendarAfterCommit(master.getId());
 
+        // Deactivation flips is_active FALSE — a sole-performer's SALON service must vanish from
+        // the booking master-list and the salon catalogue immediately, not after the 60s TTL.
+        // salon is JOIN-FETCHed by findByUserIdWithSalon and non-null (filtered above); capture
+        // its id synchronously inside the tx (Anti-Bug §E / §F rule 2).
+        evictBookabilityCachesAfterCommit(
+                master.getId(),
+                master.getSalon() != null ? master.getSalon().getId() : null);
+
         // Evict stale master-by-user entry so the deactivated master fails isActive guards for
         // callers using the cache. actorUserId is available directly without a JOIN FETCH because
         // findByUserIdWithSalon already filtered on it — no lazy-load risk.
@@ -415,6 +433,14 @@ public class MasterService {
         master.setActive(false);
         // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
         evictMasterCalendarAfterCommit(masterId);
+
+        // Deactivation flips is_active FALSE — a sole-performer's SALON service must vanish from
+        // the booking master-list and the salon catalogue immediately, not after the 60s TTL.
+        // salon is JOIN-FETCHed by findByIdWithSalonAndOwner and may be null (INDEPENDENT_MASTER,
+        // a no-op for the catalogue evict); capture its id synchronously inside the tx (§E / §F-2).
+        evictBookabilityCachesAfterCommit(
+                masterId,
+                master.getSalon() != null ? master.getSalon().getId() : null);
 
         // Capture the user UUID while the transaction is still open (user is JOIN FETCH-ed by
         // findByIdWithSalonAndOwner, so getUser() is initialized). A stale master-by-user entry
@@ -625,6 +651,38 @@ public class MasterService {
             @Override
             public void afterCommit() {
                 doEvictMasterCalendarByMaster(masterId);
+            }
+        });
+    }
+
+    /**
+     * Registers an {@code afterCommit} callback that evicts the two "new bookability verdict"
+     * caches whenever a master's {@code is_active} state flips (PERF/consistency MEDIUM):
+     * <ul>
+     *   <li>{@code master-service-bookable} for this master (short-circuits on
+     *       {@code !msa.getMaster().isActive()} in {@code SlotCalculationService#hasBookableFutureSlot}),
+     *       and</li>
+     *   <li>{@code salon-service-catalog} for the owning salon (the catalogue query gates on
+     *       {@code m.isActive = true}) — a no-op when {@code salonId} is {@code null} (independent
+     *       master, no salon catalogue entry).</li>
+     * </ul>
+     *
+     * <p>Both {@code masterId} and {@code salonId} MUST be captured synchronously by the caller
+     * inside the open transaction — never lazy-loaded via {@code master.getSalon()} after commit
+     * (Anti-Bug §E / §F rule 2). Mirrors the wiring already in {@code BookingService} /
+     * {@code ServiceCatalogService}.
+     */
+    private void evictBookabilityCachesAfterCommit(UUID masterId, UUID salonId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+                if (salonId != null) {
+                    salonCatalogCacheEvictor.evict(salonId);
+                }
             }
         });
     }

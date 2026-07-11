@@ -3,7 +3,6 @@ package com.beautica.booking.service;
 import com.beautica.booking.dto.BookableMasterResponse;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.master.service.MasterScheduleService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
@@ -23,51 +22,41 @@ import java.util.UUID;
  * {@code GET /salons/{salonId}/services/{serviceDefId}/masters}).
  *
  * <p><b>Why this exists.</b> {@code SalonService#getMastersBySalon} (the salon-profile roster)
- * and {@code ServiceCatalogService} (the service/assignment CRUD) both stop at
- * "{@code is_active} + active assignment" — neither checks whether the master has any usable
- * schedule. That gap let a master with zero weekly schedules (e.g. a SALON_OWNER's
- * auto-created own-master row, which the platform never prompts to configure hours) appear as a
- * selectable booking target whose calendar then shows every date disabled. This service is the
- * single place that closes that gap for the booking-selection flow specifically — the gate is
- * deliberately NOT added to the roster or catalog reads, which serve display purposes where an
- * unscheduled master is still a legitimate listing.
+ * and {@code ServiceCatalogService} (the service/assignment CRUD) both stopped at
+ * "{@code is_active} + active assignment" — neither checked whether the master could actually be
+ * booked. That gap let a master with no usable schedule, or one whose calendar is fully booked out
+ * across the entire horizon, appear as a selectable booking target whose slot picker then shows
+ * nothing free. This service closes that gap for the booking-selection flow.
  *
- * <p><b>Schedule-gate strategy: reuse, not a parallel EXISTS query.</b> A candidate is
- * "bookable" only if {@link MasterScheduleService#hasUsableSchedule} — which resolves the exact
- * same override/template/gap precedence, {@code EXPLICIT_TIMES} handling, and {@code valid_to}
- * expiry as the client calendar's {@link MasterScheduleService#getClientWorkingDays} (Phase
- * 15.11), just without materializing the full per-date projection first — reports at least one
- * working day in the same near-term horizon a client would ever actually see. Reusing the
- * resolver (rather than hand-rolling a repository-level {@code EXISTS} over
- * {@code weekly_schedules}/{@code working_intervals}) is a deliberate correctness-first choice:
- * any future change to that precedence only has to be correct in one place, and this list can
- * never drift from what the calendar actually enables. Salon master rosters are small (a handful
- * of candidates per salon, not caller-controlled in size), so resolving each candidate
- * individually is an acceptable cost — {@link MasterScheduleService#hasUsableSchedule} both
- * short-circuits the per-candidate day-walk at the first working day AND is cached
- * ({@code master-usable-schedule}, 60s TTL, {@code sync=true}), mirroring
- * {@code master-working-days}.
+ * <p><b>Bookability gate: the single shared free-slot verdict.</b> A candidate is "bookable" only
+ * if {@link SlotCalculationService#hasBookableFutureSlot} — active assignment, active master, a
+ * usable schedule in the booking window, AND ≥1 FREE FUTURE slot (existing PENDING/CONFIRMED
+ * bookings subtracted; slot start ≥ now + {@link BookingStartsAtValidator#MIN_MINUTES_AHEAD}). This
+ * is the exact same verdict the salon catalogue uses
+ * ({@code ServiceCatalogService#getSalonServiceCatalog} via
+ * {@link SlotCalculationService#filterBookableAssignments}), computed from the exact same
+ * effective-day resolver and {@code TimeSlotCalculator} subtraction that
+ * {@link SlotCalculationService#getAvailableSlots} exposes — so the master list, the catalogue, and
+ * the slot picker can never disagree on whether a master is bookable. Salon master rosters are small
+ * (a handful of candidates per salon, not caller-controlled), so resolving each candidate is
+ * acceptable — {@link SlotCalculationService#hasBookableFutureSlot} short-circuits the day-walk at
+ * the first free slot AND is cached ({@code master-service-bookable}, 60s TTL, {@code sync=true}),
+ * evicted by master prefix on every schedule write and every booking write.
  *
  * <p><b>DoS posture (security follow-up).</b> This endpoint is {@code permitAll} (unauthenticated
- * browsing before a client commits to signing up — see {@code SecurityConfig}), whereas
- * {@code GET /masters/{masterId}/working-days} — the calendar endpoint reading the same resolver
- * family — requires {@code isAuthenticated()}. That is a real, structural difference, but it does
- * not create a disproportionate amplification surface: (1) the candidate roster size per request
- * is bounded by how many masters a single salon actually assigns to a single service (small,
- * not attacker-supplied), so a caller cannot inflate the per-request fan-out; (2) the salon and
- * service ids needed to call this endpoint are already discoverable through other {@code permitAll}
- * catalog reads ({@code GET /salons/{salonId}}, {@code GET /salons/{salonId}/services}, public
- * search), so this endpoint grants no new enumeration capability; (3) the short-circuit above
- * means the common case (a master with a normal near-term schedule) resolves in a handful of
- * date-folds rather than the full 181-day walk; and (4) the {@code master-usable-schedule} cache
- * gives it the identical bounded, {@code sync=true} caching posture as the authenticated calendar
- * endpoint, so repeated probing of the same master within the 60s TTL is a cache hit, not a
- * repeated DB resolution. No additional rate limiting was added — Bucket4j is reserved for
- * {@code /auth/*} and blanket-applying it here would throttle legitimate unauthenticated browsing.
+ * browsing before a client commits to signing up — see {@code SecurityConfig}). It does not create a
+ * disproportionate amplification surface: (1) the candidate roster size per request is bounded by how
+ * many masters a single salon assigns to a single service (small, not attacker-supplied); (2) the
+ * salon and service ids needed are already discoverable through other {@code permitAll} catalog
+ * reads, so this grants no new enumeration capability; (3) the short-circuit means the common case
+ * (a master with near-term free slots) resolves in a handful of date-folds rather than the full
+ * 181-day walk; and (4) the {@code master-service-bookable} cache gives repeated probing of the same
+ * master within the 60s TTL a cache hit, not a repeated DB resolution. No additional rate limiting
+ * was added — Bucket4j is reserved for {@code /auth/*}.
  *
- * <p>The horizon mirrors {@link BookingStartsAtValidator#MAX_DAYS_AHEAD} (180 days) — the
- * maximum lead time a booking can ever be created for, so checking schedule usability further
- * out than that would find "working days" a client could never actually book against.
+ * <p>The horizon mirrors {@link BookingStartsAtValidator#MAX_DAYS_AHEAD} (180 days) — the maximum
+ * lead time a booking can ever be created for, so checking bookability further out would find slots a
+ * client could never actually book against.
  */
 @Service
 public class BookingMasterService {
@@ -75,19 +64,19 @@ public class BookingMasterService {
     private final SalonRepository salonRepository;
     private final ServiceRepository serviceRepository;
     private final MasterServiceRepository masterServiceRepository;
-    private final MasterScheduleService masterScheduleService;
+    private final SlotCalculationService slotCalculationService;
     private final Clock kyivClock;
 
     public BookingMasterService(
             SalonRepository salonRepository,
             ServiceRepository serviceRepository,
             MasterServiceRepository masterServiceRepository,
-            MasterScheduleService masterScheduleService,
+            SlotCalculationService slotCalculationService,
             Clock clock) {
         this.salonRepository = salonRepository;
         this.serviceRepository = serviceRepository;
         this.masterServiceRepository = masterServiceRepository;
-        this.masterScheduleService = masterScheduleService;
+        this.slotCalculationService = slotCalculationService;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
 
@@ -129,8 +118,11 @@ public class BookingMasterService {
         LocalDate to = from.plusDays(BookingStartsAtValidator.MAX_DAYS_AHEAD);
 
         return candidates.stream()
-                .filter(assignment ->
-                        masterScheduleService.hasUsableSchedule(assignment.getMaster().getId(), from, to))
+                // Pass the already JOIN-FETCHed assignment as `preloaded` so a cache MISS reuses it
+                // instead of re-issuing findByMasterIdAndIdWithGraph (Perf #4). It is not part of the
+                // cache key, so the cached verdict is shared with entity-less callers.
+                .filter(assignment -> slotCalculationService.hasBookableFutureSlot(
+                        assignment.getMaster().getId(), assignment.getId(), assignment, from, to))
                 .map(BookableMasterResponse::from)
                 .toList();
     }

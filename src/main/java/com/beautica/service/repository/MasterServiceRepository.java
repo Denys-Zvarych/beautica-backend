@@ -160,13 +160,12 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * transaction). The DB {@code UNIQUE (master_id, service_def_id)} constraint (V7) guarantees
      * at most one row per (master, service), so no {@code DISTINCT} is needed.
      *
-     * <p><strong>Schedule usability is intentionally NOT filtered here.</strong> Whether a
-     * candidate has a usable schedule is resolved in-memory by
-     * {@code com.beautica.booking.service.BookingMasterService}, which reuses
-     * {@code MasterScheduleService.hasUsableSchedule} — the short-circuiting boolean gate over the
-     * same override/template/gap resolver the client calendar reads
-     * ({@code getClientWorkingDays}, Phase 15.11) — so the master list and the calendar can never
-     * disagree (see that class's Javadoc).
+     * <p><strong>Bookability is intentionally NOT filtered here.</strong> Whether a candidate has a
+     * free future slot is resolved in-memory by
+     * {@code com.beautica.booking.service.BookingMasterService}, which delegates to
+     * {@code SlotCalculationService.hasBookableFutureSlot} — the shared free-slot verdict over the
+     * same effective-day resolver and slot subtraction the salon catalogue and slot picker use — so
+     * the master list, catalogue, and slot picker can never disagree (see that class's Javadoc).
      */
     @Query("""
             SELECT msa FROM MasterServiceAssignment msa
@@ -180,4 +179,37 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     List<MasterServiceAssignment> findBookableAssignmentsBySalonAndServiceDef(
             @Param("salonId") UUID salonId,
             @Param("serviceDefId") UUID serviceDefId);
+
+    /**
+     * Catalogue candidates (Phase 23.x — CRITICAL free-slot fix): every active
+     * {@link MasterServiceAssignment} of an active master belonging to {@code salonId}, whose linked
+     * service definition is an active SALON-owned service of the same salon. Returns the assignment
+     * (not the bare definition) so the caller has, per row, both the {@code master} (to group by and
+     * resolve a schedule/booking window once per master) and the effective
+     * duration/{@code serviceDefinition} needed by the {@code SlotCalculationService} free-slot gate.
+     *
+     * <p>{@code JOIN FETCH msa.serviceDefinition sd} + {@code LEFT JOIN FETCH sd.serviceType} + the
+     * {@code sd.serviceType} hop initialise everything {@code ServiceDefinitionResponse#from} reads,
+     * and {@code JOIN FETCH msa.master m} initialises the master used to group the batched free-slot
+     * check (Anti-Bug §E — no N+1 / lazy load outside the transaction). One row per (master, def)
+     * assignment: the caller de-duplicates to distinct bookable definitions after the free-slot gate.
+     *
+     * <p>The {@code m.salon.id = :salonId} + {@code sd.ownerId = :salonId} predicates jointly close the
+     * rotated-master and cross-salon leaks (a master who left the salon, or an assignment pointing at a
+     * definition owned by a different salon, never contributes). Bounded by the salon's own
+     * roster × menu (not caller-supplied), mirroring {@link #findBookableAssignmentsBySalonAndServiceDef}.
+     */
+    @Query("""
+            SELECT msa FROM MasterServiceAssignment msa
+            JOIN FETCH msa.serviceDefinition sd
+            LEFT JOIN FETCH sd.serviceType
+            JOIN FETCH msa.master m
+            WHERE m.salon.id = :salonId
+              AND m.isActive = true
+              AND msa.isActive = true
+              AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+              AND sd.ownerId = :salonId
+              AND sd.isActive = true
+            """)
+    List<MasterServiceAssignment> findBookableAssignmentsBySalon(@Param("salonId") UUID salonId);
 }

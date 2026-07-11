@@ -17,6 +17,7 @@ import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterAll;
@@ -38,7 +39,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
@@ -85,6 +89,11 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    // Bookability-eviction guard: exercised through the REAL deactivate path so the afterCommit
+    // salon-service-catalog eviction fires against the live Caffeine cache + Postgres container.
+    @Autowired
+    private com.beautica.master.service.MasterService masterService;
+
     @MockBean
     private NotificationOutboxService notificationOutboxService;
 
@@ -122,6 +131,12 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         assignServiceToMaster(legacyOkService, master1);
         assignServiceToMaster(legacyInactiveOnlyService, inactiveMaster);
         // unassignedService intentionally has zero master_services rows.
+
+        // Phase 23.x free-slot gate: the two active masters need a usable schedule (with free future
+        // slots) or NOTHING they perform would be catalogue-visible. inactiveMaster stays scheduleless —
+        // it is is_active=false anyway, so its lone legacy service must still be excluded.
+        seedUsableSchedule(master1);
+        seedUsableSchedule(master2);
 
         log.debug("Act: GET {}/{}/services with no Authorization header", SALONS_URL, salonId);
         ResponseEntity<String> resp =
@@ -188,6 +203,146 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
                 new TypeReference<ApiResponse<SalonServiceCatalogResponse>>() {});
         assertThat(wrapper.data().categories())
                 .as("a salon with no bookable services must return an empty (not null) category list")
+                .isEmpty();
+    }
+
+    // ── Phase 23.x free-slot gate — catalogue hides fully-booked / scheduleless / rotated ──
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/services — HIDES a service whose only performing master is fully booked out")
+    void should_hideService_when_onlyPerformingMasterIsFullyBooked() throws Exception {
+        UUID ownerId = createSalonOwner("owner-fb-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerId, "FullyBooked Salon " + System.nanoTime());
+        UUID master = createSalonMaster(salonId, "m-fb-" + System.nanoTime() + "@beautica.test", true);
+        UUID service = createSalonService(salonId, "MANICURE", "Booked Manicure");
+        assignServiceToMaster(service, master);
+        // Usable schedule but every slot occupied → no free future slot → not bookable.
+        seedFullyBookedMasterFor(master, service);
+
+        assertThat(catalogueServiceIds(salonId))
+                .as("a service whose only master has no free future slot must be hidden from the catalogue")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/services — HIDES a service whose only performing master has no schedule")
+    void should_hideService_when_onlyPerformingMasterIsScheduleless() throws Exception {
+        UUID ownerId = createSalonOwner("owner-sl-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerId, "Scheduleless Salon " + System.nanoTime());
+        UUID master = createSalonMaster(salonId, "m-sl-" + System.nanoTime() + "@beautica.test", true);
+        UUID service = createSalonService(salonId, "MANICURE", "Scheduleless Manicure");
+        assignServiceToMaster(service, master);
+        // No schedule seeded at all → no working day in the horizon → no bookable slot.
+
+        assertThat(catalogueServiceIds(salonId))
+                .as("a service whose only master has no usable schedule must be hidden")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/services — SHOWS a service when at least one performing master has a free slot (fully-booked sibling doesn't hide it)")
+    void should_showService_when_atLeastOneMasterHasFreeSlot() throws Exception {
+        UUID ownerId = createSalonOwner("owner-mix-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerId, "Mixed Salon " + System.nanoTime());
+        UUID service = createSalonService(salonId, "MANICURE", "Shared Manicure");
+
+        UUID bookedMaster = createSalonMaster(salonId, "m-booked-" + System.nanoTime() + "@beautica.test", true);
+        assignServiceToMaster(service, bookedMaster);
+        seedFullyBookedMasterFor(bookedMaster, service);
+
+        UUID freeMaster = createSalonMaster(salonId, "m-free-" + System.nanoTime() + "@beautica.test", true);
+        assignServiceToMaster(service, freeMaster);
+        seedUsableSchedule(freeMaster);
+
+        assertThat(catalogueServiceIds(salonId))
+                .as("one master with a free slot keeps the shared service visible despite a fully-booked sibling")
+                .containsExactly(service);
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/services — a rotated-away master's assignment must NOT leak the service into its OLD salon's catalogue")
+    void should_notLeakRotatedMasterService_intoOldSalonCatalogue() throws Exception {
+        UUID ownerA = createSalonOwner("owner-a-" + System.nanoTime() + "@beautica.test");
+        UUID salonA = createSalon(ownerA, "Salon A " + System.nanoTime());
+        UUID ownerB = createSalonOwner("owner-b-" + System.nanoTime() + "@beautica.test");
+        UUID salonB = createSalon(ownerB, "Salon B " + System.nanoTime());
+
+        UUID serviceOfA = createSalonService(salonA, "MANICURE", "A's Manicure");
+        // The only performing master now belongs to salon B but kept an active assignment to A's service,
+        // and has a perfectly bookable schedule. A's catalogue must still not surface the service.
+        UUID rotated = createSalonMaster(salonB, "m-rot-" + System.nanoTime() + "@beautica.test", true);
+        assignServiceToMaster(serviceOfA, rotated);
+        seedUsableSchedule(rotated);
+
+        assertThat(catalogueServiceIds(salonA))
+                .as("a rotated master's stale assignment must not keep salon A's service visible")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("INVARIANT — catalogue-visible service ⇒ non-empty bookable master-list (the two gates can never diverge)")
+    void should_holdInvariant_catalogueVisibleImpliesNonEmptyBookableMasterList() throws Exception {
+        UUID ownerId = createSalonOwner("owner-inv-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerId, "Invariant Salon " + System.nanoTime());
+
+        // serviceX: performed by a bookable master (free slots) → must be catalogue-visible.
+        UUID serviceX = createSalonService(salonId, "MANICURE", "Bookable X");
+        UUID masterX = createSalonMaster(salonId, "m-x-" + System.nanoTime() + "@beautica.test", true);
+        assignServiceToMaster(serviceX, masterX);
+        seedUsableSchedule(masterX);
+
+        // serviceY: performed only by a fully-booked master → must be catalogue-hidden.
+        UUID serviceY = createSalonService(salonId, "HAIRDRESSING", "Booked Y");
+        UUID masterY = createSalonMaster(salonId, "m-y-" + System.nanoTime() + "@beautica.test", true);
+        assignServiceToMaster(serviceY, masterY);
+        seedFullyBookedMasterFor(masterY, serviceY);
+
+        java.util.Set<UUID> visible = catalogueServiceIds(salonId);
+        assertThat(visible)
+                .as("only the service with a bookable master is catalogue-visible")
+                .containsExactly(serviceX);
+
+        // The anti-drift lock: EVERY catalogue-visible service must resolve to a non-empty bookable
+        // master-list from the OTHER gate (BookingMasterService). If the two gates ever diverge, this
+        // fails before a client can pick a service whose master picker is empty.
+        for (UUID sid : visible) {
+            assertThat(bookableMasterIds(salonId, sid))
+                    .as("catalogue-visible service %s must have >=1 bookable master", sid)
+                    .isNotEmpty();
+        }
+
+        // Symmetric direction: the hidden service's master-list is empty — both gates agree it's not bookable.
+        assertThat(bookableMasterIds(salonId, serviceY))
+                .as("the catalogue-hidden service must also have an empty bookable master-list")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/services — deactivating the SOLE performing master EVICTS the catalogue so the service disappears on the very next call (no 60s TTL wait)")
+    void should_evictCatalogueImmediately_when_solePerformingMasterDeactivated() throws Exception {
+        UUID ownerId = createSalonOwner("owner-evict-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = createSalon(ownerId, "Evict Salon " + System.nanoTime());
+        UUID master = createSalonMaster(salonId, "m-evict-" + System.nanoTime() + "@beautica.test", true);
+        UUID service = createSalonService(salonId, "MANICURE", "Sole Manicure");
+        assignServiceToMaster(service, master);
+        seedUsableSchedule(master);
+
+        // Prime the salon-service-catalog cache: the service is visible while its sole performer is active.
+        assertThat(catalogueServiceIds(salonId))
+                .as("sole active performer with a free future slot must make the SALON service catalogue-visible")
+                .containsExactly(service);
+
+        // Deactivate the sole performer through the REAL service path so the afterCommit eviction fires.
+        log.debug("Act: deactivate sole performing master {} of salon {} via MasterService.deactivateMaster",
+                master, salonId);
+        masterService.deactivateMaster(ownerId, master);
+
+        // The very next call must reflect the deactivation immediately. Without the afterCommit eviction
+        // of salon-service-catalog, the primed cache entry would keep serving the service for up to the
+        // 60s TTL — this assertion is RED on the un-fixed code and GREEN once the eviction is wired.
+        assertThat(catalogueServiceIds(salonId))
+                .as("deactivating the sole performing master must evict the catalogue so its SALON service "
+                        + "vanishes on the next call, not after the 60s TTL")
                 .isEmpty();
     }
 
@@ -552,6 +707,87 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT id FROM master_services WHERE master_id = ? AND service_def_id = ?",
                 UUID.class, masterId, serviceDefId);
+    }
+
+    // ── Phase 23.x free-slot gate fixtures (schedule + bookings) ─────────────────
+
+    private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
+
+    /** "Today" in Kyiv — the same civil day the free-slot gate computes from the autowired clock. */
+    private LocalDate kyivToday() {
+        return LocalDate.now(KYIV);
+    }
+
+    private UUID insertWeeklySchedule(UUID masterId, LocalDate validFrom, LocalDate validTo) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, NOW(), NOW())",
+                scheduleId, masterId, validFrom, validTo);
+        return scheduleId;
+    }
+
+    private void insertInterval(UUID scheduleId, int isoDow, LocalTime start, LocalTime end) {
+        jdbcTemplate.update(
+                "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                UUID.randomUUID(), scheduleId, isoDow, start, end);
+    }
+
+    /**
+     * Open-ended weekly template with a 09:00–17:00 interval on today's ISO weekday — many free future
+     * slots, so the master passes the free-slot gate (used to make a catalogue service bookable).
+     */
+    private void seedUsableSchedule(UUID masterId) {
+        UUID scheduleId = insertWeeklySchedule(masterId, kyivToday(), null);
+        insertInterval(scheduleId, kyivToday().getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(17, 0));
+    }
+
+    /**
+     * Makes {@code masterId} FULLY BOOKED for {@code serviceDefId}: a schedule whose only working day is
+     * today+7 with a single 60-min slot [10:00,11:00] (the seeded services are 60 min → exactly one
+     * slot), then a CONFIRMED guest booking occupying it. No free future slot remains anywhere in the
+     * horizon, so the free-slot gate must hide the service unless another master can perform it.
+     */
+    private void seedFullyBookedMasterFor(UUID masterId, UUID serviceDefId) {
+        LocalDate day = kyivToday().plusDays(7);
+        UUID scheduleId = insertWeeklySchedule(masterId, day, day);
+        insertInterval(scheduleId, day.getDayOfWeek().getValue(), LocalTime.of(10, 0), LocalTime.of(11, 0));
+
+        UUID masterServiceId = resolveMasterServiceId(masterId, serviceDefId);
+        OffsetDateTime startsAt = day.atTime(10, 0).atZone(KYIV).toOffsetDateTime();
+        OffsetDateTime endsAt = day.atTime(11, 0).atZone(KYIV).toOffsetDateTime();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, master_id, master_service_id, status, booking_source, "
+                        + "guest_name, guest_phone, cancel_token, starts_at, ends_at, price_at_booking, "
+                        + "duration_minutes_at_booking, buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'CONFIRMED', 'LINK', 'Guest', '+380501112233', ?, ?, ?, "
+                        + "500.00, 60, 0, NOW(), NOW())",
+                UUID.randomUUID(), masterId, masterServiceId, UUID.randomUUID(), startsAt, endsAt);
+    }
+
+    /** GET the salon catalogue and return the flat set of visible service-definition ids. */
+    private java.util.Set<UUID> catalogueServiceIds(UUID salonId) throws Exception {
+        ResponseEntity<String> resp =
+                restTemplate.getForEntity(SALONS_URL + "/" + salonId + "/services", String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var wrapper = objectMapper.readValue(resp.getBody(),
+                new TypeReference<ApiResponse<SalonServiceCatalogResponse>>() {});
+        java.util.Set<UUID> ids = new java.util.HashSet<>();
+        wrapper.data().categories().forEach(g -> g.services().forEach(s -> ids.add(s.id())));
+        return ids;
+    }
+
+    /** GET the bookable master-list for a service and return the master ids (the second gate). */
+    private List<UUID> bookableMasterIds(UUID salonId, UUID serviceDefId) throws Exception {
+        ResponseEntity<String> resp = restTemplate.getForEntity(
+                SALONS_URL + "/" + salonId + "/services/" + serviceDefId + "/masters", String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(resp.getBody()).get("data");
+        List<UUID> ids = new java.util.ArrayList<>();
+        data.forEach(n -> ids.add(UUID.fromString(n.get("masterId").asText())));
+        return ids;
     }
 
     /**

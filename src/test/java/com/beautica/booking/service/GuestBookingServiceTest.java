@@ -57,6 +57,7 @@ class GuestBookingServiceTest {
     @Mock private SlotCalculationService slotCalculationService;
     @Mock private NotificationOutboxService outboxService;
     @Mock private SmsService smsService;
+    @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     private GuestBookingService service;
 
@@ -68,7 +69,7 @@ class GuestBookingServiceTest {
         service = new GuestBookingService(
                 guestTokenProvider, masterRepository, masterServiceRepository, bookingRepository,
                 slotCalculationService, outboxService, smsService,
-                new BookingSmsProperties(), FRONTEND,
+                new BookingSmsProperties(), salonCatalogCacheEvictor, FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC));
     }
 

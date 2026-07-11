@@ -45,7 +45,8 @@ import static org.mockito.Mockito.when;
 
 @SpringBootTest(
         classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class,
-                CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, CacheConfig.class},
+                CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, SalonCatalogCacheEvictor.class,
+                CacheConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
@@ -64,6 +65,16 @@ class ServiceCatalogServiceCacheTest {
     // service-layer ownership guard. Mock it (void enforce* defaults to a no-op) so the
     // cache-behaviour tests below exercise the happy owner path.
     @MockBean(name = "authz") com.beautica.common.security.AuthorizationService authz;
+    // Phase 23.x: ServiceCatalogService now delegates the catalogue free-slot gate to
+    // SlotCalculationService. It is not on the @SpringBootTest classes list, so mock it to satisfy
+    // the constructor wiring; the catalogue cache test stubs its filter as a pass-through.
+    @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    // Phase 23.x (perf/security #2): ServiceCatalogService evicts the salon-service-catalog cache via
+    // this collaborator on every definition mutation. It is a REAL bean here (on the @SpringBootTest
+    // classes list) so its @CacheEvict fires through the AOP proxy — the salon-catalogue eviction tests
+    // below assert an actual recompute, not an annotation-count. @Autowired only to make its presence
+    // explicit; ServiceCatalogService injects it by constructor.
+    @Autowired SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Autowired ServiceCatalogService serviceCatalogService;
     @Autowired CacheManager cacheManager;
@@ -77,6 +88,7 @@ class ServiceCatalogServiceCacheTest {
         cacheManager.getCache("service-categories").clear();
         cacheManager.getCache("available-slots").clear();
         cacheManager.getCache("platform-category-order").clear();
+        cacheManager.getCache("salon-service-catalog").clear();
     }
 
     // ── sync = true regression pins (Anti-Bug §F-7 — thundering-herd guard) ────
@@ -334,10 +346,21 @@ class ServiceCatalogServiceCacheTest {
                 .basePrice(new BigDecimal("300.00"))
                 .build();
 
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId1), any(Pageable.class)))
-                .thenReturn(List.of(manicure));
-        when(serviceRepository.findBookableServicesBySalon(eq(salonId2), any(Pageable.class)))
-                .thenReturn(List.of(manicure));
+        // Phase 23.x: catalogue loads candidate ASSIGNMENTS then runs the free-slot gate per master.
+        com.beautica.master.entity.Master master1 =
+                com.beautica.master.entity.Master.builder().id(UUID.randomUUID()).isActive(true).build();
+        com.beautica.master.entity.Master master2 =
+                com.beautica.master.entity.Master.builder().id(UUID.randomUUID()).isActive(true).build();
+        com.beautica.service.entity.MasterServiceAssignment a1 =
+                com.beautica.service.entity.MasterServiceAssignment.builder()
+                        .id(UUID.randomUUID()).master(master1).serviceDefinition(manicure).isActive(true).build();
+        com.beautica.service.entity.MasterServiceAssignment a2 =
+                com.beautica.service.entity.MasterServiceAssignment.builder()
+                        .id(UUID.randomUUID()).master(master2).serviceDefinition(manicure).isActive(true).build();
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId1)).thenReturn(List.of(a1));
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId2)).thenReturn(List.of(a2));
+        when(slotCalculationService.filterBookableAssignments(any(), any()))
+                .thenAnswer(inv -> inv.getArgument(1));
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(com.beautica.service.entity.PlatformCategory.ofApproved("MANICURE", "Манікюр")));
 
@@ -347,5 +370,54 @@ class ServiceCatalogServiceCacheTest {
         // Two distinct salons still share the SAME platform-category-order cache entry
         // ('all' key, no salonId in the key) — the repository must be hit only once.
         verify(platformCategoryRepository, times(1)).findApprovedActive();
+    }
+
+    // ── salon-service-catalog cache (perf/security #2) ─────────────────────────
+    //
+    // getSalonServiceCatalog is @Cacheable("salon-service-catalog", key=#salonId, sync=true). A repeat
+    // call within TTL must be served from cache; a service-def mutation for the salon must evict THAT
+    // salon's entry (only) via the real SalonCatalogCacheEvictor.@CacheEvict so the next call recomputes.
+
+    @Test
+    @DisplayName("second getSalonServiceCatalog for the same salon within TTL is served from cache — findBookableAssignmentsBySalon called once")
+    void should_serveSalonCatalogFromCache_when_calledTwiceForSameSalon() {
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        serviceCatalogService.getSalonServiceCatalog(salonId);
+        serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonId);
+    }
+
+    @Test
+    @DisplayName("deactivateServiceDefinition evicts ONLY the owning salon's catalogue entry — that salon recomputes, a sibling salon stays cached (correct salonId source via findSalonOwnerId)")
+    void should_evictOnlyOwningSalonCatalog_when_serviceDefinitionDeactivated() {
+        UUID salonA = UUID.randomUUID();
+        UUID salonB = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonA)).thenReturn(List.of());
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonB)).thenReturn(List.of());
+        // Deactivation resolves the salon id from the def's SALON owner — this is the salonId the
+        // eviction must target. No performing masters keeps the other eviction paths no-ops.
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId)).thenReturn(List.of());
+        when(serviceRepository.findSalonOwnerId(serviceDefId)).thenReturn(Optional.of(salonA));
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        // Populate both salons' catalogue entries.
+        serviceCatalogService.getSalonServiceCatalog(salonA);
+        serviceCatalogService.getSalonServiceCatalog(salonB);
+
+        // Mutate salon A's catalogue — the real evictor fires @CacheEvict(key = salonA) after (no active
+        // transaction here, so evictSalonCatalogAfterCommit runs the eviction synchronously).
+        serviceCatalogService.deactivateServiceDefinition(UUID.randomUUID(), serviceDefId);
+
+        // Salon A recomputes (cache evicted); salon B stays cached (per-key eviction, not a blanket clear).
+        serviceCatalogService.getSalonServiceCatalog(salonA);
+        serviceCatalogService.getSalonServiceCatalog(salonB);
+
+        verify(masterServiceRepository, times(2)).findBookableAssignmentsBySalon(salonA);
+        verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonB);
     }
 }
