@@ -45,7 +45,7 @@ import java.util.UUID;
  *
  * <p><b>Concurrency.</b> Double-booking is prevented by the exact mechanism the
  * regular {@code BookingService.doCreateBooking} uses: a per-master Postgres
- * advisory transaction lock ({@code bookingRepository.acquireAdvisoryLock}) is
+ * advisory transaction lock ({@code bookingRepository.acquireAdvisoryLockWithTimeout}) is
  * acquired BEFORE the overlap check, so check + insert are atomic against a
  * concurrent guest booking for the same master+slot. A {@code DataIntegrityViolation}
  * on save is a final backstop mapped to 409.
@@ -170,6 +170,20 @@ public class GuestBookingService {
         return guestTokenProvider.validate(token);
     }
 
+    /**
+     * Persists the guest booking under the per-master advisory lock.
+     *
+     * <p><b>Lock-wait bound.</b> {@link BookingRepository#acquireAdvisoryLockWithTimeout(UUID)}
+     * fuses {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent to
+     * {@code SET LOCAL}) into the SAME statement/round-trip as the master advisory-lock
+     * acquisition, so the wait is bounded to 3s instead of blocking indefinitely — one round
+     * trip instead of two. This closes the same advisory-lock DoS class documented on
+     * {@link BookingRepository#acquireAdvisoryLockWithTimeout(UUID)}: this endpoint
+     * ({@code POST /api/v1/book/{slug}/booking}) is {@code permitAll}, gated only by a
+     * non-IP-bound guest JWT and a per-IP rate limit, so a replayed guest token fired
+     * concurrently from multiple source IPs would otherwise be able to park unbounded Hikari
+     * connections on the same master's advisory lock.
+     */
     private Booking persistBooking(Master master, MasterServiceAssignment msa,
                                    GuestBookingRequest req, String guestPhone) {
         ServiceDefinition def = msa.getServiceDefinition();
@@ -182,7 +196,9 @@ public class GuestBookingService {
 
         // Per-master advisory lock BEFORE the overlap check — same mechanism as
         // BookingService.doCreateBooking, so check + insert are atomic (no TOCTOU race).
-        Integer lock = bookingRepository.acquireAdvisoryLock(master.getId());
+        // acquireAdvisoryLockWithTimeout() bounds this wait to 3s in the same round trip
+        // (see class-level Javadoc above).
+        Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(master.getId());
         if (lock == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }

@@ -59,7 +59,15 @@ import java.util.UUID;
                 // shape — WHERE client_id = ? ORDER BY starts_at DESC. JPA cannot encode the DESC
                 // sort direction — V95 declares starts_at DESC; this annotation mirrors the columns
                 // only so ddl-auto=validate sees the index exists.
-                @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at")
+                @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at"),
+                // partial index (V112): client-scoped cross-master/salon overlap check
+                // (BookingRepository.findFirstConflictingClientBookingId[Excluding]). JPA cannot
+                // encode WHERE status IN ('PENDING','CONFIRMED') AND client_id IS NOT NULL — the
+                // predicate lives in V112 only; mirrors idx_bookings_master_slot_overlap (V26) but
+                // keyed by client_id. client_id IS NOT NULL excludes guest (LINK) bookings, which
+                // always have a null client_id (V89 chk_bookings_guest_fields) and can never match
+                // this query's client_id equality — indexing them would be pure write amplification.
+                @Index(name = "idx_bookings_client_slot_overlap", columnList = "client_id, starts_at, ends_at")
         }
 )
 @Getter

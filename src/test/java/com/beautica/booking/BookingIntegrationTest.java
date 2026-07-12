@@ -3,11 +3,13 @@ package com.beautica.booking;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
+import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.sms.SmsService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -60,8 +62,17 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private BookingRepository bookingRepository;
 
+    @Autowired
+    private GuestTokenProvider guestTokenProvider;
+
     @MockBean
     private NotificationOutboxService notificationOutboxService;
+
+    // Guest-booking regression test (Phase 19.4 out-of-scope guard) drives the real
+    // POST /api/v1/book/{slug}/booking flow, which sends a confirmation SMS after commit —
+    // mock the provider so no real SMS call is attempted (mirrors GuestBookingConcurrencyIT).
+    @MockBean
+    private SmsService smsService;
 
     @BeforeEach
     void configureHttpClient() {
@@ -617,6 +628,271 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo("17:00");
     }
 
+    // ── Client-scoped cross-master booking conflict (Phase 19.4) ────────────────
+
+    @Test
+    @DisplayName("POST /bookings — 409 CLIENT_BOOKING_CONFLICT when the client already holds an "
+            + "overlapping booking with a DIFFERENT master (core new behaviour, real DB)")
+    void should_return409ClientBookingConflict_when_clientHasOverlappingBookingWithDifferentMaster() throws Exception {
+        String clientToken = createClientAndGetToken("integ-cbc-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterAId = createSalonOwnerSalonAndMaster("integ-cbc-ownerA-" + System.nanoTime() + "@beautica.test");
+        UUID masterAServiceId = createMasterService(masterAId);
+        addWorkingHoursForEveryDay(masterAId);
+        UUID masterBId = createSalonOwnerSalonAndMaster("integ-cbc-ownerB-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = createMasterService(masterBId);
+        addWorkingHoursForEveryDay(masterBId);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        UUID existingBookingId = createBooking(clientToken, masterAId, masterAServiceId, startsAt);
+
+        // Same client, same time window, a completely DIFFERENT master/salon.
+        var request = new CreateBookingRequest(masterBId, masterBServiceId, startsAt, null, null);
+        log.debug("Act: POST {} — client already holds a booking with master A at this time, "
+                + "now booking master B at the same time", BOOKINGS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(clientToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("overlapping booking with a different master must return 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.path("success").asBoolean())
+                .as("response envelope must have success=false")
+                .isFalse();
+        assertThat(body.path("data").path("code").asText())
+                .as("conflict code must be CLIENT_BOOKING_CONFLICT, distinguishing this from the "
+                        + "generic master-busy 409 (data:null)")
+                .isEqualTo("CLIENT_BOOKING_CONFLICT");
+        assertThat(body.path("data").path("conflictingBookingId").asText())
+                .as("conflict detail must reference the client's EXISTING booking with master A")
+                .isEqualTo(existingBookingId.toString());
+        assertThat(body.path("message").asText())
+                .isEqualTo("Client already has an overlapping booking");
+
+        long bookingCount = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM bookings", Long.class);
+        assertThat(bookingCount)
+                .as("only the original booking with master A must exist — the conflicting attempt "
+                        + "was never persisted")
+                .isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/reschedule — 409 CLIENT_BOOKING_CONFLICT when the new time "
+            + "overlaps another booking the client holds with a DIFFERENT master")
+    void should_return409ClientBookingConflict_when_rescheduleOverlapsClientsOtherBookingWithDifferentMaster()
+            throws Exception {
+        String clientToken = createClientAndGetToken("integ-cbc-resched-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterAId = createSalonOwnerSalonAndMaster("integ-cbc-resched-ownerA-" + System.nanoTime() + "@beautica.test");
+        UUID masterAServiceId = createMasterService(masterAId);
+        addWorkingHoursForEveryDay(masterAId);
+        UUID masterBId = createSalonOwnerSalonAndMaster("integ-cbc-resched-ownerB-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = createMasterService(masterBId);
+        addWorkingHoursForEveryDay(masterBId);
+
+        ZonedDateTime slotA = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2)
+                .withHour(9).withMinute(0).withSecond(0).withNano(0);
+        ZonedDateTime slotB = slotA.withHour(15);
+        UUID bookingAId = createBooking(clientToken, masterAId, masterAServiceId, slotA);
+        UUID bookingBId = createBooking(clientToken, masterBId, masterBServiceId, slotB);
+
+        // Client reschedules booking B onto booking A's occupied window — different master,
+        // but the SAME client already holds that time.
+        String body = "{\"newStartsAt\":\"" + slotA.toOffsetDateTime() + "\"}";
+        log.debug("Act: PATCH {}/{}/reschedule onto the client's OWN other-master booking window",
+                BOOKINGS_URL, bookingBId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingBId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("rescheduling into the client's own other-master booking window must return 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        JsonNode responseBody = objectMapper.readTree(response.getBody());
+        assertThat(responseBody.path("data").path("code").asText())
+                .isEqualTo("CLIENT_BOOKING_CONFLICT");
+        assertThat(responseBody.path("data").path("conflictingBookingId").asText())
+                .isEqualTo(bookingAId.toString());
+
+        // Booking B is unchanged — still on its original 15:00 slot.
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
+                String.class, bookingBId))
+                .as("booking B must remain on its original slot after a rejected reschedule")
+                .isEqualTo("15:00");
+    }
+
+    // NOTE: an IT-level "reschedule to a time overlapping the booking's own CURRENT window"
+    // test was deliberately NOT added here. SlotCalculationService.getAvailableSlots (the
+    // assertStartsOnAvailableSlot oracle) sources occupied windows from
+    // BookingRepository.findActiveByMasterInRange WITHOUT excluding the booking being
+    // rescheduled, so any reschedule request targeting a time that overlaps the booking's own
+    // still-stored window is rejected as 409 "Slot not available" BEFORE the client-conflict
+    // exclusion logic is ever reached — this is a separate, pre-existing constraint of the slot
+    // oracle, not a defect in the client-conflict feature. The own-row exclusion contract of
+    // findFirstConflictingClientBookingIdExcluding IS correctly implemented and is proven
+    // directly against real Postgres in BookingRepositoryTest
+    // (should_excludeOwnRow_when_findFirstConflictingClientBookingIdExcluding), which calls the
+    // repository method directly and bypasses the slot oracle. See the QA report's residual-gaps
+    // section for the full writeup.
+
+    @Test
+    @DisplayName("POST /bookings — half-open boundary: a new booking starting exactly when the "
+            + "client's existing (different-master) booking ends is ALLOWED, no off-by-one")
+    void should_allowNewBooking_when_startsExactlyWhenClientsOtherBookingEnds() throws Exception {
+        String clientToken = createClientAndGetToken("integ-cbc-boundary-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterAId = createSalonOwnerSalonAndMaster("integ-cbc-boundary-ownerA-" + System.nanoTime() + "@beautica.test");
+        UUID masterAServiceId = createMasterService(masterAId);
+        addWorkingHoursForEveryDay(masterAId);
+        UUID masterBId = createSalonOwnerSalonAndMaster("integ-cbc-boundary-ownerB-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = createMasterService(masterBId);
+        addWorkingHoursForEveryDay(masterBId);
+
+        // Master A booking: 10:00–11:00 (60-minute service, no buffer).
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        createBooking(clientToken, masterAId, masterAServiceId, startsAt);
+
+        // Master B booking starts exactly at 11:00 — the half-open interval means this must
+        // NOT be treated as a conflict with the client's own 10:00–11:00 master-A booking.
+        ZonedDateTime backToBackStart = startsAt.plusHours(1);
+        var request = new CreateBookingRequest(masterBId, masterBServiceId, backToBackStart, null, null);
+        log.debug("Act: POST {} — new booking starts exactly when the client's other booking ends", BOOKINGS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(clientToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("back-to-back booking starting exactly when the client's other booking ends must be allowed")
+                .isEqualTo(HttpStatus.CREATED);
+    }
+
+    @Test
+    @DisplayName("POST /bookings — 409 CLIENT_BOOKING_CONFLICT when the EXISTING booking's "
+            + "service-duration-derived end extends past the newly requested start (duration-awareness)")
+    void should_return409ClientBookingConflict_when_existingBookingDurationExtendsPastNewRequestedStart()
+            throws Exception {
+        String clientToken = createClientAndGetToken("integ-cbc-duration-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterAId = createSalonOwnerSalonAndMaster("integ-cbc-duration-ownerA-" + System.nanoTime() + "@beautica.test");
+        // 90-minute service on master A: a 10:00 start ends at 11:30, not 11:00 — the
+        // conflict must be derived from the ACTUAL service duration, not a naive same-start check.
+        UUID masterAServiceId = createMasterServiceWithDuration(masterAId, 90);
+        addWorkingHoursForEveryDay(masterAId);
+        UUID masterBId = createSalonOwnerSalonAndMaster("integ-cbc-duration-ownerB-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = createMasterService(masterBId);
+        addWorkingHoursForEveryDay(masterBId);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        UUID existingBookingId = createBooking(clientToken, masterAId, masterAServiceId, startsAt);
+
+        // 11:00 is BEFORE the existing booking's duration-derived end (11:30) but AFTER its
+        // start (10:00) — only a duration-aware overlap check catches this.
+        ZonedDateTime overlappingStart = startsAt.plusHours(1);
+        var request = new CreateBookingRequest(masterBId, masterBServiceId, overlappingStart, null, null);
+        log.debug("Act: POST {} — requested start falls inside the existing booking's "
+                + "duration-derived window, not at its literal start time", BOOKINGS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(clientToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("a request falling inside the existing booking's duration-derived window must conflict")
+                .isEqualTo(HttpStatus.CONFLICT);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.path("data").path("code").asText()).isEqualTo("CLIENT_BOOKING_CONFLICT");
+        assertThat(body.path("data").path("conflictingBookingId").asText())
+                .isEqualTo(existingBookingId.toString());
+    }
+
+    @Test
+    @DisplayName("POST /bookings — CLIENT_BOOKING_CONFLICT (not the generic master-busy conflict) "
+            + "wins when BOTH the client-conflict and the master-busy checks would fire")
+    void should_returnClientBookingConflictNotGenericConflict_when_bothClientConflictAndMasterBusyApply()
+            throws Exception {
+        String clientAToken = createClientAndGetToken("integ-cbc-precedence-a-" + System.nanoTime() + "@beautica.test");
+        String clientBToken = createClientAndGetToken("integ-cbc-precedence-b-" + System.nanoTime() + "@beautica.test");
+        UUID masterAId = createSalonOwnerSalonAndMaster("integ-cbc-precedence-ownerA-" + System.nanoTime() + "@beautica.test");
+        UUID masterAServiceId = createMasterService(masterAId);
+        addWorkingHoursForEveryDay(masterAId);
+        UUID masterCId = createSalonOwnerSalonAndMaster("integ-cbc-precedence-ownerC-" + System.nanoTime() + "@beautica.test");
+        UUID masterCServiceId = createMasterService(masterCId);
+        addWorkingHoursForEveryDay(masterCId);
+
+        ZonedDateTime slot = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2)
+                .withHour(13).withMinute(0).withSecond(0).withNano(0);
+
+        // Master A is BUSY at `slot` — a different client (B) already holds it.
+        createBooking(clientBToken, masterAId, masterAServiceId, slot);
+        // Client A separately holds an unrelated booking (master C) at the SAME `slot`.
+        createBooking(clientAToken, masterCId, masterCServiceId, slot);
+
+        // Client A now requests master A at `slot`: master A is busy AND client A has a
+        // conflict — the client-conflict check must win (it runs first, before the master
+        // lock is even acquired).
+        var request = new CreateBookingRequest(masterAId, masterAServiceId, slot, null, null);
+        log.debug("Act: POST {} — both master-busy and client-conflict conditions hold simultaneously",
+                BOOKINGS_URL);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(clientAToken)),
+                String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.path("data").path("code").asText())
+                .as("the structured CLIENT_BOOKING_CONFLICT code must win over the generic "
+                        + "master-busy conflict (which carries data:null) when both apply")
+                .isEqualTo("CLIENT_BOOKING_CONFLICT");
+    }
+
+    @Test
+    @DisplayName("POST /book/{slug}/booking — a GUEST booking is NOT subject to the client-conflict "
+            + "check, even when its window overlaps an authenticated client's existing booking")
+    void should_allowGuestBooking_when_windowOverlapsAnAuthenticatedClientsExistingBooking() throws Exception {
+        String clientToken = createClientAndGetToken("integ-cbc-guest-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterAId = createSalonOwnerSalonAndMaster("integ-cbc-guest-ownerA-" + System.nanoTime() + "@beautica.test");
+        UUID masterAServiceId = createMasterService(masterAId);
+        addWorkingHoursForEveryDay(masterAId);
+
+        ZonedDateTime slot = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2)
+                .withHour(9).withMinute(0).withSecond(0).withNano(0);
+        createBooking(clientToken, masterAId, masterAServiceId, slot);
+
+        // Master B is bookable via the public guest link, entirely unrelated to master A.
+        UUID masterBId = createSalonOwnerSalonAndMaster("integ-cbc-guest-ownerB-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = createMasterService(masterBId);
+        addWorkingHoursForEveryDay(masterBId);
+        String slug = "cbc-guest-exempt-" + Long.toString(System.nanoTime(), 36);
+        jdbcTemplate.update("UPDATE masters SET booking_slug = ? WHERE id = ?", slug, masterBId);
+
+        String guestToken = guestTokenProvider.generate("+380509998877");
+        String body = "{\"serviceId\":\"" + masterBServiceId + "\",\"startsAt\":\""
+                + slot.toOffsetDateTime() + "\",\"name\":\"Гість\",\"surname\":\"Тестовий\"}";
+
+        HttpHeaders guestHeaders = new HttpHeaders();
+        guestHeaders.setBearerAuth(guestToken);
+        guestHeaders.setContentType(MediaType.APPLICATION_JSON);
+
+        log.debug("Act: POST /book/{}/booking — window overlaps an authenticated client's booking, "
+                + "but the guest flow has no client identity to conflict-check against", slug);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/book/" + slug + "/booking", HttpMethod.POST,
+                new HttpEntity<>(body, guestHeaders), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("a guest booking must succeed even when its window overlaps an authenticated "
+                        + "client's own booking — the guest path is out of scope for the "
+                        + "client-conflict check")
+                .isEqualTo(HttpStatus.CREATED);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String createClientAndGetToken(String email) throws Exception {
@@ -672,6 +948,28 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
                 serviceDefId, salonId, resolveServiceTypeId());
+
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId);
+
+        return masterServiceId;
+    }
+
+    /**
+     * Same as {@link #createMasterService(UUID)} but with a caller-supplied base duration —
+     * used by the duration-awareness client-conflict test where a 60-minute default would not
+     * exercise the distinction between "same start time" and "duration-derived end".
+     */
+    private UUID createMasterServiceWithDuration(UUID masterId, int durationMinutes) {
+        UUID salonId = jdbcTemplate.queryForObject(
+                "SELECT salon_id FROM masters WHERE id = ?", UUID.class, masterId);
+
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Test Service', ?, ?, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, resolveServiceTypeId(), durationMinutes);
 
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(

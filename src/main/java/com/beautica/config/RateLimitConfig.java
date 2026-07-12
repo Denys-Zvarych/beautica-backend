@@ -164,6 +164,27 @@ public class RateLimitConfig {
 
     private static final Duration OTP_SEND_WINDOW = Duration.ofMinutes(15);
 
+    // Per-user cap for the two authenticated booking-conflict write endpoints that take the
+    // per-client advisory lock (BookingRepository.acquireClientAdvisoryLockWithTimeout):
+    //   - POST /api/v1/bookings
+    //   - PATCH /api/v1/bookings/{bookingId}/reschedule
+    // Unlike every other bucket in this class (IP-keyed, because AuthRateLimitFilter runs
+    // BEFORE JwtAuthenticationFilter on permitAll surfaces), this bucket is keyed by the
+    // authenticated user id — see BookingRateLimitFilter, which runs AFTER
+    // JwtAuthenticationFilter so the principal is available. The advisory lock is salted by
+    // the caller's OWN user id, so a single authenticated CLIENT needs no IP diversity to
+    // serialize N concurrent requests on the identical lock; without this bucket, N > Hikari's
+    // maximum-pool-size (10) concurrent requests from one free account can exhaust the pool
+    // and 503 the whole app for every other tenant (booking advisory-lock DoS fix). 5/10s is
+    // generous for a legitimate client retrying a declined slot while bounding a scripted
+    // flood. Both endpoints share ONE bucket — same "shared bucket for one class of endpoint"
+    // pattern as rotateStaffBuckets in AuthRateLimitFilter. Configurable so integration tests
+    // (e.g. the 10-concurrent-request BookingConcurrencyTest) can raise the cap.
+    @Value("${app.rate-limit.booking-write-capacity:5}")
+    private long bookingWriteCapacity;
+
+    private static final Duration BOOKING_WRITE_WINDOW = Duration.ofSeconds(10);
+
     // 5-minute eviction grace past the rate-limit window so a bucket entry is not
     // evicted the instant its window rolls over (avoids a false-start on the very
     // next request). Shared by every windowed bucket below.
@@ -416,6 +437,22 @@ public class RateLimitConfig {
                 OTP_SEND_WINDOW.plus(EVICTION_GRACE),
                 otpSendCapacity,
                 OTP_SEND_WINDOW);
+    }
+
+    /**
+     * Per-USER bucket (see field javadoc above) shared by {@code POST /api/v1/bookings} and
+     * {@code PATCH /api/v1/bookings/{bookingId}/reschedule}, consumed by
+     * {@link com.beautica.booking.filter.BookingRateLimitFilter}. {@code expireAfterAccess}
+     * gives a 5-minute grace past the 10-second window so a bucket entry is not evicted the
+     * instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> bookingWriteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                BOOKING_WRITE_WINDOW.plus(EVICTION_GRACE),
+                bookingWriteCapacity,
+                BOOKING_WRITE_WINDOW);
     }
 
     /**

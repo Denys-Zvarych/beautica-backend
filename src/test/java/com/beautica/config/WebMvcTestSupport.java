@@ -6,6 +6,7 @@ import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.PasswordResetService;
 import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.beautica.booking.filter.BookingRateLimitFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
@@ -106,6 +107,34 @@ public class WebMvcTestSupport {
         LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
         return new AuthRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy,
                 dummy, dummy) {
+            @Override
+            protected void doFilterInternal(HttpServletRequest req,
+                                            HttpServletResponse res,
+                                            FilterChain chain)
+                    throws ServletException, IOException {
+                chain.doFilter(req, res);
+            }
+
+            @Override
+            public boolean shouldNotFilter(HttpServletRequest request) {
+                return true;
+            }
+        };
+    }
+
+    /**
+     * Pass-through {@link BookingRateLimitFilter}: per-user rate limiting is not under test
+     * in a controller slice, and its {@code bookingWriteBuckets} bean lives in
+     * {@code RateLimitConfig} (a {@code @Configuration} not loaded by {@code @WebMvcTest}).
+     * {@link #shouldNotFilter} returns {@code true} so the filter is skipped entirely by the
+     * servlet container — same pattern as {@link #authRateLimitFilter()}.
+     */
+    @Bean
+    @Primary
+    @SuppressWarnings("unchecked")
+    public BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
+        LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
+        return new BookingRateLimitFilter(dummy, objectMapper) {
             @Override
             protected void doFilterInternal(HttpServletRequest req,
                                             HttpServletResponse res,

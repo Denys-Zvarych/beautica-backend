@@ -823,4 +823,264 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .containsExactly(due.getId());
     }
 
+    // ── findFirstConflictingClientBookingId[Excluding] (Phase 19.4, real DB) ──────
+    //
+    // The service-layer tests (BookingServiceTest) exercise these methods only via
+    // Mockito. This section pins the actual native-query contract against real Postgres:
+    // status filtering (PENDING/CONFIRMED conflict; every terminal status does not),
+    // half-open boundary, ORDER BY starts_at ASC LIMIT 1 determinism, cross-master scope
+    // (client_id only, no master_id predicate), and the excluding-variant's self-exclusion.
+
+    /** A second master + master-service, independent of {@link #master}/{@link #masterService}. */
+    private Master secondMasterWithService() {
+        User secondMasterUser = new User(
+                "master2-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.INDEPENDENT_MASTER,
+                "Second",
+                "Master",
+                "+380503333334"
+        );
+        em.persist(secondMasterUser);
+
+        Master secondMaster = Master.builder()
+                .user(secondMasterUser)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(secondMaster);
+        return secondMaster;
+    }
+
+    private MasterServiceAssignment serviceFor(Master m) {
+        ServiceDefinition def = ServiceDefinition.builder()
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(m.getId())
+                .name("Pedicure")
+                .category("MANICURE")
+                .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("400.00"))
+                .serviceType(defaultServiceType)
+                .isActive(true)
+                .build();
+        em.persist(def);
+
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(m)
+                .serviceDefinition(def)
+                .isActive(true)
+                .build();
+        em.persist(msa);
+        return msa;
+    }
+
+    private Booking bookingFor(User client, Master m, MasterServiceAssignment msa,
+                                BookingStatus status, OffsetDateTime startsAt, OffsetDateTime endsAt) {
+        return Booking.builder()
+                .client(client)
+                .master(m)
+                .masterService(msa)
+                .status(status)
+                .startsAt(startsAt)
+                .endsAt(endsAt)
+                .priceAtBooking(new BigDecimal("400.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+    }
+
+    @Test
+    @DisplayName("should_findConflict_when_overlappingBookingIsWithADifferentMaster")
+    void should_findConflict_when_overlappingBookingIsWithADifferentMaster() {
+        Master otherMaster = secondMasterWithService();
+        MasterServiceAssignment otherMsa = serviceFor(otherMaster);
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+        Booking existing = bookingFor(clientUser, otherMaster, otherMsa, BookingStatus.CONFIRMED, startsAt, endsAt);
+        em.persist(existing);
+        em.flush();
+
+        // Requested window is for a DIFFERENT master (master, not otherMaster) — the query
+        // is scoped by client_id only, so it must still find the cross-master conflict.
+        Optional<UUID> result = bookingRepository.findFirstConflictingClientBookingId(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC));
+
+        assertThat(result).contains(existing.getId());
+    }
+
+    @Test
+    @DisplayName("should_returnEmpty_when_noOverlappingClientBookingExists")
+    void should_returnEmpty_when_noOverlappingClientBookingExists() {
+        Optional<UUID> result = bookingRepository.findFirstConflictingClientBookingId(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
+
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    @DisplayName("should_returnEmpty_when_newBookingStartsExactlyWhenClientsExistingBookingEnds_halfOpenBoundary")
+    void should_returnEmpty_when_newBookingStartsExactlyWhenClientsExistingBookingEnds() {
+        Booking existing = bookingFor(clientUser, master, masterService, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
+        em.persist(existing);
+        em.flush();
+
+        Optional<UUID> result = bookingRepository.findFirstConflictingClientBookingId(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC));
+
+        assertThat(result)
+                .as("back-to-back is allowed — the half-open interval must not treat an "
+                        + "exact-boundary touch as an overlap")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("should_findConflict_when_pendingClientBookingOverlaps")
+    void should_findConflict_when_pendingClientBookingOverlaps() {
+        Booking existing = bookingFor(clientUser, master, masterService, BookingStatus.PENDING,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
+        em.persist(existing);
+        em.flush();
+
+        Optional<UUID> result = bookingRepository.findFirstConflictingClientBookingId(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC));
+
+        assertThat(result).contains(existing.getId());
+    }
+
+    @Test
+    @DisplayName("should_returnEmpty_when_overlappingClientBookingIsCancelled")
+    void should_returnEmpty_when_overlappingClientBookingIsCancelled() {
+        assertNoConflict_forTerminalStatus(BookingStatus.CANCELLED);
+    }
+
+    @Test
+    @DisplayName("should_returnEmpty_when_overlappingClientBookingIsDeclined")
+    void should_returnEmpty_when_overlappingClientBookingIsDeclined() {
+        assertNoConflict_forTerminalStatus(BookingStatus.DECLINED);
+    }
+
+    @Test
+    @DisplayName("should_returnEmpty_when_overlappingClientBookingIsCompleted")
+    void should_returnEmpty_when_overlappingClientBookingIsCompleted() {
+        assertNoConflict_forTerminalStatus(BookingStatus.COMPLETED);
+    }
+
+    @Test
+    @DisplayName("should_returnEmpty_when_overlappingClientBookingIsNotCompleted")
+    void should_returnEmpty_when_overlappingClientBookingIsNotCompleted() {
+        assertNoConflict_forTerminalStatus(BookingStatus.NOT_COMPLETED);
+    }
+
+    private void assertNoConflict_forTerminalStatus(BookingStatus terminalStatus) {
+        Booking existing = bookingFor(clientUser, master, masterService, terminalStatus,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
+        em.persist(existing);
+        em.flush();
+
+        Optional<UUID> result = bookingRepository.findFirstConflictingClientBookingId(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC));
+
+        assertThat(result)
+                .as("a %s booking must never be reported as a client conflict", terminalStatus)
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("should_returnEarliestConflict_when_clientHoldsMultipleOverlappingBookings")
+    void should_returnEarliestConflict_when_clientHoldsMultipleOverlappingBookings() {
+        Master otherMaster = secondMasterWithService();
+        MasterServiceAssignment otherMsa = serviceFor(otherMaster);
+
+        Booking later = bookingFor(clientUser, master, masterService, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC));
+        Booking earlier = bookingFor(clientUser, otherMaster, otherMsa, BookingStatus.PENDING,
+                OffsetDateTime.of(2026, 6, 1, 9, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC));
+        em.persist(later);
+        em.persist(earlier);
+        em.flush();
+
+        // A wide requested window overlaps BOTH — ORDER BY starts_at ASC LIMIT 1 must
+        // deterministically surface the earlier one.
+        Optional<UUID> result = bookingRepository.findFirstConflictingClientBookingId(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 9, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC));
+
+        assertThat(result).contains(earlier.getId());
+    }
+
+    @Test
+    @DisplayName("should_excludeOwnRow_when_findFirstConflictingClientBookingIdExcluding")
+    void should_excludeOwnRow_when_findFirstConflictingClientBookingIdExcluding() {
+        Booking booking = bookingFor(clientUser, master, masterService, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
+        em.persist(booking);
+        em.flush();
+
+        // The requested window overlaps the booking's OWN stored window — with the
+        // exclusion, this must NOT be reported as a conflict against itself.
+        Optional<UUID> excluded = bookingRepository.findFirstConflictingClientBookingIdExcluding(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC),
+                booking.getId());
+        assertThat(excluded).isEmpty();
+
+        // Sanity: WITHOUT the exclusion the same window IS reported as a conflict —
+        // proves the excluding-variant's empty result above is due to the exclusion,
+        // not to some other predicate mismatch.
+        Optional<UUID> notExcluded = bookingRepository.findFirstConflictingClientBookingId(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC));
+        assertThat(notExcluded).contains(booking.getId());
+    }
+
+    @Test
+    @DisplayName("should_stillFindOtherConflict_when_findFirstConflictingClientBookingIdExcludingOnlyExcludesOneRow")
+    void should_stillFindOtherConflict_when_excludingOnlyOneOfTwoOverlappingBookings() {
+        Master otherMaster = secondMasterWithService();
+        MasterServiceAssignment otherMsa = serviceFor(otherMaster);
+
+        Booking excludedBooking = bookingFor(clientUser, master, masterService, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
+        Booking otherConflict = bookingFor(clientUser, otherMaster, otherMsa, BookingStatus.PENDING,
+                OffsetDateTime.of(2026, 6, 1, 10, 15, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 15, 0, 0, ZoneOffset.UTC));
+        em.persist(excludedBooking);
+        em.persist(otherConflict);
+        em.flush();
+
+        Optional<UUID> result = bookingRepository.findFirstConflictingClientBookingIdExcluding(
+                clientUser.getId(),
+                OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC),
+                excludedBooking.getId());
+
+        assertThat(result)
+                .as("excluding one overlapping row must not suppress a genuine conflict from another")
+                .contains(otherConflict.getId());
+    }
+
 }

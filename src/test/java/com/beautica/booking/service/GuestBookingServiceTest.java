@@ -99,6 +99,14 @@ class GuestBookingServiceTest {
         assertThat(textCaptor.getValue())
                 .contains("Запис підтверджено")
                 .contains(response.cancelUrl());
+        // Advisory-lock DoS fix regression: the fused acquireAdvisoryLockWithTimeout() query
+        // (perf fix — sets the transaction-scoped lock_timeout AND takes the master lock in one
+        // round trip) must be the query actually used to acquire the master lock (see
+        // BookingRepository.acquireAdvisoryLockWithTimeout / GuestBookingService.persistBooking
+        // Javadoc). Its presence here in place of the old two-step
+        // setBookingLockTimeout()+acquireAdvisoryLock() pair IS the regression guard that the
+        // timeout ceiling is still applied before the lock wait.
+        verify(bookingRepository).acquireAdvisoryLockWithTimeout(masterId);
     }
 
     @Test
@@ -109,7 +117,7 @@ class GuestBookingServiceTest {
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
-        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(true);
 
         assertThatThrownBy(() -> service.createGuestBooking(
@@ -119,6 +127,10 @@ class GuestBookingServiceTest {
 
         verify(bookingRepository, never()).saveAndFlush(any());
         verifyNoInteractions(smsService);
+        // Lock timeout must still be set even when the slot turns out to be taken — it is
+        // fused into the same statement as the lock acquisition attempt, which is the first
+        // lock-related statement in the transaction.
+        verify(bookingRepository).acquireAdvisoryLockWithTimeout(masterId);
     }
 
     @Test
@@ -135,6 +147,9 @@ class GuestBookingServiceTest {
                 "Bearer t", SLUG, new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль")))
                 .isInstanceOf(NotFoundException.class);
 
+        // Neither the fused (with-timeout) nor the plain master-lock query ran — persistBooking
+        // was never reached, so no lock-acquisition attempt (and therefore no timeout) happened.
+        verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
     }
 
@@ -225,7 +240,7 @@ class GuestBookingServiceTest {
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
-        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
     }
 
