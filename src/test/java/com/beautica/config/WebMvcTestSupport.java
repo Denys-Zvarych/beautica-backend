@@ -6,7 +6,6 @@ import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.PasswordResetService;
 import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.filter.AuthRateLimitFilter;
-import com.beautica.booking.filter.BookingRateLimitFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
@@ -122,33 +121,12 @@ public class WebMvcTestSupport {
         };
     }
 
-    /**
-     * Pass-through {@link BookingRateLimitFilter}: per-user rate limiting is not under test
-     * in a controller slice, and its {@code bookingWriteBuckets} bean lives in
-     * {@code RateLimitConfig} (a {@code @Configuration} not loaded by {@code @WebMvcTest}).
-     * {@link #shouldNotFilter} returns {@code true} so the filter is skipped entirely by the
-     * servlet container — same pattern as {@link #authRateLimitFilter()}.
-     */
-    @Bean
-    @Primary
-    @SuppressWarnings("unchecked")
-    public BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
-        LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
-        return new BookingRateLimitFilter(dummy, objectMapper) {
-            @Override
-            protected void doFilterInternal(HttpServletRequest req,
-                                            HttpServletResponse res,
-                                            FilterChain chain)
-                    throws ServletException, IOException {
-                chain.doFilter(req, res);
-            }
-
-            @Override
-            public boolean shouldNotFilter(HttpServletRequest request) {
-                return true;
-            }
-        };
-    }
+    // NOTE: BookingRateLimitFilter deliberately has NO stand-in here. It is not a @Component —
+    // it is an explicit @Bean in RateLimitConfig, co-located with the bookingWriteBuckets
+    // LoadingCache it consumes (see its javadoc). A @WebMvcTest slice loads neither, so no slice
+    // can be broken by it and none needs a mock. Keep it that way: re-annotating it @Component
+    // would make every narrow slice — including the ones that do NOT import this class — fail to
+    // refresh with "No qualifying bean of type LoadingCache<String, Bucket>".
 
     /**
      * Mock {@link PasswordResetService}: the password-reset business logic is not

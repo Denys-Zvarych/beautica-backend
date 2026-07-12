@@ -80,6 +80,16 @@ class ServiceCatalogServicePricingTest {
     @Mock
     private CacheManager cacheManager;
 
+    // Phase 21.x (62ec609): ServiceCatalogService now constructor-depends on
+    // SlotCalculationService (bookable-master gating) and SalonCatalogCacheEvictor
+    // (salon-catalogue cache eviction). Without these @Mocks, @InjectMocks leaves the
+    // fields null and every write path NPEs in evictSalonCatalogAfterCommit.
+    @Mock
+    private com.beautica.booking.service.SlotCalculationService slotCalculationService;
+
+    @Mock
+    private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 

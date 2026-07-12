@@ -97,6 +97,10 @@ class OwnerMasterCacheTest {
     @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
     // Phase 21.3: MasterService now constructor-depends on AuthorizationService (rotateMasterToSalon).
     @MockBean AuthorizationService authorizationService;
+    // Phase 21.x (62ec609): MasterService now constructor-depends on SlotCalculationService
+    // (bookable-master gating) and SalonCatalogCacheEvictor (salon-catalogue cache eviction).
+    @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

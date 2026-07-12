@@ -8,11 +8,9 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
@@ -43,8 +41,20 @@ import java.util.UUID;
  * a raw cast) is passed through untouched: this filter has no user id to key a bucket on, and
  * the downstream {@code anyRequest().authenticated()} rule / controller
  * {@code @PreAuthorize("hasRole('CLIENT')")} rejects it with 401/403 regardless.
+ *
+ * <p><b>Deliberately NOT a {@code @Component}</b> — it is declared as an explicit {@code @Bean} in
+ * {@code RateLimitConfig#bookingRateLimitFilter}, right next to the {@code bookingWriteBuckets}
+ * {@link LoadingCache} it consumes. {@code @WebMvcTest} includes {@link jakarta.servlet.Filter} in
+ * its component-scan type filter, so a {@code @Component} filter is auto-detected by EVERY narrow
+ * slice, while the {@code @Configuration} that supplies its bucket ({@code RateLimitConfig}) is
+ * not — which is exactly how this filter broke unrelated slices ({@code InternalApiKeyFilterTest},
+ * {@code InternalCategoryControllerTest}) with
+ * {@code No qualifying bean of type LoadingCache<String, Bucket>}. Declaring the filter and its
+ * bucket in ONE non-scanned {@code @Configuration} makes them all-or-nothing: the full application
+ * context loads both (production rate limit fully active, unchanged), and a slice loads neither
+ * (context refreshes cleanly). No slice can be broken by this filter merely existing, and no
+ * per-test mock or import is required.
  */
-@Component
 public class BookingRateLimitFilter extends OncePerRequestFilter {
 
     private static final String BOOKINGS_PATH = "/api/v1/bookings";
@@ -56,8 +66,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
-            @Qualifier("bookingWriteBuckets") LoadingCache<String, Bucket> bookingWriteBuckets,
-            ObjectMapper objectMapper) {
+            LoadingCache<String, Bucket> bookingWriteBuckets, ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.objectMapper = objectMapper;
     }

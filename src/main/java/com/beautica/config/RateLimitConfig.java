@@ -1,5 +1,7 @@
 package com.beautica.config;
 
+import com.beautica.booking.filter.BookingRateLimitFilter;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
@@ -453,6 +455,32 @@ public class RateLimitConfig {
                 BOOKING_WRITE_WINDOW.plus(EVICTION_GRACE),
                 bookingWriteCapacity,
                 BOOKING_WRITE_WINDOW);
+    }
+
+    /**
+     * {@link BookingRateLimitFilter} — declared here as an explicit {@code @Bean} rather than
+     * annotated {@code @Component}, deliberately co-located with the {@link #bookingWriteBuckets()}
+     * {@link LoadingCache} it consumes.
+     *
+     * <p><b>Why not {@code @Component}:</b> {@code @WebMvcTest} includes
+     * {@link jakarta.servlet.Filter} in its component-scan type filter, so a {@code @Component}
+     * filter is auto-detected by EVERY narrow slice — but this {@code @Configuration}, which
+     * supplies the filter's bucket, is not loaded by a slice. That mismatch is what made every
+     * unprotected slice fail to refresh with {@code No qualifying bean of type
+     * LoadingCache<String, Bucket>} (e.g. {@code InternalApiKeyFilterTest},
+     * {@code InternalCategoryControllerTest}). Binding filter + bucket into one non-scanned
+     * {@code @Configuration} makes them all-or-nothing and therefore safe by construction: the
+     * full application context loads both — so the production per-user rate limit that closes the
+     * advisory-lock connection-pool-exhaustion DoS remains fully active and unchanged — while a
+     * slice loads neither and refreshes cleanly, with no per-test mock or import needed.
+     */
+    @Bean
+    public BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
+        // Direct call (not a LoadingCache<String, Bucket> parameter): this class declares many
+        // beans of that exact generic type, so injecting by type would be ambiguous and resolve
+        // only by lucky parameter-name matching. @Configuration is CGLIB-proxied, so this returns
+        // the same bookingWriteBuckets singleton — unambiguous by construction.
+        return new BookingRateLimitFilter(bookingWriteBuckets(), objectMapper);
     }
 
     /**
