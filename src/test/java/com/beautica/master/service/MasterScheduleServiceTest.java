@@ -62,9 +62,12 @@ class MasterScheduleServiceTest {
     @Mock
     private CacheManager cacheManager;
 
+    @Mock
+    private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+
     private MasterScheduleService spyService() {
         return spy(new MasterScheduleService(weeklyScheduleRepository, scheduleExceptionRepository,
-                masterRepository, dateMath, authz, scheduleMapper, cacheManager));
+                masterRepository, dateMath, authz, scheduleMapper, cacheManager, salonCatalogCacheEvictor));
     }
 
     @Test

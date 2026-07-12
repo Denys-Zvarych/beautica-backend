@@ -77,6 +77,16 @@ class ServiceCatalogServiceUpdateTest {
     @Mock
     private CacheManager cacheManager;
 
+    // Phase 21.x (62ec609): ServiceCatalogService now constructor-depends on
+    // SlotCalculationService (bookable-master gating) and SalonCatalogCacheEvictor
+    // (salon-catalogue cache eviction) — see the identical gap fixed in
+    // OwnerMasterCacheTest for MasterService.
+    @Mock
+    private com.beautica.booking.service.SlotCalculationService slotCalculationService;
+
+    @Mock
+    private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 

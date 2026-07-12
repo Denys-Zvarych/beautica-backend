@@ -1,5 +1,7 @@
 package com.beautica.config;
 
+import com.beautica.booking.filter.BookingRateLimitFilter;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
@@ -163,6 +165,27 @@ public class RateLimitConfig {
     private long otpSendCapacity;
 
     private static final Duration OTP_SEND_WINDOW = Duration.ofMinutes(15);
+
+    // Per-user cap for the two authenticated booking-conflict write endpoints that take the
+    // per-client advisory lock (BookingRepository.acquireClientAdvisoryLockWithTimeout):
+    //   - POST /api/v1/bookings
+    //   - PATCH /api/v1/bookings/{bookingId}/reschedule
+    // Unlike every other bucket in this class (IP-keyed, because AuthRateLimitFilter runs
+    // BEFORE JwtAuthenticationFilter on permitAll surfaces), this bucket is keyed by the
+    // authenticated user id — see BookingRateLimitFilter, which runs AFTER
+    // JwtAuthenticationFilter so the principal is available. The advisory lock is salted by
+    // the caller's OWN user id, so a single authenticated CLIENT needs no IP diversity to
+    // serialize N concurrent requests on the identical lock; without this bucket, N > Hikari's
+    // maximum-pool-size (10) concurrent requests from one free account can exhaust the pool
+    // and 503 the whole app for every other tenant (booking advisory-lock DoS fix). 5/10s is
+    // generous for a legitimate client retrying a declined slot while bounding a scripted
+    // flood. Both endpoints share ONE bucket — same "shared bucket for one class of endpoint"
+    // pattern as rotateStaffBuckets in AuthRateLimitFilter. Configurable so integration tests
+    // (e.g. the 10-concurrent-request BookingConcurrencyTest) can raise the cap.
+    @Value("${app.rate-limit.booking-write-capacity:5}")
+    private long bookingWriteCapacity;
+
+    private static final Duration BOOKING_WRITE_WINDOW = Duration.ofSeconds(10);
 
     // 5-minute eviction grace past the rate-limit window so a bucket entry is not
     // evicted the instant its window rolls over (avoids a false-start on the very
@@ -416,6 +439,48 @@ public class RateLimitConfig {
                 OTP_SEND_WINDOW.plus(EVICTION_GRACE),
                 otpSendCapacity,
                 OTP_SEND_WINDOW);
+    }
+
+    /**
+     * Per-USER bucket (see field javadoc above) shared by {@code POST /api/v1/bookings} and
+     * {@code PATCH /api/v1/bookings/{bookingId}/reschedule}, consumed by
+     * {@link com.beautica.booking.filter.BookingRateLimitFilter}. {@code expireAfterAccess}
+     * gives a 5-minute grace past the 10-second window so a bucket entry is not evicted the
+     * instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> bookingWriteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                BOOKING_WRITE_WINDOW.plus(EVICTION_GRACE),
+                bookingWriteCapacity,
+                BOOKING_WRITE_WINDOW);
+    }
+
+    /**
+     * {@link BookingRateLimitFilter} — declared here as an explicit {@code @Bean} rather than
+     * annotated {@code @Component}, deliberately co-located with the {@link #bookingWriteBuckets()}
+     * {@link LoadingCache} it consumes.
+     *
+     * <p><b>Why not {@code @Component}:</b> {@code @WebMvcTest} includes
+     * {@link jakarta.servlet.Filter} in its component-scan type filter, so a {@code @Component}
+     * filter is auto-detected by EVERY narrow slice — but this {@code @Configuration}, which
+     * supplies the filter's bucket, is not loaded by a slice. That mismatch is what made every
+     * unprotected slice fail to refresh with {@code No qualifying bean of type
+     * LoadingCache<String, Bucket>} (e.g. {@code InternalApiKeyFilterTest},
+     * {@code InternalCategoryControllerTest}). Binding filter + bucket into one non-scanned
+     * {@code @Configuration} makes them all-or-nothing and therefore safe by construction: the
+     * full application context loads both — so the production per-user rate limit that closes the
+     * advisory-lock connection-pool-exhaustion DoS remains fully active and unchanged — while a
+     * slice loads neither and refreshes cleanly, with no per-test mock or import needed.
+     */
+    @Bean
+    public BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
+        // Direct call (not a LoadingCache<String, Bucket> parameter): this class declares many
+        // beans of that exact generic type, so injecting by type would be ambiguous and resolve
+        // only by lucky parameter-name matching. @Configuration is CGLIB-proxied, so this returns
+        // the same bookingWriteBuckets singleton — unambiguous by construction.
+        return new BookingRateLimitFilter(bookingWriteBuckets(), objectMapper);
     }
 
     /**

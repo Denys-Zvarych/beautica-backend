@@ -1124,24 +1124,31 @@ public class SearchService {
     }
 
     /**
-     * Appends the <em>bookable gate</em> for a salon-owned {@code service_definitions}
-     * row aliased {@code defAlias}: an {@code EXISTS} that the def is actively
-     * performed by at least one active master. This mirrors — byte-for-byte in
-     * semantics — the catalogue's canonical gate
+     * Appends the coarse <em>bookable gate</em> for a salon-owned {@code service_definitions}
+     * row aliased {@code defAlias}, correlated to the salon aliased {@code salonAlias}: an
+     * {@code EXISTS} that the def is actively performed by at least one active master
+     * <em>belonging to that salon</em>. Mirrors the catalogue's canonical coarse gate
      * {@code ServiceRepository.findBookableServicesBySalon}
-     * ({@code EXISTS(MasterServiceAssignment WHERE serviceDefinition = sd AND
-     * isActive AND master.isActive)}), so salon <em>search</em> and the salon
-     * <em>booking catalogue</em> never diverge on what a salon offers.
+     * ({@code EXISTS(MasterServiceAssignment WHERE serviceDefinition = sd AND isActive AND
+     * master.isActive AND master.salon.id = salonId)}).
      *
-     * <p>Deliberately does NOT add a {@code masters.salon_id = s.id} check: the
-     * {@code master_services} assignment only ever links the owning salon's own
-     * masters, exactly as the catalogue query relies on. Adding a stricter
-     * {@code salon_id} predicate here would make search stricter than the
-     * catalogue.
+     * <p>The {@code mx.salon_id = <salonAlias>.id} correlation closes the rotated-master
+     * stale-assignment leak (a master who left this salon but kept an active assignment row must
+     * not keep the salon's service visible) — matching the same predicate now present on the
+     * catalogue query and the assignment-level {@code findBookableAssignmentsBySalon} query.
+     *
+     * <p><b>Free-slot bookability is NOT reflected in search SQL.</b> The authoritative catalogue
+     * ({@code ServiceCatalogService#getSalonServiceCatalog}) additionally hides a service unless a
+     * performing master has ≥1 free future slot (the Phase 23.x fix). That per-slot computation is
+     * intentionally not expressed in this search SQL — search stays on the coarse gate and may show a
+     * salon whose masters are momentarily fully booked. Reconciling the two in SQL is a separate
+     * architect follow-up.
      */
-    private static void appendSalonBookableGate(StringBuilder sb, String defAlias) {
+    // TODO(architect follow-up): free-slot bookability not reflected in search SQL — see catalogue authoritative gate
+    private static void appendSalonBookableGate(StringBuilder sb, String defAlias, String salonAlias) {
         sb.append("AND EXISTS (SELECT 1 FROM master_services msx ")
                 .append("JOIN masters mx ON mx.id = msx.master_id AND mx.is_active = true ")
+                .append("AND mx.salon_id = ").append(salonAlias).append(".id ")
                 .append("WHERE msx.service_def_id = ").append(defAlias).append(".id ")
                 .append("AND msx.is_active = true) ");
     }
@@ -1303,7 +1310,9 @@ public class SearchService {
                 .append("CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END)) AS pmax ")
                 .append("FROM master_services ms ")
                 .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                // mad.salon_id = s.id closes the rotated-master leak, matching appendSalonBookableGate.
                 .append("JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true ")
+                .append("AND mad.salon_id = s.id ")
                 .append("WHERE sd.owner_type = 'SALON' AND sd.owner_id = s.id ")
                 .append("AND ms.is_active = true ");
         // Slug precedence: scope the price band to the matched services. Category
@@ -1333,7 +1342,7 @@ public class SearchService {
                 .append("FROM service_definitions sd2 ")
                 .append("WHERE sd2.owner_type = 'SALON' AND sd2.owner_id = t.id ")
                 .append("AND sd2.is_active = true ");
-        appendSalonBookableGate(sb, "sd2");
+        appendSalonBookableGate(sb, "sd2", "t");
         if (hasCategory) {
             sb.append("AND sd2.category = :category ");
         }
@@ -1356,7 +1365,7 @@ public class SearchService {
                 .append("FROM service_definitions sd3 ")
                 .append("WHERE sd3.owner_type = 'SALON' AND sd3.owner_id = t.id ")
                 .append("AND sd3.is_active = true ");
-        appendSalonBookableGate(sb, "sd3");
+        appendSalonBookableGate(sb, "sd3", "t");
         sb.append("AND (");
         appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
         sb.append(") ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
@@ -1381,7 +1390,7 @@ public class SearchService {
                 .append("SELECT 1 FROM service_definitions sdf ")
                 .append("WHERE sdf.owner_type = 'SALON' AND sdf.owner_id = s.id ")
                 .append("AND sdf.is_active = true ");
-        appendSalonBookableGate(sb, "sdf");
+        appendSalonBookableGate(sb, "sdf", "s");
         sb.append("AND (");
         appendServiceTypeMatchDisjunction(sb, "sdf", serviceTypes.size());
         sb.append(")) ");

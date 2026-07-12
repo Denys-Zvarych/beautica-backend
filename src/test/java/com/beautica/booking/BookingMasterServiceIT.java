@@ -248,6 +248,95 @@ class BookingMasterServiceIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════
+    // 1b. Free-slot gate — Phase 23.x: bookability now requires ≥1 FREE future slot,
+    //     not merely a usable schedule. A master whose every slot in the window is
+    //     occupied by PENDING/CONFIRMED bookings is NOT bookable and must be dropped.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Free-slot gate (fully-booked / rotated exclusions)")
+    class FreeSlotGate {
+
+        @Test
+        @DisplayName("(i) master whose only working day is fully booked out is EXCLUDED (no free future slot)")
+        void should_excludeMaster_when_everySlotInWindowIsBooked() {
+            UUID salonId = seedActiveSalon();
+            UUID serviceDefId = seedSalonService(salonId, true);
+            Seed s = seedMasterWithAssignment(salonId, serviceDefId, true, true, "Fully", "Booked");
+            // Exactly ONE working day in the whole horizon, a single 60-min slot [10:00,11:00] (the
+            // service base duration is 60), then a CONFIRMED booking occupying that only slot. The
+            // schedule is usable (would pass the old schedule-only gate), but there is NO free slot left.
+            LocalDate day = today().plusDays(7);
+            seedSingleSlotDay(s.masterId(), day);
+            seedConfirmedBooking(s.masterId(), s.masterServiceId(), day,
+                    LocalTime.of(10, 0), LocalTime.of(11, 0));
+
+            assertThat(masterIds(dataArray(callEndpoint(salonId, serviceDefId))))
+                    .as("a master with a usable schedule but zero free future slots must be excluded")
+                    .isEmpty();
+        }
+
+        @Test
+        @DisplayName("(ii) scheduleless master is EXCLUDED under the free-slot predicate too (no schedule → no slots)")
+        void should_excludeScheduleless_underFreeSlotPredicate() {
+            UUID salonId = seedActiveSalon();
+            UUID serviceDefId = seedSalonService(salonId, true);
+            // Active + assigned, but no schedule at all → resolveEffectiveRange yields no working day →
+            // hasBookableFutureSlot is false.
+            seedMasterWithAssignment(salonId, serviceDefId, true, true, "No", "Schedule");
+
+            assertThat(masterIds(dataArray(callEndpoint(salonId, serviceDefId)))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("(iii) a fully-booked master is dropped while a sibling with ≥1 free slot remains INCLUDED")
+        void should_keepMasterWithFreeSlot_whileDroppingFullyBookedSibling() {
+            UUID salonId = seedActiveSalon();
+            UUID serviceDefId = seedSalonService(salonId, true);
+
+            Seed booked = seedMasterWithAssignment(salonId, serviceDefId, true, true, "Booked", "Out");
+            LocalDate day = today().plusDays(7);
+            seedSingleSlotDay(booked.masterId(), day);
+            seedConfirmedBooking(booked.masterId(), booked.masterServiceId(), day,
+                    LocalTime.of(10, 0), LocalTime.of(11, 0));
+
+            Seed free = seedMasterWithAssignment(salonId, serviceDefId, true, true, "Has", "FreeSlot");
+            seedIntervalSchedule(free.masterId(), today(), null, today().getDayOfWeek().getValue(),
+                    LocalTime.of(9, 0), LocalTime.of(17, 0));
+
+            assertThat(masterIds(dataArray(callEndpoint(salonId, serviceDefId))))
+                    .as("only the master with a free future slot is bookable; the fully-booked one is dropped")
+                    .containsExactly(free.masterId())
+                    .doesNotContain(booked.masterId());
+        }
+
+        @Test
+        @DisplayName("(iv) rotated master (active assignment to salon A's service but master.salon_id now = salon B) is EXCLUDED from A's list")
+        void should_excludeRotatedMaster_fromOriginalSalonMasterList() {
+            UUID salonA = seedActiveSalon();
+            UUID salonB = seedActiveSalon();
+            UUID serviceOfA = seedSalonService(salonA, true);
+
+            // The rotated master left salon A for salon B but kept an active assignment row pointing at
+            // salon A's service, AND has a perfectly bookable schedule with free slots. It must still be
+            // excluded from salon A's master list — the candidate query gates on m.salon.id = :salonId.
+            Seed rotated = seedMasterWithAssignment(salonB, serviceOfA, true, true, "Rotated", "Away");
+            seedIntervalSchedule(rotated.masterId(), today(), null, today().getDayOfWeek().getValue(),
+                    LocalTime.of(9, 0), LocalTime.of(17, 0));
+
+            // A genuinely-in-salon-A bookable master so the list is otherwise non-empty.
+            Seed legit = seedMasterWithAssignment(salonA, serviceOfA, true, true, "Still", "Here");
+            seedIntervalSchedule(legit.masterId(), today(), null, today().getDayOfWeek().getValue(),
+                    LocalTime.of(9, 0), LocalTime.of(17, 0));
+
+            assertThat(masterIds(dataArray(callEndpoint(salonA, serviceOfA))))
+                    .as("the rotated master must never surface in the salon it left, despite a free schedule")
+                    .containsExactly(legit.masterId())
+                    .doesNotContain(rotated.masterId());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
     // 2. 404 boundary — salon / service resolution (existence-oracle avoidance)
     // ════════════════════════════════════════════════════════════════════════════
 
@@ -504,6 +593,38 @@ class BookingMasterServiceIT extends AbstractIntegrationTest {
     /** A weekly_schedules row covering the window but with NO intervals and NO discrete times. */
     private void seedEmptySchedule(UUID masterId, LocalDate validFrom, LocalDate validTo) {
         insertWeeklySchedule(masterId, validFrom, validTo);
+    }
+
+    /**
+     * A schedule whose only working day is {@code day} (valid_from == valid_to == day) with a single
+     * 60-minute interval [10:00, 11:00]. Because the seeded service's base duration is 60 min, exactly
+     * ONE slot ({@code 10:00}) can be generated — booking it out leaves the master fully booked for the
+     * whole horizon.
+     */
+    private void seedSingleSlotDay(UUID masterId, LocalDate day) {
+        seedIntervalSchedule(masterId, day, day, day.getDayOfWeek().getValue(),
+                LocalTime.of(10, 0), LocalTime.of(11, 0));
+    }
+
+    /**
+     * Inserts a CONFIRMED guest (LINK) booking occupying {@code [start, end)} Kyiv-civil time on
+     * {@code day} for {@code masterServiceId}. A LINK booking needs no client user row (client_id NULL +
+     * guest identity + cancel token — V89 CHECK), the cheapest way to occupy a slot. Only PENDING/
+     * CONFIRMED bookings are subtracted by the free-slot gate (BookingRepository#findActiveByMasterInRange).
+     */
+    private void seedConfirmedBooking(UUID masterId, UUID masterServiceId, LocalDate day,
+            LocalTime start, LocalTime end) {
+        java.time.OffsetDateTime startsAt = day.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+        java.time.OffsetDateTime endsAt = day.atTime(end).atZone(TimeZones.KYIV).toOffsetDateTime();
+        int durationMinutes = (int) java.time.Duration.between(startsAt, endsAt).toMinutes();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, master_id, master_service_id, status, booking_source, "
+                        + "guest_name, guest_phone, cancel_token, starts_at, ends_at, price_at_booking, "
+                        + "duration_minutes_at_booking, buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'CONFIRMED', 'LINK', 'Guest', '+380501112233', ?, ?, ?, "
+                        + "500.00, ?, 0, NOW(), NOW())",
+                UUID.randomUUID(), masterId, masterServiceId, UUID.randomUUID(),
+                startsAt, endsAt, durationMinutes);
     }
 
     /** Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL). */

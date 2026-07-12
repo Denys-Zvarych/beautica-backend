@@ -121,6 +121,13 @@ public class WebMvcTestSupport {
         };
     }
 
+    // NOTE: BookingRateLimitFilter deliberately has NO stand-in here. It is not a @Component —
+    // it is an explicit @Bean in RateLimitConfig, co-located with the bookingWriteBuckets
+    // LoadingCache it consumes (see its javadoc). A @WebMvcTest slice loads neither, so no slice
+    // can be broken by it and none needs a mock. Keep it that way: re-annotating it @Component
+    // would make every narrow slice — including the ones that do NOT import this class — fail to
+    // refresh with "No qualifying bean of type LoadingCache<String, Bucket>".
+
     /**
      * Mock {@link PasswordResetService}: the password-reset business logic is not
      * under test in an {@code AuthController} slice. Provided so the

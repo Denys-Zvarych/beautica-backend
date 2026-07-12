@@ -56,6 +56,8 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private ServiceTypeRepository serviceTypeRepository;
     @Mock private CacheManager cacheManager;
     @Mock private com.beautica.common.security.AuthorizationService authz;
+    @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     private ServiceCatalogService service;
 
@@ -74,7 +76,9 @@ class ServiceCatalogServiceCatalogTest {
                 serviceTypeSearchService,
                 serviceTypeRepository,
                 cacheManager,
-                authz
+                authz,
+                slotCalculationService,
+                salonCatalogCacheEvictor
         );
     }
 

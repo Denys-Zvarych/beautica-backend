@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.beautica.booking.filter.BookingRateLimitFilter;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,6 +44,7 @@ public class SecurityConfig {
 
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
+    private final BookingRateLimitFilter bookingRateLimitFilter;
     private final InternalApiKeyFilter internalApiKeyFilter;
     private final Environment environment;
 
@@ -51,10 +53,12 @@ public class SecurityConfig {
 
     public SecurityConfig(JwtAuthenticationFilter jwtAuthenticationFilter,
                           AuthRateLimitFilter authRateLimitFilter,
+                          BookingRateLimitFilter bookingRateLimitFilter,
                           InternalApiKeyFilter internalApiKeyFilter,
                           Environment environment) {
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
         this.authRateLimitFilter = authRateLimitFilter;
+        this.bookingRateLimitFilter = bookingRateLimitFilter;
         this.internalApiKeyFilter = internalApiKeyFilter;
         this.environment = environment;
     }
@@ -202,6 +206,10 @@ public class SecurityConfig {
                 })
                 .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
                 .addFilterBefore(authRateLimitFilter, JwtAuthenticationFilter.class)
+                // Runs AFTER JwtAuthenticationFilter so Authentication.getDetails() (the JWT
+                // subject / user id) is already populated — this filter is user-keyed, not
+                // IP-keyed (see BookingRateLimitFilter javadoc).
+                .addFilterAfter(bookingRateLimitFilter, JwtAuthenticationFilter.class)
                 .addFilterBefore(internalApiKeyFilter, UsernamePasswordAuthenticationFilter.class);
 
         return authorizeConfig.build();

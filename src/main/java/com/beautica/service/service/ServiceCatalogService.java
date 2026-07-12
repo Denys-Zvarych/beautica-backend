@@ -69,6 +69,8 @@ public class ServiceCatalogService {
     private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
     private final com.beautica.common.security.AuthorizationService authz;
+    private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Transactional
     public ServiceDefinitionResponse addServiceToSalon(
@@ -98,6 +100,9 @@ public class ServiceCatalogService {
         definition.setServiceType(serviceType);
 
         ServiceDefinition saved = serviceRepository.save(definition);
+        // A new SALON-owned definition has no assignment yet (not bookable), but evict the salon
+        // catalogue for consistency with the other mutation sites (perf/security #2) — cheap per-key.
+        evictSalonCatalogAfterCommit(salonId);
         return ServiceDefinitionResponse.from(saved);
     }
 
@@ -145,6 +150,9 @@ public class ServiceCatalogService {
         // Evict after commit so a parallel reader cannot repopulate the cache with
         // the pre-insert DB snapshot between eviction and commit (anti-bug §F).
         evictMasterServicesCache(List.of(masterId));
+        // A new assignment can make a previously-unbookable SALON service appear in the catalogue
+        // (perf/security #2): evict this salon's catalogue.
+        evictSalonCatalogAfterCommit(salonId);
 
         return MasterServiceResponse.from(saved);
     }
@@ -492,6 +500,16 @@ public class ServiceCatalogService {
         // matching masterId using the Caffeine prefix scan pattern (anti-bug §F rule 6).
         evictAvailableSlotsCache(affectedMasterIds);
 
+        // Fix #6 PERF: deactivation removes this definition from every performing master's bookable set,
+        // so the shared master-service-bookable free-slot verdict (gating the booking master-list) is now
+        // stale for each affected master — evict it by master prefix, alongside masterServices/available-slots.
+        evictBookableFutureSlotsCache(affectedMasterIds);
+
+        // Fix #2/#6 PERF: a SALON-owned definition leaving the bookable set changes the salon catalogue.
+        // findSalonOwnerId returns the salon id only for a SALON-owned def (empty → master-owned, no
+        // catalogue entry). Resolved before the UPDATE (deactivation flips is_active, not ownerType).
+        evictSalonCatalogAfterCommit(serviceRepository.findSalonOwnerId(serviceDefId).orElse(null));
+
         // Step 3: execute the update; check after registration so the callback is a
         // no-op when the method throws (transaction rolls back, afterCommit never fires).
         int updated = serviceRepository.deactivateById(serviceDefId);
@@ -532,6 +550,8 @@ public class ServiceCatalogService {
         List<UUID> affectedMasterIds =
                 masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
         evictMasterServicesCache(affectedMasterIds);
+        // Name/price/duration/category changes alter the catalogue's rendered content (perf/security #2).
+        evictSalonCatalogAfterCommit(salonCatalogIdOf(saved));
 
         return ServiceDefinitionResponse.from(saved);
     }
@@ -556,6 +576,8 @@ public class ServiceCatalogService {
         List<UUID> affectedMasterIds =
                 masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
         evictMasterServicesCache(affectedMasterIds);
+        // A photo change alters the catalogue's rendered content (perf/security #2).
+        evictSalonCatalogAfterCommit(salonCatalogIdOf(saved));
 
         return ServiceDefinitionResponse.from(saved);
     }
@@ -685,21 +707,39 @@ public class ServiceCatalogService {
      * A salon's public, bookable service catalog grouped by category (Phase 13.6,
      * {@code GET /salons/{salonId}/services}).
      *
-     * <p>No caching for v1 (deliberate — keeps this PR scoped): the underlying query is
-     * already cheap (indexed {@code owner_type}/{@code owner_id}/{@code is_active} plus an
-     * {@code EXISTS} on an indexed FK), unlike {@code getMasterServices} which justified a
-     * cache by eliminating a JOIN-heavy graph query on a very hot single-master path.
+     * <p><b>Free-slot bookability gate (Phase 23.x — CRITICAL fix).</b> A service appears here
+     * only if at least one performing master is actually BOOKABLE — active, in this salon, actively
+     * assigned, and with ≥1 free future slot after existing bookings are subtracted. This is the same
+     * verdict the booking master-list uses ({@code BookingMasterService#getBookableMasters}), so the
+     * catalogue and the master picker can never disagree. Candidate assignments are loaded once
+     * ({@code findBookableAssignmentsBySalon}), grouped by master, and each master's schedule + booking
+     * window is resolved ONCE by {@code SlotCalculationService#filterBookableAssignments} — O(distinct
+     * masters) heavy loads, not O(services × masters).
      *
-     * <p>Bounded via an internal soft cap ({@code PageRequest.of(0, 500)}, mirroring
-     * {@code getMasterServices}'s {@code PageRequest.of(0, 200)}) rather than exposing a
-     * caller-supplied {@code Pageable} — the mobile client needs the WHOLE catalog at once
-     * to group it by category, so pagination would only fragment categories across pages.
+     * <p><b>Caching (perf/security #2).</b> Cached in {@code salon-service-catalog} keyed on
+     * {@code salonId} (60-sec TTL, {@code sync=true}) — this is a {@code permitAll} endpoint whose body
+     * runs an O(distinct masters) free-slot compute per hit (schedule resolve + booking load per master),
+     * a DB-amplification / stampede surface without a result cache. {@code sync=true} collapses the
+     * thundering herd when a popular salon's entry expires (§F-7). Explicit eviction runs afterCommit via
+     * {@link SalonCatalogCacheEvictor} from every write that can flip the bookable-service set: a
+     * booking / cancellation / schedule change on any master in the salon (evicted at those write sites
+     * by the master's salon id) and this service's own definition mutations (create / assign / update /
+     * photo / deactivate). The 60-sec TTL is only a backstop.
+     *
+     * <p>The result is the WHOLE catalog (not paginated) so the mobile client can group it by
+     * category client-side; the candidate query is bounded by salon scope, not a caller-supplied size.
      */
     @Transactional(readOnly = true)
+    @Cacheable(value = "salon-service-catalog", key = "#salonId", sync = true)
     public SalonServiceCatalogResponse getSalonServiceCatalog(UUID salonId) {
-        List<ServiceDefinition> definitions =
-                serviceRepository.findBookableServicesBySalon(salonId, PageRequest.of(0, 500));
+        List<MasterServiceAssignment> candidates =
+                masterServiceRepository.findBookableAssignmentsBySalon(salonId);
 
+        if (candidates.isEmpty()) {
+            return new SalonServiceCatalogResponse(List.of());
+        }
+
+        List<ServiceDefinition> definitions = bookableDefinitions(candidates);
         if (definitions.isEmpty()) {
             return new SalonServiceCatalogResponse(List.of());
         }
@@ -727,6 +767,32 @@ public class ServiceCatalogService {
                 .toList();
 
         return new SalonServiceCatalogResponse(categories);
+    }
+
+    /**
+     * Groups the candidate assignments by master, runs the batched free-slot gate once per master
+     * ({@code SlotCalculationService#filterBookableAssignments} — one schedule resolve + one booking
+     * load per master), and returns the distinct {@link ServiceDefinition}s that at least one bookable
+     * master performs, sorted by {@code (category, name)} so the caller's category grouping keeps the
+     * same within-group ordering the previous {@code findBookableServicesBySalon} query produced.
+     */
+    private List<ServiceDefinition> bookableDefinitions(List<MasterServiceAssignment> candidates) {
+        Map<UUID, List<MasterServiceAssignment>> byMaster = candidates.stream()
+                .collect(Collectors.groupingBy(a -> a.getMaster().getId()));
+
+        Map<UUID, ServiceDefinition> bookableById = new LinkedHashMap<>();
+        for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : byMaster.entrySet()) {
+            for (MasterServiceAssignment msa :
+                    slotCalculationService.filterBookableAssignments(entry.getKey(), entry.getValue())) {
+                bookableById.putIfAbsent(msa.getServiceDefinition().getId(), msa.getServiceDefinition());
+            }
+        }
+
+        return bookableById.values().stream()
+                .sorted(Comparator
+                        .comparing((ServiceDefinition sd) -> Objects.requireNonNullElse(sd.getCategory(), ""))
+                        .thenComparing(ServiceDefinition::getName))
+                .toList();
     }
 
     /**
@@ -920,6 +986,62 @@ public class ServiceCatalogService {
         } else {
             var cache = cacheManager.getCache("masterServices");
             if (cache != null) masterIds.forEach(cache::evict);
+        }
+    }
+
+    /**
+     * Evicts the {@code salon-service-catalog} entry for the given salon after commit (perf/security #2).
+     * A {@code null} salonId (a master-owned, salon-less definition) is a no-op — an independent master
+     * owns no salon catalogue entry. Deferred to {@code afterCommit} so a parallel reader cannot
+     * repopulate the public cache with a pre-commit snapshot (§F rule 2).
+     */
+    /**
+     * The salon-catalogue key for a definition: its {@code ownerId} when SALON-owned (the ownerId IS the
+     * salon id), else {@code null} (a master-owned definition owns no salon catalogue entry).
+     */
+    private static UUID salonCatalogIdOf(ServiceDefinition definition) {
+        return definition.getOwnerType() == OwnerType.SALON ? definition.getOwnerId() : null;
+    }
+
+    private void evictSalonCatalogAfterCommit(UUID salonId) {
+        if (salonId == null) {
+            return;
+        }
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            salonCatalogCacheEvictor.evict(salonId);
+                        }
+                    });
+        } else {
+            salonCatalogCacheEvictor.evict(salonId);
+        }
+    }
+
+    /**
+     * Evicts the {@code master-service-bookable} verdict for each affected master after commit
+     * (perf #6). Deactivating a definition removes it from every performing master's bookable set, so
+     * the shared free-slot verdict that gates the booking master-list must be invalidated (by master
+     * prefix — {@link com.beautica.booking.service.SlotCalculationService#evictBookableFutureSlotsByMaster}),
+     * alongside {@code masterServices} and {@code available-slots}.
+     */
+    private void evictBookableFutureSlotsCache(List<UUID> masterIds) {
+        if (masterIds.isEmpty()) {
+            return;
+        }
+        Runnable task = () -> masterIds.forEach(slotCalculationService::evictBookableFutureSlotsByMaster);
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            task.run();
+                        }
+                    });
+        } else {
+            task.run();
         }
     }
 

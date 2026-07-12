@@ -16,6 +16,7 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
@@ -25,6 +26,7 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -75,6 +77,7 @@ public class BookingService {
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final Clock clock;
     private final CacheManager cacheManager;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Transactional
     public BookingResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
@@ -343,7 +346,7 @@ public class BookingService {
         booking.setProviderComment(req.comment());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved);
     }
@@ -404,7 +407,7 @@ public class BookingService {
         booking.setCancellationReason(req.cancellationReason());
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved);
     }
@@ -416,7 +419,10 @@ public class BookingService {
      * (≥15 min ahead, ≤180 days), the same working-hours / effective-day check via
      * {@link #assertStartsOnAvailableSlot} (the master must actually work the requested slot),
      * the per-master advisory lock, and the overlap check — here excluding the booking's own row
-     * ({@link BookingRepository#existsOverlapExcluding}).
+     * ({@link BookingRepository#existsOverlapExcluding}). Also reuses the create-path
+     * client-conflict guard ({@link #assertNoClientConflictExcluding}): the new window must not
+     * overlap ANY other {@code PENDING}/{@code CONFIRMED} booking this client holds, excluding
+     * this booking's own row — see {@link ClientBookingConflictException}.
      * A {@code CONFIRMED} booking reverts to {@code PENDING} (re-enters the approval queue);
      * a {@code PENDING} booking stays {@code PENDING}. Either way the provider is re-notified
      * via a {@code BOOKING_RESCHEDULED} outbox event. {@code priceAtBooking} and
@@ -430,9 +436,12 @@ public class BookingService {
      * @param bookingId   the booking to move
      * @param req         the new start time
      * @return the updated booking
-     * @throws ForbiddenException if the actor is not the owning client (403)
-     * @throws BusinessException  if the source state is not PENDING/CONFIRMED (409) or the new
-     *                            slot conflicts (409); {@link #validateStartsAt} rejects bad times (400)
+     * @throws ForbiddenException              if the actor is not the owning client (403)
+     * @throws BusinessException               if the source state is not PENDING/CONFIRMED (409) or
+     *                                          the new slot conflicts with the master's calendar
+     *                                          (409); {@link #validateStartsAt} rejects bad times (400)
+     * @throws ClientBookingConflictException  if the new window overlaps another booking this
+     *                                          client already holds (409, {@code CLIENT_BOOKING_CONFLICT})
      */
     @Transactional
     public BookingDetailResponse rescheduleBooking(UUID actorUserId, UUID bookingId, RescheduleBookingRequest req) {
@@ -472,12 +481,24 @@ public class BookingService {
 
         LocalDate oldDate = booking.getStartsAt().toLocalDate();
 
-        // Same critical section as doCreateBooking: serialize per-master, then overlap-check
-        // (excluding this booking's own row so it cannot collide with itself).
+        // Same critical section as doCreateBooking, in the same client-then-master order
+        // (deadlock freedom — see BookingRepository.acquireClientAdvisoryLockWithTimeout
+        // javadoc). actorUserId IS the owning client here — ownership was already verified
+        // above. acquireClientLock's fused query also sets the transaction-scoped lock_timeout
+        // for the whole transaction, bounding the wait on both this lock and the master lock
+        // below.
+        acquireClientLock(actorUserId);
+
+        // Client-conflict check (excluding this booking's own row) runs BEFORE the master-busy
+        // check — and before the master lock is even acquired — same precedence and rationale
+        // as create; see doCreateBooking.
+        assertNoClientConflictExcluding(actorUserId, newStartsAt, newEndsAt, bookingId);
+
         Integer lockResult = bookingRepository.acquireAdvisoryLock(masterId);
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
+
         if (bookingRepository.existsOverlapExcluding(masterId, newStartsAt, newEndsAt, bookingId)) {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }
@@ -493,9 +514,9 @@ public class BookingService {
         outboxService.enqueueBookingRescheduled(saved.getId());
         // Evict the freed old-day slots and the now-occupied new-day slots, plus the
         // provider calendar — after commit, so a parallel reader cannot repopulate stale data.
-        registerSlotEviction(masterId, oldDate, saved.getMasterService().getId());
+        registerSlotEviction(masterId, salonIdOf(saved), oldDate, saved.getMasterService().getId());
         if (!oldDate.equals(newStartsAt.toLocalDate())) {
-            registerSlotEviction(masterId, newStartsAt.toLocalDate(), saved.getMasterService().getId());
+            registerSlotEviction(masterId, salonIdOf(saved), newStartsAt.toLocalDate(), saved.getMasterService().getId());
         }
         evictMasterCalendarAfterCommit(masterId);
         // A rescheduled booking is always PENDING/CONFIRMED, so canReview is false by the
@@ -538,6 +559,24 @@ public class BookingService {
             throw new ForbiddenException("Only clients can create bookings");
         }
 
+        // Client lock (salt 1) is always acquired BEFORE the master lock (salt 0) — the
+        // deterministic global order that keeps the two lock classes deadlock-free (see
+        // BookingRepository.acquireClientAdvisoryLockWithTimeout javadoc). acquireClientLock's
+        // fused query also sets the transaction-scoped lock_timeout for the whole transaction
+        // (backend-security: bounds every subsequent lock wait, including the master lock
+        // below, so a flood of concurrent requests from one account fails fast with a clean 409
+        // instead of parking a Hikari connection for the full pool connection-timeout).
+        acquireClientLock(clientId);
+
+        // Client-conflict check runs BEFORE the master-busy check — and, since the reorder,
+        // before the master lock is even acquired: when the requested window conflicts with
+        // the client's own calendar, the caller gets the more specific, actionable
+        // CLIENT_BOOKING_CONFLICT rather than the generic "Slot not available" — locked
+        // product decision — AND the shared per-master lock (contended by every other client
+        // racing for the same popular master) is never touched for a conflict that is entirely
+        // about this client's own calendar (backend-perf).
+        assertNoClientConflict(clientId, startsAt, endsAt);
+
         Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
@@ -572,7 +611,7 @@ public class BookingService {
         }
 
         outboxService.enqueueNewBooking(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved);
     }
 
@@ -603,17 +642,104 @@ public class BookingService {
         BookingStartsAtValidator.validate(startsAt, clock);
     }
 
-    private void registerSlotEviction(UUID masterId, LocalDate date, UUID masterServiceId) {
+    /**
+     * Acquires the per-client advisory lock (salt 1) — serializing concurrent create/reschedule
+     * requests from the same client. This is always the FIRST lock taken in the transaction;
+     * the per-master advisory lock (salt 0) is acquired afterwards, only once the
+     * client-conflict check has passed — see
+     * {@link BookingRepository#acquireClientAdvisoryLockWithTimeout(UUID)} for the
+     * deadlock-freedom argument that depends on this fixed client-then-master order.
+     *
+     * <p>{@link BookingRepository#acquireClientAdvisoryLockWithTimeout(UUID)} fuses
+     * {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent to
+     * {@code SET LOCAL}) into the SAME statement as the lock acquisition — one round trip
+     * instead of two. Because the timeout is transaction-scoped, it remains in force for the
+     * rest of the transaction and therefore still bounds the master lock acquired later via the
+     * plain {@link BookingRepository#acquireAdvisoryLock(UUID)}, with no need to re-apply it.
+     */
+    private void acquireClientLock(UUID clientId) {
+        Integer lockResult = bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId);
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
+    }
+
+    /**
+     * Throws {@link ClientBookingConflictException} if the client already holds a
+     * {@code PENDING}/{@code CONFIRMED} booking (with ANY master/salon) overlapping
+     * {@code [startsAt, endsAt)}. Caller must hold {@link #acquireClientLock(UUID)} first so
+     * two concurrent requests from the same client cannot both pass this check.
+     */
+    private void assertNoClientConflict(UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt) {
+        bookingRepository.findFirstConflictingClientBookingId(clientId, startsAt, endsAt)
+                .ifPresent(conflictId -> {
+                    throw clientConflictException(conflictId);
+                });
+    }
+
+    /**
+     * Same as {@link #assertNoClientConflict} but excludes the booking being rescheduled from
+     * its own conflict scan, so a booking never collides with itself when only its time moves.
+     */
+    private void assertNoClientConflictExcluding(
+            UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt, UUID excludeBookingId) {
+        bookingRepository.findFirstConflictingClientBookingIdExcluding(clientId, startsAt, endsAt, excludeBookingId)
+                .ifPresent(conflictId -> {
+                    throw clientConflictException(conflictId);
+                });
+    }
+
+    /**
+     * Re-hydrated with the full association graph (client/master/masterService/
+     * serviceDefinition) so the exception can read service name + master display name
+     * without triggering a lazy load. The row was just found by the query above in this
+     * same transaction, so it is guaranteed to still exist.
+     *
+     * <p><b>Lock-window note (backend-perf audit):</b> this JOIN FETCH runs while the CLIENT
+     * advisory lock is still held — {@code pg_advisory_xact_lock} releases only at
+     * commit/rollback, so it cannot be dropped mid-transaction before throwing. The
+     * client-then-master reorder already shrank this window versus the prior master-then-client
+     * order: the master lock has NOT been acquired yet at this point (it is only taken after
+     * {@link #assertNoClientConflict}/{@link #assertNoClientConflictExcluding} pass), so this
+     * extra read only extends the hold on the caller's OWN client lock, never the shared
+     * per-master lock other clients may be waiting on. The fetch itself only runs on the rare
+     * conflict path (never on the common success path), so its cost is bounded to that case.
+     */
+    private ClientBookingConflictException clientConflictException(UUID conflictingBookingId) {
+        Booking conflict = bookingRepository.findByIdWithFullGraph(conflictingBookingId)
+                .orElseThrow(() -> new BusinessException(
+                        HttpStatus.INTERNAL_SERVER_ERROR, "Conflicting booking could not be loaded"));
+        return new ClientBookingConflictException(conflict);
+    }
+
+    /** Discovery/catalogue salon id for a booking: the booked salon, or null for an independent master. */
+    private static UUID salonIdOf(Booking booking) {
+        Salon salon = booking.getSalon();
+        return salon != null ? salon.getId() : null;
+    }
+
+    private void registerSlotEviction(UUID masterId, UUID salonId, LocalDate date, UUID masterServiceId) {
+        Runnable task = () -> {
+            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+            // The booking changed occupancy → the master's free-slot bookability verdict may
+            // flip; evict by master prefix (window keys can't be evicted per-date).
+            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            // A flipped bookability verdict can add/remove a service from the salon catalogue
+            // (perf/security #2). Null salon (independent master) owns no catalogue entry.
+            if (salonId != null) {
+                salonCatalogCacheEvictor.evict(salonId);
+            }
+        };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+                    task.run();
                 }
             });
         } else {
             // No active transaction (e.g. unit test context) — evict directly
-            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
+            task.run();
         }
     }
 

@@ -353,6 +353,31 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("windowEnd") OffsetDateTime windowEnd
     );
 
+    /**
+     * All PENDING/CONFIRMED bookings for a master overlapping the {@code [windowStart, windowEnd)}
+     * range, ordered by start. Backs the batched free-slot bookability gate
+     * ({@code SlotCalculationService#filterBookableAssignments} / {@code hasBookableFutureSlot}):
+     * the whole booking horizon is loaded ONCE per master and sliced per-day in memory, instead of
+     * one {@link #findOverlappingByMaster} query per day. The overlap predicate ({@code starts_at <
+     * windowEnd AND ends_at > windowStart}) matches {@link #findOverlappingByMaster} so a booking whose
+     * tail spills past a day boundary is still returned. Bounded by the service layer's ≤180-day
+     * booking horizon (Anti-Bug §E-3 — not an unbounded scan), and aligned to the same
+     * {@code (master_id, status, starts_at)} access path as the per-day finder.
+     */
+    @Query(value = """
+            SELECT * FROM bookings
+            WHERE master_id = :masterId
+              AND status IN ('PENDING','CONFIRMED')
+              AND starts_at < :windowEnd
+              AND ends_at   > :windowStart
+            ORDER BY starts_at ASC
+            """, nativeQuery = true)
+    List<Booking> findActiveByMasterInRange(
+            @Param("masterId") UUID masterId,
+            @Param("windowStart") OffsetDateTime windowStart,
+            @Param("windowEnd") OffsetDateTime windowEnd
+    );
+
     @Query(value = """
             SELECT EXISTS (
               SELECT 1 FROM bookings
@@ -393,6 +418,112 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
             @Param("excludeBookingId") UUID excludeBookingId
     );
+
+    // ── Client-scoped conflict check (cross-master/salon double-booking) ─────────
+    /**
+     * Id of the client's earliest {@code PENDING}/{@code CONFIRMED} booking — with ANY
+     * master/salon — that overlaps the requested {@code [requestedStartsAt, requestedEndsAt)}
+     * window. Half-open interval overlap, same predicate shape as {@link #existsOverlap}, but
+     * scoped by {@code client_id} instead of {@code master_id} so it catches a client double-
+     * booking themselves across two different masters. {@code ORDER BY starts_at ASC LIMIT 1}
+     * makes the earliest conflict deterministic when a client somehow holds more than one
+     * overlapping booking. Backed by the partial index {@code idx_bookings_client_slot_overlap}
+     * (V112), mirroring {@code idx_bookings_master_slot_overlap} (V26).
+     *
+     * <p>Callers must hold the per-client advisory lock (see
+     * {@link #acquireClientAdvisoryLockWithTimeout(UUID)}) before invoking, so a concurrent
+     * request from the same client cannot race this check-then-insert.
+     */
+    @Query(value = """
+            SELECT id FROM bookings
+             WHERE client_id = :clientId
+               AND status IN ('PENDING','CONFIRMED')
+               AND starts_at < :requestedEndsAt
+               AND ends_at   > :requestedStartsAt
+             ORDER BY starts_at ASC
+             LIMIT 1
+            """, nativeQuery = true)
+    Optional<UUID> findFirstConflictingClientBookingId(
+            @Param("clientId") UUID clientId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt
+    );
+
+    /**
+     * Same as {@link #findFirstConflictingClientBookingId} but excludes a single booking's own
+     * row — used by the reschedule flow so a booking does not conflict with itself when only
+     * its time changes.
+     */
+    @Query(value = """
+            SELECT id FROM bookings
+             WHERE client_id = :clientId
+               AND id <> :excludeBookingId
+               AND status IN ('PENDING','CONFIRMED')
+               AND starts_at < :requestedEndsAt
+               AND ends_at   > :requestedStartsAt
+             ORDER BY starts_at ASC
+             LIMIT 1
+            """, nativeQuery = true)
+    Optional<UUID> findFirstConflictingClientBookingIdExcluding(
+            @Param("clientId") UUID clientId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("excludeBookingId") UUID excludeBookingId
+    );
+
+    /**
+     * Fused, single-round-trip form of the per-client advisory lock: sets this transaction's
+     * {@code lock_timeout} to 3s via {@code set_config('lock_timeout', '3s', true)} — the
+     * {@code is_local=true} third argument makes this functionally identical to
+     * {@code SET LOCAL lock_timeout = '3s'} (transaction-scoped; resets automatically at
+     * commit/rollback and never leaks onto the next borrower of the pooled connection) — AND
+     * acquires the salt-{@code 1} advisory lock in the SAME statement. Folding the two into one
+     * round trip removes a network hop from every booking write (perf finding; measurable on
+     * Neon's serverless proxy, which is a real network hop per statement, not a local call).
+     *
+     * <p>Postgres evaluates a SELECT target list left-to-right per row, so
+     * {@code set_config(...)} is guaranteed to run before {@code pg_advisory_xact_lock(...)} on
+     * the same row — the 3s ceiling is already in force for THIS lock acquisition. Because the
+     * GUC is transaction-scoped (not just statement-scoped), it also remains in force for the
+     * rest of the transaction, so it still bounds the subsequent per-master
+     * {@link #acquireAdvisoryLock(UUID)} wait in {@code BookingService.doCreateBooking} /
+     * {@code rescheduleBooking} WITHOUT needing to be re-applied there.
+     *
+     * <p>Serializes concurrent create/reschedule requests from the SAME client so two
+     * simultaneous requests cannot both pass the client-conflict check before either insert
+     * commits (the classic check-then-act race). Without the timeout, a single authenticated
+     * CLIENT firing N concurrent requests would deterministically serialize all of them on the
+     * identical advisory lock — parking N-1 Hikari connections for up to the full
+     * connection-timeout and starving the pool (Neon free-tier {@code maximum-pool-size: 10})
+     * for every other tenant (security fix, booking advisory-lock DoS audit).
+     *
+     * <p>Uses salt {@code 1} (vs. salt {@code 0} for {@link #acquireAdvisoryLock(UUID)}) so the
+     * client-lock and master-lock hash spaces never collide, even in the (already vanishingly
+     * unlikely) event a master id and a client's user id share the same UUID text.
+     *
+     * <p><b>Deadlock freedom:</b> every caller acquires the CLIENT lock (salt 1) BEFORE the
+     * master lock (salt 0) — see {@code BookingService.doCreateBooking} /
+     * {@code rescheduleBooking}. Because both request paths are the only writers that ever take
+     * both locks, and both always acquire them in the same client-then-master order, no session
+     * can hold a master lock while waiting on a client lock — the precondition for a two-lock
+     * deadlock cycle never arises. {@code GuestBookingService} takes ONLY the master lock (via
+     * {@link #acquireAdvisoryLockWithTimeout(UUID)} — no client id to key on), so it can never
+     * participate in a two-lock cycle either.
+     *
+     * <p>A session that waits longer than {@code lock_timeout} aborts the lock wait with
+     * Postgres {@code 55P03 lock_not_available}. Hibernate/Spring exception translation
+     * surfaces this as {@link org.springframework.dao.CannotAcquireLockException} — mapped to
+     * a clean 409 by {@code GlobalExceptionHandler#handleCannotAcquireLock} — instead of
+     * parking the connection for the full Hikari connection-timeout (20 s) or surfacing a
+     * bare 500.
+     */
+    @Query(value = """
+            SELECT 1 FROM (
+                SELECT set_config('lock_timeout', '3s', true),
+                       pg_advisory_xact_lock(hashtextextended(CAST(:clientId AS text), 1))
+            ) sub
+            """, nativeQuery = true)
+    Integer acquireClientAdvisoryLockWithTimeout(@Param("clientId") UUID clientId);
 
     // ── View-access projection — ownership-only, role from SecurityContext ───────
     /**
@@ -444,10 +575,48 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
     // but should be revisited if the platform scales significantly.
+    //
+    // Ordering: BookingService.doCreateBooking / rescheduleBooking acquire this lock AFTER
+    // acquireClientAdvisoryLockWithTimeout (see that method's javadoc for the full
+    // deadlock-freedom argument) — the per-client conflict check runs and can fail fast
+    // without ever contending this shared per-master lock, which every other client racing
+    // for the same popular master is waiting on. No timeout is (re-)applied here: the fused
+    // set_config('lock_timeout', ..., true) issued by acquireClientAdvisoryLockWithTimeout
+    // earlier in the SAME transaction is transaction-scoped, so its 3s ceiling already covers
+    // this wait too.
     @Query(value = """
             SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))) sub
             """, nativeQuery = true)
     Integer acquireAdvisoryLock(@Param("masterId") UUID masterId);
+
+    /**
+     * Fused, single-round-trip form of the per-master advisory lock for callers that take
+     * ONLY the master lock (no client lock beforehand) — currently just
+     * {@code GuestBookingService#persistBooking}. Sets this transaction's {@code lock_timeout}
+     * to 3s via {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent
+     * to {@code SET LOCAL}) AND acquires the salt-{@code 0} advisory lock in the SAME
+     * statement/round-trip — see {@link #acquireClientAdvisoryLockWithTimeout(UUID)} for the
+     * full rationale (evaluation-order guarantee, DoS-closing motivation, perf round-trip
+     * saving) shared by both fused methods.
+     *
+     * <p>The guest-booking endpoint ({@code POST /api/v1/book/{slug}/booking}) is
+     * {@code permitAll}, gated only by a non-IP-bound guest JWT plus a per-IP rate limit, so an
+     * unbounded lock wait there is an equally viable advisory-lock DoS vector as the
+     * authenticated path — hence the timeout is fused here too, not just on the client lock.
+     *
+     * <p>{@code BookingService} does NOT use this method for its own master lock: it always
+     * takes the client lock first via {@link #acquireClientAdvisoryLockWithTimeout(UUID)},
+     * which already sets the transaction-scoped timeout, so its later master lock uses the
+     * plain {@link #acquireAdvisoryLock(UUID)} — re-applying the timeout there would be a
+     * redundant round trip.
+     */
+    @Query(value = """
+            SELECT 1 FROM (
+                SELECT set_config('lock_timeout', '3s', true),
+                       pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))
+            ) sub
+            """, nativeQuery = true)
+    Integer acquireAdvisoryLockWithTimeout(@Param("masterId") UUID masterId);
 
     // ── Guest-booking reminder sweep (Phase 13.3) ─────────────────────────────
     /**

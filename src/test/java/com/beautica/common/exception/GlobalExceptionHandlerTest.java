@@ -4,9 +4,19 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.beautica.auth.Role;
 import com.beautica.auth.dto.EmailAlreadyRegisteredResponse;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
+import com.beautica.booking.dto.ClientBookingConflictResponse;
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.ApiResponse;
+import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.PriceType;
+import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.user.User;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.ConstraintViolationException;
@@ -18,6 +28,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.MethodParameter;
+import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -29,6 +40,7 @@ import org.springframework.security.authorization.AuthorizationDeniedException;
 import org.springframework.security.authorization.AuthorizationDecision;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -37,6 +49,8 @@ import org.springframework.web.multipart.support.MissingServletRequestPartExcept
 
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -793,6 +807,113 @@ class GlobalExceptionHandlerTest {
                 .isFalse();
     }
 
+    /**
+     * Minimal, fully-hydrated {@link Booking} fixture used to construct a
+     * {@link ClientBookingConflictException} — mirrors the fixture style in
+     * {@code BookingServiceTest}. No lazy fields are touched by the exception constructor
+     * beyond master.user and masterService.serviceDefinition, both set here.
+     */
+    private Booking buildConflictingBooking(UUID id) {
+        User masterUser = new User(
+                "master@example.com", "hash", Role.INDEPENDENT_MASTER, "Olena", "Kovalenko", "+380501234567");
+        Master master = Master.builder()
+                .user(masterUser)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(true)
+                .build();
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .name("Manicure")
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("500.00"))
+                .baseDurationMinutes(90)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(master)
+                .serviceDefinition(serviceDef)
+                .isActive(true)
+                .build();
+        User client = new User(
+                "client@example.com", "hash", Role.CLIENT, "Client", "Test", "+380631234567");
+        Booking booking = Booking.builder()
+                .client(client)
+                .master(master)
+                .masterService(msa)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(OffsetDateTime.parse("2026-07-15T14:00:00+03:00"))
+                .endsAt(OffsetDateTime.parse("2026-07-15T15:30:00+03:00"))
+                .priceAtBooking(new BigDecimal("500.00"))
+                .durationMinutesAtBooking(90)
+                .bufferMinutesAtBooking(0)
+                .build();
+        ReflectionTestUtils.setField(booking, "id", id);
+        return booking;
+    }
+
+    @Test
+    @DisplayName("Should return 409 with CLIENT_BOOKING_CONFLICT code and conflicting-booking details "
+            + "when ClientBookingConflictException is thrown")
+    void should_return409WithClientBookingConflictCode_when_clientBookingConflictExceptionThrown() {
+        // Arrange — BookingService throws this when the client already holds an overlapping
+        // PENDING/CONFIRMED booking with a different master/salon. The handler must emit the
+        // structured ClientBookingConflictResponse body (code + conflict details) instead of
+        // letting handleBusiness catch it and return the generic master-busy conflict message.
+        UUID conflictingBookingId = UUID.randomUUID();
+        Booking conflicting = buildConflictingBooking(conflictingBookingId);
+        var ex = new ClientBookingConflictException(conflicting);
+
+        // Act
+        ResponseEntity<ApiResponse<ClientBookingConflictResponse>> response =
+                handler.handleClientBookingConflict(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("a client double-booking themselves must map to 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        // Reference the constant — a rename of ClientBookingConflictException.ERROR_CODE must
+        // fail this test, not silently break the mobile client's routing between this and the
+        // generic "Slot not available" (master-busy) 409.
+        assertThat(response.getBody().data().code())
+                .as("code must be the stable CLIENT_BOOKING_CONFLICT constant")
+                .isEqualTo(ClientBookingConflictException.ERROR_CODE);
+
+        assertThat(response.getBody().data().conflictingBookingId()).isEqualTo(conflictingBookingId);
+        assertThat(response.getBody().data().serviceName()).isEqualTo("Manicure");
+        assertThat(response.getBody().data().masterName()).isEqualTo("Olena Kovalenko");
+        assertThat(response.getBody().data().startsAt()).isNotNull();
+        assertThat(response.getBody().data().endsAt()).isNotNull();
+
+        assertThat(response.getBody().message())
+                .as("message must be the stable wire-contract string")
+                .isEqualTo("Client already has an overlapping booking");
+    }
+
+    @Test
+    @DisplayName("handleClientBookingConflict — emits DEBUG log marker only")
+    void should_emitDebugLog_when_clientBookingConflictExceptionThrown() {
+        Booking conflicting = buildConflictingBooking(UUID.randomUUID());
+        var ex = new ClientBookingConflictException(conflicting);
+        listAppender.list.clear();
+
+        handler.handleClientBookingConflict(ex);
+
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleClientBookingConflict must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must contain the non-PII exception class marker")
+                .contains("ClientBookingConflictException");
+    }
+
     @Test
     @DisplayName("should return 400 with generic message when ConstraintViolationException is thrown")
     void should_return400_withGenericMessage_when_constraintViolationExceptionThrown() {
@@ -931,6 +1052,92 @@ class GlobalExceptionHandlerTest {
         assertThat(debugEvents.get(0).getFormattedMessage())
                 .as("DEBUG log must reference the resource path")
                 .contains("/swagger-ui/index.html");
+    }
+
+    // ── handleCannotAcquireLock (Phase 19.4 — 55P03 lock_timeout → 409) ──────────
+    //
+    // CannotAcquireLockException is Spring's SQLState translation of Postgres 55P03
+    // (lock_not_available), raised when a booking advisory-lock wait exceeds the 3s
+    // lock_timeout fused into BookingRepository.acquireClientAdvisoryLockWithTimeout /
+    // acquireAdvisoryLockWithTimeout. Before this handler existed, the generic
+    // handleGeneric(Exception) fallback would have turned a lock-wait timeout into a
+    // bare 500 with no "try again" semantics — these tests pin the 409 mapping.
+
+    @Test
+    @DisplayName("handleCannotAcquireLock — returns 409 with the standard conflict message when a "
+            + "booking advisory-lock wait exceeds lock_timeout")
+    void should_return409_when_cannotAcquireLockExceptionThrown() {
+        // Arrange — mirrors the real translation path: Hibernate/Spring wraps the Postgres
+        // 55P03 SQLState into CannotAcquireLockException with a driver-shaped cause message
+        // that must never reach the client.
+        var ex = new CannotAcquireLockException(
+                "could not execute statement",
+                new RuntimeException("ERROR: canceling statement due to lock timeout"));
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleCannotAcquireLock(ex);
+
+        // Assert — same "try again" semantics as the existing master/client-busy 409s
+        assertThat(response.getStatusCode())
+                .as("a lock_timeout wait must map to 409, not the 500 the generic handler would produce")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        assertThat(response.getBody().message())
+                .as("message must be the shared static conflict string — same wording as handleBusiness's "
+                        + "CONFLICT branch, so the mobile client treats both identically")
+                .isEqualTo("Request could not be completed due to a conflict");
+    }
+
+    @Test
+    @DisplayName("handleCannotAcquireLock — never echoes the SQL state, driver cause, or lock detail "
+            + "in the response body")
+    void should_notLeakLockDetail_when_cannotAcquireLockExceptionThrown() {
+        // Arrange — a cause message shaped like the real Postgres 55P03 error text, which
+        // names the lock class and the timed-out statement — must never reach the client.
+        String leakyCause = "ERROR: canceling statement due to lock timeout — "
+                + "pg_advisory_xact_lock(hashtextextended(...))";
+        var ex = new CannotAcquireLockException("could not execute statement", new RuntimeException(leakyCause));
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleCannotAcquireLock(ex);
+
+        // Assert — no internal detail leaks into the HTTP body
+        assertThat(response.getBody().message())
+                .as("response must not leak the lock-wait cause text")
+                .doesNotContain("pg_advisory_xact_lock")
+                .doesNotContain("lock timeout")
+                .doesNotContain("hashtextextended");
+    }
+
+    @Test
+    @DisplayName("handleCannotAcquireLock — emits the real cause only at DEBUG, never at a louder level")
+    void should_logCauseAtDebugOnly_when_cannotAcquireLockExceptionThrown() {
+        // Arrange
+        var ex = new CannotAcquireLockException("could not execute statement",
+                new RuntimeException("55P03 lock_not_available"));
+        listAppender.list.clear();
+
+        // Act
+        handler.handleCannotAcquireLock(ex);
+
+        // Assert — exactly one DEBUG event, no louder-level event at all (this handler never
+        // needs ERROR/WARN — a bounded lock-wait timeout is an expected, self-healing condition)
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleCannotAcquireLock must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+
+        boolean anyLouderLevel = listAppender.list.stream()
+                .anyMatch(e -> e.getLevel() == Level.WARN || e.getLevel() == Level.ERROR);
+        assertThat(anyLouderLevel)
+                .as("a bounded lock-wait timeout must never be logged at WARN/ERROR")
+                .isFalse();
     }
 
     /**

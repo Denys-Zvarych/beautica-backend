@@ -114,6 +114,9 @@ class BookingServiceCacheTest {
     @MockBean SlotCalculationService slotCalculationService;
     @MockBean ReviewRepository reviewRepository;
     @MockBean DiscoveryLocationResolver discoveryLocationResolver;
+    // Phase 23.x (perf/security #2): BookingService evicts the salon-service-catalog cache via this
+    // collaborator after commit. Not on the @SpringBootTest classes list, so mock it for wiring.
+    @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Autowired BookingService bookingService;
     @Autowired CacheManager cacheManager;

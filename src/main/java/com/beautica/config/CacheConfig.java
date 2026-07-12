@@ -1,6 +1,9 @@
 package com.beautica.config;
 
 import com.github.benmanes.caffeine.cache.Caffeine;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.cache.caffeine.CaffeineCacheManager;
@@ -35,6 +38,10 @@ public class CacheConfig {
      *                         backs GET /salons/{salonId}/services/{serviceDefId}/masters) — same
      *                         60 sec TTL/500-entry sizing and master-prefix eviction as
      *                         master-working-days, which it mirrors
+     *   master-service-bookable — shared per-(master, service) "≥1 free future slot in [from,to]"
+     *                         bookability verdict (Phase 23.x, SlotCalculationService#hasBookableFutureSlot)
+     *                         gating both the booking master-list and the salon catalogue — 60 sec TTL,
+     *                         max 500; evicted by master prefix on every schedule AND booking write
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
      *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
@@ -67,8 +74,12 @@ public class CacheConfig {
      * eviction.
      */
     @Bean
-    public CacheManager cacheManager() {
+    public CacheManager cacheManager(ObjectProvider<MeterRegistry> meterRegistryProvider) {
         CaffeineCacheManager manager = new CaffeineCacheManager();
+        // Optional so pure @WebMvcTest slices (no actuator/metrics context) still wire the cache
+        // manager; when a MeterRegistry is present the hot slot caches export hit-rate / eviction
+        // gauges (Perf #5). getIfAvailable() returns the actuator-autoconfigured primary registry.
+        MeterRegistry meterRegistry = meterRegistryProvider.getIfAvailable();
         manager.registerCustomCache("service-categories",
                 Caffeine.newBuilder()
                         .maximumSize(200)
@@ -104,11 +115,14 @@ public class CacheConfig {
                         .maximumSize(500)
                         .expireAfterWrite(10, TimeUnit.MINUTES)
                         .build());
-        manager.registerCustomCache("available-slots",
+        // Metered (Perf #5): high-cardinality per-(master, date, service) slot lists on hot public
+        // read + write-evict paths. The CaffeineCacheMetrics gauge surfaces hit-rate / eviction-count
+        // so a churn regression (500-cap too small for live master×date×service fan-out) is observable
+        // before it degrades latency, rather than raising the cap blind.
+        registerMetered(manager, meterRegistry, "available-slots",
                 Caffeine.newBuilder()
                         .maximumSize(500)
-                        .expireAfterWrite(60, TimeUnit.SECONDS)
-                        .build());
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
         manager.registerCustomCache("master-calendar",
                 Caffeine.newBuilder()
                         .maximumSize(500)
@@ -132,6 +146,24 @@ public class CacheConfig {
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
+        // Phase 23.x (CRITICAL free-slot fix) — the shared per-(master, service) "≥1 free future slot
+        // in [from,to]" bookability verdict (SlotCalculationService#hasBookableFutureSlot) that gates
+        // both the booking master-list AND the salon catalogue. Mirrors available-slots: 60-sec TTL,
+        // 500 entries, sync=true. Key is {masterId, masterServiceId, from, to}; the window portion
+        // cannot be evicted per-date, so it is evicted by MASTER PREFIX on every schedule write
+        // (MasterScheduleService#evictSlotsAfterCommit) AND every booking write
+        // (SlotCalculationService#evictBookableFutureSlotsByMaster, called from the booking-write
+        // afterCommit hooks) — a new/cancelled booking anywhere in the horizon can flip the verdict.
+        // Metered + raised cap (Perf #5). Key is {masterId, masterServiceId, from, to}: the booking
+        // horizon window is fixed per call, so live cardinality is ~ (active masters × services they
+        // perform). Across many salons that exceeds the previous 500-cap, so a popular master-list /
+        // catalogue mix churned entries within the 60-sec TTL, defeating the cache. Raised to 2000 to
+        // hold the working set for current scale; the CaffeineCacheMetrics gauge makes further tuning
+        // data-driven rather than guessed.
+        registerMetered(manager, meterRegistry, "master-service-bookable",
+                Caffeine.newBuilder()
+                        .maximumSize(2000)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
         manager.registerCustomCache("master-by-user",
                 Caffeine.newBuilder()
                         .maximumSize(500)
@@ -251,6 +283,19 @@ public class CacheConfig {
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
+        // Phase 23.x (perf/security #2) — public salon service catalogue behind
+        // GET /api/v1/salons/{salonId}/services, keyed on salonId. permitAll + uncached previously ran
+        // an O(distinct masters) free-slot compute per hit (schedule resolve + booking load per master),
+        // a DB-amplification / stampede surface. Mirrors booking-slug-info: 60-sec TTL, sync=true on the
+        // @Cacheable (collapses the thundering herd when a popular salon's entry expires — §F-7), metered
+        // (Perf #5). Unlike booking-slug-info this cache HAS explicit @CacheEvict wiring
+        // (SalonCatalogCacheEvictor, afterCommit): a booking / schedule change on any master in the salon,
+        // or a service-definition mutation, flips the bookable-service set, so the 60-sec TTL is a backstop
+        // not the primary invalidation. 500 entries cover the most-browsed salons at current scale.
+        registerMetered(manager, meterRegistry, "salon-service-catalog",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
         // Phase 13.6 (perf follow-up) — approved+active PlatformCategory ordering backing
         // ServiceCatalogService#buildCategoryOrderAndNames. Mirrors service-categories's config: this
         // is admin-approval-gated reference data, identical across every request, previously
@@ -263,5 +308,21 @@ public class CacheConfig {
                         .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
         return manager;
+    }
+
+    /**
+     * Builds a stats-recording Caffeine cache, registers it under {@code name}, and — when a
+     * {@link MeterRegistry} is available — binds a {@link CaffeineCacheMetrics} gauge
+     * (hit-rate, eviction-count, load stats) tagged by cache name (Perf #5). {@code recordStats()}
+     * is mandatory for the metrics to report; the builder is finalised here so callers never forget
+     * it. A null registry (metrics-less slice test) registers the cache without metrics.
+     */
+    private static void registerMetered(CaffeineCacheManager manager, MeterRegistry meterRegistry,
+                                        String name, Caffeine<Object, Object> builder) {
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> cache = builder.recordStats().build();
+        manager.registerCustomCache(name, cache);
+        if (meterRegistry != null) {
+            CaffeineCacheMetrics.monitor(meterRegistry, cache, name);
+        }
     }
 }

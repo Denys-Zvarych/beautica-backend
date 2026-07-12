@@ -73,9 +73,32 @@ class MasterServiceTest {
     // parameter. The creation paths call getOrCreateSlug(...) after save — a no-op stub
     // (default mock) is sufficient; its return value is ignored by MasterService.
     @Mock private com.beautica.booking.service.BookingSlugService bookingSlugService;
+    // Bookability-eviction fix: MasterService now constructor-depends on these two collaborators.
+    // Declared so @InjectMocks wires real mocks instead of leaving the fields null — otherwise the
+    // afterCommit eviction callback NPEs the instant any deactivate/reactivate path is replayed
+    // under an active transaction synchronization (see should_evict* guard tests below).
+    @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @InjectMocks
     private MasterService masterService;
+
+    /**
+     * Runs {@code action} with Spring transaction synchronization active, then replays every
+     * registered {@code afterCommit()} callback exactly as a real commit would, and clears the
+     * synchronization. The bookability-cache eviction is registered as an {@code afterCommit}
+     * callback, so without this replay it never runs in a non-transactional unit test.
+     */
+    private void runAndReplayAfterCommit(Runnable action) {
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            action.run();
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(TransactionSynchronization::afterCommit);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
 
     // ── createMasterForIndependentUser ─────────────────────────────────────────
 
@@ -416,6 +439,129 @@ class MasterServiceTest {
         verify(masterDetailCache).evict(masterId);
         // The master-by-user cache must also have been evicted for the user.
         verify(masterByUserCache).evict(userId);
+    }
+
+    // ── bookability-cache eviction guard (deactivate/reactivate flips is_active) ──
+    // Regression net for the fix: each is_active flip must, after commit, evict
+    //   • master-service-bookable (via slotCalculationService.evictBookableFutureSlotsByMaster(masterId)), and
+    //   • salon-service-catalog   (via salonCatalogCacheEvictor.evict(salonId), non-null salon only).
+    // Without these, a deactivated sole-performer's SALON service lingered in
+    // GET /salons/{id}/services + the booking master-list for up to the 60s TTL.
+
+    @Test
+    @DisplayName("deactivateMaster — after commit evicts master-service-bookable (by masterId) AND salon-service-catalog (by salonId)")
+    void should_evictBothBookabilityCaches_when_deactivateMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(userId);
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+        ReflectionTestUtils.setField(master, "user", user);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
+
+        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(salonCatalogCacheEvictor).evict(salonId);
+    }
+
+    @Test
+    @DisplayName("deactivateOwnerMaster — after commit evicts master-service-bookable (by masterId) AND salon-service-catalog (by salonId)")
+    void should_evictBothBookabilityCaches_when_deactivateOwnerMaster() {
+        UUID actorUserId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByUserIdWithSalon(actorUserId)).thenReturn(Optional.of(master));
+
+        runAndReplayAfterCommit(() -> masterService.deactivateOwnerMaster(actorUserId, salonId));
+
+        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(salonCatalogCacheEvictor).evict(salonId);
+    }
+
+    @Test
+    @DisplayName("createMasterForOwner (reactivation branch) — after commit evicts master-service-bookable (by masterId) AND salon-service-catalog (by salonId)")
+    void should_evictBothBookabilityCaches_when_reactivatingInactiveOwnerMaster() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        User owner = mock(User.class);
+        when(owner.getRole()).thenReturn(Role.SALON_OWNER);
+        when(owner.getId()).thenReturn(userId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salon.getOwner()).thenReturn(owner);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master inactive = Master.builder()
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(false)
+                .build();
+        ReflectionTestUtils.setField(inactive, "id", masterId);
+        ReflectionTestUtils.setField(inactive, "salon", salon);
+
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(inactive));
+
+        runAndReplayAfterCommit(() -> masterService.createMasterForOwner(owner, salon));
+
+        // Reactivation flips is_active TRUE — the sole-performer's SALON service can (re)appear,
+        // so both bookability caches must be evicted, exactly as on deactivation.
+        assertThat(inactive.isActive())
+                .as("reactivation branch must flip the row active")
+                .isTrue();
+        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(salonCatalogCacheEvictor).evict(salonId);
+    }
+
+    @Test
+    @DisplayName("deactivateMaster (INDEPENDENT_MASTER, no salon) — evicts master-service-bookable but is a no-op on the salon-catalog evictor")
+    void should_notTouchSalonCatalogEvictor_when_deactivatedMasterHasNoSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getId()).thenReturn(userId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+        ReflectionTestUtils.setField(master, "user", user);
+        // salon intentionally left null — an independent master owns no salon catalogue entry.
+
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+
+        runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
+
+        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(salonCatalogCacheEvictor, never()).evict(any());
     }
 
     // ── upsertWorkingHours ─────────────────────────────────────────────────────

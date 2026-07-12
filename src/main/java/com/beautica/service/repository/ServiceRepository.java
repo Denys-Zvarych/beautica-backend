@@ -59,6 +59,20 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     int deactivateById(@Param("id") UUID id);
 
     /**
+     * Resolves the owning salon id for a SALON-owned definition (its {@code ownerId} IS the salon id),
+     * or empty for a master-owned (INDEPENDENT_MASTER) definition or an unknown id. Used by
+     * {@code ServiceCatalogService.deactivateServiceDefinition} to evict the affected salon's
+     * {@code salon-service-catalog} entry (perf/security #2/#6) without hydrating the full entity —
+     * a master-owned definition owns no salon catalogue entry, hence the empty result.
+     */
+    @Query("""
+            SELECT sd.ownerId FROM ServiceDefinition sd
+            WHERE sd.id = :serviceDefId
+              AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+            """)
+    Optional<UUID> findSalonOwnerId(@Param("serviceDefId") UUID serviceDefId);
+
+    /**
      * A salon's bookable catalog for its public profile (Phase 13.6): active
      * {@link ServiceDefinition}s owned by the salon that have at least one active
      * {@link com.beautica.service.entity.MasterServiceAssignment} on an active master.
@@ -68,7 +82,17 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * groups by category. {@code EXISTS} against {@code MasterServiceAssignment} is the
      * "bookable" gate: a salon-owned service with zero active master assignments (or whose
      * only assigned masters are deactivated) must not appear on the public profile, since a
-     * client could never actually book it.
+     * client could never actually book it. The {@code msa.master.salon.id = :salonId} predicate
+     * closes the rotated-master stale-assignment leak: a master who left this salon but kept an
+     * active assignment row no longer counts toward the salon's bookable set.
+     *
+     * <p><b>Coarse gate only.</b> This is the coarse "actively performed by an in-salon master"
+     * gate that salon <em>search</em> mirrors ({@code SearchService#appendSalonBookableGate}). The
+     * live catalogue ({@code ServiceCatalogService#getSalonServiceCatalog}) additionally requires
+     * ≥1 free future slot per the Phase 23.x fix and therefore drives off the assignment-level
+     * {@code MasterServiceRepository#findBookableAssignmentsBySalon} query plus the
+     * {@code SlotCalculationService} free-slot gate — this method is retained as the canonical
+     * coarse-gate reference the search SQL is kept in step with.
      *
      * <p>{@code LEFT JOIN FETCH sd.serviceType} avoids the N+1 that
      * {@link ServiceDefinitionResponse#from} would otherwise trigger (it reads
@@ -87,6 +111,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
                   WHERE msa.serviceDefinition = sd
                     AND msa.isActive = true
                     AND msa.master.isActive = true
+                    AND msa.master.salon.id = :salonId
               )
             ORDER BY sd.category ASC, sd.name ASC
             """)

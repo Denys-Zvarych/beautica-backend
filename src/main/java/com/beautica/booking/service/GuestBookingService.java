@@ -17,6 +17,7 @@ import com.beautica.notification.sms.SmsService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import io.jsonwebtoken.JwtException;
 import lombok.extern.slf4j.Slf4j;
@@ -44,7 +45,7 @@ import java.util.UUID;
  *
  * <p><b>Concurrency.</b> Double-booking is prevented by the exact mechanism the
  * regular {@code BookingService.doCreateBooking} uses: a per-master Postgres
- * advisory transaction lock ({@code bookingRepository.acquireAdvisoryLock}) is
+ * advisory transaction lock ({@code bookingRepository.acquireAdvisoryLockWithTimeout}) is
  * acquired BEFORE the overlap check, so check + insert are atomic against a
  * concurrent guest booking for the same master+slot. A {@code DataIntegrityViolation}
  * on save is a final backstop mapped to 409.
@@ -64,6 +65,7 @@ public class GuestBookingService {
     private final NotificationOutboxService outboxService;
     private final SmsService smsService;
     private final BookingSmsProperties smsProperties;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final String frontendBaseUrl;
     private final Clock kyivClock;
 
@@ -76,6 +78,7 @@ public class GuestBookingService {
             NotificationOutboxService outboxService,
             SmsService smsService,
             BookingSmsProperties smsProperties,
+            SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             Clock clock) {
         this.guestTokenProvider = guestTokenProvider;
@@ -86,6 +89,7 @@ public class GuestBookingService {
         this.outboxService = outboxService;
         this.smsService = smsService;
         this.smsProperties = smsProperties;
+        this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.frontendBaseUrl = frontendBaseUrl;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
@@ -166,6 +170,20 @@ public class GuestBookingService {
         return guestTokenProvider.validate(token);
     }
 
+    /**
+     * Persists the guest booking under the per-master advisory lock.
+     *
+     * <p><b>Lock-wait bound.</b> {@link BookingRepository#acquireAdvisoryLockWithTimeout(UUID)}
+     * fuses {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent to
+     * {@code SET LOCAL}) into the SAME statement/round-trip as the master advisory-lock
+     * acquisition, so the wait is bounded to 3s instead of blocking indefinitely — one round
+     * trip instead of two. This closes the same advisory-lock DoS class documented on
+     * {@link BookingRepository#acquireAdvisoryLockWithTimeout(UUID)}: this endpoint
+     * ({@code POST /api/v1/book/{slug}/booking}) is {@code permitAll}, gated only by a
+     * non-IP-bound guest JWT and a per-IP rate limit, so a replayed guest token fired
+     * concurrently from multiple source IPs would otherwise be able to park unbounded Hikari
+     * connections on the same master's advisory lock.
+     */
     private Booking persistBooking(Master master, MasterServiceAssignment msa,
                                    GuestBookingRequest req, String guestPhone) {
         ServiceDefinition def = msa.getServiceDefinition();
@@ -178,7 +196,9 @@ public class GuestBookingService {
 
         // Per-master advisory lock BEFORE the overlap check — same mechanism as
         // BookingService.doCreateBooking, so check + insert are atomic (no TOCTOU race).
-        Integer lock = bookingRepository.acquireAdvisoryLock(master.getId());
+        // acquireAdvisoryLockWithTimeout() bounds this wait to 3s in the same round trip
+        // (see class-level Javadoc above).
+        Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(master.getId());
         if (lock == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
@@ -199,10 +219,20 @@ public class GuestBookingService {
     private void registerAfterCommit(Master master, MasterServiceAssignment msa,
                                      Booking saved, String guestPhone, String cancelUrl) {
         String smsText = buildConfirmationSms(master, msa, saved, cancelUrl);
+        // Capture the salon id inside the transaction (before the afterCommit callback runs) —
+        // null for an independent master (no salon catalogue entry).
+        UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
         Runnable task = () -> {
             sendConfirmationSms(guestPhone, smsText);
             slotCalculationService.evictAvailableSlots(
                     master.getId(), saved.getStartsAt().toLocalDate(), msa.getId());
+            // A new guest booking changed occupancy → evict the master's free-slot bookability
+            // verdict (master-prefix; window keys can't be evicted per-date).
+            slotCalculationService.evictBookableFutureSlotsByMaster(master.getId());
+            // A flipped verdict can add/remove a service from the salon catalogue (perf/security #2).
+            if (salonId != null) {
+                salonCatalogCacheEvictor.evict(salonId);
+            }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {

@@ -13,6 +13,7 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
@@ -35,6 +36,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -94,6 +96,8 @@ class BookingServiceTest {
     private com.beautica.location.DiscoveryLocationResolver discoveryLocationResolver;
     @Mock
     private CacheManager cacheManager;
+    @Mock
+    private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     private Clock clock;
 
@@ -127,7 +131,8 @@ class BookingServiceTest {
                 reviewRepository,
                 discoveryLocationResolver,
                 clock,
-                cacheManager
+                cacheManager,
+                salonCatalogCacheEvictor
         );
 
         clientId = UUID.randomUUID();
@@ -318,6 +323,77 @@ class BookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.CONFLICT));
+    }
+
+    @Test
+    @DisplayName("409 CLIENT_BOOKING_CONFLICT is thrown when the client already holds an overlapping "
+            + "booking with a DIFFERENT master — the master-busy check never runs")
+    void should_throwClientBookingConflict_when_clientAlreadyHasOverlappingBookingWithDifferentMaster() {
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+
+        UUID otherMasterId = UUID.randomUUID();
+        Master otherMaster = buildMaster(otherMasterId, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment otherMsa = buildMsa(UUID.randomUUID(), otherMaster, serviceDef, null, null);
+        UUID conflictingBookingId = UUID.randomUUID();
+        Booking conflicting = buildBooking(conflictingBookingId, client, otherMaster, otherMsa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findFirstConflictingClientBookingId(eq(clientId), any(), any()))
+                .thenReturn(Optional.of(conflictingBookingId));
+        when(bookingRepository.findByIdWithFullGraph(conflictingBookingId)).thenReturn(Optional.of(conflicting));
+
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
+                .isInstanceOf(ClientBookingConflictException.class)
+                .satisfies(ex -> {
+                    ClientBookingConflictException cbce = (ClientBookingConflictException) ex;
+                    assertThat(cbce.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+                    assertThat(cbce.getConflictingBookingId()).isEqualTo(conflictingBookingId);
+                    assertThat(cbce.getServiceName()).isEqualTo(serviceDef.getName());
+                    assertThat(cbce.getMasterName()).isEqualTo("First Last");
+                    assertThat(cbce.getStartsAt()).isEqualTo(conflicting.getStartsAt());
+                    assertThat(cbce.getEndsAt()).isEqualTo(conflicting.getEndsAt());
+                });
+
+        // Client-conflict wins deterministically: since the Phase 19.4 client-then-master
+        // reorder, the master lock is not even acquired — the shared per-master lock (which
+        // every other client racing for the same popular master may be waiting on) is never
+        // touched for a conflict that is entirely about this client's own calendar.
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).existsOverlap(any(), any(), any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("advisory locks are acquired client-then-master (deterministic order, Phase 19.4 "
+            + "reorder), and the client-conflict check runs before the master lock is even acquired")
+    void should_acquireClientLockBeforeMasterLock_andCheckClientConflictFirst_when_creatingBooking() {
+        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.PENDING);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+
+        bookingService.createBooking(clientId, null, validRequest());
+
+        // acquireClientAdvisoryLockWithTimeout is the fused query (Phase perf fix) that sets
+        // the transaction-scoped lock_timeout AND takes the client lock in one round trip — its
+        // presence here (in place of a separate setBookingLockTimeout() + acquireClientAdvisoryLock()
+        // pair) IS the regression guard that the timeout ceiling is still applied before the
+        // client lock wait, without weakening the ordering assertion below.
+        InOrder inOrder = org.mockito.Mockito.inOrder(bookingRepository);
+        inOrder.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(clientId);
+        inOrder.verify(bookingRepository).findFirstConflictingClientBookingId(eq(clientId), any(), any());
+        inOrder.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        inOrder.verify(bookingRepository).existsOverlap(eq(masterId), any(), any());
+
+        // The master lock still uses the PLAIN (non-fused) query — the 3s lock_timeout set by
+        // acquireClientAdvisoryLockWithTimeout is transaction-scoped (set_config(..., true)),
+        // so it remains in force for this later master-lock wait without needing to be
+        // re-applied. Asserting this negative confirms the fused master-lock variant was not
+        // (mis)used here — that variant is reserved for GuestBookingService, which has no
+        // preceding client lock to inherit the timeout from.
+        verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
     }
 
     @Test
@@ -873,7 +949,11 @@ class BookingServiceTest {
                 newStartsAt.plusMinutes(60).atZoneSameInstant(KYIV));
         when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId)))
                 .thenReturn(List.of(slot));
-        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        // lenient: since the Phase 19.4 client-then-master reorder, the client-conflict test
+        // that also calls this helper throws before the master lock is ever acquired, making
+        // this stub unreachable on that path (by design — that IS the perf fix).
+        org.mockito.Mockito.lenient()
+                .when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
         // Reschedule success builds the enriched BookingDetailResponse via the label seam.
         // lenient: the 409-overlap test stubs the slot/lock but throws before enrichment.
         org.mockito.Mockito.lenient()
@@ -1053,6 +1133,43 @@ class BookingServiceTest {
                         .isEqualTo(HttpStatus.CONFLICT));
         // Self-exclusion: overlap is checked excluding this booking's own id
         verify(bookingRepository).existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId));
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any());
+    }
+
+    @Test
+    @DisplayName("409 CLIENT_BOOKING_CONFLICT is thrown when the new time overlaps another booking the "
+            + "client holds with a DIFFERENT master, and the master-busy check never runs")
+    void should_throwClientBookingConflict_when_rescheduleOverlapsClientsOtherBookingWithDifferentMaster() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+
+        UUID otherMasterId = UUID.randomUUID();
+        Master otherMaster = buildMaster(otherMasterId, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment otherMsa = buildMsa(UUID.randomUUID(), otherMaster, serviceDef, null, null);
+        UUID conflictingBookingId = UUID.randomUUID();
+        Booking conflicting = buildBooking(conflictingBookingId, client, otherMaster, otherMsa, BookingStatus.PENDING);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(
+                eq(clientId), any(), any(), eq(bookingId)))
+                .thenReturn(Optional.of(conflictingBookingId));
+        when(bookingRepository.findByIdWithFullGraph(conflictingBookingId)).thenReturn(Optional.of(conflicting));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(ClientBookingConflictException.class)
+                .satisfies(ex -> assertThat(((ClientBookingConflictException) ex).getConflictingBookingId())
+                        .isEqualTo(conflictingBookingId));
+
+        // Self-exclusion honoured: findFirstConflictingClientBookingIdExcluding was called with
+        // this booking's own id, and — client-conflict wins deterministically, with the
+        // Phase 19.4 client-then-master reorder — the master lock is never acquired, the
+        // master-busy check never runs, and nothing is persisted.
+        verify(bookingRepository).findFirstConflictingClientBookingIdExcluding(
+                eq(clientId), any(), any(), eq(bookingId));
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).existsOverlapExcluding(any(), any(), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any());
     }
