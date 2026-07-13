@@ -1,6 +1,7 @@
 package com.beautica.master.service;
 
 import com.beautica.common.DateRange;
+import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
@@ -27,8 +28,6 @@ import com.beautica.master.repository.ScheduleExceptionRepository;
 import com.beautica.master.repository.WeeklyScheduleRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import lombok.RequiredArgsConstructor;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -67,13 +66,36 @@ public class MasterScheduleService {
     private static final int MAX_INTERVALS_PER_DAY = 6;
     private static final int MAX_DISCRETE_TIMES_PER_DAY = 24;
 
+    /**
+     * Every master-availability cache a SCHEDULE write can invalidate. All five are keyed by a SpEL inline
+     * list whose first element is the masterId, so all five are evicted by the same master-prefix scan
+     * ({@link MasterCachePrefixEvictor}):
+     * <ul>
+     *   <li>{@code available-slots} — {@code {masterId, date, masterServiceId}}</li>
+     *   <li>{@code master-working-days} — {@code {masterId, from, to}} (schedule-shape mode)</li>
+     *   <li>{@code master-usable-schedule} — {@code {masterId, from, to}} ({@link #hasUsableSchedule})</li>
+     *   <li>{@code master-service-bookable} — {@code {masterId, masterServiceId, from, to}}</li>
+     *   <li>{@code master-bookable-days} — {@code {masterId, from, to, masterServiceId}} (the
+     *       availability-aware mode of the working-days endpoint)</li>
+     * </ul>
+     * A schedule change can flip the verdict of ANY of them for ANY of the master's services, so the write
+     * path evicts the whole set; the window/date portion of those keys cannot be evicted selectively.
+     */
+    private static final String[] SCHEDULE_WRITE_CACHES = {
+            "available-slots",
+            "master-working-days",
+            "master-usable-schedule",
+            "master-service-bookable",
+            "master-bookable-days",
+    };
+
     private final WeeklyScheduleRepository weeklyScheduleRepository;
     private final ScheduleExceptionRepository scheduleExceptionRepository;
     private final MasterRepository masterRepository;
     private final ScheduleDateMath dateMath;
     private final AuthorizationService authz;
     private final ScheduleMapper scheduleMapper;
-    private final CacheManager cacheManager;
+    private final MasterCachePrefixEvictor cacheEvictor;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     // ---- Step 2: weekly-template upsert -------------------------------------------------
@@ -609,11 +631,18 @@ public class MasterScheduleService {
     // ---- cache eviction (afterCommit, per-master prefix) --------------------------------
 
     /**
-     * Evicts the affected master's {@code available-slots} <b>and</b> {@code master-working-days}
-     * entries <b>after commit</b> so a parallel reader cannot repopulate stale availability mid-write
-     * (§F). A schedule/override change can affect any service's slots for the master, so we evict by
-     * master prefix (the cache key's first element is the masterId) rather than per
+     * Evicts all five of the affected master's availability caches ({@link #SCHEDULE_WRITE_CACHES})
+     * <b>after commit</b> so a parallel reader cannot repopulate stale availability mid-write (§F). A
+     * schedule/override change can affect any service's slots for the master, so we evict by master prefix
+     * (the cache key's first element is the masterId) rather than per
      * {@code (date, masterServiceId)}/{@code (from, to)} — bounded to one master, not blanket.
+     *
+     * <p><b>Off the request thread (Perf MEDIUM-3).</b> The five keyset scans (~5 500 key comparisons) used
+     * to run synchronously on the committing thread. They are now submitted to {@code cacheEvictionExecutor}
+     * from inside the same {@code afterCommit} hook — so ordering is unchanged (never before commit), but a
+     * schedule write no longer pays for the scan. The scan logic itself lives in the shared
+     * {@link MasterCachePrefixEvictor} (it was duplicated verbatim here and in
+     * {@code SlotCalculationService}).
      *
      * <p><b>Salon catalogue (perf/security #2).</b> A schedule change can flip whether a master has any
      * free future slot, so it can add/remove a service from the master's SALON catalogue. When the master
@@ -630,71 +659,11 @@ public class MasterScheduleService {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                doEvictAvailableSlotsByMaster(masterId);
-                doEvictWorkingDaysByMaster(masterId);
-                doEvictUsableScheduleByMaster(masterId);
-                doEvictServiceBookableByMaster(masterId);
+                cacheEvictor.evictByMasterPrefix(masterId, SCHEDULE_WRITE_CACHES);
                 if (salonId != null) {
                     salonCatalogCacheEvictor.evict(salonId);
                 }
             }
         });
-    }
-
-    private void doEvictAvailableSlotsByMaster(UUID masterId) {
-        evictByMasterPrefix("available-slots", masterId);
-    }
-
-    /**
-     * Mirrors {@link #doEvictAvailableSlotsByMaster}: {@code master-working-days} is keyed
-     * {@code {#masterId, #from, #to}}, so the same masterId-prefix Caffeine key scan applies.
-     */
-    private void doEvictWorkingDaysByMaster(UUID masterId) {
-        evictByMasterPrefix("master-working-days", masterId);
-    }
-
-    /**
-     * Mirrors {@link #doEvictWorkingDaysByMaster}: {@code master-usable-schedule} (backing
-     * {@link #hasUsableSchedule}) is keyed identically {@code {#masterId, #from, #to}}, so the same
-     * masterId-prefix Caffeine key scan applies.
-     */
-    private void doEvictUsableScheduleByMaster(UUID masterId) {
-        evictByMasterPrefix("master-usable-schedule", masterId);
-    }
-
-    /**
-     * Mirrors {@link #doEvictUsableScheduleByMaster}: {@code master-service-bookable} (backing
-     * {@code SlotCalculationService#hasBookableFutureSlot}) is keyed {@code {#masterId,
-     * #masterServiceId, #from, #to}} whose first element is the masterId, so the same masterId-prefix
-     * Caffeine key scan applies. A schedule change can flip the free-slot verdict for any of the
-     * master's services, so it must be evicted alongside {@code master-usable-schedule}.
-     */
-    private void doEvictServiceBookableByMaster(UUID masterId) {
-        evictByMasterPrefix("master-service-bookable", masterId);
-    }
-
-    /**
-     * {@code @Cacheable} with an explicit SpEL {@code key} (e.g. {@code key = "{#masterId, #from, #to}"})
-     * is never wrapped in a {@link org.springframework.cache.interceptor.SimpleKey} — that type is only
-     * produced by the default {@code SimpleKeyGenerator} when no {@code key} attribute is given. The
-     * {@code {...}} inline-list SpEL literal evaluates to a {@link List} (an {@code ArrayList}) at
-     * runtime, so eviction matches on the real key's runtime type — {@link List} — and compares its
-     * first element (the masterId) directly, rather than an {@code instanceof SimpleKey} check (which
-     * never matches these keys) or fragile {@code toString()} substring matching.
-     */
-    private void evictByMasterPrefix(String cacheName, UUID masterId) {
-        Cache springCache = cacheManager.getCache(cacheName);
-        if (springCache == null) {
-            return;
-        }
-        Object nativeCache = springCache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof List<?> keyParts
-                            && !keyParts.isEmpty()
-                            && masterId.equals(keyParts.get(0)));
-        } else {
-            springCache.clear();
-        }
     }
 }

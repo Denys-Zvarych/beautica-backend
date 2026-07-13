@@ -1,6 +1,7 @@
 package com.beautica.master.service;
 
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.EffectiveDaySource;
 import com.beautica.master.dto.MasterWorkingDayResponse;
@@ -13,7 +14,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.cache.CacheManager;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -60,14 +60,14 @@ class MasterScheduleServiceTest {
     private ScheduleMapper scheduleMapper;
 
     @Mock
-    private CacheManager cacheManager;
+    private MasterCachePrefixEvictor cacheEvictor;
 
     @Mock
     private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     private MasterScheduleService spyService() {
         return spy(new MasterScheduleService(weeklyScheduleRepository, scheduleExceptionRepository,
-                masterRepository, dateMath, authz, scheduleMapper, cacheManager, salonCatalogCacheEvictor));
+                masterRepository, dateMath, authz, scheduleMapper, cacheEvictor, salonCatalogCacheEvictor));
     }
 
     @Test

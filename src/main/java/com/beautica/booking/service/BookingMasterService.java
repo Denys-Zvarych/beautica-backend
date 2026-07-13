@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.BookableMasterResponse;
+import com.beautica.common.BookingWindow;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.salon.repository.SalonRepository;
@@ -31,7 +32,7 @@ import java.util.UUID;
  * <p><b>Bookability gate: the single shared free-slot verdict.</b> A candidate is "bookable" only
  * if {@link SlotCalculationService#hasBookableFutureSlot} — active assignment, active master, a
  * usable schedule in the booking window, AND ≥1 FREE FUTURE slot (existing PENDING/CONFIRMED
- * bookings subtracted; slot start ≥ now + {@link BookingStartsAtValidator#MIN_MINUTES_AHEAD}). This
+ * bookings subtracted; slot start ≥ now + {@link BookingWindow#MIN_MINUTES_AHEAD}). This
  * is the exact same verdict the salon catalogue uses
  * ({@code ServiceCatalogService#getSalonServiceCatalog} via
  * {@link SlotCalculationService#filterBookableAssignments}), computed from the exact same
@@ -54,7 +55,7 @@ import java.util.UUID;
  * master within the 60s TTL a cache hit, not a repeated DB resolution. No additional rate limiting
  * was added — Bucket4j is reserved for {@code /auth/*}.
  *
- * <p>The horizon mirrors {@link BookingStartsAtValidator#MAX_DAYS_AHEAD} (180 days) — the maximum
+ * <p>The horizon mirrors {@link BookingWindow#MAX_DAYS_AHEAD} (180 days) — the maximum
  * lead time a booking can ever be created for, so checking bookability further out would find slots a
  * client could never actually book against.
  */
@@ -115,7 +116,7 @@ public class BookingMasterService {
         }
 
         LocalDate from = LocalDate.now(kyivClock);
-        LocalDate to = from.plusDays(BookingStartsAtValidator.MAX_DAYS_AHEAD);
+        LocalDate to = from.plusDays(BookingWindow.MAX_DAYS_AHEAD);
 
         return candidates.stream()
                 // Pass the already JOIN-FETCHed assignment as `preloaded` so a cache MISS reuses it

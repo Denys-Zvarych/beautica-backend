@@ -3,12 +3,16 @@ package com.beautica.booking.service;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingTimeRange;
+import com.beautica.common.cache.MasterCachePrefixEvictor;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.TimeSlotCalculator;
 import com.beautica.common.util.TimeSlotCalculator.TimeRange;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.EffectiveDaySource;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.Master;
 import com.beautica.master.service.MasterScheduleService;
@@ -70,7 +74,10 @@ class SlotCalculationServiceTest {
     private TimeSlotCalculator timeSlotCalculator;
 
     @Mock
-    private org.springframework.cache.CacheManager cacheManager;
+    private ScheduleDateMath dateMath;
+
+    @Mock
+    private MasterCachePrefixEvictor cacheEvictor;
 
     private SlotCalculationService slotCalculationService;
 
@@ -80,8 +87,9 @@ class SlotCalculationServiceTest {
                 bookingRepository,
                 masterServiceRepository,
                 masterScheduleService,
+                dateMath,
                 timeSlotCalculator,
-                cacheManager,
+                cacheEvictor,
                 clock);
     }
 
@@ -141,7 +149,7 @@ class SlotCalculationServiceTest {
                 slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
 
         assertThat(result).isEmpty();
-        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -175,7 +183,7 @@ class SlotCalculationServiceTest {
                 slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
 
         assertThat(result).isEmpty();
-        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -248,7 +256,8 @@ class SlotCalculationServiceTest {
                 eq(LocalTime.of(17, 0)),
                 eq(Duration.ofMinutes(60)),
                 eq(Duration.ofMinutes(30)),
-                eq(List.of())))
+                eq(List.of()),
+                any()))
                 .thenReturn(calculatorResult);
 
         List<AvailableSlotResponse> result =
@@ -261,7 +270,8 @@ class SlotCalculationServiceTest {
                 eq(LocalTime.of(17, 0)),
                 eq(Duration.ofMinutes(60)),
                 eq(Duration.ofMinutes(30)),
-                eq(List.of()));
+                eq(List.of()),
+                any());
     }
 
     @Test
@@ -304,7 +314,8 @@ class SlotCalculationServiceTest {
                 eq(LocalTime.of(17, 0)),
                 eq(Duration.ofMinutes(45)),
                 eq(Duration.ofMinutes(30)),
-                eq(List.of())))
+                eq(List.of()),
+                any()))
                 .thenReturn(calculatorResult);
 
         List<AvailableSlotResponse> result =
@@ -318,7 +329,8 @@ class SlotCalculationServiceTest {
                 eq(LocalTime.of(17, 0)),
                 eq(Duration.ofMinutes(45)),
                 eq(Duration.ofMinutes(30)),
-                eq(List.of()));
+                eq(List.of()),
+                any());
     }
 
     @Test
@@ -354,7 +366,7 @@ class SlotCalculationServiceTest {
 
         // The duration guard fires before the schedule resolver is consulted.
         verifyNoInteractions(masterScheduleService);
-        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -375,9 +387,14 @@ class SlotCalculationServiceTest {
         verifyNoInteractions(masterScheduleService);
     }
 
+    /**
+     * Security LOW-1 — {@code GET /slots} shares {@code loadBookableAssignment} with the working-days
+     * projection, so the inactive case reports 404 here too (was 400 "master service is inactive"):
+     * unknown, foreign and deactivated must be indistinguishable to a caller holding a stale id.
+     */
     @Test
-    @DisplayName("should throwBusinessException when masterService is inactive")
-    void should_throwBusinessException_when_masterServiceIsInactive() {
+    @DisplayName("should throw NotFound (not 400) when masterService is inactive")
+    void should_throwNotFound_when_masterServiceIsInactive() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
         LocalDate tomorrow = LocalDate.of(2026, 5, 8);
@@ -389,8 +406,8 @@ class SlotCalculationServiceTest {
 
         assertThatThrownBy(() ->
                 slotCalculationService.getAvailableSlots(masterId, tomorrow, masterServiceId))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("inactive");
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("not found");
 
         verifyNoInteractions(masterScheduleService);
         verifyNoInteractions(timeSlotCalculator);
@@ -429,7 +446,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of(mockBooking));
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
 
         slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
@@ -437,7 +454,7 @@ class SlotCalculationServiceTest {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<TimeRange>> occupiedCaptor = ArgumentCaptor.forClass(List.class);
         verify(timeSlotCalculator).calculateAvailableSlots(
-                any(), any(), any(), any(), any(), occupiedCaptor.capture());
+                any(), any(), any(), any(), any(), occupiedCaptor.capture(), any());
 
         List<TimeRange> captured = occupiedCaptor.getValue();
         assertThat(captured).hasSize(1);
@@ -469,14 +486,14 @@ class SlotCalculationServiceTest {
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of());
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
 
         slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
 
         ArgumentCaptor<Duration> totalDurationCaptor = ArgumentCaptor.forClass(Duration.class);
         verify(timeSlotCalculator).calculateAvailableSlots(
-                any(), any(), any(), totalDurationCaptor.capture(), any(), any());
+                any(), any(), any(), totalDurationCaptor.capture(), any(), any(), any());
 
         assertThat(totalDurationCaptor.getValue()).isEqualTo(Duration.ofMinutes(90));
     }
@@ -518,7 +535,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(List.of(existingBooking));
         // Calculator returns empty — simulates the 10:00 slot being blocked because the
         // 90-min candidate window [10:00, 11:30] overlaps the occupied range [09:00, 10:00]
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
 
         List<AvailableSlotResponse> result =
@@ -529,7 +546,7 @@ class SlotCalculationServiceTest {
         // Confirm the calculator received totalDuration = 90 min (service 60 + buffer 30)
         ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
         verify(timeSlotCalculator).calculateAvailableSlots(
-                any(), any(), any(), durationCaptor.capture(), any(), any());
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
         assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(90));
     }
 
@@ -627,7 +644,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of());
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of(new TimeRange(slotStart, slotEnd)));
 
         List<AvailableSlotResponse> result =
@@ -676,7 +693,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
         when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
                 .thenReturn(List.of());
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
 
         slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
@@ -726,7 +743,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
         when(bookingRepository.findOverlappingByMaster(eq(masterId), any(), any()))
                 .thenReturn(List.of());
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of(new TimeRange(slotStart.toInstant(), slotEnd.toInstant())));
 
         // Act
@@ -734,7 +751,7 @@ class SlotCalculationServiceTest {
 
         // Assert — slots returned; calculator was invoked (master-type-agnostic path taken)
         assertThat(slots).hasSize(1);
-        verify(timeSlotCalculator).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
+        verify(timeSlotCalculator).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -769,7 +786,7 @@ class SlotCalculationServiceTest {
 
         // Assert — exception date → empty; calculator not called
         assertThat(slots).isEmpty();
-        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any());
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
     }
 
     // ── Perf #3 — occupied bookings bucketed by civil day (end-exclusive) ──────────────────────
@@ -797,11 +814,12 @@ class SlotCalculationServiceTest {
                 .build();
     }
 
-    private static Booking bookingRange(String startIso, String endIso) {
-        Booking b = mock(Booking.class);
-        when(b.getStartsAt()).thenReturn(OffsetDateTime.parse(startIso));
-        when(b.getEndsAt()).thenReturn(OffsetDateTime.parse(endIso));
-        return b;
+    /**
+     * A booked interval as the availability path now sees it: a two-column projection
+     * ({@link BookingTimeRange}), not a hydrated {@code Booking} entity (Perf MEDIUM-1).
+     */
+    private static BookingTimeRange bookingRange(String startIso, String endIso) {
+        return new BookingTimeRange(OffsetDateTime.parse(startIso), OffsetDateTime.parse(endIso));
     }
 
     @Test
@@ -813,17 +831,17 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
 
         // Booking [day1 22:00, day2 00:00) Kyiv — ends precisely at the day1→day2 civil midnight.
-        Booking midnightEnding = bookingRange("2026-05-10T22:00:00+03:00", "2026-05-11T00:00:00+03:00");
+        BookingTimeRange midnightEnding = bookingRange("2026-05-10T22:00:00+03:00", "2026-05-11T00:00:00+03:00");
 
         when(masterScheduleService.resolveEffectiveRange(masterId, day1, day2))
                 .thenReturn(List.of(
                         templateDay(day1, LocalTime.of(9, 0), LocalTime.of(17, 0)),
                         templateDay(day2, LocalTime.of(9, 0), LocalTime.of(17, 0))));
-        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
                 .thenReturn(List.of(midnightEnding));
         // No free slot on any day → the whole range is walked, so both days' buckets are handed to the calculator.
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
-                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(false);
 
         boolean bookable = slotCalculationService.hasBookableFutureSlot(msa, day1, day2);
 
@@ -835,7 +853,7 @@ class SlotCalculationServiceTest {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<TimeRange>> occCaptor = ArgumentCaptor.forClass(List.class);
         verify(timeSlotCalculator, org.mockito.Mockito.times(2))
-                .calculateAvailableSlots(dateCaptor.capture(), any(), any(), any(), any(), occCaptor.capture());
+                .hasAvailableSlot(dateCaptor.capture(), any(), any(), any(), any(), occCaptor.capture(), any());
 
         List<LocalDate> dates = dateCaptor.getAllValues();
         List<List<TimeRange>> occupied = occCaptor.getAllValues();
@@ -858,7 +876,7 @@ class SlotCalculationServiceTest {
         MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
 
         // Booking [day1 22:00, day3 02:00) Kyiv — spans day1, the interior day2, and day3.
-        Booking multiDay = bookingRange("2026-05-10T22:00:00+03:00", "2026-05-12T02:00:00+03:00");
+        BookingTimeRange multiDay = bookingRange("2026-05-10T22:00:00+03:00", "2026-05-12T02:00:00+03:00");
         TimeRange expected = new TimeRange(
                 OffsetDateTime.parse("2026-05-10T22:00:00+03:00").toInstant(),
                 OffsetDateTime.parse("2026-05-12T02:00:00+03:00").toInstant());
@@ -868,10 +886,10 @@ class SlotCalculationServiceTest {
                         templateDay(day1, LocalTime.of(9, 0), LocalTime.of(17, 0)),
                         templateDay(day2, LocalTime.of(9, 0), LocalTime.of(17, 0)),
                         templateDay(day3, LocalTime.of(9, 0), LocalTime.of(17, 0))));
-        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
                 .thenReturn(List.of(multiDay));
-        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any()))
-                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(false);
 
         slotCalculationService.hasBookableFutureSlot(msa, day1, day3);
 
@@ -879,7 +897,7 @@ class SlotCalculationServiceTest {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<TimeRange>> occCaptor = ArgumentCaptor.forClass(List.class);
         verify(timeSlotCalculator, org.mockito.Mockito.times(3))
-                .calculateAvailableSlots(dateCaptor.capture(), any(), any(), any(), any(), occCaptor.capture());
+                .hasAvailableSlot(dateCaptor.capture(), any(), any(), any(), any(), occCaptor.capture(), any());
 
         assertThat(dateCaptor.getAllValues())
                 .as("all three civil days are walked in order")
@@ -909,7 +927,7 @@ class SlotCalculationServiceTest {
 
         // No schedule in the window → verdict false, but the reload-avoidance is what this test locks.
         when(masterScheduleService.resolveEffectiveRange(masterId, from, to)).thenReturn(List.of());
-        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any())).thenReturn(List.of());
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any())).thenReturn(List.of());
 
         boolean bookable = slotCalculationService.hasBookableFutureSlot(
                 masterId, masterServiceId, preloaded, from, to);
@@ -932,11 +950,336 @@ class SlotCalculationServiceTest {
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(resolved));
         when(masterScheduleService.resolveEffectiveRange(masterId, from, to)).thenReturn(List.of());
-        when(bookingRepository.findActiveByMasterInRange(eq(masterId), any(), any())).thenReturn(List.of());
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any())).thenReturn(List.of());
 
         slotCalculationService.hasBookableFutureSlot(masterId, masterServiceId, null, from, to);
 
         verify(masterServiceRepository, org.mockito.Mockito.times(1))
                 .findByMasterIdAndIdWithGraph(masterId, masterServiceId);
+    }
+
+    // ── getBookableWorkingDays — availability-aware calendar day-gating ─────────────────────────
+    //
+    // The serviceId-PRESENT mode of GET /masters/{masterId}/working-days. Unlike
+    // MasterScheduleService#getClientWorkingDays (schedule shape only), a day is `working` ONLY when a
+    // free range that fits the service duration survives the day's bookings AND starts at/after the
+    // bookable cutoff AND falls inside the booking horizon. The free-range computation is the same
+    // TimeSlotCalculator call getAvailableSlots makes (mocked here; the end-to-end agreement with the
+    // slot list is pinned by the integration suite).
+    //
+    // Clock is fixed at 2026-05-07T00:00:00Z → today (Kyiv) = 2026-05-07, cutoff = 2026-05-07T00:15:00Z.
+
+    @Test
+    @DisplayName("should mark a day not-working when the service leaves no free range, and working when it does")
+    void should_reflectFreeRanges_when_projectingBookableDays() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate fullDay = LocalDate.of(2026, 5, 20);
+        LocalDate openDay = LocalDate.of(2026, 5, 21);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, fullDay, openDay))
+                .thenReturn(List.of(
+                        templateDay(fullDay, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(openDay, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        // fullDay: every candidate taken/below cutoff → no bookable slot. openDay: one survives.
+        when(timeSlotCalculator.hasAvailableSlot(eq(fullDay), any(), any(), any(), any(), any(), any()))
+                .thenReturn(false);
+        when(timeSlotCalculator.hasAvailableSlot(eq(openDay), any(), any(), any(), any(), any(), any()))
+                .thenReturn(true);
+
+        List<MasterWorkingDayResponse> days = slotCalculationService.getBookableWorkingDays(
+                masterId, fullDay, openDay, masterServiceId);
+
+        assertThat(days).containsExactly(
+                new MasterWorkingDayResponse(fullDay, false),
+                new MasterWorkingDayResponse(openDay, true));
+    }
+
+    /**
+     * The lead-time floor is now applied INSIDE the slot walk (Perf LOW-2 / MEDIUM-4): the service no
+     * longer materialises free ranges and post-filters them, it hands ONE cutoff to
+     * {@link TimeSlotCalculator#hasAvailableSlot} and trusts the boolean. This test therefore pins what
+     * the service still owns — that the cutoff it passes is exactly {@code now + MIN_MINUTES_AHEAD},
+     * derived from the injected clock, and that the SAME instant is used for every day of the projection.
+     * That a candidate below the cutoff is actually rejected is pinned in {@code TimeSlotCalculatorTest}.
+     */
+    @Test
+    @DisplayName("should pass one shared now+15min cutoff into the slot walk for every day of the projection")
+    void should_passSharedBookableCutoff_when_projectingBookableDays() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate day1 = LocalDate.of(2026, 5, 20);
+        LocalDate day2 = LocalDate.of(2026, 5, 21);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, day1, day2))
+                .thenReturn(List.of(
+                        templateDay(day1, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(day2, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(false);
+
+        slotCalculationService.getBookableWorkingDays(masterId, day1, day2, masterServiceId);
+
+        ArgumentCaptor<Instant> cutoffCaptor = ArgumentCaptor.forClass(Instant.class);
+        verify(timeSlotCalculator, org.mockito.Mockito.times(2))
+                .hasAvailableSlot(any(), any(), any(), any(), any(), any(), cutoffCaptor.capture());
+
+        assertThat(cutoffCaptor.getAllValues())
+                .as("one cutoff — the fixed clock's now + MIN_MINUTES_AHEAD — shared by every walked day")
+                .containsOnly(Instant.parse("2026-05-07T00:15:00Z"));
+    }
+
+    @Test
+    @DisplayName("should mark a day not-working when it lies beyond the 180-day booking horizon")
+    void should_markNotWorking_when_dayIsBeyondBookingHorizon() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate lastBookable = LocalDate.of(2026, 5, 7).plusDays(180);
+        LocalDate pastHorizon = lastBookable.plusDays(1);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, lastBookable, pastHorizon))
+                .thenReturn(List.of(
+                        templateDay(lastBookable, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(pastHorizon, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        // Both days would be bookable — only the horizon separates them.
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(true);
+
+        List<MasterWorkingDayResponse> days = slotCalculationService.getBookableWorkingDays(
+                masterId, lastBookable, pastHorizon, masterServiceId);
+
+        assertThat(days).containsExactly(
+                new MasterWorkingDayResponse(lastBookable, true),
+                new MasterWorkingDayResponse(pastHorizon, false));
+        verify(timeSlotCalculator, org.mockito.Mockito.times(1))
+                .hasAvailableSlot(eq(lastBookable), any(), any(), any(), any(), any(), any());
+        verify(timeSlotCalculator, never())
+                .hasAvailableSlot(eq(pastHorizon), any(), any(), any(), any(), any(), any());
+    }
+
+    /**
+     * Perf HIGH-2 — a past date is answered by date comparison alone. Before the fast path the
+     * {@code &&} short-circuited only the FUTURE side (the horizon check), so a past date fell straight
+     * into the full slot walk and generated every candidate for the day just to discover each one sits
+     * below the cutoff. TODAY must still walk: it can be bookable later in the day.
+     */
+    @Test
+    @DisplayName("should mark a past day not-working WITHOUT walking its slots (past-date fast path)")
+    void should_markPastDayNotWorking_withoutWalkingSlots() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate yesterday = LocalDate.of(2026, 5, 6);
+        LocalDate today = LocalDate.of(2026, 5, 7);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, yesterday, today))
+                .thenReturn(List.of(
+                        templateDay(yesterday, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(today, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(true);
+
+        List<MasterWorkingDayResponse> days = slotCalculationService.getBookableWorkingDays(
+                masterId, yesterday, today, masterServiceId);
+
+        assertThat(days).containsExactly(
+                new MasterWorkingDayResponse(yesterday, false),
+                new MasterWorkingDayResponse(today, true));
+        verify(timeSlotCalculator, never())
+                .hasAvailableSlot(eq(yesterday), any(), any(), any(), any(), any(), any());
+        verify(timeSlotCalculator, org.mockito.Mockito.times(1))
+                .hasAvailableSlot(eq(today), any(), any(), any(), any(), any(), any());
+    }
+
+    // ── Window cap + guard ordering (Perf HIGH-1 / LOW-1) ───────────────────────────────────────
+
+    @Test
+    @DisplayName("should reject a serviceId-mode window wider than 63 inclusive dates (400, no DB hit)")
+    void should_throwBusinessException_when_serviceIdWindowExceedsCap() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 10);
+        LocalDate to = from.plusDays(63);
+
+        assertThatThrownBy(() -> slotCalculationService.getBookableWorkingDays(
+                masterId, from, to, masterServiceId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("63");
+
+        verifyNoInteractions(masterServiceRepository, masterScheduleService, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("should accept a serviceId-mode window of exactly 63 inclusive dates (the cap boundary)")
+    void should_accept_when_serviceIdWindowIsExactlyAtCap() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 10);
+        LocalDate to = from.plusDays(62);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, from, to)).thenReturn(List.of());
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+
+        assertThatCode(() -> slotCalculationService.getBookableWorkingDays(
+                masterId, from, to, masterServiceId))
+                .doesNotThrowAnyException();
+    }
+
+    /**
+     * Perf LOW-1 — the range guard is pure in-memory arithmetic over the two caller-supplied dates, so it
+     * runs BEFORE the assignment load: a malformed range must not cost a DB round-trip. It leaks nothing
+     * about the master (its verdict is identical whether or not the master/service exists), and the
+     * assignment is still resolved before any SCHEDULE read — so the working-hours oracle stays closed.
+     */
+    @Test
+    @DisplayName("should validate the date range BEFORE loading the assignment (no DB round-trip on a bad range)")
+    void should_validateRange_beforeAnyDbCall() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 10);
+        LocalDate to = LocalDate.of(2026, 5, 12);
+        org.mockito.Mockito.doThrow(new BusinessException("Schedule range start must not be after its end"))
+                .when(dateMath).assertExpandable(from, to);
+
+        assertThatThrownBy(() -> slotCalculationService.getBookableWorkingDays(
+                masterId, from, to, masterServiceId))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(masterServiceRepository, masterScheduleService, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("should load the window's bookings in ONE query when projecting a multi-day range (no N+1)")
+    void should_loadBookingsOnce_when_projectingMultiDayRange() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 11);
+        LocalDate to = LocalDate.of(2026, 5, 13);
+        MasterServiceAssignment msa = activeAssignment(masterId, 60, 0);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, from, to))
+                .thenReturn(List.of(
+                        templateDay(from, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(from.plusDays(1), LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                        templateDay(to, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(false);
+
+        slotCalculationService.getBookableWorkingDays(masterId, from, to, masterServiceId);
+
+        verify(bookingRepository, org.mockito.Mockito.times(1))
+                .findActiveTimeRangesByMasterInRange(eq(masterId), any(), any());
+    }
+
+    @Test
+    @DisplayName("should mark every day not-working when the master is inactive")
+    void should_markAllDaysNotWorking_when_masterIsInactive() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 20);
+        Master inactiveMaster = Master.builder().id(masterId).isActive(false).build();
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .master(inactiveMaster)
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
+                .thenReturn(List.of(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+
+        List<MasterWorkingDayResponse> days = slotCalculationService.getBookableWorkingDays(
+                masterId, date, date, masterServiceId);
+
+        assertThat(days).containsExactly(new MasterWorkingDayResponse(date, false));
+        verify(timeSlotCalculator, never()).hasAvailableSlot(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("should throw NotFound when the serviceId does not belong to the master")
+    void should_throwNotFound_when_serviceDoesNotBelongToMaster() {
+        UUID masterId = UUID.randomUUID();
+        UUID foreignServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 20);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, foreignServiceId))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> slotCalculationService.getBookableWorkingDays(
+                masterId, date, date, foreignServiceId))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    /**
+     * Security LOW-1 — a DEACTIVATED assignment must be indistinguishable from an unknown / foreign one:
+     * all three answer 404. The previous 400 ("master service is inactive") handed a caller holding a
+     * stale id a two-valued oracle — 400 meant "soft-deleted but still on THIS master", 404 meant
+     * "removed or never existed". {@link NotFoundException} is a subclass-independent assertion here:
+     * {@code BusinessException} would NOT satisfy it.
+     */
+    @Test
+    @DisplayName("should throw NotFound (not 400) when the master service assignment is inactive")
+    void should_throwNotFound_when_assignmentIsInactive() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 20);
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+        MasterServiceAssignment inactive = MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .master(ACTIVE_MASTER)
+                .isActive(false)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(inactive));
+
+        assertThatThrownBy(() -> slotCalculationService.getBookableWorkingDays(
+                masterId, date, date, masterServiceId))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(masterScheduleService);
     }
 }

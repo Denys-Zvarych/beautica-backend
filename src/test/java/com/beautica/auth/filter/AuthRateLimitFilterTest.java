@@ -1927,4 +1927,197 @@ class AuthRateLimitFilterTest {
             verifyNoInteractions(otpSendBuckets);
         }
     }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("GET /api/v1/masters/{id}/slots + /working-days — master-availability reads")
+    class MasterAvailabilityReads {
+
+        /**
+         * Perf HIGH-1(b) / security — {@code /working-days} was previously UNTHROTTLED: nothing in this
+         * filter matched {@code /api/v1/masters/**} except the {@code /slots} suffix, and the booking-write
+         * bucket only covers {@code /api/v1/bookings}. Its {@code master-bookable-days} cache is keyed on
+         * the RAW client {@code from}/{@code to}, so an authenticated caller rotating {@code from} by a day
+         * could force unbounded cache misses (4 DB queries + a slot walk each) and evict every legitimate
+         * entry. Both availability reads now share the {@code slotsBuckets} per-IP bucket.
+         */
+        @Test
+        @DisplayName("GET /working-days consumes the shared slots bucket")
+        void should_consumeSlotsBucket_when_workingDaysRequested() throws Exception {
+            when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/working-days");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verify(slotsBuckets, times(1)).get(REMOTE_ADDR);
+            assertThat(chain.getRequest())
+                    .as("an allowed working-days read is forwarded down the chain")
+                    .isNotNull();
+        }
+
+        @Test
+        @DisplayName("GET /working-days returns 429 when the bucket is exhausted")
+        void should_return429_when_workingDaysBucketExhausted() throws Exception {
+            when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/working-days");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            assertThat(response.getStatus()).isEqualTo(429);
+            assertThat(chain.getRequest())
+                    .as("a throttled working-days read must NOT reach the controller")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("GET /slots still consumes the same bucket (unchanged)")
+        void should_consumeSlotsBucket_when_slotsRequested() throws Exception {
+            when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/slots");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verify(slotsBuckets, times(1)).get(REMOTE_ADDR);
+        }
+
+        @Test
+        @DisplayName("an unrelated GET under /api/v1/masters/ is NOT throttled by the availability bucket")
+        void should_notConsumeSlotsBucket_when_otherMasterReadRequested() throws Exception {
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/effective-schedule");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verifyNoInteractions(slotsBuckets);
+            assertThat(chain.getRequest()).isNotNull();
+        }
+    }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("Path matching — decoded + normalized, not raw getRequestURI()")
+    class PercentEncodingAndNormalizationBypass {
+
+        /**
+         * SEC — the rule matcher must run on the DECODED + NORMALIZED path (as Spring MVC routes)
+         * rather than the raw, percent-encoded {@code getRequestURI()}. Otherwise an equivalent
+         * encoding that MVC still routes to the throttled handler slips past the rule. These tests
+         * pin every threat class the fix closes: percent-encoding of a rule literal, the pre-existing
+         * login brute-force limiter, {@code .} and {@code //} normalization, and no over-matching.
+         */
+        @Test
+        @DisplayName("GET /working%2ddays is throttled identically to /working-days")
+        void should_throttle_when_workingDays_path_is_percent_encoded() throws Exception {
+            when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/working%2ddays");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verify(slotsBuckets, times(1)).get(REMOTE_ADDR);
+            assertThat(response.getStatus())
+                    .as("percent-encoded /working%2ddays must hit the same slots bucket and be throttled")
+                    .isEqualTo(429);
+            assertThat(chain.getRequest())
+                    .as("a throttled encoded working-days read must NOT reach the controller")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("POST /api/v1/auth/logi%6e hits the login bucket (brute-force limiter cannot be bypassed)")
+        void should_throttle_when_login_path_is_percent_encoded() throws Exception {
+            when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request = postRequest("/api/v1/auth/logi%6e");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verify(loginBuckets, times(1)).get(REMOTE_ADDR);
+            assertThat(response.getStatus())
+                    .as("percent-encoded /logi%6e must hit the login bucket and be throttled")
+                    .isEqualTo(429);
+            assertThat(chain.getRequest())
+                    .as("a throttled encoded login must NOT reach the controller")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("POST /api/v1/auth/./login normalizes to the login bucket")
+        void should_throttle_when_login_path_has_dot_segment() throws Exception {
+            when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request = postRequest("/api/v1/auth/./login");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verify(loginBuckets, times(1)).get(REMOTE_ADDR);
+            assertThat(response.getStatus())
+                    .as("dot-segment /auth/./login must normalize to /auth/login and be throttled")
+                    .isEqualTo(429);
+            assertThat(chain.getRequest())
+                    .as("a throttled normalized login must NOT reach the controller")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("POST /api/v1//auth/login collapses the double slash to the login bucket")
+        void should_throttle_when_login_path_has_double_slash() throws Exception {
+            when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request = postRequest("/api/v1//auth/login");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verify(loginBuckets, times(1)).get(REMOTE_ADDR);
+            assertThat(response.getStatus())
+                    .as("double-slash /api/v1//auth/login must collapse to /api/v1/auth/login and be throttled")
+                    .isEqualTo(429);
+            assertThat(chain.getRequest())
+                    .as("a throttled collapsed login must NOT reach the controller")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("no over-matching — an encoded path that decodes to something unrelated is NOT throttled")
+        void should_notThrottle_when_encodedPathDecodesToUnrelatedRoute() throws Exception {
+            // /serv%69ces decodes to /services — must NOT be caught by the /slots or /working-days
+            // availability rule (guards against the fix over-matching after decoding).
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/serv%69ces");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verifyNoInteractions(slotsBuckets);
+            verifyNoInteractions(loginBuckets);
+            assertThat(chain.getRequest())
+                    .as("an unrelated decoded path must pass through untouched")
+                    .isNotNull();
+        }
+    }
 }
