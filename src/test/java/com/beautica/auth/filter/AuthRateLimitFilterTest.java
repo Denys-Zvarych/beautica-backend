@@ -2103,6 +2103,66 @@ class AuthRateLimitFilterTest {
         }
 
         @Test
+        @DisplayName("GET /working-days;jsessionid=… strips the matrix segment and still hits the slots bucket")
+        void should_throttle_when_workingDays_carriesMatrixParameter() throws Exception {
+            // UrlPathHelper.removeSemicolonContent = true strips ;matrix content before matching, so a
+            // container that surfaces a ;jsessionid on the last segment cannot smuggle the request past
+            // the availability throttle (raw getRequestURI() would end in ";jsessionid=…", not
+            // "/working-days", and would have fallen through unthrottled).
+            when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID()
+                    + "/working-days;jsessionid=0123456789ABCDEF");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verify(slotsBuckets, times(1)).get(REMOTE_ADDR);
+            assertThat(response.getStatus())
+                    .as("the matrix-parameter suffix is stripped, so /working-days still matches and throttles")
+                    .isEqualTo(429);
+            assertThat(chain.getRequest())
+                    .as("a throttled matrix-decorated working-days read must NOT reach the controller")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("two distinct IPs get independent slots buckets for /working-days (per-IP capacity)")
+        void should_useIndependentSlotsBuckets_when_workingDaysFromTwoIps() throws Exception {
+            // The availability throttle is per-IP: one IP exhausting its slots bucket must not throttle
+            // another IP's booking-calendar reads.
+            String ipA = "11.11.11.11";
+            String ipB = "22.22.22.22";
+            Bucket bucketA = org.mockito.Mockito.mock(Bucket.class);
+            Bucket bucketB = org.mockito.Mockito.mock(Bucket.class);
+            when(slotsBuckets.get(ipA)).thenReturn(bucketA);
+            when(slotsBuckets.get(ipB)).thenReturn(bucketB);
+            when(bucketA.tryConsume(1)).thenReturn(false); // A exhausted
+            when(bucketB.tryConsume(1)).thenReturn(true);  // B fresh
+
+            var reqA = new MockHttpServletRequest("GET",
+                    "/api/v1/masters/" + java.util.UUID.randomUUID() + "/working-days");
+            reqA.setRemoteAddr(ipA);
+            var respA = new MockHttpServletResponse();
+            var chainA = new MockFilterChain();
+            doFilter(reqA, respA, chainA);
+
+            var reqB = new MockHttpServletRequest("GET",
+                    "/api/v1/masters/" + java.util.UUID.randomUUID() + "/working-days");
+            reqB.setRemoteAddr(ipB);
+            var respB = new MockHttpServletResponse();
+            var chainB = new MockFilterChain();
+            doFilter(reqB, respB, chainB);
+
+            assertThat(respA.getStatus()).as("IP A's exhausted slots bucket → 429").isEqualTo(429);
+            assertThat(respB.getStatus()).as("IP B has its own fresh slots bucket → 200").isEqualTo(200);
+            verify(slotsBuckets).get(ipA);
+            verify(slotsBuckets).get(ipB);
+        }
+
+        @Test
         @DisplayName("no over-matching — an encoded path that decodes to something unrelated is NOT throttled")
         void should_notThrottle_when_encodedPathDecodesToUnrelatedRoute() throws Exception {
             // /serv%69ces decodes to /services — must NOT be caught by the /slots or /working-days

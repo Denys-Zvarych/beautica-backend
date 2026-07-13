@@ -5,6 +5,9 @@ import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.master.dto.MasterWorkingDayResponse;
+import com.beautica.master.dto.ScheduleOverrideRequest;
+import com.beautica.master.dto.WorkIntervalDto;
+import com.beautica.master.entity.ScheduleExceptionKind;
 import com.beautica.master.service.MasterScheduleService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -264,6 +267,146 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         assertThat(slotCalculationService.getBookableWorkingDays(m.masterId(), day, day, svc))
                 .as("the availability-aware mode subtracts the booking → false")
                 .containsExactly(new MasterWorkingDayResponse(day, false));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 6 — duration-fit is an EXACT boundary: a service filling the free range fits; +1 min does not
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("case 6 — a 120-min service on a 16:00–18:00 interval fits EXACTLY (day TRUE, one slot); a 121-min service does not (day FALSE, empty)")
+    void should_gateOnExactDurationFit_atTheBoundary() {
+        LocalDate day = TODAY.plusDays(7); // future so the cutoff is not the deciding factor
+
+        Master m = seedIndependentMaster();
+        UUID svc120 = addService(m, 120, 0);
+        UUID svc121 = addService(m, 121, 0);
+        // A single 2-hour interval, no bookings — the free range is exactly 16:00–18:00.
+        seedInterval(m.masterId(), day, day, day.getDayOfWeek().getValue(),
+                LocalTime.of(16, 0), LocalTime.of(18, 0));
+
+        // 120 min: 16:00 + 2h = 18:00 == interval end → fits exactly, once.
+        assertThat(bookableDay(m.masterId(), day, svc120))
+                .as("a 120-min service exactly fills the 2h interval → day bookable")
+                .isTrue();
+        assertThat(slotStarts(m.masterId(), day, svc120))
+                .as("/slots agrees — the one 16:00 start that exactly fits")
+                .containsExactly(LocalTime.of(16, 0));
+
+        // 121 min: 16:00 + 2h1m = 18:01 > 18:00 → does not fit.
+        assertThat(bookableDay(m.masterId(), day, svc121))
+                .as("one minute longer than the interval cannot fit → day unavailable")
+                .isFalse();
+        assertThat(slotStarts(m.masterId(), day, svc121))
+                .as("/slots agrees — nothing fits")
+                .isEmpty();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7 — CUSTOM_HOURS multi-interval day: only the interval long enough fits; override wins
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("case 7 — CUSTOM_HOURS override [09:00–11:00 + 14:00–18:00]; a 3h service fits ONLY the afternoon (day TRUE, slots only afternoon)")
+    void should_reflectCustomHoursOverride_andGateMultiIntervalDayOnDurationFit() {
+        LocalDate day = TODAY.plusDays(9);
+
+        Master m = seedIndependentMaster();
+        UUID svc3h = addService(m, 180, 0);
+        // No weekly template — a pure CUSTOM_HOURS override with two disjoint intervals. The availability
+        // mode must reflect the OVERRIDE (not a template, which does not exist), and gate on duration-fit
+        // across the two intervals: 09:00–11:00 (2h) cannot hold 3h; 14:00–18:00 (4h) can.
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        List.of(new WorkIntervalDto(LocalTime.of(9, 0), LocalTime.of(11, 0)),
+                                new WorkIntervalDto(LocalTime.of(14, 0), LocalTime.of(18, 0)))));
+
+        assertThat(bookableDay(m.masterId(), day, svc3h))
+                .as("a 3h service fits the afternoon interval of the override → day bookable")
+                .isTrue();
+        assertThat(slotStarts(m.masterId(), day, svc3h))
+                .as("/slots agrees — no morning start (2h interval too short); only 14:00/14:30/15:00 in "
+                        + "the afternoon (last 3h slot ends 18:00)")
+                .containsExactly(LocalTime.of(14, 0), LocalTime.of(14, 30), LocalTime.of(15, 0));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 8 — DAY_OFF override closes the date in the availability mode too (day FALSE, empty)
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("case 8 — a DAY_OFF override over a templated future day → serviceId-mode day FALSE and /slots EMPTY")
+    void should_closeDay_when_dayOffOverridesTemplate() {
+        LocalDate day = TODAY.plusDays(8);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        // A template that WOULD make the day working…
+        seedInterval(m.masterId(), day, day, day.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(17, 0));
+        // …then a DAY_OFF override that closes it.
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.DAY_OFF, null));
+
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("a DAY_OFF override beats the template → the availability-aware day is non-working")
+                .isFalse();
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("/slots agrees — a closed day offers nothing")
+                .isEmpty();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 9 — inactive MASTER: every day reports FALSE (not an error), through the real pipeline
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("case 9 — a deactivated master reports serviceId-mode day FALSE and /slots EMPTY for a would-be working day (not a 404)")
+    void should_reportAllDaysFalse_when_masterIsInactive() {
+        LocalDate day = TODAY.plusDays(7);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        seedInterval(m.masterId(), day, day, day.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(17, 0));
+        // Deactivate the master out-of-band (deactivateOwnerMaster leaves master_services intact).
+        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", m.masterId());
+
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("an inactive master exposes no bookable days — false, never an exception")
+                .isFalse();
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("/slots agrees — an inactive master offers no slots")
+                .isEmpty();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 10 — the two endpoints agree across a Europe/Kyiv DST fall-back date within the horizon
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("case 10 — on the 2026-10-25 Kyiv DST fall-back day the serviceId-mode day matches /slots (projection ⇔ slots across the transition)")
+    void should_agreeAcrossDstFallBackDay() {
+        // 2026-10-25 is the Kyiv autumn fall-back (25-hour civil day) and lies inside [today, today+180].
+        LocalDate dstDay = LocalDate.of(2026, 10, 25);
+        assertThat(dstDay).as("guard: the DST day is within the 180-day horizon from the frozen today")
+                .isAfterOrEqualTo(TODAY).isBeforeOrEqualTo(TODAY.plusDays(180));
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        seedInterval(m.masterId(), dstDay, dstDay, dstDay.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(17, 0));
+
+        boolean working = bookableDay(m.masterId(), dstDay, svc);
+        List<LocalTime> slots = slotStarts(m.masterId(), dstDay, svc);
+
+        assertThat(working)
+                .as("a full daytime schedule on the DST-transition day is bookable on both endpoints")
+                .isTrue();
+        assertThat(slots).as("/slots offers the day's starts").isNotEmpty();
+        assertThat(working)
+                .as("agreement invariant holds across the DST boundary: working ⇔ ≥1 bookable slot")
+                .isEqualTo(!slots.isEmpty());
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════

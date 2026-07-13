@@ -204,6 +204,49 @@ class TimeSlotCalculatorTest {
     }
 
     @Test
+    @DisplayName("service duration EXACTLY equal to the work window yields exactly one slot (boundary: fits)")
+    void should_returnSingleSlot_when_serviceDurationExactlyFillsWindow() {
+        // 05:00Z = 08:00 Kyiv (+03); cutoff = 08:15, well before the 09:00 window start.
+        // Window 09:00–10:00 (60 min), service 60 min: the sole candidate 09:00→10:00 ends at
+        // workEnd exactly (candidateEnd.isAfter(workEnd) is false → kept). One slot, no more.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:00:00Z"));
+
+        List<TimeRange> result = calculator.calculateAvailableSlots(
+                TEST_DATE,
+                LocalTime.of(9, 0),
+                LocalTime.of(10, 0),
+                Duration.ofHours(1),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("a service that exactly fills the window fits precisely once, starting at the window open")
+                .containsExactly(LocalTime.of(9, 0));
+    }
+
+    @Test
+    @DisplayName("service duration one minute longer than the work window yields no slot (boundary: does not fit)")
+    void should_returnEmpty_when_serviceDurationOneMinuteLongerThanWindow() {
+        // Same window 09:00–10:00 (60 min); service 61 min: 09:00→10:01 ends AFTER workEnd → rejected.
+        // Pins the off-by-one boundary against the exact-fit case above.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:00:00Z"));
+
+        List<TimeRange> result = calculator.calculateAvailableSlots(
+                TEST_DATE,
+                LocalTime.of(9, 0),
+                LocalTime.of(10, 0),
+                Duration.ofMinutes(61),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        assertThat(result)
+                .as("a service one minute longer than the window cannot fit — no slot")
+                .isEmpty();
+    }
+
+    @Test
     @DisplayName("returns empty list when service duration exceeds the work window")
     void should_returnEmpty_when_serviceDurationLongerThanWorkWindow() {
         calculator = new TimeSlotCalculator(fixedClock("2026-05-07T06:00:00Z"));
