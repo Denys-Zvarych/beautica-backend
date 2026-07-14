@@ -1,5 +1,6 @@
 package com.beautica.common.util;
 
+import com.beautica.common.BookingWindow;
 import com.beautica.common.TimeZones;
 import org.springframework.stereotype.Component;
 
@@ -24,6 +25,25 @@ public class TimeSlotCalculator {
     public record TimeRange(Instant start, Instant end) {}
 
     /**
+     * The earliest instant a generated slot may start ({@code now + BookingWindow.MIN_MINUTES_AHEAD}) —
+     * the SAME floor {@code BookingStartsAtValidator} enforces on booking create and
+     * {@code SlotCalculationService} applies to its day-availability projection. Exposed so callers that
+     * post-filter generated slots key off one cutoff rather than re-deriving it.
+     */
+    public Instant bookableCutoff() {
+        return BookingWindow.bookableCutoff(clock);
+    }
+
+    /**
+     * Materialises EVERY bookable slot in the window, using the calculator's own
+     * {@link #bookableCutoff()}. Kept for callers that genuinely need the whole list (the slot list
+     * behind {@code GET /masters/{id}/slots}).
+     *
+     * <p>Prefer {@link #calculateAvailableSlots(LocalDate, LocalTime, LocalTime, Duration, Duration,
+     * List, Instant)} whenever the caller already holds the request's cutoff — see
+     * {@link com.beautica.common.BookingWindow#bookableCutoff(Instant)} for why ONE cutoff must be
+     * threaded through a request rather than re-derived per interval.
+     *
      * @param occupied pre-filtered to the target {@code date}; ranges outside the date window
      *                 are silently ignored but waste comparison cycles — callers must narrow the
      *                 query window to [dayStart, dayEnd) before invoking this method.
@@ -36,9 +56,76 @@ public class TimeSlotCalculator {
             Duration step,
             List<TimeRange> occupied
     ) {
+        // The lead-time floor, NOT a bare "now". A candidate that merely starts after now (e.g. 5 minutes
+        // out) is rejected by BookingStartsAtValidator on create (MIN_MINUTES_AHEAD = 15), so listing it
+        // as available offered a slot that could only 400. Both paths now derive their floor from
+        // BookingWindow.bookableCutoff — see BookingWindow for the three call sites that must agree.
+        return calculateAvailableSlots(date, workStart, workEnd, serviceDuration, step, occupied,
+                bookableCutoff());
+    }
+
+    /**
+     * {@link #calculateAvailableSlots(LocalDate, LocalTime, LocalTime, Duration, Duration, List)} with an
+     * explicit, caller-supplied {@code cutoff} (Perf LOW-2) — the whole request then shares ONE
+     * {@link Instant} instead of each interval re-reading the clock and deriving a slightly different
+     * floor.
+     */
+    public List<TimeRange> calculateAvailableSlots(
+            LocalDate date,
+            LocalTime workStart,
+            LocalTime workEnd,
+            Duration serviceDuration,
+            Duration step,
+            List<TimeRange> occupied,
+            Instant cutoff
+    ) {
+        return walk(date, workStart, workEnd, serviceDuration, step, occupied, cutoff, false);
+    }
+
+    /**
+     * <b>Existence-only</b> counterpart of {@link #calculateAvailableSlots} (Perf MEDIUM-4): {@code true}
+     * as soon as ONE candidate slot in the window is bookable (starts at/after {@code cutoff} and
+     * overlaps no occupied range) — the walk returns at the first hit instead of materialising every
+     * remaining candidate.
+     *
+     * <p>The day-availability callers ({@code SlotCalculationService#isDayBookable}, which backs both the
+     * calendar day projection and the catalogue/bookable-masters gate) only ever ask "is there one?", yet
+     * previously built the full per-day slot list (up to 6 intervals × ~48 candidates) and threw all but
+     * the first away. Same predicate, same cutoff, same overlap test as the list variant — only the
+     * termination differs, so the two can never disagree.
+     */
+    public boolean hasAvailableSlot(
+            LocalDate date,
+            LocalTime workStart,
+            LocalTime workEnd,
+            Duration serviceDuration,
+            Duration step,
+            List<TimeRange> occupied,
+            Instant cutoff
+    ) {
+        return !walk(date, workStart, workEnd, serviceDuration, step, occupied, cutoff, true).isEmpty();
+    }
+
+    /**
+     * The single slot-generation walk shared by {@link #calculateAvailableSlots} and
+     * {@link #hasAvailableSlot}. {@code stopAtFirst} makes it short-circuit; everything else — argument
+     * validation, the DST-correct window resolution, the cutoff floor and the overlap test — is identical
+     * by construction, so the list and the existence answer can never drift apart.
+     */
+    private List<TimeRange> walk(
+            LocalDate date,
+            LocalTime workStart,
+            LocalTime workEnd,
+            Duration serviceDuration,
+            Duration step,
+            List<TimeRange> occupied,
+            Instant cutoff,
+            boolean stopAtFirst
+    ) {
         Objects.requireNonNull(date, "date must not be null");
         Objects.requireNonNull(workStart, "workStart must not be null");
         Objects.requireNonNull(workEnd, "workEnd must not be null");
+        Objects.requireNonNull(cutoff, "cutoff must not be null");
 
         if (serviceDuration.isNegative() || serviceDuration.isZero())
             throw new IllegalArgumentException("serviceDuration must be positive");
@@ -71,8 +158,6 @@ public class TimeSlotCalculator {
             workEndInst = date.plusDays(1).atTime(workEnd).atZone(TimeZones.KYIV).toInstant();
         }
 
-        Instant nowInst = clock.instant();
-
         List<TimeRange> result = new ArrayList<>();
         Instant t = workStartInst;
 
@@ -80,8 +165,11 @@ public class TimeSlotCalculator {
             Instant candidateEnd = t.plus(serviceDuration);
             TimeRange candidate = new TimeRange(t, candidateEnd);
 
-            if (candidate.start().isAfter(nowInst) && !overlapsAny(candidate, safeOccupied)) {
+            if (!candidate.start().isBefore(cutoff) && !overlapsAny(candidate, safeOccupied)) {
                 result.add(candidate);
+                if (stopAtFirst) {
+                    return result;
+                }
             }
 
             t = t.plus(step);

@@ -40,8 +40,9 @@ class TimeSlotCalculatorTest {
     @Test
     @DisplayName("returns all slots when there are no existing bookings")
     void should_returnAllSlots_when_noExistingBookings() {
-        // 05:59Z = 08:59 Kyiv (+03) — strictly before the 09:00 first slot so isAfter passes
-        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:59:00Z"));
+        // 05:45Z = 08:45 Kyiv (+03). The bookable cutoff is now + BookingWindow.MIN_MINUTES_AHEAD (15),
+        // i.e. exactly 09:00 Kyiv — so the 09:00 slot is at (not before) the cutoff and is kept.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:45:00Z"));
 
         List<TimeRange> result = calculator.calculateAvailableSlots(
                 TEST_DATE,
@@ -67,8 +68,9 @@ class TimeSlotCalculatorTest {
     @Test
     @DisplayName("excludes slots that overlap an existing booking")
     void should_excludeSlotOverlappingBooking_when_bookingExists() {
-        // 05:59Z = 08:59 Kyiv (+03) — strictly before 09:00 so the first slot is generated
-        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:59:00Z"));
+        // 05:45Z = 08:45 Kyiv (+03) — the 15-min bookable cutoff lands exactly on 09:00, so the first
+        // slot is still generated and only the booking overlap is under test here.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:45:00Z"));
 
         TimeRange booking = kyivRange(TEST_DATE, LocalTime.of(10, 0), LocalTime.of(11, 0));
 
@@ -202,6 +204,49 @@ class TimeSlotCalculatorTest {
     }
 
     @Test
+    @DisplayName("service duration EXACTLY equal to the work window yields exactly one slot (boundary: fits)")
+    void should_returnSingleSlot_when_serviceDurationExactlyFillsWindow() {
+        // 05:00Z = 08:00 Kyiv (+03); cutoff = 08:15, well before the 09:00 window start.
+        // Window 09:00–10:00 (60 min), service 60 min: the sole candidate 09:00→10:00 ends at
+        // workEnd exactly (candidateEnd.isAfter(workEnd) is false → kept). One slot, no more.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:00:00Z"));
+
+        List<TimeRange> result = calculator.calculateAvailableSlots(
+                TEST_DATE,
+                LocalTime.of(9, 0),
+                LocalTime.of(10, 0),
+                Duration.ofHours(1),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("a service that exactly fills the window fits precisely once, starting at the window open")
+                .containsExactly(LocalTime.of(9, 0));
+    }
+
+    @Test
+    @DisplayName("service duration one minute longer than the work window yields no slot (boundary: does not fit)")
+    void should_returnEmpty_when_serviceDurationOneMinuteLongerThanWindow() {
+        // Same window 09:00–10:00 (60 min); service 61 min: 09:00→10:01 ends AFTER workEnd → rejected.
+        // Pins the off-by-one boundary against the exact-fit case above.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:00:00Z"));
+
+        List<TimeRange> result = calculator.calculateAvailableSlots(
+                TEST_DATE,
+                LocalTime.of(9, 0),
+                LocalTime.of(10, 0),
+                Duration.ofMinutes(61),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        assertThat(result)
+                .as("a service one minute longer than the window cannot fit — no slot")
+                .isEmpty();
+    }
+
+    @Test
     @DisplayName("returns empty list when service duration exceeds the work window")
     void should_returnEmpty_when_serviceDurationLongerThanWorkWindow() {
         calculator = new TimeSlotCalculator(fixedClock("2026-05-07T06:00:00Z"));
@@ -325,13 +370,56 @@ class TimeSlotCalculatorTest {
     @Test
     @DisplayName("should return available slots when occupied list is null (null treated as empty)")
     void should_returnAvailableSlots_when_occupiedIsNull() {
-        TimeSlotCalculator calc = new TimeSlotCalculator(Clock.fixed(Instant.parse("2026-05-07T05:59:00Z"), ZoneOffset.UTC));
+        // 05:45Z = 08:45 Kyiv — bookable cutoff exactly 09:00, so the single 09:00 candidate survives.
+        TimeSlotCalculator calc = new TimeSlotCalculator(Clock.fixed(Instant.parse("2026-05-07T05:45:00Z"), ZoneOffset.UTC));
 
         List<TimeSlotCalculator.TimeRange> result = calc.calculateAvailableSlots(
             LocalDate.of(2026, 5, 7), LocalTime.of(9, 0), LocalTime.of(10, 0),
             Duration.ofMinutes(60), Duration.ofMinutes(30), null);
 
         assertThat(result).isNotEmpty();
+    }
+
+    @Test
+    @DisplayName("excludes a slot starting inside the 15-minute booking lead time — it would 400 on create")
+    void should_excludeSlot_when_startIsWithinBookingLeadTime() {
+        // 06:50Z = 09:50 Kyiv (+03). Bookable cutoff = 10:05 Kyiv.
+        //   10:00 start → 10 min away → INSIDE the lead time → must NOT be offered (create would 400).
+        //   10:30 start → 40 min away → offered.
+        TimeSlotCalculator calc = new TimeSlotCalculator(fixedClock("2026-05-07T06:50:00Z"));
+
+        List<TimeRange> result = calc.calculateAvailableSlots(
+                TEST_DATE,
+                LocalTime.of(9, 0),
+                LocalTime.of(13, 0),
+                Duration.ofHours(1),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        List<LocalTime> starts = result.stream().map(TimeSlotCalculatorTest::localStart).toList();
+        assertThat(starts).doesNotContain(LocalTime.of(10, 0));
+        assertThat(starts).startsWith(LocalTime.of(10, 30));
+    }
+
+    @Test
+    @DisplayName("keeps a slot starting exactly at the 15-minute lead-time cutoff — offered == accepted")
+    void should_keepSlot_when_startIsExactlyAtLeadTimeCutoff() {
+        // 06:45Z = 09:45 Kyiv (+03). Bookable cutoff = exactly 10:00 Kyiv — the boundary is inclusive,
+        // matching BookingStartsAtValidator (a startsAt exactly 15 min out is accepted on create).
+        TimeSlotCalculator calc = new TimeSlotCalculator(fixedClock("2026-05-07T06:45:00Z"));
+
+        List<TimeRange> result = calc.calculateAvailableSlots(
+                TEST_DATE,
+                LocalTime.of(9, 0),
+                LocalTime.of(13, 0),
+                Duration.ofHours(1),
+                Duration.ofMinutes(30),
+                List.of()
+        );
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .startsWith(LocalTime.of(10, 0));
     }
 
     @Test
@@ -348,5 +436,79 @@ class TimeSlotCalculatorTest {
             List.of()
         );
         assertThat(result).isEmpty();
+    }
+
+    // ── hasAvailableSlot — existence-only, short-circuiting (Perf MEDIUM-4 / LOW-2) ──────────────
+    //
+    // The day-availability callers only ever ask "is there ONE bookable slot?", so they use this instead
+    // of building (and discarding) the whole list. It must agree with calculateAvailableSlots exactly:
+    // same cutoff floor, same overlap test — only the termination differs.
+
+    @Test
+    @DisplayName("hasAvailableSlot — true when at least one candidate is free and at/after the cutoff")
+    void should_returnTrue_when_aBookableCandidateExists() {
+        // 05:45Z = 08:45 Kyiv; cutoff = 09:00 Kyiv exactly.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:45:00Z"));
+        Instant cutoff = calculator.bookableCutoff();
+
+        boolean hasSlot = calculator.hasAvailableSlot(
+                TEST_DATE, LocalTime.of(9, 0), LocalTime.of(13, 0),
+                Duration.ofHours(1), Duration.ofMinutes(30), List.of(), cutoff);
+
+        assertThat(hasSlot).isTrue();
+    }
+
+    @Test
+    @DisplayName("hasAvailableSlot — false when the day's only candidates all start before the cutoff")
+    void should_returnFalse_when_everyCandidateIsBeforeTheCutoff() {
+        // 14:00Z = 17:00 Kyiv; cutoff = 17:15 Kyiv. A 09:00-13:00 window is entirely in the past.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T14:00:00Z"));
+        Instant cutoff = calculator.bookableCutoff();
+
+        boolean hasSlot = calculator.hasAvailableSlot(
+                TEST_DATE, LocalTime.of(9, 0), LocalTime.of(13, 0),
+                Duration.ofHours(1), Duration.ofMinutes(30), List.of(), cutoff);
+
+        assertThat(hasSlot).isFalse();
+        assertThat(calculator.calculateAvailableSlots(
+                TEST_DATE, LocalTime.of(9, 0), LocalTime.of(13, 0),
+                Duration.ofHours(1), Duration.ofMinutes(30), List.of(), cutoff))
+                .as("the list variant agrees — the two share one walk")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("hasAvailableSlot — false when every candidate is blocked by an existing booking")
+    void should_returnFalse_when_everyCandidateIsOccupied() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:45:00Z"));
+        Instant cutoff = calculator.bookableCutoff();
+        // The whole 09:00-11:00 window is booked; a 2-hour service fits nowhere else.
+        List<TimeRange> occupied = List.of(kyivRange(TEST_DATE, LocalTime.of(9, 0), LocalTime.of(11, 0)));
+
+        boolean hasSlot = calculator.hasAvailableSlot(
+                TEST_DATE, LocalTime.of(9, 0), LocalTime.of(11, 0),
+                Duration.ofHours(2), Duration.ofMinutes(30), occupied, cutoff);
+
+        assertThat(hasSlot).isFalse();
+    }
+
+    @Test
+    @DisplayName("hasAvailableSlot — agrees with calculateAvailableSlots for the same cutoff (caller-supplied)")
+    void should_agreeWithSlotList_when_sameCutoffSupplied() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T05:45:00Z"));
+        // A cutoff the caller derived once for the request — 11:00 Kyiv (08:00Z), stricter than "now".
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(11, 0)).atZone(KYIV).toInstant();
+
+        List<TimeRange> slots = calculator.calculateAvailableSlots(
+                TEST_DATE, LocalTime.of(9, 0), LocalTime.of(13, 0),
+                Duration.ofHours(1), Duration.ofMinutes(30), List.of(), cutoff);
+        boolean hasSlot = calculator.hasAvailableSlot(
+                TEST_DATE, LocalTime.of(9, 0), LocalTime.of(13, 0),
+                Duration.ofHours(1), Duration.ofMinutes(30), List.of(), cutoff);
+
+        assertThat(hasSlot).isEqualTo(!slots.isEmpty());
+        assertThat(slots.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("the caller-supplied cutoff — not the clock — is the floor")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(11, 30), LocalTime.of(12, 0));
     }
 }

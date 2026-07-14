@@ -1,12 +1,14 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.common.util.TimeSlotCalculator;
 import com.beautica.config.CacheConfig;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.EffectiveDaySource;
 import com.beautica.master.entity.Master;
 import com.beautica.master.service.MasterScheduleService;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.service.repository.MasterServiceRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -33,7 +35,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {SlotCalculationService.class, CacheConfig.class},
+        classes = {SlotCalculationService.class, CacheConfig.class,
+                   MasterCachePrefixEvictor.class, ScheduleDateMath.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @Import(SlotCalculationServiceCacheTest.ClockConfig.class)

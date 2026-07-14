@@ -236,15 +236,49 @@ public class MasterController {
      * open to any authenticated role — mirroring {@code GET /{masterId}/slots} below, which already
      * exposes bookable start times (strictly more detail than a working/non-working flag) to any
      * authenticated caller. Bounded to ≤366 days by the same guard {@code resolveEffectiveRange} applies.
+     *
+     * <p><b>Two modes, selected by the optional {@code serviceId}</b> — the response shape
+     * ({@code [{date, working}]}) is identical in both:
+     *
+     * <ul>
+     *   <li><b>{@code serviceId} ABSENT (schedule shape, unchanged).</b> {@code working} answers "does the
+     *       master's schedule carry content on this date?" — no service duration, no bookings, no lead-time
+     *       cutoff. This is what the MASTER's own schedule UI paints, and it stays backward-compatible.</li>
+     *   <li><b>{@code serviceId} PRESENT (bookability).</b> {@code working} answers "could a client actually
+     *       book THIS service on this date?" — the schedule minus PENDING/CONFIRMED bookings must leave a
+     *       free range that fits the service's effective duration, starting at/after the booking lead-time
+     *       cutoff and within the 180-day horizon. This is what the CLIENT's booking calendar must use:
+     *       gating on the schedule-shape flag made today (past the cutoff) and fully-booked days look
+     *       selectable, and the slot screen then had nothing to show.</li>
+     * </ul>
+     *
+     * <p>The bookability mode shares ONE free-range computation and ONE cutoff with
+     * {@code GET /{masterId}/slots} (both go through {@code SlotCalculationService}), so a day reported
+     * {@code working = true} always has at least one slot on the slot endpoint, and vice versa. An unknown,
+     * foreign or inactive {@code serviceId} 404s exactly as it does on {@code /slots}.
+     *
+     * <p><b>Window bounds differ per mode.</b> The {@code serviceId}-ABSENT mode keeps the shared ≤366-day
+     * read window. The {@code serviceId}-PRESENT mode is additionally capped at <b>63 inclusive dates</b>
+     * (400 beyond that): each day in that mode costs a slot walk, and its cache is keyed on the raw
+     * {@code from}/{@code to}, so an unbounded window was both a per-request amplifier and a cache-eviction
+     * lever ({@code SlotCalculationService#assertBookableSpan}). Two calendar months is more than the mobile
+     * calendar — which pages month-by-month — ever requests. Both modes are throttled per IP by
+     * {@code AuthRateLimitFilter} (shared with {@code /slots}).
      */
     @GetMapping("/{masterId}/working-days")
     @PreAuthorize("isAuthenticated()")
     public ApiResponse<List<MasterWorkingDayResponse>> getWorkingDays(
             @PathVariable UUID masterId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
-            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(required = false) UUID serviceId
     ) {
-        return ApiResponse.ok(masterScheduleService.getClientWorkingDays(masterId, from, to));
+        // Mode selection only — each branch delegates the whole decision to its owning service. The
+        // cached methods live on two different beans, so dispatching here (rather than inside one of
+        // them) also keeps both @Cacheable proxies effective (self-invocation would bypass AOP — §F-3).
+        return ApiResponse.ok(serviceId == null
+                ? masterScheduleService.getClientWorkingDays(masterId, from, to)
+                : slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceId));
     }
 
     @DeleteMapping("/{masterId}")

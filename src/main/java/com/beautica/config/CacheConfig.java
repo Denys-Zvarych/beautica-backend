@@ -42,6 +42,10 @@ public class CacheConfig {
      *                         bookability verdict (Phase 23.x, SlotCalculationService#hasBookableFutureSlot)
      *                         gating both the booking master-list and the salon catalogue — 60 sec TTL,
      *                         max 500; evicted by master prefix on every schedule AND booking write
+     *   master-bookable-days — availability-aware per-date bookability projection per
+     *                         master/from/to/masterService (SlotCalculationService#getBookableWorkingDays,
+     *                         backs GET /masters/{masterId}/working-days?serviceId=…) — 60 sec TTL,
+     *                         max 2000; evicted by master prefix on every schedule AND booking write
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
      *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
@@ -161,6 +165,31 @@ public class CacheConfig {
         // hold the working set for current scale; the CaffeineCacheMetrics gauge makes further tuning
         // data-driven rather than guessed.
         registerMetered(manager, meterRegistry, "master-service-bookable",
+                Caffeine.newBuilder()
+                        .maximumSize(2000)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
+        // Availability-aware calendar day-gating (SlotCalculationService#getBookableWorkingDays) — the
+        // serviceId-PRESENT mode of GET /masters/{masterId}/working-days, which the client booking
+        // calendar reads. Distinct cache from master-working-days (the serviceId-ABSENT schedule-shape
+        // mode the master's own schedule UI reads): the two answer different questions, and the
+        // masterServiceId is part of THIS key because two services of different duration legitimately
+        // yield different bookable-day sets. Mirrors master-service-bookable: 60-sec TTL, sync=true
+        // (hot client-calendar key), metered. Evicted by MASTER PREFIX (the key's first element) on every
+        // schedule write (MasterScheduleService#evictSlotsAfterCommit) AND every booking write
+        // (SlotCalculationService#evictBookableFutureSlotsByMaster) — a new/cancelled booking anywhere in
+        // the window can flip a day from bookable to full. Cardinality is master × service × calendar
+        // window (the mobile calendar pages by month), so it is sized like master-service-bookable.
+        //
+        // SIZING (Perf MEDIUM-2). maximumSize counts ENTRIES, not weight, and unlike its neighbours (whose
+        // entry is a Boolean) an entry here is a List<MasterWorkingDayResponse>. That only makes 2 000
+        // entries a safe cap because the ENTRY SIZE is itself now bounded: SlotCalculationService
+        // #assertBookableSpan rejects a serviceId-mode span wider than 63 inclusive dates, so no entry can
+        // exceed 63 records (record of LocalDate + boolean ≈ 40 B, + list/array overhead ≈ 3 KB/entry).
+        // Worst-case retained heap ≈ 2 000 × 3 KB ≈ 6 MB — comfortable on the Railway container, and an
+        // order of magnitude below the 40-60 MB the uncapped 366-day window allowed. A maximumWeight +
+        // weigher is therefore NOT needed: the window cap subsumes it, and it keeps the sizing directly
+        // comparable to the sibling caches. If the span cap is ever raised, revisit BOTH numbers together.
+        registerMetered(manager, meterRegistry, "master-bookable-days",
                 Caffeine.newBuilder()
                         .maximumSize(2000)
                         .expireAfterWrite(60, TimeUnit.SECONDS));

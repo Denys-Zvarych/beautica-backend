@@ -12,7 +12,9 @@ import com.beautica.master.dto.WeeklyScheduleDayRequest;
 import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
+import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.master.service.MasterScheduleService;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.service.repository.MasterServiceRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -150,9 +152,13 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
         // whole working day is after "now", so TimeSlotCalculator's now-filter never trims a slot.
         Instant now = date.minusDays(7).atStartOfDay(TimeZones.KYIV).toInstant();
         Clock fixed = Clock.fixed(now, ZoneOffset.UTC);
+        // ScheduleDateMath shares the SAME pinned clock as the service under test, so its range guards
+        // (past floor / far-future cap) agree with the service's notion of "today" — a real-clock instance
+        // would judge the pinned dates against a different today.
         return new SlotCalculationService(
-                bookingRepository, masterServiceRepository, masterScheduleService, timeSlotCalculator,
-                slotCacheManager, fixed);
+                bookingRepository, masterServiceRepository, masterScheduleService,
+                new ScheduleDateMath(fixed), timeSlotCalculator,
+                new MasterCachePrefixEvictor(slotCacheManager), fixed);
     }
 
     private static WeeklyScheduleRequest weekly(LocalDate from, LocalDate to, WeeklyScheduleDayRequest... days) {

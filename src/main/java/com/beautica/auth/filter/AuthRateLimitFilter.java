@@ -12,7 +12,9 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -36,8 +38,21 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String CHANGE_PASSWORD_OTP_PATH = "/api/v1/users/me/change-password/request-otp";
     private static final String INVITE_PATH = "/api/v1/auth/invite";
     private static final String LOGOUT_PATH = "/api/v1/auth/logout";
-    private static final String SLOTS_PATH_PREFIX = "/api/v1/masters/";
+    // The two master-availability READ endpoints, which share ONE bucket (slotsBuckets) because they are
+    // the same class of request from the same screen: the client booking calendar fetches
+    // /working-days for the visible month, then /slots for the tapped day. Same technique as
+    // rotateStaffBuckets (one bucket for one class of endpoint).
+    //
+    // /working-days was previously UNTHROTTLED — nothing in this filter matched /api/v1/masters/** except
+    // /slots, and the booking-write bucket only covers /api/v1/bookings. That mattered because its
+    // master-bookable-days cache is keyed on the RAW client-supplied {from, to}: an authenticated caller
+    // rotating `from` by a day could force an unbounded stream of cache misses, evicting every legitimate
+    // entry (2 000-entry cache) and turning each miss into 4 DB queries + a full slot walk. The other half
+    // of that fix is the ≤63-day window cap in SlotCalculationService#assertBookableSpan, which bounds the
+    // COST and SIZE of a single miss; this bucket bounds the RATE.
+    private static final String MASTER_AVAILABILITY_PATH_PREFIX = "/api/v1/masters/";
     private static final String SLOTS_PATH_SUFFIX = "/slots";
+    private static final String WORKING_DAYS_PATH_SUFFIX = "/working-days";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
     private static final String PROFILE_UPDATE_PATH = "/api/v1/independent-masters/me/profile";
@@ -101,6 +116,20 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String ROTATE_ADMIN_SALON_PATH_PREFIX = "/api/v1/salons/";
     private static final String ROTATE_MASTER_SALON_PATH_PREFIX = "/api/v1/masters/";
     private static final String ROTATE_STAFF_SALON_PATH_SUFFIX = "/salon";
+    // Resolves the DECODED + NORMALIZED request path for rule matching (see resolveMatchPath).
+    // urlDecode + removeSemicolonContent are UrlPathHelper defaults; set explicitly so the
+    // security-critical decode step is self-documenting and cannot be silently disabled by a
+    // future default change. Stateless after construction and thread-safe for the read-only
+    // getPathWithinApplication call, so a single shared static instance is correct.
+    private static final UrlPathHelper MATCH_PATH_HELPER = createMatchPathHelper();
+
+    private static UrlPathHelper createMatchPathHelper() {
+        UrlPathHelper helper = new UrlPathHelper();
+        helper.setUrlDecode(true);
+        helper.setRemoveSemicolonContent(true);
+        return helper;
+    }
+
     private static final int RETRY_AFTER_SECONDS = 60;
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
@@ -485,7 +514,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
-        String path = request.getRequestURI();
+        String path = resolveMatchPath(request);
         String method = request.getMethod();
 
         // Device-token rate-limit: POST or DELETE /api/v1/devices/token — checked before
@@ -507,10 +536,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        // Slots rate-limit: GET /api/v1/masters/{masterId}/slots — checked before POST guard
+        // Master-availability read rate-limit: GET /api/v1/masters/{masterId}/slots AND
+        // GET /api/v1/masters/{masterId}/working-days — checked before the POST guard. Both are the
+        // client booking calendar's reads and share slotsBuckets (default 60 / 60 s per IP; a user
+        // paging months + tapping days makes a handful of requests per minute, nowhere near the cap).
+        // See MASTER_AVAILABILITY_PATH_PREFIX for why /working-days must be throttled.
         if (HttpMethod.GET.matches(method)
-                && path.startsWith(SLOTS_PATH_PREFIX)
-                && path.endsWith(SLOTS_PATH_SUFFIX)) {
+                && path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
+                && (path.endsWith(SLOTS_PATH_SUFFIX) || path.endsWith(WORKING_DAYS_PATH_SUFFIX))) {
             applyRateLimit(request, response, filterChain, slotsBuckets, RETRY_AFTER_SECONDS);
             return;
         }
@@ -680,6 +713,34 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         }
 
         applyRateLimit(request, response, filterChain, cache, retryAfterSeconds);
+    }
+
+    /**
+     * Resolves the path used for throttle-rule matching from the request's DECODED and
+     * NORMALIZED path — mirroring how Spring MVC routes the request — instead of the raw,
+     * percent-encoded, un-normalized {@link HttpServletRequest#getRequestURI()}.
+     *
+     * <p>The servlet container hands back {@code getRequestURI()} exactly as received: still
+     * percent-encoded and not collapsed. Spring MVC, however, routes on the decoded/normalized
+     * path, so matching a rule on the raw URI lets a caller reach a throttled handler with an
+     * equivalent spelling that skips the rule — e.g. {@code POST /api/v1/auth/logi%6e} (routes to
+     * login, unthrottled credential stuffing) or {@code GET /api/v1/masters/{id}/working%2ddays}.
+     * {@code StrictHttpFirewall} does not reject these.
+     *
+     * <p>This filter runs BEFORE the {@code DispatcherServlet} parses and caches the request path,
+     * so {@code ServletRequestPathUtils.getCachedPath(request)} is not yet populated here. We
+     * therefore decode/normalize independently via {@link UrlPathHelper} (which percent-decodes
+     * ONCE, strips {@code ;matrix} content, and collapses duplicate slashes) and then fold any
+     * {@code .}/{@code ..} segments that survive decoding (e.g. {@code %2e%2e}) with
+     * {@link StringUtils#cleanPath}. {@code cleanPath} performs no decoding, so there is no
+     * double-decode (which would itself open a bypass). Verified against spring-web 6.2.6:
+     * {@code working%2ddays -> working-days}, {@code logi%6e -> login},
+     * {@code /auth/./login -> /auth/login}, {@code //auth -> /auth}, {@code %2e%2e -> ..} folded,
+     * while unencoded paths pass through byte-for-byte so every existing rule's spelling still
+     * matches.
+     */
+    private String resolveMatchPath(HttpServletRequest request) {
+        return StringUtils.cleanPath(MATCH_PATH_HELPER.getPathWithinApplication(request));
     }
 
     private void applyRateLimit(HttpServletRequest request,

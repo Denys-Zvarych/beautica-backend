@@ -354,25 +354,32 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     );
 
     /**
-     * All PENDING/CONFIRMED bookings for a master overlapping the {@code [windowStart, windowEnd)}
-     * range, ordered by start. Backs the batched free-slot bookability gate
-     * ({@code SlotCalculationService#filterBookableAssignments} / {@code hasBookableFutureSlot}):
-     * the whole booking horizon is loaded ONCE per master and sliced per-day in memory, instead of
-     * one {@link #findOverlappingByMaster} query per day. The overlap predicate ({@code starts_at <
-     * windowEnd AND ends_at > windowStart}) matches {@link #findOverlappingByMaster} so a booking whose
-     * tail spills past a day boundary is still returned. Bounded by the service layer's ≤180-day
-     * booking horizon (Anti-Bug §E-3 — not an unbounded scan), and aligned to the same
-     * {@code (master_id, status, starts_at)} access path as the per-day finder.
+     * The occupied {@code [startsAt, endsAt)} intervals of a master's PENDING/CONFIRMED bookings
+     * overlapping {@code [windowStart, windowEnd)}, ordered by start. Backs the whole availability
+     * computation — the calendar day projection ({@code SlotCalculationService#getBookableWorkingDays}),
+     * the free-slot bookability gate ({@code hasBookableFutureSlot}) and the batched catalogue filter
+     * ({@code filterBookableAssignments}): the whole window is loaded ONCE per master and sliced per-day
+     * in memory, instead of one {@link #findOverlappingByMaster} query per day.
+     *
+     * <p><b>Projection, not entities (Perf MEDIUM-1).</b> Returns {@link BookingTimeRange} — the only two
+     * columns any consumer reads. The previous {@code SELECT *} native variant hydrated full managed
+     * {@code Booking} entities (20+ columns incl. guest PII and the cancel token) purely to call two
+     * getters. The overlap predicate ({@code starts_at < windowEnd AND ends_at > windowStart}) is
+     * unchanged from {@link #findOverlappingByMaster} — so a booking whose tail spills past a day
+     * boundary is still returned, and the query still rides {@code idx_bookings_master_slot_overlap}.
+     * Bounded by the service layer's ≤180-day booking horizon (Anti-Bug §E-3 — not an unbounded scan).
      */
-    @Query(value = """
-            SELECT * FROM bookings
-            WHERE master_id = :masterId
-              AND status IN ('PENDING','CONFIRMED')
-              AND starts_at < :windowEnd
-              AND ends_at   > :windowStart
-            ORDER BY starts_at ASC
-            """, nativeQuery = true)
-    List<Booking> findActiveByMasterInRange(
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingTimeRange(b.startsAt, b.endsAt)
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
+                               com.beautica.booking.enums.BookingStatus.CONFIRMED)
+              AND b.startsAt < :windowEnd
+              AND b.endsAt   > :windowStart
+            ORDER BY b.startsAt ASC
+            """)
+    List<BookingTimeRange> findActiveTimeRangesByMasterInRange(
             @Param("masterId") UUID masterId,
             @Param("windowStart") OffsetDateTime windowStart,
             @Param("windowEnd") OffsetDateTime windowEnd

@@ -1083,4 +1083,178 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .contains(otherConflict.getId());
     }
 
+    // ── findActiveTimeRangesByMasterInRange — the two-column availability projection (Perf MEDIUM-1) ──
+    //
+    // The availability computation (calendar day projection + free-slot gate) reads bookings ONLY through
+    // this JPQL constructor projection, which must reproduce findOverlappingByMaster's predicate exactly:
+    // PENDING/CONFIRMED only, master-scoped, [starts_at < windowEnd AND ends_at > windowStart), ordered by
+    // start. These pin the data-correctness contract the whole booking-day fix rides on.
+
+    private static final OffsetDateTime WINDOW_START =
+            OffsetDateTime.of(2026, 6, 1, 0, 0, 0, 0, ZoneOffset.UTC);
+    private static final OffsetDateTime WINDOW_END =
+            OffsetDateTime.of(2026, 6, 2, 0, 0, 0, 0, ZoneOffset.UTC);
+
+    @Test
+    @DisplayName("should_projectStartAndEnd_forPendingAndConfirmedOrderedByStart")
+    void should_projectStartAndEnd_forPendingAndConfirmedInRange() {
+        Booking confirmed = buildBooking(BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 1, 14, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 15, 0, 0, 0, ZoneOffset.UTC));
+        Booking pending = buildBooking(BookingStatus.PENDING,
+                OffsetDateTime.of(2026, 6, 1, 9, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC));
+        em.persist(confirmed);
+        em.persist(pending);
+        em.flush();
+
+        List<BookingTimeRange> result = bookingRepository.findActiveTimeRangesByMasterInRange(
+                master.getId(), WINDOW_START, WINDOW_END);
+
+        // Ordered by startsAt ASC (pending 09:00 before confirmed 14:00), projecting exactly the two columns.
+        assertThat(result)
+                .as("both active bookings are projected, ordered by start, as (startsAt, endsAt) tuples")
+                .extracting(BookingTimeRange::startsAt, BookingTimeRange::endsAt)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                OffsetDateTime.of(2026, 6, 1, 9, 0, 0, 0, ZoneOffset.UTC),
+                                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC)),
+                        org.assertj.core.groups.Tuple.tuple(
+                                OffsetDateTime.of(2026, 6, 1, 14, 0, 0, 0, ZoneOffset.UTC),
+                                OffsetDateTime.of(2026, 6, 1, 15, 0, 0, 0, ZoneOffset.UTC)));
+    }
+
+    @Test
+    @DisplayName("should_excludeTerminalStatuses_when_projectingActiveTimeRanges")
+    void should_excludeTerminalStatuses_when_projectingActiveTimeRanges() {
+        // Every non-active status parked in the window — none may leak into the availability projection,
+        // or a cancelled/declined slot would wrongly read as occupied and hide a genuinely free day.
+        int hour = 9;
+        for (BookingStatus terminal : List.of(
+                BookingStatus.DECLINED, BookingStatus.CANCELLED,
+                BookingStatus.COMPLETED, BookingStatus.NOT_COMPLETED)) {
+            em.persist(buildBooking(terminal,
+                    OffsetDateTime.of(2026, 6, 1, hour, 0, 0, 0, ZoneOffset.UTC),
+                    OffsetDateTime.of(2026, 6, 1, hour + 1, 0, 0, 0, ZoneOffset.UTC)));
+            hour += 2;
+        }
+        em.flush();
+
+        List<BookingTimeRange> result = bookingRepository.findActiveTimeRangesByMasterInRange(
+                master.getId(), WINDOW_START, WINDOW_END);
+
+        assertThat(result)
+                .as("DECLINED / CANCELLED / COMPLETED / NOT_COMPLETED never occupy availability")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("should_excludeBoundaryAbuttingBookings_when_projectingActiveTimeRanges")
+    void should_excludeBoundaryAbuttingBookings_when_projectingActiveTimeRanges() {
+        // Entirely before the window, ending EXACTLY at windowStart (ends_at > windowStart is FALSE) — out.
+        Booking before = buildBooking(BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 5, 31, 23, 0, 0, 0, ZoneOffset.UTC),
+                WINDOW_START);
+        // Starts EXACTLY at windowEnd (starts_at < windowEnd is FALSE) — out.
+        Booking after = buildBooking(BookingStatus.CONFIRMED,
+                WINDOW_END,
+                OffsetDateTime.of(2026, 6, 2, 1, 0, 0, 0, ZoneOffset.UTC));
+        // A plainly in-window booking as the positive control. None of the three overlap each other
+        // (before ends 00:00, within is 10:00–11:00, after starts 00:00 next day), so all coexist.
+        Booking within = buildBooking(BookingStatus.PENDING,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
+        em.persist(before);
+        em.persist(after);
+        em.persist(within);
+        em.flush();
+
+        List<BookingTimeRange> result = bookingRepository.findActiveTimeRangesByMasterInRange(
+                master.getId(), WINDOW_START, WINDOW_END);
+
+        assertThat(result)
+                .as("half-open [windowStart, windowEnd): a booking ending exactly at windowStart or "
+                        + "starting exactly at windowEnd is out; only the in-window booking survives")
+                .extracting(BookingTimeRange::startsAt)
+                .containsExactly(OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC));
+    }
+
+    @Test
+    @DisplayName("should_includeTailSpillingAcrossWindowStart_when_projectingActiveTimeRanges")
+    void should_includeTailSpillingAcrossWindowStart_when_projectingActiveTimeRanges() {
+        // Starts on the previous day, tail spills past windowStart (ends_at > windowStart) — included,
+        // exactly as the day-bucketing relies on to occupy the first in-window day.
+        Booking spillIn = buildBooking(BookingStatus.PENDING,
+                OffsetDateTime.of(2026, 5, 31, 23, 30, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 6, 1, 0, 30, 0, 0, ZoneOffset.UTC));
+        em.persist(spillIn);
+        em.flush();
+
+        List<BookingTimeRange> result = bookingRepository.findActiveTimeRangesByMasterInRange(
+                master.getId(), WINDOW_START, WINDOW_END);
+
+        assertThat(result)
+                .as("a booking whose tail spills past windowStart is returned by the overlap predicate")
+                .extracting(BookingTimeRange::startsAt, BookingTimeRange::endsAt)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(
+                        OffsetDateTime.of(2026, 5, 31, 23, 30, 0, 0, ZoneOffset.UTC),
+                        OffsetDateTime.of(2026, 6, 1, 0, 30, 0, 0, ZoneOffset.UTC)));
+    }
+
+    @Test
+    @DisplayName("should_scopeToMaster_when_projectingActiveTimeRanges")
+    void should_excludeOtherMastersBookings_when_projectingActiveTimeRanges() {
+        User otherMasterUser = new User(
+                "other-master-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash", Role.INDEPENDENT_MASTER, "Other", "Master", "+380509999999");
+        em.persist(otherMasterUser);
+        Master otherMaster = Master.builder()
+                .user(otherMasterUser)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(otherMaster);
+        ServiceDefinition otherDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(otherMaster.getId())
+                .name("Other")
+                .category("MANICURE")
+                .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("450.00"))
+                .serviceType(defaultServiceType)
+                .isActive(true)
+                .build();
+        em.persist(otherDef);
+        MasterServiceAssignment otherAssignment = MasterServiceAssignment.builder()
+                .master(otherMaster)
+                .serviceDefinition(otherDef)
+                .isActive(true)
+                .build();
+        em.persist(otherAssignment);
+
+        Booking otherMasterBooking = Booking.builder()
+                .client(clientUser)
+                .master(otherMaster)
+                .masterService(otherAssignment)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC))
+                .endsAt(OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC))
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        em.persist(otherMasterBooking);
+        em.flush();
+
+        List<BookingTimeRange> result = bookingRepository.findActiveTimeRangesByMasterInRange(
+                master.getId(), WINDOW_START, WINDOW_END);
+
+        assertThat(result)
+                .as("the projection is master-scoped — another master's booking never occupies this master")
+                .isEmpty();
+    }
+
 }
