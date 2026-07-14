@@ -245,7 +245,7 @@ public class MasterController {
      *       master's schedule carry content on this date?" — no service duration, no bookings, no lead-time
      *       cutoff. This is what the MASTER's own schedule UI paints, and it stays backward-compatible.</li>
      *   <li><b>{@code serviceId} PRESENT (bookability).</b> {@code working} answers "could a client actually
-     *       book THIS service on this date?" — the schedule minus PENDING/CONFIRMED bookings must leave a
+     *       book THIS service on this date?" — the schedule minus CONFIRMED bookings must leave a
      *       free range that fits the service's effective duration, starting at/after the booking lead-time
      *       cutoff and within the 180-day horizon. This is what the CLIENT's booking calendar must use:
      *       gating on the schedule-shape flag made today (past the cutoff) and fully-booked days look

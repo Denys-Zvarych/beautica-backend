@@ -296,7 +296,7 @@ class EmailNotificationServiceTest {
         verify(mailSender).send(realMessage);
 
         assertThat(templateCaptor.getValue()).isEqualTo("email/booking-declined");
-        assertThat(realMessage.getSubject()).isEqualTo("Бронювання відхилено");
+        assertThat(realMessage.getSubject()).isEqualTo("Бронювання скасовано");
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("comment")).isEqualTo("На жаль, майстер недоступний");

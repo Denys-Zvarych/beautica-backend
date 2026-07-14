@@ -54,7 +54,14 @@ public class ReviewService {
         Booking booking = bookingRepository.findByIdWithFullGraph(request.bookingId())
                 .orElseThrow(() -> new NotFoundException("Booking not found"));
 
-        if (!booking.getClient().getId().equals(clientId)) {
+        // A guest (LINK) booking has no registered account (V89 chk_bookings_guest_fields —
+        // client_id is null), so no authenticated CLIENT can ever be its owner. Guarding
+        // against a null client here (instead of dereferencing unconditionally) turns what
+        // would be a 500 into the same uniform 403 an unowned booking gets — mirrors
+        // BookingService.cancelBooking / rescheduleBooking, and stays consistent with
+        // BookingService.canReview, which already treats a guest COMPLETED booking as
+        // non-reviewable (no account exists to leave a review with).
+        if (booking.getClient() == null || !booking.getClient().getId().equals(clientId)) {
             throw new ForbiddenException("Not authorized to review this booking");
         }
 

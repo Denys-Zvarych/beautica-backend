@@ -97,7 +97,7 @@ class BookingCompletionIT extends AbstractIntegrationTest {
 
     @ParameterizedTest(name = "start status {0} → BusinessException, status unchanged, zero outbox rows")
     @EnumSource(value = BookingStatus.class,
-            names = {"PENDING", "DECLINED", "CANCELLED", "NOT_COMPLETED", "COMPLETED"})
+            names = {"DECLINED", "CANCELLED", "NOT_COMPLETED", "COMPLETED"})
     @DisplayName("completing from any non-CONFIRMED start status throws, leaves status unchanged, and writes ZERO outbox rows")
     void should_throwAndWriteNoOutbox_when_completingFromIllegalStartStatus(BookingStatus startStatus) {
         UUID masterId = createIndependentMaster("compl-illegal-master-" + startStatus + "-" + System.nanoTime() + "@beautica.test");

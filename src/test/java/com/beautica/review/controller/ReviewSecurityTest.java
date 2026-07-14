@@ -92,26 +92,48 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("POST /reviews — 403 (not 400) when client B submits a review for a PENDING booking not owned by client B")
-    void should_return403_when_clientSubmitsReviewForPendingBookingNotOwned() throws Exception {
+    @DisplayName("POST /reviews — 403 (not 400) when client B submits a review for a not-yet-completed booking not owned by client B")
+    void should_return403_when_clientSubmitsReviewForConfirmedBookingNotOwned() throws Exception {
         UUID masterId        = createIndependentMaster("sec-im2-" + System.nanoTime() + "@beautica.test");
         UUID masterServiceId = createIndependentMasterService(masterId);
 
-        // Client A owns the PENDING booking
+        // Client A owns the not-yet-completed (CONFIRMED) booking
         String clientAEmail = "sec-cli-a2-" + System.nanoTime() + "@beautica.test";
         createClientAndGetToken(clientAEmail);
         UUID clientAId  = resolveUserIdByEmail(clientAEmail);
-        UUID bookingId  = createPendingBooking(clientAId, masterId, masterServiceId);
+        UUID bookingId  = createConfirmedBooking(clientAId, masterId, masterServiceId);
 
         // Client B has no relationship to this booking
         String clientBEmail = "sec-cli-b2-" + System.nanoTime() + "@beautica.test";
         String clientBToken = createClientAndGetToken(clientBEmail);
 
-        log.debug("Act: client B posts review on client A's PENDING bookingId={} — must return 403, not 400", bookingId);
+        log.debug("Act: client B posts review on client A's CONFIRMED bookingId={} — must return 403, not 400", bookingId);
         ResponseEntity<String> response = postReview(clientBToken, bookingId, 5);
 
         assertThat(response.getStatusCode())
                 .as("ownership check must run before status check — client B must get 403, not 400")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 403 (not 500) when an authenticated CLIENT submits a guest booking's id")
+    void should_return403NotServerError_when_clientSubmitsReviewForGuestBooking() throws Exception {
+        // Guest (LINK) booking: client_id is NULL (V89 chk_bookings_guest_fields) — no account
+        // ever owns it, so no authenticated CLIENT can pass the ownership check. Before the fix,
+        // booking.getClient().getId() unconditionally NPE'd here (500 instead of a clean 403) —
+        // an authz check turned into a crash, plus a 500-vs-403 existence oracle.
+        UUID masterId        = createIndependentMaster("sec-guest-im-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        UUID bookingId       = createCompletedGuestBooking(masterId, masterServiceId);
+
+        String clientEmail = "sec-guest-cli-" + System.nanoTime() + "@beautica.test";
+        String clientToken = createClientAndGetToken(clientEmail);
+
+        log.debug("Act: authenticated CLIENT posts review on guest bookingId={} — must return 403", bookingId);
+        ResponseEntity<String> response = postReview(clientToken, bookingId, 5);
+
+        assertThat(response.getStatusCode())
+                .as("a guest booking has no owning client — must be rejected with 403, never 500")
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
@@ -161,18 +183,19 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Inserts a booking directly with status=PENDING.
-     * starts_at/ends_at are set in the future so no past-booking constraint is triggered.
-     * salon_id is omitted — INDEPENDENT_MASTER bookings have no salon (V18 schema, nullable).
+     * Inserts a booking directly with status=CONFIRMED (not yet reviewable — review requires
+     * COMPLETED). starts_at/ends_at are set in the future so no past-booking constraint is
+     * triggered. salon_id is omitted — INDEPENDENT_MASTER bookings have no salon (V18 schema,
+     * nullable).
      */
-    private UUID createPendingBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
+    private UUID createConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO bookings " +
                 "(id, client_id, master_id, master_service_id, status, " +
                 "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, " +
                 "buffer_minutes_at_booking, created_at, updated_at) " +
-                "VALUES (?, ?, ?, ?, 'PENDING', " +
+                "VALUES (?, ?, ?, ?, 'CONFIRMED', " +
                 "NOW() + interval '1 day', NOW() + interval '1 day 1 hour', " +
                 "500.00, 60, 0, NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId);
@@ -195,6 +218,29 @@ class ReviewSecurityTest extends AbstractIntegrationTest {
                 "NOW() - interval '2 hours', NOW() - interval '1 hour', " +
                 "500.00, 60, 0, NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId);
+        return bookingId;
+    }
+
+    /**
+     * Inserts a guest (LINK) booking directly with status=COMPLETED and client_id NULL.
+     * guest_name/guest_phone are required non-null (V89 chk_bookings_guest_fields);
+     * cancel_token is optional once the status is terminal (V91). starts_at/ends_at are set
+     * in the past so no overlap-exclusion constraint is triggered. salon_id is omitted —
+     * INDEPENDENT_MASTER bookings have no salon (V18 schema, nullable).
+     */
+    private UUID createCompletedGuestBooking(UUID masterId, UUID masterServiceId) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings " +
+                "(id, client_id, master_id, master_service_id, status, booking_source, " +
+                "guest_name, guest_surname, guest_phone, cancel_token, " +
+                "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, " +
+                "buffer_minutes_at_booking, created_at, updated_at) " +
+                "VALUES (?, NULL, ?, ?, 'COMPLETED', 'LINK', " +
+                "'Олена', 'Коваль', '+380501234567', ?, " +
+                "NOW() - interval '2 hours', NOW() - interval '1 hour', " +
+                "500.00, 60, 0, NOW(), NOW())",
+                bookingId, masterId, masterServiceId, UUID.randomUUID());
         return bookingId;
     }
 

@@ -43,7 +43,7 @@ public class NotificationService {
     public void notifyNewBooking(Booking booking) {
         String masterEmail = booking.getMaster().getUser().getEmail();
         UUID masterUserId = booking.getMaster().getUser().getId();
-        String clientName = (safe(booking.getClient().getFirstName()) + " " + safe(booking.getClient().getLastName())).trim();
+        String clientName = resolveClientName(booking);
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
 
@@ -57,6 +57,15 @@ public class NotificationService {
     }
 
     public void notifyBookingStatusChanged(Booking booking) {
+        // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) and no
+        // account to notify by email/push. Repurposing PATCH /decline as provider-initiated
+        // cancellation (Phase 24.2) makes "provider cancels a guest booking" a routine path —
+        // without this guard, getClient().getEmail() below NPEs and the outbox entry dies
+        // (mirrors the notifyReviewRequested guard).
+        if (booking.getClient() == null) {
+            log.debug("Skipping STATUS_CHANGED notification for account-less guest booking {}", booking.getId());
+            return;
+        }
         BookingStatus status = booking.getStatus();
         String clientEmail = booking.getClient().getEmail();
         UUID clientUserId = booking.getClient().getId();
@@ -77,8 +86,8 @@ public class NotificationService {
                 emailService.sendBookingDeclinedEmail(clientEmail, booking);
                 pushService.sendToUser(
                         clientUserId,
-                        "Бронювання відхилено",
-                        truncate("Ваше бронювання на " + serviceName + " відхилено"),
+                        "Бронювання скасовано",
+                        truncate("Ваше бронювання на " + serviceName + " скасовано"),
                         Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId)
                 );
             }
@@ -87,9 +96,10 @@ public class NotificationService {
     }
 
     /**
-     * Notifies the provider (master / salon-admin) that the client rescheduled the booking
-     * to a new time and it is awaiting re-approval (Phase 19.2). Targets the master's user —
-     * the same recipient as {@link #notifyNewBooking(Booking)} — with «Запит на перенесення» copy.
+     * Notifies the provider (master / salon-admin) that the client moved the booking to a new
+     * time (Phase 19.2; copy updated Phase 24.4 — the booking stays {@code CONFIRMED} at the new
+     * time, there is no re-approval step). Targets the master's user — the same recipient as
+     * {@link #notifyNewBooking(Booking)} — with «Бронювання перенесено» copy.
      */
     public void notifyBookingRescheduled(Booking booking) {
         String masterEmail = booking.getMaster().getUser().getEmail();
@@ -100,8 +110,8 @@ public class NotificationService {
         emailService.sendBookingRescheduledEmail(masterEmail, booking);
         pushService.sendToUser(
                 masterUserId,
-                "Запит на перенесення",
-                truncate("Клієнт попросив перенести бронювання на " + serviceName),
+                "Бронювання перенесено",
+                truncate("Клієнт переніс бронювання на " + serviceName),
                 Map.of("type", "BOOKING_RESCHEDULED", "bookingId", bookingId)
         );
     }
@@ -140,7 +150,7 @@ public class NotificationService {
     public void notifyClientCancelled(Booking booking) {
         String masterEmail = booking.getMaster().getUser().getEmail();
         UUID masterUserId = booking.getMaster().getUser().getId();
-        String clientName = (safe(booking.getClient().getFirstName()) + " " + safe(booking.getClient().getLastName())).trim();
+        String clientName = resolveClientName(booking);
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
 
@@ -179,6 +189,27 @@ public class NotificationService {
                     "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
         }
         return frontendBaseUrl + "/bookings/" + bookingId + "/review";
+    }
+
+    /**
+     * Resolves the display name of the person who made this booking, for the master-facing
+     * {@code NEW_BOOKING} / {@code CLIENT_CANCELLED} notifications.
+     *
+     * <p>A guest (LINK) booking has no registered account (V89 {@code chk_bookings_guest_fields}
+     * — {@code client_id} is null), so {@code booking.getClient()} unconditionally would NPE the
+     * outbox drain for every single guest booking (both on creation and on the guest's own
+     * token-based cancellation via {@link com.beautica.booking.service.BookingCancellationService}
+     * — {@code CLIENT_CANCELLED} is guest-only; there is no authenticated-client caller). Falls
+     * back to the OTP-verified guest identity, mirroring {@code BookingDetailResponse.from}.
+     * This is the master's own booking, so surfacing the guest's name is not a PII leak;
+     * {@code guestPhone} is intentionally never read here.
+     */
+    private static String resolveClientName(Booking booking) {
+        var client = booking.getClient();
+        if (client != null) {
+            return (safe(client.getFirstName()) + " " + safe(client.getLastName())).trim();
+        }
+        return (safe(booking.getGuestName()) + " " + safe(booking.getGuestSurname())).trim();
     }
 
     private static String safe(String value) {

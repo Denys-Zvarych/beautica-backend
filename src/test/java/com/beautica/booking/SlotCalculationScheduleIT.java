@@ -292,7 +292,7 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
             masterScheduleService.upsertOverride(s.actorId(), s.masterId(),
                     new ScheduleOverrideRequest(monday, ScheduleExceptionKind.CUSTOM_HOURS,
                             List.of(iv(LocalTime.of(9, 0), LocalTime.of(12, 0)))));
-            // Book 10:00–11:00 Kyiv on that date (PENDING).
+            // Book 10:00–11:00 Kyiv on that date (CONFIRMED).
             insertBooking(s, monday, LocalTime.of(10, 0), LocalTime.of(11, 0));
 
             List<AvailableSlotResponse> slots = slotServiceWithTodayBefore(monday)
@@ -588,7 +588,7 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
         jdbc.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
                         + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
                         + "buffer_minutes_at_booking, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, 0, NOW(), NOW())",
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, 0, NOW(), NOW())",
                 UUID.randomUUID(), s.actorId(), s.masterId(), s.masterServiceId(),
                 startsAt, endsAt, PRICE, minutes);
     }

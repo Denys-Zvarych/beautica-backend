@@ -171,7 +171,7 @@ class ReviewServiceTest {
 
     @ParameterizedTest
     @DisplayName("throws 400 BusinessException when booking status is not COMPLETED (covers all non-terminal states)")
-    @EnumSource(value = BookingStatus.class, names = {"PENDING", "CONFIRMED", "DECLINED", "CANCELLED", "NOT_COMPLETED"})
+    @EnumSource(value = BookingStatus.class, names = {"CONFIRMED", "DECLINED", "CANCELLED", "NOT_COMPLETED"})
     void should_throw400_when_bookingStatusIsNotCompleted(BookingStatus status) {
         // Ownership check runs first (fix for IDOR oracle); stub client so it passes through to status check.
         User client = mock(User.class);
@@ -210,6 +210,25 @@ class ReviewServiceTest {
         when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> reviewService.createReview(differentClientId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("403 Forbidden (not 500) when an authenticated CLIENT submits a guest booking's id")
+    void should_throwForbidden_when_bookingIsGuestBookingWithNullClient() {
+        // Guest (LINK) booking: null client (V89 chk_bookings_guest_fields). Before the fix,
+        // booking.getClient().getId() unconditionally NPE'd here — a 500 instead of a clean 403,
+        // and an existence oracle (500 vs 403 told a caller a booking id was real but foreign).
+        Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(null);
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 5, null);
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
                 .isInstanceOf(ForbiddenException.class);
 
         verify(reviewRepository, never()).save(any());

@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -63,8 +64,9 @@ import static org.mockito.Mockito.verify;
  * <p>Closes the Phase 5.16 HIGH finding: validates the four end-to-end guarantees
  * the unit-test layer cannot prove on its own:
  * <ol>
- *   <li>{@code POST /bookings} writes exactly one PENDING outbox row inside the
- *       booking transaction.</li>
+ *   <li>{@code POST /bookings} writes exactly two PENDING outbox rows (one per distinct
+ *       recipient — NEW_BOOKING for the master, STATUS_CHANGED for the client; Decision D3,
+ *       track 24.x auto-confirm) inside the booking transaction.</li>
  *   <li>An outbox INSERT honours the surrounding transaction boundary — rolling
  *       back the caller's transaction also rolls back the outbox row.</li>
  *   <li>The drain worker advances PENDING entries to SENT when
@@ -118,8 +120,8 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("POST /bookings — notification_outbox has one NEW_BOOKING/PENDING row when booking is created")
-    void should_persistOutboxEntry_when_bookingCreated() throws Exception {
+    @DisplayName("POST /bookings — notification_outbox has 2 rows (NEW_BOOKING→master, STATUS_CHANGED→client) when booking is auto-confirmed (Decision D3)")
+    void should_persistTwoDistinctRecipientOutboxEntries_when_bookingCreated() throws Exception {
         String clientToken = createClientAndGetToken("integ-outbox-client-" + System.nanoTime() + "@beautica.test");
         UUID masterId = createSalonOwnerSalonAndMaster("integ-outbox-owner-" + System.nanoTime() + "@beautica.test");
         UUID masterServiceId = createMasterService(masterId);
@@ -143,17 +145,33 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
         var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<BookingResponse>>() {});
         UUID bookingId = body.data().id();
 
+        // Track 24.x auto-confirms at creation, so the create path enqueues TWO events, one per
+        // distinct recipient (Decision D3, verified no double-send): NEW_BOOKING → the master,
+        // STATUS_CHANGED → the client's already-CONFIRMED branch — not the same event fired twice.
         List<NotificationOutboxEntry> rows = outboxRepository.findAll();
-        assertThat(rows).hasSize(1);
+        assertThat(rows).hasSize(2);
 
-        NotificationOutboxEntry only = rows.get(0);
-        assertThat(only.getEventType()).isEqualTo(OutboxEventType.NEW_BOOKING);
-        assertThat(only.getStatus()).isEqualTo(OutboxStatus.PENDING);
-        assertThat(only.getAttempts()).isZero();
-        assertThat(only.getPayload()).isNull();
-        assertThat(only.getAggregateId())
-                .as("aggregateId must point to the created booking")
-                .isEqualTo(bookingId);
+        Map<OutboxEventType, NotificationOutboxEntry> byType = rows.stream()
+                .collect(Collectors.toMap(NotificationOutboxEntry::getEventType, row -> row));
+        assertThat(byType)
+                .as("exactly one NEW_BOOKING row and one STATUS_CHANGED row")
+                .containsOnlyKeys(OutboxEventType.NEW_BOOKING, OutboxEventType.STATUS_CHANGED);
+
+        for (NotificationOutboxEntry row : rows) {
+            assertThat(row.getStatus()).isEqualTo(OutboxStatus.PENDING);
+            assertThat(row.getAttempts()).isZero();
+            assertThat(row.getPayload()).isNull();
+            assertThat(row.getAggregateId())
+                    .as("aggregateId must point to the created booking")
+                    .isEqualTo(bookingId);
+        }
+
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId).orElseThrow();
+        UUID masterRecipientId = booking.getMaster().getUser().getId();
+        UUID clientRecipientId = booking.getClient().getId();
+        assertThat(masterRecipientId)
+                .as("NEW_BOOKING (master) and STATUS_CHANGED (client) must target two distinct recipients")
+                .isNotEqualTo(clientRecipientId);
     }
 
     @Test

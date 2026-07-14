@@ -139,7 +139,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
         Booking loaded = em.find(Booking.class, booking.getId());
 
         assertThat(loaded.getId()).isNotNull();
-        assertThat(loaded.getStatus()).isEqualTo(BookingStatus.PENDING);
+        assertThat(loaded.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(loaded.getPriceAtBooking().compareTo(new BigDecimal("450.00"))).isZero();
         assertThat(loaded.getDurationMinutesAtBooking()).isEqualTo(60);
         assertThat(loaded.getStartsAt()).isNotNull();
@@ -202,7 +202,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
         OffsetDateTime ts = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         Booking booking = Booking.builder()
                 .client(client).master(master).masterService(masterService).salon(null)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(ts).endsAt(ts)
                 .priceAtBooking(new BigDecimal("450.00"))
                 .durationMinutesAtBooking(60).bufferMinutesAtBooking(0)
@@ -220,7 +220,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
         Booking booking = Booking.builder()
                 .client(client).master(master).masterService(masterService).salon(null)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(startsAt).endsAt(endsAt)
                 .priceAtBooking(new BigDecimal("450.00"))
                 .durationMinutesAtBooking(0).bufferMinutesAtBooking(0)
@@ -238,7 +238,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
         Booking booking = Booking.builder()
                 .client(client).master(master).masterService(masterService).salon(null)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(startsAt).endsAt(endsAt)
                 .priceAtBooking(new BigDecimal("-1.00"))
                 .durationMinutesAtBooking(60).bufferMinutesAtBooking(0)
@@ -250,13 +250,13 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("chk_cancellation_reason_status — non-null reason rejected for non-terminal PENDING status")
-    void should_rejectBooking_when_cancellationReasonSetOnPendingStatus() {
+    @DisplayName("chk_cancellation_reason_status — non-null reason rejected for non-terminal CONFIRMED status")
+    void should_rejectBooking_when_cancellationReasonSetOnConfirmedStatus() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
         Booking booking = Booking.builder()
                 .client(client).master(master).masterService(masterService).salon(null)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(startsAt).endsAt(endsAt)
                 .priceAtBooking(new BigDecimal("450.00"))
                 .durationMinutesAtBooking(60).bufferMinutesAtBooking(0)
@@ -269,7 +269,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("uq_client_idempotency_key_active — duplicate key for same client in PENDING status is rejected")
+    @DisplayName("uq_client_idempotency_key_active — duplicate key for same client in CONFIRMED status is rejected")
     void should_rejectBooking_when_duplicateIdempotencyKeyForActiveBooking() {
         OffsetDateTime startsAt1 = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt1 = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
@@ -310,7 +310,7 @@ class BookingEntityJpaTest extends AbstractDataJpaTest {
                 .master(master)
                 .masterService(masterService)
                 .salon(null)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(startsAt)
                 .endsAt(endsAt)
                 .priceAtBooking(new BigDecimal("450.00"))

@@ -92,18 +92,14 @@ public class BookingController {
         return ApiResponse.ok(bookingService.getMyBookings(AuthenticationUtils.userId(auth), auth, status, pageable));
     }
 
-    @PatchMapping("/{bookingId}/confirm")
-    @PreAuthorize("hasAnyRole('SALON_OWNER', 'INDEPENDENT_MASTER')")
-    public ResponseEntity<Void> confirmBooking(
-            @PathVariable UUID bookingId,
-            Authentication auth
-    ) {
-        bookingService.confirmBooking(AuthenticationUtils.userId(auth), bookingId);
-        return ResponseEntity.noContent().build();
-    }
-
+    /**
+     * Provider-initiated cancellation of an already-{@code CONFIRMED} booking (Phase 24.2).
+     * Distinct from {@code PATCH /cancel} (client-initiated): this yields {@code DECLINED} so
+     * the client's booking list can tell "ви скасували" from "салон скасував". There is no
+     * {@code /confirm} endpoint any more — every booking is auto-confirmed at creation.
+     */
     @PatchMapping("/{bookingId}/decline")
-    @PreAuthorize("hasAnyRole('SALON_OWNER', 'INDEPENDENT_MASTER')")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') and @authz.canCancelBooking(authentication, #bookingId)")
     public ResponseEntity<Void> declineBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody StatusUpdateRequest req,
@@ -124,7 +120,7 @@ public class BookingController {
     }
 
     @PatchMapping("/{bookingId}/not-complete")
-    @PreAuthorize("hasAnyRole('SALON_OWNER', 'INDEPENDENT_MASTER')")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') and @authz.canCancelBooking(authentication, #bookingId)")
     public ResponseEntity<Void> notCompleteBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody StatusUpdateRequest req,
@@ -140,7 +136,7 @@ public class BookingController {
      * <p>Actor is resolved from the security principal — never from the body. Returns the
      * existing {@link BookingDetailResponse} shape (the same view {@code GET /bookings/{id}}
      * returns); Phase 19.3 will enrich this DTO. Errors: {@code 409} on a conflicting slot or
-     * a non-PENDING/CONFIRMED source state, {@code 403} for a non-owner, {@code 400} for a bad time.
+     * a non-CONFIRMED source state, {@code 403} for a non-owner, {@code 400} for a bad time.
      */
     @PatchMapping("/{bookingId}/reschedule")
     @PreAuthorize("hasRole('CLIENT')")

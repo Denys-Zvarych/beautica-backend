@@ -137,4 +137,21 @@ class BookingDetailResponseTest {
         assertThat(response.clientComment()).isNull();
         assertThat(response.providerComment()).isNull();
     }
+
+    @Test
+    @DisplayName("clientId is null and clientFirstName/clientLastName fall back to the guest identity when the booking has no registered client (LINK)")
+    void should_returnGuestIdentity_when_bookingHasNoRegisteredClient() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestName()).thenReturn("Оксана");
+        when(booking.getGuestSurname()).thenReturn("Мельник");
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientId()).isNull();
+        assertThat(response.clientFirstName()).isEqualTo("Оксана");
+        assertThat(response.clientLastName()).isEqualTo("Мельник");
+        // master PII is unaffected — sourced from booking.getMaster().getUser(), never getClient()
+        assertThat(response.masterFirstName()).isEqualTo("Наталія");
+        assertThat(response.masterLastName()).isEqualTo("Бойко");
+    }
 }

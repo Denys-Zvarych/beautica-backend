@@ -103,7 +103,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
 
@@ -122,7 +122,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.STATUS_CHANGED, 0, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
 
@@ -151,7 +151,7 @@ class NotificationOutboxDrainWorkerTest {
                 "inviteUrlSealed", sealed));
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, payload, aggregateId);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         // INVITE entries are excluded from the bookingIds set — stub returns empty to be safe.
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
         when(cipher.open(sealed)).thenReturn(decryptedUrl);
@@ -185,7 +185,7 @@ class NotificationOutboxDrainWorkerTest {
         // attempts=2 so this third attempt promotes the entry to DEAD.
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, aggregateId);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
         when(cipher.open(anyString())).thenThrow(new IllegalStateException(
                 "OutboxPayloadCipher open failed — corrupt or tampered ciphertext"));
@@ -220,7 +220,7 @@ class NotificationOutboxDrainWorkerTest {
                 "salonName", "Beauty"));
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, aggregateId);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
 
         workerWithRealMapper.drain();
@@ -243,7 +243,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("dispatch error")).when(notificationService).notifyNewBooking(booking);
@@ -265,7 +265,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 2, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("persistent failure")).when(notificationService).notifyNewBooking(booking);
@@ -285,7 +285,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("x".repeat(600))).when(notificationService).notifyNewBooking(booking);
@@ -313,7 +313,7 @@ class NotificationOutboxDrainWorkerTest {
         Booking booking2 = mock(Booking.class);
         Booking booking3 = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(entry1, entry2, entry3));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(entry1, entry2, entry3));
         when(booking1.getId()).thenReturn(bookingId1);
         when(booking2.getId()).thenReturn(bookingId2);
         when(booking3.getId()).thenReturn(bookingId3);
@@ -326,7 +326,7 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(entry1.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(entry2.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(entry3.getStatus()).isEqualTo(OutboxStatus.PENDING);
-        verify(outboxRepository, times(1)).claimPendingBatch(20);
+        verify(outboxRepository, times(1)).claimPendingBatch(50);
     }
 
     // ── Test 8: URL query string token is redacted from lastError ─────────────
@@ -338,7 +338,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Request failed: https://api.example.com/send?token=abc123secret"))
@@ -364,7 +364,7 @@ class NotificationOutboxDrainWorkerTest {
         String segment = "a".repeat(20);
         String jwtLike = segment + "." + segment + "." + segment;
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Auth header invalid: " + jwtLike))
@@ -386,7 +386,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.CLIENT_CANCELLED, 0, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
 
@@ -404,7 +404,7 @@ class NotificationOutboxDrainWorkerTest {
         UUID bookingId = UUID.randomUUID();
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
 
         worker.drain();
@@ -419,7 +419,7 @@ class NotificationOutboxDrainWorkerTest {
     @Test
     @DisplayName("drain does nothing when claimPendingBatch returns empty list")
     void should_doNothing_when_batchIsEmpty() {
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of());
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of());
 
         worker.drain();
 
@@ -437,7 +437,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
         Booking booking = mock(Booking.class);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret.sig"))
@@ -511,7 +511,7 @@ class NotificationOutboxDrainWorkerTest {
         UUID aggregateId = UUID.randomUUID();
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, "NOT_JSON", aggregateId);
 
-        when(outboxRepository.claimPendingBatch(20)).thenReturn(List.of(outboxEntry));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
 
         workerWithRealMapper.drain();

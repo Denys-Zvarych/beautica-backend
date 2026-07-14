@@ -35,7 +35,14 @@ import java.util.stream.Collectors;
 @Slf4j
 public class NotificationOutboxDrainWorker {
 
-    private static final int BATCH_SIZE = 20;
+    // Track 24.x auto-confirm: doCreateBooking now enqueues NEW_BOOKING + STATUS_CHANGED
+    // atomically on every booking creation (previously the STATUS_CHANGED half only landed
+    // later, on a separate provider /confirm request, naturally time-spreading the two events).
+    // That doubles outbox volume at peak booking moments with zero time-spread, against this
+    // fixed-capacity serial drain worker — bump batch size proportionately (20 -> 50) rather
+    // than shortening fixedDelay or parallelizing dispatch (which would risk SMTP/FCM rate
+    // limits and the retry/DEAD-row semantics phase 2 relies on). Conservative, reversible.
+    private static final int BATCH_SIZE = 50;
     private static final int MAX_ATTEMPTS = 3;
     private static final int MAX_ERROR_LENGTH = 500;
 

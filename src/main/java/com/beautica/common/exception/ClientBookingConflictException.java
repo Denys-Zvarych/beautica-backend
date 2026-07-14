@@ -8,7 +8,7 @@ import org.springframework.http.HttpStatus;
 
 /**
  * Thrown by {@code BookingService} when an authenticated client attempts to create, or
- * reschedule into, a time window that overlaps a {@code PENDING}/{@code CONFIRMED} booking
+ * reschedule into, a time window that overlaps a {@code CONFIRMED} booking
  * the SAME client already holds — regardless of master or salon.
  *
  * <p>Distinct from the pre-existing generic {@code 409 "Slot not available"}

@@ -14,7 +14,7 @@ package com.beautica.notification.entity;
  */
 public enum OutboxEventType {
 
-    /** A new booking has been created and is awaiting confirmation. */
+    /** A new booking has been created and auto-confirmed (track 24.x — no approval step). */
     NEW_BOOKING,
 
     /** An existing booking changed status (e.g. CONFIRMED → COMPLETED). */
@@ -27,9 +27,9 @@ public enum OutboxEventType {
     INVITE,
 
     /**
-     * A client moved an existing PENDING/CONFIRMED booking to a new time (Phase 19.2).
-     * The booking is back in PENDING awaiting the provider's re-approval; the provider
-     * (master / salon-admin) is notified to re-confirm or decline at the new time.
+     * A client moved an existing CONFIRMED booking to a new time (Phase 19.2). Per the track
+     * 24.x auto-confirm state machine the booking stays CONFIRMED at the new time — the
+     * provider (master / salon-admin) is simply notified of the new time.
      */
     BOOKING_RESCHEDULED,
 

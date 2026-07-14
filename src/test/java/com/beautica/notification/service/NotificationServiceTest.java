@@ -81,6 +81,27 @@ class NotificationServiceTest {
         assertThat(bodyCaptor.getValue()).contains("Тест Клієнт").contains("Тест послуга");
     }
 
+    @Test
+    @DisplayName("notifyNewBooking falls back to the guest identity (no NPE) for a null-client guest booking")
+    void should_useGuestIdentity_when_notifyNewBookingForGuestBooking() {
+        // Guest (LINK) booking: null client (V89 chk_bookings_guest_fields). GuestBookingService
+        // enqueues NEW_BOOKING for EVERY guest booking, so an unguarded booking.getClient()
+        // dereference here NPEs the drain worker on 100% of guest bookings — the master is never
+        // notified at all and the outbox row goes DEAD. Falls back to guestName/guestSurname,
+        // mirroring BookingDetailResponse.from.
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildGuestBookingMock(masterUserId, "Олена", "Коваль");
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyNewBooking(booking);
+
+        verify(emailService).sendNewBookingEmail(anyString(), eq(booking));
+        verify(pushService).sendToUser(eq(masterUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .as("push body must carry the guest's name, not throw or read a null client")
+                .contains("Олена Коваль");
+    }
+
     // -------------------------------------------------------------------------
     // notifyBookingStatusChanged — CONFIRMED
     // -------------------------------------------------------------------------
@@ -119,7 +140,7 @@ class NotificationServiceTest {
         verify(emailService).sendBookingDeclinedEmail(anyString(), eq(booking));
         verify(pushService).sendToUser(
                 eq(clientUserId),
-                eq("Бронювання відхилено"),
+                eq("Бронювання скасовано"),
                 anyString(),
                 eq(Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId))
         );
@@ -173,6 +194,25 @@ class NotificationServiceTest {
                 anyString(),
                 eq(Map.of("type", "CLIENT_CANCELLED", "bookingId", bookingId))
         );
+    }
+
+    @Test
+    @DisplayName("notifyClientCancelled falls back to the guest identity (no NPE) for a null-client guest booking")
+    void should_useGuestIdentity_when_notifyClientCancelledForGuestBooking() {
+        // CLIENT_CANCELLED is enqueued ONLY by BookingCancellationService.cancel — the public
+        // guest cancel-link flow — so booking.getClient() is guaranteed null on every real call
+        // of this method. An unguarded dereference here NPEs 100% of the time.
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildGuestBookingMock(masterUserId, "Іван", "Петренко");
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyClientCancelled(booking);
+
+        verify(emailService).sendClientCancelledEmail(anyString(), eq(booking));
+        verify(pushService).sendToUser(eq(masterUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .as("push body must carry the guest's name, not throw or read a null client")
+                .contains("Іван Петренко");
     }
 
     // -------------------------------------------------------------------------
@@ -309,6 +349,34 @@ class NotificationServiceTest {
         lenient().when(clientUser.getFirstName()).thenReturn("Тест");
         lenient().when(clientUser.getLastName()).thenReturn("Клієнт");
         when(booking.getClient()).thenReturn(clientUser);
+
+        User masterUser = mock(User.class);
+        lenient().when(masterUser.getId()).thenReturn(masterUserId);
+        lenient().when(masterUser.getEmail()).thenReturn("master@example.com");
+        Master master = mock(Master.class);
+        lenient().when(master.getUser()).thenReturn(masterUser);
+        lenient().when(booking.getMaster()).thenReturn(master);
+
+        ServiceDefinition sd = mock(ServiceDefinition.class);
+        lenient().when(sd.getName()).thenReturn("Тест послуга");
+        MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
+        lenient().when(msa.getServiceDefinition()).thenReturn(sd);
+        lenient().when(booking.getMasterService()).thenReturn(msa);
+
+        return booking;
+    }
+
+    /**
+     * Builds a guest (LINK) booking mock: {@code getClient()} returns null (V89
+     * chk_bookings_guest_fields), and {@code getGuestName}/{@code getGuestSurname} carry the
+     * OTP-verified guest identity instead.
+     */
+    private Booking buildGuestBookingMock(UUID masterUserId, String guestName, String guestSurname) {
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(UUID.randomUUID());
+        when(booking.getClient()).thenReturn(null);
+        lenient().when(booking.getGuestName()).thenReturn(guestName);
+        lenient().when(booking.getGuestSurname()).thenReturn(guestSurname);
 
         User masterUser = mock(User.class);
         lenient().when(masterUser.getId()).thenReturn(masterUserId);

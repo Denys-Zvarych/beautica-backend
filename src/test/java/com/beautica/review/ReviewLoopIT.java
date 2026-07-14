@@ -7,7 +7,6 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.BusinessException;
-import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import com.beautica.notification.service.PushNotificationService;
@@ -251,17 +250,17 @@ class ReviewLoopIT extends AbstractIntegrationTest {
     // ── guest path (audit-fix pin): an account-less booking never yields a review prompt ─
 
     /**
-     * End-to-end truth for the account-less (LINK) path — and a discrepancy this regression net
-     * surfaced. The completion service loads the booking via
-     * {@code BookingRepository.findByIdWithFullGraph}, whose JPQL {@code JOIN FETCH b.client} is an
-     * INNER join. A guest booking has {@code client_id = NULL}, so it is not returned — completion
-     * 404s before the 18.3 {@code if (saved.getClient() != null)} guard is ever reached. The guard is
-     * therefore unreachable via this path (see QA finding). The guarantee that matters end-to-end
-     * still holds and is what this test pins: an account-less booking produces ZERO
-     * {@code REVIEW_REQUESTED} rows and no client review email — no account, no prompt, no mail.
+     * End-to-end truth for the account-less (LINK) path (track 24.7 audit — CRITICAL finding 1
+     * fixed). {@code BookingRepository.findByIdWithFullGraph} now {@code LEFT JOIN FETCH}es
+     * {@code b.client} (was an INNER join that silently excluded every null-client row), so a
+     * guest booking completes normally instead of 404ing. The 18.3
+     * {@code if (saved.getClient() != null)} guard is what actually keeps this test's guarantee:
+     * an account-less booking still produces ZERO {@code REVIEW_REQUESTED} rows and no client
+     * review email — no account, no prompt, no mail — it just now reaches that guard via a
+     * successful completion rather than never reaching it at all.
      */
     @Test
-    @DisplayName("completing an account-less guest (LINK) booking never produces a REVIEW_REQUESTED row or a client review email (the null-client path yields no prompt)")
+    @DisplayName("completing an account-less guest (LINK) booking succeeds but never produces a REVIEW_REQUESTED row or a client review email (the null-client path yields no prompt)")
     void should_yieldNoReviewPrompt_forAccountLessGuestBooking() {
         UUID masterId = createIndependentMaster("loop-guest-master-" + System.nanoTime() + "@beautica.test");
         UUID masterUserId = masterUserId(masterId);
@@ -275,11 +274,15 @@ class ReviewLoopIT extends AbstractIntegrationTest {
                 .as("the guest LINK booking must be persisted with a null client")
                 .isEqualTo(1L);
 
-        // The completion full-graph fetch inner-joins the client, so a null-client booking is not
-        // loadable → NotFoundException. (Documents the 18.3 guard's unreachability via this path.)
-        assertThatThrownBy(() -> bookingService.completeBooking(masterUserId, bookingId))
-                .as("guest booking is not loadable by the completion full-graph fetch (INNER JOIN client)")
-                .isInstanceOf(NotFoundException.class);
+        // The completion full-graph fetch LEFT JOINs the client, so a null-client booking loads
+        // and completes normally — no NotFoundException.
+        assertThat(bookingService.completeBooking(masterUserId, bookingId))
+                .as("completing a guest booking must succeed now that the full-graph fetch LEFT "
+                        + "JOINs client, instead of 404ing")
+                .isNotNull();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .isEqualTo("COMPLETED");
 
         assertThat(countOutboxByType("REVIEW_REQUESTED", bookingId))
                 .as("an account-less booking must never enqueue a review prompt")

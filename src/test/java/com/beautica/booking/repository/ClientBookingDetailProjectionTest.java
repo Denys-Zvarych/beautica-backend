@@ -395,7 +395,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
         MasterServiceAssignment msa =
                 persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Massage", "MASSAGE");
-        Booking pending = persistBooking(master, msa, null, BookingStatus.PENDING,
+        Booking confirmed = persistBooking(master, msa, null, BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 5, 9, 0, 0, 0, ZoneOffset.UTC));
         persistBooking(master, msa, null, BookingStatus.COMPLETED,
                 OffsetDateTime.of(2026, 6, 6, 9, 0, 0, 0, ZoneOffset.UTC));
@@ -403,13 +403,13 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> filtered = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), BookingStatus.PENDING, PageRequest.of(0, 20));
+                clientUser.getId(), BookingStatus.CONFIRMED, PageRequest.of(0, 20));
         Page<ClientBookingDetailProjection> all = bookingRepository.findClientBookingDetails(
                 clientUser.getId(), null, PageRequest.of(0, 20));
 
         assertThat(filtered.getContent())
                 .extracting(ClientBookingDetailProjection::id)
-                .containsExactly(pending.getId());
+                .containsExactly(confirmed.getId());
         assertThat(all.getTotalElements()).isEqualTo(2);
     }
 
@@ -472,7 +472,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
         MasterServiceAssignment msa =
                 persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Waxing", "WAXING");
-        persistBooking(master, msa, null, BookingStatus.PENDING,
+        persistBooking(master, msa, null, BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 7, 9, 0, 0, 0, ZoneOffset.UTC));
         em.flush();
         em.clear();

@@ -338,7 +338,7 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         Master master = persistIndependentMaster(seededDistrictIds.get(0));
         MasterServiceAssignment service = persistService(master, "Manicure", "MANICURE", "300");
         // Only a non-COMPLETED booking exists.
-        persistBooking(client, master, service, BookingStatus.PENDING, "300", slot());
+        persistBooking(client, master, service, BookingStatus.CONFIRMED, "300", slot());
         em.flush();
         em.clear();
 

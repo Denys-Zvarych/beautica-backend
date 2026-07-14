@@ -62,7 +62,7 @@ class BookingResponseTest {
         when(booking.getClient()).thenReturn(client);
         when(booking.getMaster()).thenReturn(master);
         when(booking.getMasterService()).thenReturn(masterService);
-        when(booking.getStatus()).thenReturn(BookingStatus.PENDING);
+        when(booking.getStatus()).thenReturn(BookingStatus.CONFIRMED);
         when(booking.getStartsAt()).thenReturn(STARTS_AT);
         when(booking.getEndsAt()).thenReturn(ENDS_AT);
         when(booking.getPriceAtBooking()).thenReturn(new BigDecimal("350.00"));
@@ -80,7 +80,7 @@ class BookingResponseTest {
         assertThat(response.masterId()).isEqualTo(masterId);
         assertThat(response.masterServiceId()).isEqualTo(masterServiceId);
         assertThat(response.serviceName()).isEqualTo("Манікюр");
-        assertThat(response.status()).isEqualTo(BookingStatus.PENDING);
+        assertThat(response.status()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(response.priceAtBooking()).isEqualByComparingTo(new BigDecimal("350.00"));
         assertThat(response.durationMinutesAtBooking()).isEqualTo(60);
 
@@ -129,7 +129,7 @@ class BookingResponseTest {
         when(winterBooking.getClient()).thenReturn(client);
         when(winterBooking.getMaster()).thenReturn(master);
         when(winterBooking.getMasterService()).thenReturn(masterService);
-        when(winterBooking.getStatus()).thenReturn(BookingStatus.PENDING);
+        when(winterBooking.getStatus()).thenReturn(BookingStatus.CONFIRMED);
         when(winterBooking.getStartsAt()).thenReturn(winterStartsAt);
         when(winterBooking.getEndsAt()).thenReturn(winterStartsAt.plusHours(1));
         when(winterBooking.getPriceAtBooking()).thenReturn(new BigDecimal("350.00"));

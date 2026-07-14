@@ -482,7 +482,7 @@ public class MasterService {
      *
      * <p><b>Known limitation (documented, not fixed here):</b> this only reassigns
      * {@code master.salon_id}. There is no booking-conflict guard — a master with existing
-     * future {@code PENDING}/{@code CONFIRMED} bookings will silently appear under the new salon
+     * future {@code CONFIRMED} bookings will silently appear under the new salon
      * everywhere post-rotation, exactly like the already-deferred "block deactivation until
      * futureBookingCount is exposed" item for {@link #deactivateMaster}. Do not block callers on
      * this; track it as a follow-up once {@code futureBookingCount} exists.

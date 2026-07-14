@@ -21,6 +21,15 @@ import java.util.UUID;
  * actors — the master needs the client's name on their calendar. No field-level role
  * differentiation is applied. If {@code canViewBooking} scope ever widens, audit this DTO.
  *
+ * <p><b>Guest (LINK) bookings.</b> A guest booking has no registered account —
+ * {@code client_id} is {@code NULL} (V89 {@code chk_bookings_guest_fields}) — so {@code clientId}
+ * is nullable here. {@code clientFirstName}/{@code clientLastName} fall back to the booking's
+ * OTP-verified {@code guestName}/{@code guestSurname} so the owning provider (the only actor who
+ * can ever reach a guest booking's detail view — {@code enforceCanViewBooking} never admits a
+ * CLIENT actor onto a null-client booking) still has a name to put on their calendar.
+ * {@code guestPhone} is deliberately NOT surfaced by this DTO — it is SMS-transport PII, not
+ * calendar-display PII, and has no field here to leak into.
+ *
  * <p><b>Phase 19.3 — client enrichment.</b> Adds the master's avatar/type, the (nullable)
  * salon name, the master's discovery address (district-primary locality labels + street/
  * building), the service category, and {@code canReview}. {@code canReview} and the resolved
@@ -83,13 +92,16 @@ public record BookingDetailResponse(
         Master master = booking.getMaster();
         User masterUser = master.getUser();
         Salon salon = master.getSalon();
+        User client = booking.getClient();
 
         String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
         String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
 
         return new BookingDetailResponse(
                 booking.getId(),
-                booking.getClient().getId(),
+                // Guest (LINK) bookings have no registered client (V89 chk_bookings_guest_fields) —
+                // clientId is null for them, mirroring BookingResponse.from's guard.
+                client != null ? client.getId() : null,
                 master.getId(),
                 booking.getMasterService().getId(),
                 booking.getMasterService().getServiceDefinition().getName(),
@@ -99,8 +111,10 @@ public record BookingDetailResponse(
                 booking.getPriceAtBooking(),
                 booking.getDurationMinutesAtBooking(),
                 booking.getCreatedAt().atOffset(ZoneOffset.UTC),
-                booking.getClient().getFirstName(),
-                booking.getClient().getLastName(),
+                // Fall back to the OTP-verified guest identity so the owning provider still sees
+                // a name on their calendar instead of null — guestPhone is intentionally excluded.
+                client != null ? client.getFirstName() : booking.getGuestName(),
+                client != null ? client.getLastName() : booking.getGuestSurname(),
                 masterUser.getFirstName(),
                 masterUser.getLastName(),
                 booking.getClientComment(),
