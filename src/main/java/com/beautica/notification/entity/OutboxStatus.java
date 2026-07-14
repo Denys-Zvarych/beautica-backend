@@ -19,9 +19,12 @@ public enum OutboxStatus {
     PENDING,
 
     /**
-     * Row has been claimed by a scheduler instance via {@code FOR UPDATE SKIP LOCKED}
-     * and is being processed. Rows stuck in this state after a crash are detected
-     * by the dead-letter sweep job.
+     * Row has been claimed by a scheduler instance via {@code FOR UPDATE SKIP LOCKED} —
+     * atomically, in the same statement as the claim (see
+     * {@link com.beautica.notification.repository.NotificationOutboxRepository#claimPendingBatch(int)}) —
+     * and is being processed. Rows stuck in this state after a crash (e.g. mid-rollout on
+     * Railway) are reclaimed by
+     * {@link com.beautica.notification.service.NotificationOutboxReclaimJob}.
      */
     PROCESSING,
 

@@ -106,12 +106,19 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
     // ── MEDIUM-2 ──────────────────────────────────────────────────────────────
 
     /**
-     * MEDIUM-2: Verifies that {@code claimPendingBatch} returns only PENDING rows
+     * MEDIUM-2: Verifies that {@code claimPendingBatch} claims only rows that WERE PENDING
      * and that they arrive in {@code created_at ASC} (oldest-first) order.
      *
      * <p>Rows are inserted with explicit {@code created_at} values one second apart via
      * {@link JdbcTemplate} to guarantee deterministic ordering regardless of clock
      * resolution inside the container.
+     *
+     * <p>Post atomic-claim fix (MEDIUM concurrency defect), a claimed row's returned
+     * {@code status} is {@link OutboxStatus#PROCESSING}, not {@code PENDING} — the claim
+     * statement flips it in the same transaction that claims it. This is asserted both in
+     * memory (the entity objects returned by the call) and independently via a fresh read
+     * through {@link JdbcTemplate}, to prove the flip is actually durable in the row, not just
+     * an artefact of Hibernate echoing back the RETURNING clause.
      */
     @Test
     @DisplayName("should_returnOnlyPendingRows_inCreatedAtAscOrder_when_mixedStatusRowsExist")
@@ -139,15 +146,24 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         // Act
         List<NotificationOutboxEntry> result = repo.claimPendingBatch(10);
 
-        // Assert — count, status, and ascending order.
+        // Assert — count, atomic status flip, and ascending order.
         assertThat(result).hasSize(3);
-        assertThat(result).allMatch(e -> e.getStatus() == OutboxStatus.PENDING);
+        assertThat(result)
+                .as("claim must flip status to PROCESSING atomically, not leave it PENDING")
+                .allMatch(e -> e.getStatus() == OutboxStatus.PROCESSING);
         assertThat(result)
                 .extracting(NotificationOutboxEntry::getId)
                 .containsExactly(pendingId1, pendingId2, pendingId3);
         assertThat(result)
                 .extracting(e -> e.getCreatedAt().toEpochMilli())
                 .isSorted();
+
+        // Independent DB-level read (bypassing the persistence context) proves the flip is
+        // durable within the transaction, not just an in-memory echo of the RETURNING clause.
+        List<String> statusesInDb = jdbcTemplate.queryForList(
+                "SELECT status FROM notification_outbox WHERE id IN (?, ?, ?)",
+                String.class, pendingId1, pendingId2, pendingId3);
+        assertThat(statusesInDb).containsOnly("PROCESSING");
     }
 
     // ── MEDIUM-3 ──────────────────────────────────────────────────────────────
@@ -378,6 +394,132 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         return count != null && count > 0;
     }
 
+    // ── Reclaim query (MEDIUM concurrency fix) ──────────────────────────────────
+
+    /**
+     * Verifies {@link NotificationOutboxRepository#reclaimStaleProcessingRows}: the crash-safety
+     * half of the MEDIUM concurrency fix. A {@code PROCESSING} row abandoned by a crashed
+     * instance must eventually become claimable again — otherwise the fix that stops duplicate
+     * sends (atomic claim-and-flip) would trade them for a worse bug: a stranded row that is
+     * NEVER retried.
+     *
+     * <p>Same {@code @Transactional(propagation = NOT_SUPPORTED)} + manual JDBC seeding/cleanup
+     * rationale as the purge-query tests above: {@code reclaimStaleProcessingRows} is
+     * {@code REQUIRES_NEW}, so seed rows must be committed (not left in the {@code @DataJpaTest}
+     * default rollback-only transaction) to be visible to it.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @DisplayName("should_resetToPending_when_staleProcessingRowIsBelowMaxAttempts")
+    void should_resetToPending_when_staleProcessingRowIsBelowMaxAttempts() {
+        // Arrange — a PROCESSING row with attempts=0, "updated" long before staleBefore.
+        Instant now = Instant.now();
+        Instant staleUpdatedAt = now.minus(java.time.Duration.ofHours(2));
+        Instant staleBefore = now.minus(java.time.Duration.ofHours(1));
+        UUID id = UUID.randomUUID();
+        insertOutboxRow(id, OutboxEventType.NEW_BOOKING, "PROCESSING", staleUpdatedAt, 0);
+
+        // Act — attempts(0)+1=1 < maxAttempts(3), so it must go back to PENDING, not DEAD.
+        int reclaimed = repo.reclaimStaleProcessingRows(staleBefore, 3, "reclaimed-below-max");
+
+        // Assert
+        assertThat(reclaimed).isEqualTo(1);
+        var row = jdbcTemplate.queryForMap(
+                "SELECT status, attempts, last_error FROM notification_outbox WHERE id = ?", id);
+        assertThat(row.get("status")).isEqualTo("PENDING");
+        assertThat(row.get("attempts")).isEqualTo(1);
+        assertThat(row.get("last_error")).isEqualTo("reclaimed-below-max");
+
+        jdbcTemplate.update("DELETE FROM notification_outbox WHERE id = ?", id);
+    }
+
+    /**
+     * A reclaim counts as a delivery attempt (same as a failed dispatch would). When that
+     * attempt would reach {@code maxAttempts}, the row must go straight to {@code DEAD} instead
+     * of back to {@code PENDING} — otherwise a "poison" entry that crashes the worker every time
+     * would loop claim → crash → reclaim forever instead of ever reaching the dead-letter state.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @DisplayName("should_setToDead_when_reclaimWouldReachMaxAttempts")
+    void should_setToDead_when_reclaimWouldReachMaxAttempts() {
+        // Arrange — attempts=2, so the reclaimed 3rd attempt hits maxAttempts(3) exactly.
+        Instant now = Instant.now();
+        Instant staleUpdatedAt = now.minus(java.time.Duration.ofHours(2));
+        Instant staleBefore = now.minus(java.time.Duration.ofHours(1));
+        UUID id = UUID.randomUUID();
+        insertOutboxRow(id, OutboxEventType.NEW_BOOKING, "PROCESSING", staleUpdatedAt, 2);
+
+        // Act
+        int reclaimed = repo.reclaimStaleProcessingRows(staleBefore, 3, "reclaimed-at-max");
+
+        // Assert
+        assertThat(reclaimed).isEqualTo(1);
+        var row = jdbcTemplate.queryForMap(
+                "SELECT status, attempts FROM notification_outbox WHERE id = ?", id);
+        assertThat(row.get("status")).isEqualTo("DEAD");
+        assertThat(row.get("attempts")).isEqualTo(3);
+
+        jdbcTemplate.update("DELETE FROM notification_outbox WHERE id = ?", id);
+    }
+
+    /**
+     * A {@code PROCESSING} row updated AFTER {@code staleBefore} is still legitimately being
+     * worked on by a live instance — it must NOT be reclaimed. Reclaiming it early would
+     * reintroduce exactly the duplicate-send bug the atomic claim fix closed.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @DisplayName("should_notReclaim_when_processingRowIsNewerThanStaleBefore")
+    void should_notReclaim_when_processingRowIsNewerThanStaleBefore() {
+        // Arrange — updated_at is AFTER staleBefore (recently claimed, still in flight).
+        Instant now = Instant.now();
+        Instant recentUpdatedAt = now.minus(java.time.Duration.ofMinutes(1));
+        Instant staleBefore = now.minus(java.time.Duration.ofHours(1));
+        UUID id = UUID.randomUUID();
+        insertOutboxRow(id, OutboxEventType.NEW_BOOKING, "PROCESSING", recentUpdatedAt, 0);
+
+        // Act
+        int reclaimed = repo.reclaimStaleProcessingRows(staleBefore, 3, "should-not-appear");
+
+        // Assert — untouched.
+        assertThat(reclaimed).isZero();
+        var row = jdbcTemplate.queryForMap(
+                "SELECT status, attempts FROM notification_outbox WHERE id = ?", id);
+        assertThat(row.get("status")).isEqualTo("PROCESSING");
+        assertThat(row.get("attempts")).isEqualTo(0);
+
+        jdbcTemplate.update("DELETE FROM notification_outbox WHERE id = ?", id);
+    }
+
+    /**
+     * Rows in any status OTHER than {@code PROCESSING} (PENDING, SENT, DEAD) must never be
+     * touched by the reclaim sweep, no matter how old {@code updated_at} is — the predicate is
+     * {@code status = 'PROCESSING'}, not merely "old".
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @DisplayName("should_notReclaim_when_rowStatusIsNotProcessing")
+    void should_notReclaim_when_rowStatusIsNotProcessing() {
+        // Arrange — an old PENDING row (e.g. legitimately still waiting for its next drain tick).
+        Instant now = Instant.now();
+        Instant staleUpdatedAt = now.minus(java.time.Duration.ofHours(2));
+        Instant staleBefore = now.minus(java.time.Duration.ofHours(1));
+        UUID id = UUID.randomUUID();
+        insertOutboxRow(id, OutboxEventType.NEW_BOOKING, "PENDING", staleUpdatedAt, 0);
+
+        // Act
+        int reclaimed = repo.reclaimStaleProcessingRows(staleBefore, 3, "should-not-appear");
+
+        // Assert — untouched.
+        assertThat(reclaimed).isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM notification_outbox WHERE id = ?", String.class, id))
+                .isEqualTo("PENDING");
+
+        jdbcTemplate.update("DELETE FROM notification_outbox WHERE id = ?", id);
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /**
@@ -394,15 +536,27 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * @param createdAt the timestamp to stamp on the row
      */
     private void insertOutboxRow(UUID id, OutboxEventType eventType, String status, Instant createdAt) {
+        insertOutboxRow(id, eventType, status, createdAt, 0);
+    }
+
+    /**
+     * Overload accepting an explicit {@code attempts} value — used by the reclaim tests, which
+     * need to seed a row already at {@code MAX_ATTEMPTS - 1} to prove the DEAD-vs-PENDING branch.
+     * {@code createdAt} stamps both {@code created_at} and {@code updated_at} (matching the
+     * 4-arg overload); the reclaim tests only care that {@code updated_at} is stale, and this
+     * satisfies that identically.
+     */
+    private void insertOutboxRow(UUID id, OutboxEventType eventType, String status, Instant createdAt, int attempts) {
         jdbcTemplate.update(
                 """
                 INSERT INTO notification_outbox
                     (id, event_type, aggregate_id, status, attempts, created_at, updated_at)
-                VALUES (?, ?, gen_random_uuid(), ?, 0, ?, ?)
+                VALUES (?, ?, gen_random_uuid(), ?, ?, ?, ?)
                 """,
                 id,
                 eventType.name(),
                 status,
+                attempts,
                 java.sql.Timestamp.from(createdAt),
                 java.sql.Timestamp.from(createdAt)
         );

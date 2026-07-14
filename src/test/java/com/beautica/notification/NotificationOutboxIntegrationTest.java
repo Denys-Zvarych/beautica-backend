@@ -1,5 +1,9 @@
 package com.beautica.notification;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
@@ -19,6 +23,7 @@ import com.beautica.notification.service.NotificationService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.slf4j.LoggerFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -343,6 +348,103 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
         verify(notificationService, times(1)).notifyBookingRescheduled(any(Booking.class));
     }
 
+    @Test
+    @DisplayName("persistResults — a poison entry's persist failure (row deleted concurrently) does not roll back sibling entries' SENT status, and is logged rather than rethrown")
+    void should_persistSiblingResults_when_oneEntryFailsToPersist() throws Exception {
+        // Arrange — 3 real bookings so dispatch() (Phase 2, mocked NotificationService) succeeds
+        // for all three, giving each entry a deterministic in-memory SENT outcome before Phase 3
+        // (persist) ever runs. Distinct back-to-back hours on the same master avoid slot conflicts.
+        String clientToken = createClientAndGetToken("integ-outbox-poison-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-outbox-poison-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        ZonedDateTime base = ZonedDateTime.now().plusDays(3).withHour(9).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId1 = createBookingAt(clientToken, masterId, masterServiceId, base);
+        UUID bookingId2 = createBookingAt(clientToken, masterId, masterServiceId, base.plusHours(1));
+        UUID bookingId3 = createBookingAt(clientToken, masterId, masterServiceId, base.plusHours(2));
+
+        // The real POST path above already enqueued its own NEW_BOOKING/STATUS_CHANGED rows for
+        // each booking — drop them so this test's assertions target exactly the 3 controlled
+        // entries seeded below, one per booking.
+        outboxRepository.deleteAll();
+        outboxRepository.flush();
+
+        NotificationOutboxEntry survivor1 = outboxRepository.saveAndFlush(NotificationOutboxEntry.builder()
+                .eventType(OutboxEventType.NEW_BOOKING)
+                .aggregateId(bookingId1)
+                .build());
+        NotificationOutboxEntry poison = outboxRepository.saveAndFlush(NotificationOutboxEntry.builder()
+                .eventType(OutboxEventType.NEW_BOOKING)
+                .aggregateId(bookingId2)
+                .build());
+        NotificationOutboxEntry survivor2 = outboxRepository.saveAndFlush(NotificationOutboxEntry.builder()
+                .eventType(OutboxEventType.NEW_BOOKING)
+                .aggregateId(bookingId3)
+                .build());
+
+        Logger workerLogger = (Logger) LoggerFactory.getLogger(NotificationOutboxDrainWorker.class);
+        ListAppender<ILoggingEvent> logAppender = new ListAppender<>();
+        logAppender.start();
+        workerLogger.addAppender(logAppender);
+
+        try {
+            // Act — drive the three real drain phases individually (instead of one drain() call)
+            // so the concurrent fault can be injected at the exact point this fix targets: after
+            // Phase 1 claims + Phase 2 dispatches (both already succeeded in memory) but before
+            // Phase 3 persists. This mirrors the production race persistResults()'s javadoc names
+            // explicitly — purgeStaleOutboxRows() (or a crashed/reclaiming sibling instance)
+            // deleting/reclaiming a row out from under a drain that is already in flight.
+            List<NotificationOutboxEntry> batch = drainWorker.claimBatch();
+            assertThat(batch)
+                    .as("all 3 seeded PENDING rows must be claimed and flipped to PROCESSING")
+                    .hasSize(3);
+
+            // Simulate the concurrent fault: the poison row disappears out from under the claimed
+            // in-memory entity between claim (Phase 1, already committed) and persist (Phase 3).
+            jdbcTemplate.update("DELETE FROM notification_outbox WHERE id = ?", poison.getId());
+
+            var results = drainWorker.dispatchAll(batch);
+
+            // Sanity — Phase 2 (no DB) succeeded for all 3, including the soon-to-be-poisoned
+            // entry: its SENT outcome was already decided in memory before the DB fault occurs.
+            verify(notificationService, times(3)).notifyNewBooking(any(Booking.class));
+
+            // Phase 3 — must not blow up even though the poison entry's persistOne() will throw.
+            drainWorker.persistResults(results);
+        } finally {
+            workerLogger.detachAppender(logAppender);
+        }
+
+        // Assert — the two untouched siblings reached SENT. Under the pre-fix behaviour (one
+        // shared REQUIRES_NEW transaction for the whole batch), the poison entry's failed UPDATE
+        // would have aborted that shared transaction and rolled these back to PENDING too.
+        NotificationOutboxEntry reloadedSurvivor1 = outboxRepository.findById(survivor1.getId()).orElseThrow();
+        assertThat(reloadedSurvivor1.getStatus())
+                .as("sibling 1 must reach SENT despite the poison entry's persist failure")
+                .isEqualTo(OutboxStatus.SENT);
+        NotificationOutboxEntry reloadedSurvivor2 = outboxRepository.findById(survivor2.getId()).orElseThrow();
+        assertThat(reloadedSurvivor2.getStatus())
+                .as("sibling 2 must reach SENT despite the poison entry's persist failure")
+                .isEqualTo(OutboxStatus.SENT);
+
+        // The poison row was genuinely deleted, not silently resurrected by the failed merge().
+        assertThat(outboxRepository.findById(poison.getId()))
+                .as("poison entry's row must remain deleted — a failed merge() must not resurrect it")
+                .isEmpty();
+
+        // The failure was logged, not swallowed. persistResults() returning normally above already
+        // proves "not rethrown" — this pins the "logged" half of the contract.
+        assertThat(logAppender.list)
+                .as("persistResults must log the poison entry's failure via log.error, not silently drop it")
+                .anySatisfy(event -> {
+                    assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+                    assertThat(event.getFormattedMessage())
+                            .contains(poison.getId().toString())
+                            .contains("ObjectOptimisticLockingFailureException");
+                });
+    }
+
     // ── helpers (copied verbatim from BookingIntegrationTest — extraction is a
     //    backlog follow-up flagged by the QA audit) ──────────────────────────────
 
@@ -426,6 +528,10 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
 
     private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId) throws Exception {
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        return createBookingAt(clientToken, masterId, masterServiceId, startsAt);
+    }
+
+    private UUID createBookingAt(String clientToken, UUID masterId, UUID masterServiceId, ZonedDateTime startsAt) throws Exception {
         var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
 
         ResponseEntity<String> resp = restTemplate.exchange(

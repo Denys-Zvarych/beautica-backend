@@ -195,6 +195,7 @@ public class BookingService {
                 p.clientLastName(),
                 p.masterFirstName(),
                 p.masterLastName(),
+                p.masterProfessionalTitle(),
                 p.clientComment(),
                 p.providerComment(),
                 p.clientCancellationNote(),
@@ -205,6 +206,7 @@ public class BookingService {
                 labels.districtLabel(p.discoveryDistrictId()),
                 p.street(),
                 p.buildingNo(),
+                p.locationNote(),
                 p.categoryName(),
                 // Defensive only: this projection is CLIENT-scoped (WHERE client_id = :clientId),
                 // so p.clientId() is always non-null in practice — never a guest booking.

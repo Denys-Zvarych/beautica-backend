@@ -222,6 +222,19 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * One-query, N+1-free projection for {@code GET /bookings/me}: every field
      * {@link com.beautica.booking.dto.BookingDetailResponse} needs for a client row,
      * plus a {@code reviewExists} flag via {@code LEFT JOIN Review}.
+     * {@code mu.professionalTitle} rides the same {@code JOIN m.user mu} already used for
+     * {@code mu.firstName}/{@code mu.lastName} — no additional join, and the column is
+     * nullable (a master may never have set a title).
+     *
+     * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
+     * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
+     * — salon-presence wins outright, even when the salon's own column is {@code NULL}. This
+     * mirrors {@link com.beautica.booking.dto.BookingDetailResponse#from} exactly: {@code salon
+     * != null ? salon.getX() : masterUser.getX()}. <b>Do not use {@code COALESCE(s.X, mu.X)}
+     * here</b> — {@code COALESCE} falls through to the master's own value whenever the salon's
+     * column is {@code NULL}, which for a salon-employed master leaks the master's personal
+     * data (e.g. their home door code) onto a salon booking. Riding the same
+     * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
      *
      * <p>{@code statusFilter} is optional: when {@code null} the
      * {@code (:statusFilter IS NULL OR b.status = :statusFilter)} idiom matches all rows
@@ -258,16 +271,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
                 b.client.lastName,
                 mu.firstName,
                 mu.lastName,
+                mu.professionalTitle,
                 b.clientComment,
                 b.providerComment,
                 b.clientCancellationNote,
                 mu.avatarUrl,
                 mu.role,
                 s.name,
-                COALESCE(s.cityId, mu.cityId),
-                COALESCE(s.districtId, mu.districtId),
-                COALESCE(s.street, mu.street),
-                COALESCE(s.buildingNo, mu.buildingNo),
+                CASE WHEN s.id IS NOT NULL THEN s.cityId ELSE mu.cityId END,
+                CASE WHEN s.id IS NOT NULL THEN s.districtId ELSE mu.districtId END,
+                CASE WHEN s.id IS NOT NULL THEN s.street ELSE mu.street END,
+                CASE WHEN s.id IS NOT NULL THEN s.buildingNo ELSE mu.buildingNo END,
+                CASE WHEN s.id IS NOT NULL THEN s.locationNote ELSE mu.locationNote END,
                 sd.category,
                 CASE WHEN r.id IS NOT NULL THEN true ELSE false END
             )

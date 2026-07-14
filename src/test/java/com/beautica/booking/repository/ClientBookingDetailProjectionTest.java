@@ -2,6 +2,7 @@ package com.beautica.booking.repository;
 
 import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
+import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
@@ -249,6 +250,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         UUID masterDistrictId = tax[1];
         User masterUser = persistMasterUser(
                 masterCityId, masterDistrictId, "Khreschatyk", "10", "https://cdn.test/avatar.png");
+        masterUser.setLocationNote("Ring the bell twice");
         Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
         MasterServiceAssignment msa =
                 persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Manicure", "MANICURE");
@@ -273,6 +275,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         ClientBookingDetailProjection::discoveryDistrictId,
                         ClientBookingDetailProjection::street,
                         ClientBookingDetailProjection::buildingNo,
+                        ClientBookingDetailProjection::locationNote,
                         ClientBookingDetailProjection::categoryName,
                         ClientBookingDetailProjection::reviewExists)
                 .containsExactly(
@@ -285,6 +288,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         masterDistrictId,
                         "Khreschatyk",
                         "10",
+                        "Ring the bell twice",
                         "MANICURE",
                         false);
     }
@@ -311,15 +315,18 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                 .districtId(salonDistrictId)
                 .street("Volodymyrska")
                 .buildingNo("55")
+                .locationNote("3rd floor, door code 1234")
                 .isActive(true)
                 .build();
         em.persist(salon);
 
-        // Master's own user row carries DIFFERENT locality to prove the salon link wins.
-        // masterType is sourced from the master user's role, so it must be SALON_MASTER here.
+        // Master's own user row carries DIFFERENT locality AND a DIFFERENT locationNote to
+        // prove the salon link wins for both — a client must never see one provider's street
+        // paired with another provider's door code.
         User masterUser = persistMasterUser(
                 Role.SALON_MASTER, masterOwnTax[0], masterOwnTax[1],
                 "OwnStreet", "99", "https://cdn.test/salon-master.png");
+        masterUser.setLocationNote("Master's own note - must NOT surface for a salon booking");
         Master master = persistMaster(masterUser, salon, MasterType.SALON_MASTER);
         MasterServiceAssignment msa =
                 persistService(master, OwnerType.SALON, salon.getId(), "Pedicure", "PEDICURE");
@@ -341,6 +348,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         ClientBookingDetailProjection::discoveryDistrictId,
                         ClientBookingDetailProjection::street,
                         ClientBookingDetailProjection::buildingNo,
+                        ClientBookingDetailProjection::locationNote,
                         ClientBookingDetailProjection::categoryName)
                 .containsExactly(
                         "Glamour Studio",
@@ -349,7 +357,132 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         salonDistrictId,
                         "Volodymyrska",
                         "55",
+                        "3rd floor, door code 1234",
                         "PEDICURE");
+    }
+
+    // ── salon-employed master, salon has NO note (COALESCE-fallthrough regression) ─
+    //
+    // HIGH security finding: `COALESCE(s.X, mu.X)` falls through to the master's own
+    // column whenever the salon's column is NULL — the common case, since most salons
+    // never fill in an address/note. For a salon-employed master this silently leaked
+    // the master's PERSONAL street/buildingNo/locationNote (e.g. their home door code)
+    // onto a SALON booking. `BookingDetailResponse.from` (the entity path) never had
+    // this bug — its ternary (`salon != null ? salon.getX() : masterUser.getX()`) picks
+    // the salon's value outright, even when null. The two tests below pin the fixed
+    // `CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END` projection rule and prove it
+    // now agrees with the entity path.
+
+    @Test
+    @DisplayName("projection returns NULL locality/address fields — never the master's own — "
+            + "when the salon-employed master's salon has no note/address set")
+    void should_returnNullFields_when_salonEmployedAndSalonFieldsAreNull() {
+        User ownerUser = new User(
+                "owner-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash", Role.SALON_OWNER, "Owner", "Person", "+380503333333");
+        em.persist(ownerUser);
+
+        // Salon deliberately leaves cityId/districtId/street/buildingNo/locationNote unset
+        // (NULL) — the common case for a salon that never filled in its address.
+        Salon salon = Salon.builder()
+                .owner(ownerUser)
+                .name("Bare Studio")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+
+        // Master's own user row carries a FULL address AND a personal locationNote — this
+        // must NOT surface for a salon booking, no matter how "empty" the salon's row is.
+        UUID[] masterOwnTax = persistTaxonomy();
+        User masterUser = persistMasterUser(
+                Role.SALON_MASTER, masterOwnTax[0], masterOwnTax[1],
+                "MasterHomeStreet", "42", "https://cdn.test/salon-master-2.png");
+        masterUser.setLocationNote("Master's home door code - must NOT surface for a salon booking");
+        Master master = persistMaster(masterUser, salon, MasterType.SALON_MASTER);
+        MasterServiceAssignment msa =
+                persistService(master, OwnerType.SALON, salon.getId(), "Haircut", "HAIR");
+        persistBooking(master, msa, salon, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 8, 12, 0, 0, 0, ZoneOffset.UTC));
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).hasSize(1);
+        ClientBookingDetailProjection p = page.getContent().get(0);
+        assertThat(p)
+                .extracting(
+                        ClientBookingDetailProjection::salonName,
+                        ClientBookingDetailProjection::discoveryCityId,
+                        ClientBookingDetailProjection::discoveryDistrictId,
+                        ClientBookingDetailProjection::street,
+                        ClientBookingDetailProjection::buildingNo,
+                        ClientBookingDetailProjection::locationNote)
+                .containsExactly(
+                        "Bare Studio",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null);
+    }
+
+    @Test
+    @DisplayName("entity path (BookingDetailResponse.from) and projection path "
+            + "(findClientBookingDetails) agree on street/buildingNo/locationNote "
+            + "for the same booking when the salon has no note/address")
+    void should_matchEntityPathValues_when_salonEmployedAndSalonNoteIsNull() {
+        User ownerUser = new User(
+                "owner-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash", Role.SALON_OWNER, "Owner", "Person", "+380504444444");
+        em.persist(ownerUser);
+
+        Salon salon = Salon.builder()
+                .owner(ownerUser)
+                .name("Parity Studio")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+
+        UUID[] masterOwnTax = persistTaxonomy();
+        User masterUser = persistMasterUser(
+                Role.SALON_MASTER, masterOwnTax[0], masterOwnTax[1],
+                "AnotherHomeStreet", "7", "https://cdn.test/salon-master-3.png");
+        masterUser.setLocationNote("Another personal note - must NOT surface");
+        Master master = persistMaster(masterUser, salon, MasterType.SALON_MASTER);
+        MasterServiceAssignment msa =
+                persistService(master, OwnerType.SALON, salon.getId(), "Coloring", "HAIR");
+        Booking booking = persistBooking(master, msa, salon, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 9, 12, 0, 0, 0, ZoneOffset.UTC));
+
+        // Flush so JPA auditing populates booking.createdAt (a @PrePersist callback fired at
+        // flush time) before the entity path reads it — but don't clear yet, so the graph
+        // below (master/user/salon) is still the exact in-memory objects, not lazy proxies.
+        em.flush();
+
+        BookingDetailResponse entityResponse =
+                BookingDetailResponse.from(booking, false, "Kyiv", "Podil");
+
+        em.clear();
+
+        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, PageRequest.of(0, 20));
+        ClientBookingDetailProjection projection = page.getContent().get(0);
+
+        assertThat(projection.street())
+                .as("street must agree between entity and projection paths")
+                .isEqualTo(entityResponse.street())
+                .isNull();
+        assertThat(projection.buildingNo())
+                .as("buildingNo must agree between entity and projection paths")
+                .isEqualTo(entityResponse.buildingNo())
+                .isNull();
+        assertThat(projection.locationNote())
+                .as("locationNote must agree between entity and projection paths "
+                        + "(and must NOT leak the master's personal note)")
+                .isEqualTo(entityResponse.locationNote())
+                .isNull();
     }
 
     // ── reviewExists via LEFT JOIN Review (OneToOne — no row fan-out) ─────────────

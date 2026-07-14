@@ -82,6 +82,17 @@ server:
     # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.
     max-swallow-size: 5MB
 
+notification:
+  outbox:
+    reclaim:
+      # Minimum age (from updated_at) before a PROCESSING notification_outbox row is treated as
+      # stranded by a crashed/killed instance (most commonly a Railway rolling-deploy teardown
+      # mid-dispatch) and reclaimed back to PENDING (or DEAD if retries are exhausted) by
+      # NotificationOutboxReclaimJob. Must comfortably exceed NotificationOutboxDrainWorker's
+      # worst-case Phase 2 dispatch window for a full batch (~33 min at BATCH_SIZE=50) — see
+      # NotificationOutboxDrainWorker#drain() javadoc.
+      stale-claim-threshold: 60m
+
 management:
   endpoints:
     web:

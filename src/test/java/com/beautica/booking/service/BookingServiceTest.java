@@ -1404,6 +1404,56 @@ class BookingServiceTest {
         verify(bookingRepository).findClientBookingDetails(clientId, BookingStatus.CONFIRMED, pageable);
     }
 
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRow(
+            String masterProfessionalTitle, String locationNote) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                masterProfessionalTitle,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                locationNote,
+                "MANICURE", false);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) surfaces masterProfessionalTitle and locationNote from the projection when set")
+    void should_surfaceTitleAndLocationNote_when_clientProjectionRowHasBoth() {
+        Pageable pageable = Pageable.unpaged();
+        var row = clientProjectionRow("Перукар-стиліст", "3-й поверх, код 1234");
+        when(bookingRepository.findClientBookingDetails(clientId, null, pageable))
+                .thenReturn(new PageImpl<>(List.of(row)));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
+
+        assertThat(result.data()).hasSize(1);
+        assertThat(result.data().get(0).masterProfessionalTitle()).isEqualTo("Перукар-стиліст");
+        assertThat(result.data().get(0).locationNote()).isEqualTo("3-й поверх, код 1234");
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) surfaces null masterProfessionalTitle/locationNote (not NPE) when the projection row has neither")
+    void should_returnNullTitleAndLocationNote_when_clientProjectionRowHasNeither() {
+        Pageable pageable = Pageable.unpaged();
+        var row = clientProjectionRow(null, null);
+        when(bookingRepository.findClientBookingDetails(clientId, null, pageable))
+                .thenReturn(new PageImpl<>(List.of(row)));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
+
+        assertThat(result.data()).hasSize(1);
+        assertThat(result.data().get(0).masterProfessionalTitle()).isNull();
+        assertThat(result.data().get(0).locationNote()).isNull();
+    }
+
     @Test
     @DisplayName("INDEPENDENT_MASTER receives bookings from the master-scoped repository method")
     void should_returnMasterBookings_when_independentMasterLists() {
@@ -1585,6 +1635,7 @@ class BookingServiceTest {
         Master enriched = buildEnrichedMaster(
                 MasterType.INDEPENDENT_MASTER, Role.INDEPENDENT_MASTER,
                 "https://cdn.test/avatar.png", cityId, districtId, "Khreschatyk", "10");
+        enriched.getUser().setLocationNote("Ring the bell twice");
         MasterServiceAssignment enrichedMsa = buildMsa(masterServiceId, enriched, serviceDef, null, null);
         Booking booking = buildBooking(bookingId, client, enriched, enrichedMsa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
@@ -1604,6 +1655,7 @@ class BookingServiceTest {
                         BookingDetailResponse::districtLabel,
                         BookingDetailResponse::street,
                         BookingDetailResponse::buildingNo,
+                        BookingDetailResponse::locationNote,
                         BookingDetailResponse::canReview)
                 .containsExactly(
                         "https://cdn.test/avatar.png",
@@ -1613,6 +1665,7 @@ class BookingServiceTest {
                         "Shevchenkivskyi",
                         "Khreschatyk",
                         "10",
+                        "Ring the bell twice",
                         true);
     }
 
@@ -1625,12 +1678,15 @@ class BookingServiceTest {
         Master enriched = buildEnrichedMaster(
                 MasterType.SALON_MASTER, Role.SALON_MASTER,
                 "https://cdn.test/salon-master.png", UUID.randomUUID(), UUID.randomUUID(), "OwnStreet", "99");
+        // The master's own note is DIFFERENT to prove the salon wins, never the master's own note.
+        enriched.getUser().setLocationNote("Master's own note - must NOT surface");
         com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder()
                 .name("Glamour Studio")
                 .cityId(salonCityId)
                 .districtId(salonDistrictId)
                 .street("Volodymyrska")
                 .buildingNo("55")
+                .locationNote("3rd floor, door code 1234")
                 .isActive(true)
                 .build();
         setField(enriched, "salon", salon);
@@ -1651,13 +1707,33 @@ class BookingServiceTest {
                         BookingDetailResponse::cityLabel,
                         BookingDetailResponse::districtLabel,
                         BookingDetailResponse::street,
-                        BookingDetailResponse::buildingNo)
+                        BookingDetailResponse::buildingNo,
+                        BookingDetailResponse::locationNote)
                 .containsExactly(
                         "Glamour Studio",
                         Role.SALON_MASTER,
                         "Lviv",
                         "Halytskyi",
                         "Volodymyrska",
-                        "55");
+                        "55",
+                        "3rd floor, door code 1234");
+    }
+
+    @Test
+    @DisplayName("locationNote and masterProfessionalTitle are null (not NPE) on a guest (LINK) booking whose master has set neither")
+    void should_returnNullLocationNoteAndTitle_when_guestBookingAndMasterHasNeither() {
+        Booking guestBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        setField(guestBooking, "client", null);
+        setField(guestBooking, "guestName", "Оксана");
+        setField(guestBooking, "guestSurname", "Мельник");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        BookingDetailResponse result = bookingService.getBooking(UUID.randomUUID(), bookingId);
+
+        assertThat(result.clientId()).isNull();
+        assertThat(result.masterProfessionalTitle()).isNull();
+        assertThat(result.locationNote()).isNull();
     }
 }

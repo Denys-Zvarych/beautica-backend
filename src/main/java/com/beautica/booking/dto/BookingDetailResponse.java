@@ -33,13 +33,23 @@ import java.util.UUID;
  *
  * <p><b>Phase 19.3 — client enrichment.</b> Adds the master's avatar/type, the (nullable)
  * salon name, the master's discovery address (district-primary locality labels + street/
- * building), the service category, and {@code canReview}. {@code canReview} and the resolved
+ * building), the service category, and {@code canReview}. {@code masterProfessionalTitle}
+ * (added later, alongside the other {@code master*} fields) is likewise nullable — a master
+ * may never have set one; render nothing (not a placeholder string) when null. {@code canReview}
+ * and the resolved
  * {@code cityLabel}/{@code districtLabel} are NOT derivable from the entity graph alone —
  * {@code canReview} is the COMPLETED+no-review predicate computed by the service, and the
  * locality labels come from the {@code DiscoveryLocationResolver} M2 seam (same FK-join
  * label resolution {@code MasterSearchResult} uses). The discovery locality is district-
  * primary via the salon link when the master is salon-employed, else the master's own user
  * row — mirroring {@code SearchService}'s {@code COALESCE(salon, user)} rule.
+ *
+ * <p><b>{@code locationNote} (client mobile phase 14.3 enrichment)</b> is the provider's
+ * free-text arrival hint ("3-й поверх, код 1234"). It follows the EXACT SAME salon-vs-
+ * independent resolution rule as {@code street}/{@code buildingNo} above — never a second,
+ * parallel rule: a salon-employed master surfaces the salon's own {@code locationNote}, an
+ * independent master surfaces their own user row's {@code locationNote}. Nullable — most
+ * providers never write one.
  *
  * <p><b>Track 25.x — note visibility is MUTUAL, by locked product decision.</b>
  * {@code providerComment} (written by the provider on {@code /decline} or {@code /not-complete})
@@ -69,6 +79,11 @@ public record BookingDetailResponse(
         String masterFirstName,
         String masterLastName,
         @Schema(types = {"string", "null"}, nullable = true,
+                description = "The master's professional title/headline (e.g. "
+                        + "\"Перукар-стиліст\"), same field as MasterSummaryResponse/"
+                        + "MasterDetailResponse. Nullable — a master may never have set one.")
+        String masterProfessionalTitle,
+        @Schema(types = {"string", "null"}, nullable = true,
                 description = "The client's booking-creation note (written once at POST "
                         + "/bookings). Visible to the provider. Distinct from "
                         + "clientCancellationNote below — this is NOT the cancellation reason.")
@@ -92,6 +107,13 @@ public record BookingDetailResponse(
         String districtLabel,
         String street,
         String buildingNo,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "The provider's free-text arrival hint (e.g. \"3-й поверх, код "
+                        + "1234\", \"вхід з двору, дзвонити двічі\"). Resolved by the identical "
+                        + "salon-vs-independent rule as street/buildingNo: a salon booking "
+                        + "surfaces the salon's own note, an independent master surfaces their "
+                        + "own note. Nullable — most providers never set one.")
+        String locationNote,
         String categoryName,
         boolean canReview
 ) {
@@ -122,6 +144,7 @@ public record BookingDetailResponse(
 
         String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
         String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
+        String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
 
         return new BookingDetailResponse(
                 booking.getId(),
@@ -143,6 +166,7 @@ public record BookingDetailResponse(
                 client != null ? client.getLastName() : booking.getGuestSurname(),
                 masterUser.getFirstName(),
                 masterUser.getLastName(),
+                masterUser.getProfessionalTitle(),
                 booking.getClientComment(),
                 booking.getProviderComment(),
                 booking.getClientCancellationNote(),
@@ -153,6 +177,7 @@ public record BookingDetailResponse(
                 districtLabel,
                 resolvedStreet,
                 resolvedBuildingNo,
+                resolvedLocationNote,
                 booking.getMasterService().getServiceDefinition().getCategory(),
                 canReview
         );

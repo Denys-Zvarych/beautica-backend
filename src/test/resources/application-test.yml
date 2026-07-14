@@ -92,6 +92,33 @@ app:
     payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
   internal-api-key: test-internal-api-key
 
+notification:
+  outbox:
+    drain:
+      # QA fix (track 25.x booking-enrichment audit, 2026-07-14): the real
+      # @Scheduled(fixedDelayString) NotificationOutboxDrainWorker.drain() timer is live in
+      # every full @SpringBootTest context (SchedulingConfig is not profile-gated). Integration
+      # tests drive draining deterministically via a direct drainWorker.drain() call — the
+      # background timer racing that manual call over the same PENDING row
+      # (SELECT ... FOR UPDATE SKIP LOCKED) caused a rare "expected: SENT but was: PENDING"
+      # flake in NotificationOutboxIntegrationTest, plus a logged
+      # ObjectOptimisticLockingFailureException when the background worker's phase-3 save()
+      # later targeted a row a test had already deleteAll()'d. One hour comfortably exceeds any
+      # single test-suite run, so the background timer never fires during tests; production
+      # keeps the 5000ms default (see NotificationOutboxDrainWorker#drain javadoc).
+      fixed-delay-ms: 3600000
+    reclaim:
+      # Same one-hour-comfortably-exceeds-any-test-run reasoning as drain.fixed-delay-ms above —
+      # the background NotificationOutboxReclaimJob timer must not fire mid-test and reclaim a
+      # row a test is still in the middle of asserting on. Tests that need to exercise the
+      # reclaim sweep itself call NotificationOutboxReclaimJob#sweep() directly with a pinned
+      # Clock, bypassing the scheduler entirely.
+      fixed-delay-ms: 3600000
+      # Config-record binding requires SOME positive value even though tests never wait for the
+      # scheduler; unit/repository tests pass an explicit staleBefore Instant directly and never
+      # read this property.
+      stale-claim-threshold: 60m
+
 management:
   health:
     mail:

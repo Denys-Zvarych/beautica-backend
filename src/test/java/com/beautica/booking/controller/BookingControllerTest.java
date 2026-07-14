@@ -125,12 +125,18 @@ class BookingControllerTest {
                 ZonedDateTime.now().plusDays(1).plusMinutes(60),
                 new BigDecimal("500.00"), 60,
                 OffsetDateTime.now(ZoneOffset.UTC),
-                "Oksana", "Kovalenko", "Natalia", "Lysenko", null, null,
+                "Oksana", "Kovalenko", "Natalia", "Lysenko",
+                // masterProfessionalTitle (additive)
+                "Перукар-стиліст",
+                null, null,
                 // Phase 25.8: clientCancellationNote (additive)
                 null,
                 // Phase 19.3 enrichment fields
                 null, com.beautica.auth.Role.INDEPENDENT_MASTER, null,
-                "Kyiv", null, null, null, "MANICURE", false
+                "Kyiv", null, null, null,
+                // locationNote (additive)
+                null,
+                "MANICURE", false
         );
     }
 
@@ -998,6 +1004,7 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.data.data[0].status").value("CONFIRMED"))
                 .andExpect(jsonPath("$.data.data[0].masterType").value("INDEPENDENT_MASTER"))
                 .andExpect(jsonPath("$.data.data[0].cityLabel").value("Kyiv"))
+                .andExpect(jsonPath("$.data.data[0].masterProfessionalTitle").value("Перукар-стиліст"))
                 .andExpect(jsonPath("$.data.data[0].canReview").value(false));
     }
 
