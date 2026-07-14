@@ -231,7 +231,9 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
 
         ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(tokenFor(adminEmail))),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Салон закритий сьогодні\"}",
+                        bearerHeaders(tokenFor(adminEmail))),
                 Void.class);
 
         assertThat(resp.getStatusCode())
@@ -250,7 +252,9 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
 
         ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}", bearerHeaders(tokenFor(adminEmail))),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не прийшов на прийом\"}",
+                        bearerHeaders(tokenFor(adminEmail))),
                 Void.class);
 
         assertThat(resp.getStatusCode())

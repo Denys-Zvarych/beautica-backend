@@ -260,6 +260,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
                 mu.lastName,
                 b.clientComment,
                 b.providerComment,
+                b.clientCancellationNote,
                 mu.avatarUrl,
                 mu.role,
                 s.name,

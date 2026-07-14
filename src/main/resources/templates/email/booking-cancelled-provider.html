@@ -2,7 +2,9 @@
 <!--
   Template: email/booking-cancelled-provider
   Variables: masterName (String), clientName (String), serviceName (String),
-             startsAt (String — pre-formatted), comment (String, nullable)
+             startsAt (String — pre-formatted), cancellationNote (String, nullable — the
+             client's /cancel note, Fix D3), creationNote (String, nullable — the client's
+             booking-creation note; NEVER shown under the cancellation-reason label)
 -->
 <html xmlns:th="http://www.thymeleaf.org" lang="uk">
 <head>
@@ -90,16 +92,34 @@
                     10:00, 20 травня 2026
                   </td>
                 </tr>
-                <tr th:if="${comment != null and !#strings.isEmpty(comment)}">
+                <!-- Fix D3: the client's ACTUAL cancellation-time note — NEVER the creation note. -->
+                <tr th:if="${cancellationNote != null and !#strings.isEmpty(cancellationNote)}">
                   <td style="padding:12px 16px;background:#EDE4D7;font-weight:700;
                              color:#0D0906;font-size:14px;border-top:1px solid #D4C5B5;
                              font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
-                    Причина
+                    Причина скасування
                   </td>
                   <td style="padding:12px 16px;color:#3D2B1A;font-size:14px;border-top:1px solid #D4C5B5;
+                             white-space:pre-line;
                              font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
-                      th:text="${comment}">
+                      th:text="${cancellationNote}">
                     Причина скасування
+                  </td>
+                </tr>
+                <!-- Distinct row + distinct label from the cancellation reason above — the
+                     booking-creation note (set at POST /bookings), rendered here ONLY, never
+                     mislabeled as the cancellation reason (Fix D3). -->
+                <tr th:if="${creationNote != null and !#strings.isEmpty(creationNote)}">
+                  <td style="padding:12px 16px;background:#EDE4D7;font-weight:700;
+                             color:#0D0906;font-size:14px;border-top:1px solid #D4C5B5;
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                    Побажання клієнта
+                  </td>
+                  <td style="padding:12px 16px;color:#3D2B1A;font-size:14px;border-top:1px solid #D4C5B5;
+                             white-space:pre-line;
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                      th:text="${creationNote}">
+                    Побажання при бронюванні
                   </td>
                 </tr>
               </table>

@@ -309,7 +309,9 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("Sends client-cancelled notification email to master and forwards the client comment to the template")
+    @DisplayName("Fix D3: sends client-cancelled notification email to master with the ACTUAL "
+            + "cancellation note under 'cancellationNote' and the booking-creation note under "
+            + "its own distinct 'creationNote' variable — the two must never swap")
     void should_callMailSenderSend_when_sendClientCancelledEmailCalled() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
@@ -318,7 +320,11 @@ class EmailNotificationServiceTest {
                 "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
                 OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
         );
-        when(booking.getClientComment()).thenReturn("Змінились плани");
+        // clientComment = the booking-CREATION note; clientCancellationNote = the ACTUAL
+        // cancellation-time note (Fix D2/D3) — deliberately different values so a regression
+        // that swaps them back would fail this test immediately.
+        when(booking.getClientComment()).thenReturn("Будь ласка, без ароматизаторів");
+        when(booking.getClientCancellationNote()).thenReturn("Змінились плани");
         ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
@@ -331,7 +337,8 @@ class EmailNotificationServiceTest {
         assertThat(realMessage.getSubject()).isEqualTo("Клієнт скасував бронювання");
 
         Context captured = (Context) contextCaptor.getValue();
-        assertThat(captured.getVariable("comment")).isEqualTo("Змінились плани");
+        assertThat(captured.getVariable("cancellationNote")).isEqualTo("Змінились плани");
+        assertThat(captured.getVariable("creationNote")).isEqualTo("Будь ласка, без ароматизаторів");
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
         assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
         assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");

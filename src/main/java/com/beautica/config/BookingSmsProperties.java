@@ -104,5 +104,28 @@ public class BookingSmsProperties {
         public void setCancellation(String cancellation) {
             this.cancellation = cancellation;
         }
+
+        /**
+         * Provider-decline template for a GUEST (LINK) booking (Phase 25.7). A guest has no
+         * account for email/push (V89 {@code chk_bookings_guest_fields}), so this SMS is the
+         * ONLY channel that tells them their booking was declined. Placeholders:
+         * {@code {serviceName}}, {@code {masterName}}, {@code {date}}, {@code {time}},
+         * {@code {comment}} — the provider's decline note, truncated to ~120 chars by
+         * {@code NotificationService} before substitution (Cyrillic SMS segments are
+         * ~70 chars; 120 chars keeps this to two segments).
+         */
+        private String decline =
+                "Beautica: На жаль, ваш запис скасовано.\n"
+                        + "{serviceName} у {masterName}\n"
+                        + "{date} о {time}\n\n"
+                        + "Причина: {comment}";
+
+        public String getDecline() {
+            return decline;
+        }
+
+        public void setDecline(String decline) {
+            this.decline = decline;
+        }
     }
 }

@@ -7,6 +7,7 @@ import com.beautica.common.TimeZones;
 import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
+import io.swagger.v3.oas.annotations.media.Schema;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -39,6 +40,17 @@ import java.util.UUID;
  * label resolution {@code MasterSearchResult} uses). The discovery locality is district-
  * primary via the salon link when the master is salon-employed, else the master's own user
  * row — mirroring {@code SearchService}'s {@code COALESCE(salon, user)} rule.
+ *
+ * <p><b>Track 25.x — note visibility is MUTUAL, by locked product decision.</b>
+ * {@code providerComment} (written by the provider on {@code /decline} or {@code /not-complete})
+ * is returned to BOTH the provider AND the client on this same DTO — including on a
+ * {@code NOT_COMPLETED} (no-show) booking. This is INTENTIONAL, not a PII/privacy leak: the
+ * product decision is "all notes should be visible for all sides" (see
+ * {@code docs/backend-phases}, track 25.x). Symmetrically, {@code clientCancellationNote}
+ * (written by the client on {@code /cancel}) is returned to both the client AND the provider.
+ * Do NOT add audience-based suppression of either field — a prior architect review flagged this
+ * as a leak and that recommendation was explicitly rejected by the product owner. See
+ * {@code BookingNoteVisibilityIT} for the tests that pin this behaviour.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -56,8 +68,22 @@ public record BookingDetailResponse(
         String clientLastName,
         String masterFirstName,
         String masterLastName,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "The client's booking-creation note (written once at POST "
+                        + "/bookings). Visible to the provider. Distinct from "
+                        + "clientCancellationNote below — this is NOT the cancellation reason.")
         String clientComment,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Written by the provider on /decline or /not-complete. Visible to "
+                        + "the CLIENT on both DECLINED and NOT_COMPLETED bookings — intentional, "
+                        + "by locked product decision (\"all notes visible for all sides\"), NOT "
+                        + "a privacy leak. Do not suppress this for any audience.")
         String providerComment,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Written by the CLIENT on /cancel. Visible to the provider — "
+                        + "the symmetric counterpart of providerComment. Only ever non-null on a "
+                        + "CANCELLED booking.")
+        String clientCancellationNote,
         // ── Phase 19.3 client-enrichment fields ──────────────────────────────
         String masterAvatarUrl,
         Role masterType,
@@ -119,6 +145,7 @@ public record BookingDetailResponse(
                 masterUser.getLastName(),
                 booking.getClientComment(),
                 booking.getProviderComment(),
+                booking.getClientCancellationNote(),
                 masterUser.getAvatarUrl(),
                 masterUser.getRole(),
                 salon != null ? salon.getName() : null,

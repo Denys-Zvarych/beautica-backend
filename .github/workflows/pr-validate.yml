@@ -60,6 +60,12 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
 
+      # Phase 25.6 — email is the one place in this app that renders free-text user input
+      # (booking notes). th:utext bypasses Thymeleaf's HTML escaping; this gate fails the
+      # build immediately if it is ever introduced under templates/email/.
+      - name: Forbid th:utext in email templates
+        run: ./scripts/forbid_th_utext_in_email.sh
+
       # Fast fail: compile main + test sources before the heavier build/test
       # steps. This is the explicit compile half of the regression gate and
       # surfaces a broken build in seconds rather than after the full suite.

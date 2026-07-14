@@ -46,6 +46,7 @@ public record ClientBookingDetailProjection(
         String masterLastName,
         String clientComment,
         String providerComment,
+        String clientCancellationNote,
         String masterAvatarUrl,
         Role masterType,
         String salonName,

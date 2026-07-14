@@ -162,6 +162,15 @@ app:
         Beautica: Ваш запис скасовано.
         {serviceName} у {masterName}
         {date} о {time}
+      # Phase 25.7 — sent to a GUEST (LINK) booking's phone when the provider declines. A guest
+      # has no account for email/push, so this SMS is the only channel that tells them at all.
+      # {comment} is the provider's decline note, truncated to ~120 chars before substitution.
+      decline: |-
+        Beautica: На жаль, ваш запис скасовано.
+        {serviceName} у {masterName}
+        {date} о {time}
+
+        Причина: {comment}
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

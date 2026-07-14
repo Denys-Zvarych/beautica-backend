@@ -94,8 +94,15 @@ public class NotificationOutboxDrainWorker {
      * <p><b>Phase 3</b> ({@code REQUIRES_NEW} tx): persist the status updates
      * collected in phase 2 using dirty-checking on re-attached entries.
      *
-     * <p>Worst-case phase 2 duration: {@code BATCH_SIZE × SMTP_TIMEOUT_SECS}
-     * (e.g. 20 × 20s = 400s) — but zero DB connections are held during that time.
+     * <p>Worst-case phase 2 duration: {@code BATCH_SIZE × per-entry dispatch worst-case}. Each
+     * {@code dispatch()} call makes ONE of two chains: (a) the common case — email (SMTP:
+     * connect 5s + read 10s + write 10s ≈ 25s, {@code application.yml} mail.smtp.*) followed by
+     * push ({@code FirebaseConfig}: connect 5s + read 10s ≈ 15s) — ≈ 40s; or (b) a guest-DECLINED
+     * entry (Phase 25.7), which sends SMS INSTEAD of email/push ({@code TurbosmsService}: connect
+     * 3s + read 5s ≈ 8s) — a third blocking-I/O call type on this same serial loop, but strictly
+     * cheaper than chain (a), so it does not raise the batch-level bound. At
+     * {@code BATCH_SIZE = 50}: 50 × 40s = 2000s worst case — but zero DB connections are held
+     * during that time.
      */
     @Scheduled(fixedDelay = 5_000)
     public void drain() {

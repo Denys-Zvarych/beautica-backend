@@ -81,35 +81,71 @@ class EmailTemplateRenderingTest {
         assertThat(html).doesNotContain("Причина");
     }
 
+    // Phase 25.5 (Fix D3): booking-cancelled-provider no longer takes a single `comment`
+    // variable — the cancellation-time note (`cancellationNote`) and the booking-creation note
+    // (`creationNote`) are distinct variables under distinct labels, so they can never swap
+    // slots. See EmailNotificationService.sendClientCancelledEmail.
+
     @Test
-    @DisplayName("booking-cancelled-provider template renders comment row when comment is present")
-    void should_renderCommentRow_when_cancelledProviderWithComment() {
+    @DisplayName("booking-cancelled-provider template renders cancellationNote under «Причина скасування»")
+    void should_renderCancellationNoteRow_when_cancelledProviderWithCancellationNote() {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван");
         ctx.setVariable("serviceName", "Стрижка");
         ctx.setVariable("startsAt", "10:00, 25 травня 2026");
-        ctx.setVariable("comment", "Особисті обставини");
+        ctx.setVariable("cancellationNote", "Особисті обставини");
+        ctx.setVariable("creationNote", null);
 
         String html = templateEngine.process("email/booking-cancelled-provider", ctx);
 
         assertThat(html).contains("Особисті обставини");
-        assertThat(html).contains("Причина");
+        assertThat(html).contains("Причина скасування");
+        assertThat(html).doesNotContain("Побажання клієнта");
     }
 
     @Test
-    @DisplayName("booking-cancelled-provider template omits comment row when comment is null")
-    void should_omitCommentRow_when_cancelledProviderWithNullComment() {
+    @DisplayName("booking-cancelled-provider template omits both note rows when both are null")
+    void should_omitBothNoteRows_when_cancelledProviderWithNoNotes() {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван");
         ctx.setVariable("serviceName", "Стрижка");
         ctx.setVariable("startsAt", "10:00, 25 травня 2026");
-        ctx.setVariable("comment", null);
+        ctx.setVariable("cancellationNote", null);
+        ctx.setVariable("creationNote", null);
 
         String html = templateEngine.process("email/booking-cancelled-provider", ctx);
 
-        assertThat(html).doesNotContain("Причина");
+        assertThat(html).doesNotContain("Причина скасування");
+        assertThat(html).doesNotContain("Побажання клієнта");
+    }
+
+    @Test
+    @DisplayName("booking-cancelled-provider template renders creationNote under its OWN "
+            + "«Побажання клієнта» label — never under «Причина скасування» (Fix D3 regression guard)")
+    void should_renderCreationNoteUnderItsOwnLabel_never_asCancellationReason() {
+        var ctx = new Context();
+        ctx.setVariable("masterName", "Оксана");
+        ctx.setVariable("clientName", "Іван");
+        ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("startsAt", "10:00, 25 травня 2026");
+        ctx.setVariable("cancellationNote", "Захворів у день візиту");
+        ctx.setVariable("creationNote", "Будь ласка, без ароматизаторів");
+
+        String html = templateEngine.process("email/booking-cancelled-provider", ctx);
+
+        assertThat(html).contains("Причина скасування").contains("Захворів у день візиту");
+        assertThat(html).contains("Побажання клієнта").contains("Будь ласка, без ароматизаторів");
+        // The two notes must never appear swapped — the cancellation-reason row's own text
+        // node must not contain the creation note's text, and vice versa.
+        int cancellationLabelIdx = html.indexOf("Причина скасування");
+        int creationNoteTextIdx = html.indexOf("Будь ласка, без ароматизаторів");
+        int creationLabelIdx = html.indexOf("Побажання клієнта");
+        assertThat(creationNoteTextIdx)
+                .as("the creation note's text must render AFTER its own label, not the cancellation-reason label")
+                .isGreaterThan(creationLabelIdx)
+                .isGreaterThan(cancellationLabelIdx);
     }
 
     @Test

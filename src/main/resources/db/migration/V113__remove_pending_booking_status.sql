@@ -14,18 +14,28 @@
 UPDATE bookings SET status = 'CONFIRMED' WHERE status = 'PENDING';
 
 -- 1) chk_booking_status (V18) — drop PENDING from the 6-value CHECK.
--- NOT VALID + a separate VALIDATE CONSTRAINT avoids a full-table validation scan under the
--- ACCESS EXCLUSIVE lock this transaction already holds: the backfill on line 14 above already
--- guarantees every existing row satisfies the new CHECK, so ADD CONSTRAINT only needs to block
--- NEW violations from this point forward (instant, metadata-only); VALIDATE CONSTRAINT then
--- scans to prove the historical guarantee, but takes only SHARE UPDATE EXCLUSIVE — a lighter
--- lock than the ACCESS EXCLUSIVE a validating ADD CONSTRAINT would hold for the same scan.
+-- ADD CONSTRAINT ... NOT VALID is metadata-only (instant) and, from the moment THIS statement
+-- commits, enforces the CHECK on every NEW insert/update — the backfill on line 14 above already
+-- guarantees every EXISTING row satisfies it, so there is no enforcement gap of any kind, only a
+-- deferred retroactive scan.
+--
+-- That retroactive scan (VALIDATE CONSTRAINT) is deliberately NOT run in this same file — see
+-- V115. MEDIUM finding fixed here: a same-migration "NOT VALID then VALIDATE CONSTRAINT" is
+-- COSMETIC, not a real lock-avoidance idiom. Flyway runs an entire migration script inside ONE
+-- transaction by default (`mixed=false`; no `spring.flyway.mixed` / executeInTransaction=false
+-- anywhere in this repo), and Postgres never downgrades a lock mid-transaction — so a
+-- VALIDATE CONSTRAINT appended right here would still run its full-table scan while this very
+-- transaction is still holding the ACCESS EXCLUSIVE lock the ADD CONSTRAINT above just took.
+-- Net lock severity/duration would be identical to a single validating ADD CONSTRAINT. The
+-- lighter SHARE UPDATE EXCLUSIVE lock VALIDATE CONSTRAINT can take only materializes across a
+-- transaction boundary, i.e. a separate Flyway version, which commits and releases the ACCESS
+-- EXCLUSIVE lock before V115's VALIDATE CONSTRAINT statements begin their scan.
 ALTER TABLE bookings DROP CONSTRAINT chk_booking_status;
 ALTER TABLE bookings
     ADD CONSTRAINT chk_booking_status CHECK (
         status IN ('CONFIRMED','DECLINED','COMPLETED','NOT_COMPLETED','CANCELLED')
     ) NOT VALID;
-ALTER TABLE bookings VALIDATE CONSTRAINT chk_booking_status;
+-- VALIDATE CONSTRAINT chk_booking_status runs in V115 (separate transaction — see comment above).
 
 -- 2) no_overlapping_bookings (V18) — the EXCLUDE gist index backing the DB-level double-booking
 -- guard. Narrowing WHERE (status IN ('PENDING','CONFIRMED')) to WHERE (status = 'CONFIRMED')

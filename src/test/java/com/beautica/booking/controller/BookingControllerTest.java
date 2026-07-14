@@ -126,6 +126,8 @@ class BookingControllerTest {
                 new BigDecimal("500.00"), 60,
                 OffsetDateTime.now(ZoneOffset.UTC),
                 "Oksana", "Kovalenko", "Natalia", "Lysenko", null, null,
+                // Phase 25.8: clientCancellationNote (additive)
+                null,
                 // Phase 19.3 enrichment fields
                 null, com.beautica.auth.Role.INDEPENDENT_MASTER, null,
                 "Kyiv", null, null, null, "MANICURE", false
@@ -433,7 +435,7 @@ class BookingControllerTest {
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), eq(bookingId), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Invalid status transition"));
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Провайдер недоступний"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
@@ -450,7 +452,7 @@ class BookingControllerTest {
     void should_return204_when_authorizedDeclineBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Провайдер недоступний"));
         // Slice test: the @authz SpEL gate in @PreAuthorize is the predicate under test here —
         // the service ownership guard is mocked out, so admit this owner explicitly.
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
@@ -469,7 +471,7 @@ class BookingControllerTest {
     void should_return204_when_independentMasterDeclinesBooking() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Провайдер недоступний"));
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
 
@@ -491,7 +493,7 @@ class BookingControllerTest {
     void should_return403_when_salonMasterDeclinesBooking() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
@@ -506,7 +508,7 @@ class BookingControllerTest {
     void should_return403_when_salonAdminAttemptsToDecline() throws Exception {
         var adminId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
         // Not stubbed → defaults false: an unassigned SALON_ADMIN fails @authz.canCancelBooking.
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(false);
 
@@ -523,7 +525,7 @@ class BookingControllerTest {
     void should_return403_when_clientDeclinesBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -538,7 +540,7 @@ class BookingControllerTest {
     void should_return400_when_declineCalledWithoutReason() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST,
@@ -631,7 +633,7 @@ class BookingControllerTest {
     void should_return204_when_authorizedNotCompleteBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
 
@@ -648,7 +650,7 @@ class BookingControllerTest {
     void should_return204_when_independentMasterMarksNotCompleted() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "Клієнт не з'явився"));
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
 
@@ -665,7 +667,7 @@ class BookingControllerTest {
     void should_return403_when_salonMasterMarksNotCompleted() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
@@ -683,7 +685,7 @@ class BookingControllerTest {
     void should_return403_when_salonAdminAttemptsToNotComplete() throws Exception {
         var adminId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(false);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
@@ -699,7 +701,7 @@ class BookingControllerTest {
     void should_return403_when_clientNotCompletesBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -714,7 +716,7 @@ class BookingControllerTest {
     void should_return400_when_notCompleteCalledWithoutReason() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required"));
@@ -1103,7 +1105,7 @@ class BookingControllerTest {
     void should_return400_when_declineHasInvalidCancellationReasonEnum() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = "{\"cancellationReason\":\"INVALID_REASON\"}";
+        var body = "{\"cancellationReason\":\"INVALID_REASON\",\"comment\":\"Валідний коментар\"}";
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))

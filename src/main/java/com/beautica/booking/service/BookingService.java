@@ -197,6 +197,7 @@ public class BookingService {
                 p.masterLastName(),
                 p.clientComment(),
                 p.providerComment(),
+                p.clientCancellationNote(),
                 p.masterAvatarUrl(),
                 p.masterType(),
                 p.salonName(),
@@ -350,7 +351,7 @@ public class BookingService {
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.DECLINED);
         booking.setStatus(BookingStatus.DECLINED);
         booking.setCancellationReason(req.cancellationReason());
-        booking.setProviderComment(req.comment());
+        booking.setProviderComment(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
@@ -395,7 +396,7 @@ public class BookingService {
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED);
         booking.setStatus(BookingStatus.NOT_COMPLETED);
         booking.setCancellationReason(req.cancellationReason());
-        booking.setProviderComment(req.comment());
+        booking.setProviderComment(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
@@ -419,6 +420,11 @@ public class BookingService {
         booking.setStatus(BookingStatus.CANCELLED);
         // cancellationReason is guaranteed non-null by @NotNull on CancelBookingRequest
         booking.setCancellationReason(req.cancellationReason());
+        // Fix D2 (track 25.x): req.comment() was validated at the API but never persisted —
+        // the client's cancellation note was silently discarded. Stored separately from
+        // clientComment (the booking-CREATION note) so the provider's "client cancelled" email
+        // (see EmailNotificationService.sendClientCancelledEmail, Fix D3) never confuses the two.
+        booking.setClientCancellationNote(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
@@ -616,7 +622,7 @@ public class BookingService {
                 .durationMinutesAtBooking(effectiveDuration)
                 .bufferMinutesAtBooking(bufferMinutes)
                 .idempotencyKey(idempotencyKey)
-                .clientComment(request.clientComment())
+                .clientComment(BookingComments.normalize(request.clientComment()))
                 .build();
 
         Booking saved;

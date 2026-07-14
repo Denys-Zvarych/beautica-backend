@@ -114,7 +114,9 @@ class BookingSecurityTest extends AbstractIntegrationTest {
         log.debug("Act: PATCH {}/{}/decline as SALON_MASTER — must return 403", BOOKINGS_URL, bookingId);
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(salonMasterToken)),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Майстер недоступний\"}",
+                        bearerHeaders(salonMasterToken)),
                 String.class);
 
         assertThat(response.getStatusCode())
@@ -142,7 +144,9 @@ class BookingSecurityTest extends AbstractIntegrationTest {
         log.debug("Act: PATCH {}/{}/decline with Owner B token targeting Owner A's booking — must be denied", BOOKINGS_URL, bookingId);
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(ownerBToken)),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Не наш майстер\"}",
+                        bearerHeaders(ownerBToken)),
                 String.class);
 
         assertThat(response.getStatusCode())

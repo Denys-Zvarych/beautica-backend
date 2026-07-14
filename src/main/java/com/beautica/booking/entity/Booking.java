@@ -133,6 +133,17 @@ public class Booking extends AuditableEntity {
     @Column(name = "provider_comment", length = 1000)
     private String providerComment;
 
+    // Phase 25.4 (V114) — the client's OWN cancellation note, written by cancelBooking
+    // (CONFIRMED -> CANCELLED). Distinct from clientComment (the booking-CREATION note set once
+    // at POST /bookings and legitimately present on CONFIRMED/COMPLETED rows too — see V114's
+    // deliberate absence of a CHECK on that column). Per the locked "notes are visible to all
+    // sides" decision, this note is shown to the PROVIDER, mirroring how providerComment is
+    // shown to the client on DECLINED/NOT_COMPLETED. chk_client_cancellation_note_status (V114)
+    // enforces it is only ever non-null on a CANCELLED row.
+    @Setter
+    @Column(name = "client_cancellation_note", length = 1000)
+    private String clientCancellationNote;
+
     // ── Guest-booking columns (Phase 13.3 / V89; relaxed by V91) ──────────────
     // A LINK booking is created via beautica.app/book/{slug} by a phone-verified,
     // account-less client. The DB CHECK chk_bookings_guest_fields enforces that

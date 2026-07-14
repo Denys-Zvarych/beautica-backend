@@ -165,7 +165,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         String clientToken = createClientAndGetToken("integ-decline-client-" + System.nanoTime() + "@beautica.test");
         UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
 
-        String body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}";
+        String body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Майстер захворів сьогодні\"}";
         log.debug("Act: PATCH {}/{}/decline as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
         ResponseEntity<Void> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
@@ -209,7 +209,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .as("booking must be CONFIRMED immediately after creation, before not-complete transition")
                 .isEqualTo("CONFIRMED");
 
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
+        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився вчасно\"}";
         log.debug("Act: PATCH {}/{}/not-complete as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
         ResponseEntity<Void> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
@@ -503,7 +503,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         // Provider declines the rescheduled CONFIRMED booking → DECLINED via the unchanged path.
         ResponseEntity<Void> declineResponse = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(ownerToken)),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Новий час теж не підходить\"}",
+                        bearerHeaders(ownerToken)),
                 Void.class);
         assertThat(declineResponse.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))

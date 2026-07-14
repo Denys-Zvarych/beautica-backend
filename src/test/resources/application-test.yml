@@ -43,6 +43,13 @@ app:
     # the same authenticated client) is not itself rate-limited — mirrors every other capacity
     # above (production default stays the tight 5/10s in RateLimitConfig).
     booking-write-capacity: 100000
+    # High so an IT firing several PATCH /bookings/{id}/decline or /not-complete calls for the
+    # same authenticated provider (e.g. GuestBookingDeclineNotificationIT, BookingCommentPersistenceIT)
+    # is not itself rate-limited — production default stays 10/60s in RateLimitConfig.
+    # BookingRateLimitFilterTest's decline/not-complete throttling assertions build the filter
+    # directly against a hand-built single-slot LoadingCache (bypassing this property entirely),
+    # so this override does not neuter that coverage.
+    booking-decline-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.

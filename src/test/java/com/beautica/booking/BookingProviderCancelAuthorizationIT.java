@@ -9,6 +9,7 @@ import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
+import com.beautica.notification.sms.SmsService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
@@ -75,6 +77,12 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
 
     @Autowired
     private NotificationOutboxDrainWorker drainWorker;
+
+    // Phase 25.7: declining a guest booking now sends an SMS (see
+    // should_return204AndDrainWithoutDeadRow_when_providerDeclinesGuestBooking below). Mocked so
+    // this class never performs real network I/O against the Turbosms API.
+    @MockBean
+    private SmsService smsService;
 
     @BeforeEach
     void configureHttpClient() {
@@ -305,6 +313,11 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
         assertThat(deadRows)
                 .as("zero DEAD rows must exist anywhere in the outbox after draining a guest-booking decline")
                 .isZero();
+
+        // Phase 25.7: a declined guest booking is told via SMS — the one notification channel
+        // available for an account-less LINK booking.
+        org.mockito.Mockito.verify(smsService, org.mockito.Mockito.times(1))
+                .send(org.mockito.ArgumentMatchers.eq("+380509998877"), org.mockito.ArgumentMatchers.anyString());
     }
 
     // ── state-machine bypass (assertTransition) over HTTP ─────────────────────────
@@ -317,7 +330,8 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}",
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Спроба скасувати завершений запис\"}",
                         bearerHeaders(tokenFor(salon.ownerEmail))),
                 String.class);
 
@@ -352,14 +366,18 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
     private ResponseEntity<Void> patchDecline(UUID bookingId, String token) {
         return restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(token)),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Провайдер недоступний\"}",
+                        bearerHeaders(token)),
                 Void.class);
     }
 
     private ResponseEntity<Void> patchNotComplete(UUID bookingId, String token) {
         return restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}", bearerHeaders(token)),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився\"}",
+                        bearerHeaders(token)),
                 Void.class);
     }
 
