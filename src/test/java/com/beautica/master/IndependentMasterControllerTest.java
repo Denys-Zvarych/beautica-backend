@@ -151,12 +151,17 @@ class IndependentMasterControllerTest {
     /**
      * Returns a minimal valid request body for
      * {@code PATCH /api/v1/independent-masters/me}.
-     * Only {@code cityId} is required; remaining fields are optional in the DTO.
+     *
+     * <p>Phase 10.6 reversal: {@code cityId}, {@code street} <em>and</em>
+     * {@code buildingNo} are all required ({@code @NotNull}/{@code @NotBlank}).
+     * {@code locationNote} is deliberately omitted here so every happy-path and
+     * role test doubles as proof that {@code locationNote} stays optional.
      */
     private String validRequestBody(UUID cityId) throws Exception {
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("cityId", cityId.toString());
-        body.put("street", "вулиця Хрещатик, 1");
+        body.put("street", "вулиця Хрещатик");
+        body.put("buildingNo", "1");
         return objectMapper.writeValueAsString(body);
     }
 
@@ -178,8 +183,8 @@ class IndependentMasterControllerTest {
                 null,         // cityName
                 null,         // oblastName
                 null,         // districtName
-                "вулиця Хрещатик, 1",
-                null,         // buildingNo
+                "вулиця Хрещатик",
+                "1",          // buildingNo
                 null,         // locationNote
                 null,         // bio
                 null, null,         // instagram
@@ -210,7 +215,8 @@ class IndependentMasterControllerTest {
                 .andExpect(jsonPath("$.data.id").value(userId.toString()))
                 .andExpect(jsonPath("$.data.role").value("INDEPENDENT_MASTER"))
                 .andExpect(jsonPath("$.data.cityId").value(cityId.toString()))
-                .andExpect(jsonPath("$.data.street").value("вулиця Хрещатик, 1"));
+                .andExpect(jsonPath("$.data.street").value("вулиця Хрещатик"))
+                .andExpect(jsonPath("$.data.buildingNo").value("1"));
     }
 
     // ── PATCH /me — 401 unauthenticated ──────────────────────────────────────
@@ -263,9 +269,10 @@ class IndependentMasterControllerTest {
     void should_return400_when_cityIdIsMissingFromRequestBody() throws Exception {
         var userId = UUID.randomUUID();
         // Omit cityId entirely — the @NotNull constraint must reject this at the
-        // controller boundary before the service is ever invoked.
+        // controller boundary before the service is ever invoked. street + buildingNo
+        // are supplied so the 400 is attributable solely to the missing cityId.
         String bodyWithoutCityId = objectMapper.writeValueAsString(
-                java.util.Map.of("street", "вулиця Хрещатик, 1"));
+                java.util.Map.of("street", "вулиця Хрещатик", "buildingNo", "1"));
 
         mockMvc.perform(patch(PATCH_ME_URL)
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -288,6 +295,7 @@ class IndependentMasterControllerTest {
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("cityId", cityId.toString());
         body.put("street", tooLongStreet);
+        body.put("buildingNo", "1");   // valid — isolates the failure to the oversized street
         String requestBody = objectMapper.writeValueAsString(body);
 
         mockMvc.perform(patch(PATCH_ME_URL)
@@ -314,6 +322,8 @@ class IndependentMasterControllerTest {
 
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("cityId", cityId.toString());
+        body.put("street", "вулиця Хрещатик");   // valid — isolates the failure to locationNote
+        body.put("buildingNo", "1");
         body.put("locationNote", locationNoteWithControlChar);
         String requestBody = objectMapper.writeValueAsString(body);
 
@@ -325,5 +335,105 @@ class IndependentMasterControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.message").isNotEmpty());
+    }
+
+    // ── Phase 10.6 reversal — street + buildingNo now REQUIRED (@NotBlank) ─────
+    // Regression net for the address-required reversal. Before the change a
+    // city/district-only body returned 200 and silently persisted a blank address;
+    // it must now be a clean 400 at the DTO boundary.
+
+    @Test
+    @DisplayName("PATCH /me — 400 with errors.street + errors.buildingNo when both are absent (city/district only — the reversed bug)")
+    void should_return400WithFieldErrors_when_streetAndBuildingNoAbsent() throws Exception {
+        var userId = UUID.randomUUID();
+        var cityId = UUID.randomUUID();
+        // The exact payload that used to succeed pre-reversal: city (+ district) only,
+        // no structured address. This is the request that must now be rejected.
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("cityId", cityId.toString());
+        body.put("districtId", UUID.randomUUID().toString());
+        String requestBody = objectMapper.writeValueAsString(body);
+
+        mockMvc.perform(patch(PATCH_ME_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.street").value("Street is required"))
+                .andExpect(jsonPath("$.errors.buildingNo").value("Building number is required"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 400 with errors.street when street is a blank string (@NotBlank, not merely null)")
+    void should_return400_when_streetIsBlankString() throws Exception {
+        var userId = UUID.randomUUID();
+        var cityId = UUID.randomUUID();
+        // street = "" — present in the payload but blank. @NotBlank must reject it
+        // (a null-only check would let this through); buildingNo is valid to isolate street.
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("cityId", cityId.toString());
+        body.put("street", "");
+        body.put("buildingNo", "1");
+        String requestBody = objectMapper.writeValueAsString(body);
+
+        mockMvc.perform(patch(PATCH_ME_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.street").value("Street is required"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 400 with errors.buildingNo when buildingNo is a blank string (@NotBlank)")
+    void should_return400_when_buildingNoIsBlankString() throws Exception {
+        var userId = UUID.randomUUID();
+        var cityId = UUID.randomUUID();
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("cityId", cityId.toString());
+        body.put("street", "вулиця Хрещатик");
+        body.put("buildingNo", "   ");   // whitespace-only — blank, must be rejected
+        String requestBody = objectMapper.writeValueAsString(body);
+
+        mockMvc.perform(patch(PATCH_ME_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.buildingNo").value("Building number is required"));
+    }
+
+    @Test
+    @DisplayName("PATCH /me — 200 when street + buildingNo present and locationNote omitted (locationNote stays optional)")
+    void should_return200_when_streetAndBuildingNoPresentWithoutLocationNote() throws Exception {
+        var userId = UUID.randomUUID();
+        var cityId = UUID.randomUUID();
+
+        when(userService.updateProfile(eq(userId), any()))
+                .thenReturn(stubUpdatedProfile(userId, cityId));
+
+        // Body carries cityId + street + buildingNo but NO locationNote — the reversal
+        // must not have accidentally made locationNote required.
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("cityId", cityId.toString());
+        body.put("street", "вулиця Хрещатик");
+        body.put("buildingNo", "12");
+        String requestBody = objectMapper.writeValueAsString(body);
+
+        mockMvc.perform(patch(PATCH_ME_URL)
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.street").value("вулиця Хрещатик"))
+                .andExpect(jsonPath("$.data.buildingNo").value("1"));
     }
 }

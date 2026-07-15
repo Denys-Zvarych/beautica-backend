@@ -240,7 +240,10 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
         // no districtId is required — only cityId is mandatory for provider locality.
         UUID cityId = jdbcTemplate.queryForObject(
                 "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
-        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null, null, null, null);
+        // street + buildingNo are now @NotBlank on CreateSalonRequest (Phase 10.6 reversal);
+        // the create must carry a valid pair to clear the @Valid boundary and reach 201.
+        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null,
+                "вул. Хрещатик", "1", null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(ownerToken)),

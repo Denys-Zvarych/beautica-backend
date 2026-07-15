@@ -47,6 +47,12 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
 
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
+    // Phase 10.6 reversal: street + buildingNo are now @NotBlank on both salon DTOs.
+    // These service-layer fixtures carry a valid structured address so they mirror what
+    // the @Valid HTTP boundary now guarantees.
+    private static final String VALID_STREET = "вул. Хрещатик";
+    private static final String VALID_BUILDING_NO = "1";
+
     @Autowired
     private SalonService salonService;
 
@@ -122,7 +128,8 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
         // instagramUrl, cityId, districtId, street, buildingNo, locationNote — mirrors the
         // proven shape used in SalonRegistrationIntegrationTest.
         return new CreateSalonRequest(
-                name, null, "Kyiv", null, null, null, null, cityId, null, null, null, null);
+                name, null, "Kyiv", null, null, null, null, cityId, null,
+                VALID_STREET, VALID_BUILDING_NO, null);
     }
 
     private UpdateSalonRequest updateRequest(String name) {
@@ -131,7 +138,8 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
         // UpdateSalonRequest field order: name, description, city, region, address,
         // cityId, districtId, street, buildingNo, locationNote, phone, instagramUrl.
         return new UpdateSalonRequest(
-                name, null, null, null, null, cityId, null, null, null, null, null, null);
+                name, null, null, null, null, cityId, null,
+                VALID_STREET, VALID_BUILDING_NO, null, null, null);
     }
 
     /** Raw-SQL read that bypasses the Hibernate persistence context — reads the committed row. */

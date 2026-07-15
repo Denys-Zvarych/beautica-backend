@@ -64,7 +64,11 @@ class ServiceTestFixtures {
         // no districtId is required — only cityId is mandatory for provider locality.
         UUID cityId = jdbcTemplate.queryForObject(
                 "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
-        String body = "{\"name\":\"" + name + "\",\"cityId\":\"" + cityId + "\"}";
+        // street + buildingNo are now @NotBlank on CreateSalonRequest (Phase 10.6
+        // reversal); include a valid pair so this shared HTTP-boundary fixture clears
+        // @Valid and returns 201 for every downstream integration test that relies on it.
+        String body = "{\"name\":\"" + name + "\",\"cityId\":\"" + cityId
+                + "\",\"street\":\"вул. Хрещатик\",\"buildingNo\":\"1\"}";
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons", HttpMethod.POST,
                 new HttpEntity<>(body, bearerHeaders(ownerToken)),

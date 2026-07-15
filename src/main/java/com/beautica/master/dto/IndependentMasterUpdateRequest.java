@@ -1,6 +1,7 @@
 package com.beautica.master.dto;
 
 import com.beautica.location.LocalityWriteInput;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
@@ -18,6 +19,13 @@ import java.util.UUID;
  * <p>Validation mirrors {@link com.beautica.user.UpdateProfileRequest} — same
  * {@code @Size} caps and control-character {@code @Pattern} to prevent a 500
  * on oversized or malformed payloads (§A).
+ *
+ * <p><strong>Address contract:</strong> {@code street} and {@code buildingNo}
+ * are <em>required</em> ({@code @NotBlank}). This is a deliberate reversal of
+ * the Phase 10.6 "provider address optional" model (city/district-only was the
+ * old model); a blank/absent value now yields a clean 400 at the DTO boundary.
+ * Only {@code locationNote} (and {@code districtId}, per the most-specific-node
+ * rule) remains optional.
  */
 public record IndependentMasterUpdateRequest(
 
@@ -26,10 +34,12 @@ public record IndependentMasterUpdateRequest(
 
         UUID districtId,   // nullable — cities without urban districts
 
+        @NotBlank(message = "Street is required")
         @Size(max = 255, message = "Street must be at most 255 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Street must not contain control characters")
         String street,
 
+        @NotBlank(message = "Building number is required")
         @Size(max = 50, message = "Building number must be at most 50 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Building number must not contain control characters")
         String buildingNo,

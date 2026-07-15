@@ -75,6 +75,17 @@ class SalonControllerTest {
     private static final Logger log = LoggerFactory.getLogger(SalonControllerTest.class);
     private static final String SALONS_URL = "/api/v1/salons";
 
+    /**
+     * Phase 10.6 reversal: {@code street} and {@code buildingNo} are now
+     * {@code @NotBlank} on both {@link CreateSalonRequest} and
+     * {@link UpdateSalonRequest}. Every request that must reach the service (or a
+     * role/authz gate) has to carry a valid pair, so tests share these fixtures.
+     * {@code locationNote} is intentionally never set — every happy path doubles
+     * as proof that {@code locationNote} stays optional.
+     */
+    private static final String VALID_STREET = "вул. Хрещатик";
+    private static final String VALID_BUILDING_NO = "1";
+
     // ── Security configuration ────────────────────────────────────────────────
 
     /**
@@ -161,7 +172,8 @@ class SalonControllerTest {
     void should_return201_when_validSalonCreation() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
-        var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
+        var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null,
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
         var stubResponse = stubSalonResponse(salonId, "My Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
@@ -182,7 +194,10 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 403 when CLIENT token is used")
     void should_return403_when_clientTokenUsedToCreateSalon() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Forbidden Salon", null, null, null, null, null, null, null, null, null, null, null);
+        // Valid body (street + buildingNo present) so the 403 is attributable to the
+        // CLIENT role gate, not to bean validation — @Valid now fires before @PreAuthorize.
+        var request = new CreateSalonRequest("Forbidden Salon", null, null, null, null, null, null,
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         log.debug("Act: POST {} as CLIENT — must be rejected with 403", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -212,11 +227,12 @@ class SalonControllerTest {
         var userId = UUID.randomUUID();
 
         log.debug("Act: POST {} with blank name — must fail @NotBlank and return 400", SALONS_URL);
+        // street + buildingNo valid so the 400 is attributable to the blank name, not the required-address reversal.
         mockMvc.perform(post(SALONS_URL)
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"\",\"city\":\"Kyiv\"}"))
+                        .content("{\"name\":\"\",\"city\":\"Kyiv\",\"street\":\"вул. Тестова\",\"buildingNo\":\"1\"}"))
                 .andExpect(status().isBadRequest());
     }
 
@@ -326,8 +342,10 @@ class SalonControllerTest {
         // authz returns false for the attacker (different owner)
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
 
+        // Valid body (street + buildingNo present) so the 403 is attributable to the
+        // ownership gate, not bean validation — @Valid now fires before @PreAuthorize.
         var request = new UpdateSalonRequest("Hijacked", null, null, null, null,
-                null, null, null, null, null, null, null);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null, null, null);
 
         log.debug("Act: PATCH {}/{} with attacker's token — different owner must be denied", SALONS_URL, salonId);
         mockMvc.perform(patch(SALONS_URL + "/" + salonId)
@@ -391,8 +409,10 @@ class SalonControllerTest {
         when(salonService.updateSalon(eq(adminUserId), eq(salonId), any(UpdateSalonRequest.class)))
                 .thenReturn(updated);
 
+        // Valid body with street + buildingNo but NO locationNote — this happy path also
+        // proves the reversal did not make locationNote required on PATCH.
         var request = new UpdateSalonRequest("Updated By Admin", null, null, null, null,
-                null, null, null, null, null, null, null);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null, null, null);
 
         log.debug("Act: PATCH {}/{} as SALON_ADMIN belonging to that salon", SALONS_URL, salonId);
         mockMvc.perform(patch(SALONS_URL + "/" + salonId)
@@ -483,7 +503,8 @@ class SalonControllerTest {
     void should_return201_when_salonOwnerCreatesSecondSalon() throws Exception {
         var userId = UUID.randomUUID();
         var secondSalonId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null, null, null, null, null, null);
+        var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null,
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
         var stubResponse = stubSalonResponse(secondSalonId, "Second Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
@@ -505,7 +526,9 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses javascript: scheme")
     void should_return400_when_instagramUrlUsesJavascriptScheme() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Insta Salon JS", null, "Kyiv", null, null, null, "javascript:alert(1)", null, null, null, null, null);
+        // street + buildingNo valid so the 400 is attributable to the instagramUrl scheme, not the required-address reversal.
+        var request = new CreateSalonRequest("Insta Salon JS", null, "Kyiv", null, null, null, "javascript:alert(1)",
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         log.debug("Act: POST {} with instagramUrl='javascript:alert(1)' — must be rejected with 400", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -520,7 +543,9 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses http: instead of https:")
     void should_return400_when_instagramUrlUsesHttpScheme() throws Exception {
         var userId = UUID.randomUUID();
-        var request = new CreateSalonRequest("Insta Salon HTTP", null, "Kyiv", null, null, null, "http://instagram.com/testuser", null, null, null, null, null);
+        // street + buildingNo valid so the 400 is attributable to the http scheme, not the required-address reversal.
+        var request = new CreateSalonRequest("Insta Salon HTTP", null, "Kyiv", null, null, null, "http://instagram.com/testuser",
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         log.debug("Act: POST {} with instagramUrl='http://instagram.com/testuser' — must be rejected with 400", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -733,7 +758,7 @@ class SalonControllerTest {
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Valid Salon\",\"street\":\"Khreshchatyk 1\\nbad\"}"))
+                        .content("{\"name\":\"Valid Salon\",\"buildingNo\":\"1\",\"street\":\"Khreshchatyk 1\\nbad\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
     }
@@ -747,7 +772,7 @@ class SalonControllerTest {
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Valid Salon\",\"buildingNo\":\"12\\u0000A\"}"))
+                        .content("{\"name\":\"Valid Salon\",\"street\":\"вул. Тестова\",\"buildingNo\":\"12\\u0000A\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
     }
@@ -761,7 +786,7 @@ class SalonControllerTest {
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Valid Salon\",\"locationNote\":\"near the park\\tbad\"}"))
+                        .content("{\"name\":\"Valid Salon\",\"street\":\"вул. Тестова\",\"buildingNo\":\"1\",\"locationNote\":\"near the park\\tbad\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
     }
@@ -779,7 +804,7 @@ class SalonControllerTest {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var request = new CreateSalonRequest("My Salon", null, null, null, null, null, "@some.handle",
-                null, null, null, null, null);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
         var stubResponse = stubSalonResponse(salonId, "My Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class))).thenReturn(stubResponse);
@@ -810,9 +835,88 @@ class SalonControllerTest {
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Valid Name\",\"instagramUrl\":\"not a real value!!\"}"))
+                        .content("{\"name\":\"Valid Name\",\"street\":\"вул. Тестова\",\"buildingNo\":\"1\",\"instagramUrl\":\"not a real value!!\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // ── Phase 10.6 reversal — street + buildingNo now REQUIRED (@NotBlank) ────
+    // Regression net for the address-required reversal on both create and update.
+    // Before the change a city/district-only (or address-less) body was accepted;
+    // it must now be a clean 400 at the DTO boundary via GlobalExceptionHandler.
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 with errors.street + errors.buildingNo when both are absent (the reversed bug)")
+    void should_return400WithFieldErrors_when_streetAndBuildingNoAbsent_onCreate() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: POST {} without street/buildingNo — the payload that used to succeed pre-reversal", SALONS_URL);
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"city\":\"Kyiv\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.street").value("Street is required"))
+                .andExpect(jsonPath("$.errors.buildingNo").value("Building number is required"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 with errors.street when street is a blank string (@NotBlank, not merely null)")
+    void should_return400_when_streetIsBlank_onCreate() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: POST {} with street='' — @NotBlank must reject an empty string, not only null", SALONS_URL);
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"street\":\"\",\"buildingNo\":\"1\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.street").value("Street is required"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 201 when street + buildingNo present and locationNote omitted (locationNote stays optional)")
+    void should_return201_when_streetAndBuildingNoPresentWithoutLocationNote_onCreate() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        // No locationNote in the body — proves the reversal did not make locationNote required.
+        var request = new CreateSalonRequest("Note-less Salon", null, null, null, null, null, null,
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+        when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
+                .thenReturn(stubSalonResponse(salonId, "Note-less Salon"));
+
+        log.debug("Act: POST {} with street+buildingNo but no locationNote — must succeed (201)", SALONS_URL);
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.name").value("Note-less Salon"));
+    }
+
+    @Test
+    @DisplayName("PATCH /api/v1/salons/{id} — 400 with errors.street + errors.buildingNo when both are absent")
+    void should_return400WithFieldErrors_when_streetAndBuildingNoAbsent_onUpdate() throws Exception {
+        var ownerUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        // @Valid fires before @PreAuthorize, so the missing-address 400 is reached even
+        // without stubbing authz. The service must never be invoked with a blank address.
+        log.debug("Act: PATCH {}/{} with a name-only body — missing street/buildingNo must 400", SALONS_URL, salonId);
+        mockMvc.perform(patch(SALONS_URL + "/" + salonId)
+                        .with(authenticatedAs(ownerUserId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Renamed Salon\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.street").value("Street is required"))
+                .andExpect(jsonPath("$.errors.buildingNo").value("Building number is required"));
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

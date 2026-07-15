@@ -36,12 +36,18 @@ class SalonInstagramValidationTest {
         }
     }
 
+    // Phase 10.6 reversal: street + buildingNo are now @NotBlank on both DTOs. The
+    // builders supply a valid pair so validator.validate(...) surfaces only the
+    // instagramUrl constraint under test — isolating each assertion to its target field.
+    private static final String VALID_STREET = "вул. Хрещатик";
+    private static final String VALID_BUILDING_NO = "1";
+
     private static CreateSalonRequest createWithInstagram(String instagramUrl) {
         // Field order: name, description, city, region, address, phone, instagramUrl,
         //              cityId, districtId, street, buildingNo, locationNote
         return new CreateSalonRequest(
                 "My Salon", null, null, null, null, null, instagramUrl,
-                null, null, null, null, null);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
     }
 
     private static UpdateSalonRequest updateWithInstagram(String instagramUrl) {
@@ -49,7 +55,7 @@ class SalonInstagramValidationTest {
         //              street, buildingNo, locationNote, phone, instagramUrl
         return new UpdateSalonRequest(
                 "My Salon", null, null, null, null,
-                null, null, null, null, null, null, instagramUrl);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null, null, instagramUrl);
     }
 
     private static boolean hasInstagramViolation(Set<? extends ConstraintViolation<?>> violations) {
