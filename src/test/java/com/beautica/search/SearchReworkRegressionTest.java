@@ -373,6 +373,69 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         }
     }
 
+    // ── Anti-Bug audit LOW-1 — legacy city-less salon must not leak a ────────
+    // ── salon-employed master's own locality onto discovery ─────────────────
+
+    @Test
+    @DisplayName("Anti-Bug LOW-1 — a legacy salon with NULL city_id/district_id (predates the Phase 10.3 "
+            + "locality columns) never resurrects its employed SALON_MASTER on /search/masters via the "
+            + "master's own personal city/district, even though the DISCOVERY_CITY_EXPR/DISCOVERY_DISTRICT_EXPR "
+            + "COALESCE is data-independent of salon.city_id — the u.role = 'INDEPENDENT_MASTER' predicate is "
+            + "the actual guard, not the salon's locality data")
+    void should_neverSurfaceSalonMasterUnderOwnPersonalLocality_when_salonIsCityLess() throws Exception {
+        ensureHttpClient();
+        UUID ownerPersonalCity = cityIdByName("Київ");
+        UUID ownerPersonalDistrict = districtIdInCity("Київ", 0);
+
+        UUID ownerId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
+                ownerId, "ms-cityless-owner-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest");
+
+        // Legacy salon: city_id/district_id both NULL (never migrated / never updated
+        // since Phase 10.3 added the columns) — SalonService.createSalon/updateSalon
+        // would reject this via LocalityWriteValidator today, but a pre-existing row
+        // can still carry it, per Salon.java §67-72 / LocalityWriteValidator §35-39.
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city_id, district_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, NULL, NULL, true, NOW(), NOW())",
+                salonId, ownerId, "CitylessLegacySalon");
+
+        // Worst-case simulation: the employed SALON_MASTER's OWN user row carries a real
+        // personal city/district. The live write path (UserService.applyLocality) never
+        // lets a SALON_MASTER set this, but the DB column itself has no CHECK preventing
+        // it — seeded directly here to prove the search guard does not depend on that
+        // write-path discipline holding.
+        UUID masterUserId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, city_id, district_id, "
+                        + "is_active, email_verified) VALUES (?, ?, ?, 'SALON_MASTER', ?, ?, ?, true, true)",
+                masterUserId, "ms-cityless-master-" + UUID.randomUUID() + "@beautica.test",
+                "$2a$04$placeholdervaluefortestonlydigest", salonId, ownerPersonalCity, ownerPersonalDistrict);
+
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', 4.5::numeric, 2, true, NOW(), NOW())",
+                masterId, masterUserId, salonId);
+
+        ResponseEntity<String> underPersonalDistrict = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + ownerPersonalCity
+                        + "&location.districtId=" + ownerPersonalDistrict + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        JsonNode page = objectMapper.readTree(underPersonalDistrict.getBody()).path("data");
+
+        assertThat(page.path("totalElements").asLong())
+                .as("the SALON_MASTER's own personal district must never resurface them on the public "
+                        + "grid, regardless of the salon's (missing) locality data")
+                .isZero();
+    }
+
     /**
      * Seeds one salon (under {@code ownerId}) stamped with the given
      * city/district FK and one employed SALON_MASTER + masters row. Returns the

@@ -34,15 +34,19 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code booking.setClientCancellationNote(...)} (i.e. exactly D2, the live prod bug this track
  * fixed — "the client's cancel comment was silently discarded") would NOT fail a single test.
  *
- * <p>Also closes: (1) the required-note contract (Phase 25.2 — {@code @NotBlank}
- * {@code @Size(min=10,max=1000)} on {@code StatusUpdateRequest.comment}) was never exercised
- * through {@code @Valid} at the controller boundary — only unit-level DTO validation for
- * control characters existed; (2) end-to-end normalization — {@code BookingComments.normalize}
- * had a thorough table-driven unit test, but nothing proved a CRLF/zero-width note submitted
- * over real HTTP actually lands normalized in the database.
+ * <p>Also closes: (1) end-to-end normalization — {@code BookingComments.normalize} had a
+ * thorough table-driven unit test, but nothing proved a CRLF/zero-width note submitted over real
+ * HTTP actually lands normalized in the database; (2) the comment CONTRACT on
+ * {@code StatusUpdateRequest.comment} (below) — Phase 25.2 originally made it required (
+ * {@code @NotBlank} + {@code @Size(min=10,max=1000)}), then Phase 25.9, shipped the same day,
+ * reversed that: the note is now optional for all roles on both {@code /decline} and
+ * {@code /not-complete}. Only the raw {@code @Size(max=1000)} DoS ceiling and the
+ * control-character {@code @Pattern} guard remain — this class asserts both directions: an
+ * absent/blank/short comment is accepted and persists NULL/verbatim, while the surviving
+ * ceiling/pattern guards still 400.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Booking comment persistence — D2 regression guard + required-note contract (Phase 25.x)")
+@DisplayName("Booking comment persistence — D2 regression guard + optional-note contract (Phase 25.9)")
 class BookingCommentPersistenceIT extends AbstractIntegrationTest {
 
     private static final String BOOKINGS_URL = "/api/v1/bookings";
@@ -180,99 +184,151 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
 
     private record CancelPayload(String cancellationReason, String comment) {}
 
-    // ── required-note contract (Phase 25.2): @NotBlank + @Size(min=10,max=1000) ──
+    // ── optional-note contract (Phase 25.9 — reverses Phase 25.2's "required, ≥10-char" ─────
+    // decision, made and shipped earlier the same day): comment is now optional for all roles
+    // on both /decline and /not-complete. @NotBlank and the normalized-length floor
+    // (@NormalizedSize) were removed from StatusUpdateRequest.comment; only the raw
+    // @Size(max=1000) DoS ceiling and the control-character @Pattern guard remain.
 
     @Test
-    @DisplayName("PATCH /decline — 400 when comment field is entirely absent from the JSON body")
-    void should_return400_when_declineCommentFieldAbsent() {
+    @DisplayName("Phase 25.9: PATCH /decline — 204 when comment field is entirely absent from the "
+            + "JSON body, and provider_comment persists NULL")
+    void should_return204WithNullProviderComment_when_declineCommentFieldAbsent() {
         Fixture fx = seedSalonBooking();
         UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
 
-        ResponseEntity<String> resp = restTemplate.exchange(
+        ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
                 new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(tokenFor(fx.ownerEmail))),
-                String.class);
+                Void.class);
 
         assertThat(resp.getStatusCode())
-                .as("an absent comment must fail @NotBlank at the controller boundary")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertUnchanged(bookingId, "CONFIRMED");
+                .as("an absent comment must now be accepted — the note is optional")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("DECLINED");
+        assertThat(dbProviderComment(bookingId))
+                .as("no comment supplied must persist as NULL, never an empty string")
+                .isNull();
     }
 
     @Test
-    @DisplayName("PATCH /decline — 400 when comment is blank (whitespace only)")
-    void should_return400_when_declineCommentIsBlank() {
+    @DisplayName("Phase 25.9: PATCH /decline — 204 when comment is blank (whitespace only), and "
+            + "provider_comment persists NULL (blank normalizes to null)")
+    void should_return204WithNullProviderComment_when_declineCommentIsBlank() {
         Fixture fx = seedSalonBooking();
         UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
 
         ResponseEntity<String> resp = patchDecline(bookingId, tokenFor(fx.ownerEmail), "        ");
 
         assertThat(resp.getStatusCode())
-                .as("a whitespace-only comment must fail @NotBlank")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertUnchanged(bookingId, "CONFIRMED");
+                .as("a whitespace-only comment must now be accepted — @NotBlank was removed")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbProviderComment(bookingId)).isNull();
     }
 
     @Test
-    @DisplayName("PATCH /decline — 400 when comment is 9 characters (one below the 10-char floor)")
-    void should_return400_when_declineCommentIsNineChars() {
+    @DisplayName("Phase 25.9: PATCH /decline — 204 when comment is 9 characters (below the old, "
+            + "now-removed 10-char floor), persisted verbatim")
+    void should_return204_when_declineCommentIsNineChars() {
         Fixture fx = seedSalonBooking();
         UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
 
         ResponseEntity<String> resp = patchDecline(bookingId, tokenFor(fx.ownerEmail), "123456789");
 
         assertThat(resp.getStatusCode())
-                .as("a 9-char comment must fail @Size(min=10) — boundary N-1")
+                .as("a 9-char comment must be accepted — the min-length floor was removed, not lowered")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbProviderComment(bookingId)).isEqualTo("123456789");
+    }
+
+    @Test
+    @DisplayName("PATCH /decline — 400 when comment exceeds 1000 raw characters (the DoS-guard "
+            + "ceiling survives the note becoming optional)")
+    void should_return400_when_declineCommentExceedsRawMaxLength() {
+        Fixture fx = seedSalonBooking();
+        UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
+
+        ResponseEntity<String> resp = patchDecline(bookingId, tokenFor(fx.ownerEmail), "a".repeat(1001));
+
+        assertThat(resp.getStatusCode())
+                .as("an over-1000-char comment must still fail the raw @Size ceiling")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         assertUnchanged(bookingId, "CONFIRMED");
     }
 
     @Test
-    @DisplayName("PATCH /decline — 204 when comment is exactly 10 characters (the accepted floor)")
-    void should_return204_when_declineCommentIsExactlyTenChars() {
+    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment field is entirely absent, "
+            + "and provider_comment persists NULL")
+    void should_return204WithNullProviderComment_when_notCompleteCommentFieldAbsent() {
         Fixture fx = seedSalonBooking();
         UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
 
-        ResponseEntity<String> resp = patchDecline(bookingId, tokenFor(fx.ownerEmail), "1234567890");
+        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
+                Void.class);
 
         assertThat(resp.getStatusCode())
-                .as("a 10-char comment must be accepted — boundary N")
+                .as("an absent comment must now be accepted on /not-complete too")
                 .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
+        assertThat(dbProviderComment(bookingId)).isNull();
     }
 
     @Test
-    @DisplayName("PATCH /not-complete — 400 when comment is blank (same @Valid StatusUpdateRequest as /decline, "
-            + "but a distinct @PatchMapping method that could independently drop @Valid)")
-    void should_return400_when_notCompleteCommentIsBlank() {
+    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is blank (whitespace only), "
+            + "and provider_comment persists NULL")
+    void should_return204WithNullProviderComment_when_notCompleteCommentIsBlank() {
         Fixture fx = seedSalonBooking();
         UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"   \"}";
-        ResponseEntity<String> resp = restTemplate.exchange(
+        ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
                 new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
-                String.class);
+                Void.class);
 
         assertThat(resp.getStatusCode())
-                .as("a blank comment must fail @NotBlank on /not-complete too")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertUnchanged(bookingId, "CONFIRMED");
+                .as("a blank comment must now be accepted on /not-complete too")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbProviderComment(bookingId)).isNull();
     }
 
     @Test
-    @DisplayName("PATCH /not-complete — 400 when comment is 9 characters (one below the 10-char floor)")
-    void should_return400_when_notCompleteCommentIsNineChars() {
+    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is 9 characters (below the "
+            + "old, now-removed 10-char floor), persisted verbatim")
+    void should_return204_when_notCompleteCommentIsNineChars() {
         Fixture fx = seedSalonBooking();
         UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"123456789\"}";
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("a 9-char comment must be accepted on /not-complete too")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbProviderComment(bookingId)).isEqualTo("123456789");
+    }
+
+    @Test
+    @DisplayName("PATCH /not-complete — 400 when comment contains a forbidden control character "
+            + "(NUL byte) — the @Pattern guard survives the note becoming optional")
+    void should_return400_when_notCompleteCommentContainsControlCharacter() {
+        Fixture fx = seedSalonBooking();
+        UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
+
+        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"legit note\u0000embedded\"}";
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
                 new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
                 String.class);
 
         assertThat(resp.getStatusCode())
-                .as("a 9-char comment must fail @Size(min=10) on /not-complete too")
+                .as("an embedded NUL byte must still fail the control-character @Pattern")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         assertUnchanged(bookingId, "CONFIRMED");
     }
@@ -294,6 +350,16 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
         assertThat(dbStatus)
                 .as("a rejected (400) request must never mutate booking status")
                 .isEqualTo(expectedStatus);
+    }
+
+    private String dbStatus(UUID bookingId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    private String dbProviderComment(UUID bookingId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT provider_comment FROM bookings WHERE id = ?", String.class, bookingId);
     }
 
     private JsonNode getBookingData(UUID bookingId, String token) throws Exception {

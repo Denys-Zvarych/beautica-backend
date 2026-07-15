@@ -300,14 +300,25 @@ public class NotificationService {
         }
     }
 
+    /**
+     * Phase 25.9: the provider's decline note is optional (for all roles). {@code decline} and
+     * {@code declineReason} are two separate config templates — see {@link BookingSmsProperties}
+     * — precisely so a null/blank note never leaves a dangling "Причина: " label with nothing
+     * after it: the reason clause is only substituted and appended when a non-blank, truncated
+     * comment actually survives {@link #stripUrlsForSms}/{@link #truncateForSms}.
+     */
     private String buildGuestDeclineSms(Booking booking) {
         OffsetDateTime kyiv = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return smsProperties.getSms().getDecline()
+        String base = smsProperties.getSms().getDecline()
                 .replace("{serviceName}", safe(booking.getMasterService().getServiceDefinition().getName()))
                 .replace("{masterName}", masterName(booking.getMaster()))
                 .replace("{date}", SMS_DATE_FMT.format(kyiv))
-                .replace("{time}", SMS_TIME_FMT.format(kyiv))
-                .replace("{comment}", truncateForSms(stripUrlsForSms(booking.getProviderComment())));
+                .replace("{time}", SMS_TIME_FMT.format(kyiv));
+        String comment = truncateForSms(stripUrlsForSms(booking.getProviderComment()));
+        if (comment.isBlank()) {
+            return base;
+        }
+        return base + smsProperties.getSms().getDeclineReason().replace("{comment}", comment);
     }
 
     /**

@@ -109,16 +109,27 @@ public class BookingSmsProperties {
          * Provider-decline template for a GUEST (LINK) booking (Phase 25.7). A guest has no
          * account for email/push (V89 {@code chk_bookings_guest_fields}), so this SMS is the
          * ONLY channel that tells them their booking was declined. Placeholders:
-         * {@code {serviceName}}, {@code {masterName}}, {@code {date}}, {@code {time}},
-         * {@code {comment}} — the provider's decline note, truncated to ~120 chars by
-         * {@code NotificationService} before substitution (Cyrillic SMS segments are
-         * ~70 chars; 120 chars keeps this to two segments).
+         * {@code {serviceName}}, {@code {masterName}}, {@code {date}}, {@code {time}}. Does NOT
+         * carry the reason clause — see {@link #declineReason} — the provider's note is optional
+         * (Phase 25.9) and this base template must stand alone, coherently, without it.
          */
         private String decline =
                 "Beautica: На жаль, ваш запис скасовано.\n"
                         + "{serviceName} у {masterName}\n"
-                        + "{date} о {time}\n\n"
-                        + "Причина: {comment}";
+                        + "{date} о {time}";
+
+        /**
+         * Reason clause APPENDED to {@link #decline} only when the provider actually left a note
+         * (Phase 25.9 — {@code comment} became optional on {@code /decline}/{@code /not-complete},
+         * reversing Phase 25.2's "required" decision from earlier the same day). Kept as its own
+         * template, not baked into {@link #decline}, so a null/blank note never leaves a dangling
+         * "Причина: " label with nothing after it — {@code NotificationService} only substitutes
+         * and appends this fragment when a non-blank, truncated comment exists. Placeholder:
+         * {@code {comment}} — the provider's decline note, truncated to ~120 chars by
+         * {@code NotificationService} before substitution (Cyrillic SMS segments are ~70 chars;
+         * 120 chars keeps this to two segments).
+         */
+        private String declineReason = "\n\nПричина: {comment}";
 
         public String getDecline() {
             return decline;
@@ -126,6 +137,14 @@ public class BookingSmsProperties {
 
         public void setDecline(String decline) {
             this.decline = decline;
+        }
+
+        public String getDeclineReason() {
+            return declineReason;
+        }
+
+        public void setDeclineReason(String declineReason) {
+            this.declineReason = declineReason;
         }
     }
 }

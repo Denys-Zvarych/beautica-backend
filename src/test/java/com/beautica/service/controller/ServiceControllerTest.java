@@ -132,14 +132,14 @@ class ServiceControllerTest {
 
     private ServiceDefinitionResponse stubServiceDefResponse(UUID id, String name) {
         return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
     }
 
     private MasterServiceResponse stubMasterServiceResponse(UUID id, UUID masterId, String name) {
         var sdResponse = stubServiceDefResponse(UUID.randomUUID(), name);
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
                 null, null, null);
     }
 
@@ -149,10 +149,10 @@ class ServiceControllerTest {
         var sdResponse = new ServiceDefinitionResponse(
                 UUID.randomUUID(), name, null, null, 60, 10, true,
                 serviceTypeId, serviceTypeNameUk, null, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
                 serviceTypeId, serviceTypeNameUk, null);
     }
 
@@ -165,10 +165,10 @@ class ServiceControllerTest {
         var sdResponse = new ServiceDefinitionResponse(
                 UUID.randomUUID(), name, null, null, 60, 10, true,
                 serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн",
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
                 serviceTypeId, serviceTypeNameUk, serviceTypeSlug);
     }
 
@@ -177,7 +177,7 @@ class ServiceControllerTest {
             UUID id, String name, UUID serviceTypeId, String serviceTypeNameUk, String serviceTypeSlug) {
         return new ServiceDefinitionResponse(id, name, null, "MANICURE", 60, 10, true,
                 serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
     }
 
     // ── POST /api/v1/salons/{salonId}/services ─────────────────────────────────
@@ -779,7 +779,7 @@ class ServiceControllerTest {
                 serviceId, "Range Manicure", null, "MANICURE", 60, 0, true,
                 null, null, null, null,
                 PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"),
-                "від 500 до 800 грн");
+                "від 500 до 800 ₴");
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
@@ -800,7 +800,7 @@ class ServiceControllerTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.priceType").value("RANGE"))
-                .andExpect(jsonPath("$.data.priceDisplay").value("від 500 до 800 грн"));
+                .andExpect(jsonPath("$.data.priceDisplay").value("від 500 до 800 ₴"));
     }
 
     @Test
@@ -1228,7 +1228,7 @@ class ServiceControllerTest {
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
         var stub = new ServiceDefinitionResponse(
                 serviceDefId, "Manicure", null, null, 60, 10, true, null, null, null, photoUrl,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 грн");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
         when(serviceCatalogService.updateServicePhoto(eq(serviceDefId), eq(photoUrl)))

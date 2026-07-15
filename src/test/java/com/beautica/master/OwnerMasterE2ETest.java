@@ -5,6 +5,7 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
+import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.dashboard.dto.RevenueResponse;
@@ -59,8 +60,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>Owner sets working hours via PATCH /api/v1/masters/{id}/working-hours.</li>
  *   <li>Owner creates a service definition via POST /api/v1/salons/{id}/services.</li>
  *   <li>Owner assigns the service to the owner-master via POST /api/v1/salons/{id}/masters/{id}/services.</li>
- *   <li>Client books the owner-master via POST /api/v1/bookings.</li>
- *   <li>Owner confirms the booking via PATCH /api/v1/bookings/{id}/confirm.</li>
+ *   <li>Client books the owner-master via POST /api/v1/bookings — booking is auto-confirmed
+ *       at creation (track 24.x removed the separate approval/{@code PATCH .../confirm} step,
+ *       so this is asserted directly off the create response and the DB, not a follow-up call).</li>
  *   <li>Owner completes the booking via PATCH /api/v1/bookings/{id}/complete.</li>
  *   <li>Owner checks the dashboard revenue — completed booking appears with positive revenue.</li>
  * </ol>
@@ -100,7 +102,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
     // ── E2E happy path ────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("Full lifecycle: owner enables master → client books → owner confirms+completes → revenue appears in dashboard")
+    @DisplayName("Full lifecycle: owner enables master → client books (auto-confirmed) → owner completes → revenue appears in dashboard")
     void should_completeFullBookingLifecycle_when_ownerOperatesAsOwnMaster() throws Exception {
 
         // ── Step 1: register an owner and a client via JDBC ──────────────────
@@ -237,25 +239,22 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         assertThat(bookingBody.data().masterId())
                 .as("booking masterId must match the owner-master")
                 .isEqualTo(masterId);
-        log.debug("Step 7 complete — bookingId={}", bookingId);
 
-        // ── Step 8: owner confirms the booking ────────────────────────────────
-        ResponseEntity<Void> confirmResp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
-                Void.class);
-        assertThat(confirmResp.getStatusCode())
-                .as("confirm must return 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
+        // Bookings are auto-confirmed at creation (track 24.x removed the approval step —
+        // there is no PATCH .../confirm hop any more). Assert the new contract directly off
+        // the create response, then cross-check the DB row before moving on.
+        assertThat(bookingBody.data().status())
+                .as("booking must already be CONFIRMED in the create response — no approval step exists")
+                .isEqualTo(BookingStatus.CONFIRMED);
 
-        String statusAfterConfirm = jdbcTemplate.queryForObject(
+        String statusAfterCreate = jdbcTemplate.queryForObject(
                 "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(statusAfterConfirm)
-                .as("booking must be CONFIRMED in DB after owner confirms")
+        assertThat(statusAfterCreate)
+                .as("booking must be CONFIRMED in DB immediately after creation")
                 .isEqualTo("CONFIRMED");
-        log.debug("Step 8 complete — booking CONFIRMED");
+        log.debug("Step 7 complete — bookingId={} auto-confirmed", bookingId);
 
-        // ── Step 9: owner completes the booking ───────────────────────────────
+        // ── Step 8: owner completes the booking ───────────────────────────────
         ResponseEntity<Void> completeResp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/complete", HttpMethod.PATCH,
                 new HttpEntity<>(bearerHeaders(ownerToken)),
@@ -269,16 +268,16 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         assertThat(statusAfterComplete)
                 .as("booking must be COMPLETED in DB after owner completes")
                 .isEqualTo("COMPLETED");
-        log.debug("Step 9 complete — booking COMPLETED");
+        log.debug("Step 8 complete — booking COMPLETED");
 
-        // ── Step 10: verify completed booking appears in dashboard revenue ─────
+        // ── Step 9: verify completed booking appears in dashboard revenue ──────
         // Narrow the date range to a window that includes the booking's creation date.
         // The dashboard service uses the booking's starts_at field in the revenue query.
         LocalDate from = LocalDate.now(KYIV).minusDays(1);
         LocalDate to   = LocalDate.now(KYIV).plusDays(7);
         String dashUrl = DASHBOARD_URL + "?from=" + from + "&to=" + to;
 
-        log.debug("Step 10: GET {} as SALON_OWNER — completed booking must appear in revenue", dashUrl);
+        log.debug("Step 9: GET {} as SALON_OWNER — completed booking must appear in revenue", dashUrl);
         ResponseEntity<String> dashResp = restTemplate.exchange(
                 dashUrl, HttpMethod.GET,
                 new HttpEntity<>(bearerHeaders(ownerToken)),
@@ -297,7 +296,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
                 .as("dashboard revenue must be positive after one completed booking")
                 .isGreaterThan(BigDecimal.ZERO);
 
-        log.debug("Step 10 complete — revenue={} totalBookings={}",
+        log.debug("Step 9 complete — revenue={} totalBookings={}",
                 dashBody.data().estimatedRevenue(), dashBody.data().totalCompletedBookings());
     }
 

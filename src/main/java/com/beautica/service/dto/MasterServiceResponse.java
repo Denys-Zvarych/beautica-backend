@@ -40,7 +40,7 @@ public record MasterServiceResponse(
         BigDecimal priceMin,
         /** RANGE ceiling surfaced from the service definition; null for FIXED. */
         BigDecimal priceMax,
-        /** Pre-formatted display string, e.g. {@code "500 грн"} or {@code "від 500 до 800 грн"}. */
+        /** Pre-formatted display string, e.g. {@code "500 ₴"} or {@code "від 500 до 800 ₴"}. */
         String priceDisplay,
         /**
          * Chosen service type id, lifted from the nested {@link ServiceDefinitionResponse}.

@@ -201,6 +201,41 @@ class NotificationServiceTest {
     }
 
     @Test
+    @DisplayName("Phase 25.9: a null provider note produces a coherent guest decline SMS — no "
+            + "dangling \"Причина: \" label with nothing after it (the note is now optional for all roles)")
+    void should_omitReasonLine_when_guestBookingDeclinedWithNullProviderComment() {
+        Booking booking = buildGuestBookingMockForDecline(null);
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyBookingStatusChanged(booking);
+
+        verify(smsService).send(eq("+380501234567"), textCaptor.capture());
+        String text = textCaptor.getValue();
+        assertThat(text)
+                .as("a null note must never leave a dangling reason label, found=%s", text)
+                .doesNotContain("Причина")
+                .contains("Тест послуга")
+                .contains("Тест Майстер")
+                .doesNotEndWith(" ")
+                .doesNotEndWith("\n");
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: a blank (whitespace-only) provider note is treated the same as null — "
+            + "no dangling reason label")
+    void should_omitReasonLine_when_guestBookingDeclinedWithBlankProviderComment() {
+        Booking booking = buildGuestBookingMockForDecline("   ");
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyBookingStatusChanged(booking);
+
+        verify(smsService).send(eq("+380501234567"), textCaptor.capture());
+        assertThat(textCaptor.getValue())
+                .as("a whitespace-only note must not produce a reason label")
+                .doesNotContain("Причина");
+    }
+
+    @Test
     @DisplayName("SEC MEDIUM: the guest decline SMS strips a URL from the provider's note — "
             + "a Beautica-branded SMS to a real OTP-verified phone must not carry a link")
     void should_stripUrlFromGuestDeclineSms_whenProviderCommentContainsLink() {

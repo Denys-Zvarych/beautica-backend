@@ -298,7 +298,7 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
                 INSERT INTO bookings
                   (id, client_id, master_id, master_service_id, status,
                    starts_at, ends_at, price_at_booking, duration_minutes_at_booking, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'PENDING',
+                VALUES (?, ?, ?, ?, 'CONFIRMED',
                    NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 1 hour',
                    300.00, 60, NOW(), NOW())
                 """,

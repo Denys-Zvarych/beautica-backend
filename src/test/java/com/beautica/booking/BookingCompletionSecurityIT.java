@@ -263,6 +263,42 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
     }
 
+    // ── Phase 25.9: the provider's note is optional on both endpoints, for all roles ─────
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /decline — 204 when comment is absent from the request body")
+    void should_return204_when_declineHasNoComment() {
+        Salon salon = createSalon("compl-sec-nocomment-decl-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(tokenFor(salon.ownerEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("declining with no comment must return 204 — the note is optional for all roles")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("DECLINED");
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is absent from the request body")
+    void should_return204_when_notCompleteHasNoComment() {
+        Salon salon = createSalon("compl-sec-nocomment-nc-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}", bearerHeaders(tokenFor(salon.ownerEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("marking not-complete with no comment must return 204 — the note is optional for all roles")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
+    }
+
     // ── HTTP helpers ─────────────────────────────────────────────────────────────
 
     private ResponseEntity<Void> patchComplete(UUID bookingId, String token) {

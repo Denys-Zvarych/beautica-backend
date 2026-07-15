@@ -175,13 +175,18 @@ app:
         {date} о {time}
       # Phase 25.7 — sent to a GUEST (LINK) booking's phone when the provider declines. A guest
       # has no account for email/push, so this SMS is the only channel that tells them at all.
-      # {comment} is the provider's decline note, truncated to ~120 chars before substitution.
+      # Deliberately does NOT include the reason clause — see decline-reason below — the
+      # provider's note is optional (Phase 25.9) and this template must stand alone, coherently,
+      # without one.
       decline: |-
         Beautica: На жаль, ваш запис скасовано.
         {serviceName} у {masterName}
         {date} о {time}
-
-        Причина: {comment}
+      # Phase 25.9 — appended to `decline` above ONLY when the provider actually left a note, so
+      # an optional/absent note never leaves a dangling "Причина: " label with nothing after it.
+      # {comment} is the provider's decline note, truncated to ~120 chars before substitution.
+      # Double-quoted (not a block scalar) so the leading "\n\n" separator is unambiguous.
+      decline-reason: "\n\nПричина: {comment}"
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

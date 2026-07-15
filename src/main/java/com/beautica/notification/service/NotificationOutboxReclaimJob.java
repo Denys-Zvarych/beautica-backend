@@ -59,7 +59,8 @@ public class NotificationOutboxReclaimJob {
      * {@code notification.outbox.drain.fixed-delay-ms} does for
      * {@link NotificationOutboxDrainWorker#drain()}).
      */
-    @Scheduled(fixedDelayString = "${notification.outbox.reclaim.fixed-delay-ms:300000}")
+    @Scheduled(fixedDelayString = "${notification.outbox.reclaim.fixed-delay-ms:300000}",
+               initialDelayString = "${notification.outbox.reclaim.initial-delay-ms:0}")
     public void reclaimStaleProcessingRows() {
         int reclaimed = sweep();
         if (reclaimed > 0) {

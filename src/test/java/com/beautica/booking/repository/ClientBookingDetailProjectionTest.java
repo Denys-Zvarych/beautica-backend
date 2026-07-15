@@ -53,6 +53,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
+    /**
+     * The {@code users.professional_title} VARCHAR(100) cap (V110), mirrored by
+     * {@code User.professionalTitle}'s {@code @Column(length = 100)} and by the
+     * {@code @Size(max = 100)} on both write-path DTOs.
+     */
+    private static final int MAX_PROFESSIONAL_TITLE_LENGTH = 100;
+
     @Autowired
     private BookingRepository bookingRepository;
 
@@ -291,6 +298,73 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         "Ring the bell twice",
                         "MANICURE",
                         false);
+    }
+
+    // ── masterProfessionalTitle round-trip (Anti-Bug audit LOW-2) ────────────────
+    //
+    // masterProfessionalTitle is a straight passthrough with no conditional logic
+    // (mu.professionalTitle -> ClientBookingDetailProjection.masterProfessionalTitle ->
+    // BookingDetailResponse.masterProfessionalTitle) — nothing here resolves salon-vs-master
+    // or applies any transform. The write-side gate (VARCHAR(100) cap, control/bidi-char
+    // rejection) is pinned at the DTO layer by MasterProfileUpdateRequestValidationTest's
+    // professionalTitle nested classes; what's worth pinning at THIS layer is that the
+    // projection does not silently truncate or mangle a title at the DB column's exact
+    // boundary length on its way through the JPQL projection into the response DTO.
+
+    @Test
+    @DisplayName("projection round-trips a max-length (100 char) masterProfessionalTitle intact — "
+            + "no truncation through the JPQL projection")
+    void should_notTruncateMasterProfessionalTitle_when_atMaxLength() {
+        // Padded to the cap programmatically rather than hand-counted — the assertion is
+        // about length preservation, not content, so the exact characters are irrelevant as
+        // long as they are valid per MasterProfileUpdateRequest's professionalTitle @Pattern.
+        String prefix = "Майстер-перукар вищої категорії ";
+        String maxLengthTitle = prefix + "x".repeat(MAX_PROFESSIONAL_TITLE_LENGTH - prefix.length());
+        assertThat(maxLengthTitle).hasSize(MAX_PROFESSIONAL_TITLE_LENGTH);
+
+        User masterUser = persistMasterUser(
+                null, null, "Khreschatyk", "10", "https://cdn.test/avatar.png");
+        masterUser.setProfessionalTitle(maxLengthTitle);
+        Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment msa =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Manicure", "MANICURE");
+        persistBooking(master, msa, null, BookingStatus.COMPLETED,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC));
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).hasSize(1);
+        assertThat(page.getContent().get(0).masterProfessionalTitle())
+                .as("a %s-char title (the VARCHAR(100)/@Size(max=100) boundary) must survive the "
+                        + "projection byte-for-byte — no truncation, no whitespace trim",
+                        MAX_PROFESSIONAL_TITLE_LENGTH)
+                .isEqualTo(maxLengthTitle)
+                .hasSize(MAX_PROFESSIONAL_TITLE_LENGTH);
+    }
+
+    @Test
+    @DisplayName("projection returns null masterProfessionalTitle when the master never set one")
+    void should_returnNullMasterProfessionalTitle_when_neverSet() {
+        User masterUser = persistMasterUser(
+                null, null, "Khreschatyk", "10", "https://cdn.test/avatar.png");
+        // professionalTitle deliberately left unset (null) — the common case.
+        Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment msa =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Manicure", "MANICURE");
+        persistBooking(master, msa, null, BookingStatus.COMPLETED,
+                OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC));
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, PageRequest.of(0, 20));
+
+        assertThat(page.getContent().get(0).masterProfessionalTitle())
+                .as("a master who never set a title must render as null, not an empty-string placeholder")
+                .isNull();
     }
 
     // ── salon-primary locality (salon link wins via COALESCE) ────────────────────

@@ -49,13 +49,31 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
      * Top discovery districts by COMPLETED-booking count, most-visited first, as
      * {@link DistrictCount} rows carrying the FK id only (the service resolves the label
      * via the taxonomy join — occupied-territory ban). Discovery district is
-     * district-primary: the salon link wins via {@code COALESCE}, else the master's own
-     * user row (mirrors the 19.3 booking-detail / {@code SearchService} rule). Rows whose
-     * resolved district id is null are excluded. Bound with {@code PageRequest.of(0, 3)}.
+     * district-primary: salon-presence wins outright via
+     * {@code CASE WHEN s.id IS NOT NULL THEN s.districtId ELSE mu.districtId END}, even
+     * when the salon's own {@code districtId} is {@code NULL} (a legacy salon predating
+     * the Phase 10.3 locality columns, or a salon whose city has no urban districts).
+     * Rows whose resolved district id is null are excluded — including a salon-employed
+     * master's completed booking whose salon has no district, which is deliberately
+     * dropped from the aggregate rather than falling back to {@code mu.districtId}.
+     *
+     * <p><b>Do not use {@code COALESCE(s.districtId, mu.districtId)}</b> — unlike
+     * {@code SearchService} / {@code FavoriteRepository} (where the salon join is
+     * structurally always {@code NULL} for the rows those queries can ever return, making
+     * the {@code COALESCE} vs {@code CASE WHEN} choice moot), {@code Booking.master} here
+     * is unrestricted by role: a {@code SALON_MASTER} or {@code SALON_OWNER}-type master's
+     * completed booking DOES join a real salon row. {@code COALESCE} would silently fall
+     * through to {@code mu.districtId} whenever {@code s.districtId} is {@code NULL},
+     * exactly the class of bug fixed in {@code findClientBookingDetails} (19.3) — for a
+     * {@code SALON_OWNER}-type master, {@code mu.districtId} is a one-time mirror of the
+     * salon's OWN locality taken at salon-creation time ({@code SalonService.createSalon}),
+     * never re-synced on salon relocation ({@code SalonService.updateSalon} does not touch
+     * it), so it can go stale and point at a district the salon no longer occupies. This
+     * mirrors {@link com.beautica.booking.dto.BookingDetailResponse#from}'s ternary exactly.
      */
     @Query("""
             SELECT new com.beautica.client.repository.DistrictCount(
-                COALESCE(s.districtId, mu.districtId),
+                CASE WHEN s.id IS NOT NULL THEN s.districtId ELSE mu.districtId END,
                 COUNT(b)
             )
             FROM Booking b
@@ -64,8 +82,8 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
             LEFT JOIN m.salon s
             WHERE b.client.id = :clientId
               AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
-              AND COALESCE(s.districtId, mu.districtId) IS NOT NULL
-            GROUP BY COALESCE(s.districtId, mu.districtId)
+              AND CASE WHEN s.id IS NOT NULL THEN s.districtId ELSE mu.districtId END IS NOT NULL
+            GROUP BY CASE WHEN s.id IS NOT NULL THEN s.districtId ELSE mu.districtId END
             ORDER BY COUNT(b) DESC
             """)
     List<DistrictCount> findTopDistricts(@Param("clientId") UUID clientId, Pageable pageable);

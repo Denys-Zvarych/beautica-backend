@@ -38,11 +38,29 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * unavailable to any other claimer (via the {@code WHERE status = 'PENDING'} predicate) from
      * the instant this transaction commits, not merely while it is open.
      *
-     * <p>Implemented as a data-modifying CTE: the inner {@code UPDATE ... RETURNING *} does the
-     * atomic claim-and-flip using the same {@code FOR UPDATE SKIP LOCKED} subquery as before (so
-     * concurrent claimers on the SAME instance still avoid blocking on each other); the outer
-     * {@code SELECT ... ORDER BY created_at ASC} re-sorts the result, because PostgreSQL does not
-     * guarantee that an {@code UPDATE ... RETURNING} preserves the order of the driving subquery.
+     * <p><strong>Why the locking SELECT is a separate {@code MATERIALIZED} CTE (batch-cap
+     * concurrency fix).</strong> The earlier form was a single
+     * {@code UPDATE ... WHERE id IN (SELECT id ... LIMIT :limit FOR UPDATE SKIP LOCKED)}. Under
+     * PostgreSQL {@code READ COMMITTED}, when the driving {@code UPDATE} meets a row that a
+     * concurrent transaction has updated in the meantime it performs an EvalPlanQual re-check — and
+     * that re-check can <em>re-evaluate the {@code IN}-sublink</em>, i.e. re-run the
+     * {@code LIMIT ... FOR UPDATE SKIP LOCKED} select against the now-changed lock landscape. The
+     * re-evaluated sublink can yield rows beyond the original {@code LIMIT}, so a
+     * {@code claimPendingBatch(1)} could flip (and return) TWO rows while a racing worker got zero —
+     * the exact intermittent failure in
+     * {@code NotificationOutboxIntegrationTest#should_skipLockedEntries_when_twoWorkersRunConcurrently}
+     * (reproduced with {@code pg_backend_pid} logging: one connection, {@code limit=1},
+     * {@code count=2}). Disabling pgjdbc server-side prepared statements
+     * ({@code prepareThreshold=0}) and inlining the cap as a SQL literal both left it reproducing —
+     * proving the cause is the sublink re-evaluation, not the parameter binding. Splitting the
+     * locking SELECT into its own {@code WITH candidates AS MATERIALIZED (...)} CTE forces PostgreSQL
+     * to evaluate the {@code LIMIT}/{@code FOR UPDATE SKIP LOCKED} exactly once; the {@code UPDATE}
+     * then only joins the already-fixed, already-locked id set, so it can never touch more than
+     * {@code limit} rows regardless of concurrent activity.
+     *
+     * <p>The outer {@code SELECT ... ORDER BY created_at ASC} re-sorts the result, because
+     * PostgreSQL does not guarantee that an {@code UPDATE ... RETURNING} preserves the order of the
+     * driving CTE.
      *
      * <p><strong>Crash safety.</strong> If an instance dies between this claim committing and the
      * eventual status write, the row is stranded in {@code PROCESSING} forever unless something
@@ -76,19 +94,21 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      */
     @Transactional(propagation = Propagation.MANDATORY)
     @Query(value = """
-        WITH claimed AS (
-            UPDATE notification_outbox
+        WITH candidates AS MATERIALIZED (
+            SELECT id
+              FROM notification_outbox
+             WHERE status = 'PENDING'
+             ORDER BY created_at ASC
+             LIMIT :limit
+               FOR UPDATE SKIP LOCKED
+        ),
+        claimed AS (
+            UPDATE notification_outbox n
                SET status = 'PROCESSING',
                    updated_at = now()
-             WHERE id IN (
-                   SELECT id
-                     FROM notification_outbox
-                    WHERE status = 'PENDING'
-                    ORDER BY created_at ASC
-                    LIMIT :limit
-                      FOR UPDATE SKIP LOCKED
-             )
-            RETURNING *
+              FROM candidates c
+             WHERE n.id = c.id
+            RETURNING n.*
         )
         SELECT * FROM claimed ORDER BY created_at ASC
         """, nativeQuery = true)

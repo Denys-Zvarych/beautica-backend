@@ -147,7 +147,8 @@ public class NotificationOutboxDrainWorker {
      * this phase's transaction commits. {@link NotificationOutboxReclaimJob} is the paired
      * safety net that recovers a row stranded in {@code PROCESSING} by a crashed instance.
      */
-    @Scheduled(fixedDelayString = "${notification.outbox.drain.fixed-delay-ms:5000}")
+    @Scheduled(fixedDelayString = "${notification.outbox.drain.fixed-delay-ms:5000}",
+               initialDelayString = "${notification.outbox.drain.initial-delay-ms:0}")
     public void drain() {
         // Calls via `self` so each phase method runs through the Spring AOP proxy
         // and its @Transactional annotation is honoured (self-invocation bypass fix).

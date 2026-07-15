@@ -107,6 +107,12 @@ notification:
       # single test-suite run, so the background timer never fires during tests; production
       # keeps the 5000ms default (see NotificationOutboxDrainWorker#drain javadoc).
       fixed-delay-ms: 3600000
+      # fixedDelay does NOT delay the FIRST @Scheduled fire — without this, drain() fires once at
+      # t≈0 on EVERY @SpringBootTest context startup (SchedulingConfig#EnableScheduling is not
+      # profile-gated). This keeps the background scheduler quiet during tests (hygiene). NOTE: this
+      # does NOT fix the NotificationOutboxIntegrationTest concurrency flake — that flake was proven
+      # to reproduce with the scheduler fully suppressed (root cause is elsewhere; see below).
+      initial-delay-ms: 3600000
     reclaim:
       # Same one-hour-comfortably-exceeds-any-test-run reasoning as drain.fixed-delay-ms above —
       # the background NotificationOutboxReclaimJob timer must not fire mid-test and reclaim a
@@ -114,6 +120,8 @@ notification:
       # reclaim sweep itself call NotificationOutboxReclaimJob#sweep() directly with a pinned
       # Clock, bypassing the scheduler entirely.
       fixed-delay-ms: 3600000
+      # Suppress the reclaim job's t≈0 first fire too (same fixedDelay-first-fire reason as drain).
+      initial-delay-ms: 3600000
       # Config-record binding requires SOME positive value even though tests never wait for the
       # scheduler; unit/repository tests pass an explicit staleBefore Instant directly and never
       # read this property.

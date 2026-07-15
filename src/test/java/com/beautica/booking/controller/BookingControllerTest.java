@@ -473,6 +473,24 @@ class BookingControllerTest {
     }
 
     @Test
+    @DisplayName("Phase 25.9: PATCH /{bookingId}/decline — 204 when comment is absent (the note is "
+            + "optional for all roles, reverses Phase 25.2's required-comment decision)")
+    void should_return204_when_declineCalledWithNoComment() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
+        when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
     @DisplayName("PATCH /{bookingId}/decline — 204 when INDEPENDENT_MASTER declines booking")
     void should_return204_when_independentMasterDeclinesBooking() throws Exception {
         var masterId = UUID.randomUUID();
@@ -640,6 +658,24 @@ class BookingControllerTest {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
+        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /{bookingId}/not-complete — 204 when comment is absent (the note "
+            + "is optional for all roles, reverses Phase 25.2's required-comment decision)")
+    void should_return204_when_notCompleteCalledWithNoComment() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
         when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
 

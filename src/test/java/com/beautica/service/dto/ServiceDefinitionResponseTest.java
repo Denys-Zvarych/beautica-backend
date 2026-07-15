@@ -46,7 +46,7 @@ class ServiceDefinitionResponseTest {
         assertThat(response.priceMin()).isEqualByComparingTo(new BigDecimal("50.00"));
         assertThat(response.priceMax()).isNull();
         assertThat(response.priceType()).isEqualTo(PriceType.FIXED);
-        assertThat(response.priceDisplay()).isEqualTo("50 грн");
+        assertThat(response.priceDisplay()).isEqualTo("50 ₴");
         assertThat(response.bufferMinutesAfter()).isEqualTo(10);
         assertThat(response.isActive()).isTrue();
         assertThat(response.serviceTypeId())
@@ -96,7 +96,7 @@ class ServiceDefinitionResponseTest {
                 .isEqualByComparingTo(new BigDecimal("800.00"));
         assertThat(response.priceDisplay())
                 .as("priceDisplay must use PriceDisplayFormatter RANGE format — whole hryvnia, no .00")
-                .isEqualTo("від 500 до 800 грн");
+                .isEqualTo("від 500 до 800 ₴");
     }
 
     @Test

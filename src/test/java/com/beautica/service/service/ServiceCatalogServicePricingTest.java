@@ -154,7 +154,7 @@ class ServiceCatalogServicePricingTest {
         assertThat(result.priceType()).isEqualTo(PriceType.FIXED);
         assertThat(result.priceMin()).isEqualByComparingTo("500.00");
         assertThat(result.priceMax()).isNull();
-        assertThat(result.priceDisplay()).isEqualTo("500 грн");
+        assertThat(result.priceDisplay()).isEqualTo("500 ₴");
     }
 
     // ── Create RANGE ──────────────────────────────────────────────────────────
@@ -203,7 +203,7 @@ class ServiceCatalogServicePricingTest {
         assertThat(result.priceType()).isEqualTo(PriceType.RANGE);
         assertThat(result.priceMin()).isEqualByComparingTo("800.00");
         assertThat(result.priceMax()).isEqualByComparingTo("1500.00");
-        assertThat(result.priceDisplay()).isEqualTo("від 800 до 1500 грн");
+        assertThat(result.priceDisplay()).isEqualTo("від 800 до 1500 ₴");
     }
 
     // ── PATCH FIXED → RANGE ───────────────────────────────────────────────────
@@ -371,7 +371,7 @@ class ServiceCatalogServicePricingTest {
         assertThat(result.priceType()).isEqualTo(PriceType.RANGE);
         assertThat(result.priceMin()).isEqualByComparingTo("600.00");
         assertThat(result.priceMax()).isEqualByComparingTo("1200.00");
-        assertThat(result.priceDisplay()).isEqualTo("від 600 до 1200 грн");
+        assertThat(result.priceDisplay()).isEqualTo("від 600 до 1200 ₴");
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(captor.capture());

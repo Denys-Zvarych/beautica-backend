@@ -351,16 +351,18 @@ class BookingRateLimitFilterTest {
         assertThat(getResponse.getStatus()).isNotEqualTo(429);
         assertThat(getChain.getRequest()).isNotNull();
 
-        // PATCH .../confirm is a different booking-write endpoint, NOT reschedule — must not
-        // consume (or be blocked by) the reschedule/create bucket.
-        var patchConfirm = new MockHttpServletRequest("PATCH", "/api/v1/bookings/" + bookingId + "/confirm");
-        var confirmResponse = new MockHttpServletResponse();
-        var confirmChain = new MockFilterChain();
-        filter.doFilterInternal(patchConfirm, confirmResponse, confirmChain);
-        assertThat(confirmResponse.getStatus())
-                .as("PATCH .../confirm must not be throttled by the create/reschedule bucket")
+        // PATCH .../complete is a different booking-write endpoint, NOT reschedule — must not
+        // consume (or be blocked by) the reschedule/create bucket. (Track 24.x retired PATCH
+        // .../confirm entirely — bookings are auto-confirmed at creation — so /complete is now
+        // the real unthrottled booking-write route used to prove this path-matcher behaviour.)
+        var patchComplete = new MockHttpServletRequest("PATCH", "/api/v1/bookings/" + bookingId + "/complete");
+        var completeResponse = new MockHttpServletResponse();
+        var completeChain = new MockFilterChain();
+        filter.doFilterInternal(patchComplete, completeResponse, completeChain);
+        assertThat(completeResponse.getStatus())
+                .as("PATCH .../complete must not be throttled by the create/reschedule bucket")
                 .isNotEqualTo(429);
-        assertThat(confirmChain.getRequest()).isNotNull();
+        assertThat(completeChain.getRequest()).isNotNull();
 
         // The single-slot bucket must still be intact for a real create/reschedule call —
         // proves the two calls above never touched it.

@@ -16,6 +16,7 @@ import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -246,6 +247,24 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingA)).isEqualTo("CONFIRMED");
     }
 
+    @Test
+    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is absent from the request body "
+            + "(the note is optional for all roles)")
+    void should_return204_when_notCompleteHasNoComment() {
+        Salon salon = createSalon("provcancel-nc-nocomment-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}", bearerHeaders(tokenFor(salon.ownerEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("marking not-complete with no comment must return 204")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
+    }
+
     // ── guest (LINK) booking decline — Risk R4 regression ─────────────────────────
 
     /**
@@ -318,6 +337,58 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
         // available for an account-less LINK booking.
         org.mockito.Mockito.verify(smsService, org.mockito.Mockito.times(1))
                 .send(org.mockito.ArgumentMatchers.eq("+380509998877"), org.mockito.ArgumentMatchers.anyString());
+    }
+
+    /**
+     * Phase 25.9 — the provider's note is now optional for all roles. Mirrors
+     * {@link #should_return204AndDrainWithoutDeadRow_when_providerDeclinesGuestBooking} exactly,
+     * but omits {@code comment} from the request body entirely: a guest (LINK, null-client)
+     * booking has no email/push channel, so the decline SMS is the ONLY notification this actor
+     * ever receives — it must still send, drain cleanly (no DEAD row), and read coherently with
+     * no dangling "Причина: " label.
+     */
+    @Test
+    @DisplayName("Phase 25.9: PATCH /decline on a GUEST (LINK, null-client) booking with NO comment "
+            + "returns 204, sends a coherent SMS with no dangling reason clause, and drains the "
+            + "outbox cleanly — no DEAD row")
+    void should_return204AndDrainWithoutDeadRow_when_providerDeclinesGuestBookingWithNoComment() {
+        Salon salon = createSalon("provcancel-guest-nocomment-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedGuestSalonBooking(salon);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(tokenFor(salon.ownerEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("provider declining a guest booking with no comment must return 204")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("DECLINED");
+
+        List<NotificationOutboxEntry> pending = outboxRepository.findAll();
+        assertThat(pending).hasSize(1);
+
+        drainWorker.drain();
+
+        NotificationOutboxEntry drained = outboxRepository.findById(pending.get(0).getId()).orElseThrow();
+        assertThat(drained.getStatus())
+                .as("a guest decline with no note must still drain to SENT, never DEAD")
+                .isEqualTo(OutboxStatus.SENT);
+        assertThat(drained.getLastError()).isNull();
+
+        long deadRows = outboxRepository.findAll().stream()
+                .filter(e -> e.getStatus() == OutboxStatus.DEAD)
+                .count();
+        assertThat(deadRows)
+                .as("zero DEAD rows after draining a no-comment guest decline")
+                .isZero();
+
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        org.mockito.Mockito.verify(smsService, org.mockito.Mockito.times(1))
+                .send(org.mockito.ArgumentMatchers.eq("+380509998877"), textCaptor.capture());
+        assertThat(textCaptor.getValue())
+                .as("a null note must never leave a dangling \"Причина: \" label in the SMS")
+                .doesNotContain("Причина");
     }
 
     // ── state-machine bypass (assertTransition) over HTTP ─────────────────────────

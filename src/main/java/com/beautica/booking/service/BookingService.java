@@ -92,9 +92,15 @@ public class BookingService {
 
     @Transactional(readOnly = true)
     public BookingDetailResponse getBooking(UUID actorUserId, UUID bookingId) {
-        // Use full-graph fetch to avoid lazy-load SELECTs when building BookingDetailResponse
+        // Existence + view-authorization collapse to a single uniform 403 (Finding 8 — existence
+        // oracle), mirroring cancelBooking/rescheduleBooking. A missing id and an existing-but-
+        // foreign booking must be indistinguishable to the caller: a missing booking short-circuits
+        // to the SAME 403 the ownership guard (enforceCanViewBooking) throws for a foreign one, so
+        // an authenticated actor can no longer probe whether an arbitrary booking id exists by
+        // observing a 404-vs-403 split. The full-graph fetch is still required to build the detail
+        // response for the legitimate owner (200 + full detail unchanged).
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
-                .orElseThrow(() -> new NotFoundException("Booking not found"));
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
         authz.enforceCanViewBooking(actorUserId, booking);
         boolean canReview = canReview(
                 booking.getStatus(), reviewRepository.existsByBookingId(bookingId), booking.getClient() != null);

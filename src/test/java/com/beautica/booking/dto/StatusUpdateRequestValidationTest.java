@@ -16,13 +16,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Pure Jakarta Bean Validation coverage for {@link StatusUpdateRequest#comment()} — the shared
  * request body for {@code PATCH /decline} and {@code PATCH /not-complete}.
  *
- * <p>{@link #should_rejectComment_paddedWithZeroWidthChars()} is the regression guard for the
- * LOW finding this class exists to close: a plain {@code @Size(min = 10)} on the RAW string ran
- * before {@code BookingComments.normalize()} stripped Unicode {@code Cf} (zero-width/bidi)
- * padding in the service layer, so {@code "ok"} padded with 8 zero-width spaces (raw length 10)
- * used to clear the floor and then normalize back down to the 2-character degenerate case the
- * floor exists to reject. {@link com.beautica.booking.validation.NormalizedSize} closes the gap
- * by validating the NORMALIZED length instead.
+ * <p>Phase 25.9 (reverses Phase 25.2's "required, ≥10-char" decision, made and shipped earlier
+ * the same day): {@code comment} is now OPTIONAL for all roles. {@code @NotBlank} and the
+ * normalized-length floor ({@code @NormalizedSize(min = 10, ...)}, since deleted along with the
+ * now-unused {@code NormalizedSize}/{@code NormalizedSizeValidator} classes) are gone. What
+ * survives: the raw {@code @Size(max = 1000)} DoS-guard ceiling and the control-character
+ * {@code @Pattern} guard — neither is about the "is a note required" question.
  *
  * <p>No Spring context / Testcontainers — a {@link Validator} fully reproduces the constraint,
  * mirroring {@link com.beautica.common.validation.NoDigitsDtoValidationTest}.
@@ -48,25 +47,39 @@ class StatusUpdateRequestValidationTest {
     }
 
     @Test
-    @DisplayName("rejects a comment padded with zero-width spaces past the raw 10-char floor — "
-            + "the normalized length (2 meaningful chars) is what actually gets checked")
-    void should_rejectComment_paddedWithZeroWidthChars() {
-        // "ok" (2 meaningful chars) + 8 zero-width spaces (U+200B) = raw length 10 — would have
-        // cleared a naive @Size(min = 10) on the raw string.
-        String padded = "ok" + "​".repeat(8);
-        assertThat(padded.length()).as("raw length must clear a naive @Size(min=10)").isEqualTo(10);
-
-        var violations = validator.validate(withComment(padded));
+    @DisplayName("Phase 25.9: accepts a null comment — the note is optional for all roles")
+    void should_acceptComment_whenNull() {
+        var violations = validator.validate(withComment(null));
 
         assertThat(hasViolationOn(violations, "comment"))
-                .as("zero-width-padded comment must still trip the (normalized) length floor, found=%s",
-                        violations)
-                .isTrue();
+                .as("a null comment must not trip any constraint, found=%s", violations)
+                .isFalse();
     }
 
     @Test
-    @DisplayName("accepts a genuinely meaningful comment of at least 10 normalized characters")
-    void should_acceptComment_whenNormalizedLengthClearsFloor() {
+    @DisplayName("Phase 25.9: accepts a blank (whitespace-only) comment — @NotBlank was removed")
+    void should_acceptComment_whenBlank() {
+        var violations = validator.validate(withComment("   "));
+
+        assertThat(hasViolationOn(violations, "comment"))
+                .as("a blank comment must not trip any constraint, found=%s", violations)
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: accepts a genuinely short comment (below the old 10-char floor) — the "
+            + "floor was removed, not merely lowered")
+    void should_acceptComment_whenShorterThanOldTenCharFloor() {
+        var violations = validator.validate(withComment("No show"));
+
+        assertThat(hasViolationOn(violations, "comment"))
+                .as("a short comment must not trip any constraint, found=%s", violations)
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("accepts a genuinely meaningful long-form comment")
+    void should_acceptComment_whenLongFormText() {
         var violations = validator.validate(withComment("Master is sick today, sorry for the trouble"));
 
         assertThat(hasViolationOn(violations, "comment"))
@@ -75,17 +88,7 @@ class StatusUpdateRequestValidationTest {
     }
 
     @Test
-    @DisplayName("rejects a blank comment via @NotBlank")
-    void should_rejectComment_whenBlank() {
-        var violations = validator.validate(withComment("   "));
-
-        assertThat(hasViolationOn(violations, "comment"))
-                .as("blank comment must trip @NotBlank, found=%s", violations)
-                .isTrue();
-    }
-
-    @Test
-    @DisplayName("rejects a comment over 1000 raw characters via the raw @Size ceiling")
+    @DisplayName("rejects a comment over 1000 raw characters via the raw @Size ceiling (DoS guard survives)")
     void should_rejectComment_whenOverRawMaxLength() {
         var violations = validator.validate(withComment("a".repeat(1001)));
 
@@ -95,15 +98,33 @@ class StatusUpdateRequestValidationTest {
     }
 
     @Test
-    @DisplayName("accepts exactly 10 genuinely meaningful characters (the floor, inclusive)")
-    void should_acceptComment_whenExactlyAtNormalizedFloor() {
-        String exactlyTenChars = "No shows!!";
-        assertThat(exactlyTenChars.strip().length()).isEqualTo(10);
-
-        var violations = validator.validate(withComment(exactlyTenChars));
+    @DisplayName("accepts exactly 1000 raw characters (the ceiling, inclusive)")
+    void should_acceptComment_whenExactlyAtRawMaxLength() {
+        var violations = validator.validate(withComment("a".repeat(1000)));
 
         assertThat(hasViolationOn(violations, "comment"))
-                .as("exactly 10 normalized characters must clear the floor, found=%s", violations)
+                .as("exactly 1000 characters must clear the ceiling, found=%s", violations)
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("rejects a comment containing a forbidden control character (NUL byte) — the "
+            + "@Pattern guard survives")
+    void should_rejectComment_whenContainsControlCharacter() {
+        var violations = validator.validate(withComment("legit comment\u0000embedded null"));
+
+        assertThat(hasViolationOn(violations, "comment"))
+                .as("an embedded NUL byte must trip the control-character @Pattern, found=%s", violations)
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("accepts a comment containing a newline or tab — only C0/C1 control chars are banned")
+    void should_acceptComment_whenContainsNewlineAndTab() {
+        var violations = validator.validate(withComment("line one\nline two\tindented"));
+
+        assertThat(hasViolationOn(violations, "comment"))
+                .as("newline/tab must not trip the control-character @Pattern, found=%s", violations)
                 .isFalse();
     }
 }
