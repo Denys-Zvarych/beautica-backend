@@ -34,6 +34,12 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
 
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
+    // Phase 10.6 reversal: street + buildingNo are now @NotBlank on CreateSalonRequest.
+    // These service-layer tests persist a realistic structured address so the fixtures
+    // mirror what the @Valid HTTP boundary now guarantees.
+    private static final String VALID_STREET = "вул. Хрещатик";
+    private static final String VALID_BUILDING_NO = "1";
+
     @Autowired
     private SalonService salonService;
 
@@ -69,7 +75,7 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
         UUID cityId = jdbcTemplate.queryForObject(
                 "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
         var request = new CreateSalonRequest(
-                "Velvet Studio", null, "Kyiv", null, null, null, null, cityId, null, null, null, null);
+                "Velvet Studio", null, "Kyiv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         // Act
         var salonResponse = salonService.createSalon(ownerId, request);
@@ -111,9 +117,9 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
         UUID cityId = jdbcTemplate.queryForObject(
                 "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
         var firstRequest = new CreateSalonRequest(
-                "First Studio", null, "Kyiv", null, null, null, null, cityId, null, null, null, null);
+                "First Studio", null, "Kyiv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null);
         var secondRequest = new CreateSalonRequest(
-                "Second Studio", null, "Lviv", null, null, null, null, cityId, null, null, null, null);
+                "Second Studio", null, "Lviv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         // Act — create first salon (triggers auto-master)
         salonService.createSalon(ownerId, firstRequest);

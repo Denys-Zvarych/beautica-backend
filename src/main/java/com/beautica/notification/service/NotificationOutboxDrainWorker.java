@@ -35,8 +35,22 @@ import java.util.stream.Collectors;
 @Slf4j
 public class NotificationOutboxDrainWorker {
 
-    private static final int BATCH_SIZE = 20;
-    private static final int MAX_ATTEMPTS = 3;
+    // Track 24.x auto-confirm: doCreateBooking now enqueues NEW_BOOKING + STATUS_CHANGED
+    // atomically on every booking creation (previously the STATUS_CHANGED half only landed
+    // later, on a separate provider /confirm request, naturally time-spreading the two events).
+    // That doubles outbox volume at peak booking moments with zero time-spread, against this
+    // fixed-capacity serial drain worker — bump batch size proportionately (20 -> 50) rather
+    // than shortening fixedDelay or parallelizing dispatch (which would risk SMTP/FCM rate
+    // limits and the retry/DEAD-row semantics phase 2 relies on). Conservative, reversible.
+    private static final int BATCH_SIZE = 50;
+
+    /**
+     * Package-private (not {@code private}) so {@link NotificationOutboxReclaimJob} can apply
+     * the exact same retry ceiling when a stranded {@code PROCESSING} row is reclaimed — a
+     * reclaim counts as a delivery attempt, same as a failed dispatch here, and both paths must
+     * agree on when an entry is dead-lettered.
+     */
+    static final int MAX_ATTEMPTS = 3;
     private static final int MAX_ERROR_LENGTH = 500;
 
     /**
@@ -57,11 +71,12 @@ public class NotificationOutboxDrainWorker {
     private final OutboxPayloadCipher cipher;
 
     /**
-     * Self-proxy reference so that {@link #drain()} can call the three phase methods
-     * through the Spring AOP proxy and have their {@code @Transactional} annotations
-     * honoured. Direct {@code this.claimBatch()} calls bypass the proxy and leave
-     * {@code MANDATORY} propagation on {@code claimPendingBatch()} without a surrounding
-     * transaction (Fix HIGH-4 self-invocation AOP bypass).
+     * Self-proxy reference so that {@link #drain()} (and {@link #persistResults(List)}, for
+     * its per-entry {@link #persistOne(EntryResult)} calls) can call phase methods through the
+     * Spring AOP proxy and have their {@code @Transactional} annotations honoured. Direct
+     * {@code this.claimBatch()} calls bypass the proxy and leave {@code MANDATORY} propagation
+     * on {@code claimPendingBatch()} without a surrounding transaction (Fix HIGH-4
+     * self-invocation AOP bypass).
      *
      * <p>This is a deliberate, documented exception to the project's no-field-injection
      * rule. Self-proxy injection cannot be expressed as a constructor parameter (circular
@@ -84,13 +99,56 @@ public class NotificationOutboxDrainWorker {
      * calls outside any transaction. No DB connection is held during this phase.
      * Each entry's dispatch result (SENT or DEAD) is recorded in-memory.
      *
-     * <p><b>Phase 3</b> ({@code REQUIRES_NEW} tx): persist the status updates
-     * collected in phase 2 using dirty-checking on re-attached entries.
+     * <p><b>Phase 3</b> ({@code NOT_SUPPORTED} — see {@link #persistResults(List)}): persist the
+     * status updates collected in phase 2, ONE independent {@code REQUIRES_NEW} transaction per
+     * entry, so one entry's persistence failure cannot roll back its batch-mates' already-decided
+     * outcomes.
      *
-     * <p>Worst-case phase 2 duration: {@code BATCH_SIZE × SMTP_TIMEOUT_SECS}
-     * (e.g. 20 × 20s = 400s) — but zero DB connections are held during that time.
+     * <p>Worst-case phase 2 duration: {@code BATCH_SIZE × per-entry dispatch worst-case}. Each
+     * {@code dispatch()} call makes ONE of two chains: (a) the common case — email (SMTP:
+     * connect 5s + read 10s + write 10s ≈ 25s, {@code application.yml} mail.smtp.*) followed by
+     * push ({@code FirebaseConfig}: connect 5s + read 10s ≈ 15s) — ≈ 40s; or (b) a guest-DECLINED
+     * entry (Phase 25.7), which sends SMS INSTEAD of email/push ({@code TurbosmsService}: connect
+     * 3s + read 5s ≈ 8s) — a third blocking-I/O call type on this same serial loop, but strictly
+     * cheaper than chain (a), so it does not raise the batch-level bound. At
+     * {@code BATCH_SIZE = 50}: 50 × 40s = 2000s worst case — but zero DB connections are held
+     * during that time. {@link NotificationOutboxReclaimJob}'s stale-claim threshold (production
+     * default 60 min) is set with a comfortable margin over this ~33 min figure.
+     *
+     * <p><b>Test-isolation note (QA, track 25.x booking-enrichment audit, 2026-07-14).</b> The
+     * period is property-driven ({@code notification.outbox.drain.fixed-delay-ms}, default
+     * {@code 5000} — unchanged production behaviour) specifically so {@code application-test.yml}
+     * can push it out to an effectively-never-fires interval. Every integration test that calls
+     * {@code drainWorker.drain()} directly (e.g. {@code NotificationOutboxIntegrationTest},
+     * {@code GuestBookingDeclineNotificationIT}, {@code ReviewLoopIT}) runs inside a full
+     * {@code @SpringBootTest} context where {@code SchedulingConfig}'s real
+     * {@code @EnableScheduling} bean is ALSO live — with the previous hard-coded 5s delay, this
+     * background timer raced the test's own manual call over the exact same PENDING row (claim
+     * uses {@code FOR UPDATE SKIP LOCKED}, so the loser's {@code claimBatch()} silently returns
+     * an empty batch instead of throwing), producing a rare "expected: SENT but was: PENDING"
+     * flake plus a logged {@code ObjectOptimisticLockingFailureException} when the background
+     * worker's phase-3 {@code save()} later targeted a row the test had already
+     * {@code deleteAll()}'d.
+     *
+     * <p><b>Correction (backlog, MEDIUM concurrency fix).</b> The note above's conclusion — "so
+     * this was a test-infrastructure gap, not a production concurrency defect" — was wrong, and
+     * is the kind of stale reasoning this correction exists to prevent being copied forward
+     * again. It's true that within a single JVM, {@code fixedDelay} serializes {@code drain()}
+     * against itself. But production runs on Railway, which performs <em>rolling deploys</em>:
+     * the old and new instance run concurrently — each with its own live {@code @Scheduled}
+     * timer — for the duration of every deploy. Nothing coordinates {@code drain()} calls
+     * across instances. Before this fix, {@link #claimBatch()} only held a row lock for the
+     * duration of its own short transaction and never changed the row's status, so a second
+     * instance's claim — arriving after the first instance's claim transaction committed but
+     * before it finished dispatch — would re-claim and re-dispatch the same notification. The
+     * fix: {@link com.beautica.notification.repository.NotificationOutboxRepository#claimPendingBatch(int)}
+     * now flips the row to {@code PROCESSING} atomically, in the same statement as the claim, so
+     * it is excluded from every other claimer — same instance or a different one — the instant
+     * this phase's transaction commits. {@link NotificationOutboxReclaimJob} is the paired
+     * safety net that recovers a row stranded in {@code PROCESSING} by a crashed instance.
      */
-    @Scheduled(fixedDelay = 5_000)
+    @Scheduled(fixedDelayString = "${notification.outbox.drain.fixed-delay-ms:5000}",
+               initialDelayString = "${notification.outbox.drain.initial-delay-ms:0}")
     public void drain() {
         // Calls via `self` so each phase method runs through the Spring AOP proxy
         // and its @Transactional annotation is honoured (self-invocation bypass fix).
@@ -105,6 +163,11 @@ public class NotificationOutboxDrainWorker {
     /**
      * Phase 1 — claim a batch of PENDING rows inside a short {@code REQUIRES_NEW}
      * transaction. The transaction commits as soon as this method returns.
+     *
+     * <p>The claim itself flips each row to {@code PROCESSING} atomically (see
+     * {@link com.beautica.notification.repository.NotificationOutboxRepository#claimPendingBatch(int)}),
+     * so once this method returns, every returned entry is durably unavailable to any other
+     * claimer — on this instance or any other — regardless of how long phases 2/3 take.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public List<NotificationOutboxEntry> claimBatch() {
@@ -148,22 +211,51 @@ public class NotificationOutboxDrainWorker {
     }
 
     /**
-     * Phase 3 — persist the dispatch outcomes inside a short {@code REQUIRES_NEW}
-     * transaction. Applies the computed status fields directly to the entity objects
-     * (which are re-attached to the new session by JPA merge semantics on save, or
-     * flushed via dirty-checking if they were still managed). Uses
-     * {@code outboxRepository.save()} to guarantee persistence in both managed and
-     * detached scenarios.
+     * Phase 3 — persist the dispatch outcomes, one entry per independent
+     * {@code REQUIRES_NEW} transaction (via {@link #persistOne(EntryResult)}, called through
+     * the {@code self} proxy so its {@code @Transactional} is honoured).
+     *
+     * <p><b>Per-entry isolation (MEDIUM concurrency fix, second half).</b> Previously every
+     * entry's status write shared ONE {@code REQUIRES_NEW} transaction with a single flush at
+     * commit. PostgreSQL aborts an entire transaction on the first statement-level error within
+     * it — so one entry's write failure (e.g. its row was concurrently deleted by
+     * {@link #purgeStaleOutboxRows()}, or any other transient fault) poisoned that shared
+     * connection and rolled back every OTHER entry's status write in the same batch too. Those
+     * other entries — which may have dispatched successfully — would then be re-claimed and
+     * re-dispatched on the next tick, because their {@code SENT}/{@code DEAD} outcome was never
+     * durably recorded. Giving each entry its own transaction means one entry's failure can only
+     * ever cost that one entry (it stays {@code PROCESSING} until
+     * {@link NotificationOutboxReclaimJob} reclaims it) — never its batch-mates.
+     *
+     * <p>A failure here is caught, not rethrown: this method must not let one entry's exception
+     * abort the loop before its siblings get their chance to persist.
      */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void persistResults(List<EntryResult> results) {
         for (EntryResult result : results) {
-            NotificationOutboxEntry entry = result.entry();
-            entry.setStatus(result.status());
-            entry.setAttempts(result.attempts());
-            entry.setLastError(result.lastError());
-            outboxRepository.save(entry);
+            try {
+                self.persistOne(result);
+            } catch (Exception e) {
+                log.error("Failed to persist outbox result [{}] (target status={}): {}",
+                        result.entry().getId(), result.status(), e.getClass().getSimpleName());
+            }
         }
+    }
+
+    /**
+     * Persists a single entry's dispatch outcome inside its own short {@code REQUIRES_NEW}
+     * transaction — see {@link #persistResults(List)} for why isolation matters. Applies the
+     * computed status fields directly to the entity object (re-attached to the new session by
+     * JPA merge semantics on save, or flushed via dirty-checking if still managed) and flushes
+     * immediately so any failure surfaces from this call, not from a later implicit flush.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void persistOne(EntryResult result) {
+        NotificationOutboxEntry entry = result.entry();
+        entry.setStatus(result.status());
+        entry.setAttempts(result.attempts());
+        entry.setLastError(result.lastError());
+        outboxRepository.saveAndFlush(entry);
     }
 
     /** Lightweight value object carrying dispatch outcome for one outbox entry. */

@@ -360,7 +360,10 @@ public class AuthorizationService {
                 return true;
             }
             if (actorRole == Role.CLIENT) {
-                return v.clientUserId().equals(actorId);
+                // Guest (LINK) bookings have a null clientUserId (findViewAccessById now
+                // LEFT JOINs client, per the track 24.7 audit) — null-guard so a CLIENT
+                // probing a guest booking's id denies cleanly instead of NPEing.
+                return v.clientUserId() != null && v.clientUserId().equals(actorId);
             }
             if (actorRole == Role.SALON_MASTER) {
                 // SALON_MASTER may only view their own bookings — not all bookings at the salon.
@@ -370,42 +373,77 @@ public class AuthorizationService {
         }).orElse(false);
     }
 
-    public void enforceCanManageBooking(UUID actorUserId, Booking booking) {
-        if (!isAuthorizedToManageBooking(actorUserId, booking)) {
+    /**
+     * Shared provider-authority predicate underlying booking completion, no-show, and
+     * provider-initiated cancellation (Phase 18.4 completion; Phase 24.2 decline/not-complete).
+     * An {@code INDEPENDENT_MASTER}-type booking is authorized by the master's own user; a
+     * salon-type booking (SALON_OWNER-type or SALON_MASTER-type master) resolves via
+     * {@link #hasManagementAccess}, which admits BOTH the salon owner (by ownership) AND the
+     * assigned {@code SALON_ADMIN} (by salon assignment).
+     *
+     * <p><strong>Intentional divergence from {@link #isAuthorizedToManageBooking}</strong> (used
+     * only by {@link #enforceCanViewBooking} now): that predicate deliberately excludes
+     * {@code SALON_ADMIN}. Do NOT broaden {@code isAuthorizedToManageBooking} to match this one.
+     */
+    private boolean hasProviderAuthorityOverBooking(
+            boolean independentMasterBooking, UUID masterUserId, UUID salonId, UUID actorId, Role actorRole) {
+        if (independentMasterBooking) {
+            return masterUserId != null && masterUserId.equals(actorId);
+        }
+        return salonId != null && hasManagementAccess(salonId, actorId, actorRole);
+    }
+
+    /**
+     * Entity-based wrapper of {@link #hasProviderAuthorityOverBooking} for the {@code enforce*}
+     * guards.
+     *
+     * <p><b>Perf finding 5 (track 24.7 audit):</b> every caller of this overload loads the
+     * booking via {@code BookingRepository#findByIdWithFullGraph}, which already
+     * {@code LEFT JOIN FETCH}es {@code m.salon s} AND {@code s.owner} — so a {@code SALON_OWNER}
+     * actor can be authorized purely in memory, with zero extra round trip. Only the
+     * {@code SALON_ADMIN} case falls back to {@link #hasManagementAccess}, a real DB query,
+     * because the admin's assigned-salon id genuinely is not present in the loaded graph.
+     *
+     * <p>Evaluation is branch-local: the in-memory owner comparison runs first and short-circuits
+     * on a match; {@link #hasManagementAccess} is invoked only when it does not, so this never
+     * unconditionally pays for both checks (the eager-evaluation bug this replaces).
+     */
+    private boolean hasProviderAuthorityOverBooking(UUID actorId, Booking booking) {
+        Master master = booking.getMaster();
+        if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+            return hasProviderAuthorityOverBooking(true, master.getUser().getId(), null, actorId, null);
+        }
+        Salon salon = master.getSalon();
+        if (salon == null) {
+            return false;
+        }
+        if (salon.getOwner() != null && salon.getOwner().getId().equals(actorId)) {
+            return true;
+        }
+        // Not the (in-memory) owner — fall back to the DB-backed check, which also covers the
+        // assigned SALON_ADMIN case the loaded graph cannot answer.
+        return hasManagementAccess(salon.getId(), actorId, roleFromCurrentAuthentication());
+    }
+
+    /**
+     * Service-layer completion guard (Phase 18.4) — the entity-based twin of
+     * {@link #canCompleteBooking}. See {@link #hasProviderAuthorityOverBooking(UUID, Booking)}
+     * for the shared predicate.
+     */
+    public void enforceCanCompleteBooking(UUID actorUserId, Booking booking) {
+        if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
             throw new ForbiddenException("Access denied");
         }
     }
 
     /**
-     * Service-layer completion guard (Phase 18.4) — the entity-based twin of
-     * {@link #canCompleteBooking}.
-     *
-     * <p><strong>Intentional divergence from {@link #isAuthorizedToManageBooking}:</strong> this
-     * predicate <em>admits</em> a {@code SALON_ADMIN} assigned to the booking's salon, whereas
-     * {@code isAuthorizedToManageBooking} (used by confirm/decline/not-complete) deliberately
-     * excludes admins and keeps those transitions owner-level. The relaxation is scoped to the
-     * <em>completion</em> action only — do NOT "fix" the difference by pointing completion back at
-     * {@code enforceCanManageBooking}, and do NOT broaden {@code isAuthorizedToManageBooking}.
-     *
-     * <ul>
-     *   <li>INDEPENDENT_MASTER booking → actor must be the master's user.</li>
-     *   <li>Salon booking → {@code hasManagementAccess(salonId, actor)} — grants BOTH the salon
-     *       OWNER (by ownership) and the assigned SALON_ADMIN (by salon assignment).</li>
-     *   <li>SALON_MASTER / CLIENT → never satisfy either branch → {@link ForbiddenException}.</li>
-     * </ul>
+     * Service-layer provider-cancellation guard (Phase 24.2) — the entity-based twin of
+     * {@link #canCancelBooking}, backing {@code declineBooking}/{@code notCompleteBooking}.
+     * Same predicate as {@link #enforceCanCompleteBooking}: an actor trusted to mark a visit
+     * completed is trusted to cancel one or mark a no-show (decisions D1/D2).
      */
-    public void enforceCanCompleteBooking(UUID actorUserId, Booking booking) {
-        Master master = booking.getMaster();
-        boolean allowed;
-        if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
-            allowed = master.getUser().getId().equals(actorUserId);
-        } else {
-            // SALON_OWNER-type and SALON_MASTER-type masters both resolve authority via salon
-            // management access, which admits the owner AND the assigned SALON_ADMIN (Phase 18.4).
-            allowed = master.getSalon() != null
-                    && hasManagementAccess(master.getSalon().getId(), actorUserId);
-        }
-        if (!allowed) {
+    public void enforceCanCancelBooking(UUID actorUserId, Booking booking) {
+        if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
             throw new ForbiddenException("Access denied");
         }
     }
@@ -428,14 +466,32 @@ public class AuthorizationService {
         if (cannotComplete) return false;
         UUID actorId = principalId(auth);
         Role actorRole = roleFromAuthentication(auth);
-        return bookingRepository.findCompletionAccessById(bookingId).map(v -> {
-            if (v.salonId() == null) {
-                // Independent-master booking: actor must be the master's user.
-                return v.masterUserId().equals(actorId);
-            }
-            // Salon booking: owner (ownership) or assigned SALON_ADMIN (salon assignment).
-            return hasManagementAccess(v.salonId(), actorId, actorRole);
-        }).orElse(false);
+        return bookingRepository.findCompletionAccessById(bookingId)
+                .map(v -> hasProviderAuthorityOverBooking(
+                        v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+                .orElse(false);
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} provider-cancellation predicate (Phase 24.2), backing
+     * {@code PATCH /bookings/{id}/decline} and {@code PATCH /bookings/{id}/not-complete}.
+     * Reuses the same {@link BookingCompletionAccess} projection and predicate as
+     * {@link #canCompleteBooking} — see {@link #enforceCanCancelBooking} for why the two
+     * actions share one authority shape.
+     *
+     * <p>Role fast path + missing-booking handling mirror {@link #canCompleteBooking} exactly.
+     */
+    public boolean canCancelBooking(Authentication auth, UUID bookingId) {
+        boolean cannotCancel = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotCancel) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findCompletionAccessById(bookingId)
+                .map(v -> hasProviderAuthorityOverBooking(
+                        v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+                .orElse(false);
     }
 
     public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
@@ -448,7 +504,10 @@ public class AuthorizationService {
         Role actorRole = roleFromCurrentAuthentication();
         boolean allowed = false;
         if (actorRole == Role.CLIENT) {
-            allowed = booking.getClient().getId().equals(actorUserId);
+            // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) — a
+            // CLIENT can never own one, so null-guard rather than dereference getId() on null
+            // (regression: NPE'd into a 500 instead of the correct 403 here).
+            allowed = booking.getClient() != null && booking.getClient().getId().equals(actorUserId);
         } else if (actorRole == Role.SALON_MASTER) {
             // Fix M1: SALON_MASTER may only view their own bookings, not all bookings
             // at the salon — the previous salon-scoped check leaked other masters'
@@ -460,24 +519,28 @@ public class AuthorizationService {
         }
     }
 
+    /**
+     * Owner-only booking-management predicate. As of Phase 24.2 this backs ONLY
+     * {@link #canViewBooking} / {@link #enforceCanViewBooking} — the completion, decline, and
+     * not-complete actions moved to {@link #hasProviderAuthorityOverBooking(UUID, Booking)},
+     * which additionally admits the assigned {@code SALON_ADMIN}. Do NOT broaden this predicate
+     * to match that one; the divergence (owner-only view-authorization vs. owner+admin
+     * provider-action authorization) is intentional.
+     */
     private boolean isAuthorizedToManageBooking(UUID actorId, Booking booking) {
         // SALON_MASTER exclusion: callers are responsible for short-circuiting before reaching here.
-        // canManageBooking() does so explicitly; other callers (enforceCanManageBooking, canViewBooking)
-        // rely on the ID-ownership checks below, which a SALON_MASTER cannot satisfy because their
-        // userId is never equal to the salon owner's userId.
+        // canManageBooking() does so explicitly; other callers (canViewBooking) rely on the
+        // ID-ownership checks below, which a SALON_MASTER cannot satisfy because their userId is
+        // never equal to the salon owner's userId.
         //
         // SALON_ADMIN exclusion: implicit via ownership semantics — SALON_ADMIN has a distinct userId
         // from the salon owner, so the owner-ID equality check below always returns false for them.
-        // This means SALON_ADMIN cannot confirm/decline/complete individual bookings — only the salon
-        // OWNER and the assigned INDEPENDENT_MASTER can. This boundary keeps booking lifecycle
-        // authority at the owner level and must be preserved if ownership logic ever relaxes.
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             return master.getUser().getId().equals(actorId);
         }
-        // SALON_OWNER-type master booking: master.salon.owner.id == actorId grants the
-        // owner confirm/decline/complete authority over their own bookings. SALON_ADMIN
-        // still excluded (distinct userId), preserving the owner-level lifecycle boundary.
+        // SALON_OWNER-type master booking: master.salon.owner.id == actorId grants the owner
+        // view authority over their own bookings. SALON_ADMIN still excluded (distinct userId).
         // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
         // (owner-operated) masters: authority derives from salon management access.
         // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.

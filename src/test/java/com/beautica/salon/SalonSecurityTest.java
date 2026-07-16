@@ -42,6 +42,13 @@ class SalonSecurityTest extends AbstractIntegrationTest {
     private static final String SALONS_URL = "/api/v1/salons";
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
+    // Phase 10.6 reversal: street + buildingNo are now @NotBlank on both
+    // CreateSalonRequest and UpdateSalonRequest. Every request that must reach a
+    // role/ownership gate has to carry a valid pair so the resulting 403 is
+    // attributable to the authz gate, not to bean validation (@Valid fires first).
+    private static final String VALID_STREET = "вул. Хрещатик";
+    private static final String VALID_BUILDING_NO = "1";
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -84,8 +91,10 @@ class SalonSecurityTest extends AbstractIntegrationTest {
         String ownerBToken = createSalonOwnerAndGetToken(
                 "owner-b-patch-" + System.nanoTime() + "@beautica.test");
 
+        // Valid street + buildingNo so the 403 is attributable to the cross-owner
+        // ownership gate, not to the required-address @NotBlank check.
         var patchRequest = new UpdateSalonRequest("Stolen Salon", null, null, null, null,
-                null, null, null, null, null, null, null);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null, null, null);
 
         log.debug("Act: PATCH {}/{} with Owner B's token targeting Owner A's salon — cross-owner patch must be denied", SALONS_URL, salonAId);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -173,7 +182,8 @@ class SalonSecurityTest extends AbstractIntegrationTest {
         // no districtId is required — only cityId is mandatory for provider locality.
         UUID cityId = jdbcTemplate.queryForObject(
                 "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
-        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null, null, null, null);
+        var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null,
+                VALID_STREET, VALID_BUILDING_NO, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 SALONS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(ownerToken)),

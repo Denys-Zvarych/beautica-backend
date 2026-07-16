@@ -16,8 +16,8 @@ import java.util.UUID;
  *   <li>{@code priceType} — the pricing mode ({@code FIXED} or {@code RANGE}).</li>
  *   <li>{@code priceMin} — the canonical floor ({@code base_price}) for both modes.</li>
  *   <li>{@code priceMax} — the ceiling for RANGE; {@code null} for FIXED.</li>
- *   <li>{@code priceDisplay} — pre-formatted display string, e.g. {@code "500 грн"} or
- *       {@code "від 500 до 800 грн"}. {@code null} when {@code priceMin} is {@code null}.</li>
+ *   <li>{@code priceDisplay} — pre-formatted display string, e.g. {@code "500 ₴"} or
+ *       {@code "від 500 до 800 ₴"}. {@code null} when {@code priceMin} is {@code null}.</li>
  * </ul>
  */
 public record ServiceDefinitionResponse(

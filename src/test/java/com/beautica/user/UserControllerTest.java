@@ -290,6 +290,56 @@ class UserControllerTest {
                 .updateProfile(any(UUID.class), any(UpdateProfileRequest.class));
     }
 
+    // ── Client locality stays OPTIONAL (Phase 10.6-reversal client-path guard) ────
+    // The Phase 10.6 reversal made street + buildingNo @NotBlank on the PROVIDER DTOs
+    // (IndependentMasterUpdateRequest / Create/UpdateSalonRequest) ONLY. The CLIENT
+    // self-service path (PATCH /users/me → UpdateProfileRequest) must NOT inherit that
+    // constraint: a client may save a city-only (or city+district) locality with no
+    // structured address. This test pins that invariant explicitly with a populated
+    // cityId/districtId and null street/buildingNo — it would fail the instant an
+    // accidental @NotBlank leaked onto UpdateProfileRequest.street/buildingNo.
+
+    @Test
+    @DisplayName("PATCH /me — 200 when CLIENT saves city+district only, no street/buildingNo (client locality stays optional)")
+    void should_return200_when_clientSavesCityOnlyWithoutStreetOrBuilding() throws Exception {
+        var userId = UUID.randomUUID();
+        var cityId = UUID.randomUUID();
+        var districtId = UUID.randomUUID();
+        var updated = new UserProfileResponse(
+                userId, "jane@example.com", "CLIENT",
+                "Jane", "Doe", null,
+                cityId, districtId,           // cityId, districtId — persisted for a client
+                null,                         // oblastId
+                "Київ", null, "Печерський",   // cityName, oblastName, districtName
+                null, null, null,             // street, buildingNo, locationNote — all stay null
+                null, null, null,             // bio, instagram, professionalTitle
+                true, false, null
+        );
+        when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
+                .thenReturn(updated);
+
+        // City + district set, but NO street / buildingNo — the realistic client
+        // "set my discovery city" save. @NotBlank must not exist on this DTO, so the
+        // request must reach the service and echo the persisted city.
+        var body = new UpdateProfileRequest(null, null, null,
+                cityId, districtId, null, null, null, null, null);
+
+        mockMvc.perform(patch("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.cityId").value(cityId.toString()))
+                .andExpect(jsonPath("$.data.districtId").value(districtId.toString()))
+                .andExpect(jsonPath("$.data.street").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.buildingNo").value(org.hamcrest.Matchers.nullValue()));
+
+        org.mockito.Mockito.verify(userService)
+                .updateProfile(eq(userId), any(UpdateProfileRequest.class));
+    }
+
     // ── UpdateProfileRequest @NoDigits regression (MEDIUM fix) ────────────────────
     // PATCH /users/me previously bypassed the no-digit person-name rule. @NoDigits is
     // now wired onto firstName/lastName; these lock the controller-boundary behaviour:

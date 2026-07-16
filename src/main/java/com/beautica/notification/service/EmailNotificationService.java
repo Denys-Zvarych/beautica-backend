@@ -110,7 +110,7 @@ public class EmailNotificationService {
     public void sendNewBookingEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
-        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("clientName", resolveClientName(booking));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
         send(to, "Нове бронювання", "email/new-booking", ctx);
@@ -122,7 +122,7 @@ public class EmailNotificationService {
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
-        send(to, "Запит на перенесення", "email/booking-rescheduled-provider", ctx);
+        send(to, "Бронювання перенесено", "email/booking-rescheduled-provider", ctx);
     }
 
     public void sendBookingConfirmedEmail(String to, Booking booking) {
@@ -163,7 +163,7 @@ public class EmailNotificationService {
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("comment", booking.getProviderComment());
-        send(to, "Бронювання відхилено", "email/booking-declined", ctx);
+        send(to, "Бронювання скасовано", "email/booking-declined", ctx);
     }
 
     /**
@@ -226,13 +226,29 @@ public class EmailNotificationService {
         }
     }
 
+    /**
+     * Sends the provider a "client cancelled" notification (Phase 24.x / fixed track 25.x — D3).
+     *
+     * <p><b>Fix D3.</b> This previously set {@code comment} from {@code booking.getClientComment()}
+     * — the booking-CREATION note (set once at POST /bookings, from
+     * {@code CreateBookingRequest.clientComment}) — and rendered it under the template's
+     * «Причина скасування» (cancellation reason) label. A client who wrote a creation-time note
+     * ("please, no fragrance") and later cancelled with an unrelated reason would cause the
+     * provider to see their creation note mislabeled as the cancellation reason, while the
+     * client's ACTUAL cancellation note ({@code clientCancellationNote}, persisted by
+     * {@code BookingService.cancelBooking} since the D2 fix) was silently dropped. Now
+     * {@code cancellationNote} carries the real cancellation-time note under its own label, and
+     * {@code creationNote} carries the booking-creation note under a separate, distinctly-labeled
+     * row — the two can never swap slots again.
+     */
     public void sendClientCancelledEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
-        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("clientName", resolveClientName(booking));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
-        ctx.setVariable("comment", booking.getClientComment());
+        ctx.setVariable("cancellationNote", booking.getClientCancellationNote());
+        ctx.setVariable("creationNote", booking.getClientComment());
         send(to, "Клієнт скасував бронювання", "email/booking-cancelled-provider", ctx);
     }
 
@@ -281,6 +297,26 @@ public class EmailNotificationService {
 
     private static String fullName(User user) {
         return user.getFirstName() + " " + user.getLastName();
+    }
+
+    /**
+     * Resolves the display name of the person who made this booking, for the master-facing
+     * "new booking" / "client cancelled" emails. A guest (LINK) booking has no registered
+     * account (V89 {@code chk_bookings_guest_fields} — {@code client_id} is null), so
+     * {@code fullName(booking.getClient())} would NPE unconditionally for every guest
+     * booking. Falls back to the OTP-verified guest identity, mirroring
+     * {@code NotificationService.resolveClientName} and {@code BookingDetailResponse.from}.
+     * This is the master's own booking, so surfacing the guest's name is not a PII leak;
+     * {@code guestPhone} is intentionally never read here.
+     */
+    private static String resolveClientName(Booking booking) {
+        User client = booking.getClient();
+        if (client != null) {
+            return fullName(client);
+        }
+        String guestName = booking.getGuestName() == null ? "" : booking.getGuestName();
+        String guestSurname = booking.getGuestSurname() == null ? "" : booking.getGuestSurname();
+        return (guestName + " " + guestSurname).trim();
     }
 
     private static String formatStartsAt(Booking booking) {

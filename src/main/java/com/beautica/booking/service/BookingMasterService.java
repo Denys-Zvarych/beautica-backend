@@ -31,7 +31,7 @@ import java.util.UUID;
  *
  * <p><b>Bookability gate: the single shared free-slot verdict.</b> A candidate is "bookable" only
  * if {@link SlotCalculationService#hasBookableFutureSlot} — active assignment, active master, a
- * usable schedule in the booking window, AND ≥1 FREE FUTURE slot (existing PENDING/CONFIRMED
+ * usable schedule in the booking window, AND ≥1 FREE FUTURE slot (existing CONFIRMED
  * bookings subtracted; slot start ≥ now + {@link BookingWindow#MIN_MINUTES_AHEAD}). This
  * is the exact same verdict the salon catalogue uses
  * ({@code ServiceCatalogService#getSalonServiceCatalog} via

@@ -15,6 +15,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.review.repository.ReviewRepository;
+import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
@@ -92,11 +93,18 @@ public class BookingService {
 
     @Transactional(readOnly = true)
     public BookingDetailResponse getBooking(UUID actorUserId, UUID bookingId) {
-        // Use full-graph fetch to avoid lazy-load SELECTs when building BookingDetailResponse
+        // Existence + view-authorization collapse to a single uniform 403 (Finding 8 — existence
+        // oracle), mirroring cancelBooking/rescheduleBooking. A missing id and an existing-but-
+        // foreign booking must be indistinguishable to the caller: a missing booking short-circuits
+        // to the SAME 403 the ownership guard (enforceCanViewBooking) throws for a foreign one, so
+        // an authenticated actor can no longer probe whether an arbitrary booking id exists by
+        // observing a 404-vs-403 split. The full-graph fetch is still required to build the detail
+        // response for the legitimate owner (200 + full detail unchanged).
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
-                .orElseThrow(() -> new NotFoundException("Booking not found"));
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
         authz.enforceCanViewBooking(actorUserId, booking);
-        boolean canReview = canReview(booking.getStatus(), reviewRepository.existsByBookingId(bookingId));
+        boolean canReview = canReview(
+                booking.getStatus(), reviewRepository.existsByBookingId(bookingId), booking.getClient() != null);
         return enrichSingle(booking, canReview);
     }
 
@@ -120,9 +128,15 @@ public class BookingService {
                 booking, canReview, labels.cityLabel(cityId), labels.districtLabel(districtId));
     }
 
-    /** {@code canReview = COMPLETED && no existing review} — single source of the truth table. */
-    private static boolean canReview(BookingStatus status, boolean reviewExists) {
-        return status == BookingStatus.COMPLETED && !reviewExists;
+    /**
+     * {@code canReview = COMPLETED && no existing review && a registered client exists to leave
+     * one} — single source of the truth table. A guest (LINK) booking has no account
+     * ({@code client_id} is null, V89 {@code chk_bookings_guest_fields}), so it can never be
+     * review-eligible even once COMPLETED — {@code ReviewService.createReview} requires an
+     * authenticated CLIENT owner, which a guest booking can never have.
+     */
+    private static boolean canReview(BookingStatus status, boolean reviewExists, boolean hasClient) {
+        return hasClient && status == BookingStatus.COMPLETED && !reviewExists;
     }
 
     /** Discovery city id: salon's when salon-employed, else the master's own user row. */
@@ -188,8 +202,10 @@ public class BookingService {
                 p.clientLastName(),
                 p.masterFirstName(),
                 p.masterLastName(),
+                p.masterProfessionalTitle(),
                 p.clientComment(),
                 p.providerComment(),
+                p.clientCancellationNote(),
                 p.masterAvatarUrl(),
                 p.masterType(),
                 p.salonName(),
@@ -197,8 +213,11 @@ public class BookingService {
                 labels.districtLabel(p.discoveryDistrictId()),
                 p.street(),
                 p.buildingNo(),
+                p.locationNote(),
                 p.categoryName(),
-                canReview(p.status(), p.reviewExists()));
+                // Defensive only: this projection is CLIENT-scoped (WHERE client_id = :clientId),
+                // so p.clientId() is always non-null in practice — never a guest booking.
+                canReview(p.status(), p.reviewExists(), p.clientId() != null));
     }
 
     /**
@@ -312,7 +331,7 @@ public class BookingService {
                 .map(b -> {
                     UUID cityId = discoveryCityId(b);
                     UUID districtId = discoveryDistrictId(b);
-                    boolean canReview = canReview(b.getStatus(), reviewed.contains(b.getId()));
+                    boolean canReview = canReview(b.getStatus(), reviewed.contains(b.getId()), b.getClient() != null);
                     return BookingDetailResponse.from(
                             b, canReview, labels.cityLabel(cityId), labels.districtLabel(districtId));
                 })
@@ -320,18 +339,16 @@ public class BookingService {
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 
-    @Transactional
-    public BookingResponse confirmBooking(UUID actorUserId, UUID bookingId) {
-        Booking booking = loadBookingOrThrow(bookingId);
-        authz.enforceCanManageBooking(actorUserId, booking);
-        assertTransition(booking, BookingStatus.PENDING, BookingStatus.CONFIRMED);
-        booking.setStatus(BookingStatus.CONFIRMED);
-        Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueStatusChanged(saved.getId());
-        evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        return BookingResponse.from(saved);
-    }
-
+    /**
+     * Provider-initiated cancellation (Phase 24.2 — repurposes what was {@code /decline}).
+     *
+     * <p>Under the track 24.x auto-confirm state machine a booking is born {@code CONFIRMED} —
+     * there is no provider approval step to decline, so this now models the provider (salon
+     * owner, assigned salon admin, or independent master) backing out of an already-confirmed
+     * booking. Distinguished from {@link #cancelBooking} (client-initiated) by the resulting
+     * {@code DECLINED} status, so the client's booking list can render "салон скасував"
+     * separately from "ви скасували".
+     */
     @Transactional
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         // Fix M4: require a reason, consistent with notCompleteBooking
@@ -339,11 +356,11 @@ public class BookingService {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required for declining a booking");
         }
         Booking booking = loadBookingOrThrow(bookingId);
-        authz.enforceCanManageBooking(actorUserId, booking);
-        assertTransition(booking, BookingStatus.PENDING, BookingStatus.DECLINED);
+        authz.enforceCanCancelBooking(actorUserId, booking);
+        assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.DECLINED);
         booking.setStatus(BookingStatus.DECLINED);
         booking.setCancellationReason(req.cancellationReason());
-        booking.setProviderComment(req.comment());
+        booking.setProviderComment(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
@@ -354,8 +371,9 @@ public class BookingService {
     @Transactional
     public BookingResponse completeBooking(UUID actorUserId, UUID bookingId) {
         Booking booking = loadBookingOrThrow(bookingId);
-        // Phase 18.4: completion admits SALON_ADMIN (unlike confirm/decline/not-complete, which
-        // stay owner-level on enforceCanManageBooking). See AuthorizationService.enforceCanCompleteBooking.
+        // Phase 18.4 / 24.2: completion, decline, and not-complete all share the same
+        // provider-authority shape (admits SALON_ADMIN) — see AuthorizationService.enforceCanCompleteBooking
+        // / enforceCanCancelBooking.
         authz.enforceCanCompleteBooking(actorUserId, booking);
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.COMPLETED);
         booking.setStatus(BookingStatus.COMPLETED);
@@ -377,14 +395,17 @@ public class BookingService {
     @Transactional
     public BookingResponse notCompleteBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking booking = loadBookingOrThrow(bookingId);
-        authz.enforceCanManageBooking(actorUserId, booking);
+        // Phase 24.2: aligned to the same provider-authority shape as completeBooking/
+        // declineBooking (admits SALON_ADMIN) — leaving admin able to complete/decline but not
+        // mark a no-show would be an incoherent permission set (decision D2).
+        authz.enforceCanCancelBooking(actorUserId, booking);
         if (req.cancellationReason() == null) {
             throw new BusinessException("Cancellation reason required");
         }
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED);
         booking.setStatus(BookingStatus.NOT_COMPLETED);
         booking.setCancellationReason(req.cancellationReason());
-        booking.setProviderComment(req.comment());
+        booking.setProviderComment(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
@@ -394,17 +415,30 @@ public class BookingService {
 
     @Transactional
     public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, CancelBookingRequest req) {
-        Booking booking = loadBookingOrThrow(bookingId);
-        if (!booking.getClient().getId().equals(clientUserId)) {
-            throw new ForbiddenException("Access denied");
-        }
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle):
+        // a missing id, a guest (LINK, null-client) booking, and an existing-but-foreign booking
+        // must all be indistinguishable to the caller. A prior 404-then-403 split let an
+        // authenticated CLIENT probe whether an arbitrary booking id exists at all.
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .filter(b -> b.getClient() != null && b.getClient().getId().equals(clientUserId))
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
         BookingStatus current = booking.getStatus();
-        if (current != BookingStatus.PENDING && current != BookingStatus.CONFIRMED) {
+        if (current != BookingStatus.CONFIRMED) {
             throw new BusinessException("Cannot cancel a booking in status %s".formatted(current));
         }
+        // Track 24.x read-only-after-elapse: once the appointment window has fully passed the
+        // booking is read-only for the client and awaits provider resolution (decline / complete /
+        // mark-no-show) — the client can no longer cancel it. Checked AFTER the status guard so a
+        // non-CONFIRMED booking still reports the more specific status conflict.
+        assertNotElapsedForClient(booking);
         booking.setStatus(BookingStatus.CANCELLED);
         // cancellationReason is guaranteed non-null by @NotNull on CancelBookingRequest
         booking.setCancellationReason(req.cancellationReason());
+        // Fix D2 (track 25.x): req.comment() was validated at the API but never persisted —
+        // the client's cancellation note was silently discarded. Stored separately from
+        // clientComment (the booking-CREATION note) so the provider's "client cancelled" email
+        // (see EmailNotificationService.sendClientCancelledEmail, Fix D3) never confuses the two.
+        booking.setClientCancellationNote(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
@@ -413,7 +447,7 @@ public class BookingService {
     }
 
     /**
-     * Moves a client's own {@code PENDING}/{@code CONFIRMED} booking to a new future time.
+     * Moves a client's own {@code CONFIRMED} booking to a new future time.
      *
      * <p>Reuses the create-path validation: {@link #validateStartsAt(OffsetDateTime)}
      * (≥15 min ahead, ≤180 days), the same working-hours / effective-day check via
@@ -421,23 +455,23 @@ public class BookingService {
      * the per-master advisory lock, and the overlap check — here excluding the booking's own row
      * ({@link BookingRepository#existsOverlapExcluding}). Also reuses the create-path
      * client-conflict guard ({@link #assertNoClientConflictExcluding}): the new window must not
-     * overlap ANY other {@code PENDING}/{@code CONFIRMED} booking this client holds, excluding
-     * this booking's own row — see {@link ClientBookingConflictException}.
-     * A {@code CONFIRMED} booking reverts to {@code PENDING} (re-enters the approval queue);
-     * a {@code PENDING} booking stays {@code PENDING}. Either way the provider is re-notified
-     * via a {@code BOOKING_RESCHEDULED} outbox event. {@code priceAtBooking} and
+     * overlap ANY other {@code CONFIRMED} booking this client holds, excluding this booking's own
+     * row — see {@link ClientBookingConflictException}.
+     * The booking stays {@code CONFIRMED} at the new time (no provider re-approval step — see the
+     * track 24.x locked state machine). The provider is still notified of the new time via a
+     * {@code BOOKING_RESCHEDULED} outbox event. {@code priceAtBooking} and
      * {@code durationMinutesAtBooking} are frozen and are NOT recomputed.
      *
-     * <p>No change to {@code confirmBooking}/{@code declineBooking}: a rescheduled booking is
-     * an ordinary {@code PENDING} booking, so a later decline → {@code DECLINED} and a later
-     * confirm → {@code CONFIRMED} at the new time, via the existing transition logic.
+     * <p>With no revert-to-approval-queue backstop, the slot/overlap/lead-time/schedule checks
+     * below are the ONLY thing preventing a double-booked slot — they MUST run unweakened on
+     * every reschedule.
      *
      * @param actorUserId the authenticated CLIENT (from the security principal, never the body)
      * @param bookingId   the booking to move
      * @param req         the new start time
      * @return the updated booking
      * @throws ForbiddenException              if the actor is not the owning client (403)
-     * @throws BusinessException               if the source state is not PENDING/CONFIRMED (409) or
+     * @throws BusinessException               if the source state is not CONFIRMED (409) or
      *                                          the new slot conflicts with the master's calendar
      *                                          (409); {@link #validateStartsAt} rejects bad times (400)
      * @throws ClientBookingConflictException  if the new window overlaps another booking this
@@ -445,19 +479,24 @@ public class BookingService {
      */
     @Transactional
     public BookingDetailResponse rescheduleBooking(UUID actorUserId, UUID bookingId, RescheduleBookingRequest req) {
-        Booking booking = loadBookingOrThrow(bookingId);
-
-        // Ownership: only the owning registered client may reschedule. A guest (LINK)
-        // booking has no client account, so getClient() is null and the actor can never match.
-        if (booking.getClient() == null || !booking.getClient().getId().equals(actorUserId)) {
-            throw new ForbiddenException("Access denied");
-        }
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring cancelBooking. A guest (LINK) booking has no client account, so getClient()
+        // is null and the actor can never match — it falls into the same uniform 403 as a
+        // missing id or a foreign booking, never a distinguishable 404.
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .filter(b -> b.getClient() != null && b.getClient().getId().equals(actorUserId))
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
 
         BookingStatus current = booking.getStatus();
-        if (current != BookingStatus.PENDING && current != BookingStatus.CONFIRMED) {
+        if (current != BookingStatus.CONFIRMED) {
             throw new BusinessException(HttpStatus.CONFLICT,
                     "Cannot reschedule a booking in status %s".formatted(current));
         }
+        // Track 24.x read-only-after-elapse: an already-elapsed booking is read-only for the
+        // client and awaits provider resolution — the client can no longer move it to a new time.
+        // Checked AFTER the status guard so a non-CONFIRMED booking still reports the more
+        // specific status conflict.
+        assertNotElapsedForClient(booking);
 
         OffsetDateTime newStartsAt = req.newStartsAt();
         validateStartsAt(newStartsAt);
@@ -519,9 +558,11 @@ public class BookingService {
             registerSlotEviction(masterId, salonIdOf(saved), newStartsAt.toLocalDate(), saved.getMasterService().getId());
         }
         evictMasterCalendarAfterCommit(masterId);
-        // A rescheduled booking is always PENDING/CONFIRMED, so canReview is false by the
-        // COMPLETED predicate — no review-existence query needed on this path.
-        return enrichSingle(saved, canReview(saved.getStatus(), false));
+        // A rescheduled booking is always CONFIRMED, so canReview is false by the
+        // COMPLETED predicate — no review-existence query needed on this path. saved.getClient()
+        // is guaranteed non-null here (the ownership filter above only matches account-bound
+        // bookings), passed through for signature consistency with the other call sites.
+        return enrichSingle(saved, canReview(saved.getStatus(), false, saved.getClient() != null));
     }
 
     private BookingResponse doCreateBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
@@ -593,14 +634,14 @@ public class BookingService {
                 // salon is set from master.getSalon() which is null for INDEPENDENT_MASTER.
                 // This preserves the V18 nullable salon_id column intent without an explicit check.
                 .salon(master.getSalon())
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(startsAt)
                 .endsAt(endsAt)
                 .priceAtBooking(effectivePrice)
                 .durationMinutesAtBooking(effectiveDuration)
                 .bufferMinutesAtBooking(bufferMinutes)
                 .idempotencyKey(idempotencyKey)
-                .clientComment(request.clientComment())
+                .clientComment(BookingComments.normalize(request.clientComment()))
                 .build();
 
         Booking saved;
@@ -610,7 +651,13 @@ public class BookingService {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }
 
+        // Two outbox rows, two distinct recipients (D3): NEW_BOOKING → the master (see
+        // NotificationService.notifyNewBooking); STATUS_CHANGED → the client, whose CONFIRMED
+        // branch already dispatches «Бронювання підтверджено» (see notifyBookingStatusChanged).
+        // No new event type — the booking is auto-confirmed at creation (track 24.x), so this
+        // is simply the client-facing half of the same create event, not a genuine transition.
         outboxService.enqueueNewBooking(saved.getId());
+        outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved);
     }
@@ -666,7 +713,7 @@ public class BookingService {
 
     /**
      * Throws {@link ClientBookingConflictException} if the client already holds a
-     * {@code PENDING}/{@code CONFIRMED} booking (with ANY master/salon) overlapping
+     * {@code CONFIRMED} booking (with ANY master/salon) overlapping
      * {@code [startsAt, endsAt)}. Caller must hold {@link #acquireClientLock(UUID)} first so
      * two concurrent requests from the same client cannot both pass this check.
      */
@@ -748,6 +795,23 @@ public class BookingService {
         // additional SELECTs for masterService and serviceDefinition
         return bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new NotFoundException("Booking not found"));
+    }
+
+    /**
+     * Guards the client-initiated write paths (cancel / reschedule) against an already-elapsed
+     * booking: once {@code endsAt} is before "now" the appointment is read-only for the client and
+     * only the provider (decline / complete / mark-no-show) may resolve it (track 24.x). Compared
+     * on the absolute instant via the injected {@link Clock} (the same time source
+     * {@link #validateStartsAt} uses), so tests can pin an elapsed booking deterministically.
+     *
+     * <p>Deliberately NOT applied to the provider paths ({@link #declineBooking},
+     * {@link #completeBooking}, {@link #notCompleteBooking}) — resolving an elapsed booking is
+     * exactly their job.
+     */
+    private void assertNotElapsedForClient(Booking booking) {
+        if (booking.getEndsAt().toInstant().isBefore(clock.instant())) {
+            throw new BookingElapsedException();
+        }
     }
 
     private void assertTransition(Booking booking, BookingStatus expected, BookingStatus target) {

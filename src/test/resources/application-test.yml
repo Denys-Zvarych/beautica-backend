@@ -43,6 +43,13 @@ app:
     # the same authenticated client) is not itself rate-limited — mirrors every other capacity
     # above (production default stays the tight 5/10s in RateLimitConfig).
     booking-write-capacity: 100000
+    # High so an IT firing several PATCH /bookings/{id}/decline or /not-complete calls for the
+    # same authenticated provider (e.g. GuestBookingDeclineNotificationIT, BookingCommentPersistenceIT)
+    # is not itself rate-limited — production default stays 10/60s in RateLimitConfig.
+    # BookingRateLimitFilterTest's decline/not-complete throttling assertions build the filter
+    # directly against a hand-built single-slot LoadingCache (bypassing this property entirely),
+    # so this override does not neuter that coverage.
+    booking-decline-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.
@@ -84,6 +91,41 @@ app:
     # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
     payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
   internal-api-key: test-internal-api-key
+
+notification:
+  outbox:
+    drain:
+      # QA fix (track 25.x booking-enrichment audit, 2026-07-14): the real
+      # @Scheduled(fixedDelayString) NotificationOutboxDrainWorker.drain() timer is live in
+      # every full @SpringBootTest context (SchedulingConfig is not profile-gated). Integration
+      # tests drive draining deterministically via a direct drainWorker.drain() call — the
+      # background timer racing that manual call over the same PENDING row
+      # (SELECT ... FOR UPDATE SKIP LOCKED) caused a rare "expected: SENT but was: PENDING"
+      # flake in NotificationOutboxIntegrationTest, plus a logged
+      # ObjectOptimisticLockingFailureException when the background worker's phase-3 save()
+      # later targeted a row a test had already deleteAll()'d. One hour comfortably exceeds any
+      # single test-suite run, so the background timer never fires during tests; production
+      # keeps the 5000ms default (see NotificationOutboxDrainWorker#drain javadoc).
+      fixed-delay-ms: 3600000
+      # fixedDelay does NOT delay the FIRST @Scheduled fire — without this, drain() fires once at
+      # t≈0 on EVERY @SpringBootTest context startup (SchedulingConfig#EnableScheduling is not
+      # profile-gated). This keeps the background scheduler quiet during tests (hygiene). NOTE: this
+      # does NOT fix the NotificationOutboxIntegrationTest concurrency flake — that flake was proven
+      # to reproduce with the scheduler fully suppressed (root cause is elsewhere; see below).
+      initial-delay-ms: 3600000
+    reclaim:
+      # Same one-hour-comfortably-exceeds-any-test-run reasoning as drain.fixed-delay-ms above —
+      # the background NotificationOutboxReclaimJob timer must not fire mid-test and reclaim a
+      # row a test is still in the middle of asserting on. Tests that need to exercise the
+      # reclaim sweep itself call NotificationOutboxReclaimJob#sweep() directly with a pinned
+      # Clock, bypassing the scheduler entirely.
+      fixed-delay-ms: 3600000
+      # Suppress the reclaim job's t≈0 first fire too (same fixedDelay-first-fire reason as drain).
+      initial-delay-ms: 3600000
+      # Config-record binding requires SOME positive value even though tests never wait for the
+      # scheduler; unit/repository tests pass an explicit staleBefore Instant directly and never
+      # read this property.
+      stale-claim-threshold: 60m
 
 management:
   health:

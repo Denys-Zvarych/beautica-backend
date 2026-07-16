@@ -16,7 +16,8 @@ import org.springframework.context.annotation.Configuration;
         PublicBaseUrlProperties.class,
         SupportProperties.class,
         TurbosmsProperties.class,
-        BookingSmsProperties.class
+        BookingSmsProperties.class,
+        OutboxReclaimPolicyConfig.class
 })
 public class AppConfigProperties {
 }

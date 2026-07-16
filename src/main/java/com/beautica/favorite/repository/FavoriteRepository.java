@@ -73,6 +73,22 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * not role-filtered here: the service rejects a {@code SALON_MASTER} target at
      * write time, so no such favorite row can exist to read back.
      *
+     * <p><b>Anti-Bug audit LOW-1 (2026-07):</b> {@code COALESCE(sal.city_id, u.city_id)}
+     * below is intentional, not the fall-through class fixed in
+     * {@code BookingRepository.findClientBookingDetails} (19.3) — {@code Salon.cityId}
+     * itself CAN be null (legacy pre-Phase-10.3 rows, no {@code NOT NULL}), but that
+     * fact is irrelevant here: {@code FavoriteService.validateMasterTarget} rejects any
+     * target whose owning user role is not {@code INDEPENDENT_MASTER} with a 400
+     * <em>before</em> a favorite row is ever written, and an {@code INDEPENDENT_MASTER}'s
+     * {@code masters.salon_id} is structurally always {@code NULL}
+     * ({@code MasterService.createMasterForIndependentUser} never sets a salon). So
+     * {@code sal.*} is always {@code NULL} for every row this query can ever join,
+     * independent of any salon's actual {@code city_id}/{@code district_id} data —
+     * {@code COALESCE} and a {@code CASE WHEN sal.id IS NOT NULL …} guard are provably
+     * equivalent here. Pinned by
+     * {@code FavoriteServiceTest.should_throwBadRequest_when_targetIsSalonMaster}
+     * (write-time rejection, independent of any salon data).
+     *
      * <p>{@code last_service_name} is a correlated {@code LATERAL} subquery taking the
      * single most-recent booking for this {@code (client, master)} pair — one extra
      * index-served lookup per favorited master (served by {@code

@@ -84,9 +84,13 @@ class BookingSecurityTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
+    // NOTE(24.7): these two cases used to exercise the now-deleted PATCH /confirm route.
+    // Migrated onto /decline (track 24.x — the untouched provider-cancellation path) so the role
+    // gate + cross-tenant IDOR coverage they encode does not silently disappear.
+
     @Test
-    @DisplayName("PATCH confirm — 403 when SALON_MASTER attempts to confirm (not a manager role)")
-    void should_return403_when_salonMasterAttemptsToConfirmBooking() throws Exception {
+    @DisplayName("PATCH decline — 403 when SALON_MASTER attempts to decline (not a manager role)")
+    void should_return403_when_salonMasterAttemptsToDeclineBooking() throws Exception {
         // Arrange: create a salon with a master; CLIENT books a slot
         String ownerEmail = "sm-confirm-owner-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
@@ -106,20 +110,22 @@ class BookingSecurityTest extends AbstractIntegrationTest {
                 String.class, masterId);
         String salonMasterToken = loginAndGetToken(masterEmail);
 
-        // Act: SALON_MASTER attempts to confirm — must be rejected with 403
-        log.debug("Act: PATCH {}/{}/confirm as SALON_MASTER — must return 403", BOOKINGS_URL, bookingId);
+        // Act: SALON_MASTER attempts to decline — must be rejected with 403
+        log.debug("Act: PATCH {}/{}/decline as SALON_MASTER — must return 403", BOOKINGS_URL, bookingId);
         ResponseEntity<String> response = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(salonMasterToken)),
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Майстер недоступний\"}",
+                        bearerHeaders(salonMasterToken)),
                 String.class);
 
         assertThat(response.getStatusCode())
-                .as("SALON_MASTER confirming booking must return 403, bookingId=%s", bookingId)
+                .as("SALON_MASTER declining booking must return 403, bookingId=%s", bookingId)
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
-    @DisplayName("PATCH confirm — 403 when owner B attempts to confirm a booking from salon A")
+    @DisplayName("PATCH decline — 403 when owner B attempts to decline a booking from salon A")
     void should_return403_when_ownerOfSalonBManagesBookingInSalonA() throws Exception {
         String ownerAEmail = "owner-a-idor-" + System.nanoTime() + "@beautica.test";
         UUID masterAId = createSalonOwnerSalonAndMaster(ownerAEmail);
@@ -135,14 +141,16 @@ class BookingSecurityTest extends AbstractIntegrationTest {
         createSalonOwnerSalonAndMaster(ownerBEmail);
         String ownerBToken = loginAndGetToken(ownerBEmail);
 
-        log.debug("Act: PATCH {}/{}/confirm with Owner B token targeting Owner A's booking — must be denied", BOOKINGS_URL, bookingId);
+        log.debug("Act: PATCH {}/{}/decline with Owner B token targeting Owner A's booking — must be denied", BOOKINGS_URL, bookingId);
         ResponseEntity<String> response = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(ownerBToken)),
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Не наш майстер\"}",
+                        bearerHeaders(ownerBToken)),
                 String.class);
 
         assertThat(response.getStatusCode())
-                .as("status must be 403 when owner B confirms booking in salon A, bookingId=%s", bookingId)
+                .as("status must be 403 when owner B declines booking in salon A, bookingId=%s", bookingId)
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 

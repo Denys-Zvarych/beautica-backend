@@ -6,7 +6,7 @@ import jakarta.validation.constraints.NotNull;
 import java.time.OffsetDateTime;
 
 /**
- * Request to move a {@code PENDING} or {@code CONFIRMED} booking to a new time.
+ * Request to move a {@code CONFIRMED} booking to a new time.
  *
  * <p>The {@code @Future} guard rejects past instants at the controller boundary;
  * the stricter lead-time floor (≥15 min ahead) and the ≤180-day cap are enforced

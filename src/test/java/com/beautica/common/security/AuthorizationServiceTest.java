@@ -1204,6 +1204,41 @@ class AuthorizationServiceTest {
                 .doesNotThrowAnyException();
     }
 
+    @Test
+    @DisplayName("enforceCanViewBooking throws ForbiddenException (not a 500 NPE) when a CLIENT views a "
+            + "guest (LINK / null-client) booking — regression for the missing null guard on "
+            + "booking.getClient().getId() at enforceCanViewBooking L482")
+    void should_return403NotCrash_when_clientViewsGuestBooking() {
+        UUID actorId = UUID.randomUUID();
+
+        // Guest (LINK) booking: no client account (V89 chk_bookings_guest_fields), so
+        // booking.getClient() is null. The master is salon-bound so isAuthorizedToManageBooking
+        // (checked first) resolves via the salon-owner id, which never matches this CLIENT actor,
+        // and falls through to the actorRole == CLIENT branch — the one that dereferences
+        // getClient().getId() unconditionally before the fix, NPEing into an unhandled 500
+        // instead of the correct "not this actor's booking" 403.
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        Booking guestBooking = mock(Booking.class);
+        when(guestBooking.getMaster()).thenReturn(master);
+        when(guestBooking.getClient()).thenReturn(null);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_CLIENT"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(actorId, guestBooking))
+                .as("a null-client (guest) booking viewed by a CLIENT must yield 403, never an "
+                        + "unhandled NullPointerException/500")
+                .isInstanceOf(ForbiddenException.class);
+    }
+
     // ── canManageMaster — role fast-path (no DB hit) ──────────────────────────
 
     @Test
@@ -1526,123 +1561,20 @@ class AuthorizationServiceTest {
                 .as("null salon on SALON_OWNER-type master must yield ForbiddenException on schedule enforce");
     }
 
-    // ── isAuthorizedToManageBooking — SALON_OWNER master type (Phase 12.1) ────
-
-    @Test
-    @DisplayName("enforceCanManageBooking — does not throw when SALON_OWNER-type master's salon owner matches actor")
-    void should_notThrow_when_enforceCanManageBookingCalledWithSalonOwnerTypeAndCorrectOwner() {
-        UUID actorId = UUID.randomUUID();
-
-        User salonOwner = mock(User.class);
-        when(salonOwner.getId()).thenReturn(actorId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(salonOwner);
-
-        Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
-        when(master.getSalon()).thenReturn(salon);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
-
-        authorizationService.enforceCanManageBooking(actorId, booking);
-        // No exception = pass.
-    }
-
-    @Test
-    @DisplayName("enforceCanManageBooking — throws ForbiddenException when booking master is SALON_OWNER type but actor is a different owner")
-    void should_throwForbidden_when_wrongActorTriesToManageBookingWithSalonOwnerTypeMaster() {
-        UUID actorId = UUID.randomUUID();
-        UUID realOwnerId = UUID.randomUUID();
-
-        User realOwner = mock(User.class);
-        when(realOwner.getId()).thenReturn(realOwnerId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(realOwner);
-
-        Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
-        when(master.getSalon()).thenReturn(salon);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
-
-        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(actorId, booking))
-                .isInstanceOf(ForbiddenException.class)
-                .as("a different owner must not be allowed to manage a booking whose master is SALON_OWNER type");
-    }
-
-    @Test
-    @DisplayName("enforceCanManageBooking — throws ForbiddenException when SALON_OWNER-type master has null salon on booking")
-    void should_throwForbidden_when_salonOwnerTypeMasterHasNullSalonOnBookingEnforce() {
-        UUID actorId = UUID.randomUUID();
-
-        Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
-        when(master.getSalon()).thenReturn(null);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
-
-        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(actorId, booking))
-                .isInstanceOf(ForbiddenException.class)
-                .as("null salon on SALON_OWNER-type master must yield ForbiddenException on booking enforce");
-    }
-
-    // ── enforceCanManageBooking ────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("enforceCanManageBooking throws ForbiddenException when owner B tries to manage owner A's salon booking")
-    void should_throwForbidden_when_enforceCanManageBookingCalledWithWrongOwner() {
-        UUID ownerAId = UUID.randomUUID();
-        UUID ownerBId = UUID.randomUUID();
-
-        User ownerA = mock(User.class);
-        when(ownerA.getId()).thenReturn(ownerAId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(ownerA);
-
-        Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
-        when(master.getSalon()).thenReturn(salon);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
-
-        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(ownerBId, booking))
-                .isInstanceOf(ForbiddenException.class);
-    }
-
-    @Test
-    @DisplayName("enforceCanManageBooking does not throw when correct salon owner manages their own salon's booking")
-    void should_notThrow_when_enforceCanManageBookingCalledWithCorrectSalonOwner() {
-        UUID actorId = UUID.randomUUID();
-
-        User salonOwner = mock(User.class);
-        when(salonOwner.getId()).thenReturn(actorId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(salonOwner);
-
-        Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
-        when(master.getSalon()).thenReturn(salon);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
-
-        assertThatCode(() -> authorizationService.enforceCanManageBooking(actorId, booking))
-                .doesNotThrowAnyException();
-    }
+    // TODO(24.7): AuthorizationService.enforceCanManageBooking was deleted in Phase 24.2 — it had
+    // zero remaining production callers once declineBooking/notCompleteBooking moved to
+    // enforceCanCancelBooking (which also admits SALON_ADMIN via hasProviderAuthorityOverBooking,
+    // unlike the deleted owner-only predicate). Former coverage here (SALON_OWNER-type-master
+    // ownership match/mismatch, null-salon guard, SALON_MASTER-type-master owner match/mismatch)
+    // has no 1:1 replacement — isAuthorizedToManageBooking (the private predicate that backed it)
+    // is now exercised only indirectly via canViewBooking/enforceCanViewBooking below. backend-qa
+    // should add equivalent coverage for enforceCanCancelBooking/canCancelBooking instead (see the
+    // provider-cancel authz matrix in the 24.2/24.7 plan).
 
     // ── Phase 12.3 — Owner-as-master: authorization explicit tests ────────────
 
-    // Split from the former dual-behaviour should_allowOwner_toConfirmOwnMasterBooking,
-    // which exercised both the SpEL projection path (canManageBooking) and the in-memory
-    // entity path (enforceCanManageBooking) in one method. One behaviour per test now.
+    // canManageBooking (SpEL projection path) still exists unchanged — the in-memory
+    // enforceCanManageBooking twin was deleted in Phase 24.2 (see the TODO(24.7) above).
     @Test
     @DisplayName("Phase 12.3: canManageBooking allows the owner to confirm their own SALON_OWNER-type master booking (projection path)")
     void should_allowOwner_toConfirmOwnMasterBooking_viaCanManageBooking() {
@@ -1661,55 +1593,6 @@ class AuthorizationServiceTest {
         assertThat(canManage)
                 .as("SALON_OWNER actor must be able to manage their own SALON_OWNER-type master booking via canManageBooking")
                 .isTrue();
-    }
-
-    @Test
-    @DisplayName("Phase 12.3: enforceCanManageBooking allows the owner to confirm their own SALON_OWNER-type master booking (in-memory entity path)")
-    void should_allowOwner_toConfirmOwnMasterBooking_viaEnforceCanManageBooking() {
-        UUID actorId = UUID.randomUUID();
-
-        // isAuthorizedToManageBooking path: in-memory entity check via enforceCanManageBooking
-        User salonOwner = mock(User.class);
-        when(salonOwner.getId()).thenReturn(actorId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(salonOwner);
-
-        Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
-        when(master.getSalon()).thenReturn(salon);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
-
-        assertThatCode(() -> authorizationService.enforceCanManageBooking(actorId, booking))
-                .as("enforceCanManageBooking must not throw for SALON_OWNER-type master booking owned by actor")
-                .doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("Phase 12.3: SALON_ADMIN cannot confirm/complete a SALON_OWNER-type master booking — owner-level boundary preserved")
-    void should_denySalonAdmin_toCompleteOwnerMasterBooking() {
-        UUID adminId = UUID.randomUUID();
-        UUID realOwnerId = UUID.randomUUID(); // the actual salon owner — not the admin
-
-        User realOwner = mock(User.class);
-        when(realOwner.getId()).thenReturn(realOwnerId);
-
-        Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(realOwner);
-
-        Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
-        when(master.getSalon()).thenReturn(salon);
-
-        Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
-
-        // adminId != realOwnerId → isAuthorizedToManageBooking returns false → throws
-        assertThatThrownBy(() -> authorizationService.enforceCanManageBooking(adminId, booking))
-                .as("SALON_ADMIN (distinct userId) must not be able to complete a SALON_OWNER-type master booking")
-                .isInstanceOf(ForbiddenException.class);
     }
 
     @Test

@@ -146,7 +146,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
-        Booking booking = buildBooking(BookingStatus.PENDING, startsAt, endsAt);
+        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
         em.persist(booking);
         em.flush();
 
@@ -213,12 +213,12 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("should_existsOverlapReturnTrue_when_pendingBookingConflicts")
-    void should_existsOverlapReturnTrue_when_pendingBookingConflicts() {
+    @DisplayName("should_existsOverlapReturnTrue_when_confirmedBookingConflicts")
+    void should_existsOverlapReturnTrue_when_confirmedBookingConflicts() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
-        Booking booking = buildBooking(BookingStatus.PENDING, startsAt, endsAt);
+        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
         em.persist(booking);
         em.flush();
 
@@ -236,7 +236,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
-        Booking booking = buildBooking(BookingStatus.PENDING, startsAt, endsAt);
+        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
         em.persist(booking);
         em.flush();
 
@@ -258,7 +258,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .client(clientUser)
                 .master(master)
                 .masterService(masterService)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(startsAt)
                 .endsAt(endsAt)
                 .priceAtBooking(new BigDecimal("450.00"))
@@ -282,7 +282,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
-        Booking booking = buildBooking(BookingStatus.PENDING, startsAt, endsAt);
+        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
         em.persist(booking);
         em.flush();
 
@@ -360,7 +360,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .master(master)
                 .masterService(masterService)
                 .salon(salon)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.CONFIRMED)
                 .startsAt(OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC))
                 .endsAt(OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC))
                 .priceAtBooking(new BigDecimal("450.00"))
@@ -437,19 +437,19 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .build();
         em.persist(salonMsa);
 
-        Booking pendingBooking = Booking.builder()
+        Booking declinedBooking = Booking.builder()
                 .client(clientUser)
                 .master(salonMaster)
                 .masterService(salonMsa)
                 .salon(salon)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.DECLINED)
                 .startsAt(OffsetDateTime.of(2026, 7, 1, 10, 0, 0, 0, ZoneOffset.UTC))
                 .endsAt(OffsetDateTime.of(2026, 7, 1, 11, 0, 0, 0, ZoneOffset.UTC))
                 .priceAtBooking(new BigDecimal("350.00"))
                 .durationMinutesAtBooking(60)
                 .bufferMinutesAtBooking(0)
                 .build();
-        em.persist(pendingBooking);
+        em.persist(declinedBooking);
 
         Booking confirmedBooking = Booking.builder()
                 .client(clientUser)
@@ -469,10 +469,10 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<UUID> idPage = bookingRepository.findIdsBySalonIdAndOwnerIdAndStatus(
-                salon.getId(), salonOwner.getId(), BookingStatus.PENDING, PageRequest.of(0, 10));
+                salon.getId(), salonOwner.getId(), BookingStatus.DECLINED, PageRequest.of(0, 10));
 
         assertThat(idPage.getTotalElements()).isEqualTo(1);
-        assertThat(idPage.getContent().get(0)).isEqualTo(pendingBooking.getId());
+        assertThat(idPage.getContent().get(0)).isEqualTo(declinedBooking.getId());
     }
 
     @Test
@@ -535,19 +535,19 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .build();
         em.persist(salonMsa);
 
-        Booking pendingBooking = Booking.builder()
+        Booking declinedBooking = Booking.builder()
                 .client(clientUser)
                 .master(salonMaster)
                 .masterService(salonMsa)
                 .salon(salon)
-                .status(BookingStatus.PENDING)
+                .status(BookingStatus.DECLINED)
                 .startsAt(OffsetDateTime.of(2026, 8, 1, 10, 0, 0, 0, ZoneOffset.UTC))
                 .endsAt(OffsetDateTime.of(2026, 8, 1, 10, 45, 0, 0, ZoneOffset.UTC))
                 .priceAtBooking(new BigDecimal("300.00"))
                 .durationMinutesAtBooking(45)
                 .bufferMinutesAtBooking(0)
                 .build();
-        em.persist(pendingBooking);
+        em.persist(declinedBooking);
 
         em.flush();
         em.clear();
@@ -827,7 +827,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
     //
     // The service-layer tests (BookingServiceTest) exercise these methods only via
     // Mockito. This section pins the actual native-query contract against real Postgres:
-    // status filtering (PENDING/CONFIRMED conflict; every terminal status does not),
+    // status filtering (CONFIRMED conflicts; every terminal status does not),
     // half-open boundary, ORDER BY starts_at ASC LIMIT 1 determinism, cross-master scope
     // (client_id only, no master_id predicate), and the excluding-variant's self-exclusion.
 
@@ -945,9 +945,9 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("should_findConflict_when_pendingClientBookingOverlaps")
-    void should_findConflict_when_pendingClientBookingOverlaps() {
-        Booking existing = bookingFor(clientUser, master, masterService, BookingStatus.PENDING,
+    @DisplayName("should_findConflict_when_confirmedClientBookingOverlaps")
+    void should_findConflict_when_confirmedClientBookingOverlaps() {
+        Booking existing = bookingFor(clientUser, master, masterService, BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
         em.persist(existing);
@@ -1011,7 +1011,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         Booking later = bookingFor(clientUser, master, masterService, BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC));
-        Booking earlier = bookingFor(clientUser, otherMaster, otherMsa, BookingStatus.PENDING,
+        Booking earlier = bookingFor(clientUser, otherMaster, otherMsa, BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 9, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC));
         em.persist(later);
@@ -1065,7 +1065,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         Booking excludedBooking = bookingFor(clientUser, master, masterService, BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
-        Booking otherConflict = bookingFor(clientUser, otherMaster, otherMsa, BookingStatus.PENDING,
+        Booking otherConflict = bookingFor(clientUser, otherMaster, otherMsa, BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 10, 15, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 11, 15, 0, 0, ZoneOffset.UTC));
         em.persist(excludedBooking);
@@ -1087,7 +1087,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
     //
     // The availability computation (calendar day projection + free-slot gate) reads bookings ONLY through
     // this JPQL constructor projection, which must reproduce findOverlappingByMaster's predicate exactly:
-    // PENDING/CONFIRMED only, master-scoped, [starts_at < windowEnd AND ends_at > windowStart), ordered by
+    // CONFIRMED only, master-scoped, [starts_at < windowEnd AND ends_at > windowStart), ordered by
     // start. These pin the data-correctness contract the whole booking-day fix rides on.
 
     private static final OffsetDateTime WINDOW_START =
@@ -1096,22 +1096,23 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
             OffsetDateTime.of(2026, 6, 2, 0, 0, 0, 0, ZoneOffset.UTC);
 
     @Test
-    @DisplayName("should_projectStartAndEnd_forPendingAndConfirmedOrderedByStart")
-    void should_projectStartAndEnd_forPendingAndConfirmedInRange() {
-        Booking confirmed = buildBooking(BookingStatus.CONFIRMED,
+    @DisplayName("should_projectStartAndEnd_forConfirmedBookingsOrderedByStart")
+    void should_projectStartAndEnd_forConfirmedBookingsInRange() {
+        // track 24.x: only CONFIRMED is active — two CONFIRMED bookings exercise the ordering.
+        Booking later = buildBooking(BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 14, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 15, 0, 0, 0, ZoneOffset.UTC));
-        Booking pending = buildBooking(BookingStatus.PENDING,
+        Booking earlier = buildBooking(BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 9, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC));
-        em.persist(confirmed);
-        em.persist(pending);
+        em.persist(later);
+        em.persist(earlier);
         em.flush();
 
         List<BookingTimeRange> result = bookingRepository.findActiveTimeRangesByMasterInRange(
                 master.getId(), WINDOW_START, WINDOW_END);
 
-        // Ordered by startsAt ASC (pending 09:00 before confirmed 14:00), projecting exactly the two columns.
+        // Ordered by startsAt ASC (earlier 09:00 before later 14:00), projecting exactly the two columns.
         assertThat(result)
                 .as("both active bookings are projected, ordered by start, as (startsAt, endsAt) tuples")
                 .extracting(BookingTimeRange::startsAt, BookingTimeRange::endsAt)
@@ -1161,7 +1162,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 OffsetDateTime.of(2026, 6, 2, 1, 0, 0, 0, ZoneOffset.UTC));
         // A plainly in-window booking as the positive control. None of the three overlap each other
         // (before ends 00:00, within is 10:00–11:00, after starts 00:00 next day), so all coexist.
-        Booking within = buildBooking(BookingStatus.PENDING,
+        Booking within = buildBooking(BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC));
         em.persist(before);
@@ -1184,7 +1185,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
     void should_includeTailSpillingAcrossWindowStart_when_projectingActiveTimeRanges() {
         // Starts on the previous day, tail spills past windowStart (ends_at > windowStart) — included,
         // exactly as the day-bucketing relies on to occupy the first in-window day.
-        Booking spillIn = buildBooking(BookingStatus.PENDING,
+        Booking spillIn = buildBooking(BookingStatus.CONFIRMED,
                 OffsetDateTime.of(2026, 5, 31, 23, 30, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 1, 0, 30, 0, 0, ZoneOffset.UTC));
         em.persist(spillIn);

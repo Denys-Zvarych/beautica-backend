@@ -12,8 +12,6 @@ import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -36,10 +34,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * (real Spring Security {@code @PreAuthorize} + real {@link com.beautica.common.security.AuthorizationService}
  * over a seeded Testcontainers Postgres).
  *
- * <p>Proves the Phase 18.4 relaxation is <b>scoped to completion only</b>: a {@code SALON_ADMIN}
- * assigned to the booking's salon may complete it (204) but still cannot confirm/decline/not-complete
- * (403 — those stay owner-level). Cross-tenant actors and a non-existent booking id both return an
- * identical 403 (no 403-vs-404 existence oracle).
+ * <p>Track 24.x retired {@code PATCH /bookings/{id}/confirm} entirely (bookings are now
+ * auto-confirmed at creation) and, per Decisions D1/D2, widened the assigned {@code SALON_ADMIN}
+ * to ALL provider-authority transitions on a booking — complete, decline, and not-complete alike
+ * share {@link com.beautica.common.security.AuthorizationService#hasProviderAuthorityOverBooking}
+ * via {@code enforceCanCompleteBooking}/{@code enforceCanCancelBooking}. Cross-tenant actors and a
+ * non-existent booking id both return an identical 403 (no 403-vs-404 existence oracle).
  *
  * <p>{@link NotificationOutboxService} is mocked so a successful completion has no dispatch side
  * effect — this suite asserts HTTP status codes only, never business side effects (those are T1/T3).
@@ -219,28 +219,84 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingA)).isEqualTo("CONFIRMED");
     }
 
-    // ── containment regression: admin relaxation is completion-scoped only ────────
+    // ── SALON_ADMIN is admitted on decline/not-complete too (Decisions D1/D2) ─────
 
-    @ParameterizedTest(name = "SALON_ADMIN → 403 on {0}")
-    @CsvSource({
-            "confirm,      {}",
-            "decline,      {\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}",
-            "not-complete, {\"cancellationReason\":\"CLIENT_NO_SHOW\"}"
-    })
-    @DisplayName("SALON_ADMIN is still 403 on confirm/decline/not-complete — the Phase 18.4 relaxation does not leak past completion")
-    void should_return403_when_adminAttemptsNonCompletionTransition(String action, String body) {
+    @Test
+    @DisplayName("PATCH /decline — SALON_ADMIN assigned to the booking's salon returns 204 (Decision D1)")
+    void should_return204_when_assignedAdminDeclinesConfirmedBooking() {
         Salon salon = createSalon("compl-sec-contain-owner-" + System.nanoTime() + "@beautica.test");
         String adminEmail = "compl-sec-contain-admin-" + System.nanoTime() + "@beautica.test";
         createUser(adminEmail, "SALON_ADMIN", salon.salonId);
         UUID bookingId = insertConfirmedSalonBooking(salon);
 
         ResponseEntity<Void> resp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/" + action, HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(tokenFor(adminEmail))), Void.class);
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Салон закритий сьогодні\"}",
+                        bearerHeaders(tokenFor(adminEmail))),
+                Void.class);
 
         assertThat(resp.getStatusCode())
-                .as("SALON_ADMIN must be 403 on %s (owner-level transition)", action)
-                .isEqualTo(HttpStatus.FORBIDDEN);
+                .as("assigned SALON_ADMIN declining a booking must return 204 (Decision D1)")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("DECLINED");
+    }
+
+    @Test
+    @DisplayName("PATCH /not-complete — SALON_ADMIN assigned to the booking's salon returns 204 (Decision D2)")
+    void should_return204_when_assignedAdminMarksConfirmedBookingNotComplete() {
+        Salon salon = createSalon("compl-sec-contain-owner-" + System.nanoTime() + "@beautica.test");
+        String adminEmail = "compl-sec-contain-admin-" + System.nanoTime() + "@beautica.test";
+        createUser(adminEmail, "SALON_ADMIN", salon.salonId);
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не прийшов на прийом\"}",
+                        bearerHeaders(tokenFor(adminEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("assigned SALON_ADMIN marking not-complete must return 204 (Decision D2)")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
+    }
+
+    // ── Phase 25.9: the provider's note is optional on both endpoints, for all roles ─────
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /decline — 204 when comment is absent from the request body")
+    void should_return204_when_declineHasNoComment() {
+        Salon salon = createSalon("compl-sec-nocomment-decl-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(tokenFor(salon.ownerEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("declining with no comment must return 204 — the note is optional for all roles")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("DECLINED");
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is absent from the request body")
+    void should_return204_when_notCompleteHasNoComment() {
+        Salon salon = createSalon("compl-sec-nocomment-nc-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}", bearerHeaders(tokenFor(salon.ownerEmail))),
+                Void.class);
+
+        assertThat(resp.getStatusCode())
+                .as("marking not-complete with no comment must return 204 — the note is optional for all roles")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
     }
 
     // ── HTTP helpers ─────────────────────────────────────────────────────────────

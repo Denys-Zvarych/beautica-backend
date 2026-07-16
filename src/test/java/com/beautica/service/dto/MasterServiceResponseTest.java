@@ -184,7 +184,7 @@ class MasterServiceResponseTest {
                 .isEqualByComparingTo(new BigDecimal("1200.00"));
         assertThat(response.priceDisplay())
                 .as("priceDisplay must use PriceDisplayFormatter RANGE format — whole hryvnia, no .00")
-                .isEqualTo("від 600 до 1200 грн");
+                .isEqualTo("від 600 до 1200 ₴");
     }
 
     // ── Phase 16.4: serviceTypeId + serviceTypeNameUk lifted from the nested definition ──

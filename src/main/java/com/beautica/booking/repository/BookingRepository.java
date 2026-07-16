@@ -174,13 +174,14 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("status") BookingStatus status,
             Pageable pageable);
 
+    // The provider "Графік" (calendar) query — a booking is born CONFIRMED (track 24.x
+    // auto-confirm), so it appears here the instant it is created.
     @Query(value = """
             SELECT b.id FROM Booking b
             WHERE b.master.id = :masterId
             AND b.startsAt >= :from
             AND b.startsAt < :to
-            AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
-                             com.beautica.booking.enums.BookingStatus.CONFIRMED,
+            AND b.status IN (com.beautica.booking.enums.BookingStatus.CONFIRMED,
                              com.beautica.booking.enums.BookingStatus.COMPLETED)
             ORDER BY b.startsAt ASC
             """,
@@ -189,8 +190,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             WHERE b.master.id = :masterId
             AND b.startsAt >= :from
             AND b.startsAt < :to
-            AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
-                             com.beautica.booking.enums.BookingStatus.CONFIRMED,
+            AND b.status IN (com.beautica.booking.enums.BookingStatus.CONFIRMED,
                              com.beautica.booking.enums.BookingStatus.COMPLETED)
             """)
     Page<UUID> findActiveIdsByMasterIdAndStartsAtBetween(
@@ -206,7 +206,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      */
     @Query("""
             SELECT b FROM Booking b
-            JOIN FETCH b.client
+            LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
             LEFT JOIN FETCH m.salon s
@@ -222,6 +222,19 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * One-query, N+1-free projection for {@code GET /bookings/me}: every field
      * {@link com.beautica.booking.dto.BookingDetailResponse} needs for a client row,
      * plus a {@code reviewExists} flag via {@code LEFT JOIN Review}.
+     * {@code mu.professionalTitle} rides the same {@code JOIN m.user mu} already used for
+     * {@code mu.firstName}/{@code mu.lastName} — no additional join, and the column is
+     * nullable (a master may never have set a title).
+     *
+     * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
+     * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
+     * — salon-presence wins outright, even when the salon's own column is {@code NULL}. This
+     * mirrors {@link com.beautica.booking.dto.BookingDetailResponse#from} exactly: {@code salon
+     * != null ? salon.getX() : masterUser.getX()}. <b>Do not use {@code COALESCE(s.X, mu.X)}
+     * here</b> — {@code COALESCE} falls through to the master's own value whenever the salon's
+     * column is {@code NULL}, which for a salon-employed master leaks the master's personal
+     * data (e.g. their home door code) onto a salon booking. Riding the same
+     * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
      *
      * <p>{@code statusFilter} is optional: when {@code null} the
      * {@code (:statusFilter IS NULL OR b.status = :statusFilter)} idiom matches all rows
@@ -258,15 +271,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
                 b.client.lastName,
                 mu.firstName,
                 mu.lastName,
+                mu.professionalTitle,
                 b.clientComment,
                 b.providerComment,
+                b.clientCancellationNote,
                 mu.avatarUrl,
                 mu.role,
                 s.name,
-                COALESCE(s.cityId, mu.cityId),
-                COALESCE(s.districtId, mu.districtId),
-                COALESCE(s.street, mu.street),
-                COALESCE(s.buildingNo, mu.buildingNo),
+                CASE WHEN s.id IS NOT NULL THEN s.cityId ELSE mu.cityId END,
+                CASE WHEN s.id IS NOT NULL THEN s.districtId ELSE mu.districtId END,
+                CASE WHEN s.id IS NOT NULL THEN s.street ELSE mu.street END,
+                CASE WHEN s.id IS NOT NULL THEN s.buildingNo ELSE mu.buildingNo END,
+                CASE WHEN s.id IS NOT NULL THEN s.locationNote ELSE mu.locationNote END,
                 sd.category,
                 CASE WHEN r.id IS NOT NULL THEN true ELSE false END
             )
@@ -294,9 +310,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
 
     // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────
 
+    /**
+     * <b>Guest (LINK) bookings ({@code client_id IS NULL}, V89) must resolve here too</b> —
+     * {@code client} is a {@code LEFT JOIN FETCH}, not an inner join. An inner join here
+     * silently excludes every null-client row, which made {@code loadBookingOrThrow} (backing
+     * {@code /complete}, {@code /decline}, {@code /not-complete}) and {@code getBooking}
+     * ({@code GET /bookings/{id}}) 404 for ANY guest booking — the entire provider-side guest
+     * lifecycle was unreachable (CRITICAL finding, track 24.7 audit). See
+     * {@link #findAllByIdsWithGraph} for the sibling batch-hydrate query with the same fix.
+     */
     @Query("""
             SELECT b FROM Booking b
-            JOIN FETCH b.client
+            LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
             LEFT JOIN FETCH m.salon s
@@ -313,8 +338,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
 
     /**
      * Matches the partial unique index {@code uq_client_idempotency_key_active}
-     * which covers only PENDING and CONFIRMED rows. Filtering by status here
-     * allows the planner to use the partial index rather than scanning all rows.
+     * which covers only CONFIRMED rows (track 24.x — a booking is born CONFIRMED). Filtering by
+     * status here allows the planner to use the partial index rather than scanning all rows.
      *
      * <p>Intentional design: idempotency keys can be reused once a booking reaches a
      * terminal state (COMPLETED, CANCELLED, etc.) — a repeat request creates a new booking.
@@ -331,8 +356,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             JOIN FETCH ms.serviceDefinition
             WHERE b.client.id = :clientId
               AND b.idempotencyKey = :idempotencyKey
-              AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
-                               com.beautica.booking.enums.BookingStatus.CONFIRMED)
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
     Optional<Booking> findActiveByClientIdAndIdempotencyKey(
             @Param("clientId") UUID clientId,
@@ -341,7 +365,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     @Query(value = """
             SELECT * FROM bookings
             WHERE master_id = :masterId
-              AND status IN ('PENDING','CONFIRMED')
+              AND status = 'CONFIRMED'
               AND starts_at < :windowEnd
               AND ends_at   > :windowStart
             """, nativeQuery = true)
@@ -354,7 +378,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     );
 
     /**
-     * The occupied {@code [startsAt, endsAt)} intervals of a master's PENDING/CONFIRMED bookings
+     * The occupied {@code [startsAt, endsAt)} intervals of a master's CONFIRMED bookings
      * overlapping {@code [windowStart, windowEnd)}, ordered by start. Backs the whole availability
      * computation — the calendar day projection ({@code SlotCalculationService#getBookableWorkingDays}),
      * the free-slot bookability gate ({@code hasBookableFutureSlot}) and the batched catalogue filter
@@ -373,8 +397,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             SELECT new com.beautica.booking.repository.BookingTimeRange(b.startsAt, b.endsAt)
             FROM Booking b
             WHERE b.master.id = :masterId
-              AND b.status IN (com.beautica.booking.enums.BookingStatus.PENDING,
-                               com.beautica.booking.enums.BookingStatus.CONFIRMED)
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
               AND b.startsAt < :windowEnd
               AND b.endsAt   > :windowStart
             ORDER BY b.startsAt ASC
@@ -389,7 +412,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             SELECT EXISTS (
               SELECT 1 FROM bookings
                WHERE master_id = :masterId
-                 AND status IN ('PENDING','CONFIRMED')
+                 AND status = 'CONFIRMED'
                  AND starts_at < :requestedEndsAt
                  AND ends_at   > :requestedStartsAt
             )
@@ -405,7 +428,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * flow so a booking does not collide with itself when only its time changes.
      *
      * <p>Same predicate as {@link #existsOverlap(UUID, OffsetDateTime, OffsetDateTime)}
-     * (PENDING/CONFIRMED rows only, half-open interval overlap) plus
+     * (CONFIRMED rows only, half-open interval overlap) plus
      * {@code id <> :excludeBookingId}. Callers must hold the per-master advisory lock
      * (see {@link #acquireAdvisoryLock(UUID)}) before invoking, identical to create.
      */
@@ -414,7 +437,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
               SELECT 1 FROM bookings
                WHERE master_id = :masterId
                  AND id <> :excludeBookingId
-                 AND status IN ('PENDING','CONFIRMED')
+                 AND status = 'CONFIRMED'
                  AND starts_at < :requestedEndsAt
                  AND ends_at   > :requestedStartsAt
             )
@@ -428,7 +451,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
 
     // ── Client-scoped conflict check (cross-master/salon double-booking) ─────────
     /**
-     * Id of the client's earliest {@code PENDING}/{@code CONFIRMED} booking — with ANY
+     * Id of the client's earliest {@code CONFIRMED} booking — with ANY
      * master/salon — that overlaps the requested {@code [requestedStartsAt, requestedEndsAt)}
      * window. Half-open interval overlap, same predicate shape as {@link #existsOverlap}, but
      * scoped by {@code client_id} instead of {@code master_id} so it catches a client double-
@@ -444,7 +467,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     @Query(value = """
             SELECT id FROM bookings
              WHERE client_id = :clientId
-               AND status IN ('PENDING','CONFIRMED')
+               AND status = 'CONFIRMED'
                AND starts_at < :requestedEndsAt
                AND ends_at   > :requestedStartsAt
              ORDER BY starts_at ASC
@@ -465,7 +488,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             SELECT id FROM bookings
              WHERE client_id = :clientId
                AND id <> :excludeBookingId
-               AND status IN ('PENDING','CONFIRMED')
+               AND status = 'CONFIRMED'
                AND starts_at < :requestedEndsAt
                AND ends_at   > :requestedStartsAt
              ORDER BY starts_at ASC
@@ -544,14 +567,23 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * resolving it from there eliminates the cross-join and the extra DB column read.
      *
      * <p>Returns empty when the booking does not exist.
+     *
+     * <p><b>{@code client} is an explicit {@code LEFT JOIN}</b>, not the implicit
+     * {@code b.client.id} path — implicit single-valued-association navigation in JPQL
+     * compiles to an INNER join, which would silently exclude every guest (LINK) booking
+     * whose {@code client_id} is {@code NULL} (V89). Same class of defect as
+     * {@link #findByIdWithFullGraph}'s former inner {@code JOIN FETCH b.client} (CRITICAL
+     * finding, track 24.7 audit) — fixed defensively here even though this projection is not
+     * currently wired into any {@code @PreAuthorize} SpEL.
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingViewAccess(
-                b.client.id,
+                bc.id,
                 bm.user.id,
                 sOwner.id
             )
             FROM Booking b
+            LEFT JOIN b.client bc
             JOIN b.master bm
             JOIN bm.user
             LEFT JOIN bm.salon bs

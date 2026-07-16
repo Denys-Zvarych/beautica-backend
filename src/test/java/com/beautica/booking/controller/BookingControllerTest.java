@@ -109,7 +109,7 @@ class BookingControllerTest {
     private BookingResponse stubResponse(UUID bookingId, UUID clientId, UUID masterId, UUID serviceId) {
         return new BookingResponse(
                 bookingId, clientId, masterId, serviceId, "Manicure",
-                BookingStatus.PENDING,
+                BookingStatus.CONFIRMED,
                 ZonedDateTime.now().plusDays(1),
                 ZonedDateTime.now().plusDays(1).plusMinutes(60),
                 new BigDecimal("500.00"), 60,
@@ -120,15 +120,23 @@ class BookingControllerTest {
     private BookingDetailResponse stubDetailResponse(UUID bookingId, UUID clientId, UUID masterId, UUID serviceId) {
         return new BookingDetailResponse(
                 bookingId, clientId, masterId, serviceId, "Manicure",
-                BookingStatus.PENDING,
+                BookingStatus.CONFIRMED,
                 ZonedDateTime.now().plusDays(1),
                 ZonedDateTime.now().plusDays(1).plusMinutes(60),
                 new BigDecimal("500.00"), 60,
                 OffsetDateTime.now(ZoneOffset.UTC),
-                "Oksana", "Kovalenko", "Natalia", "Lysenko", null, null,
+                "Oksana", "Kovalenko", "Natalia", "Lysenko",
+                // masterProfessionalTitle (additive)
+                "Перукар-стиліст",
+                null, null,
+                // Phase 25.8: clientCancellationNote (additive)
+                null,
                 // Phase 19.3 enrichment fields
                 null, com.beautica.auth.Role.INDEPENDENT_MASTER, null,
-                "Kyiv", null, null, null, "MANICURE", false
+                "Kyiv", null, null, null,
+                // locationNote (additive)
+                null,
+                "MANICURE", false
         );
     }
 
@@ -152,7 +160,7 @@ class BookingControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.data.status").value("PENDING"));
+                .andExpect(jsonPath("$.data.status").value("CONFIRMED"));
     }
 
     @Test
@@ -372,7 +380,7 @@ class BookingControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.id").value(bookingId.toString()))
-                .andExpect(jsonPath("$.data.status").value("PENDING"));
+                .andExpect(jsonPath("$.data.status").value("CONFIRMED"));
     }
 
     @Test
@@ -404,71 +412,8 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.message").value("Resource not found"));
     }
 
-    // ── PATCH /{bookingId}/confirm ────────────────────────────────────────────
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/confirm — 204 when salon owner confirms booking")
-    void should_return204_when_ownerConfirmsBooking() throws Exception {
-        var ownerId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        when(bookingService.confirmBooking(any(), eq(bookingId))).thenReturn(null);
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf()))
-                .andExpect(status().isNoContent());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/confirm — 204 when INDEPENDENT_MASTER confirms booking")
-    void should_return204_when_independentMasterConfirmsBooking() throws Exception {
-        var masterId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        when(bookingService.confirmBooking(any(), eq(bookingId))).thenReturn(null);
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
-                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
-                        .with(csrf()))
-                .andExpect(status().isNoContent());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/confirm — 403 when SALON_MASTER attempts to confirm booking")
-    void should_return403_when_salonMasterConfirmsBooking() throws Exception {
-        var masterId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
-                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
-                        .with(csrf()))
-                .andExpect(status().isForbidden());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/confirm — 403 when SALON_ADMIN attempts to confirm booking")
-    void should_return403_when_salonAdminAttemptsToConfirm() throws Exception {
-        var adminId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
-                        .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
-                        .with(csrf()))
-                .andExpect(status().isForbidden());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/confirm — 403 when CLIENT tries to confirm")
-    void should_return403_when_clientConfirmsBooking() throws Exception {
-        var clientId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        when(bookingService.confirmBooking(any(), eq(bookingId)))
-                .thenThrow(new ForbiddenException("Access denied"));
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
-                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
-                        .with(csrf()))
-                .andExpect(status().isForbidden());
-    }
+    // TODO(24.7): PATCH /{bookingId}/confirm no longer exists (track 24.x auto-confirm —
+    // bookings are born CONFIRMED). backend-qa should add a test asserting the route 404s.
 
     // ── PATCH /{bookingId}/cancel ─────────────────────────────────────────────
 
@@ -489,16 +434,20 @@ class BookingControllerTest {
     }
 
     @Test
-    @DisplayName("PATCH /{bookingId}/confirm — 400 when service throws on invalid transition")
+    @DisplayName("PATCH /{bookingId}/decline — 400 when service throws on invalid transition")
     void should_return400_when_invalidStatusTransition() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        when(bookingService.confirmBooking(any(), eq(bookingId)))
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
+        when(bookingService.declineBooking(any(), eq(bookingId), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Invalid status transition"));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Провайдер недоступний"));
 
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/confirm")
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf()))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
                 .andExpect(status().isBadRequest());
     }
 
@@ -509,7 +458,28 @@ class BookingControllerTest {
     void should_return204_when_authorizedDeclineBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Провайдер недоступний"));
+        // Slice test: the @authz SpEL gate in @PreAuthorize is the predicate under test here —
+        // the service ownership guard is mocked out, so admit this owner explicitly.
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
+        when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /{bookingId}/decline — 204 when comment is absent (the note is "
+            + "optional for all roles, reverses Phase 25.2's required-comment decision)")
+    void should_return204_when_declineCalledWithNoComment() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
@@ -525,7 +495,8 @@ class BookingControllerTest {
     void should_return204_when_independentMasterDeclinesBooking() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Провайдер недоступний"));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
@@ -536,12 +507,17 @@ class BookingControllerTest {
                 .andExpect(status().isNoContent());
     }
 
+    // Phase 24.2: SALON_ADMIN now passes the controller role gate (hasAnyRole(...,'SALON_ADMIN',...))
+    // — this exercises the "role admitted but @authz.canCancelBooking denies" path (e.g. an admin
+    // NOT assigned to the booking's salon), not a blanket SALON_ADMIN denial.
+    // TODO(24.7): add the full provider-cancel authz matrix (assigned SALON_ADMIN ✅ 204,
+    // unassigned SALON_ADMIN ❌ 403) — see phase 24.2/24.7 plan.
     @Test
     @DisplayName("PATCH /{bookingId}/decline — 403 when SALON_MASTER attempts to decline booking")
     void should_return403_when_salonMasterDeclinesBooking() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
@@ -552,11 +528,13 @@ class BookingControllerTest {
     }
 
     @Test
-    @DisplayName("PATCH /{bookingId}/decline — 403 when SALON_ADMIN attempts to decline booking")
+    @DisplayName("PATCH /{bookingId}/decline — 403 when SALON_ADMIN is not assigned to the booking's salon")
     void should_return403_when_salonAdminAttemptsToDecline() throws Exception {
         var adminId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
+        // Not stubbed → defaults false: an unassigned SALON_ADMIN fails @authz.canCancelBooking.
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(false);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
@@ -571,9 +549,7 @@ class BookingControllerTest {
     void should_return403_when_clientDeclinesBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
-        when(bookingService.declineBooking(any(), eq(bookingId), any()))
-                .thenThrow(new ForbiddenException("Access denied"));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -588,7 +564,8 @@ class BookingControllerTest {
     void should_return400_when_declineCalledWithoutReason() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST,
                         "Cancellation reason required for declining a booking"));
@@ -680,7 +657,26 @@ class BookingControllerTest {
     void should_return204_when_authorizedNotCompleteBooking() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
+        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /{bookingId}/not-complete — 204 when comment is absent (the note "
+            + "is optional for all roles, reverses Phase 25.2's required-comment decision)")
+    void should_return204_when_notCompleteCalledWithNoComment() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
@@ -696,7 +692,8 @@ class BookingControllerTest {
     void should_return204_when_independentMasterMarksNotCompleted() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "Клієнт не з'явився"));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
@@ -712,7 +709,7 @@ class BookingControllerTest {
     void should_return403_when_salonMasterMarksNotCompleted() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
@@ -722,12 +719,16 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
     }
 
+    // Phase 24.2: SALON_ADMIN now passes the controller role gate — this exercises the "role
+    // admitted but @authz.canCancelBooking denies" path (an admin not assigned to the salon).
+    // TODO(24.7): add the assigned-SALON_ADMIN ✅ 204 case to the authz matrix.
     @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 403 when SALON_ADMIN attempts to mark booking not-completed")
+    @DisplayName("PATCH /{bookingId}/not-complete — 403 when SALON_ADMIN is not assigned to the booking's salon")
     void should_return403_when_salonAdminAttemptsToNotComplete() throws Exception {
         var adminId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(false);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
@@ -742,9 +743,7 @@ class BookingControllerTest {
     void should_return403_when_clientNotCompletesBooking() throws Exception {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
-        when(bookingService.notCompleteBooking(any(), eq(bookingId), any()))
-                .thenThrow(new ForbiddenException("Access denied"));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -759,7 +758,8 @@ class BookingControllerTest {
     void should_return400_when_notCompleteCalledWithoutReason() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, null));
+        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required"));
 
@@ -986,20 +986,20 @@ class BookingControllerTest {
     }
 
     @Test
-    @DisplayName("GET /me — 200 and status param is forwarded to the service when ?status=PENDING is supplied")
+    @DisplayName("GET /me — 200 and status param is forwarded to the service when ?status=CANCELLED is supplied")
     void should_return200_and_passStatusParam_when_statusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), eq(BookingStatus.PENDING), any()))
+        when(bookingService.getMyBookings(any(), any(), eq(BookingStatus.CANCELLED), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
-                        .param("status", "PENDING")
+                        .param("status", "CANCELLED")
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
 
-        org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(), eq(BookingStatus.PENDING), any());
+        org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(), eq(BookingStatus.CANCELLED), any());
     }
 
     @Test
@@ -1037,9 +1037,10 @@ class BookingControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.totalElements").value(1))
                 .andExpect(jsonPath("$.data.data[0].id").value(bookingId.toString()))
-                .andExpect(jsonPath("$.data.data[0].status").value("PENDING"))
+                .andExpect(jsonPath("$.data.data[0].status").value("CONFIRMED"))
                 .andExpect(jsonPath("$.data.data[0].masterType").value("INDEPENDENT_MASTER"))
                 .andExpect(jsonPath("$.data.data[0].cityLabel").value("Kyiv"))
+                .andExpect(jsonPath("$.data.data[0].masterProfessionalTitle").value("Перукар-стиліст"))
                 .andExpect(jsonPath("$.data.data[0].canReview").value(false));
     }
 
@@ -1147,7 +1148,7 @@ class BookingControllerTest {
     void should_return400_when_declineHasInvalidCancellationReasonEnum() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
-        var body = "{\"cancellationReason\":\"INVALID_REASON\"}";
+        var body = "{\"cancellationReason\":\"INVALID_REASON\",\"comment\":\"Валідний коментар\"}";
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
@@ -1190,6 +1191,7 @@ class BookingControllerTest {
         // Newline (0x0A) is whitespace, not a forbidden C0 control char — @Pattern must accept it
         var body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\""
                 + ",\"comment\":\"line one\\nline two\"}";
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.declineBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/decline")
@@ -1230,6 +1232,7 @@ class BookingControllerTest {
         // Tab (0x09) is whitespace, not a forbidden C0 control char — @Pattern must accept it
         var body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\""
                 + ",\"comment\":\"no-show note\\ttab-separated\"}";
+        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")

@@ -25,7 +25,7 @@ class PriceDisplayFormatterTest {
     void should_formatFixed_when_wholeHryvnia() {
         String result = PriceDisplayFormatter.format(PriceType.FIXED, new BigDecimal("500.00"), null);
 
-        assertThat(result).isEqualTo("500 грн");
+        assertThat(result).isEqualTo("500 ₴");
     }
 
     @Test
@@ -33,7 +33,7 @@ class PriceDisplayFormatterTest {
     void should_formatFixed_when_wholeHryvniaNoScale() {
         String result = PriceDisplayFormatter.format(PriceType.FIXED, new BigDecimal("300"), null);
 
-        assertThat(result).isEqualTo("300 грн");
+        assertThat(result).isEqualTo("300 ₴");
     }
 
     @Test
@@ -41,15 +41,15 @@ class PriceDisplayFormatterTest {
     void should_formatFixed_when_decimalAmount() {
         String result = PriceDisplayFormatter.format(PriceType.FIXED, new BigDecimal("500.50"), null);
 
-        assertThat(result).isEqualTo("500.50 грн");
+        assertThat(result).isEqualTo("500.50 ₴");
     }
 
     @Test
-    @DisplayName("FIXED small amount — 0.01 грн")
+    @DisplayName("FIXED small amount — 0.01 ₴")
     void should_formatFixed_when_smallDecimalAmount() {
         String result = PriceDisplayFormatter.format(PriceType.FIXED, new BigDecimal("0.01"), null);
 
-        assertThat(result).isEqualTo("0.01 грн");
+        assertThat(result).isEqualTo("0.01 ₴");
     }
 
     @Test
@@ -57,33 +57,33 @@ class PriceDisplayFormatterTest {
     void should_formatFixed_when_largeWholeAmount() {
         String result = PriceDisplayFormatter.format(PriceType.FIXED, new BigDecimal("99999999.00"), null);
 
-        assertThat(result).isEqualTo("99999999 грн");
+        assertThat(result).isEqualTo("99999999 ₴");
     }
 
     // ── RANGE mode ────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("RANGE whole hryvnia — від N до M грн")
+    @DisplayName("RANGE whole hryvnia — від N до M ₴")
     void should_formatRange_when_wholeHryvnia() {
         String result = PriceDisplayFormatter.format(PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"));
 
-        assertThat(result).isEqualTo("від 500 до 800 грн");
+        assertThat(result).isEqualTo("від 500 до 800 ₴");
     }
 
     @Test
-    @DisplayName("RANGE with decimal values — від 500.50 до 800.99 грн")
+    @DisplayName("RANGE with decimal values — від 500.50 до 800.99 ₴")
     void should_formatRange_when_decimalAmounts() {
         String result = PriceDisplayFormatter.format(PriceType.RANGE, new BigDecimal("500.50"), new BigDecimal("800.99"));
 
-        assertThat(result).isEqualTo("від 500.50 до 800.99 грн");
+        assertThat(result).isEqualTo("від 500.50 до 800.99 ₴");
     }
 
     @Test
-    @DisplayName("RANGE with mixed whole/decimal — від 500 до 800.50 грн")
+    @DisplayName("RANGE with mixed whole/decimal — від 500 до 800.50 ₴")
     void should_formatRange_when_mixedAmounts() {
         String result = PriceDisplayFormatter.format(PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.50"));
 
-        assertThat(result).isEqualTo("від 500 до 800.50 грн");
+        assertThat(result).isEqualTo("від 500 до 800.50 ₴");
     }
 
     // ── formatAmount helper (package-private) ─────────────────────────────────

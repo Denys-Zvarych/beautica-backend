@@ -60,10 +60,10 @@ import java.util.UUID;
                 // sort direction — V95 declares starts_at DESC; this annotation mirrors the columns
                 // only so ddl-auto=validate sees the index exists.
                 @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at"),
-                // partial index (V112): client-scoped cross-master/salon overlap check
-                // (BookingRepository.findFirstConflictingClientBookingId[Excluding]). JPA cannot
-                // encode WHERE status IN ('PENDING','CONFIRMED') AND client_id IS NOT NULL — the
-                // predicate lives in V112 only; mirrors idx_bookings_master_slot_overlap (V26) but
+                // partial index (V112, predicate narrowed by V113): client-scoped cross-master/salon
+                // overlap check (BookingRepository.findFirstConflictingClientBookingId[Excluding]).
+                // JPA cannot encode WHERE status = 'CONFIRMED' AND client_id IS NOT NULL — the
+                // predicate lives in V113 only; mirrors idx_bookings_master_slot_overlap (V26) but
                 // keyed by client_id. client_id IS NOT NULL excludes guest (LINK) bookings, which
                 // always have a null client_id (V89 chk_bookings_guest_fields) and can never match
                 // this query's client_id equality — indexing them would be pure write amplification.
@@ -132,6 +132,17 @@ public class Booking extends AuditableEntity {
     @Setter
     @Column(name = "provider_comment", length = 1000)
     private String providerComment;
+
+    // Phase 25.4 (V114) — the client's OWN cancellation note, written by cancelBooking
+    // (CONFIRMED -> CANCELLED). Distinct from clientComment (the booking-CREATION note set once
+    // at POST /bookings and legitimately present on CONFIRMED/COMPLETED rows too — see V114's
+    // deliberate absence of a CHECK on that column). Per the locked "notes are visible to all
+    // sides" decision, this note is shown to the PROVIDER, mirroring how providerComment is
+    // shown to the client on DECLINED/NOT_COMPLETED. chk_client_cancellation_note_status (V114)
+    // enforces it is only ever non-null on a CANCELLED row.
+    @Setter
+    @Column(name = "client_cancellation_note", length = 1000)
+    private String clientCancellationNote;
 
     // ── Guest-booking columns (Phase 13.3 / V89; relaxed by V91) ──────────────
     // A LINK booking is created via beautica.app/book/{slug} by a phone-verified,
@@ -220,18 +231,18 @@ public class Booking extends AuditableEntity {
     }
 
     /**
-     * Moves this booking to a new time window and re-enters the approval queue.
+     * Moves this booking to a new time window.
      *
-     * <p>Per the Phase 19.2 locked decision a {@code CONFIRMED} booking reverts to
-     * {@code PENDING} on reschedule (the provider must re-approve at the new time);
-     * a {@code PENDING} booking stays {@code PENDING}. {@code priceAtBooking} and
+     * <p>Per the track 24.x locked state machine (auto-confirm), a booking is always
+     * {@code CONFIRMED} from creation, and rescheduling never reverts it — there is no
+     * provider re-approval queue to re-enter. {@code priceAtBooking} and
      * {@code durationMinutesAtBooking} are frozen at the original booking and are
      * deliberately NOT recomputed here — the caller computes {@code newEndsAt} from
      * the frozen duration (+ buffer) before invoking this method.
      *
      * <p>Allowed source-state and slot/overlap validation are the caller's
      * responsibility (see {@code BookingService.rescheduleBooking}); this method only
-     * applies the state transition once those checks have passed.
+     * moves the time window once those checks have passed.
      *
      * @param newStartsAt the new start instant (already validated by the service)
      * @param newEndsAt   the new end instant ({@code newStartsAt + duration + buffer})
@@ -239,8 +250,5 @@ public class Booking extends AuditableEntity {
     public void reschedule(OffsetDateTime newStartsAt, OffsetDateTime newEndsAt) {
         this.startsAt = newStartsAt;
         this.endsAt = newEndsAt;
-        if (this.status == BookingStatus.CONFIRMED) {
-            this.status = BookingStatus.PENDING;
-        }
     }
 }

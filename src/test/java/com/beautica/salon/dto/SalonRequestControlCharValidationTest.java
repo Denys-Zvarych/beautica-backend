@@ -26,6 +26,13 @@ class SalonRequestControlCharValidationTest {
     private static final String VTAB = "\u000B";
     private static final String DEL = "\u007F";
 
+    // Phase 10.6 reversal: street + buildingNo are now @NotBlank on both DTOs. The
+    // builders below supply a valid pair so validator.validate(...) surfaces ONLY the
+    // description violation under test — otherwise the .isEmpty() positive assertions
+    // would fail on unrelated street/buildingNo violations (de-vacuuming).
+    private static final String VALID_STREET = "вул. Хрещатик";
+    private static final String VALID_BUILDING_NO = "1";
+
     private static Validator validator;
 
     @BeforeAll
@@ -38,13 +45,13 @@ class SalonRequestControlCharValidationTest {
     private static CreateSalonRequest createWithDescription(String description) {
         return new CreateSalonRequest(
                 "My Salon", description, null, null, null, null, null,
-                null, null, null, null, null);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null);
     }
 
     private static UpdateSalonRequest updateWithDescription(String description) {
         return new UpdateSalonRequest(
                 "My Salon", description, null, null, null,
-                null, null, null, null, null, null, null);
+                null, null, VALID_STREET, VALID_BUILDING_NO, null, null, null);
     }
 
     private static boolean hasDescriptionViolation(Set<? extends ConstraintViolation<?>> violations) {

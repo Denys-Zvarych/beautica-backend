@@ -16,7 +16,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * to {@code 'APP'}, and the polymorphic {@code chk_bookings_guest_fields} CHECK
  * rejects a half-populated LINK row.
  *
- * <p>Also verifies the V91 relaxation: an <em>active</em> LINK row (PENDING/CONFIRMED)
+ * <p>Also verifies the V91 relaxation: an <em>active</em> LINK row (CONFIRMED — the only
+ * active status since track 24.x removed PENDING)
  * still requires a non-null {@code cancel_token}, but a LINK row in a terminal status
  * (e.g. {@code CANCELLED}) may carry a NULL token — this is the guest-cancel path that
  * nulls the token while setting status = CANCELLED.
@@ -63,7 +64,7 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
         jdbcTemplate.update("""
                 INSERT INTO bookings (id, client_id, master_id, master_service_id, status, starts_at, ends_at,
                     price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'PENDING', NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 1 hour',
+                VALUES (?, ?, ?, ?, 'CONFIRMED', NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 1 hour',
                     350.00, 60, 0, NOW(), NOW())
                 """, bookingId, ids.clientId(), ids.masterId(), ids.masterServiceId());
 

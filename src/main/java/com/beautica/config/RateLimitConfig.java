@@ -187,6 +187,25 @@ public class RateLimitConfig {
 
     private static final Duration BOOKING_WRITE_WINDOW = Duration.ofSeconds(10);
 
+    // Per-user cap for the two SMS/notification-triggering booking-write endpoints:
+    //   - PATCH /api/v1/bookings/{bookingId}/decline
+    //   - PATCH /api/v1/bookings/{bookingId}/not-complete
+    // Deliberately a SEPARATE bucket from bookingWriteCapacity above (different threat model —
+    // see BookingRateLimitFilter's class javadoc): declineBooking substitutes the provider's own
+    // free text into a Beautica-branded SMS sent to a real, OTP-verified guest phone number
+    // (NotificationService.buildGuestDeclineSms, Phase 25.7); an unthrottled provider account
+    // could otherwise mass-dispatch that SMS across every booking they own in one burst
+    // (smishing / SMS-bomb concern), which the tight 5-per-10s create/reschedule budget was never
+    // sized to bound. 10 requests / 60s mirrors the other authenticated-write buckets in this
+    // class (media upload, profile update, bulk service setup) — generous enough for a provider
+    // clearing a backlog of no-shows/declines in one sitting, while capping a scripted flood to
+    // at most 10 outbound messages per minute per account. Configurable so integration tests can
+    // raise the cap.
+    @Value("${app.rate-limit.booking-decline-capacity:10}")
+    private long bookingDeclineCapacity;
+
+    private static final Duration BOOKING_DECLINE_WINDOW = Duration.ofSeconds(60);
+
     // 5-minute eviction grace past the rate-limit window so a bucket entry is not
     // evicted the instant its window rolls over (avoids a false-start on the very
     // next request). Shared by every windowed bucket below.
@@ -458,29 +477,48 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-user bucket (see {@link #bookingDeclineCapacity} field javadoc) shared by
+     * {@code PATCH /api/v1/bookings/{bookingId}/decline} and
+     * {@code PATCH /api/v1/bookings/{bookingId}/not-complete}, consumed by
+     * {@link com.beautica.booking.filter.BookingRateLimitFilter}. {@code expireAfterAccess} gives
+     * a 5-minute grace past the 60-second window so a bucket entry is not evicted the instant the
+     * window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> bookingDeclineBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                BOOKING_DECLINE_WINDOW.plus(EVICTION_GRACE),
+                bookingDeclineCapacity,
+                BOOKING_DECLINE_WINDOW);
+    }
+
+    /**
      * {@link BookingRateLimitFilter} — declared here as an explicit {@code @Bean} rather than
      * annotated {@code @Component}, deliberately co-located with the {@link #bookingWriteBuckets()}
-     * {@link LoadingCache} it consumes.
+     * / {@link #bookingDeclineBuckets()} {@link LoadingCache} beans it consumes.
      *
      * <p><b>Why not {@code @Component}:</b> {@code @WebMvcTest} includes
      * {@link jakarta.servlet.Filter} in its component-scan type filter, so a {@code @Component}
      * filter is auto-detected by EVERY narrow slice — but this {@code @Configuration}, which
-     * supplies the filter's bucket, is not loaded by a slice. That mismatch is what made every
+     * supplies the filter's buckets, is not loaded by a slice. That mismatch is what made every
      * unprotected slice fail to refresh with {@code No qualifying bean of type
      * LoadingCache<String, Bucket>} (e.g. {@code InternalApiKeyFilterTest},
-     * {@code InternalCategoryControllerTest}). Binding filter + bucket into one non-scanned
+     * {@code InternalCategoryControllerTest}). Binding filter + buckets into one non-scanned
      * {@code @Configuration} makes them all-or-nothing and therefore safe by construction: the
-     * full application context loads both — so the production per-user rate limit that closes the
-     * advisory-lock connection-pool-exhaustion DoS remains fully active and unchanged — while a
-     * slice loads neither and refreshes cleanly, with no per-test mock or import needed.
+     * full application context loads all of them — so the production per-user rate limits that
+     * close the advisory-lock connection-pool-exhaustion DoS AND the guest-decline-SMS mass-burst
+     * DoS remain fully active and unchanged — while a slice loads none of them and refreshes
+     * cleanly, with no per-test mock or import needed.
      */
     @Bean
     public BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
         // Direct call (not a LoadingCache<String, Bucket> parameter): this class declares many
         // beans of that exact generic type, so injecting by type would be ambiguous and resolve
         // only by lucky parameter-name matching. @Configuration is CGLIB-proxied, so this returns
-        // the same bookingWriteBuckets singleton — unambiguous by construction.
-        return new BookingRateLimitFilter(bookingWriteBuckets(), objectMapper);
+        // the same bookingWriteBuckets/bookingDeclineBuckets singletons — unambiguous by
+        // construction.
+        return new BookingRateLimitFilter(bookingWriteBuckets(), bookingDeclineBuckets(), objectMapper);
     }
 
     /**

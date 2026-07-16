@@ -127,11 +127,11 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
                 .isEqualByComparingTo(new BigDecimal("600.00"));
     }
 
-    // ── 2. PENDING and CANCELLED bookings excluded from revenue ──────────────
+    // ── 2. DECLINED and CANCELLED bookings excluded from revenue ─────────────
 
     @Test
-    @DisplayName("GET /revenue — excludes PENDING and CANCELLED bookings from totals")
-    void should_excludePendingAndCancelledBookings_when_computingRevenue() throws Exception {
+    @DisplayName("GET /revenue — excludes DECLINED and CANCELLED bookings from totals")
+    void should_excludeDeclinedAndCancelledBookings_when_computingRevenue() throws Exception {
         // Arrange
         String ownerEmail = "dash-excl-owner-" + System.nanoTime() + "@beautica.test";
         DataFixture fixture = createSalonOwnerSalonAndMaster(ownerEmail);
@@ -140,8 +140,10 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         OffsetDateTime yesterday = ZonedDateTime.now(KYIV).minusDays(1)
                 .withHour(10).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
 
+        // Track 24.x retired PENDING (bookings are now auto-confirmed at creation); DECLINED
+        // stands in as the other non-completed terminal status alongside CANCELLED.
         insertBookingWithStatus(fixture, yesterday, new BigDecimal("100.00"), "COMPLETED");
-        insertBookingWithStatus(fixture, yesterday.plusHours(2), new BigDecimal("200.00"), "PENDING");
+        insertBookingWithStatus(fixture, yesterday.plusHours(2), new BigDecimal("200.00"), "DECLINED");
         insertBookingWithStatus(fixture, yesterday.plusHours(4), new BigDecimal("300.00"), "CANCELLED");
 
         log.debug("Act: GET {} as SALON_OWNER — only the COMPLETED booking must be counted", REVENUE_URL);
@@ -157,7 +159,7 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
 
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
         assertThat(data.path("totalCompletedBookings").asLong())
-                .as("only the 1 COMPLETED booking must be counted; PENDING/CANCELLED excluded")
+                .as("only the 1 COMPLETED booking must be counted; DECLINED/CANCELLED excluded")
                 .isEqualTo(1L);
         assertThat(new BigDecimal(data.path("estimatedRevenue").asText()))
                 .as("revenue must only include the COMPLETED booking's price")
@@ -637,12 +639,13 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Inserts a booking with an explicit status. Only PENDING/CONFIRMED rows are excluded from
-     * the overlap exclusion constraint (see {@code V18__create_bookings.sql}), so COMPLETED rows
-     * with overlapping times are safe to insert directly.
+     * Inserts a booking with an explicit status. Only CONFIRMED rows are excluded from
+     * the overlap exclusion constraint (V18, narrowed from PENDING/CONFIRMED to CONFIRMED-only by
+     * {@code V113__remove_pending_booking_status.sql}), so COMPLETED rows with overlapping times
+     * are safe to insert directly.
      *
      * <p>Note: the {@code chk_cancellation_reason_status} constraint (V24) forbids a non-null
-     * {@code cancellation_reason} on PENDING/CONFIRMED rows, so we never set it here.
+     * {@code cancellation_reason} on CONFIRMED rows, so we never set it here.
      */
     private void insertBookingWithStatus(DataFixture f, OffsetDateTime startsAt,
                                          BigDecimal price, String status) {

@@ -9,8 +9,8 @@ import java.math.RoundingMode;
  * Pure utility for formatting a service price into a human-readable Ukrainian string.
  *
  * <ul>
- *   <li>FIXED: {@code "500 грн"}, {@code "500.50 грн"}</li>
- *   <li>RANGE: {@code "від 500 до 800 грн"}, {@code "від 500.50 до 800.99 грн"}</li>
+ *   <li>FIXED: {@code "500 ₴"}, {@code "500.50 ₴"}</li>
+ *   <li>RANGE: {@code "від 500 до 800 ₴"}, {@code "від 500.50 до 800.99 ₴"}</li>
  * </ul>
  *
  * <p>Trailing {@code .00} is stripped — whole hryvnia amounts are displayed without decimals.
@@ -20,7 +20,7 @@ import java.math.RoundingMode;
  */
 public final class PriceDisplayFormatter {
 
-    private static final String CURRENCY_SUFFIX = " грн";
+    private static final String CURRENCY_SUFFIX = " ₴";
 
     private PriceDisplayFormatter() {
         // utility class — no instantiation
@@ -32,7 +32,7 @@ public final class PriceDisplayFormatter {
      * @param priceType the pricing mode; must not be {@code null}
      * @param priceMin  the minimum (or only) price; must not be {@code null}
      * @param priceMax  the maximum price; required when {@code priceType == RANGE}, ignored for FIXED
-     * @return a formatted display string, e.g. {@code "500 грн"} or {@code "від 500 до 800 грн"}
+     * @return a formatted display string, e.g. {@code "500 ₴"} or {@code "від 500 до 800 ₴"}
      * @throws IllegalArgumentException if required arguments are null or inconsistent
      */
     public static String format(PriceType priceType, BigDecimal priceMin, BigDecimal priceMax) {

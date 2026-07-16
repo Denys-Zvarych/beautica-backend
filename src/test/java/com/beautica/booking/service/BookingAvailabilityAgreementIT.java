@@ -182,8 +182,13 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     // ════════════════════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("case 3 — a future day fully covered by a CONFIRMED + a PENDING booking → day FALSE and /slots EMPTY (both statuses subtract)")
-    void should_agreeDayUnavailable_when_futureDayFullyBookedByPendingAndConfirmed() {
+    @DisplayName("case 3 — a future day fully covered by two CONFIRMED bookings → day FALSE and /slots EMPTY (multiple bookings tile and fully subtract)")
+    void should_agreeDayUnavailable_when_futureDayFullyBookedByTwoConfirmedBookings() {
+        // Track 24.x retired PENDING (bookings are now auto-confirmed at creation); this case used
+        // to mix a CONFIRMED + a PENDING booking to prove BOTH active statuses subtract availability.
+        // With a single active pre-terminal status, the scenario is re-expressed as two DISTINCT
+        // CONFIRMED bookings that together tile the whole interval — still proving that availability
+        // subtraction aggregates correctly across multiple bookings, not just a single one.
         LocalDate day = TODAY.plusDays(10);
 
         Master m = seedIndependentMaster();
@@ -191,15 +196,15 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         seedInterval(m.masterId(), day, day, day.getDayOfWeek().getValue(),
                 LocalTime.of(9, 0), LocalTime.of(17, 0));
         UUID client = seedClient();
-        // The two bookings tile the whole 09:00–17:00 interval — one CONFIRMED, one PENDING.
+        // The two bookings tile the whole 09:00–17:00 interval.
         insertBooking(m.masterId(), svc, client, day, LocalTime.of(9, 0), LocalTime.of(13, 0), "CONFIRMED");
-        insertBooking(m.masterId(), svc, client, day, LocalTime.of(13, 0), LocalTime.of(17, 0), "PENDING");
+        insertBooking(m.masterId(), svc, client, day, LocalTime.of(13, 0), LocalTime.of(17, 0), "CONFIRMED");
 
         boolean working = bookableDay(m.masterId(), day, svc);
         List<LocalTime> slots = slotStarts(m.masterId(), day, svc);
 
         assertThat(working)
-                .as("every slot is taken by an active (PENDING/CONFIRMED) booking → non-working, even "
+                .as("every slot is taken by a CONFIRMED booking → non-working, even "
                         + "though the schedule shape has intervals that day")
                 .isFalse();
         assertThat(slots).as("/slots agrees — nothing left to book").isEmpty();

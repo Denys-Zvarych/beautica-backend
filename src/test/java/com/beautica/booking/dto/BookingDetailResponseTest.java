@@ -3,6 +3,7 @@ package com.beautica.booking.dto;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
+import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
@@ -55,6 +56,8 @@ class BookingDetailResponseTest {
         masterUser = mock(User.class);
         when(masterUser.getFirstName()).thenReturn("Наталія");
         when(masterUser.getLastName()).thenReturn("Бойко");
+        when(masterUser.getProfessionalTitle()).thenReturn("Перукар-стиліст");
+        when(masterUser.getLocationNote()).thenReturn("3-й поверх, код 1234");
 
         var master = mock(Master.class);
         when(master.getId()).thenReturn(masterId);
@@ -114,6 +117,7 @@ class BookingDetailResponseTest {
         // master PII — sourced from booking.getMaster().getUser(), NOT booking.getClient()
         assertThat(response.masterFirstName()).isEqualTo("Наталія");
         assertThat(response.masterLastName()).isEqualTo("Бойко");
+        assertThat(response.masterProfessionalTitle()).isEqualTo("Перукар-стиліст");
 
         // comments
         assertThat(response.clientComment()).isEqualTo("great service");
@@ -124,6 +128,9 @@ class BookingDetailResponseTest {
         assertThat(response.cityLabel()).isEqualTo("Київ");
         assertThat(response.districtLabel()).isEqualTo("Шевченківський");
         assertThat(response.salonName()).isNull();
+
+        // locationNote — no salon on this booking, so it resolves from the master's own user row
+        assertThat(response.locationNote()).isEqualTo("3-й поверх, код 1234");
     }
 
     @Test
@@ -136,5 +143,83 @@ class BookingDetailResponseTest {
 
         assertThat(response.clientComment()).isNull();
         assertThat(response.providerComment()).isNull();
+    }
+
+    @Test
+    @DisplayName("clientId is null and clientFirstName/clientLastName fall back to the guest identity when the booking has no registered client (LINK)")
+    void should_returnGuestIdentity_when_bookingHasNoRegisteredClient() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestName()).thenReturn("Оксана");
+        when(booking.getGuestSurname()).thenReturn("Мельник");
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientId()).isNull();
+        assertThat(response.clientFirstName()).isEqualTo("Оксана");
+        assertThat(response.clientLastName()).isEqualTo("Мельник");
+        // master PII is unaffected — sourced from booking.getMaster().getUser(), never getClient()
+        assertThat(response.masterFirstName()).isEqualTo("Наталія");
+        assertThat(response.masterLastName()).isEqualTo("Бойко");
+        assertThat(response.masterProfessionalTitle()).isEqualTo("Перукар-стиліст");
+    }
+
+    @Test
+    @DisplayName("masterProfessionalTitle is null (not NPE) when the master never set one")
+    void should_returnNullProfessionalTitle_when_masterHasNoTitle() {
+        when(masterUser.getProfessionalTitle()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.masterProfessionalTitle()).isNull();
+        // the rest of the master row is unaffected by a missing title
+        assertThat(response.masterFirstName()).isEqualTo("Наталія");
+        assertThat(response.masterLastName()).isEqualTo("Бойко");
+    }
+
+    @Test
+    @DisplayName("masterProfessionalTitle and locationNote are null (not NPE) on a guest (LINK) booking whose master has set neither — both fields hang off the master's user, never the (possibly-null) client")
+    void should_returnNullProfessionalTitle_when_guestBookingAndMasterHasNoTitle() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestName()).thenReturn("Оксана");
+        when(booking.getGuestSurname()).thenReturn("Мельник");
+        when(masterUser.getProfessionalTitle()).thenReturn(null);
+        when(masterUser.getLocationNote()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientId()).isNull();
+        assertThat(response.masterProfessionalTitle()).isNull();
+        assertThat(response.locationNote()).isNull();
+    }
+
+    // ── locationNote — salon-vs-independent resolution (mirrors street/buildingNo) ────
+
+    @Test
+    @DisplayName("locationNote resolves from the master's OWN user row when the master has no salon (independent master)")
+    void should_resolveLocationNoteFromMaster_when_masterIsIndependent() {
+        when(masterUser.getLocationNote()).thenReturn("Дзвонити двічі");
+        // master.getSalon() is unstubbed on this mock -> null, exercising the independent branch.
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.salonName()).isNull();
+        assertThat(response.locationNote()).isEqualTo("Дзвонити двічі");
+    }
+
+    @Test
+    @DisplayName("locationNote resolves from the SALON, never the master's own note, when the master is salon-employed")
+    void should_resolveLocationNoteFromSalon_when_masterIsSalonEmployed() {
+        // The master's own note is set to a DIFFERENT value to prove the salon wins.
+        when(masterUser.getLocationNote()).thenReturn("Master's own note — must NOT surface");
+        var salon = mock(Salon.class);
+        when(salon.getName()).thenReturn("Glamour Studio");
+        when(salon.getLocationNote()).thenReturn("3-й поверх, код 1234");
+        var master = booking.getMaster();
+        when(master.getSalon()).thenReturn(salon);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.salonName()).isEqualTo("Glamour Studio");
+        assertThat(response.locationNote()).isEqualTo("3-й поверх, код 1234");
     }
 }

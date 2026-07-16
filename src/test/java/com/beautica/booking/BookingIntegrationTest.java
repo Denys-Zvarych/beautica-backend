@@ -149,39 +149,13 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
-    @Test
-    @DisplayName("PATCH /bookings/{id}/confirm — 204 when salon owner confirms a pending booking")
-    void should_confirmBooking_and_return204_when_salonOwnerConfirms() throws Exception {
-        String ownerEmail = "integ-owner-confirm-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
-        String ownerToken = loginAndGetToken(ownerEmail);
-
-        UUID masterServiceId = createMasterService(masterId);
-        addWorkingHoursForEveryDay(masterId);
-
-        String clientToken = createClientAndGetToken("integ-client-confirm-" + System.nanoTime() + "@beautica.test");
-        UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
-
-        log.debug("Act: PATCH {}/{}/confirm with SALON_OWNER token — must return 204", BOOKINGS_URL, bookingId);
-        ResponseEntity<Void> response = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
-                Void.class);
-
-        assertThat(response.getStatusCode())
-                .as("owner confirming booking must return 204, bookingId=%s", bookingId)
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        String dbStatus = jdbcTemplate.queryForObject(
-                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(dbStatus)
-                .as("booking status in DB must be CONFIRMED after owner confirm, bookingId=%s", bookingId)
-                .isEqualTo("CONFIRMED");
-    }
+    // NOTE(24.x): the standalone "/confirm 204 when owner confirms" coverage was removed — the
+    // route no longer exists (bookings are auto-confirmed at creation). Auto-confirm status is
+    // asserted inline wherever a booking is created (see should_completeBooking_when_confirmedStatusFlow).
 
     @Test
-    @DisplayName("PATCH /bookings/{id}/decline — PENDING booking transitions to DECLINED with reason stored in DB")
-    void should_declineBooking_and_return204_when_pendingBookingDeclined() throws Exception {
+    @DisplayName("PATCH /bookings/{id}/decline — CONFIRMED booking transitions to DECLINED with reason stored in DB")
+    void should_declineBooking_and_return204_when_confirmedBookingDeclined() throws Exception {
         String ownerEmail = "integ-decline-owner-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
         String ownerToken = loginAndGetToken(ownerEmail);
@@ -191,7 +165,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         String clientToken = createClientAndGetToken("integ-decline-client-" + System.nanoTime() + "@beautica.test");
         UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
 
-        String body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}";
+        String body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Майстер захворів сьогодні\"}";
         log.debug("Act: PATCH {}/{}/decline as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
         ResponseEntity<Void> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
@@ -216,6 +190,36 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("Phase 25.9: PATCH /bookings/{id}/decline — 204 with no comment in the body; "
+            + "the note is optional for all roles (reverses Phase 25.2's required-comment decision)")
+    void should_declineBooking_and_return204_when_noCommentProvided() throws Exception {
+        String ownerEmail = "integ-decline-nocomment-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-decline-nocomment-client-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
+
+        String body = "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}";
+        ResponseEntity<Void> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(ownerToken)),
+                Void.class);
+
+        assertThat(response.getStatusCode())
+                .as("owner declining with no comment must return 204 — the note is optional")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        String dbProviderComment = jdbcTemplate.queryForObject(
+                "SELECT provider_comment FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbProviderComment)
+                .as("no comment supplied must persist as NULL, never an empty string")
+                .isNull();
+    }
+
+    @Test
     @DisplayName("PATCH /bookings/{id}/not-complete — CONFIRMED booking transitions to NOT_COMPLETED with reason stored in DB")
     void should_markNotCompleted_and_return204_when_confirmedBookingMarkedNotCompleted() throws Exception {
         String ownerEmail = "integ-notcomplete-owner-" + System.nanoTime() + "@beautica.test";
@@ -228,19 +232,14 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0);
         UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
 
-        // First confirm the booking
-        restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
-                Void.class);
-
-        String dbStatusAfterConfirm = jdbcTemplate.queryForObject(
+        // Bookings are auto-confirmed at creation (track 24.x) — no /confirm hop exists any more.
+        String dbStatusAfterCreate = jdbcTemplate.queryForObject(
                 "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(dbStatusAfterConfirm)
-                .as("booking must be CONFIRMED before not-complete transition")
+        assertThat(dbStatusAfterCreate)
+                .as("booking must be CONFIRMED immediately after creation, before not-complete transition")
                 .isEqualTo("CONFIRMED");
 
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
+        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився вчасно\"}";
         log.debug("Act: PATCH {}/{}/not-complete as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
         ResponseEntity<Void> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
@@ -262,6 +261,37 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         assertThat(dbReason)
                 .as("cancellation_reason must be stored as CLIENT_NO_SHOW")
                 .isEqualTo("CLIENT_NO_SHOW");
+    }
+
+    @Test
+    @DisplayName("Phase 25.9: PATCH /bookings/{id}/not-complete — 204 with no comment in the body; "
+            + "the note is optional for all roles (reverses Phase 25.2's required-comment decision)")
+    void should_markNotCompleted_and_return204_when_noCommentProvided() throws Exception {
+        String ownerEmail = "integ-notcomplete-nocomment-owner-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-notcomplete-nocomment-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(3).withHour(15).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
+        ResponseEntity<Void> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(ownerToken)),
+                Void.class);
+
+        assertThat(response.getStatusCode())
+                .as("owner marking not-complete with no comment must return 204 — the note is optional")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        String dbProviderComment = jdbcTemplate.queryForObject(
+                "SELECT provider_comment FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbProviderComment)
+                .as("no comment supplied must persist as NULL, never an empty string")
+                .isNull();
     }
 
     @Test
@@ -367,8 +397,8 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("PATCH /bookings/{id}/confirm and /complete — full PENDING→CONFIRMED→COMPLETED flow with DB assertions")
-    void should_confirmAndCompleteBooking_when_fullStatusFlow() throws Exception {
+    @DisplayName("PATCH /bookings/{id}/complete — full CONFIRMED→COMPLETED flow with DB assertions (track 24.x auto-confirm, no /confirm hop)")
+    void should_completeBooking_when_confirmedStatusFlow() throws Exception {
         String ownerEmail = "integ-flow-owner-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
         String ownerToken = loginAndGetToken(ownerEmail);
@@ -379,24 +409,14 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(13).withMinute(0).withSecond(0).withNano(0);
         UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
 
-        // Step 2: SALON_OWNER confirms — expect 204
-        log.debug("Act: PATCH {}/{}/confirm as SALON_OWNER", BOOKINGS_URL, bookingId);
-        ResponseEntity<Void> confirmResponse = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
-                Void.class);
-        assertThat(confirmResponse.getStatusCode())
-                .as("confirm must return 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        // Step 3: DB must show CONFIRMED
-        String statusAfterConfirm = jdbcTemplate.queryForObject(
+        // Step 1: DB must show CONFIRMED — bookings are auto-confirmed at creation (track 24.x).
+        String statusAfterCreate = jdbcTemplate.queryForObject(
                 "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(statusAfterConfirm)
-                .as("DB status must be CONFIRMED after confirm, bookingId=%s", bookingId)
+        assertThat(statusAfterCreate)
+                .as("DB status must be CONFIRMED immediately after creation, bookingId=%s", bookingId)
                 .isEqualTo("CONFIRMED");
 
-        // Step 4: SALON_OWNER completes — expect 204
+        // Step 2: SALON_OWNER completes — expect 204
         log.debug("Act: PATCH {}/{}/complete as SALON_OWNER", BOOKINGS_URL, bookingId);
         ResponseEntity<Void> completeResponse = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/complete", HttpMethod.PATCH,
@@ -406,7 +426,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .as("complete must return 204")
                 .isEqualTo(HttpStatus.NO_CONTENT);
 
-        // Step 5: DB must show COMPLETED
+        // Step 3: DB must show COMPLETED
         String statusAfterComplete = jdbcTemplate.queryForObject(
                 "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
         assertThat(statusAfterComplete)
@@ -478,14 +498,85 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
+    @Test
+    @DisplayName("GET /bookings/{id} — an authenticated actor probing a NON-EXISTENT booking id gets the "
+            + "SAME 403 as a foreign booking (no 403-vs-404 existence oracle — mirrors the /cancel & "
+            + "/complete convention)")
+    void should_return403_when_authenticatedUserProbesNonexistentBookingId() throws Exception {
+        String clientToken = createClientAndGetToken("integ-getprobe-client-" + System.nanoTime() + "@beautica.test");
+        UUID nonExistentBookingId = UUID.randomUUID();
+
+        log.debug("Act: GET {}/{} (random, non-existent id) with a CLIENT token — must return 403, not 404",
+                BOOKINGS_URL, nonExistentBookingId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + nonExistentBookingId, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(clientToken)),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("probing a non-existent booking id must return 403 (identical to a foreign booking) "
+                        + "so the endpoint cannot be used as an existence oracle — never a distinguishing 404")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("PATCH /bookings/{id}/cancel — the OWNING client cancels a CONFIRMED booking → 204 and the "
+            + "DB status is specifically CANCELLED, never DECLINED (pins the client half of the load-bearing "
+            + "CANCELLED-vs-DECLINED distinction at the API level — the provider /decline half is asserted in "
+            + "should_declineBooking_and_return204_when_confirmedBookingDeclined)")
+    void should_transitionToCancelled_when_owningClientCancelsConfirmedBooking() throws Exception {
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-cancel-pos-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken("integ-cancel-pos-client-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
+
+        // Guard: track 24.x auto-confirm — the booking is CONFIRMED at creation, so /cancel
+        // acts on a real CONFIRMED source state (not a leftover PENDING).
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .as("booking must be CONFIRMED immediately after creation, before the client cancels")
+                .isEqualTo("CONFIRMED");
+
+        String body = "{\"cancellationReason\":\"CLIENT_CANCELLED\",\"comment\":\"Захворіла, перенесу пізніше\"}";
+        log.debug("Act: PATCH {}/{}/cancel as the OWNING CLIENT — must return 204", BOOKINGS_URL, bookingId);
+        ResponseEntity<Void> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/cancel", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientToken)),
+                Void.class);
+
+        assertThat(response.getStatusCode())
+                .as("owning client cancelling own CONFIRMED booking must return 204")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        String dbStatus = jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+        // The distinction is load-bearing: the client's "Мої записи" must render "ви скасували"
+        // (CANCELLED) separately from "салон скасував" (DECLINED). A regression that routed the
+        // client /cancel through the provider /decline status would pass every existing
+        // 204 + note-persistence assertion — only this explicit terminal-status pin catches it.
+        assertThat(dbStatus)
+                .as("client /cancel must yield CANCELLED — the client-initiated terminal status")
+                .isEqualTo("CANCELLED");
+        assertThat(dbStatus)
+                .as("client /cancel must NOT produce DECLINED — that is the PROVIDER-initiated status")
+                .isNotEqualTo("DECLINED");
+
+        String dbReason = jdbcTemplate.queryForObject(
+                "SELECT cancellation_reason FROM bookings WHERE id = ?", String.class, bookingId);
+        assertThat(dbReason)
+                .as("cancellation_reason must be stored as CLIENT_CANCELLED")
+                .isEqualTo("CLIENT_CANCELLED");
+    }
+
     // ── PATCH /bookings/{id}/reschedule (Phase 19.2) ─────────────────────────
 
     @Test
-    @DisplayName("PATCH /bookings/{id}/reschedule then /confirm — CONFIRMED booking reverts to PENDING at the new time, then provider confirm ⇒ CONFIRMED at the new time")
-    void should_rescheduleThenConfirm_when_clientMovesConfirmedBooking() throws Exception {
+    @DisplayName("PATCH /bookings/{id}/reschedule — CONFIRMED booking stays CONFIRMED at the new time (track 24.x — reschedule no longer touches status)")
+    void should_stayConfirmed_when_clientReschedulesConfirmedBooking() throws Exception {
         String ownerEmail = "integ-resched-confirm-owner-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
-        String ownerToken = loginAndGetToken(ownerEmail);
         UUID masterServiceId = createMasterService(masterId);
         addWorkingHoursForEveryDay(masterId);
 
@@ -493,9 +584,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
         UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
 
-        // Provider confirms the original booking → CONFIRMED.
-        restTemplate.exchange(BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(ownerToken)), Void.class);
+        // Booking is auto-confirmed at creation — no provider /confirm hop required or possible.
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
                 .isEqualTo("CONFIRMED");
 
@@ -511,32 +600,18 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .as("client rescheduling own CONFIRMED booking must return 200")
                 .isEqualTo(HttpStatus.OK);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
-                .as("CONFIRMED booking must revert to PENDING after reschedule")
-                .isEqualTo("PENDING");
+                .as("reschedule must not touch status — booking stays CONFIRMED")
+                .isEqualTo("CONFIRMED");
         String dbStartsAfterReschedule = jdbcTemplate.queryForObject(
                 "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
                 String.class, bookingId);
         assertThat(dbStartsAfterReschedule)
                 .as("starts_at must move to the new 11:00 Kyiv time")
                 .isEqualTo("11:00");
-
-        // Provider re-confirms at the new time → CONFIRMED at the new time.
-        ResponseEntity<Void> confirmResponse = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/confirm", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(ownerToken)), Void.class);
-        assertThat(confirmResponse.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
-                .as("re-confirm after reschedule must yield CONFIRMED")
-                .isEqualTo("CONFIRMED");
-        assertThat(jdbcTemplate.queryForObject(
-                "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
-                String.class, bookingId))
-                .as("confirmed time must still be the new 11:00 slot")
-                .isEqualTo("11:00");
     }
 
     @Test
-    @DisplayName("PATCH /bookings/{id}/reschedule then /decline — rescheduled booking is PENDING, then provider decline ⇒ DECLINED (standard path)")
+    @DisplayName("PATCH /bookings/{id}/reschedule then /decline — CONFIRMED booking stays CONFIRMED after reschedule, then provider decline ⇒ DECLINED (standard path)")
     void should_rescheduleThenDecline_when_providerRejectsNewTime() throws Exception {
         String ownerEmail = "integ-resched-decline-owner-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
@@ -555,13 +630,15 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
-                .as("PENDING booking stays PENDING after reschedule")
-                .isEqualTo("PENDING");
+                .as("reschedule must not touch status — booking stays CONFIRMED")
+                .isEqualTo("CONFIRMED");
 
-        // Provider declines the rescheduled (PENDING) booking → DECLINED via the unchanged path.
+        // Provider declines the rescheduled CONFIRMED booking → DECLINED via the unchanged path.
         ResponseEntity<Void> declineResponse = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(ownerToken)),
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\",\"comment\":\"Новий час теж не підходить\"}",
+                        bearerHeaders(ownerToken)),
                 Void.class);
         assertThat(declineResponse.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))

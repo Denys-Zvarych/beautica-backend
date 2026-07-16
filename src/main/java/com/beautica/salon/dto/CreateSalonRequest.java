@@ -11,10 +11,15 @@ import java.util.UUID;
  * Salon creation request.
  *
  * <p>Phase 10.3: locality is expressed via the taxonomy FK pair
- * ({@code cityId} / {@code districtId}) plus the light structured address
- * ({@code street} / {@code buildingNo} / {@code locationNote}). All five
- * fields are nullable — the mobile flow always sends them, but they are
- * optional for backward-compatible clients.
+ * ({@code cityId} / {@code districtId}) plus the structured address
+ * ({@code street} / {@code buildingNo} / {@code locationNote}).
+ *
+ * <p><strong>Address contract:</strong> {@code street} and {@code buildingNo}
+ * are <em>required</em> ({@code @NotBlank}) — a deliberate reversal of the
+ * Phase 10.6 "provider address optional" model (city/district-only was the old
+ * model); a blank/absent value now yields a clean 400 at the DTO boundary. Only
+ * {@code locationNote} (and {@code districtId}, per the most-specific-node rule)
+ * remains optional.
  *
  * <p>The legacy free-text {@code city} / {@code region} / {@code address}
  * fields are retained nullable for forward-compat with geocoder Part B.
@@ -64,9 +69,11 @@ public record CreateSalonRequest(
         // of a clean 400.
         UUID cityId,
         UUID districtId,
+        @NotBlank(message = "Street is required")
         @Size(max = 255, message = "Street must be at most 255 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Street must not contain control characters")
         String street,
+        @NotBlank(message = "Building number is required")
         @Size(max = 50, message = "Building number must be at most 50 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Building number must not contain control characters")
         String buildingNo,

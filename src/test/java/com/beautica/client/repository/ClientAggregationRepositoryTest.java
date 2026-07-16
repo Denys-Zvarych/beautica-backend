@@ -42,9 +42,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * non-COMPLETED bookings spanning multiple service-type categories, districts and
  * masters — plus a second client whose bookings must never bleed into the first's
  * aggregates — and pins: COMPLETED-only counting, top-N ordering (including a tie
- * broken by category name ASC), district COALESCE(salon, master-user) resolution,
- * budget AVG/MIN/MAX/COUNT, and most-recent-first timeline ordering with the category
- * key/name and serviceName populated. ASCII-only seed data throughout.
+ * broken by category name ASC), district CASE-WHEN(salon-presence, master-user) resolution
+ * (salon wins outright when present, even with a null district — never falls through to the
+ * master's own personal district; §Anti-Bug-fix-19.3-class), budget AVG/MIN/MAX/COUNT, and
+ * most-recent-first timeline ordering with the category key/name and serviceName populated.
+ * ASCII-only seed data throughout.
  */
 @DisplayName("ClientAggregationRepository — @DataJpaTest")
 class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
@@ -114,7 +116,7 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         return m;
     }
 
-    /** Salon master whose salon carries the discovery district (wins via COALESCE). */
+    /** Salon master whose salon carries the discovery district (wins via CASE WHEN salon-presence). */
     private Master persistSalonMaster(UUID salonDistrictId, UUID masterUserDistrictId) {
         User owner = persistUser(Role.SALON_OWNER, "owner");
         em.persist(owner);
@@ -274,7 +276,7 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
 
     @Test
     @DisplayName("findTopDistricts — ranks discovery districts by COMPLETED count desc, salon district "
-            + "wins via COALESCE, master-user district used when no salon")
+            + "wins via CASE WHEN salon-presence, master-user district used only when no salon")
     void should_rankDistricts_when_completedBookingsExist() {
         UUID salonDistrict = seededDistrictIds.get(0);
         UUID masterUserDistrict = seededDistrictIds.get(1);
@@ -304,7 +306,41 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         assertThat(top.get(0).count()).isEqualTo(3L);
         assertThat(top.get(1).districtId()).as("master-user district when no salon").isEqualTo(indepDistrict);
         assertThat(top.get(1).count()).isEqualTo(1L);
-        // The master-user district behind the salon must NOT appear — COALESCE picked the salon.
+        // The master-user district behind the salon must NOT appear — CASE WHEN picked the salon.
+        assertThat(top).extracting(DistrictCount::districtId).doesNotContain(masterUserDistrict);
+    }
+
+    @Test
+    @DisplayName("findTopDistricts — LOW fix: salon presence wins outright even when the salon's own "
+            + "district is NULL (legacy/districtless-city salon) — must NOT fall through to the "
+            + "salon-employed master's personal user-row district (mirrors the 19.3 booking-detail rule; "
+            + "CASE WHEN, not COALESCE)")
+    void should_excludeMasterUserDistrict_when_salonExistsButHasNullDistrict() {
+        UUID masterUserDistrict = seededDistrictIds.get(1);
+        UUID indepDistrict = seededDistrictIds.get(2);
+
+        // Salon has NO district (e.g. a legacy salon predating the Phase 10.3 locality
+        // columns, or a districtless-city salon) — its OWN row still exists (LEFT JOIN
+        // matches), it just carries districtId = null.
+        Master salonMaster = persistSalonMaster(null, masterUserDistrict);
+        MasterServiceAssignment salonService = persistService(salonMaster, "Salon Manicure", "MANICURE", "500");
+        // Control: an independent master with a real district still counts normally.
+        Master indepMaster = persistIndependentMaster(indepDistrict);
+        MasterServiceAssignment indepService = persistService(indepMaster, "Indep Manicure", "MANICURE", "300");
+
+        persistBooking(client, salonMaster, salonService, BookingStatus.COMPLETED, "500", slot());
+        persistBooking(client, indepMaster, indepService, BookingStatus.COMPLETED, "300", slot());
+        em.flush();
+        em.clear();
+
+        List<DistrictCount> top = repository.findTopDistricts(client.getId(), TOP_3);
+
+        assertThat(top)
+                .as("the districtless-salon booking is dropped (null resolved district), never "
+                        + "attributed to the master's own personal district — the independent "
+                        + "master's booking is the only surviving row")
+                .hasSize(1);
+        assertThat(top.get(0).districtId()).isEqualTo(indepDistrict);
         assertThat(top).extracting(DistrictCount::districtId).doesNotContain(masterUserDistrict);
     }
 
@@ -338,7 +374,7 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         Master master = persistIndependentMaster(seededDistrictIds.get(0));
         MasterServiceAssignment service = persistService(master, "Manicure", "MANICURE", "300");
         // Only a non-COMPLETED booking exists.
-        persistBooking(client, master, service, BookingStatus.PENDING, "300", slot());
+        persistBooking(client, master, service, BookingStatus.CONFIRMED, "300", slot());
         em.flush();
         em.clear();
 

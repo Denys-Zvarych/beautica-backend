@@ -142,7 +142,7 @@ public class SlotCalculationService {
         LocalDate windowEndDate = crossesMidnight ? date.plusDays(2) : date.plusDays(1);
         OffsetDateTime dayEnd = windowEndDate.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
-        // Step 7: load existing bookings that overlap the day window (PENDING + CONFIRMED only).
+        // Step 7: load existing bookings that overlap the day window (CONFIRMED only).
         // Loaded once for the whole day and subtracted from every interval below.
         List<TimeRange> occupied = bookingRepository
                 .findOverlappingByMaster(masterId, dayStart, dayEnd)
@@ -169,7 +169,7 @@ public class SlotCalculationService {
      * Per-date <b>bookability</b> projection for {@code [from, to]} — the {@code serviceId}-aware mode of
      * {@code GET /masters/{masterId}/working-days}. A date is {@code working = true} iff the client could
      * actually complete a booking on it: the master's resolved schedule for that date leaves a free range
-     * (after PENDING/CONFIRMED bookings are subtracted) long enough for the service's effective duration,
+     * (after CONFIRMED bookings are subtracted) long enough for the service's effective duration,
      * starting at or after {@link #bookableCutoff()} and within the booking horizon.
      *
      * <p><b>Why this exists.</b> {@code MasterScheduleService#getClientWorkingDays} — the no-{@code
@@ -299,7 +299,7 @@ public class SlotCalculationService {
     //
     // A performing master is "bookable" for a service iff there is ≥1 FREE FUTURE slot: an active
     // assignment on an active master, a usable schedule in the booking window, and a generated slot
-    // whose start is ≥ now + MIN_MINUTES_AHEAD after existing PENDING/CONFIRMED bookings are
+    // whose start is ≥ now + MIN_MINUTES_AHEAD after existing CONFIRMED bookings are
     // subtracted. This is the SINGLE verdict shared by the salon catalogue
     // (ServiceCatalogService#getSalonServiceCatalog) and the booking master-list
     // (BookingMasterService#getBookableMasters), so the two can never diverge. The free-slot check
@@ -343,7 +343,7 @@ public class SlotCalculationService {
      * Entity-taking core of the free-slot bookability verdict (Perf #4) — no cache, no reload. Shared by
      * the cached {@link #hasBookableFutureSlot(UUID, UUID, MasterServiceAssignment, LocalDate, LocalDate)}
      * wrapper (on a cache miss) and any caller that already holds the assignment. Guards active assignment
-     * + active master, resolves the schedule range once and the window's PENDING/CONFIRMED bookings once
+     * + active master, resolves the schedule range once and the window's CONFIRMED bookings once
      * (bucketed per day — Perf #3), then short-circuits on the first free slot starting ≥ now +
      * {@code MIN_MINUTES_AHEAD}.
      */
@@ -473,7 +473,7 @@ public class SlotCalculationService {
     /**
      * <b>THE single per-day bookability predicate.</b> True iff {@code day}'s resolved schedule leaves at
      * least one free range that fits {@code totalDuration} and starts at/after {@code cutoff}, once the
-     * day's PENDING/CONFIRMED bookings are subtracted.
+     * day's CONFIRMED bookings are subtracted.
      *
      * <p>Three consumers share it and therefore cannot disagree: the calendar day projection
      * ({@link #getBookableWorkingDays}, one call per date), the short-circuiting bookability gate
@@ -508,7 +508,7 @@ public class SlotCalculationService {
     }
 
     /**
-     * Loads the master's PENDING/CONFIRMED bookings across {@code [from, to]} in ONE query and buckets
+     * Loads the master's CONFIRMED bookings across {@code [from, to]} in ONE query and buckets
      * them by Kyiv-civil date (Perf #3) so the day-walk indexes each day's slice directly. Window bounded
      * by the caller's ≤180-day booking horizon (§E-3). A booking is added to every civil day it overlaps
      * ({@code [dateOf(start) .. dateOf(end − ε)]}), reproducing the previous per-day overlap test

@@ -130,56 +130,8 @@ class BookingServiceCacheTest {
         }
     }
 
-    @Test
-    @DisplayName("confirmBooking evicts the master-calendar cache")
-    void should_evictMasterCalendarCache_when_confirmBookingCalled() {
-        UUID actorUserId = UUID.randomUUID();
-        UUID bookingId = UUID.randomUUID();
-
-        // Arrange — put a sentinel entry in master-calendar to confirm eviction
-        Cache cache = cacheManager.getCache("master-calendar");
-        assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
-
-        // Build a mock Booking in PENDING status with all fields BookingResponse.from() needs
-        Booking booking = mock(Booking.class);
-        User client = mock(User.class);
-        Master master = mock(Master.class);
-        MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
-        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
-
-        when(booking.getStatus()).thenReturn(BookingStatus.PENDING);
-        when(booking.getId()).thenReturn(bookingId);
-        when(booking.getClient()).thenReturn(client);
-        when(booking.getMaster()).thenReturn(master);
-        when(booking.getMasterService()).thenReturn(msa);
-        when(msa.getServiceDefinition()).thenReturn(serviceDef);
-        when(msa.getId()).thenReturn(UUID.randomUUID());
-        when(client.getId()).thenReturn(UUID.randomUUID());
-        when(master.getId()).thenReturn(UUID.randomUUID());
-        when(serviceDef.getName()).thenReturn("Test Service");
-        when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).plusHours(2));
-        when(booking.getEndsAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).plusHours(3));
-        when(booking.getPriceAtBooking()).thenReturn(new BigDecimal("200.00"));
-        when(booking.getDurationMinutesAtBooking()).thenReturn(60);
-        when(booking.getCreatedAt()).thenReturn(Instant.now());
-
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(bookingRepository.save(any())).thenReturn(booking);
-        doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
-
-        // Act — wrap in transaction so afterCommit() fires
-        transactionTemplate.execute(status -> {
-            bookingService.confirmBooking(actorUserId, bookingId);
-            return null;
-        });
-
-        // Assert — sentinel must be gone: allEntries=true evicts the entire cache
-        assertThat(cache.get("sentinel"))
-                .as("master-calendar cache must be fully evicted after confirmBooking")
-                .isNull();
-    }
+    // TODO(24.7): add a create-path cache-eviction test (bookings are now born CONFIRMED via
+    // doCreateBooking — there is no more standalone confirmBooking() transition to cover).
 
     @Test
     @DisplayName("declineBooking evicts the master-calendar cache")
@@ -193,11 +145,13 @@ class BookingServiceCacheTest {
         cache.put("sentinel", "value");
         assertThat(cache.get("sentinel")).isNotNull();
 
-        Booking booking = mockPendingBooking(bookingId);
+        // Phase 24.2: declineBooking now transitions CONFIRMED → DECLINED (provider-initiated
+        // cancellation) — there is no more PENDING source state.
+        Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
-        doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
+        doNothing().when(authz).enforceCanCancelBooking(actorUserId, booking);
 
         StatusUpdateRequest request = new StatusUpdateRequest(
                 CancellationReason.PROVIDER_UNAVAILABLE,
@@ -263,7 +217,7 @@ class BookingServiceCacheTest {
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
-        doNothing().when(authz).enforceCanManageBooking(actorUserId, booking);
+        doNothing().when(authz).enforceCanCancelBooking(actorUserId, booking);
 
         StatusUpdateRequest request = new StatusUpdateRequest(
                 CancellationReason.CLIENT_NO_SHOW,
@@ -316,15 +270,6 @@ class BookingServiceCacheTest {
         assertThat(cache.get("sentinel"))
                 .as("master-calendar cache must be fully evicted after cancelBooking")
                 .isNull();
-    }
-
-    /**
-     * Builds a fully-mocked Booking in PENDING status with every field BookingResponse.from()
-     * and registerSlotEviction() touch. Used by transition tests that start from PENDING
-     * (declineBooking).
-     */
-    private Booking mockPendingBooking(UUID bookingId) {
-        return mockBookingInStatus(bookingId, BookingStatus.PENDING);
     }
 
     /**
