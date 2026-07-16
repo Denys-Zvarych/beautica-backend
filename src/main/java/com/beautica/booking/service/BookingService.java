@@ -15,6 +15,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.review.repository.ReviewRepository;
+import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
@@ -425,6 +426,11 @@ public class BookingService {
         if (current != BookingStatus.CONFIRMED) {
             throw new BusinessException("Cannot cancel a booking in status %s".formatted(current));
         }
+        // Track 24.x read-only-after-elapse: once the appointment window has fully passed the
+        // booking is read-only for the client and awaits provider resolution (decline / complete /
+        // mark-no-show) — the client can no longer cancel it. Checked AFTER the status guard so a
+        // non-CONFIRMED booking still reports the more specific status conflict.
+        assertNotElapsedForClient(booking);
         booking.setStatus(BookingStatus.CANCELLED);
         // cancellationReason is guaranteed non-null by @NotNull on CancelBookingRequest
         booking.setCancellationReason(req.cancellationReason());
@@ -486,6 +492,11 @@ public class BookingService {
             throw new BusinessException(HttpStatus.CONFLICT,
                     "Cannot reschedule a booking in status %s".formatted(current));
         }
+        // Track 24.x read-only-after-elapse: an already-elapsed booking is read-only for the
+        // client and awaits provider resolution — the client can no longer move it to a new time.
+        // Checked AFTER the status guard so a non-CONFIRMED booking still reports the more
+        // specific status conflict.
+        assertNotElapsedForClient(booking);
 
         OffsetDateTime newStartsAt = req.newStartsAt();
         validateStartsAt(newStartsAt);
@@ -784,6 +795,23 @@ public class BookingService {
         // additional SELECTs for masterService and serviceDefinition
         return bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new NotFoundException("Booking not found"));
+    }
+
+    /**
+     * Guards the client-initiated write paths (cancel / reschedule) against an already-elapsed
+     * booking: once {@code endsAt} is before "now" the appointment is read-only for the client and
+     * only the provider (decline / complete / mark-no-show) may resolve it (track 24.x). Compared
+     * on the absolute instant via the injected {@link Clock} (the same time source
+     * {@link #validateStartsAt} uses), so tests can pin an elapsed booking deterministically.
+     *
+     * <p>Deliberately NOT applied to the provider paths ({@link #declineBooking},
+     * {@link #completeBooking}, {@link #notCompleteBooking}) — resolving an elapsed booking is
+     * exactly their job.
+     */
+    private void assertNotElapsedForClient(Booking booking) {
+        if (booking.getEndsAt().toInstant().isBefore(clock.instant())) {
+            throw new BookingElapsedException();
+        }
     }
 
     private void assertTransition(Booking booking, BookingStatus expected, BookingStatus target) {

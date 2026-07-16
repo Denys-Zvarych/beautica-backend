@@ -914,6 +914,56 @@ class GlobalExceptionHandlerTest {
                 .contains("ClientBookingConflictException");
     }
 
+    // ── handleBookingElapsed (track 24.x read-only-after-elapse) ───────────────
+
+    @Test
+    @DisplayName("handleBookingElapsed — 409 with BOOKING_ALREADY_ELAPSED code, success=false, and the stable wire message")
+    void should_return409WithBookingAlreadyElapsedCode_when_bookingElapsedExceptionThrown() {
+        // BookingService throws this when a CLIENT cancels/reschedules a booking whose window has
+        // already fully elapsed. The dedicated handler must emit the structured BookingElapsedResponse
+        // (data.code) rather than letting handleBusiness genericise it into the shared "conflict"
+        // message the mobile app also uses for master-busy / slot-not-available 409s.
+        var ex = new com.beautica.common.exception.BookingElapsedException();
+
+        ResponseEntity<ApiResponse<com.beautica.booking.dto.BookingElapsedResponse>> response =
+                handler.handleBookingElapsed(ex);
+
+        assertThat(response.getStatusCode())
+                .as("a client mutation on an elapsed booking must map to 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+        // Reference the constant — a rename must fail this test, not silently break mobile routing
+        // between this and the generic 409s.
+        assertThat(response.getBody().data().code())
+                .as("data.code must be the stable BOOKING_ALREADY_ELAPSED constant")
+                .isEqualTo(com.beautica.common.exception.BookingElapsedException.ERROR_CODE);
+        assertThat(response.getBody().data().code()).isEqualTo("BOOKING_ALREADY_ELAPSED");
+        assertThat(response.getBody().message())
+                .as("message must be the stable wire-contract string")
+                .isEqualTo("This booking's time has already passed");
+    }
+
+    @Test
+    @DisplayName("handleBookingElapsed — emits DEBUG log marker only (non-PII exception class)")
+    void should_emitDebugLog_when_bookingElapsedExceptionThrown() {
+        var ex = new com.beautica.common.exception.BookingElapsedException();
+        listAppender.list.clear();
+
+        handler.handleBookingElapsed(ex);
+
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleBookingElapsed must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must contain the non-PII exception class marker")
+                .contains("BookingElapsedException");
+    }
+
     @Test
     @DisplayName("should return 400 with generic message when ConstraintViolationException is thrown")
     void should_return400_withGenericMessage_when_constraintViolationExceptionThrown() {

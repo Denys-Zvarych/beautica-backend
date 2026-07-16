@@ -2,6 +2,7 @@ package com.beautica.common.exception;
 
 import com.beautica.auth.dto.EmailAlreadyRegisteredResponse;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
+import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
@@ -90,6 +91,28 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         ClientBookingConflictResponse.from(ex),
                         "Client already has an overlapping booking"));
+    }
+
+    /**
+     * Distinct 409 for a client attempting to reschedule/cancel a booking whose appointment
+     * window has already elapsed (track 24.x read-only-after-elapse rule).
+     *
+     * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
+     * declaration order) {@link #handleBusiness} so the structured {@link BookingElapsedResponse}
+     * body — carrying the {@code BOOKING_ALREADY_ELAPSED} code — is emitted instead of the
+     * generic conflict message the mobile app also uses for "master busy" / "slot not available"
+     * 409s. The cases are distinguished by {@code data.code}, never by the top-level
+     * {@code message} string.
+     */
+    @ExceptionHandler(BookingElapsedException.class)
+    public ResponseEntity<ApiResponse<BookingElapsedResponse>> handleBookingElapsed(
+            BookingElapsedException ex) {
+        log.debug("Booking already elapsed: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        new BookingElapsedResponse(BookingElapsedException.ERROR_CODE),
+                        "This booking's time has already passed"));
     }
 
     @ExceptionHandler(BusinessException.class)

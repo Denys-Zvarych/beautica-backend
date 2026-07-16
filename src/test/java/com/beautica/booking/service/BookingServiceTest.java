@@ -12,6 +12,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
@@ -945,6 +946,212 @@ class BookingServiceTest {
                 .isEqualTo(BookingStatus.CONFIRMED);
         verify(bookingRepository, never()).save(any());
         verify(outboxService, never()).enqueueStatusChanged(any());
+    }
+
+    // ── elapsed-client guard (track 24.x — read-only-after-elapse) ─────────────
+    //
+    // BookingService#assertNotElapsedForClient(booking): rejects a CLIENT cancel/reschedule once
+    // booking.endsAt is strictly before the injected Clock's instant (throws BookingElapsedException
+    // → 409 BOOKING_ALREADY_ELAPSED). The comparison is on the ABSOLUTE instant via the pinned
+    // Clock, so a booking's elapsed-ness is deterministic here (Clock.fixed in setUp). These pin the
+    // branch, the strict-isBefore boundary, the guard ordering (after the status guard), and the
+    // server-authority property (no request field can flip the verdict). The full HTTP contract +
+    // provider-still-allowed matrix lives in BookingElapsedClientGuardIT.
+
+    /** Builds a CONFIRMED-by-default booking whose slot ends at an exact instant relative to the pinned Clock. */
+    private Booking buildBookingEndingAt(BookingStatus status, Instant endsAtInstant) {
+        OffsetDateTime endsAt = OffsetDateTime.ofInstant(endsAtInstant, KYIV);
+        Booking b = Booking.builder()
+                .client(client)
+                .master(master)
+                .masterService(msa)
+                .status(status)
+                .startsAt(endsAt.minusHours(1))
+                .endsAt(endsAt)
+                .priceAtBooking(new BigDecimal("200.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        setField(b, "id", bookingId);
+        ReflectionTestUtils.setField(b, "createdAt", Instant.now());
+        return b;
+    }
+
+    /** Matrix #1 (service level). Elapsed CONFIRMED cancel → BookingElapsedException, no mutation, no side effects. */
+    @Test
+    @DisplayName("cancel — elapsed CONFIRMED booking throws BookingElapsedException (409 BOOKING_ALREADY_ELAPSED); status unchanged, no save/outbox")
+    void should_throwBookingElapsed_when_clientCancelsElapsedConfirmedBooking() {
+        Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant().minusSeconds(60));
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                .as("a client cancel of an already-ended booking must be a 409 elapsed conflict")
+                .isInstanceOf(BookingElapsedException.class)
+                .satisfies(ex -> assertThat(((BookingElapsedException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("a rejected cancel must leave the booking CONFIRMED — the provider still owns resolution")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
+    }
+
+    /** Matrix #2 (service level). Elapsed CONFIRMED reschedule → BookingElapsedException BEFORE any slot lookup/persist. */
+    @Test
+    @DisplayName("reschedule — elapsed CONFIRMED booking throws BookingElapsedException before any slot lookup/lock/persist")
+    void should_throwBookingElapsed_when_clientReschedulesElapsedConfirmedBooking() {
+        Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant().minusSeconds(60));
+        // A perfectly valid FUTURE target time — proves the client cannot escape the guard by
+        // supplying a good newStartsAt: the verdict is on the SOURCE booking's persisted endsAt.
+        RescheduleBookingRequest req = new RescheduleBookingRequest(
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BookingElapsedException.class);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        // Guard short-circuits ahead of the whole reschedule critical section (Q6 verify-not-called).
+        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any());
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any());
+    }
+
+    /** Matrix #3 (boundary, strictly before). endsAt one nanosecond before now → elapsed → rejected. */
+    @Test
+    @DisplayName("boundary — endsAt exactly 1ns BEFORE the Clock instant is elapsed → cancel rejected (strict isBefore, lower side)")
+    void should_reject_when_endsAtIsOneNanoBeforeNow() {
+        Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant().minusNanos(1));
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                .as("endsAt < now (by 1ns) must be treated as elapsed")
+                .isInstanceOf(BookingElapsedException.class);
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+    }
+
+    /** Matrix #3 (boundary, equal). endsAt == now → NOT before → NOT elapsed → cancel ALLOWED (documented isBefore semantics). */
+    @Test
+    @DisplayName("boundary — endsAt EXACTLY EQUAL to the Clock instant is NOT elapsed → cancel allowed (isBefore is strict; equal passes)")
+    void should_allowCancel_when_endsAtExactlyEqualsNow() {
+        Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant());
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.cancelBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus())
+                .as("endsAt == now is the last non-elapsed instant (guard uses strict isBefore) — cancel must succeed")
+                .isEqualTo(BookingStatus.CANCELLED);
+        verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    /** Matrix #3 (boundary, strictly after). endsAt one nanosecond after now → not elapsed → cancel allowed. */
+    @Test
+    @DisplayName("boundary — endsAt 1ns AFTER the Clock instant is not elapsed → cancel allowed (upper side)")
+    void should_allowCancel_when_endsAtIsOneNanoAfterNow() {
+        Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant().plusNanos(1));
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.cancelBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    /** Matrix #7 (ordering). An elapsed but NON-CONFIRMED booking reports the STATUS conflict, not the elapsed code. */
+    @Test
+    @DisplayName("ordering — elapsed COMPLETED booking cancel reports the STATUS conflict (BAD_REQUEST), NOT BookingElapsedException (status guard runs first)")
+    void should_reportStatusConflictNotElapsed_when_cancellingElapsedCompletedBooking() {
+        Booking booking = buildBookingEndingAt(BookingStatus.COMPLETED, clock.instant().minusSeconds(60));
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                .as("the more specific status conflict must win — the guard sits AFTER the status check")
+                // BookingElapsedException extends BusinessException, so also assert it is NOT that subclass.
+                .isInstanceOf(BusinessException.class)
+                .isNotInstanceOf(BookingElapsedException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    /** Matrix #7 (ordering, reschedule). Same ordering guarantee on the reschedule path (CONFLICT, not elapsed). */
+    @Test
+    @DisplayName("ordering — elapsed COMPLETED booking reschedule reports the STATUS conflict (CONFLICT), NOT BookingElapsedException")
+    void should_reportStatusConflictNotElapsed_when_reschedulingElapsedCompletedBooking() {
+        Booking booking = buildBookingEndingAt(BookingStatus.COMPLETED, clock.instant().minusSeconds(60));
+        RescheduleBookingRequest req = new RescheduleBookingRequest(
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .isNotInstanceOf(BookingElapsedException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+    }
+
+    /** Matrix #6 (server authority). The elapsed verdict is invariant to request contents — no client field can flip it. */
+    @Test
+    @DisplayName("server-authority — cancel of an elapsed booking is 409 regardless of request body contents (reason/comment); no client field flips the verdict")
+    void should_rejectRegardlessOfRequestContents_when_cancellingElapsedBooking() {
+        Instant elapsedEnd = clock.instant().minusSeconds(60);
+        when(bookingRepository.findByIdWithFullGraph(bookingId))
+                .thenAnswer(inv -> Optional.of(buildBookingEndingAt(BookingStatus.CONFIRMED, elapsedEnd)));
+
+        // Two materially different bodies — different reason, with/without a free-text note. Neither
+        // carries a timestamp, and the outcome is identical: the verdict depends ONLY on the server
+        // Clock + persisted endsAt. This is precisely what defeats a device-clock rollback: there is
+        // no client-supplied "now" to trust.
+        for (CancelBookingRequest req : List.of(
+                new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null),
+                new CancelBookingRequest(CancellationReason.PROVIDER_UNAVAILABLE, "will not be reached"))) {
+            assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                    .as("request contents cannot bypass the server-clock-authoritative elapsed guard")
+                    .isInstanceOf(BookingElapsedException.class);
+        }
+        verify(bookingRepository, never()).save(any());
+    }
+
+    /** Matrix #4 (regression, cancel). A FUTURE CONFIRMED booking still cancels — the guard didn't break the normal path. */
+    @Test
+    @DisplayName("regression — a FUTURE CONFIRMED booking still cancels to CANCELLED (elapsed guard does not touch the normal path)")
+    void should_stillCancelFutureBooking_afterElapsedGuardAdded() {
+        Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant().plusSeconds(3600));
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.cancelBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    /** Matrix #4 (regression, reschedule). A FUTURE CONFIRMED booking still reschedules to the new time. */
+    @Test
+    @DisplayName("regression — a FUTURE CONFIRMED booking still reschedules to the new time (elapsed guard does not touch the normal path)")
+    void should_stillRescheduleFutureBooking_afterElapsedGuardAdded() {
+        Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant().plusSeconds(3600));
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(6).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        BookingDetailResponse result = bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+        assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
+        verify(outboxService).enqueueBookingRescheduled(bookingId);
     }
 
     // ── rescheduleBooking (Phase 19.2) ─────────────────────────────────────────
