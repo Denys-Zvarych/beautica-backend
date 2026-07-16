@@ -42,6 +42,49 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             """)
     Page<UUID> findIdsByMasterIdOrderByCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
 
+    // ── Master reviews — sortable list (Phase 8.11) ────────────────────────────
+    //
+    // Three additional fixed, named finders — one per non-NEWEST SalonReviewSort value —
+    // mirroring the salon list (findIdsBySalonIdOrderBy... below). Same rationale as there and
+    // as findIdsByMasterIdOrderByCreatedAtDesc above: a closed set of hardcoded ORDER BY
+    // clauses instead of a caller-supplied Sort, so a free-form sort string can never probe
+    // entity property names via PropertyReferenceException. NEWEST reuses the existing
+    // findIdsByMasterIdOrderByCreatedAtDesc. HIGHEST/LOWEST tie-break on createdAt DESC for a
+    // stable order within equal ratings — identical to the salon variants.
+
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.master.id = :masterId
+            ORDER BY r.createdAt ASC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.master.id = :masterId
+            """)
+    Page<UUID> findIdsByMasterIdOrderByCreatedAtAsc(@Param("masterId") UUID masterId, Pageable pageable);
+
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.master.id = :masterId
+            ORDER BY r.rating DESC, r.createdAt DESC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.master.id = :masterId
+            """)
+    Page<UUID> findIdsByMasterIdOrderByRatingDescCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
+
+    @Query(value = """
+            SELECT r.id FROM Review r
+            WHERE r.master.id = :masterId
+            ORDER BY r.rating ASC, r.createdAt DESC
+            """,
+           countQuery = """
+            SELECT COUNT(r) FROM Review r
+            WHERE r.master.id = :masterId
+            """)
+    Page<UUID> findIdsByMasterIdOrderByRatingAscCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
+
     /**
      * Batch-hydrates a bounded set of reviews with their associations.
      *
@@ -146,6 +189,17 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      */
     @Query("SELECT r.rating AS rating, COUNT(r) AS count FROM Review r WHERE r.salon.id = :salonId GROUP BY r.rating")
     List<RatingCountProjection> countBySalonIdGroupByRating(@Param("salonId") UUID salonId);
+
+    /**
+     * Master-scoped twin of {@link #countBySalonIdGroupByRating}, backing
+     * {@link com.beautica.review.dto.MasterReviewSummaryResponse}'s {@code ratingDistribution}
+     * (Phase 8.10). Only buckets with at least one review are returned — the service layer
+     * ({@code ReviewService.getMasterReviewSummary}) zero-fills the missing 1-5 buckets so
+     * every star rating is present in the response. No new index needed: {@code reviews.master_id}
+     * is already indexed (used by {@link #findIdsByMasterIdOrderByCreatedAtDesc}).
+     */
+    @Query("SELECT r.rating AS rating, COUNT(r) AS count FROM Review r WHERE r.master.id = :masterId GROUP BY r.rating")
+    List<RatingCountProjection> countByMasterIdGroupByRating(@Param("masterId") UUID masterId);
 
     // ── Salon reviews — sortable list (Phase 13.6) ─────────────────────────────
     //

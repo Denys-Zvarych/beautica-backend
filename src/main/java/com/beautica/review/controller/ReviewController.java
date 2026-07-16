@@ -4,6 +4,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.MasterReviewSummaryResponse;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
@@ -46,11 +47,20 @@ public class ReviewController {
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
+    /**
+     * Sortable, paginated received-reviews list for a master's public profile.
+     *
+     * <p><strong>Public endpoint — no authentication required.</strong> {@code sort} defaults
+     * to {@code NEWEST} when omitted (Phase 8.11), preserving the pre-8.11 newest-first
+     * behaviour. Reuses the salon {@link SalonReviewSort} enum verbatim — the four wire values
+     * are identical, so mobile maps one enum for both endpoints.
+     */
     @GetMapping("/masters/{masterId}/reviews")
     public ApiResponse<PageResponse<ReviewResponse>> getReviewsByMaster(
             @PathVariable UUID masterId,
+            @RequestParam(required = false, defaultValue = "NEWEST") SalonReviewSort sort,
             @PageableDefault(size = 20) Pageable pageable) {
-        Page<ReviewResponse> page = reviewService.getReviewsForMaster(masterId, pageable);
+        Page<ReviewResponse> page = reviewService.getReviewsForMaster(masterId, sort, pageable);
         return ApiResponse.ok(PageResponse.of(
                 page.getContent(),
                 page.getNumber(),
@@ -58,6 +68,18 @@ public class ReviewController {
                 page.getTotalElements(),
                 page.getTotalPages()
         ));
+    }
+
+    /**
+     * Rating summary for a master's public profile (Phase 8.10).
+     *
+     * <p><strong>Public endpoint — no authentication required.</strong> Mirrors the salon
+     * {@link #getSalonReviewSummary} pattern: aggregate-only (avg + count + zero-filled 5→1
+     * distribution), no PII, so the same no-auth access rules apply.
+     */
+    @GetMapping("/masters/{masterId}/reviews/summary")
+    public ApiResponse<MasterReviewSummaryResponse> getMasterReviewSummary(@PathVariable UUID masterId) {
+        return ApiResponse.ok(reviewService.getMasterReviewSummary(masterId));
     }
 
     // Declared before /reviews/{reviewId}; Spring's PathPattern matching also favours the literal

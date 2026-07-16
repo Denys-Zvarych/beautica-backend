@@ -364,7 +364,7 @@ class ReviewControllerTest {
     @DisplayName("GET /masters/{masterId}/reviews — 200 for unauthenticated caller (public endpoint)")
     void should_return200_when_publicGetMasterReviews() throws Exception {
         var masterId = UUID.randomUUID();
-        when(reviewService.getReviewsForMaster(any(), any())).thenReturn(Page.empty());
+        when(reviewService.getReviewsForMaster(any(), any(), any())).thenReturn(Page.empty());
 
         mockMvc.perform(get(MASTERS_REVIEWS_URL, masterId)
                         .accept(MediaType.APPLICATION_JSON))
@@ -376,7 +376,7 @@ class ReviewControllerTest {
     @DisplayName("GET /masters/{masterId}/reviews — 200 with empty page when masterId does not exist")
     void should_return200_when_getMasterReviewsWithNonExistentMasterId() throws Exception {
         var nonExistentMasterId = UUID.randomUUID();
-        when(reviewService.getReviewsForMaster(any(), any())).thenReturn(Page.empty());
+        when(reviewService.getReviewsForMaster(any(), any(), any())).thenReturn(Page.empty());
 
         mockMvc.perform(get(MASTERS_REVIEWS_URL, nonExistentMasterId)
                         .accept(MediaType.APPLICATION_JSON))
@@ -390,7 +390,7 @@ class ReviewControllerTest {
     @DisplayName("GET /masters/{masterId}/reviews — 400 when page number exceeds 10000")
     void should_return400_when_pageNumberExceedsMaximum() throws Exception {
         var masterId = UUID.randomUUID();
-        when(reviewService.getReviewsForMaster(any(), any()))
+        when(reviewService.getReviewsForMaster(any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST,
                         "Page number must not exceed 10000"));
 

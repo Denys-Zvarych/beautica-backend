@@ -11,6 +11,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewSort;
 import com.beautica.review.dto.SalonReviewSummaryResponse;
 import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
@@ -333,7 +334,7 @@ class ReviewServiceTest {
         when(reviewRepository.findByIdsWithGraph(List.of(REVIEW_ID)))
                 .thenReturn(List.of(review));
 
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, SalonReviewSort.NEWEST, pageable);
 
         assertThat(result.getTotalElements()).isEqualTo(1);
         assertThat(result.getContent()).hasSize(1);
@@ -349,7 +350,7 @@ class ReviewServiceTest {
         when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), any(Pageable.class)))
                 .thenReturn(emptyIdPage);
 
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, SalonReviewSort.NEWEST, pageable);
 
         assertThat(result.getTotalElements()).isZero();
         assertThat(result.getContent()).isEmpty();
@@ -364,7 +365,7 @@ class ReviewServiceTest {
         when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(nonExistentMasterId), any(Pageable.class)))
                 .thenReturn(Page.empty(pageable));
 
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(nonExistentMasterId, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(nonExistentMasterId, SalonReviewSort.NEWEST, pageable);
 
         assertThat(result.getTotalElements()).isZero();
         assertThat(result.getContent()).isEmpty();
@@ -383,7 +384,7 @@ class ReviewServiceTest {
                 .thenReturn(emptyIdPage);
 
         // Act
-        reviewService.getReviewsForMaster(MASTER_ID, callerPageable);
+        reviewService.getReviewsForMaster(MASTER_ID, SalonReviewSort.NEWEST, callerPageable);
 
         // Assert — repository received an unsorted Pageable
         verify(reviewRepository).findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), pageableCaptor.capture());
@@ -600,7 +601,7 @@ class ReviewServiceTest {
                 .thenReturn(Page.empty(pageable));
 
         // Act — must not throw NotFoundException; same shape as a master with zero reviews
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(unknownMasterId, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(unknownMasterId, SalonReviewSort.NEWEST, pageable);
 
         // Assert — empty page returned; timing oracle is not present
         assertThat(result.isEmpty())

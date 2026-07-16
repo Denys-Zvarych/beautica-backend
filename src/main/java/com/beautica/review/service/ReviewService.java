@@ -7,7 +7,10 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.PageResponse;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.master.entity.Master;
+import com.beautica.master.repository.MasterRepository;
 import com.beautica.review.dto.CreateReviewRequest;
+import com.beautica.review.dto.MasterReviewSummaryResponse;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
@@ -46,6 +49,7 @@ public class ReviewService {
     private final ReviewRepository reviewRepository;
     private final BookingRepository bookingRepository;
     private final SalonRepository salonRepository;
+    private final MasterRepository masterRepository;
     private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
@@ -102,22 +106,43 @@ public class ReviewService {
 
     private static final int MAX_PAGE_NUMBER = 10_000;
 
-    // String key with typed delimiters to support prefix-based eviction in ReviewEventListener.
-    // sync=true prevents cache stampede when 5-min TTL expires on a popular master page.
+    /**
+     * Sortable, paginated received-reviews list for a master's public profile ({@code GET
+     * /masters/{masterId}/reviews}). Two-query ID-then-hydrate pattern (avoids the HHH90003004
+     * in-memory pagination warning + N+1), with the caller-supplied {@link Pageable} sort
+     * stripped before it reaches the repository. The sort dimension is a closed
+     * {@link SalonReviewSort} enum (Phase 8.11) dispatched to one of four fixed repository
+     * methods — reused verbatim from the salon list rather than duplicated, since the four wire
+     * values are identical (§DRY).
+     *
+     * <p>Cached under {@code reviews-by-master} with {@code sync = true} to collapse the
+     * thundering herd when a popular master's page expires. The key includes {@code sort}
+     * (Phase 8.11 decision 3) so each sort dimension gets its own entry — omitting it would
+     * make all four sorts collide on one entry and silently serve the wrong order. Evicted by
+     * {@link com.beautica.review.event.ReviewEventListener#onReviewCreated} via a prefix scan on
+     * {@code "master:<masterId>:"}, which spans every sort key.
+     */
     @Cacheable(
             value = "reviews-by-master",
-            key = "'master:' + #masterId + ':page:' + #pageable.pageNumber + ':size:' + #pageable.pageSize",
+            key = "'master:' + #masterId + ':sort:' + #sort + ':page:' + #pageable.pageNumber + ':size:' + #pageable.pageSize",
             sync = true)
     @Transactional(readOnly = true)
-    public Page<ReviewResponse> getReviewsForMaster(UUID masterId, Pageable pageable) {
+    public Page<ReviewResponse> getReviewsForMaster(UUID masterId, SalonReviewSort sort, Pageable pageable) {
         if (pageable.getPageNumber() > MAX_PAGE_NUMBER) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "Page number must not exceed " + MAX_PAGE_NUMBER);
         }
-        // Strip caller-supplied sort: the JPQL query has ORDER BY r.createdAt DESC hardcoded.
+        SalonReviewSort effectiveSort = sort != null ? sort : SalonReviewSort.NEWEST;
+
+        // Strip caller-supplied sort: each JPQL query below hardcodes its own ORDER BY.
         // A caller-supplied sort field can trigger PropertyReferenceException, leaking entity property names.
         Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
-        Page<UUID> idPage = reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, unsortedPage);
+        Page<UUID> idPage = switch (effectiveSort) {
+            case NEWEST -> reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, unsortedPage);
+            case OLDEST -> reviewRepository.findIdsByMasterIdOrderByCreatedAtAsc(masterId, unsortedPage);
+            case HIGHEST -> reviewRepository.findIdsByMasterIdOrderByRatingDescCreatedAtDesc(masterId, unsortedPage);
+            case LOWEST -> reviewRepository.findIdsByMasterIdOrderByRatingAscCreatedAtDesc(masterId, unsortedPage);
+        };
         if (idPage.isEmpty()) {
             return Page.empty(pageable);
         }
@@ -162,6 +187,43 @@ public class ReviewService {
         Review review = reviewRepository.findByIdWithAssociations(reviewId)
                 .orElseThrow(() -> new NotFoundException("Review not found"));
         return ReviewResponse.from(review);
+    }
+
+    // ── Master reviews summary (Phase 8.10) ─────────────────────────────────────
+
+    /**
+     * Rating summary for a master's public profile ({@code GET
+     * /masters/{masterId}/reviews/summary}). Structural copy of {@link #getSalonReviewSummary},
+     * swapping {@code Salon}→{@code Master}: {@code avgRating}/{@code reviewCount} are read
+     * straight off the persisted {@code Master} row (no live aggregation), consistent with the
+     * "recalculate on write, read persisted on read" contract {@link
+     * com.beautica.review.event.ReviewEventListener} maintains for the master rating.
+     *
+     * <p>Not cached — parity with {@link #getSalonReviewSummary} (a single primary-key lookup
+     * plus one indexed GROUP BY, cheap enough that a dedicated cache would only add
+     * eviction-wiring surface). {@code Review.master} is non-null for every review, so master
+     * aggregation always applies.
+     */
+    @Transactional(readOnly = true)
+    public MasterReviewSummaryResponse getMasterReviewSummary(UUID masterId) {
+        Master master = masterRepository.findById(masterId)
+                .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
+
+        List<RatingCountProjection> rows = reviewRepository.countByMasterIdGroupByRating(masterId);
+        Map<Integer, Long> countsByRating = rows.stream()
+                .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount));
+
+        // Zero-fill every bucket from 5 down to 1 — a rating with zero reviews must still
+        // appear in the response, never be silently omitted.
+        List<RatingBucket> distribution = IntStream.rangeClosed(1, 5)
+                .boxed()
+                .sorted((a, b) -> b - a)
+                .map(rating -> new RatingBucket(rating, countsByRating.getOrDefault(rating, 0L)))
+                .toList();
+
+        BigDecimal avgRating = master.getReviewCount() == 0 ? null : master.getAvgRating();
+
+        return new MasterReviewSummaryResponse(avgRating, master.getReviewCount(), distribution);
     }
 
     // ── Salon reviews (Phase 13.6 — Public Salon Profile) ───────────────────────
