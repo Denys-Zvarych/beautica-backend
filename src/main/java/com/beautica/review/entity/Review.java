@@ -33,8 +33,13 @@ import java.util.UUID;
         indexes = {
                 @Index(name = "idx_reviews_master_created", columnList = "master_id, created_at DESC"),
                 @Index(name = "idx_reviews_client_created", columnList = "client_id, created_at DESC"),
+                // Phase 8.11 master rating sorts (V116) — plain indexes, mirror-able here because
+                // master_id is NOT NULL (no partial predicate).
+                @Index(name = "idx_reviews_master_rating_desc", columnList = "master_id, rating DESC, created_at DESC"),
+                @Index(name = "idx_reviews_master_rating_asc", columnList = "master_id, rating ASC, created_at DESC"),
                 // idx_reviews_salon_created and idx_reviews_independent_master are partial indexes
-                // (WHERE salon_id IS NOT NULL / IS NULL) — defined in V40/V41, not expressible in JPA @Index
+                // (WHERE salon_id IS NOT NULL / IS NULL) — defined in V40/V41, not expressible in JPA @Index.
+                // idx_reviews_salon_rating_desc/asc (V104) are likewise partial (WHERE salon_id IS NOT NULL).
         }
 )
 @Getter

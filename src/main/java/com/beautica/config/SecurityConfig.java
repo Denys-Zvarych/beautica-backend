@@ -103,6 +103,11 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll();
+                    // Phase 8.10 — master review summary. Needs its own matcher: the
+                    // "/masters/{masterId}/reviews" pattern below is an exact-segment-count
+                    // match (no trailing **), so it does NOT cover the extra "/summary" segment.
+                    // Mirrors the salon "/reviews/summary" precedent further down.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews/summary").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
                     // Phase 13.6 (Public Salon Profile). "/reviews/summary" is registered

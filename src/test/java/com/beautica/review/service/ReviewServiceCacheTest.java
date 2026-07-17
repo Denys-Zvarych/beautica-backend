@@ -4,6 +4,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.config.CacheConfig;
 import com.beautica.master.entity.Master;
+import com.beautica.master.repository.MasterRepository;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
@@ -49,6 +50,7 @@ class ReviewServiceCacheTest {
     @MockBean ReviewRepository reviewRepository;
     @MockBean BookingRepository bookingRepository;
     @MockBean SalonRepository salonRepository;
+    @MockBean MasterRepository masterRepository;
     @MockBean ApplicationEventPublisher eventPublisher;
 
     @Autowired ReviewService reviewService;
@@ -84,6 +86,8 @@ class ReviewServiceCacheTest {
         when(review.getId()).thenReturn(reviewId);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 5);
         when(review.getComment()).thenReturn("Excellent");
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -154,6 +158,8 @@ class ReviewServiceCacheTest {
         when(review.getId()).thenReturn(reviewId);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 4);
         when(review.getComment()).thenReturn("Good");
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -165,8 +171,8 @@ class ReviewServiceCacheTest {
                 .thenReturn(List.of(review));
 
         // Act — two calls with same masterId + page args
-        Page<ReviewResponse> first  = reviewService.getReviewsForMaster(masterId, pageable);
-        Page<ReviewResponse> second = reviewService.getReviewsForMaster(masterId, pageable);
+        Page<ReviewResponse> first  = reviewService.getReviewsForMaster(masterId, SalonReviewSort.NEWEST, pageable);
+        Page<ReviewResponse> second = reviewService.getReviewsForMaster(masterId, SalonReviewSort.NEWEST, pageable);
 
         // Assert — repository accessed only once; second result is from cache
         verify(reviewRepository, times(1)).findIdsByMasterIdOrderByCreatedAtDesc(masterId, PageRequest.of(0, 20));
@@ -174,15 +180,69 @@ class ReviewServiceCacheTest {
         assertThat(second.getContent().get(0).id()).isEqualTo(first.getContent().get(0).id());
     }
 
+    @Test
+    @DisplayName("should_cacheIndependently_when_getReviewsForMasterCalledWithDifferentSort")
+    void should_cacheIndependently_when_getReviewsForMasterCalledWithDifferentSort() {
+        UUID masterId = UUID.randomUUID();
+        UUID reviewId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn("Olha");
+        when(client.getLastName()).thenReturn("Bondar");
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+
+        Review review = buildReview(reviewId, client, master, (short) 4, "Good");
+        Page<UUID> idPage = new PageImpl<>(List.of(reviewId), pageable, 1);
+
+        when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, PageRequest.of(0, 20)))
+                .thenReturn(idPage);
+        when(reviewRepository.findIdsByMasterIdOrderByRatingDescCreatedAtDesc(masterId, PageRequest.of(0, 20)))
+                .thenReturn(idPage);
+        when(reviewRepository.findByIdsWithGraph(List.of(reviewId)))
+                .thenReturn(List.of(review));
+
+        // Act — same masterId/page, two DIFFERENT sort dimensions
+        reviewService.getReviewsForMaster(masterId, SalonReviewSort.NEWEST, pageable);
+        reviewService.getReviewsForMaster(masterId, SalonReviewSort.HIGHEST, pageable);
+
+        // Assert — each distinct sort dimension hits its own repository method exactly once
+        // (no cache-key collision between NEWEST and HIGHEST for the same master/page — sort is
+        // part of the reviews-by-master cache key, Phase 8.11 decision 3).
+        verify(reviewRepository, times(1))
+                .findIdsByMasterIdOrderByCreatedAtDesc(masterId, PageRequest.of(0, 20));
+        verify(reviewRepository, times(1))
+                .findIdsByMasterIdOrderByRatingDescCreatedAtDesc(masterId, PageRequest.of(0, 20));
+    }
+
     private Review buildReview(UUID id, User client, Master master, short rating, String comment) {
         Review r = mock(Review.class);
         when(r.getId()).thenReturn(id);
         when(r.getClient()).thenReturn(client);
         when(r.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(r.getBooking()).thenReturn(booking);
         when(r.getRating()).thenReturn(rating);
         when(r.getComment()).thenReturn(comment);
         when(r.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
         return r;
+    }
+
+    // review.booking is NOT NULL (unique FK) and Booking.masterService is NOT NULL, so
+    // ReviewResponse.from never null-checks the chain — every mock that reaches
+    // ReviewResponse.from must stub getBooking(), or the mock's default `null` return NPEs.
+    private static Booking mockBookingWithServiceName(String serviceName) {
+        ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
+        when(serviceDefinition.getName()).thenReturn(serviceName);
+
+        MasterServiceAssignment masterService = mock(MasterServiceAssignment.class);
+        when(masterService.getServiceDefinition()).thenReturn(serviceDefinition);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMasterService()).thenReturn(masterService);
+        return booking;
     }
 
     // ── reviews-by-salon cache (Finding 1 — perf follow-up) ─────────────────────

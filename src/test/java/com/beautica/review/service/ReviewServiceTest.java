@@ -11,12 +11,15 @@ import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewSort;
 import com.beautica.review.dto.SalonReviewSummaryResponse;
 import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -77,6 +80,21 @@ class ReviewServiceTest {
     private static final UUID MASTER_ID  = UUID.randomUUID();
     private static final UUID REVIEW_ID  = UUID.randomUUID();
 
+    // review.booking is NOT NULL (unique FK) and Booking.masterService is NOT NULL, so
+    // ReviewResponse.from never null-checks the chain — every mock that reaches
+    // ReviewResponse.from must stub getBooking(), or the mock's default `null` return NPEs.
+    private static Booking mockBookingWithServiceName(String serviceName) {
+        var serviceDefinition = mock(ServiceDefinition.class);
+        when(serviceDefinition.getName()).thenReturn(serviceName);
+
+        var masterService = mock(MasterServiceAssignment.class);
+        when(masterService.getServiceDefinition()).thenReturn(serviceDefinition);
+
+        var booking = mock(Booking.class);
+        when(booking.getMasterService()).thenReturn(masterService);
+        return booking;
+    }
+
     // ── createReview ─────────────────────────────────────────────────────────
 
     @Test
@@ -103,6 +121,8 @@ class ReviewServiceTest {
         when(saved.getId()).thenReturn(REVIEW_ID);
         when(saved.getClient()).thenReturn(savedClient);
         when(saved.getMaster()).thenReturn(master);
+        Booking savedBooking = mockBookingWithServiceName("Manicure");
+        when(saved.getBooking()).thenReturn(savedBooking);
         when(saved.getRating()).thenReturn((short) 5);
         when(saved.getComment()).thenReturn("Great service");
         when(saved.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -118,6 +138,7 @@ class ReviewServiceTest {
         assertThat(response).isNotNull();
         assertThat(response.id()).isEqualTo(REVIEW_ID);
         assertThat(response.masterId()).isEqualTo(MASTER_ID);
+        assertThat(response.serviceName()).isEqualTo("Manicure");
         assertThat(response.rating()).isEqualTo(5);
         assertThat(response.comment()).isEqualTo("Great service");
         assertThat(response.clientDisplayName()).isEqualTo("Anna K.");
@@ -154,6 +175,8 @@ class ReviewServiceTest {
         when(saved.getId()).thenReturn(REVIEW_ID);
         when(saved.getClient()).thenReturn(savedClient);
         when(saved.getMaster()).thenReturn(master);
+        Booking savedBooking = mockBookingWithServiceName("Manicure");
+        when(saved.getBooking()).thenReturn(savedBooking);
         when(saved.getRating()).thenReturn((short) 5);
         when(saved.getComment()).thenReturn("Great service");
         when(saved.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -320,6 +343,8 @@ class ReviewServiceTest {
         when(review.getId()).thenReturn(REVIEW_ID);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 4);
         when(review.getComment()).thenReturn(null);
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -333,11 +358,12 @@ class ReviewServiceTest {
         when(reviewRepository.findByIdsWithGraph(List.of(REVIEW_ID)))
                 .thenReturn(List.of(review));
 
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, SalonReviewSort.NEWEST, pageable);
 
         assertThat(result.getTotalElements()).isEqualTo(1);
         assertThat(result.getContent()).hasSize(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(MASTER_ID);
+        assertThat(result.getContent().get(0).serviceName()).isEqualTo("Manicure");
     }
 
     @Test
@@ -349,7 +375,7 @@ class ReviewServiceTest {
         when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), any(Pageable.class)))
                 .thenReturn(emptyIdPage);
 
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(MASTER_ID, SalonReviewSort.NEWEST, pageable);
 
         assertThat(result.getTotalElements()).isZero();
         assertThat(result.getContent()).isEmpty();
@@ -364,7 +390,7 @@ class ReviewServiceTest {
         when(reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(eq(nonExistentMasterId), any(Pageable.class)))
                 .thenReturn(Page.empty(pageable));
 
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(nonExistentMasterId, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(nonExistentMasterId, SalonReviewSort.NEWEST, pageable);
 
         assertThat(result.getTotalElements()).isZero();
         assertThat(result.getContent()).isEmpty();
@@ -383,7 +409,7 @@ class ReviewServiceTest {
                 .thenReturn(emptyIdPage);
 
         // Act
-        reviewService.getReviewsForMaster(MASTER_ID, callerPageable);
+        reviewService.getReviewsForMaster(MASTER_ID, SalonReviewSort.NEWEST, callerPageable);
 
         // Assert — repository received an unsorted Pageable
         verify(reviewRepository).findIdsByMasterIdOrderByCreatedAtDesc(eq(MASTER_ID), pageableCaptor.capture());
@@ -408,6 +434,8 @@ class ReviewServiceTest {
         when(review.getId()).thenReturn(REVIEW_ID);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 5);
         when(review.getComment()).thenReturn("Excellent");
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -419,6 +447,7 @@ class ReviewServiceTest {
         assertThat(response.id()).isEqualTo(REVIEW_ID);
         assertThat(response.masterId()).isEqualTo(MASTER_ID);
         assertThat(response.clientDisplayName()).isEqualTo("Ivan P.");
+        assertThat(response.serviceName()).isEqualTo("Manicure");
     }
 
     @Test
@@ -435,6 +464,8 @@ class ReviewServiceTest {
         when(review.getId()).thenReturn(REVIEW_ID);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 3);
         when(review.getComment()).thenReturn(null);
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -462,6 +493,8 @@ class ReviewServiceTest {
         when(review.getId()).thenReturn(REVIEW_ID);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 4);
         when(review.getComment()).thenReturn(null);
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -600,7 +633,7 @@ class ReviewServiceTest {
                 .thenReturn(Page.empty(pageable));
 
         // Act — must not throw NotFoundException; same shape as a master with zero reviews
-        Page<ReviewResponse> result = reviewService.getReviewsForMaster(unknownMasterId, pageable);
+        Page<ReviewResponse> result = reviewService.getReviewsForMaster(unknownMasterId, SalonReviewSort.NEWEST, pageable);
 
         // Assert — empty page returned; timing oracle is not present
         assertThat(result.isEmpty())
