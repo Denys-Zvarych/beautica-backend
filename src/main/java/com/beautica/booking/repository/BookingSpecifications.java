@@ -63,6 +63,19 @@ public final class BookingSpecifications {
     }
 
     /**
+     * Hard scope predicate: {@code b.client.id = :clientId} (Phase 26.7.1). ALWAYS required —
+     * never made optional or combined conditionally, mirroring {@link #masterIdEquals} exactly.
+     * Callers must supply the authenticated client's own user id — never an arbitrary UUID
+     * (Anti-Bug §E-4). This is what lets {@code findClientBookingDetails}'s three-sentinel
+     * {@code WHERE} (see that method's javadoc) be replaced by a sargable ID page: the ownership
+     * boundary now lives here, on the ID-page {@link Specification}, instead of inline in the
+     * JPQL projection string.
+     */
+    public static Specification<Booking> clientIdEquals(UUID clientId) {
+        return (root, query, cb) -> cb.equal(root.get("client").get("id"), clientId);
+    }
+
+    /**
      * Hard scope predicate: {@code JOIN b.master m JOIN m.salon s WHERE s.id IN :salonIds}.
      * ALWAYS required. Mirrors the pre-fix JPQL join shape exactly. Callers must supply a
      * pre-resolved, non-empty list of the authenticated owner's OWN active salon ids (via

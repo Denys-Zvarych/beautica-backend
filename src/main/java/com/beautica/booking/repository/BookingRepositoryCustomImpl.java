@@ -74,6 +74,20 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         return findIdPage(spec, pageable);
     }
 
+    @Override
+    public Page<UUID> findIdsByClientIdFiltered(
+            UUID clientId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.clientIdEquals(clientId));
+        if (statuses != null && !statuses.isEmpty()) {
+            spec = spec.and(BookingSpecifications.statusIn(statuses));
+        }
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
     /**
      * Composes the optional Phase 26.2 date-range predicates onto {@code spec} — each bound
      * applied only when non-null, exactly like the {@code statuses} predicate above, so a caller

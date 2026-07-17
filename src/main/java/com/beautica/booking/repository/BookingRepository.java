@@ -73,10 +73,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     // see BookingRepositoryCustomImpl.findIdPage — because Sort.getProperty() is a validated,
     // whitelisted value by the time it reaches this layer (BookingService#normalizeBookingSort).
     //
-    // findClientBookingDetails below still uses the sentinel idiom — Finding 2 (MEDIUM) — left
-    // as-is deliberately; see that method's javadoc for why a Specification rewrite was judged
-    // impractical there. Its own hardcoded ORDER BY b.startsAt DESC WAS removed by Phase 26.3
-    // (a distinct defect from the sentinel one) — see that method's javadoc.
+    // hydrateClientBookingDetails (formerly findClientBookingDetails) carried the same sentinel
+    // idiom — Finding 2 (MEDIUM) — on THREE predicates (statuses, from/toExclusive, serviceIds),
+    // deliberately left as-is through Phase 26.4 because a straight Specification/Criteria
+    // rewrite would have had to re-express the query's five PII salon-precedence CASE WHEN
+    // expressions in a second language. Phase 26.7.1 closed this gap via a hybrid: filtering
+    // moved to BookingRepositoryCustom#findIdsByClientIdFiltered (a Specification ID page, same
+    // sargable shape as findIdsByMasterIdFiltered), and the JPQL projection above was reduced to
+    // a pure WHERE b.id IN :ids hydrate — the SELECT/CASE block itself was never touched. See
+    // that method's javadoc for the full history.
 
     @Query(value = """
             SELECT b.id FROM Booking b
@@ -256,14 +261,14 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<Booking> findAllByIdsWithGraph(@Param("ids") List<UUID> ids);
 
-    // ── Client booking-detail projection (Phase 19.3) ─────────────────────────
+    // ── Client booking-detail projection (Phase 19.3; sentinel removed Phase 26.7.1) ──
     /**
-     * One-query, N+1-free projection for {@code GET /bookings/me}: every field
-     * {@link com.beautica.booking.dto.BookingDetailResponse} needs for a client row,
-     * plus a {@code reviewExists} flag via {@code LEFT JOIN Review}.
-     * {@code mu.professionalTitle} rides the same {@code JOIN m.user mu} already used for
-     * {@code mu.firstName}/{@code mu.lastName} — no additional join, and the column is
-     * nullable (a master may never have set a title).
+     * Hydrates a bounded set of booking ids into the enriched
+     * {@link com.beautica.booking.dto.BookingDetailResponse} projection for {@code GET
+     * /bookings/me} (CLIENT role): every field that DTO needs for a client row, plus a
+     * {@code reviewExists} flag via {@code LEFT JOIN Review}. {@code mu.professionalTitle} rides
+     * the same {@code JOIN m.user mu} already used for {@code mu.firstName}/{@code mu.lastName}
+     * — no additional join, and the column is nullable (a master may never have set a title).
      *
      * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
      * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
@@ -275,28 +280,32 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * data (e.g. their home door code) onto a salon booking. Riding the same
      * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
      *
-     * <p>{@code statuses} is optional: when {@code null} the
-     * {@code (:statuses IS NULL OR b.status IN :statuses)} idiom matches all rows
-     * (one method covers both the filtered and unfiltered list paths). Phase 26.1 widened
-     * this from a scalar {@code statusFilter} equality to a {@code Collection} {@code IN}
-     * check so {@code GET /bookings/me} can accept repeated {@code status} values.
-     *
-     * <p><b>Phase 26.1 audit fix, Finding 2 (MEDIUM, backend-perf) — sentinel intentionally kept
-     * here.</b> The provider-path sibling queries ({@code findIdsByMasterIdFiltered} /
-     * {@code findIdsBySalonIdsFiltered}) were rewritten onto a dynamic {@code Specification}
-     * (see {@link BookingSpecifications}) to remove this exact {@code (:x IS NULL OR …)} plan-cache
-     * hazard. This query was evaluated for the same treatment and DEFERRED, not overlooked:
-     * it is a single {@code SELECT new ClientBookingDetailProjection(…)} constructor expression
-     * over 26 fields, including a {@code LEFT JOIN Review r ON r.booking = b} and five
-     * {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END} salon-precedence expressions (see
-     * above — the COALESCE-vs-CASE-WHEN distinction here guards a real PII leak). Reproducing that
-     * shape correctly via the JPA Criteria API (a 26-argument {@code CriteriaBuilder.construct}
-     * call, a criteria {@code ON}-join for the review, and five criteria {@code selectCase()}
-     * expressions) is a high-risk rewrite of a query with a locked, security-sensitive precedence
-     * rule, for a MEDIUM finding — the risk of silently reintroducing the salon/master PII leak
-     * this javadoc warns about outweighs the plan-cache benefit. Left as-is; revisit only
-     * alongside a dedicated test pass for this specific query, not as a drive-by extension of the
-     * Finding 1 fix.
+     * <p><b>Phase 26.7.1 — the sentinel is gone; this is now a pure {@code IN :ids} hydrate.</b>
+     * Prior to this phase the {@code WHERE} clause carried {@code b.client.id = :clientId} plus
+     * three {@code (:x IS NULL OR …)} sentinel predicates (statuses, {@code CAST}-guarded
+     * {@code from}/{@code toExclusive}, and {@code serviceIds}) — the same non-sargable idiom
+     * Phase 26.1 removed from the provider paths (Finding 2, MEDIUM, backend-perf), left
+     * deliberately unconverted here because a straight Criteria rewrite would have had to
+     * re-express the five PII {@code CASE WHEN} salon-precedence expressions below in a second
+     * language (Option A in the phase doc), risking a silent leak of a salon-employed master's
+     * home address onto a salon booking. Phase 26.7.1's hybrid (Option C) resolves this without
+     * that risk: the filtering — the mandatory {@code b.client.id = :clientId} scope plus the
+     * optional status/date-range/serviceId predicates — moved to a dynamic
+     * {@link org.springframework.data.jpa.domain.Specification} ID page,
+     * {@code BookingRepositoryCustom#findIdsByClientIdFiltered} (see
+     * {@link BookingSpecifications#clientIdEquals}), built with the exact same sargable,
+     * no-dead-branch technique as {@code findIdsByMasterIdFiltered}. THIS method now does only
+     * the hydrate half: given a bounded page of ids from that ID-page query, it re-emits the
+     * verbatim {@code SELECT new ClientBookingDetailProjection(…)} projection — including all
+     * five {@code CASE WHEN} expressions, copied character-for-character, never re-expressed —
+     * against a single {@code WHERE b.id IN :ids}. No sentinel, no {@code CAST}, no {@code
+     * :clientId}/{@code :statuses}/{@code :from}/{@code :toExclusive}/{@code :serviceIds}
+     * parameters remain on this query; ownership and filtering are enforced entirely upstream, on
+     * the ID page. {@code BookingService#listClientBookings} composes the two calls and
+     * re-imposes the ID page's order onto these hydrated rows (an {@code IN} clause does not
+     * guarantee row order), mirroring the provider path's
+     * {@code findIdsByMasterIdFiltered}/{@code findIdsBySalonIdsFiltered} +
+     * {@code findAllByIdsWithGraph} two-query pattern exactly.
      *
      * <p><b>Discovery locality is district-primary via the salon link</b> — the salon's
      * city/district/address wins when the master is salon-employed, else the master's own
@@ -305,67 +314,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * returns the FK ids only; {@code BookingService} resolves the {@code name_uk} labels
      * through the {@code DiscoveryLocationResolver} M2 seam (§E: batched, not per row).
      *
-     * <p>Pagination is safe to apply directly here: the query projects scalar columns (no
-     * JOIN FETCH on a collection), so Hibernate emits a correct SQL {@code LIMIT/OFFSET}
-     * and the HHH90003004 in-memory-pagination trap does not apply.
+     * <p>{@code ids} is always the bounded (page-size, default 20) result of
+     * {@code findIdsByClientIdFiltered} — never an unbounded, caller-supplied collection. This is
+     * the same bounded-{@code IN} contract {@link #findAllByIdsWithGraph} already documents for
+     * the provider path.
      *
-     * <p><b>Phase 26.3 — ordering is {@code Pageable}-driven, not hardcoded.</b> This query
-     * used to carry a literal {@code ORDER BY b.startsAt DESC}, which Spring Data
-     * <i>appends to</i> rather than replaces when the caller's {@code Pageable} also carries a
-     * {@link org.springframework.data.domain.Sort} — so {@code ?sort=priceAtBooking,desc}
-     * silently became {@code ORDER BY b.starts_at DESC, b.price_at_booking DESC}, a no-op tie
-     * clause (a master cannot hold two overlapping bookings, so {@code startsAt} is effectively
-     * unique). The hardcoded clause is removed; {@code b.startsAt} — a valid property path off
-     * the primary alias {@code b} — is what Spring appends from {@code pageable.getSort()}
-     * instead. The {@link Sort} arriving here is ALWAYS pre-validated and pre-normalized by
-     * {@code BookingService#normalizeBookingSort} before this method is called: whitelisted to
-     * {@code startsAt}/{@code priceAtBooking}/{@code createdAt} (rejecting dot-paths such as
-     * {@code master.user.passwordHash} with a 400 — this predicate area joins through
-     * {@code m}/{@code mu}, so an unvalidated {@code Sort} would be a live credential-ordering
-     * oracle), defaulted to {@code startsAt DESC} when unsorted, and always carrying a trailing
-     * {@code b.id ASC} tiebreaker for deterministic {@code OFFSET} pagination under ties. Do not
-     * call this method with a raw, unvalidated {@code Pageable}.
-     *
-     * <p>Scope: callers MUST pass the authenticated client's own user id — the predicate
-     * {@code b.client.id = :clientId} is the ownership boundary (Anti-Bug §E-4).
-     *
-     * <p><b>Phase 26.2 — optional date range.</b> {@code from}/{@code toExclusive} extend this
-     * method's existing {@code (:x IS NULL OR ...)} sentinel idiom (left as-is here per Finding 2
-     * above — this method was NOT converted to a {@link org.springframework.data.jpa.domain.Specification}).
-     * Both are already-resolved {@code Europe/Kyiv} instants computed once in
-     * {@code BookingService#getMyBookings} — {@code toExclusive} is the HALF-OPEN upper bound
-     * ({@code to.plusDays(1)} at Kyiv midnight), never an {@code <=} on {@code to} itself, so a
-     * {@code to}-day booking after 00:00 Kyiv is not silently dropped.
-     *
-     * <p><b>The two date predicates {@code CAST} the parameter before the null-check</b> —
-     * {@code (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)} — unlike
-     * the untyped {@code (:statuses IS NULL OR ...)} predicate above. This is not stylistic. A
-     * bare {@code :from IS NULL} (tried first, and separately a reordered
-     * {@code b.startsAt >= :from OR :from IS NULL} — {@code OR} is commutative so reordering
-     * changes nothing) both raised {@code ERROR: could not determine data type of parameter $N}
-     * on EVERY execution — a hard 500, not merely the GENERIC-plan slowdown Finding 1 describes.
-     * PostgreSQL's extended-query-protocol parser cannot resolve a parameter's OID from a lone
-     * {@code IS NULL} usage when nothing else in the query pins its type; {@code :statuses IS
-     * NULL} is unaffected only because Hibernate's collection/{@code IN}-clause binding machinery
-     * always assigns the array element type explicitly (needed to build {@code = ANY(?)}), a
-     * guarantee scalar temporal parameters don't get for free. The {@code CAST} gives Postgres an
-     * explicit {@code timestamp(6) with time zone} OID for the SAME parameter used later in the
-     * real {@code >=}/{@code <} comparison — verified against the {@code timestamptz} column, so
-     * this does not shift the compared instant (unlike casting to timezone-less {@code timestamp},
-     * which would silently reintroduce a server-default-zone bug). Do not revert to a bare
-     * {@code :from IS NULL} — {@code ClientBookingDetailProjectionTest} pins this against a real
-     * Postgres instance (Testcontainers), not a mock, specifically to catch a regression here.
-     *
-     * <p><b>Phase 26.4 — optional service filter, {@code :serviceIds} gets NO {@code CAST}.</b>
-     * {@code (:serviceIds IS NULL OR b.masterService.id IN :serviceIds)} mirrors the untyped
-     * {@code :statuses} predicate above, not the {@code CAST}-guarded date predicates — because
-     * {@code serviceIds} is a {@code Collection<UUID>}, bound the same way {@code statuses} is:
-     * Hibernate's collection/{@code IN}-clause binding always assigns the array element type
-     * explicitly (needed to build {@code = ANY(?)}), so Postgres never has to infer an OID from a
-     * lone {@code IS NULL} the way it does for the scalar {@code :from}/{@code :toExclusive}
-     * parameters. {@code ClientBookingDetailProjectionTest} exercises the non-null branch against
-     * a real Postgres instance (Testcontainers) to confirm this — do not add a {@code CAST} here
-     * pre-emptively; it is unneeded for a collection parameter and would be dead defensive code.
+     * <p><b>Ordering is derived upstream, on the ID page — this query carries no {@code ORDER
+     * BY}.</b> As of Phase 26.7.1 the {@link Sort} that used to reach this method (pre-validated
+     * and pre-normalized by {@code BookingService#normalizeBookingSort}: whitelisted to
+     * {@code startsAt}/{@code priceAtBooking}/{@code createdAt}, defaulted to {@code startsAt
+     * DESC} when unsorted, always carrying a trailing {@code id ASC} tiebreaker) is instead
+     * translated into Criteria {@code Order}s by
+     * {@code BookingRepositoryCustomImpl.findIdPage} — the same choke point the provider
+     * ID-page queries already use. This unifies both roles' sort discipline onto one code path;
+     * see {@code findIdsByClientIdFiltered}'s javadoc for the full contract.
      */
     @Query(value = """
             SELECT new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -407,27 +369,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
             LEFT JOIN Review r ON r.booking = b
-            WHERE b.client.id = :clientId
-              AND (:statuses IS NULL OR b.status IN :statuses)
-              AND (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)
-              AND (CAST(:toExclusive AS java.time.OffsetDateTime) IS NULL OR b.startsAt < :toExclusive)
-              AND (:serviceIds IS NULL OR b.masterService.id IN :serviceIds)
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.client.id = :clientId
-              AND (:statuses IS NULL OR b.status IN :statuses)
-              AND (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)
-              AND (CAST(:toExclusive AS java.time.OffsetDateTime) IS NULL OR b.startsAt < :toExclusive)
-              AND (:serviceIds IS NULL OR b.masterService.id IN :serviceIds)
+            WHERE b.id IN :ids
             """)
-    Page<ClientBookingDetailProjection> findClientBookingDetails(
-            @Param("clientId") UUID clientId,
-            @Param("statuses") Collection<BookingStatus> statuses,
-            @Param("from") OffsetDateTime from,
-            @Param("toExclusive") OffsetDateTime toExclusive,
-            @Param("serviceIds") Collection<UUID> serviceIds,
-            Pageable pageable);
+    List<ClientBookingDetailProjection> hydrateClientBookingDetails(@Param("ids") Collection<UUID> ids);
 
     // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────
 

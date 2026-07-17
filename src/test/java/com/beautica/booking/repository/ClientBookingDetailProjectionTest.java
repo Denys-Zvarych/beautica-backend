@@ -25,18 +25,30 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * {@code @DataJpaTest} for {@link BookingRepository#findClientBookingDetails} — the
- * single-query projection backing {@code GET /bookings/me} for CLIENT (Phase 19.3).
+ * {@code @DataJpaTest} for the CLIENT projection backing {@code GET /bookings/me} (Phase 19.3):
+ * {@link BookingRepository#findIdsByClientIdFiltered} (the sargable, sentinel-free ID page) +
+ * {@link BookingRepository#hydrateClientBookingDetails} (the PII-sensitive {@code IN :ids}
+ * projection hydrate) — composed by the {@link #findClientBookingDetails} helper below exactly
+ * as {@code BookingService#listClientBookings} composes them in production (Phase 26.7.1 split
+ * what used to be a single {@code findClientBookingDetails} query into these two).
  *
  * <p>Pins three acceptance criteria from phase-156:
  * <ol>
@@ -89,6 +101,42 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         statistics = sessionFactory.getStatistics();
         statistics.setStatisticsEnabled(true);
         statistics.clear();
+    }
+
+    // ── Phase 26.7.1 test-local composition of the two-query pattern ─────────────
+    /**
+     * {@code findClientBookingDetails} was split by Phase 26.7.1 into a sargable, sentinel-free
+     * {@code BookingRepository#findIdsByClientIdFiltered} ID page (built dynamically via
+     * {@link com.beautica.booking.repository.BookingSpecifications#clientIdEquals}) and a
+     * verbatim {@code WHERE b.id IN :ids} projection hydrate,
+     * {@code BookingRepository#hydrateClientBookingDetails} — the PII-sensitive
+     * {@code SELECT new ClientBookingDetailProjection(…)} block, including all five salon-
+     * precedence {@code CASE WHEN} expressions, moved character-for-character. This helper
+     * composes the two exactly like {@code BookingService#listClientBookings} (id page → hydrate
+     * → re-impose the id page's order onto the {@code IN}-hydrated rows, since {@code IN} does not
+     * guarantee row order), so every existing assertion below — including the PII/precedence ones
+     * — keeps exercising the identical end-to-end behaviour production code takes, without
+     * duplicating the re-order logic in every test method.
+     */
+    private Page<ClientBookingDetailProjection> findClientBookingDetails(
+            UUID clientId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Page<UUID> idPage = bookingRepository.findIdsByClientIdFiltered(
+                clientId, statuses, from, toExclusive, serviceIds, pageable);
+        if (idPage.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
+        }
+
+        List<ClientBookingDetailProjection> hydrated =
+                bookingRepository.hydrateClientBookingDetails(idPage.getContent());
+        Map<UUID, ClientBookingDetailProjection> byId = hydrated.stream()
+                .collect(Collectors.toMap(ClientBookingDetailProjection::id, Function.identity()));
+        List<ClientBookingDetailProjection> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
+                .toList();
+        return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 
     // ── fixtures ────────────────────────────────────────────────────────────────
@@ -266,7 +314,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
@@ -333,7 +381,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
@@ -359,7 +407,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent().get(0).masterProfessionalTitle())
@@ -409,7 +457,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
@@ -480,7 +528,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
@@ -540,7 +588,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
         em.clear();
 
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
         ClientBookingDetailProjection projection = page.getContent().get(0);
 
@@ -578,17 +626,23 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         // Two bookings, two rows — the OneToOne LEFT JOIN Review must not duplicate the reviewed row.
         assertThat(page.getTotalElements())
                 .as("OneToOne LEFT JOIN Review must not fan out the reviewed booking into extra rows")
                 .isEqualTo(2);
-        // Ordered by startsAt DESC: notReviewed (Jun 4) first, reviewed (Jun 3) second.
+        // Order-independent by design (Phase 26.7.1): PageRequest.of(0, 20) carries no Sort, and
+        // neither findIdsByClientIdFiltered (unsorted -> DB-plan-dependent id-page order) nor the
+        // WHERE b.id IN :ids hydrate (IN never guarantees row order) promise a particular
+        // sequence here — production ordering comes from BookingService#normalizeBookingSort
+        // injecting a Sort into the Pageable before either query runs, which this repo-direct
+        // test deliberately does not do. This test is about row COUNT/dedup + the reviewExists
+        // flag per booking, not order, so it asserts the set, not a position.
         assertThat(page.getContent())
                 .extracting(ClientBookingDetailProjection::id, ClientBookingDetailProjection::reviewExists)
-                .containsExactly(
+                .containsExactlyInAnyOrder(
                         org.assertj.core.groups.Tuple.tuple(notReviewed.getId(), false),
                         org.assertj.core.groups.Tuple.tuple(reviewed.getId(), true));
     }
@@ -609,9 +663,9 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> filtered = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> filtered = findClientBookingDetails(
                 clientUser.getId(), java.util.Set.of(BookingStatus.CONFIRMED), null, null, null, PageRequest.of(0, 20));
-        Page<ClientBookingDetailProjection> all = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> all = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(filtered.getContent())
@@ -637,7 +691,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> union = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> union = findClientBookingDetails(
                 clientUser.getId(),
                 java.util.EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED),
                 null, null, null, PageRequest.of(0, 20));
@@ -676,9 +730,9 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> filtered = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> filtered = findClientBookingDetails(
                 clientUser.getId(), null, null, null, java.util.Set.of(manicure.getId()), PageRequest.of(0, 20));
-        Page<ClientBookingDetailProjection> unfiltered = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> unfiltered = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(filtered.getContent())
@@ -710,7 +764,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> union = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> union = findClientBookingDetails(
                 clientUser.getId(), null, null, null,
                 new java.util.LinkedHashSet<>(java.util.List.of(manicure.getId(), pedicure.getId())),
                 PageRequest.of(0, 20));
@@ -740,7 +794,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<ClientBookingDetailProjection> unfiltered = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> unfiltered = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(unfiltered.getContent())
@@ -751,7 +805,9 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
     // ── bounded query count (no N+1) ─────────────────────────────────────────────
 
     @Test
-    @DisplayName("query count is bounded and independent of the number of booking rows — no N+1 for the enriched projection")
+    @DisplayName("query count is bounded (id page + count + hydrate, <= 3) and independent of the "
+            + "number of booking rows AND of the number of filters supplied — no N+1, no "
+            + "sentinel-driven fan-out (Phase 26.7.1)")
     void should_executeBoundedQueryCount_when_pageHasManyRows() {
         User masterUser = persistMasterUser(null, null, "Antonovycha", "12", "https://cdn.test/a.png");
         Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
@@ -770,7 +826,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         statistics.clear();
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
         long fiveRowQueries = statistics.getPrepareStatementCount();
 
@@ -780,22 +836,51 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                 .containsExactlyInAnyOrder(true, true, true, false, false);
 
         // Re-run against a freshly cleared persistence context to confirm the statement
-        // count is the SAME (page + count query), independent of row count — the defining
-        // property of an N+1-free query. The two unfiltered list queries (content + count)
-        // dominate; if a per-row review/label/master lookup leaked in, this count would
-        // scale with the five rows.
+        // count is the SAME (id page + count + hydrate), independent of row count — the defining
+        // property of an N+1-free query. Phase 26.7.1 raised this bound from <=2 to <=3: the
+        // single findClientBookingDetails projection+count pair became three statements
+        // (findIdsByClientIdFiltered's id query + its count query + hydrateClientBookingDetails'
+        // IN :ids hydrate) — an expected, bounded, filter-count-INDEPENDENT change (the phase doc
+        // calls this out explicitly), not an N+1 regression: it does not scale with row count
+        // (still 5 rows here), and does not scale with how many of statuses/from/toExclusive/
+        // serviceIds were supplied (this call supplies none of them).
         em.clear();
         statistics.clear();
-        Page<ClientBookingDetailProjection> rerun = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> rerun = findClientBookingDetails(
                 clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
         long rerunQueries = statistics.getPrepareStatementCount();
 
         assertThat(rerun.getContent()).hasSize(5);
         assertThat(fiveRowQueries)
-                .as("enriched projection runs a bounded number of statements (content + count), "
-                        + "not one-per-row; got %s", fiveRowQueries)
+                .as("enriched projection runs a bounded number of statements (id page + count + "
+                        + "hydrate), not one-per-row; got %s", fiveRowQueries)
                 .isEqualTo(rerunQueries)
-                .isLessThanOrEqualTo(2);
+                .isLessThanOrEqualTo(3);
+
+        // Same bound with EVERY optional predicate supplied at once (status + date range +
+        // serviceId) — proves the statement count is independent of the NUMBER OF FILTERS, not
+        // just of row count. This is what would catch a sentinel-driven fan-out regression: the
+        // (:x IS NULL OR ...) idiom this phase removes doesn't change statement COUNT either, so
+        // this assertion is really pinning "still exactly the id+count+hydrate shape", not
+        // re-testing sargability (that's Phase 26.7.2's EXPLAIN gate).
+        em.clear();
+        statistics.clear();
+        Page<ClientBookingDetailProjection> filteredRerun = findClientBookingDetails(
+                clientUser.getId(),
+                java.util.Set.of(BookingStatus.COMPLETED),
+                OffsetDateTime.of(2026, 7, 1, 0, 0, 0, 0, ZoneOffset.UTC),
+                OffsetDateTime.of(2026, 7, 6, 0, 0, 0, 0, ZoneOffset.UTC),
+                java.util.Set.of(msa.getId()),
+                PageRequest.of(0, 20));
+        long filteredQueries = statistics.getPrepareStatementCount();
+
+        assertThat(filteredRerun.getContent()).hasSize(5);
+        assertThat(filteredQueries)
+                .as("supplying all four optional filters at once must NOT add statements beyond "
+                        + "the id page + count + hydrate shape — got %s vs. the no-filter %s",
+                        filteredQueries, fiveRowQueries)
+                .isEqualTo(fiveRowQueries)
+                .isLessThanOrEqualTo(3);
     }
 
     // ── ownership boundary ───────────────────────────────────────────────────────
@@ -813,7 +898,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         UUID otherClientId = UUID.randomUUID();
-        Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
                 otherClientId, null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).isEmpty();

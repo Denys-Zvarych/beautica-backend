@@ -230,9 +230,13 @@ public class BookingService {
      * {@code GET /bookings/me} switched from the lean {@code BookingResponse} per locked
      * Option A). {@code canReview} is true only for a {@code COMPLETED} booking with no review.
      *
-     * <p><b>CLIENT</b> uses the single-query {@code findClientBookingDetails} projection —
-     * {@code reviewExists} arrives inline via a {@code LEFT JOIN Review}, and the locality FK
-     * ids are batch-resolved to labels in a fixed two queries through the M2 seam (no N+1).
+     * <p><b>CLIENT</b> (Phase 26.7.1) now shares the same two-query ID-page + hydrate shape as
+     * the provider roles below: {@code findIdsByClientIdFiltered} (sargable, sentinel-free
+     * {@code Specification} ID page) then {@code hydrateClientBookingDetails} ({@code IN :ids}
+     * projection hydrate, {@code reviewExists} inline via a {@code LEFT JOIN Review}), with order
+     * re-imposed onto the hydrate in {@code listClientBookings} — see that method's javadoc. The
+     * locality FK ids are batch-resolved to labels in a fixed two queries through the M2 seam
+     * (no N+1), same as before this phase.
      *
      * <p><b>Provider roles</b> (master / salon-owner) reuse the established two-query ID-page +
      * graph-hydrate pattern (Fix H1), then add exactly two bounded follow-ups for the page:
@@ -424,7 +428,7 @@ public class BookingService {
      * (Phase 26.3). Every property here is a scalar column directly on {@code Booking} — no
      * association traversal.
      *
-     * <p><b>This is a security boundary, not a nicety.</b> Both {@code findClientBookingDetails}
+     * <p><b>This is a security boundary, not a nicety.</b> Both {@code findIdsByClientIdFiltered}
      * and the provider ID-page queries join through {@code b.master m JOIN m.user}, so any
      * unvalidated dot-path off those aliases is legal JPQL/Criteria — e.g.
      * {@code ?sort=master.user.passwordHash,asc} would order an authenticated caller's own
@@ -530,23 +534,44 @@ public class BookingService {
     }
 
     /**
-     * CLIENT path — one projection query (reviewExists inline) + batched label resolution.
+     * CLIENT path (Phase 26.7.1 — two-query ID-page + verbatim-projection hydrate, mirroring
+     * {@link #listProviderBookings}'s established pattern). {@code findIdsByClientIdFiltered}
+     * runs the sargable, sentinel-free {@link org.springframework.data.jpa.domain.Specification}
+     * ID page (ownership + status/date-range/serviceId filters, sort translated from
+     * {@code pageable.getSort()}); {@code hydrateClientBookingDetails} then re-emits the
+     * PII-sensitive {@code ClientBookingDetailProjection} — CASE-precedence expressions untouched
+     * — for exactly that bounded id set via {@code WHERE b.id IN :ids}.
+     *
+     * <p><b>Order is re-imposed in Java</b> — the {@code IN} hydrate does not preserve the ID
+     * page's order — by mapping the hydrated rows into a {@code Map<UUID, …>} and re-walking
+     * {@code idPage.getContent()}, the identical pattern {@link #listProviderBookings} already
+     * uses for {@code findAllByIdsWithGraph}. An empty ID page short-circuits before the hydrate
+     * ever runs, so this method never emits {@code IN ()} (an invalid, dialect-breaking clause).
      */
     private Page<BookingDetailResponse> listClientBookings(
             UUID clientId, Set<BookingStatus> statuses,
             OffsetDateTime from, OffsetDateTime toExclusive,
             Set<UUID> serviceIds, Pageable pageable) {
-        Page<ClientBookingDetailProjection> page =
-                bookingRepository.findClientBookingDetails(clientId, statuses, from, toExclusive, serviceIds, pageable);
-        if (page.isEmpty()) {
-            return new PageImpl<>(List.of(), pageable, page.getTotalElements());
+        Page<UUID> idPage = bookingRepository.findIdsByClientIdFiltered(
+                clientId, statuses, from, toExclusive, serviceIds, pageable);
+        if (idPage.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
         }
 
-        DiscoveryLabels labels = resolveProjectionLabels(page.getContent());
-        List<BookingDetailResponse> content = page.getContent().stream()
+        List<ClientBookingDetailProjection> hydrated =
+                bookingRepository.hydrateClientBookingDetails(idPage.getContent());
+        DiscoveryLabels labels = resolveProjectionLabels(hydrated);
+
+        // Restore the ID page's ordering — IN :ids does not guarantee row order from the
+        // database (mirrors listProviderBookings' Map<UUID, Booking> re-order below).
+        Map<UUID, ClientBookingDetailProjection> byId = hydrated.stream()
+                .collect(Collectors.toMap(ClientBookingDetailProjection::id, Function.identity()));
+        List<BookingDetailResponse> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
                 .map(p -> toDetailResponse(p, labels))
                 .toList();
-        return new PageImpl<>(content, pageable, page.getTotalElements());
+        return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 
     /**

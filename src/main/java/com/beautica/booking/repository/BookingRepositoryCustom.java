@@ -59,4 +59,31 @@ public interface BookingRepositoryCustom {
             List<UUID> salonIds, Collection<BookingStatus> statuses,
             OffsetDateTime from, OffsetDateTime toExclusive,
             Collection<UUID> serviceIds, Pageable pageable);
+
+    /**
+     * Client-side counterpart to {@link #findIdsByMasterIdFiltered} (Phase 26.7.1 — closes the
+     * client half of the sentinel work this class opened for the provider paths in Phase 26.1).
+     * Callers must supply the authenticated user's own id as {@code clientId} — never an
+     * arbitrary UUID (Anti-Bug §E-4; enforced by {@link BookingSpecifications#clientIdEquals}).
+     * Same optional-predicate contract as {@link #findIdsByMasterIdFiltered}:
+     * {@code statuses}/{@code serviceIds} of {@code null} or empty, and {@code from}/
+     * {@code toExclusive} of {@code null}, all mean "no predicate" — omitted entirely from the
+     * emitted SQL rather than bound as a runtime-null sentinel.
+     *
+     * <p>Backs {@code BookingService#listClientBookings}: this method returns the sargable,
+     * sentinel-free ID page + count; the caller then hydrates via
+     * {@code BookingRepository#hydrateClientBookingDetails(Collection)} — the
+     * {@code SELECT new ClientBookingDetailProjection(...)} JPQL, unchanged, including its five
+     * PII salon-precedence {@code CASE WHEN} expressions — and re-imposes this page's order onto
+     * the hydrated rows, exactly mirroring the provider path's
+     * {@code findIdsByMasterIdFiltered} + {@code findAllByIdsWithGraph} two-query pattern.
+     *
+     * <p>Same Phase 26.3 pre-validated-{@code Sort} contract as {@link #findIdsByMasterIdFiltered}
+     * — the {@code Pageable} passed here MUST already be normalized by
+     * {@code BookingService#normalizeBookingSort} before this method is invoked.
+     */
+    Page<UUID> findIdsByClientIdFiltered(
+            UUID clientId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
 }

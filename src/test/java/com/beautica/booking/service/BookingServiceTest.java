@@ -1668,13 +1668,15 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithoutStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findClientBookingDetails(clientId, null, null, null, null, normalizedUnpaged())).thenReturn(Page.empty());
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged())).thenReturn(Page.empty());
 
         var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(clientId, null, null, null, null, normalizedUnpaged());
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged());
         verify(bookingRepository, never()).findIdsByClientId(any(), any());
+        // Empty ID page short-circuits before the hydrate ever runs (never emit IN ()).
+        verify(bookingRepository, never()).hydrateClientBookingDetails(any());
     }
 
     @Test
@@ -1682,14 +1684,14 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findClientBookingDetails(clientId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
         var result = bookingService.getMyBookings(
                 clientId, buildAuth(Role.CLIENT), List.of(BookingStatus.CONFIRMED), null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(clientId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
     }
 
     @Test
@@ -1699,7 +1701,7 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
         Set<BookingStatus> expected = EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED);
 
-        when(bookingRepository.findClientBookingDetails(clientId, expected, null, null, null, normalizedUnpaged()))
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, expected, null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
         var result = bookingService.getMyBookings(
@@ -1707,7 +1709,7 @@ class BookingServiceTest {
                 List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED), null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(clientId, expected, null, null, null, normalizedUnpaged());
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, expected, null, null, null, normalizedUnpaged());
     }
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRow(
@@ -1733,8 +1735,10 @@ class BookingServiceTest {
     void should_surfaceTitleAndLocationNote_when_clientProjectionRowHasBoth() {
         Pageable pageable = Pageable.unpaged();
         var row = clientProjectionRow("Перукар-стиліст", "3-й поверх, код 1234");
-        when(bookingRepository.findClientBookingDetails(clientId, null, null, null, null, normalizedUnpaged()))
-                .thenReturn(new PageImpl<>(List.of(row)));
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(bookingId)))
+                .thenReturn(List.of(row));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
@@ -1749,8 +1753,10 @@ class BookingServiceTest {
     void should_returnNullTitleAndLocationNote_when_clientProjectionRowHasNeither() {
         Pageable pageable = Pageable.unpaged();
         var row = clientProjectionRow(null, null);
-        when(bookingRepository.findClientBookingDetails(clientId, null, null, null, null, normalizedUnpaged()))
-                .thenReturn(new PageImpl<>(List.of(row)));
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(bookingId)))
+                .thenReturn(List.of(row));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
@@ -1758,6 +1764,92 @@ class BookingServiceTest {
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).masterProfessionalTitle()).isNull();
         assertThat(result.data().get(0).locationNote()).isNull();
+    }
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
+            UUID id, String serviceName) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                id, clientId, masterId, masterServiceId, serviceName,
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false);
+    }
+
+    // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no
+    //    dedicated test — `listClientBookings` maps the hydrate result into a Map<UUID,...> and
+    //    re-walks idPage.getContent() specifically because `WHERE b.id IN :ids` does not
+    //    guarantee row order, mirroring `listProviderBookings`' existing pattern for
+    //    findAllByIdsWithGraph. The two tests below pin that re-walk actually re-imposes the
+    //    ID-page order (not the hydrate's own order) and that a missing hydrate row is skipped,
+    //    not an NPE. ──────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) re-imposes the ID-page's order onto the hydrate result — "
+            + "IN :ids does not guarantee row order, so a hydrate that returns rows reversed "
+            + "relative to the ID page must still be re-sequenced to the ID page's order "
+            + "(security LOW — Phase 26.7.1 order re-imposition on the CLIENT branch)")
+    void should_reorderClientBookings_when_hydrateReturnsRowsOutOfIdPageOrder() {
+        Pageable pageable = Pageable.unpaged();
+        UUID idA = UUID.randomUUID();
+        UUID idB = UUID.randomUUID();
+        var rowA = clientProjectionRowWithId(idA, "Manicure A");
+        var rowB = clientProjectionRowWithId(idB, "Pedicure B");
+
+        // The ID page's order is [idB, idA] — this is the order production code must preserve
+        // in the response, regardless of what order the hydrate below returns rows in.
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(idB, idA)));
+        // The hydrate returns the SAME two rows but in the OPPOSITE order — simulating
+        // `WHERE b.id IN :ids` not preserving row order (rowA, whose id (idA) is second in the
+        // id page, comes back FIRST from the hydrate).
+        when(bookingRepository.hydrateClientBookingDetails(List.of(idB, idA)))
+                .thenReturn(List.of(rowA, rowB));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
+
+        assertThat(result.data())
+                .as("response order must follow the ID PAGE's order [idB, idA], NOT the hydrate "
+                        + "result's order [idA, idB] — proves the Map<UUID,...> re-walk actually "
+                        + "re-imposes id-page order rather than passing the hydrate's row order through")
+                .extracting(BookingDetailResponse::id)
+                .containsExactly(idB, idA);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) silently skips an ID-page entry whose hydrate row is "
+            + "absent (e.g. the booking was deleted mid-request) instead of throwing an NPE "
+            + "(defensive filter(Objects::nonNull) branch)")
+    void should_skipMissingHydrateRow_when_idPageContainsAnIdAbsentFromHydrateResult() {
+        Pageable pageable = Pageable.unpaged();
+        UUID idA = UUID.randomUUID();
+        UUID idB = UUID.randomUUID();
+        var rowA = clientProjectionRowWithId(idA, "Manicure A");
+
+        // The ID page lists BOTH ids, but the hydrate only returns idA's row — idB's booking
+        // vanished between the two queries (e.g. deleted mid-request).
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(idA, idB)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(idA, idB)))
+                .thenReturn(List.of(rowA));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
+
+        assertThat(result.data())
+                .as("the id missing from the hydrate must be skipped, not surfaced as a null "
+                        + "element or thrown as an NPE")
+                .extracting(BookingDetailResponse::id)
+                .containsExactly(idA);
     }
 
     @Test
@@ -2126,13 +2218,13 @@ class BookingServiceTest {
         Sort expectedNormalizedSort = threeOrders.and(Sort.by(Sort.Direction.ASC, "id"));
         Pageable expectedNormalizedPageable = Pageable.unpaged(expectedNormalizedSort);
 
-        when(bookingRepository.findClientBookingDetails(clientId, null, null, null, null, expectedNormalizedPageable))
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable))
                 .thenReturn(Page.empty());
 
         var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, atBoundPageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(clientId, null, null, null, null, expectedNormalizedPageable);
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable);
     }
 
     // ── getMyBookings — serviceId cap (Phase 26.4 audit, MAX_SERVICE_ID_FILTER
@@ -2179,7 +2271,7 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
         Pageable expectedNormalizedPageable = Pageable.unpaged(DEFAULT_BOOKING_SORT_WITH_TIEBREAKER());
 
-        when(bookingRepository.findClientBookingDetails(
+        when(bookingRepository.findIdsByClientIdFiltered(
                         eq(clientId), eq(null), eq(null), eq(null), eq(expectedServiceIds), eq(expectedNormalizedPageable)))
                 .thenReturn(Page.empty());
 
@@ -2187,7 +2279,7 @@ class BookingServiceTest {
                 clientId, buildAuth(Role.CLIENT), null, null, null, fiftyIds, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(
+        verify(bookingRepository).findIdsByClientIdFiltered(
                 eq(clientId), eq(null), eq(null), eq(null), eq(expectedServiceIds), eq(expectedNormalizedPageable));
     }
 
