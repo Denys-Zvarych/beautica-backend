@@ -12,11 +12,13 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -32,7 +34,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import com.beautica.common.exception.BusinessException;
+import io.swagger.v3.oas.annotations.Parameter;
 
+import java.time.LocalDate;
+import java.util.List;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -81,7 +86,41 @@ public class BookingController {
     @GetMapping("/me")
     @PreAuthorize("isAuthenticated()")
     public ApiResponse<PageResponse<BookingDetailResponse>> listMyBookings(
-            @RequestParam(required = false) BookingStatus status,
+            // Phase 26.1: widened from a single optional BookingStatus to a repeatable list.
+            // Spring binds both ?status=A (1-element list — every pre-26.1 caller keeps working
+            // unchanged) and ?status=A&status=B (multi-select). null/absent = no status predicate.
+            // Finding 3 (LOW, backend-security, Phase 26.1 audit): @Size caps the repeated-param
+            // list at the enum's own cardinality (5 values) BEFORE it ever reaches
+            // EnumSet.copyOf in the service. Defense-in-depth — Tomcat's request-line length
+            // limit already bounds a raw ?status=&status=... query string in practice — but a
+            // missing explicit cap here is exactly the bounded-collection pattern Anti-Bug §B1
+            // requires. @Validated on the class (see class-level annotation) makes a violation
+            // surface as a 400 ConstraintViolationException (GlobalExceptionHandler), not a 500.
+            @Parameter(description = "Repeatable status filter, e.g. ?status=CONFIRMED&status=DECLINED. "
+                    + "Omit for no status predicate.")
+            @RequestParam(required = false) @Size(max = 5) List<BookingStatus> status,
+            // Phase 26.2: optional date-range filter on startsAt, independent of each other —
+            // `from` alone is an open-ended future window, `to` alone an open-ended past window.
+            // `to` is INCLUSIVE of its whole local (Europe/Kyiv) day; the half-open instant
+            // conversion happens in BookingService#getMyBookings, never here.
+            @Parameter(description = "Bookings starting on/after the start of this local day (Europe/Kyiv). "
+                    + "Omit for an open-ended future window.")
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @Parameter(description = "Bookings starting on/before the end of this local day (Europe/Kyiv), "
+                    + "inclusive. Omit for an open-ended past window.")
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            // Phase 26.4: optional, repeatable serviceId filter — matches b.masterService.id
+            // (the master's own catalogue entry a booking was placed against), never
+            // masterService.serviceDefinition.id. Spring binds both ?serviceId=<A> (1-element
+            // list) and ?serviceId=<A>&serviceId=<B> (multi-select), same repeatable-param
+            // pattern as `status`. @Size caps the list at 50 — unlike status (self-bounded at the
+            // enum's own cardinality of 5), a UUID list has no natural upper bound, so an explicit
+            // cap is needed to stop an unbounded IN list / plan-cache inflation (Anti-Bug §B1).
+            // No facet endpoint: the existing GET /independent-masters/me/services catalogue is
+            // the option universe (see the phase doc's locked "no facet endpoint" decision).
+            @Parameter(description = "Repeatable MasterService id filter, e.g. "
+                    + "?serviceId=<A>&serviceId=<B>. Omit for no service predicate.")
+            @RequestParam(required = false) @Size(max = 50) List<UUID> serviceId,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
@@ -89,7 +128,28 @@ public class BookingController {
         if (pageable.getPageNumber() > 1000) {
             pageable = PageRequest.of(1000, pageable.getPageSize(), pageable.getSort());
         }
-        return ApiResponse.ok(bookingService.getMyBookings(AuthenticationUtils.userId(auth), auth, status, pageable));
+        return ApiResponse.ok(bookingService.getMyBookings(
+                AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, pageable));
+    }
+
+    // Phase 26.5: three path segments (/me/booked-days) so it cannot collide with the
+    // two-segment /{bookingId} above — Spring's PathPattern always prefers the more specific
+    // literal match, but this endpoint is pinned by a routing test anyway since /me vs
+    // /{bookingId} ambiguity is a live footgun in this controller.
+    @GetMapping("/me/booked-days")
+    @PreAuthorize("isAuthenticated()")
+    public ApiResponse<List<LocalDate>> listMyBookedDays(
+            // Both required (unlike /me's optional from/to): an unbounded default would scan
+            // the caller's entire booking history. Filter-independent by design — no status/
+            // serviceId param here, see BookingService#getMyBookedDays javadoc.
+            @Parameter(description = "Range start (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            Authentication auth
+    ) {
+        return ApiResponse.ok(bookingService.getMyBookedDays(
+                AuthenticationUtils.userId(auth), auth, from, to));
     }
 
     /**

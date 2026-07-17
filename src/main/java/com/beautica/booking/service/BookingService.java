@@ -14,6 +14,7 @@ import com.beautica.booking.repository.ClientBookingDetailProjection;
 import com.beautica.common.PageResponse;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
@@ -37,7 +38,9 @@ import org.springframework.cache.CacheManager;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
@@ -52,6 +55,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -79,6 +83,7 @@ public class BookingService {
     private final Clock clock;
     private final CacheManager cacheManager;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    private final ScheduleDateMath dateMath;
 
     @Transactional
     public BookingResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
@@ -225,28 +230,100 @@ public class BookingService {
      * {@code GET /bookings/me} switched from the lean {@code BookingResponse} per locked
      * Option A). {@code canReview} is true only for a {@code COMPLETED} booking with no review.
      *
-     * <p><b>CLIENT</b> uses the single-query {@code findClientBookingDetails} projection —
-     * {@code reviewExists} arrives inline via a {@code LEFT JOIN Review}, and the locality FK
-     * ids are batch-resolved to labels in a fixed two queries through the M2 seam (no N+1).
+     * <p><b>CLIENT</b> (Phase 26.7.1) now shares the same two-query ID-page + hydrate shape as
+     * the provider roles below: {@code findIdsByClientIdFiltered} (sargable, sentinel-free
+     * {@code Specification} ID page) then {@code hydrateClientBookingDetails} ({@code IN :ids}
+     * projection hydrate, {@code reviewExists} inline via a {@code LEFT JOIN Review}), with order
+     * re-imposed onto the hydrate in {@code listClientBookings} — see that method's javadoc. The
+     * locality FK ids are batch-resolved to labels in a fixed two queries through the M2 seam
+     * (no N+1), same as before this phase.
      *
      * <p><b>Provider roles</b> (master / salon-owner) reuse the established two-query ID-page +
      * graph-hydrate pattern (Fix H1), then add exactly two bounded follow-ups for the page:
      * one batched {@code findReviewedBookingIds} and the two-query label resolution — never a
      * per-row lookup.
+     *
+     * <p><b>Phase 26.1 — multi-select status.</b> {@code status} widened from a single optional
+     * {@link BookingStatus} to a repeatable {@link List}, bound by Spring from both
+     * {@code ?status=A} (1-element list, preserving every pre-26.1 caller byte-for-byte) and
+     * {@code ?status=A&status=B}. Normalised once here to an {@link EnumSet} — {@code null} or
+     * empty means "no predicate" (unfiltered, matching today's behaviour); a non-empty input
+     * de-duplicates and is self-bounded at the enum's cardinality (5), so no caller can build an
+     * unbounded {@code IN} list no matter how many times {@code status} is repeated.
+     *
+     * <p><b>Phase 26.2 — optional {@code from}/{@code to} date-range filter.</b> Both are
+     * independent, optional {@link LocalDate} bounds on {@code startsAt}: {@code from} alone is
+     * an open-ended future window, {@code to} alone an open-ended past window. {@code to} is
+     * INCLUSIVE of the whole local day — resolved as a HALF-OPEN {@code Europe/Kyiv} instant
+     * range, {@code [from.atStartOfDay(KYIV), to.plusDays(1).atStartOfDay(KYIV))}, never an
+     * {@code <=} on {@code to} itself (which would silently drop every booking after 00:00 Kyiv
+     * on the final day) and never a UTC/{@code systemDefault()} zone (which would shift every
+     * boundary by the Kyiv offset). {@code from > to} throws a 400 {@link BusinessException}
+     * rather than returning an empty page — an empty page would hide a client bug. A span wider
+     * than 366 days also throws 400, reusing {@link ScheduleDateMath#assertSpanWithinMax} rather
+     * than inventing a new literal. An extreme {@code to} near {@link LocalDate#MAX} (which
+     * {@code @DateTimeFormat(iso = DATE)} parses without complaint) would make
+     * {@code to.plusDays(1)} throw an uncaught {@link java.time.DateTimeException} — guarded by
+     * {@link ScheduleDateMath#assertToPlusOneDayRepresentable}, called unconditionally whenever
+     * {@code to} is present, so both a {@code to}-only request and a valid small span landing on
+     * that boundary get a clean 400 instead of a 500.
+     *
+     * <p><b>Phase 26.4 — optional {@code serviceId} multi-select filter.</b> {@code serviceId} is
+     * a repeatable {@link List} of {@code MasterService} ids, matched against
+     * {@code b.masterService.id} (the direct FK), never {@code masterService.serviceDefinition.id}
+     * — see {@code BookingSpecifications#masterServiceIdIn}'s javadoc for why. Normalised here,
+     * beside the status normalisation above, into a de-duplicated {@link LinkedHashSet};
+     * {@code null} or empty means "no predicate". Unlike {@code status} (self-bounded at the enum
+     * cardinality of 5), a caller-supplied UUID list is unbounded in principle, so a size above
+     * {@link #MAX_SERVICE_ID_FILTER} throws a 400 {@link BusinessException} before the set is ever
+     * handed to a query — the same defense-in-depth reasoning as the controller's
+     * {@code @Size(max = 5)} bound on {@code status} (Anti-Bug §B1: bounded collections only).
+     * No ownership check is performed against the supplied ids: the master/salon scope predicate
+     * already constrains every query, so a {@code serviceId} belonging to a different provider
+     * simply matches nothing rather than surfacing a 404 that would turn this endpoint into an
+     * existence oracle for {@code MasterService} ids (locked decision — see the phase doc).
      */
     @Transactional(readOnly = true)
     public PageResponse<BookingDetailResponse> getMyBookings(
-            UUID actorUserId, Authentication auth, BookingStatus status, Pageable pageable) {
+            UUID actorUserId, Authentication auth, List<BookingStatus> status,
+            LocalDate from, LocalDate to, List<UUID> serviceId, Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
-        Role role = auth.getAuthorities().stream()
-                .findFirst()
-                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        Role role = resolveActorRole(auth);
+
+        Set<BookingStatus> statuses = (status == null || status.isEmpty())
+                ? null
+                : EnumSet.copyOf(status);
+
+        Set<UUID> serviceIds = (serviceId == null || serviceId.isEmpty())
+                ? null
+                : new LinkedHashSet<>(serviceId);
+        if (serviceIds != null && serviceIds.size() > MAX_SERVICE_ID_FILTER) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Too many serviceId values (max " + MAX_SERVICE_ID_FILTER + ")");
+        }
+
+        if (to != null) {
+            dateMath.assertToPlusOneDayRepresentable(to);
+        }
+        if (from != null && to != null) {
+            if (from.isAfter(to)) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST, "'from' must not be after 'to'");
+            }
+            dateMath.assertSpanWithinMax(from, to);
+        }
+        OffsetDateTime fromTs = from == null ? null : from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to == null ? null : to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+
+        // Phase 26.3: validate/whitelist/default/tiebreak the sort BEFORE the role dispatch, so
+        // BOTH the client projection query and the provider ID-page query receive an identical,
+        // already-safe Pageable — see normalizeBookingSort's javadoc for why this must happen
+        // here and not deeper in either path.
+        Pageable normalizedPageable = normalizeBookingSort(pageable);
 
         Page<BookingDetailResponse> page = role == Role.CLIENT
-                ? listClientBookings(actorUserId, status, pageable)
-                : listProviderBookings(role, actorUserId, status, pageable);
+                ? listClientBookings(actorUserId, statuses, fromTs, toExclusive, serviceIds, normalizedPageable)
+                : listProviderBookings(role, actorUserId, statuses, fromTs, toExclusive, serviceIds, normalizedPageable);
 
         return PageResponse.of(
                 page.getContent(),
@@ -257,21 +334,244 @@ public class BookingService {
     }
 
     /**
-     * CLIENT path — one projection query (reviewExists inline) + batched label resolution.
+     * Resolves the caller's role from the JWT-derived granted authority — the same
+     * single-authority-per-principal assumption {@link #getMyBookings} has always relied on.
+     * Extracted (Phase 26.5) so {@code getMyBookings} and {@link #getMyBookedDays} share one
+     * copy of this lookup rather than each inlining it — a second, silently-diverging copy is
+     * exactly how these two endpoints' notion of "who is the caller" would end up disagreeing.
      */
-    private Page<BookingDetailResponse> listClientBookings(
-            UUID clientId, BookingStatus status, Pageable pageable) {
-        Page<ClientBookingDetailProjection> page =
-                bookingRepository.findClientBookingDetails(clientId, status, pageable);
-        if (page.isEmpty()) {
-            return new PageImpl<>(List.of(), pageable, page.getTotalElements());
+    private Role resolveActorRole(Authentication auth) {
+        return auth.getAuthorities().stream()
+                .findFirst()
+                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+    }
+
+    /**
+     * Phase 26.5 — {@code GET /bookings/me/booked-days}: the set of local (Europe/Kyiv) dates
+     * on which the caller has at least one booking in {@code [from, to]}, ascending and
+     * distinct. Backs the day-rail dot on the booking-management design
+     * ({@code SalonManagementDesign/lib/widgets/bookings_toolbar.dart}'s {@code _bookingDays}).
+     *
+     * <p><b>Filter-independent by design.</b> The design computes {@code _bookingDays} from the
+     * screen's full, unfiltered booking list, not the filtered/sorted view — so the dots keep
+     * showing where bookings are even while a status/date/service filter narrows the list below.
+     * This method therefore takes no {@code status} / {@code serviceId} parameter and applies no
+     * status predicate — do not add one "for symmetry" with {@link #getMyBookings}.
+     *
+     * <p><b>{@code from}/{@code to} are required</b> (unlike {@code getMyBookings}'s optional
+     * range) and capped at 366 days via {@link ScheduleDateMath#assertSpanWithinMax} — an
+     * unbounded default would scan the caller's entire booking history. Converted to the same
+     * half-open {@code [from, toExclusive)} Kyiv-zoned instant range {@code getMyBookings} uses,
+     * so a dot returned here and a non-empty {@code GET /bookings/me?from=D&to=D} for the same
+     * date D always agree.
+     *
+     * <p>Role scope mirrors {@link #getMyBookings}: {@code SALON_MASTER}/{@code
+     * INDEPENDENT_MASTER} see their own bookings (scoped by {@code masterId}, resolved from the
+     * JWT principal — never a request parameter), {@code SALON_OWNER} sees bookings across their
+     * owned active salons, {@code CLIENT} sees their own bookings, and {@code SALON_ADMIN} is
+     * forbidden — consistent with {@code getMyBookings} rejecting that role for the same reason
+     * (they manage staff/services, not bookings).
+     *
+     * <p>Aggregation happens in Postgres ({@code SELECT DISTINCT} on a timezone-converted date
+     * expression, at most ~366 rows back) — never by loading the caller's booking history into
+     * heap and reducing with {@code .map(...).distinct()} in Java.
+     */
+    @Transactional(readOnly = true)
+    public List<LocalDate> getMyBookedDays(UUID actorUserId, Authentication auth, LocalDate from, LocalDate to) {
+        if (from == null || to == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Both 'from' and 'to' are required");
+        }
+        if (from.isAfter(to)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "'from' must not be after 'to'");
+        }
+        dateMath.assertToPlusOneDayRepresentable(to);
+        dateMath.assertSpanWithinMax(from, to);
+
+        OffsetDateTime fromTs = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+
+        Role role = resolveActorRole(auth);
+
+        List<java.sql.Date> bookedDates = switch (role) {
+            case CLIENT -> bookingRepository.findBookedDatesByClientId(actorUserId, fromTs, toExclusive);
+            case SALON_MASTER, INDEPENDENT_MASTER -> {
+                Master master = masterRepository.findByUserId(actorUserId)
+                        .orElseThrow(() -> new NotFoundException("Master profile not found"));
+                yield bookingRepository.findBookedDatesByMasterId(master.getId(), fromTs, toExclusive);
+            }
+            case SALON_OWNER -> {
+                List<UUID> salonIds = salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorUserId);
+                yield salonIds.isEmpty()
+                        ? List.of()
+                        : bookingRepository.findBookedDatesBySalonIds(salonIds, fromTs, toExclusive);
+            }
+            // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings —
+            // same boundary getMyBookings enforces via listProviderBookings.
+            case SALON_ADMIN -> throw new ForbiddenException("SALON_ADMIN cannot list bookings via this endpoint");
+        };
+
+        // Conversion lives HERE, not in the repository (CRITICAL fix, backend-qa
+        // BookingMyBookedDaysIT, 2026-07-17). The three native queries above return the raw JDBC
+        // java.sql.Date the driver produces for a `date` column — Spring Data's
+        // QueryExecutionResultHandler has no java.sql.Date -> LocalDate converter for a native
+        // scalar projection, so declaring List<LocalDate> on the repository method made every
+        // request 500 with ConverterNotFoundException. java.sql.Date::toLocalDate reads the
+        // value's stored year/month/day fields directly (no zone reinterpretation), so this is
+        // lossless: the AT TIME ZONE 'Europe/Kyiv' expression in SQL already produced the correct
+        // Kyiv calendar date before JDBC ever sees it — do not move that grouping into Java.
+        return bookedDates.stream().map(java.sql.Date::toLocalDate).toList();
+    }
+
+    /**
+     * Property names {@code GET /bookings/me}'s {@code sort} query parameter may reference
+     * (Phase 26.3). Every property here is a scalar column directly on {@code Booking} — no
+     * association traversal.
+     *
+     * <p><b>This is a security boundary, not a nicety.</b> Both {@code findIdsByClientIdFiltered}
+     * and the provider ID-page queries join through {@code b.master m JOIN m.user}, so any
+     * unvalidated dot-path off those aliases is legal JPQL/Criteria — e.g.
+     * {@code ?sort=master.user.passwordHash,asc} would order an authenticated caller's own
+     * results by their employees' password-hash column, a credential side channel that never
+     * appears in the response body. {@link Sort.Order#getProperty()} returns the FULL dotted
+     * path as one string, so an exact-match {@link Set#contains} here rejects any multi-segment
+     * path outright — it never inspects only the first segment.
+     */
+    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt", "priceAtBooking");
+
+    /** Applied when the caller supplies no {@code sort} at all (Phase 26.3). */
+    private static final Sort DEFAULT_BOOKING_SORT = Sort.by(Sort.Direction.DESC, "startsAt");
+
+    /** Mandatory final tiebreaker appended to every sort — see {@link #normalizeBookingSort}. */
+    private static final Sort ID_TIEBREAKER_SORT = Sort.by(Sort.Direction.ASC, "id");
+
+    /**
+     * Max {@link Sort.Order} entries accepted in {@code GET /bookings/me}'s {@code sort} query
+     * parameter (Phase 26.3 audit, finding backend-perf F4). Matches the cardinality of
+     * {@link #SORTABLE_BOOKING_PROPERTIES} — nobody needs to sort by more than all three
+     * whitelisted properties at once. Parity with the existing {@code @Size(max = 5)} bound on
+     * the controller's {@code status} parameter: each distinct {@code (property, direction)}
+     * sequence compiles to a textually distinct SQL {@code ORDER BY} (column names can't be bind
+     * params), so an unbounded sort list inflates plan-cache entries.
+     */
+    private static final int MAX_SORT_ORDERS = 3;
+
+    /**
+     * Max de-duplicated {@code serviceId} values accepted by {@code GET /bookings/me} (Phase
+     * 26.4). Unlike {@code status} (an enum, self-bounded at 5 by its own cardinality),
+     * {@code serviceId} is an arbitrary {@code UUID} list a caller could otherwise repeat
+     * thousands of times, inflating the {@code IN} list (Anti-Bug §B1) — this cap bounds that
+     * worst-case single-request list <em>length</em>, a real DoS guard. It does <b>not</b> bound
+     * plan-cache <em>shape</em> cardinality: every distinct list length between 1 and this cap
+     * still compiles to a textually distinct {@code IN (?, ?, ...)} clause. That axis is instead
+     * addressed by {@code hibernate.query.in_clause_parameter_padding} (enabled in
+     * {@code application.yml}, Phase 26.4 finding backend-perf F1), which rounds each generated
+     * {@code IN} list up to the next power of two so far fewer distinct SQL texts reach Postgres's
+     * prepared-statement cache. 50 comfortably exceeds any real master's service catalogue (the
+     * option universe the filter sheet renders — see the phase doc's "no facet endpoint" decision)
+     * while still capping the query. Mirrored by the controller's {@code @Size(max = 50)} on the
+     * repeated {@code serviceId} request parameter.
+     */
+    private static final int MAX_SERVICE_ID_FILTER = 50;
+
+    /**
+     * Single choke point for the {@code sort} query parameter on {@code GET /bookings/me}
+     * (Phase 26.3), applied once before the CLIENT/provider role dispatch so neither path can be
+     * reached with a raw, unvalidated {@link Sort}.
+     *
+     * <ol>
+     *   <li><b>Default when unsorted.</b> {@code @PageableDefault(sort = "startsAt", DESC)} on
+     *       the controller covers the HTTP path, but this method is also called directly by
+     *       tests and (defensively) must not depend on that annotation — an unsorted
+     *       {@code Pageable} yields DB-arbitrary order once the JPQL/Criteria layers stop
+     *       hardcoding {@code ORDER BY b.startsAt DESC} themselves.</li>
+     *   <li><b>Whitelist.</b> Every {@link Sort.Order#getProperty()} must exact-match
+     *       {@link #SORTABLE_BOOKING_PROPERTIES}; anything else — including a dot-path like
+     *       {@code master.user.passwordHash} — throws a 400 {@link BusinessException} before the
+     *       {@code Sort} ever reaches a query.</li>
+     *   <li><b>Count bound.</b> More than {@link #MAX_SORT_ORDERS} orders throws a 400
+     *       {@link BusinessException} (Phase 26.3 audit F4) — parity with the controller's
+     *       {@code @Size(max = 5)} bound on {@code status}.</li>
+     *   <li><b>Mandatory {@code id} tiebreaker.</b> Appended last, always. Price (and, on the
+     *       salon path, {@code startsAt} across different masters) ties are the common case, not
+     *       the edge case — every booking of the same service shares a {@code priceAtBooking}.
+     *       Without a unique trailing column, {@code OFFSET} pagination over tied rows can
+     *       duplicate and skip rows across pages.</li>
+     * </ol>
+     *
+     * <p><b>Preserves {@code Pageable.unpaged()}.</b> {@link Pageable#getPageNumber()} and
+     * {@link Pageable#getPageSize()} throw {@link UnsupportedOperationException} on an
+     * {@code Unpaged} instance by design — several {@code BookingServiceTest} cases call this
+     * service directly with {@code Pageable.unpaged()} because they exercise status-filtering
+     * logic, not pagination. Rebuilding via {@link PageRequest#of} unconditionally would break
+     * that legitimate caller. {@link Pageable#isPaged()} branches to
+     * {@link Pageable#unpaged(Sort)} instead, carrying the normalized sort without requiring page
+     * number/size semantics that don't apply.
+     */
+    private Pageable normalizeBookingSort(Pageable pageable) {
+        Sort requestedSort = pageable.getSort();
+        Sort effectiveSort = requestedSort.isUnsorted() ? DEFAULT_BOOKING_SORT : requestedSort;
+
+        if (effectiveSort.stream().count() > MAX_SORT_ORDERS) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Too many sort properties");
         }
 
-        DiscoveryLabels labels = resolveProjectionLabels(page.getContent());
-        List<BookingDetailResponse> content = page.getContent().stream()
+        for (Sort.Order order : effectiveSort) {
+            if (!SORTABLE_BOOKING_PROPERTIES.contains(order.getProperty())) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "Unsupported sort property: " + order.getProperty());
+            }
+        }
+
+        Sort finalSort = effectiveSort.and(ID_TIEBREAKER_SORT);
+
+        if (!pageable.isPaged()) {
+            return Pageable.unpaged(finalSort);
+        }
+
+        return PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(), finalSort);
+    }
+
+    /**
+     * CLIENT path (Phase 26.7.1 — two-query ID-page + verbatim-projection hydrate, mirroring
+     * {@link #listProviderBookings}'s established pattern). {@code findIdsByClientIdFiltered}
+     * runs the sargable, sentinel-free {@link org.springframework.data.jpa.domain.Specification}
+     * ID page (ownership + status/date-range/serviceId filters, sort translated from
+     * {@code pageable.getSort()}); {@code hydrateClientBookingDetails} then re-emits the
+     * PII-sensitive {@code ClientBookingDetailProjection} — CASE-precedence expressions untouched
+     * — for exactly that bounded id set via {@code WHERE b.id IN :ids}.
+     *
+     * <p><b>Order is re-imposed in Java</b> — the {@code IN} hydrate does not preserve the ID
+     * page's order — by mapping the hydrated rows into a {@code Map<UUID, …>} and re-walking
+     * {@code idPage.getContent()}, the identical pattern {@link #listProviderBookings} already
+     * uses for {@code findAllByIdsWithGraph}. An empty ID page short-circuits before the hydrate
+     * ever runs, so this method never emits {@code IN ()} (an invalid, dialect-breaking clause).
+     */
+    private Page<BookingDetailResponse> listClientBookings(
+            UUID clientId, Set<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Set<UUID> serviceIds, Pageable pageable) {
+        Page<UUID> idPage = bookingRepository.findIdsByClientIdFiltered(
+                clientId, statuses, from, toExclusive, serviceIds, pageable);
+        if (idPage.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
+        }
+
+        List<ClientBookingDetailProjection> hydrated =
+                bookingRepository.hydrateClientBookingDetails(idPage.getContent());
+        DiscoveryLabels labels = resolveProjectionLabels(hydrated);
+
+        // Restore the ID page's ordering — IN :ids does not guarantee row order from the
+        // database (mirrors listProviderBookings' Map<UUID, Booking> re-order below).
+        Map<UUID, ClientBookingDetailProjection> byId = hydrated.stream()
+                .collect(Collectors.toMap(ClientBookingDetailProjection::id, Function.identity()));
+        List<BookingDetailResponse> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
                 .map(p -> toDetailResponse(p, labels))
                 .toList();
-        return new PageImpl<>(content, pageable, page.getTotalElements());
+        return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
 
     /**
@@ -279,7 +579,9 @@ public class BookingService {
      * query and the two-query label resolution for the whole page.
      */
     private Page<BookingDetailResponse> listProviderBookings(
-            Role role, UUID actorUserId, BookingStatus status, Pageable pageable) {
+            Role role, UUID actorUserId, Set<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Set<UUID> serviceIds, Pageable pageable) {
         // Two-query pattern (Fix H1 — HHH90003004): first fetch a page of IDs using
         // plain JPQL with no JOIN FETCH (so the DB applies LIMIT/OFFSET correctly), then
         // batch-hydrate only those IDs with the full association graph in a second query.
@@ -287,9 +589,8 @@ public class BookingService {
             case SALON_MASTER, INDEPENDENT_MASTER -> {
                 Master master = masterRepository.findByUserId(actorUserId)
                         .orElseThrow(() -> new NotFoundException("Master profile not found"));
-                yield status == null
-                        ? bookingRepository.findIdsByMasterId(master.getId(), pageable)
-                        : bookingRepository.findIdsByMasterIdAndStatus(master.getId(), status, pageable);
+                yield bookingRepository.findIdsByMasterIdFiltered(
+                        master.getId(), statuses, from, toExclusive, serviceIds, pageable);
             }
             case SALON_OWNER -> {
                 // Fix HIGH-1: salonId is on Salon.owner_id, NOT on User.salonId.
@@ -301,9 +602,8 @@ public class BookingService {
                 if (salonIds.isEmpty()) {
                     yield Page.empty(pageable);
                 }
-                yield status == null
-                        ? bookingRepository.findIdsBySalonIds(salonIds, pageable)
-                        : bookingRepository.findIdsBySalonIdsAndStatus(salonIds, status, pageable);
+                yield bookingRepository.findIdsBySalonIdsFiltered(
+                        salonIds, statuses, from, toExclusive, serviceIds, pageable);
             }
             // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings.
             // If this restriction is ever relaxed, add a SALON_ADMIN branch scoped to their salon.

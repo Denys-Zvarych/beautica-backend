@@ -21,6 +21,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -32,7 +33,9 @@ import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -57,9 +60,11 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -69,6 +74,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -99,6 +105,8 @@ class BookingServiceTest {
     private CacheManager cacheManager;
     @Mock
     private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock
+    private ScheduleDateMath dateMath;
 
     private Clock clock;
 
@@ -133,7 +141,8 @@ class BookingServiceTest {
                 discoveryLocationResolver,
                 clock,
                 cacheManager,
-                salonCatalogCacheEvictor
+                salonCatalogCacheEvictor,
+                dateMath
         );
 
         clientId = UUID.randomUUID();
@@ -1433,6 +1442,19 @@ class BookingServiceTest {
         return new com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels(Map.of(), Map.of());
     }
 
+    /**
+     * Phase 26.3: {@code BookingService#normalizeBookingSort} is called BEFORE the role dispatch
+     * and unconditionally rewrites the caller's {@code Pageable} — defaulting an unsorted sort to
+     * {@code startsAt DESC} and always appending an {@code id ASC} tiebreaker — before either the
+     * client projection query or the provider ID-page query ever see it. A test that passes in a
+     * bare {@code Pageable.unpaged()} must therefore stub/verify the repository call with THIS
+     * normalized form, not the original unsorted instance — the two are no longer the same object
+     * nor {@code equals()}, by design (see that method's javadoc).
+     */
+    private static Pageable normalizedUnpaged() {
+        return Pageable.unpaged(Sort.by(Sort.Direction.DESC, "startsAt").and(Sort.by(Sort.Direction.ASC, "id")));
+    }
+
     @Test
     @DisplayName("filtered bookings page is returned when salon owner queries with a specific status")
     void should_returnFilteredBookings_when_salonOwnerListsWithStatus() {
@@ -1441,15 +1463,16 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.CONFIRMED, pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(
+                        List.of(salonId), Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
-        var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.CONFIRMED, pageable);
+        var result = bookingService.getMyBookings(
+                actorId, buildAuth(Role.SALON_OWNER), List.of(BookingStatus.CONFIRMED), null, null, null, pageable);
 
         assertThat(result.totalElements()).isZero();
-        verify(bookingRepository).findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.CONFIRMED, pageable);
-        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
+        verify(bookingRepository)
+                .findIdsBySalonIdsFiltered(List.of(salonId), Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
     }
 
     @Test
@@ -1460,15 +1483,74 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
         var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsBySalonIds(List.of(salonId), pageable);
-        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("empty status list behaves exactly as absent — normalised to null, not an empty IN list "
+            + "(Phase 26.1: ?status= must not match nothing)")
+    void should_normalizeEmptyStatusList_to_null_when_salonOwnerListsWithEmptyStatusList() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), List.of(), null, null, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("repeated/duplicate statuses de-duplicate into a bounded EnumSet before hitting the repository "
+            + "(Phase 26.1: ?status=CONFIRMED&status=CONFIRMED)")
+    void should_deduplicateStatuses_when_salonOwnerRepeatsTheSameStatus() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(
+                        List.of(salonId), Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER),
+                List.of(BookingStatus.CONFIRMED, BookingStatus.CONFIRMED), null, null, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository)
+                .findIdsBySalonIdsFiltered(List.of(salonId), Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("multiple distinct statuses widen into a single filtered query call carrying the whole EnumSet "
+            + "(Phase 26.1: ?status=CANCELLED&status=DECLINED, union in one request)")
+    void should_passUnionOfStatuses_when_salonOwnerListsWithMultipleStatuses() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Set<BookingStatus> expected = EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED);
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), expected, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER),
+                List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED), null, null, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), expected, null, null, null, normalizedUnpaged());
     }
 
     @Test
@@ -1480,7 +1562,7 @@ class BookingServiceTest {
         Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
@@ -1488,7 +1570,7 @@ class BookingServiceTest {
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
         assertThat(result.totalElements()).isEqualTo(1);
         assertThat(result.data()).hasSize(1);
@@ -1506,7 +1588,7 @@ class BookingServiceTest {
         setField(guestBooking, "guestSurname", "Гість");
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(guestBooking));
@@ -1514,7 +1596,7 @@ class BookingServiceTest {
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
         assertThat(result.totalElements()).isEqualTo(1);
         assertThat(result.data()).hasSize(1);
@@ -1532,11 +1614,10 @@ class BookingServiceTest {
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
 
         var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
         assertThat(result.data()).isEmpty();
-        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
-        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
+        verify(bookingRepository, never()).findIdsBySalonIdsFiltered(any(), any(), any(), any(), any(), any());
     }
 
     // ── Finding 1: SALON_OWNER multi-salon tests ───────────────────────────────
@@ -1552,7 +1633,7 @@ class BookingServiceTest {
         Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(salonIds);
-        when(bookingRepository.findIdsBySalonIds(salonIds, pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(salonIds, null, null, null, null, normalizedUnpaged()))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
@@ -1560,11 +1641,11 @@ class BookingServiceTest {
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
         assertThat(result.totalElements()).isEqualTo(1);
         verify(salonRepository).findIdsByOwnerIdAndIsActiveTrue(actorId);
-        verify(bookingRepository).findIdsBySalonIds(salonIds, pageable);
+        verify(bookingRepository).findIdsBySalonIdsFiltered(salonIds, null, null, null, null, normalizedUnpaged());
     }
 
     @Test
@@ -1576,11 +1657,10 @@ class BookingServiceTest {
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
 
         var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
         assertThat(result.data()).isEmpty();
-        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
-        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
+        verify(bookingRepository, never()).findIdsBySalonIdsFiltered(any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1588,13 +1668,15 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithoutStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findClientBookingDetails(clientId, null, pageable)).thenReturn(Page.empty());
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged())).thenReturn(Page.empty());
 
-        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(clientId, null, pageable);
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged());
         verify(bookingRepository, never()).findIdsByClientId(any(), any());
+        // Empty ID page short-circuits before the hydrate ever runs (never emit IN ()).
+        verify(bookingRepository, never()).hydrateClientBookingDetails(any());
     }
 
     @Test
@@ -1602,13 +1684,32 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findClientBookingDetails(clientId, BookingStatus.CONFIRMED, pageable))
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
-        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), BookingStatus.CONFIRMED, pageable);
+        var result = bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), List.of(BookingStatus.CONFIRMED), null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(clientId, BookingStatus.CONFIRMED, pageable);
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("CLIENT with multiple statuses passes the union to the enriched client projection "
+            + "(Phase 26.1: ?status=CANCELLED&status=DECLINED for CLIENT too)")
+    void should_returnClientBookings_when_clientListsWithMultipleStatuses() {
+        Pageable pageable = Pageable.unpaged();
+        Set<BookingStatus> expected = EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED);
+
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, expected, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT),
+                List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED), null, null, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, expected, null, null, null, normalizedUnpaged());
     }
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRow(
@@ -1634,11 +1735,13 @@ class BookingServiceTest {
     void should_surfaceTitleAndLocationNote_when_clientProjectionRowHasBoth() {
         Pageable pageable = Pageable.unpaged();
         var row = clientProjectionRow("Перукар-стиліст", "3-й поверх, код 1234");
-        when(bookingRepository.findClientBookingDetails(clientId, null, pageable))
-                .thenReturn(new PageImpl<>(List.of(row)));
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(bookingId)))
+                .thenReturn(List.of(row));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
 
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).masterProfessionalTitle()).isEqualTo("Перукар-стиліст");
@@ -1650,15 +1753,103 @@ class BookingServiceTest {
     void should_returnNullTitleAndLocationNote_when_clientProjectionRowHasNeither() {
         Pageable pageable = Pageable.unpaged();
         var row = clientProjectionRow(null, null);
-        when(bookingRepository.findClientBookingDetails(clientId, null, pageable))
-                .thenReturn(new PageImpl<>(List.of(row)));
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(bookingId)))
+                .thenReturn(List.of(row));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, pageable);
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
 
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).masterProfessionalTitle()).isNull();
         assertThat(result.data().get(0).locationNote()).isNull();
+    }
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
+            UUID id, String serviceName) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                id, clientId, masterId, masterServiceId, serviceName,
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false);
+    }
+
+    // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no
+    //    dedicated test — `listClientBookings` maps the hydrate result into a Map<UUID,...> and
+    //    re-walks idPage.getContent() specifically because `WHERE b.id IN :ids` does not
+    //    guarantee row order, mirroring `listProviderBookings`' existing pattern for
+    //    findAllByIdsWithGraph. The two tests below pin that re-walk actually re-imposes the
+    //    ID-page order (not the hydrate's own order) and that a missing hydrate row is skipped,
+    //    not an NPE. ──────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) re-imposes the ID-page's order onto the hydrate result — "
+            + "IN :ids does not guarantee row order, so a hydrate that returns rows reversed "
+            + "relative to the ID page must still be re-sequenced to the ID page's order "
+            + "(security LOW — Phase 26.7.1 order re-imposition on the CLIENT branch)")
+    void should_reorderClientBookings_when_hydrateReturnsRowsOutOfIdPageOrder() {
+        Pageable pageable = Pageable.unpaged();
+        UUID idA = UUID.randomUUID();
+        UUID idB = UUID.randomUUID();
+        var rowA = clientProjectionRowWithId(idA, "Manicure A");
+        var rowB = clientProjectionRowWithId(idB, "Pedicure B");
+
+        // The ID page's order is [idB, idA] — this is the order production code must preserve
+        // in the response, regardless of what order the hydrate below returns rows in.
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(idB, idA)));
+        // The hydrate returns the SAME two rows but in the OPPOSITE order — simulating
+        // `WHERE b.id IN :ids` not preserving row order (rowA, whose id (idA) is second in the
+        // id page, comes back FIRST from the hydrate).
+        when(bookingRepository.hydrateClientBookingDetails(List.of(idB, idA)))
+                .thenReturn(List.of(rowA, rowB));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
+
+        assertThat(result.data())
+                .as("response order must follow the ID PAGE's order [idB, idA], NOT the hydrate "
+                        + "result's order [idA, idB] — proves the Map<UUID,...> re-walk actually "
+                        + "re-imposes id-page order rather than passing the hydrate's row order through")
+                .extracting(BookingDetailResponse::id)
+                .containsExactly(idB, idA);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) silently skips an ID-page entry whose hydrate row is "
+            + "absent (e.g. the booking was deleted mid-request) instead of throwing an NPE "
+            + "(defensive filter(Objects::nonNull) branch)")
+    void should_skipMissingHydrateRow_when_idPageContainsAnIdAbsentFromHydrateResult() {
+        Pageable pageable = Pageable.unpaged();
+        UUID idA = UUID.randomUUID();
+        UUID idB = UUID.randomUUID();
+        var rowA = clientProjectionRowWithId(idA, "Manicure A");
+
+        // The ID page lists BOTH ids, but the hydrate only returns idA's row — idB's booking
+        // vanished between the two queries (e.g. deleted mid-request).
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(idA, idB)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(idA, idB)))
+                .thenReturn(List.of(rowA));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, pageable);
+
+        assertThat(result.data())
+                .as("the id missing from the hydrate must be skipped, not surfaced as a null "
+                        + "element or thrown as an NPE")
+                .extracting(BookingDetailResponse::id)
+                .containsExactly(idA);
     }
 
     @Test
@@ -1669,12 +1860,12 @@ class BookingServiceTest {
         UUID masterUserId = masterUser.getId();
 
         when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
-        when(bookingRepository.findIdsByMasterId(masterId, pageable)).thenReturn(Page.empty());
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, null, null, null, null, normalizedUnpaged())).thenReturn(Page.empty());
 
-        var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER), null, pageable);
+        var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER), null, null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsByMasterId(masterId, pageable);
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, null, null, null, null, normalizedUnpaged());
     }
 
     @Test
@@ -1685,15 +1876,52 @@ class BookingServiceTest {
         UUID salonMasterUserId = salonMasterUser.getId();
 
         when(masterRepository.findByUserId(salonMasterUserId)).thenReturn(Optional.of(master));
-        when(bookingRepository.findIdsByMasterIdAndStatus(masterId, BookingStatus.CONFIRMED, pageable))
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
         var result = bookingService.getMyBookings(
-                salonMasterUserId, buildAuth(Role.SALON_MASTER), BookingStatus.CONFIRMED, pageable);
+                salonMasterUserId, buildAuth(Role.SALON_MASTER), List.of(BookingStatus.CONFIRMED), null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsByMasterIdAndStatus(masterId, BookingStatus.CONFIRMED, pageable);
-        verify(bookingRepository, never()).findIdsByMasterId(any(), any());
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER with multiple statuses passes the union to the master-scoped repository method "
+            + "(Phase 26.1: ?status=CANCELLED&status=DECLINED)")
+    void should_returnMasterBookings_when_independentMasterListsWithMultipleStatuses() {
+        Pageable pageable = Pageable.unpaged();
+        User masterUser = buildUser(UUID.randomUUID(), Role.INDEPENDENT_MASTER);
+        UUID masterUserId = masterUser.getId();
+        Set<BookingStatus> expected = EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED);
+
+        when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, expected, null, null, null, normalizedUnpaged())).thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER),
+                List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED), null, null, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, expected, null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("repeated/duplicate statuses de-duplicate to a single-element EnumSet before hitting the "
+            + "master-scoped repository method (Phase 26.1: ?status=CONFIRMED&status=CONFIRMED)")
+    void should_deduplicateStatuses_when_independentMasterRepeatsTheSameStatus() {
+        Pageable pageable = Pageable.unpaged();
+        User masterUser = buildUser(UUID.randomUUID(), Role.INDEPENDENT_MASTER);
+        UUID masterUserId = masterUser.getId();
+
+        when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER),
+                List.of(BookingStatus.CONFIRMED, BookingStatus.CONFIRMED), null, null, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
     }
 
     @Test
@@ -1703,8 +1931,362 @@ class BookingServiceTest {
         User salonAdmin = buildUser(salonAdminId, Role.SALON_ADMIN);
         Pageable pageable = Pageable.unpaged();
 
-        assertThatThrownBy(() -> bookingService.getMyBookings(salonAdminId, buildAuth(Role.SALON_ADMIN), null, pageable))
+        assertThatThrownBy(() -> bookingService.getMyBookings(salonAdminId, buildAuth(Role.SALON_ADMIN), null, null, null, null, pageable))
                 .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── getMyBookedDays (Phase 26.5 — GET /bookings/me/booked-days) ──────────────────────────────
+
+    @Test
+    @DisplayName("CLIENT scope: repository result (already distinct/ascending from the native query) "
+            + "is returned as-is, scoped by the caller's own client id — no in-Java re-reduction")
+    void should_returnClientScopedDates_when_clientRequestsBookedDays() {
+        LocalDate from = LocalDate.of(2026, 7, 1);
+        LocalDate to = LocalDate.of(2026, 7, 31);
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 7, 5), LocalDate.of(2026, 7, 20));
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+
+        // Repository returns the raw JDBC java.sql.Date (see BookingRepository's Phase 26.5
+        // javadoc — this is what production reproduces the ConverterNotFoundException with);
+        // BookingService converts to LocalDate via java.sql.Date::toLocalDate.
+        List<java.sql.Date> stubbed = expected.stream().map(java.sql.Date::valueOf).toList();
+        when(bookingRepository.findBookedDatesByClientId(clientId, fromTs, toExclusive)).thenReturn(stubbed);
+
+        var result = bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository).findBookedDatesByClientId(clientId, fromTs, toExclusive);
+        verifyNoInteractions(masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER/SALON_MASTER scope: masterId is resolved from the JWT principal "
+            + "(masterRepository.findByUserId), never taken from a request parameter")
+    void should_returnMasterScopedDates_when_independentMasterRequestsBookedDays() {
+        LocalDate from = LocalDate.of(2026, 8, 1);
+        LocalDate to = LocalDate.of(2026, 8, 10);
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 8, 3));
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID actorUserId = UUID.randomUUID();
+        List<java.sql.Date> stubbed = expected.stream().map(java.sql.Date::valueOf).toList();
+
+        when(masterRepository.findByUserId(actorUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findBookedDatesByMasterId(masterId, fromTs, toExclusive)).thenReturn(stubbed);
+
+        var result = bookingService.getMyBookedDays(actorUserId, buildAuth(Role.INDEPENDENT_MASTER), from, to);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository).findBookedDatesByMasterId(masterId, fromTs, toExclusive);
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("NotFoundException when a master-role caller has no Master profile row")
+    void should_throwNotFound_when_masterRoleCallerHasNoMasterProfile() {
+        UUID actorUserId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 8, 1);
+        LocalDate to = LocalDate.of(2026, 8, 10);
+
+        when(masterRepository.findByUserId(actorUserId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(actorUserId, buildAuth(Role.SALON_MASTER), from, to))
+                .isInstanceOf(NotFoundException.class);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER scope: aggregates across every owned active salon (salonRepository"
+            + ".findIdsByOwnerIdAndIsActiveTrue), mirroring getMyBookings' provider dispatch")
+    void should_returnSalonScopedDates_when_salonOwnerRequestsBookedDays() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 9, 12));
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        List<java.sql.Date> stubbed = expected.stream().map(java.sql.Date::valueOf).toList();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive)).thenReturn(stubbed);
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository).findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER with no active salons short-circuits to an empty list without querying bookings")
+    void should_returnEmptyList_when_salonOwnerHasNoActiveSalonsForBookedDays() {
+        UUID ownerId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to);
+
+        assertThat(result).isEmpty();
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("ForbiddenException when SALON_ADMIN calls getMyBookedDays — same boundary as getMyBookings")
+    void should_throwForbidden_when_salonAdminRequestsBookedDays() {
+        UUID salonAdminId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(salonAdminId, buildAuth(Role.SALON_ADMIN), from, to))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'from' is null — the range is required, unlike getMyBookings' "
+            + "optional from/to")
+    void should_throwBadRequest_when_fromIsNullForBookedDays() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        clientId, buildAuth(Role.CLIENT), null, LocalDate.of(2026, 7, 31)))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'to' is null")
+    void should_throwBadRequest_when_toIsNullForBookedDays() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        clientId, buildAuth(Role.CLIENT), LocalDate.of(2026, 7, 1), null))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'from' is after 'to'")
+    void should_throwBadRequest_when_fromIsAfterToForBookedDays() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        clientId, buildAuth(Role.CLIENT), LocalDate.of(2026, 7, 31), LocalDate.of(2026, 7, 1)))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("the 366-day span cap is delegated to ScheduleDateMath.assertSpanWithinMax, not "
+            + "re-implemented inline — a stub throwing from that guard propagates through getMyBookedDays "
+            + "before any repository call is made")
+    void should_delegateSpanCap_toScheduleDateMathForBookedDays() {
+        LocalDate from = LocalDate.of(2026, 1, 1);
+        LocalDate to = LocalDate.of(2027, 6, 1);
+
+        org.mockito.Mockito.doThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Date range exceeds the maximum of 366 days"))
+                .when(dateMath).assertSpanWithinMax(from, to);
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verify(dateMath).assertToPlusOneDayRepresentable(to);
+        verify(dateMath).assertSpanWithinMax(from, to);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("from/to convert to the same half-open Kyiv-zoned instant range as getMyBookings' "
+            + "date filter (from.atStartOfDay(KYIV), to.plusDays(1).atStartOfDay(KYIV)) — a dot here and "
+            + "a non-empty GET /bookings/me?from=D&to=D for the same date must agree")
+    void should_useHalfOpenKyivRange_matchingGetMyBookings_forBookedDays() {
+        LocalDate from = LocalDate.of(2026, 3, 1);
+        LocalDate to = LocalDate.of(2026, 3, 1);
+        OffsetDateTime expectedFromTs = OffsetDateTime.parse("2026-03-01T00:00:00+02:00");
+        OffsetDateTime expectedToExclusive = OffsetDateTime.parse("2026-03-02T00:00:00+02:00");
+
+        when(bookingRepository.findBookedDatesByClientId(clientId, expectedFromTs, expectedToExclusive))
+                .thenReturn(List.of());
+
+        bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to);
+
+        verify(bookingRepository).findBookedDatesByClientId(clientId, expectedFromTs, expectedToExclusive);
+    }
+
+    // ── getMyBookings — sort whitelist tripwire (Phase 26.3, backend-security gap) ──────────────
+    //
+    // normalizeBookingSort is a security boundary (see its javadoc): both the CLIENT projection
+    // query and the provider ID-page query JOIN through b.master m JOIN m.user, so an unvalidated
+    // Sort.Order#getProperty() dot-path is legal JPQL/Criteria and would let an authenticated
+    // caller order their OWN results by an arbitrary column on that join — including
+    // User.passwordHash, a real mapped column (User.java:41-42). Pre-Phase-26.3, that ordering
+    // oracle was live: ?sort=master.user.passwordHash,asc would have compiled and executed. These
+    // two tests are the ONLY assertions in the suite that the whitelist actually rejects an
+    // unlisted property before either repository method is ever reached — backend-security found
+    // the control rested entirely on manual code review with no regression net.
+
+    @Test
+    @DisplayName("BusinessException(400) is thrown, and NEITHER repository is ever touched, when sort "
+            + "targets the dotted join path master.user.passwordHash — the credential side channel "
+            + "this whitelist exists to close (an authenticated actor ordering their own bookings by "
+            + "their employees' password-hash column, never visible in the response body itself)")
+    void should_rejectSortProperty_when_dottedPathTargetsPasswordHashColumn() {
+        UUID actorId = UUID.randomUUID();
+        Pageable maliciousPageable =
+                PageRequest.of(0, 20, Sort.by(Sort.Direction.ASC, "master.user.passwordHash"));
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, buildAuth(Role.CLIENT), null, null, null, null, maliciousPageable))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("master.user.passwordHash")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+        verify(salonRepository, never()).findIdsByOwnerIdAndIsActiveTrue(any());
+        verify(masterRepository, never()).findByUserId(any());
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) is thrown, and NEITHER repository is ever touched, when sort "
+            + "targets a plain unrecognised property that is not a dotted path at all — the whitelist "
+            + "must reject any non-listed property, not only association traversals")
+    void should_rejectSortProperty_when_propertyNotOnWhitelistAtAll() {
+        UUID actorId = UUID.randomUUID();
+        Pageable badPageable = PageRequest.of(0, 20, Sort.by(Sort.Direction.DESC, "foo"));
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, buildAuth(Role.CLIENT), null, null, null, null, badPageable))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("foo")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+        verify(salonRepository, never()).findIdsByOwnerIdAndIsActiveTrue(any());
+        verify(masterRepository, never()).findByUserId(any());
+    }
+
+    // ── getMyBookings — sort cardinality bound (Phase 26.3 audit, backend-perf F4) ──────────────
+    //
+    // MAX_SORT_ORDERS caps normalizeBookingSort's effective Sort at 3 entries — each distinct
+    // (property, direction) sequence compiles to a textually distinct ORDER BY, so an unbounded
+    // sort list inflates plan-cache entries. The two tests below isolate that count bound from the
+    // whitelist check above: every property used here (startsAt, priceAtBooking — reused with a
+    // different direction to reach the required order count) is individually whitelisted, so a
+    // rejection can ONLY be attributed to cardinality, never to an unrecognised property name.
+
+    @Test
+    @DisplayName("BusinessException(400) is thrown, and NEITHER repository is ever touched, when sort "
+            + "carries 4 orders — all four individually whitelisted properties (startsAt, "
+            + "priceAtBooking, priceAtBooking desc, startsAt again) so the rejection is attributable "
+            + "ONLY to exceeding MAX_SORT_ORDERS=3, never to the property whitelist")
+    void should_rejectSort_when_fourSortOrdersExceedTheCountBound() {
+        UUID actorId = UUID.randomUUID();
+        Sort fourOrders = Sort.by("startsAt")
+                .and(Sort.by("priceAtBooking"))
+                .and(Sort.by(Sort.Direction.DESC, "priceAtBooking"))
+                .and(Sort.by(Sort.Direction.DESC, "startsAt"));
+        Pageable tooManyOrdersPageable = PageRequest.of(0, 20, fourOrders);
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, buildAuth(Role.CLIENT), null, null, null, null, tooManyOrdersPageable))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Too many sort properties")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+        verify(salonRepository, never()).findIdsByOwnerIdAndIsActiveTrue(any());
+        verify(masterRepository, never()).findByUserId(any());
+    }
+
+    @Test
+    @DisplayName("exactly 3 sort orders are accepted — the CLIENT projection query is reached with the "
+            + "normalized (3 whitelisted orders + mandatory id tiebreaker) sort, proving the bound is "
+            + "\">3 rejects\", not \">=3 rejects\" (no off-by-one against MAX_SORT_ORDERS=3)")
+    void should_acceptSort_when_exactlyThreeSortOrdersAtTheCountBound() {
+        Sort threeOrders = Sort.by("startsAt")
+                .and(Sort.by("priceAtBooking"))
+                .and(Sort.by(Sort.Direction.DESC, "startsAt"));
+        Pageable atBoundPageable = Pageable.unpaged(threeOrders);
+        Sort expectedNormalizedSort = threeOrders.and(Sort.by(Sort.Direction.ASC, "id"));
+        Pageable expectedNormalizedPageable = Pageable.unpaged(expectedNormalizedSort);
+
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, atBoundPageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable);
+    }
+
+    // ── getMyBookings — serviceId cap (Phase 26.4 audit, MAX_SERVICE_ID_FILTER
+    //    defense-in-depth) — the controller's @Size(max = 50) is the first line of defense; this
+    //    isolates the SERVICE-level bound so a future caller that reaches getMyBookings directly
+    //    (bypassing the controller layer, e.g. a new internal caller) still cannot build an
+    //    unbounded IN-list. ──────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("BusinessException(400) is thrown, and NEITHER repository is ever touched, when "
+            + "51 distinct serviceId values are supplied directly to the service — the "
+            + "service-level MAX_SERVICE_ID_FILTER=50 bound is defense-in-depth independent of the "
+            + "controller's @Size(max = 50)")
+    void should_rejectServiceIdFilter_when_51DistinctValuesExceedTheCountBound() {
+        List<UUID> fiftyOneIds = new java.util.ArrayList<>();
+        for (int i = 0; i < 51; i++) {
+            fiftyOneIds.add(UUID.randomUUID());
+        }
+        Pageable pageable = PageRequest.of(0, 20);
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        clientId, buildAuth(Role.CLIENT), null, null, null, fiftyOneIds, pageable))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("50")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+        verify(salonRepository, never()).findIdsByOwnerIdAndIsActiveTrue(any());
+        verify(masterRepository, never()).findByUserId(any());
+    }
+
+    @Test
+    @DisplayName("exactly 50 distinct serviceId values are accepted — the CLIENT projection query is "
+            + "reached with the normalized, de-duplicated 50-element set, proving the bound is "
+            + "\">50 rejects\", not \">=50 rejects\" (no off-by-one against MAX_SERVICE_ID_FILTER=50)")
+    void should_acceptServiceIdFilter_when_exactly50DistinctValuesAtTheCountBound() {
+        List<UUID> fiftyIds = new java.util.ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            fiftyIds.add(UUID.randomUUID());
+        }
+        java.util.Set<UUID> expectedServiceIds = new java.util.LinkedHashSet<>(fiftyIds);
+        Sort tiebreakerOnly = Sort.by(Sort.Direction.ASC, "id");
+        Pageable pageable = Pageable.unpaged();
+        Pageable expectedNormalizedPageable = Pageable.unpaged(DEFAULT_BOOKING_SORT_WITH_TIEBREAKER());
+
+        when(bookingRepository.findIdsByClientIdFiltered(
+                        eq(clientId), eq(null), eq(null), eq(null), eq(expectedServiceIds), eq(expectedNormalizedPageable)))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), null, null, null, fiftyIds, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsByClientIdFiltered(
+                eq(clientId), eq(null), eq(null), eq(null), eq(expectedServiceIds), eq(expectedNormalizedPageable));
+    }
+
+    /** Mirrors {@code BookingService.normalizeBookingSort}'s default-sort-plus-tiebreaker shape
+     * for an unsorted {@code Pageable.unpaged()} input: {@code startsAt DESC} then {@code id ASC}. */
+    private static Sort DEFAULT_BOOKING_SORT_WITH_TIEBREAKER() {
+        return Sort.by(Sort.Direction.DESC, "startsAt").and(Sort.by(Sort.Direction.ASC, "id"));
     }
 
     // ── getBooking ─────────────────────────────────────────────────────────────

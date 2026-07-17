@@ -10,12 +10,14 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.sql.Date;
 import java.time.OffsetDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface BookingRepository extends JpaRepository<Booking, UUID> {
+public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
 
     // ── ID-only paginated queries — two-query pattern (Fix H1 — HHH90003004) ──
     //
@@ -49,33 +51,37 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("status") BookingStatus status,
             Pageable pageable);
 
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            WHERE b.master.id = :masterId
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.master.id = :masterId
-            """)
-    // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
-    // Scope enforcement: BookingService resolves masterId via masterRepository.findByUserId(actorUserId).
-    Page<UUID> findIdsByMasterId(@Param("masterId") UUID masterId, Pageable pageable);
-
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            WHERE b.master.id = :masterId AND b.status = :status
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.master.id = :masterId AND b.status = :status
-            """)
-    // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
-    Page<UUID> findIdsByMasterIdAndStatus(
-            @Param("masterId") UUID masterId,
-            @Param("status") BookingStatus status,
-            Pageable pageable);
+    // ── Phase 26.1 — collapsed filtered query family ───────────────────────────
+    //
+    // findIdsByMasterId / findIdsByMasterIdAndStatus and findIdsBySalonIds /
+    // findIdsBySalonIdsAndStatus collapsed into ONE filtered query per scope, so
+    // 26.2 (date range), 26.3 (sort) and 26.4 (service filter) each edit a single
+    // query instead of four.
+    //
+    // Phase 26.1 audit fix (Finding 1 — HIGH, backend-perf): findIdsByMasterIdFiltered and
+    // findIdsBySalonIdsFiltered originally used the (:statuses IS NULL OR b.status IN :statuses)
+    // sentinel idiom here. That idiom is NOT sargable — PgJDBC's default prepareThreshold=5 makes
+    // Postgres fall back to a GENERIC plan after the 5th execution, one that cannot see the bound
+    // value and so cannot fold away the dead OR branch (measured ~19x slower on a 503k-row table,
+    // scaling with the provider's row count). Both methods now live in BookingRepositoryCustom /
+    // BookingRepositoryCustomImpl, built dynamically via org.springframework.data.jpa.domain
+    // .Specification (see BookingSpecifications for the full rationale) so the emitted SQL
+    // contains ONLY the predicates actually requested — no dead branch, and each predicate shape
+    // gets its own Postgres plan-cache entry. Method signatures are unchanged, so every caller
+    // (BookingService) needed no changes. Phase 26.3 replaced the (then still hardcoded)
+    // ORDER BY b.startsAt DESC with a translation of pageable.getSort() into Criteria Orders —
+    // see BookingRepositoryCustomImpl.findIdPage — because Sort.getProperty() is a validated,
+    // whitelisted value by the time it reaches this layer (BookingService#normalizeBookingSort).
+    //
+    // hydrateClientBookingDetails (formerly findClientBookingDetails) carried the same sentinel
+    // idiom — Finding 2 (MEDIUM) — on THREE predicates (statuses, from/toExclusive, serviceIds),
+    // deliberately left as-is through Phase 26.4 because a straight Specification/Criteria
+    // rewrite would have had to re-express the query's five PII salon-precedence CASE WHEN
+    // expressions in a second language. Phase 26.7.1 closed this gap via a hybrid: filtering
+    // moved to BookingRepositoryCustom#findIdsByClientIdFiltered (a Specification ID page, same
+    // sargable shape as findIdsByMasterIdFiltered), and the JPQL projection above was reduced to
+    // a pure WHERE b.id IN :ids hydrate — the SELECT/CASE block itself was never touched. See
+    // that method's javadoc for the full history.
 
     @Query(value = """
             SELECT b.id FROM Booking b
@@ -133,46 +139,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     // The previous approach resolved salonId via userRepository.findSalonIdById which only
     // returns a value for invited roles (SALON_ADMIN, SALON_MASTER). For SALON_OWNER the
     // relationship is stored on Salon.owner_id, not User.salonId — always returning empty.
-    // These methods accept a pre-resolved list of salonIds (from SalonRepository
-    // .findIdsByOwnerIdAndIsActiveTrue) and join through master → salon, covering all active
-    // salons owned by the actor in a single query.
-
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            """)
-    Page<UUID> findIdsBySalonIds(
-            @Param("salonIds") List<UUID> salonIds,
-            Pageable pageable);
-
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            AND b.status = :status
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            AND b.status = :status
-            """)
-    Page<UUID> findIdsBySalonIdsAndStatus(
-            @Param("salonIds") List<UUID> salonIds,
-            @Param("status") BookingStatus status,
-            Pageable pageable);
+    // findIdsBySalonIdsFiltered accepts a pre-resolved list of salonIds (from SalonRepository
+    // .findIdsByOwnerIdAndIsActiveTrue) and joins through master → salon, covering all active
+    // salons owned by the actor in a single query. Implemented in BookingRepositoryCustomImpl
+    // (Specification-based, see the Phase 26.1 audit-fix comment above / BookingSpecifications)
+    // rather than as a @Query here.
 
     // The provider "Графік" (calendar) query — a booking is born CONFIRMED (track 24.x
     // auto-confirm), so it appears here the instant it is created.
@@ -199,6 +170,79 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("to") OffsetDateTime to,
             Pageable pageable);
 
+    // ── Phase 26.5 — GET /bookings/me/booked-days (day-rail dot set) ──────────
+    //
+    // The rail's dot set must be the caller's FULL booking history for the range — no
+    // status filter (see the design's `_bookingDays` getter, computed from the unfiltered
+    // `widget.bookings`, not the filtered `_visible` view) — so, unlike
+    // findActiveIdsByMasterIdAndStartsAtBetween above, these three queries deliberately
+    // carry no `status IN (...)` predicate.
+    //
+    // Native + SELECT DISTINCT on a timezone-converted date expression: JPQL has no
+    // AT TIME ZONE function, and grouping must happen in Postgres (≤ ~361 rows back), not
+    // by loading every booking row into heap and reducing in Java. The half-open
+    // [:from, :toExclusive) bound on starts_at mirrors BookingService's LocalDate ->
+    // OffsetDateTime conversion (from.atStartOfDay(TimeZones.KYIV), to.plusDays(1)
+    // .atStartOfDay(TimeZones.KYIV)) exactly, so a dot here and a day-filtered result on
+    // GET /bookings/me always agree.
+    //
+    // The 'Europe/Kyiv' literal below cannot be replaced with a bound parameter reliably
+    // (AT TIME ZONE's right-hand operand is polymorphic; Postgres can fail to infer a bound
+    // parameter's type there) nor with a reference to the Java constant TimeZones.KYIV
+    // (native SQL has no access to JVM constants) — it is intentionally a literal, kept in
+    // sync with TimeZones.KYIV's value ("Europe/Kyiv") by convention. Update both together.
+    //
+    // Return type is java.sql.Date, NOT java.time.LocalDate (CRITICAL fix, backend-qa
+    // BookingMyBookedDaysIT, 2026-07-17). A native scalar projection returns the raw JDBC type
+    // the driver produces for a `date` column — java.sql.Date — and Spring Data's
+    // QueryExecutionResultHandler / GenericConversionService has no java.sql.Date -> LocalDate
+    // converter registered for that path (that conversion machinery is Hibernate's
+    // entity-attribute JSR-310 support, which a native scalar projection never goes through).
+    // Declaring List<LocalDate> here made every call 500 with ConverterNotFoundException. The
+    // caller (BookingService#getMyBookedDays) converts via java.sql.Date::toLocalDate, which is
+    // lossless here because the value is already the Kyiv calendar date computed by the
+    // `AT TIME ZONE 'Europe/Kyiv'` expression above, not a UTC-zoned instant — toLocalDate() on a
+    // java.sql.Date reads its stored year/month/day fields directly, no zone reinterpretation.
+
+    @Query(value = """
+            SELECT DISTINCT (b.starts_at AT TIME ZONE 'Europe/Kyiv')::date AS d
+            FROM bookings b
+            WHERE b.master_id = :masterId
+              AND b.starts_at >= :from
+              AND b.starts_at < :toExclusive
+            ORDER BY d
+            """, nativeQuery = true)
+    List<Date> findBookedDatesByMasterId(
+            @Param("masterId") UUID masterId,
+            @Param("from") OffsetDateTime from,
+            @Param("toExclusive") OffsetDateTime toExclusive);
+
+    @Query(value = """
+            SELECT DISTINCT (b.starts_at AT TIME ZONE 'Europe/Kyiv')::date AS d
+            FROM bookings b
+            WHERE b.salon_id IN (:salonIds)
+              AND b.starts_at >= :from
+              AND b.starts_at < :toExclusive
+            ORDER BY d
+            """, nativeQuery = true)
+    List<Date> findBookedDatesBySalonIds(
+            @Param("salonIds") Collection<UUID> salonIds,
+            @Param("from") OffsetDateTime from,
+            @Param("toExclusive") OffsetDateTime toExclusive);
+
+    @Query(value = """
+            SELECT DISTINCT (b.starts_at AT TIME ZONE 'Europe/Kyiv')::date AS d
+            FROM bookings b
+            WHERE b.client_id = :clientId
+              AND b.starts_at >= :from
+              AND b.starts_at < :toExclusive
+            ORDER BY d
+            """, nativeQuery = true)
+    List<Date> findBookedDatesByClientId(
+            @Param("clientId") UUID clientId,
+            @Param("from") OffsetDateTime from,
+            @Param("toExclusive") OffsetDateTime toExclusive);
+
     /**
      * Batch-hydrates a bounded set of booking IDs with the full association graph.
      * Always called with the result of an ID-only page query, so the IN list size
@@ -217,14 +261,14 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             """)
     List<Booking> findAllByIdsWithGraph(@Param("ids") List<UUID> ids);
 
-    // ── Client booking-detail projection (Phase 19.3) ─────────────────────────
+    // ── Client booking-detail projection (Phase 19.3; sentinel removed Phase 26.7.1) ──
     /**
-     * One-query, N+1-free projection for {@code GET /bookings/me}: every field
-     * {@link com.beautica.booking.dto.BookingDetailResponse} needs for a client row,
-     * plus a {@code reviewExists} flag via {@code LEFT JOIN Review}.
-     * {@code mu.professionalTitle} rides the same {@code JOIN m.user mu} already used for
-     * {@code mu.firstName}/{@code mu.lastName} — no additional join, and the column is
-     * nullable (a master may never have set a title).
+     * Hydrates a bounded set of booking ids into the enriched
+     * {@link com.beautica.booking.dto.BookingDetailResponse} projection for {@code GET
+     * /bookings/me} (CLIENT role): every field that DTO needs for a client row, plus a
+     * {@code reviewExists} flag via {@code LEFT JOIN Review}. {@code mu.professionalTitle} rides
+     * the same {@code JOIN m.user mu} already used for {@code mu.firstName}/{@code mu.lastName}
+     * — no additional join, and the column is nullable (a master may never have set a title).
      *
      * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
      * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
@@ -236,9 +280,32 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * data (e.g. their home door code) onto a salon booking. Riding the same
      * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
      *
-     * <p>{@code statusFilter} is optional: when {@code null} the
-     * {@code (:statusFilter IS NULL OR b.status = :statusFilter)} idiom matches all rows
-     * (one method covers both the filtered and unfiltered list paths).
+     * <p><b>Phase 26.7.1 — the sentinel is gone; this is now a pure {@code IN :ids} hydrate.</b>
+     * Prior to this phase the {@code WHERE} clause carried {@code b.client.id = :clientId} plus
+     * three {@code (:x IS NULL OR …)} sentinel predicates (statuses, {@code CAST}-guarded
+     * {@code from}/{@code toExclusive}, and {@code serviceIds}) — the same non-sargable idiom
+     * Phase 26.1 removed from the provider paths (Finding 2, MEDIUM, backend-perf), left
+     * deliberately unconverted here because a straight Criteria rewrite would have had to
+     * re-express the five PII {@code CASE WHEN} salon-precedence expressions below in a second
+     * language (Option A in the phase doc), risking a silent leak of a salon-employed master's
+     * home address onto a salon booking. Phase 26.7.1's hybrid (Option C) resolves this without
+     * that risk: the filtering — the mandatory {@code b.client.id = :clientId} scope plus the
+     * optional status/date-range/serviceId predicates — moved to a dynamic
+     * {@link org.springframework.data.jpa.domain.Specification} ID page,
+     * {@code BookingRepositoryCustom#findIdsByClientIdFiltered} (see
+     * {@link BookingSpecifications#clientIdEquals}), built with the exact same sargable,
+     * no-dead-branch technique as {@code findIdsByMasterIdFiltered}. THIS method now does only
+     * the hydrate half: given a bounded page of ids from that ID-page query, it re-emits the
+     * verbatim {@code SELECT new ClientBookingDetailProjection(…)} projection — including all
+     * five {@code CASE WHEN} expressions, copied character-for-character, never re-expressed —
+     * against a single {@code WHERE b.id IN :ids}. No sentinel, no {@code CAST}, no {@code
+     * :clientId}/{@code :statuses}/{@code :from}/{@code :toExclusive}/{@code :serviceIds}
+     * parameters remain on this query; ownership and filtering are enforced entirely upstream, on
+     * the ID page. {@code BookingService#listClientBookings} composes the two calls and
+     * re-imposes the ID page's order onto these hydrated rows (an {@code IN} clause does not
+     * guarantee row order), mirroring the provider path's
+     * {@code findIdsByMasterIdFiltered}/{@code findIdsBySalonIdsFiltered} +
+     * {@code findAllByIdsWithGraph} two-query pattern exactly.
      *
      * <p><b>Discovery locality is district-primary via the salon link</b> — the salon's
      * city/district/address wins when the master is salon-employed, else the master's own
@@ -247,12 +314,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * returns the FK ids only; {@code BookingService} resolves the {@code name_uk} labels
      * through the {@code DiscoveryLocationResolver} M2 seam (§E: batched, not per row).
      *
-     * <p>Pagination is safe to apply directly here: the query projects scalar columns (no
-     * JOIN FETCH on a collection), so Hibernate emits a correct SQL {@code LIMIT/OFFSET}
-     * and the HHH90003004 in-memory-pagination trap does not apply.
+     * <p>{@code ids} is always the bounded (page-size, default 20) result of
+     * {@code findIdsByClientIdFiltered} — never an unbounded, caller-supplied collection. This is
+     * the same bounded-{@code IN} contract {@link #findAllByIdsWithGraph} already documents for
+     * the provider path.
      *
-     * <p>Scope: callers MUST pass the authenticated client's own user id — the predicate
-     * {@code b.client.id = :clientId} is the ownership boundary (Anti-Bug §E-4).
+     * <p><b>Ordering is derived upstream, on the ID page — this query carries no {@code ORDER
+     * BY}.</b> As of Phase 26.7.1 the {@link Sort} that used to reach this method (pre-validated
+     * and pre-normalized by {@code BookingService#normalizeBookingSort}: whitelisted to
+     * {@code startsAt}/{@code priceAtBooking}/{@code createdAt}, defaulted to {@code startsAt
+     * DESC} when unsorted, always carrying a trailing {@code id ASC} tiebreaker) is instead
+     * translated into Criteria {@code Order}s by
+     * {@code BookingRepositoryCustomImpl.findIdPage} — the same choke point the provider
+     * ID-page queries already use. This unifies both roles' sort discipline onto one code path;
+     * see {@code findIdsByClientIdFiltered}'s javadoc for the full contract.
      */
     @Query(value = """
             SELECT new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -294,19 +369,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
             LEFT JOIN Review r ON r.booking = b
-            WHERE b.client.id = :clientId
-              AND (:statusFilter IS NULL OR b.status = :statusFilter)
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.client.id = :clientId
-              AND (:statusFilter IS NULL OR b.status = :statusFilter)
+            WHERE b.id IN :ids
             """)
-    Page<ClientBookingDetailProjection> findClientBookingDetails(
-            @Param("clientId") UUID clientId,
-            @Param("statusFilter") BookingStatus statusFilter,
-            Pageable pageable);
+    List<ClientBookingDetailProjection> hydrateClientBookingDetails(@Param("ids") Collection<UUID> ids);
 
     // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────
 

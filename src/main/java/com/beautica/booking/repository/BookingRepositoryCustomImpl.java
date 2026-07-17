@@ -1,0 +1,185 @@
+package com.beautica.booking.repository;
+
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingStatus;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import jakarta.persistence.TypedQuery;
+import jakarta.persistence.criteria.CriteriaBuilder;
+import jakarta.persistence.criteria.CriteriaQuery;
+import jakarta.persistence.criteria.Order;
+import jakarta.persistence.criteria.Predicate;
+import jakarta.persistence.criteria.Root;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+
+import java.time.OffsetDateTime;
+import java.util.Collection;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Criteria-API implementation of {@link BookingRepositoryCustom} (Phase 26.1 audit fix, Finding
+ * 1 — HIGH, backend-perf). See {@link BookingSpecifications} for the full design rationale.
+ *
+ * <p>{@code EntityManager} is field-injected via {@link PersistenceContext} — the documented
+ * Spring exception to constructor injection, mirroring {@code SearchService}'s own use of the
+ * same annotation for the same reason (Spring intercepts it specially to supply a
+ * transaction-aware shared proxy). This class becomes a real Spring bean via Spring Data's
+ * repository-fragment scanning (the {@code <CustomInterfaceName>Impl} naming convention), so
+ * standard field injection applies.
+ *
+ * <p>Deliberately does NOT delegate to {@code JpaSpecificationExecutor.findAll(Specification,
+ * Pageable)} — that convenience method selects full {@link Booking} rows, which would break the
+ * two-query ID-page + graph-hydrate pattern this seam must preserve
+ * ({@code BookingService.listProviderBookings}). {@code BookingRepository} deliberately does not
+ * extend {@code JpaSpecificationExecutor} for the same reason — this remains true after Phase
+ * 26.3. Building the {@link CriteriaQuery} by hand keeps the {@code SELECT b.id} projection while
+ * still — as of Phase 26.3 — deriving {@code ORDER BY} from {@code pageable.getSort()} (see
+ * {@link #findIdPage}).
+ */
+class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    @Override
+    public Page<UUID> findIdsByMasterIdFiltered(
+            UUID masterId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.masterIdEquals(masterId));
+        if (statuses != null && !statuses.isEmpty()) {
+            spec = spec.and(BookingSpecifications.statusIn(statuses));
+        }
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    @Override
+    public Page<UUID> findIdsBySalonIdsFiltered(
+            List<UUID> salonIds, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.salonIdIn(salonIds));
+        if (statuses != null && !statuses.isEmpty()) {
+            spec = spec.and(BookingSpecifications.statusIn(statuses));
+        }
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    @Override
+    public Page<UUID> findIdsByClientIdFiltered(
+            UUID clientId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.clientIdEquals(clientId));
+        if (statuses != null && !statuses.isEmpty()) {
+            spec = spec.and(BookingSpecifications.statusIn(statuses));
+        }
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    /**
+     * Composes the optional Phase 26.2 date-range predicates onto {@code spec} — each bound
+     * applied only when non-null, exactly like the {@code statuses} predicate above, so a caller
+     * that omits both bounds gets byte-for-byte the same SQL text Phase 26.1 already produces.
+     */
+    private static Specification<Booking> applyDateRange(
+            Specification<Booking> spec, OffsetDateTime from, OffsetDateTime toExclusive) {
+        Specification<Booking> result = spec;
+        if (from != null) {
+            result = result.and(BookingSpecifications.startsAtOnOrAfter(from));
+        }
+        if (toExclusive != null) {
+            result = result.and(BookingSpecifications.startsAtBefore(toExclusive));
+        }
+        return result;
+    }
+
+    /**
+     * Composes the optional Phase 26.4 {@code masterService.id IN :serviceIds} predicate onto
+     * {@code spec} — applied only when the caller supplied a non-empty set, exactly like
+     * {@code statuses} above, so a caller that omits {@code serviceId} entirely gets byte-for-byte
+     * the same SQL text Phase 26.2 already produces (no dead {@code IS NULL OR} branch — see
+     * {@link BookingSpecifications}'s class javadoc for why that idiom is rejected on this path).
+     */
+    private static Specification<Booking> applyServiceFilter(
+            Specification<Booking> spec, Collection<UUID> serviceIds) {
+        if (serviceIds == null || serviceIds.isEmpty()) {
+            return spec;
+        }
+        return spec.and(BookingSpecifications.masterServiceIdIn(serviceIds));
+    }
+
+    /**
+     * Executes {@code spec} as a {@code SELECT b.id} query ordered by {@code pageable.getSort()}
+     * (Phase 26.3 — previously a HARDCODED {@code ORDER BY b.startsAt DESC}, independent of the
+     * caller's {@code Sort}), plus a matching {@code COUNT(*)} query built from the same
+     * {@link Specification} — the same id-page-plus-count shape the superseded {@code @Query}
+     * methods produced.
+     *
+     * <p><b>Trusts an already-validated {@code Sort}.</b> {@code pageable.getSort()} is translated
+     * 1:1 into Criteria {@link Order}s via {@link Root#get(String)} on each
+     * {@link Sort.Order#getProperty()}. This is safe ONLY because both callers
+     * ({@code findIdsByMasterIdFiltered} / {@code findIdsBySalonIdsFiltered}) are reached
+     * exclusively through {@code BookingService#getMyBookings}, which normalizes and whitelists
+     * the {@code Sort} (via {@code normalizeBookingSort}) to {@code startsAt} /
+     * {@code priceAtBooking} / {@code createdAt} — plus a trailing {@code id} tiebreaker — before
+     * either method is ever invoked. An unvalidated {@code Sort} reaching this method would let
+     * {@link Root#get(String)} resolve an arbitrary property path (including through a join
+     * alias), which is exactly the ordering oracle Phase 26.3 closes at the service boundary; do
+     * NOT call this method (or its two public callers) with a raw, caller-supplied {@code Sort}.
+     */
+    private Page<UUID> findIdPage(Specification<Booking> spec, Pageable pageable) {
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+
+        CriteriaQuery<UUID> idQuery = cb.createQuery(UUID.class);
+        Root<Booking> idRoot = idQuery.from(Booking.class);
+        idQuery.select(idRoot.get("id"));
+        Predicate idPredicate = spec.toPredicate(idRoot, idQuery, cb);
+        if (idPredicate != null) {
+            idQuery.where(idPredicate);
+        }
+        idQuery.orderBy(toCriteriaOrders(cb, idRoot, pageable.getSort()));
+
+        TypedQuery<UUID> typedIdQuery = entityManager.createQuery(idQuery);
+        typedIdQuery.setFirstResult((int) pageable.getOffset());
+        typedIdQuery.setMaxResults(pageable.getPageSize());
+        List<UUID> ids = typedIdQuery.getResultList();
+
+        CriteriaQuery<Long> countQuery = cb.createQuery(Long.class);
+        Root<Booking> countRoot = countQuery.from(Booking.class);
+        countQuery.select(cb.count(countRoot));
+        Predicate countPredicate = spec.toPredicate(countRoot, countQuery, cb);
+        if (countPredicate != null) {
+            countQuery.where(countPredicate);
+        }
+        long total = entityManager.createQuery(countQuery).getSingleResult();
+
+        return new PageImpl<>(ids, pageable, total);
+    }
+
+    /**
+     * Translates a Spring Data {@link Sort} into an ordered list of Criteria {@link Order}s
+     * against {@code root} — each {@link Sort.Order} maps to a single simple property path
+     * (never a join traversal; the whitelist upstream guarantees this). Property order is
+     * preserved so the mandatory {@code id} tiebreaker (appended last by
+     * {@code BookingService#normalizeBookingSort}) always sorts after the caller's own criteria.
+     */
+    private static List<Order> toCriteriaOrders(CriteriaBuilder cb, Root<Booking> root, Sort sort) {
+        return sort.stream()
+                .map(order -> order.isAscending()
+                        ? cb.asc(root.get(order.getProperty()))
+                        : cb.desc(root.get(order.getProperty())))
+                .toList();
+    }
+}
