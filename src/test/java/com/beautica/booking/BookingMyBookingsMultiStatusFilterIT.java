@@ -63,12 +63,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       otherwise intact.</li>
  * </ol>
  *
- * <p><b>Explicitly out of scope</b> — the {@code sort} query param is known-broken (a hardcoded
- * JPQL {@code ORDER BY b.startsAt DESC} swallows it; Phase 26.3 fixes it). No test here passes a
- * {@code sort} param or asserts what the "correct" order SHOULD be relative to caller intent.
- * The ground-truth ordering used by the pagination tests is derived from the SAME hardcoded
- * {@code ORDER BY starts_at DESC} the repository already applies — this pins page-boundary
- * CONSISTENCY (page 2 continues exactly where page 1 stopped), not sort-param correctness.
+ * <p><b>Explicitly out of scope</b> — {@code sort}-param correctness (whitelisting, actual
+ * reordering by {@code priceAtBooking}/{@code startsAt}, and the mandatory {@code id} tiebreaker
+ * under price ties) is covered separately by {@code BookingMyBookingsSortIT} (Phase 26.3). No
+ * test here passes a {@code sort} param. The ground-truth ordering used by the pagination tests
+ * below is the endpoint's DEFAULT ordering (no {@code sort} param supplied), which — as of Phase
+ * 26.3 — is {@code ORDER BY starts_at DESC, id ASC}, sourced from {@code Pageable.getSort()} (the
+ * hardcoded JPQL {@code ORDER BY} these queries used to carry was removed; see
+ * {@code BookingService#normalizeBookingSort}). This class pins page-boundary CONSISTENCY (page 2
+ * continues exactly where page 1 stopped) under the default sort, not sort-param correctness.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("GET /bookings/me — Phase 26.1 multi-status filter, full HTTP stack over real Postgres")

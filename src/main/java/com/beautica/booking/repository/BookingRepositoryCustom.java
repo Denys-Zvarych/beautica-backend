@@ -22,17 +22,22 @@ public interface BookingRepositoryCustom {
      * {@code statuses == null || statuses.isEmpty()} means "no status predicate" — the predicate
      * is omitted from the query entirely rather than bound as a null sentinel.
      *
-     * <p>Ordering is a HARD {@code ORDER BY b.startsAt DESC}, independent of {@code pageable}'s
-     * own {@link org.springframework.data.domain.Sort} — identical to the pre-fix JPQL. Phase
-     * 26.3 owns making this {@code Pageable}-driven; changing it here would silently pull that
-     * phase's scope forward.
+     * <p><b>Phase 26.3 — ordering is {@code Pageable}-driven.</b> {@code pageable.getSort()} is
+     * translated 1:1 into Criteria {@code Order}s by {@code BookingRepositoryCustomImpl.findIdPage}.
+     * The {@code Sort} MUST already be validated and normalized by the caller
+     * ({@code BookingService#normalizeBookingSort}) before it reaches here: whitelisted property
+     * names only (no dot-paths — this method has no way to reject an arbitrary property path),
+     * a guaranteed non-empty {@code Sort} (defaulted to {@code startsAt DESC} when the caller's
+     * was unsorted), and a trailing unique-column tiebreaker. This repository method trusts that
+     * contract and does not re-validate it.
      */
     Page<UUID> findIdsByMasterIdFiltered(UUID masterId, Collection<BookingStatus> statuses, Pageable pageable);
 
     /**
      * Callers must supply a pre-resolved, non-empty list of the authenticated owner's OWN active
      * salon ids (Anti-Bug §E-4; enforced by {@link BookingSpecifications#salonIdIn}). Same
-     * status/ordering contract as {@link #findIdsByMasterIdFiltered}.
+     * status/ordering contract as {@link #findIdsByMasterIdFiltered} — including the Phase 26.3
+     * pre-validated-{@code Sort} requirement.
      */
     Page<UUID> findIdsBySalonIdsFiltered(List<UUID> salonIds, Collection<BookingStatus> statuses, Pageable pageable);
 }

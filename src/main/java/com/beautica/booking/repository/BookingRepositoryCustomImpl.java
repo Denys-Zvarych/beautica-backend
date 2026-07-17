@@ -7,11 +7,13 @@ import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.TypedQuery;
 import jakarta.persistence.criteria.CriteriaBuilder;
 import jakarta.persistence.criteria.CriteriaQuery;
+import jakarta.persistence.criteria.Order;
 import jakarta.persistence.criteria.Predicate;
 import jakarta.persistence.criteria.Root;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 
 import java.util.Collection;
@@ -30,17 +32,13 @@ import java.util.UUID;
  * standard field injection applies.
  *
  * <p>Deliberately does NOT delegate to {@code JpaSpecificationExecutor.findAll(Specification,
- * Pageable)}, for two reasons:
- * <ol>
- *   <li>That convenience method selects full {@link Booking} rows, which would break the
- *       two-query ID-page + graph-hydrate pattern this seam must preserve
- *       ({@code BookingService.listProviderBookings}).</li>
- *   <li>It derives its {@code ORDER BY} from {@code pageable.getSort()} — which would make
- *       {@code ?sort=} silently take effect, pulling Phase 26.3's fix forward as an unreviewed
- *       side effect. Building the {@link CriteriaQuery} by hand keeps the {@code SELECT b.id}
- *       projection AND lets {@code ORDER BY b.startsAt DESC} stay hardcoded exactly as it was in
- *       the pre-fix JPQL.</li>
- * </ol>
+ * Pageable)} — that convenience method selects full {@link Booking} rows, which would break the
+ * two-query ID-page + graph-hydrate pattern this seam must preserve
+ * ({@code BookingService.listProviderBookings}). {@code BookingRepository} deliberately does not
+ * extend {@code JpaSpecificationExecutor} for the same reason — this remains true after Phase
+ * 26.3. Building the {@link CriteriaQuery} by hand keeps the {@code SELECT b.id} projection while
+ * still — as of Phase 26.3 — deriving {@code ORDER BY} from {@code pageable.getSort()} (see
+ * {@link #findIdPage}).
  */
 class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
 
@@ -68,11 +66,23 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
     }
 
     /**
-     * Executes {@code spec} as a {@code SELECT b.id} query with a HARDCODED
-     * {@code ORDER BY b.startsAt DESC} (see class javadoc — intentionally independent of
-     * {@code pageable.getSort()}), plus a matching {@code COUNT(*)} query built from the same
+     * Executes {@code spec} as a {@code SELECT b.id} query ordered by {@code pageable.getSort()}
+     * (Phase 26.3 — previously a HARDCODED {@code ORDER BY b.startsAt DESC}, independent of the
+     * caller's {@code Sort}), plus a matching {@code COUNT(*)} query built from the same
      * {@link Specification} — the same id-page-plus-count shape the superseded {@code @Query}
      * methods produced.
+     *
+     * <p><b>Trusts an already-validated {@code Sort}.</b> {@code pageable.getSort()} is translated
+     * 1:1 into Criteria {@link Order}s via {@link Root#get(String)} on each
+     * {@link Sort.Order#getProperty()}. This is safe ONLY because both callers
+     * ({@code findIdsByMasterIdFiltered} / {@code findIdsBySalonIdsFiltered}) are reached
+     * exclusively through {@code BookingService#getMyBookings}, which normalizes and whitelists
+     * the {@code Sort} (via {@code normalizeBookingSort}) to {@code startsAt} /
+     * {@code priceAtBooking} / {@code createdAt} — plus a trailing {@code id} tiebreaker — before
+     * either method is ever invoked. An unvalidated {@code Sort} reaching this method would let
+     * {@link Root#get(String)} resolve an arbitrary property path (including through a join
+     * alias), which is exactly the ordering oracle Phase 26.3 closes at the service boundary; do
+     * NOT call this method (or its two public callers) with a raw, caller-supplied {@code Sort}.
      */
     private Page<UUID> findIdPage(Specification<Booking> spec, Pageable pageable) {
         CriteriaBuilder cb = entityManager.getCriteriaBuilder();
@@ -84,7 +94,7 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         if (idPredicate != null) {
             idQuery.where(idPredicate);
         }
-        idQuery.orderBy(cb.desc(idRoot.get("startsAt")));
+        idQuery.orderBy(toCriteriaOrders(cb, idRoot, pageable.getSort()));
 
         TypedQuery<UUID> typedIdQuery = entityManager.createQuery(idQuery);
         typedIdQuery.setFirstResult((int) pageable.getOffset());
@@ -101,5 +111,20 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         long total = entityManager.createQuery(countQuery).getSingleResult();
 
         return new PageImpl<>(ids, pageable, total);
+    }
+
+    /**
+     * Translates a Spring Data {@link Sort} into an ordered list of Criteria {@link Order}s
+     * against {@code root} — each {@link Sort.Order} maps to a single simple property path
+     * (never a join traversal; the whitelist upstream guarantees this). Property order is
+     * preserved so the mandatory {@code id} tiebreaker (appended last by
+     * {@code BookingService#normalizeBookingSort}) always sorts after the caller's own criteria.
+     */
+    private static List<Order> toCriteriaOrders(CriteriaBuilder cb, Root<Booking> root, Sort sort) {
+        return sort.stream()
+                .map(order -> order.isAscending()
+                        ? cb.asc(root.get(order.getProperty()))
+                        : cb.desc(root.get(order.getProperty())))
+                .toList();
     }
 }

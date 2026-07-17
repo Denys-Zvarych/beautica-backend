@@ -67,12 +67,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     // .Specification (see BookingSpecifications for the full rationale) so the emitted SQL
     // contains ONLY the predicates actually requested — no dead branch, and each predicate shape
     // gets its own Postgres plan-cache entry. Method signatures are unchanged, so every caller
-    // (BookingService) needed no changes. The hardcoded ORDER BY b.startsAt DESC is preserved
-    // exactly (independent of the Pageable's own Sort) — Phase 26.3 owns making it Pageable-driven.
+    // (BookingService) needed no changes. Phase 26.3 replaced the (then still hardcoded)
+    // ORDER BY b.startsAt DESC with a translation of pageable.getSort() into Criteria Orders —
+    // see BookingRepositoryCustomImpl.findIdPage — because Sort.getProperty() is a validated,
+    // whitelisted value by the time it reaches this layer (BookingService#normalizeBookingSort).
     //
     // findClientBookingDetails below still uses the sentinel idiom — Finding 2 (MEDIUM) — left
     // as-is deliberately; see that method's javadoc for why a Specification rewrite was judged
-    // impractical there.
+    // impractical there. Its own hardcoded ORDER BY b.startsAt DESC WAS removed by Phase 26.3
+    // (a distinct defect from the sentinel one) — see that method's javadoc.
 
     @Query(value = """
             SELECT b.id FROM Booking b
@@ -232,6 +235,23 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * JOIN FETCH on a collection), so Hibernate emits a correct SQL {@code LIMIT/OFFSET}
      * and the HHH90003004 in-memory-pagination trap does not apply.
      *
+     * <p><b>Phase 26.3 — ordering is {@code Pageable}-driven, not hardcoded.</b> This query
+     * used to carry a literal {@code ORDER BY b.startsAt DESC}, which Spring Data
+     * <i>appends to</i> rather than replaces when the caller's {@code Pageable} also carries a
+     * {@link org.springframework.data.domain.Sort} — so {@code ?sort=priceAtBooking,desc}
+     * silently became {@code ORDER BY b.starts_at DESC, b.price_at_booking DESC}, a no-op tie
+     * clause (a master cannot hold two overlapping bookings, so {@code startsAt} is effectively
+     * unique). The hardcoded clause is removed; {@code b.startsAt} — a valid property path off
+     * the primary alias {@code b} — is what Spring appends from {@code pageable.getSort()}
+     * instead. The {@link Sort} arriving here is ALWAYS pre-validated and pre-normalized by
+     * {@code BookingService#normalizeBookingSort} before this method is called: whitelisted to
+     * {@code startsAt}/{@code priceAtBooking}/{@code createdAt} (rejecting dot-paths such as
+     * {@code master.user.passwordHash} with a 400 — this predicate area joins through
+     * {@code m}/{@code mu}, so an unvalidated {@code Sort} would be a live credential-ordering
+     * oracle), defaulted to {@code startsAt DESC} when unsorted, and always carrying a trailing
+     * {@code b.id ASC} tiebreaker for deterministic {@code OFFSET} pagination under ties. Do not
+     * call this method with a raw, unvalidated {@code Pageable}.
+     *
      * <p>Scope: callers MUST pass the authenticated client's own user id — the predicate
      * {@code b.client.id = :clientId} is the ownership boundary (Anti-Bug §E-4).
      */
@@ -277,7 +297,6 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN Review r ON r.booking = b
             WHERE b.client.id = :clientId
               AND (:statuses IS NULL OR b.status IN :statuses)
-            ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b

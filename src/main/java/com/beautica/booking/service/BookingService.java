@@ -37,7 +37,9 @@ import org.springframework.cache.CacheManager;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
@@ -257,9 +259,15 @@ public class BookingService {
                 ? null
                 : EnumSet.copyOf(status);
 
+        // Phase 26.3: validate/whitelist/default/tiebreak the sort BEFORE the role dispatch, so
+        // BOTH the client projection query and the provider ID-page query receive an identical,
+        // already-safe Pageable — see normalizeBookingSort's javadoc for why this must happen
+        // here and not deeper in either path.
+        Pageable normalizedPageable = normalizeBookingSort(pageable);
+
         Page<BookingDetailResponse> page = role == Role.CLIENT
-                ? listClientBookings(actorUserId, statuses, pageable)
-                : listProviderBookings(role, actorUserId, statuses, pageable);
+                ? listClientBookings(actorUserId, statuses, normalizedPageable)
+                : listProviderBookings(role, actorUserId, statuses, normalizedPageable);
 
         return PageResponse.of(
                 page.getContent(),
@@ -267,6 +275,98 @@ public class BookingService {
                 page.getSize(),
                 page.getTotalElements(),
                 page.getTotalPages());
+    }
+
+    /**
+     * Property names {@code GET /bookings/me}'s {@code sort} query parameter may reference
+     * (Phase 26.3). Every property here is a scalar column directly on {@code Booking} — no
+     * association traversal.
+     *
+     * <p><b>This is a security boundary, not a nicety.</b> Both {@code findClientBookingDetails}
+     * and the provider ID-page queries join through {@code b.master m JOIN m.user}, so any
+     * unvalidated dot-path off those aliases is legal JPQL/Criteria — e.g.
+     * {@code ?sort=master.user.passwordHash,asc} would order an authenticated caller's own
+     * results by their employees' password-hash column, a credential side channel that never
+     * appears in the response body. {@link Sort.Order#getProperty()} returns the FULL dotted
+     * path as one string, so an exact-match {@link Set#contains} here rejects any multi-segment
+     * path outright — it never inspects only the first segment.
+     */
+    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt", "priceAtBooking", "createdAt");
+
+    /** Applied when the caller supplies no {@code sort} at all (Phase 26.3). */
+    private static final Sort DEFAULT_BOOKING_SORT = Sort.by(Sort.Direction.DESC, "startsAt");
+
+    /** Mandatory final tiebreaker appended to every sort — see {@link #normalizeBookingSort}. */
+    private static final Sort ID_TIEBREAKER_SORT = Sort.by(Sort.Direction.ASC, "id");
+
+    /**
+     * Max {@link Sort.Order} entries accepted in {@code GET /bookings/me}'s {@code sort} query
+     * parameter (Phase 26.3 audit, finding backend-perf F4). Matches the cardinality of
+     * {@link #SORTABLE_BOOKING_PROPERTIES} — nobody needs to sort by more than all three
+     * whitelisted properties at once. Parity with the existing {@code @Size(max = 5)} bound on
+     * the controller's {@code status} parameter: each distinct {@code (property, direction)}
+     * sequence compiles to a textually distinct SQL {@code ORDER BY} (column names can't be bind
+     * params), so an unbounded sort list inflates plan-cache entries.
+     */
+    private static final int MAX_SORT_ORDERS = 3;
+
+    /**
+     * Single choke point for the {@code sort} query parameter on {@code GET /bookings/me}
+     * (Phase 26.3), applied once before the CLIENT/provider role dispatch so neither path can be
+     * reached with a raw, unvalidated {@link Sort}.
+     *
+     * <ol>
+     *   <li><b>Default when unsorted.</b> {@code @PageableDefault(sort = "startsAt", DESC)} on
+     *       the controller covers the HTTP path, but this method is also called directly by
+     *       tests and (defensively) must not depend on that annotation — an unsorted
+     *       {@code Pageable} yields DB-arbitrary order once the JPQL/Criteria layers stop
+     *       hardcoding {@code ORDER BY b.startsAt DESC} themselves.</li>
+     *   <li><b>Whitelist.</b> Every {@link Sort.Order#getProperty()} must exact-match
+     *       {@link #SORTABLE_BOOKING_PROPERTIES}; anything else — including a dot-path like
+     *       {@code master.user.passwordHash} — throws a 400 {@link BusinessException} before the
+     *       {@code Sort} ever reaches a query.</li>
+     *   <li><b>Count bound.</b> More than {@link #MAX_SORT_ORDERS} orders throws a 400
+     *       {@link BusinessException} (Phase 26.3 audit F4) — parity with the controller's
+     *       {@code @Size(max = 5)} bound on {@code status}.</li>
+     *   <li><b>Mandatory {@code id} tiebreaker.</b> Appended last, always. Price (and, on the
+     *       salon path, {@code startsAt} across different masters) ties are the common case, not
+     *       the edge case — every booking of the same service shares a {@code priceAtBooking}.
+     *       Without a unique trailing column, {@code OFFSET} pagination over tied rows can
+     *       duplicate and skip rows across pages.</li>
+     * </ol>
+     *
+     * <p><b>Preserves {@code Pageable.unpaged()}.</b> {@link Pageable#getPageNumber()} and
+     * {@link Pageable#getPageSize()} throw {@link UnsupportedOperationException} on an
+     * {@code Unpaged} instance by design — several {@code BookingServiceTest} cases call this
+     * service directly with {@code Pageable.unpaged()} because they exercise status-filtering
+     * logic, not pagination. Rebuilding via {@link PageRequest#of} unconditionally would break
+     * that legitimate caller. {@link Pageable#isPaged()} branches to
+     * {@link Pageable#unpaged(Sort)} instead, carrying the normalized sort without requiring page
+     * number/size semantics that don't apply.
+     */
+    private Pageable normalizeBookingSort(Pageable pageable) {
+        Sort requestedSort = pageable.getSort();
+        Sort effectiveSort = requestedSort.isUnsorted() ? DEFAULT_BOOKING_SORT : requestedSort;
+
+        if (effectiveSort.stream().count() > MAX_SORT_ORDERS) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Too many sort properties");
+        }
+
+        for (Sort.Order order : effectiveSort) {
+            if (!SORTABLE_BOOKING_PROPERTIES.contains(order.getProperty())) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "Unsupported sort property: " + order.getProperty());
+            }
+        }
+
+        Sort finalSort = effectiveSort.and(ID_TIEBREAKER_SORT);
+
+        if (!pageable.isPaged()) {
+            return Pageable.unpaged(finalSort);
+        }
+
+        return PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(), finalSort);
     }
 
     /**
