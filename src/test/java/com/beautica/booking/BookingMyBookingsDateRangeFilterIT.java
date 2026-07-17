@@ -1,12 +1,8 @@
 package com.beautica.booking;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.dto.AuthResponse;
-import com.beautica.auth.dto.LoginRequest;
-import com.beautica.common.ApiResponse;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -17,10 +13,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -84,7 +78,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
 
     private static final String BOOKINGS_URL = "/api/v1/bookings";
-    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -98,10 +91,13 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
     @org.springframework.boot.test.web.server.LocalServerPort
     private int port;
 
+    private BookingTestFixtures fixtures;
+
     @BeforeEach
     void configureHttpClient() {
         restTemplate.getRestTemplate().setRequestFactory(
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -116,10 +112,10 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "never observing the generated SQL for")
     void should_returnOnlyInWindowBookings_when_providerFiltersByDateRange() throws Exception {
         String masterEmail = "mbdrf-provider-window-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("mbdrf-provider-window-client-" + System.nanoTime() + "@beautica.test",
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbdrf-provider-window-client-" + System.nanoTime() + "@beautica.test",
                 "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
 
         LocalDate from = LocalDate.of(2031, 7, 10);
         LocalDate to = LocalDate.of(2031, 7, 12);
@@ -135,11 +131,11 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
         UUID afterWindow = insertBooking(clientId, masterId, serviceId, null,
                 kyiv(to.plusDays(1), 0, 30));
 
-        ResponseEntity<String> resp = callMyBookings(tokenFor(masterEmail), from, to);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(masterEmail), from, to);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
-        assertThat(extractIds(root))
+        assertThat(fixtures.extractIds(root))
                 .as("only bookings strictly inside [from, to] (Kyiv, to inclusive) must be returned")
                 .containsExactlyInAnyOrder(atWindowStart, midWindow, nearWindowEnd)
                 .doesNotContain(beforeWindow, afterWindow);
@@ -153,10 +149,10 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "null,null was ever passed")
     void should_returnOnlyInWindowBookings_when_clientFiltersByDateRange() throws Exception {
         String masterEmail = "mbdrf-client-window-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
         String clientEmail = "mbdrf-client-window-" + System.nanoTime() + "@beautica.test";
-        UUID clientId = createUser(clientEmail, "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
 
         LocalDate from = LocalDate.of(2031, 8, 5);
         LocalDate to = LocalDate.of(2031, 8, 7);
@@ -172,11 +168,11 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
         UUID afterWindow = insertBooking(clientId, masterId, serviceId, null,
                 kyiv(to.plusDays(1), 0, 30));
 
-        ResponseEntity<String> resp = callMyBookings(tokenFor(clientEmail), from, to);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(clientEmail), from, to);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
-        assertThat(extractIds(root))
+        assertThat(fixtures.extractIds(root))
                 .as("only bookings strictly inside [from, to] (Kyiv, to inclusive) must be returned")
                 .containsExactlyInAnyOrder(atWindowStart, midWindow, nearWindowEnd)
                 .doesNotContain(beforeWindow, afterWindow);
@@ -195,21 +191,21 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "would leak in the `to`+1 00:00 booking)")
     void should_applyHalfOpenToBoundaryCorrectly_when_providerFiltersByToOnly() throws Exception {
         String masterEmail = "mbdrf-provider-halfopen-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("mbdrf-provider-halfopen-client-" + System.nanoTime() + "@beautica.test",
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbdrf-provider-halfopen-client-" + System.nanoTime() + "@beautica.test",
                 "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
 
         LocalDate to = LocalDate.of(2031, 7, 17);
         UUID lateOnToDay = insertBooking(clientId, masterId, serviceId, null, kyiv(to, 19, 30));
         UUID midnightNextDay = insertBooking(clientId, masterId, serviceId, null,
                 kyiv(to.plusDays(1), 0, 0));
 
-        ResponseEntity<String> resp = callMyBookings(tokenFor(masterEmail), null, to);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(masterEmail), null, to);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
-        assertThat(extractIds(root))
+        assertThat(fixtures.extractIds(root))
                 .as("19:30 Kyiv on the `to` day must be INCLUDED (half-open upper bound is "
                         + "`to`+1 day at Kyiv midnight, not `to` itself); 00:00 Kyiv on `to`+1 day "
                         + "must be EXCLUDED (it is exactly the exclusive boundary)")
@@ -224,21 +220,21 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "independent JPQL sentinel predicate")
     void should_applyHalfOpenToBoundaryCorrectly_when_clientFiltersByToOnly() throws Exception {
         String masterEmail = "mbdrf-client-halfopen-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
         String clientEmail = "mbdrf-client-halfopen-" + System.nanoTime() + "@beautica.test";
-        UUID clientId = createUser(clientEmail, "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
 
         LocalDate to = LocalDate.of(2031, 9, 22);
         UUID lateOnToDay = insertBooking(clientId, masterId, serviceId, null, kyiv(to, 19, 30));
         UUID midnightNextDay = insertBooking(clientId, masterId, serviceId, null,
                 kyiv(to.plusDays(1), 0, 0));
 
-        ResponseEntity<String> resp = callMyBookings(tokenFor(clientEmail), null, to);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(clientEmail), null, to);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
-        assertThat(extractIds(root))
+        assertThat(fixtures.extractIds(root))
                 .as("19:30 Kyiv on the `to` day must be INCLUDED, 00:00 Kyiv on `to`+1 day EXCLUDED")
                 .containsExactly(lateOnToDay)
                 .doesNotContain(midnightNextDay);
@@ -256,10 +252,10 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
     void should_attributeEarlyKyivLocalBookingToItsKyivDay_when_providerFiltersFromThatDay()
             throws Exception {
         String masterEmail = "mbdrf-kyiv-zone-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("mbdrf-kyiv-zone-client-" + System.nanoTime() + "@beautica.test",
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbdrf-kyiv-zone-client-" + System.nanoTime() + "@beautica.test",
                 "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
 
         LocalDate day = LocalDate.of(2031, 7, 10);
         OffsetDateTime kyivLocalStart = kyiv(day, 0, 30);
@@ -273,11 +269,11 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
 
         UUID earlyKyivBooking = insertBooking(clientId, masterId, serviceId, null, kyivLocalStart);
 
-        ResponseEntity<String> resp = callMyBookings(tokenFor(masterEmail), day, null);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(masterEmail), day, null);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
-        assertThat(extractIds(root))
+        assertThat(fixtures.extractIds(root))
                 .as("a UTC-resolved `from` boundary would place fromInstant at D 00:00Z, AFTER this "
                         + "booking's D-1 21:30Z UTC instant, wrongly excluding it; the correct "
                         + "Kyiv-resolved boundary (D-1 21:00Z) correctly includes it")
@@ -293,11 +289,11 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "(an empty page would hide a client bug)")
     void should_return400_when_fromIsAfterTo() throws Exception {
         String masterEmail = "mbdrf-from-after-to-" + System.nanoTime() + "@beautica.test";
-        createIndependentMaster(masterEmail);
+        fixtures.createIndependentMaster(masterEmail);
 
         LocalDate from = LocalDate.of(2031, 7, 20);
         LocalDate to = LocalDate.of(2031, 7, 10);
-        ResponseEntity<String> resp = callMyBookings(tokenFor(masterEmail), from, to);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(masterEmail), from, to);
 
         assertThat(resp.getStatusCode())
                 .as("from > to must be rejected as a 400, never silently return an empty page")
@@ -320,11 +316,11 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "the Phase 15.11 ScheduleDateMath range-cap guard")
     void should_return400_when_spanExceedsMaximum() throws Exception {
         String masterEmail = "mbdrf-span-too-wide-" + System.nanoTime() + "@beautica.test";
-        createIndependentMaster(masterEmail);
+        fixtures.createIndependentMaster(masterEmail);
 
         LocalDate from = LocalDate.of(2031, 1, 1);
         LocalDate to = from.plusDays(366); // 366-day diff > the 365-day-diff cap -> rejected
-        ResponseEntity<String> resp = callMyBookings(tokenFor(masterEmail), from, to);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(masterEmail), from, to);
 
         assertThat(resp.getStatusCode())
                 .as("a span wider than the 366-day cap must be rejected, not silently truncated "
@@ -338,11 +334,11 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "off-by-one in either direction")
     void should_return200_when_spanIsExactlyAtTheCap() throws Exception {
         String masterEmail = "mbdrf-span-at-cap-" + System.nanoTime() + "@beautica.test";
-        createIndependentMaster(masterEmail);
+        fixtures.createIndependentMaster(masterEmail);
 
         LocalDate from = LocalDate.of(2031, 1, 1);
         LocalDate to = from.plusDays(365); // exactly at the cap -> must be accepted
-        ResponseEntity<String> resp = callMyBookings(tokenFor(masterEmail), from, to);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(masterEmail), from, to);
 
         assertThat(resp.getStatusCode())
                 .as("a span of exactly the documented 366-day cap must be accepted, not rejected")
@@ -356,10 +352,10 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "without complaint")
     void should_return400NotServerError_when_toAloneIsLocalDateMax() throws Exception {
         String masterEmail = "mbdrf-to-max-" + System.nanoTime() + "@beautica.test";
-        createIndependentMaster(masterEmail);
+        fixtures.createIndependentMaster(masterEmail);
 
         ResponseEntity<String> resp = callMyBookingsRaw(
-                tokenFor(masterEmail), null, enc(LocalDate.MAX.toString()));
+                fixtures.tokenFor(masterEmail), null, enc(LocalDate.MAX.toString()));
 
         assertThat(resp.getStatusCode())
                 .as("to = LocalDate.MAX must be rejected as a clean 400 by "
@@ -376,12 +372,12 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
             + "alone, independent of whether the span itself would otherwise be accepted")
     void should_return400NotServerError_when_validSmallSpanEndsAtLocalDateMax() throws Exception {
         String masterEmail = "mbdrf-span-ends-at-max-" + System.nanoTime() + "@beautica.test";
-        createIndependentMaster(masterEmail);
+        fixtures.createIndependentMaster(masterEmail);
 
         LocalDate to = LocalDate.MAX;
         LocalDate from = to.minusDays(10);
         ResponseEntity<String> resp = callMyBookingsRaw(
-                tokenFor(masterEmail), enc(from.toString()), enc(to.toString()));
+                fixtures.tokenFor(masterEmail), enc(from.toString()), enc(to.toString()));
 
         assertThat(resp.getStatusCode())
                 .as("even though the from/to span itself (10 days) is comfortably within the "
@@ -395,51 +391,6 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
     /** Resolves a Kyiv-local wall-clock instant to its UTC-backed {@link OffsetDateTime}. */
     private static OffsetDateTime kyiv(LocalDate date, int hour, int minute) {
         return date.atTime(hour, minute).atZone(TimeZones.KYIV).toOffsetDateTime();
-    }
-
-    private UUID createIndependentMaster(String email) {
-        UUID userId = createUser(email, "INDEPENDENT_MASTER", null);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, "
-                        + "created_at, updated_at) VALUES (?, ?, 'INDEPENDENT_MASTER', 0.00, 0, true, NOW(), NOW())",
-                masterId, userId);
-        return masterId;
-    }
-
-    private UUID createUser(String email, String role, UUID salonId) {
-        UUID id = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, ?, ?, true, true)",
-                id, email, passwordEncoder.encode(TEST_PASSWORD), role, salonId);
-        return id;
-    }
-
-    private UUID createIndependentMasterService(UUID masterId) {
-        UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, resolveServiceTypeId());
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, masterId, serviceDefId);
-        return masterServiceId;
-    }
-
-    /** Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL). */
-    private UUID resolveServiceTypeId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT st.id FROM service_types st "
-                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
-                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
-                        + "ORDER BY st.name_uk LIMIT 1",
-                UUID.class);
     }
 
     /**
@@ -502,29 +453,6 @@ class BookingMyBookingsDateRangeFilterIT extends AbstractIntegrationTest {
         }
         String pathAndQuery = BOOKINGS_URL + "/me" + (parts.isEmpty() ? "" : "?" + String.join("&", parts));
         URI uri = URI.create("http://localhost:" + port + pathAndQuery);
-        return restTemplate.exchange(uri, HttpMethod.GET, new HttpEntity<>(bearerHeaders(token)), String.class);
-    }
-
-    private List<UUID> extractIds(JsonNode root) {
-        List<UUID> ids = new ArrayList<>();
-        for (JsonNode row : root.path("data").path("data")) {
-            ids.add(UUID.fromString(row.path("id").asText()));
-        }
-        return ids;
-    }
-
-    private String tokenFor(String email) throws Exception {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).as("login must succeed for %s", email).isEqualTo(HttpStatus.OK);
-        return objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {})
-                .data().accessToken();
-    }
-
-    private HttpHeaders bearerHeaders(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return headers;
+        return restTemplate.exchange(uri, HttpMethod.GET, new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
     }
 }

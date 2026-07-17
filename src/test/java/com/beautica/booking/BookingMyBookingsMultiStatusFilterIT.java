@@ -1,11 +1,7 @@
 package com.beautica.booking;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.dto.AuthResponse;
-import com.beautica.auth.dto.LoginRequest;
-import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -16,10 +12,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -78,7 +72,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
 
     private static final String BOOKINGS_URL = "/api/v1/bookings";
-    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
     private static final OffsetDateTime ANCHOR =
             OffsetDateTime.of(2031, 3, 3, 8, 0, 0, 0, ZoneOffset.UTC);
     private static final List<String> ALL_STATUSES =
@@ -93,10 +86,13 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    private BookingTestFixtures fixtures;
+
     @BeforeEach
     void configureHttpClient() {
         restTemplate.getRestTemplate().setRequestFactory(
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -108,9 +104,9 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             + "body does not echo the valid BookingStatus constants")
     void should_return400WithoutEchoingEnumConstants_when_statusParamIsUnrecognised() throws Exception {
         String clientEmail = "mbmsf-enum-client-" + System.nanoTime() + "@beautica.test";
-        createUser(clientEmail, "CLIENT", null);
+        fixtures.createUser(clientEmail, "CLIENT", null);
 
-        ResponseEntity<String> resp = callMyBookings(tokenFor(clientEmail), List.of("BOGUS"), null, null);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(clientEmail), List.of("BOGUS"), null, null);
 
         assertThat(resp.getStatusCode())
                 .as("an unrecognised status value must be rejected as a client error, never a 500")
@@ -146,9 +142,9 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     void should_returnOnlyOwnBookingsInRequestedStatuses_when_independentMasterFiltersMultiStatus()
             throws Exception {
         String masterAEmail = "mbmsf-im-a-" + System.nanoTime() + "@beautica.test";
-        UUID masterAId = createIndependentMaster(masterAEmail);
-        UUID clientAId = createUser("mbmsf-im-a-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceAId = createIndependentMasterService(masterAId);
+        UUID masterAId = fixtures.createIndependentMaster(masterAEmail);
+        UUID clientAId = fixtures.createUser("mbmsf-im-a-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceAId = fixtures.createIndependentMasterService(masterAId);
 
         OffsetDateTime t = ANCHOR;
         Set<UUID> confirmedAndCompletedA = new HashSet<>();
@@ -166,9 +162,9 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
 
         // Unrelated master B — same statuses, different master. Must never leak into A's page.
         String masterBEmail = "mbmsf-im-b-" + System.nanoTime() + "@beautica.test";
-        UUID masterBId = createIndependentMaster(masterBEmail);
-        UUID clientBId = createUser("mbmsf-im-b-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceBId = createIndependentMasterService(masterBId);
+        UUID masterBId = fixtures.createIndependentMaster(masterBEmail);
+        UUID clientBId = fixtures.createUser("mbmsf-im-b-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceBId = fixtures.createIndependentMasterService(masterBId);
         OffsetDateTime tb = ANCHOR;
         for (int i = 0; i < 2; i++) {
             insertBooking(clientBId, masterBId, serviceBId, null, "CONFIRMED", tb);
@@ -180,7 +176,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
         }
 
         ResponseEntity<String> resp = callMyBookings(
-                tokenFor(masterAEmail), List.of("CONFIRMED", "COMPLETED"), null, 20);
+                fixtures.tokenFor(masterAEmail), List.of("CONFIRMED", "COMPLETED"), null, 20);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
@@ -188,7 +184,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
                 .as("master A must see exactly their own 5 CONFIRMED+COMPLETED bookings")
                 .isEqualTo(5);
 
-        List<UUID> ids = extractIds(root);
+        List<UUID> ids = fixtures.extractIds(root);
         assertThat(ids)
                 .as("returned rows must be EXACTLY master A's CONFIRMED+COMPLETED bookings — no "
                         + "master-B leakage, no own-CANCELLED/DECLINED leakage")
@@ -204,7 +200,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             + "bookings, never another owner's salon")
     void should_returnOnlyOwnSalonBookings_when_salonOwnerFiltersMultiStatus() throws Exception {
         SalonFixture salonA = createSalon("mbmsf-owner-a-" + System.nanoTime() + "@beautica.test");
-        UUID clientAId = createUser("mbmsf-owner-a-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID clientAId = fixtures.createUser("mbmsf-owner-a-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID serviceAId = createSalonService(salonA.salonId(), salonA.masterId());
 
         OffsetDateTime t = ANCHOR;
@@ -218,7 +214,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
         UUID cancelledA = insertBooking(clientAId, salonA.masterId(), serviceAId, salonA.salonId(), "CANCELLED", t);
 
         SalonFixture salonB = createSalon("mbmsf-owner-b-" + System.nanoTime() + "@beautica.test");
-        UUID clientBId = createUser("mbmsf-owner-b-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID clientBId = fixtures.createUser("mbmsf-owner-b-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID serviceBId = createSalonService(salonB.salonId(), salonB.masterId());
         OffsetDateTime tb = ANCHOR;
         insertBooking(clientBId, salonB.masterId(), serviceBId, salonB.salonId(), "CONFIRMED", tb);
@@ -226,11 +222,11 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
         insertBooking(clientBId, salonB.masterId(), serviceBId, salonB.salonId(), "COMPLETED", tb);
 
         ResponseEntity<String> resp = callMyBookings(
-                tokenFor(salonA.ownerEmail()), List.of("CONFIRMED", "COMPLETED"), null, 20);
+                fixtures.tokenFor(salonA.ownerEmail()), List.of("CONFIRMED", "COMPLETED"), null, 20);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
-        List<UUID> ids = extractIds(root);
+        List<UUID> ids = fixtures.extractIds(root);
         assertThat(ids)
                 .as("owner A must see exactly their own salon's 3 CONFIRMED+COMPLETED bookings — "
                         + "never salon B's")
@@ -245,10 +241,10 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     void should_return403_when_salonAdminListsMyBookingsWithMultiStatusParam() throws Exception {
         SalonFixture salon = createSalon("mbmsf-admin-owner-" + System.nanoTime() + "@beautica.test");
         String adminEmail = "mbmsf-admin-" + System.nanoTime() + "@beautica.test";
-        createUser(adminEmail, "SALON_ADMIN", salon.salonId());
+        fixtures.createUser(adminEmail, "SALON_ADMIN", salon.salonId());
 
         ResponseEntity<String> resp = callMyBookings(
-                tokenFor(adminEmail), List.of("CONFIRMED", "COMPLETED"), null, null);
+                fixtures.tokenFor(adminEmail), List.of("CONFIRMED", "COMPLETED"), null, null);
 
         assertThat(resp.getStatusCode())
                 .as("SALON_ADMIN must be rejected by /bookings/me regardless of the status param shape")
@@ -260,12 +256,12 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             + "another client's")
     void should_returnOnlyOwnBookings_when_clientFiltersMultiStatus() throws Exception {
         String masterEmail = "mbmsf-client-scope-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
 
         String clientAEmail = "mbmsf-client-a-" + System.nanoTime() + "@beautica.test";
-        UUID clientAId = createUser(clientAEmail, "CLIENT", null);
-        UUID clientBId = createUser("mbmsf-client-b-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID clientAId = fixtures.createUser(clientAEmail, "CLIENT", null);
+        UUID clientBId = fixtures.createUser("mbmsf-client-b-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
 
         OffsetDateTime t = ANCHOR;
         Set<UUID> expectedA = new HashSet<>();
@@ -283,11 +279,11 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
         insertBooking(clientBId, masterId, serviceId, null, "COMPLETED", t);
 
         ResponseEntity<String> resp = callMyBookings(
-                tokenFor(clientAEmail), List.of("CONFIRMED", "COMPLETED"), null, 20);
+                fixtures.tokenFor(clientAEmail), List.of("CONFIRMED", "COMPLETED"), null, 20);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
-        List<UUID> ids = extractIds(root);
+        List<UUID> ids = fixtures.extractIds(root);
         assertThat(ids)
                 .as("client A must see exactly their own 3 CONFIRMED+COMPLETED bookings — never "
                         + "client B's, never their own DECLINED")
@@ -307,19 +303,19 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             + "proven against real Postgres via the provider ID-page query")
     void should_returnAllStatuses_when_noStatusParamSupplied() throws Exception {
         String masterEmail = "mbmsf-nofilter-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("mbmsf-nofilter-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbmsf-nofilter-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
         Map<String, UUID> byStatus = seedOneBookingPerStatus(clientId, masterId, serviceId, null);
 
-        ResponseEntity<String> resp = callMyBookings(tokenFor(masterEmail), List.of(), null, 20);
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(masterEmail), List.of(), null, 20);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
         assertThat(root.path("data").path("totalElements").asLong())
                 .as("absent status param must return every status, unfiltered")
                 .isEqualTo(ALL_STATUSES.size());
-        assertThat(extractIds(root)).containsExactlyInAnyOrderElementsOf(byStatus.values());
+        assertThat(fixtures.extractIds(root)).containsExactlyInAnyOrderElementsOf(byStatus.values());
     }
 
     @Test
@@ -327,11 +323,11 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             + "the SAME result as a single ?status=CONFIRMED (EnumSet bound, no duplicate rows)")
     void should_returnIdenticalResult_when_statusParamRepeatedWithDuplicateValue() throws Exception {
         String masterEmail = "mbmsf-dedupe-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("mbmsf-dedupe-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbmsf-dedupe-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
         Map<String, UUID> byStatus = seedOneBookingPerStatus(clientId, masterId, serviceId, null);
-        String token = tokenFor(masterEmail);
+        String token = fixtures.tokenFor(masterEmail);
 
         ResponseEntity<String> singleResp = callMyBookings(token, List.of("CONFIRMED"), null, 20);
         ResponseEntity<String> dupResp = callMyBookings(token, List.of("CONFIRMED", "CONFIRMED"), null, 20);
@@ -343,11 +339,11 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
                 .as("a duplicated status value must not double-count rows")
                 .isEqualTo(1)
                 .isEqualTo(singleRoot.path("data").path("totalElements").asLong());
-        assertThat(extractIds(dupRoot))
+        assertThat(fixtures.extractIds(dupRoot))
                 .as("the duplicate-value request must return the identical single-element result "
                         + "as the non-duplicated request")
                 .containsExactly(byStatus.get("CONFIRMED"))
-                .isEqualTo(extractIds(singleRoot));
+                .isEqualTo(fixtures.extractIds(singleRoot));
     }
 
     @Test
@@ -355,13 +351,13 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             + "an intersection (which would be empty) and not only the first status")
     void should_returnExactUnion_when_twoDisjointStatusesSupplied() throws Exception {
         String masterEmail = "mbmsf-union-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("mbmsf-union-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbmsf-union-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
         Map<String, UUID> byStatus = seedOneBookingPerStatus(clientId, masterId, serviceId, null);
 
         ResponseEntity<String> resp = callMyBookings(
-                tokenFor(masterEmail), List.of("CANCELLED", "DECLINED"), null, 20);
+                fixtures.tokenFor(masterEmail), List.of("CANCELLED", "DECLINED"), null, 20);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
@@ -369,7 +365,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
                 .as("union of two disjoint statuses must be 2, not 0 (intersection) and not 1 "
                         + "(only-first-status bug)")
                 .isEqualTo(2);
-        assertThat(extractIds(root))
+        assertThat(fixtures.extractIds(root))
                 .containsExactlyInAnyOrder(byStatus.get("CANCELLED"), byStatus.get("DECLINED"));
     }
 
@@ -384,9 +380,9 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     void should_returnPagesConsistentWithGroundTruthOrdering_when_providerMultiStatusFilterSpansMultiplePages()
             throws Exception {
         String masterEmail = "mbmsf-page-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("mbmsf-page-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbmsf-page-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
 
         // 23 in-filter rows (alternating CONFIRMED/COMPLETED) + 3 out-of-filter CANCELLED rows,
         // every row on a DISTINCT starts_at so ORDER BY starts_at DESC is a total order (no ties
@@ -414,7 +410,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
                 UUID.class, masterId);
         assertThat(groundTruth).as("fixture sanity check").hasSize(inFilterCount);
 
-        String token = tokenFor(masterEmail);
+        String token = fixtures.tokenFor(masterEmail);
         int pageSize = 10;
         int totalPages = 3;
         List<UUID> collectedAcrossPages = new ArrayList<>();
@@ -432,7 +428,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
                     .as("page %d: totalPages must be ceil(23/10) = 3", page)
                     .isEqualTo(totalPages);
 
-            List<UUID> pageIds = extractIds(root);
+            List<UUID> pageIds = fixtures.extractIds(root);
             int from = page * pageSize;
             int to = Math.min(inFilterCount, from + pageSize);
             assertThat(pageIds)
@@ -461,10 +457,10 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     void should_returnPagesConsistentWithGroundTruthOrdering_when_clientMultiStatusFilterSpansMultiplePages()
             throws Exception {
         String masterEmail = "mbmsf-cpage-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID serviceId = createIndependentMasterService(masterId);
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
         String clientEmail = "mbmsf-cpage-client-" + System.nanoTime() + "@beautica.test";
-        UUID clientId = createUser(clientEmail, "CLIENT", null);
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
 
         OffsetDateTime t = ANCHOR;
         int inFilterCount = 15;
@@ -482,7 +478,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
                 UUID.class, clientId);
         assertThat(groundTruth).hasSize(inFilterCount);
 
-        String token = tokenFor(clientEmail);
+        String token = fixtures.tokenFor(clientEmail);
         int pageSize = 10;
         List<UUID> collectedAcrossPages = new ArrayList<>();
 
@@ -492,7 +488,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             JsonNode root = objectMapper.readTree(resp.getBody());
             assertThat(root.path("data").path("totalElements").asLong()).isEqualTo(inFilterCount);
 
-            List<UUID> pageIds = extractIds(root);
+            List<UUID> pageIds = fixtures.extractIds(root);
             int from = page * pageSize;
             int to = Math.min(inFilterCount, from + pageSize);
             assertThat(pageIds)
@@ -512,7 +508,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     private record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
 
     private SalonFixture createSalon(String ownerEmail) {
-        UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
+        UUID ownerId = fixtures.createUser(ownerEmail, "SALON_OWNER", null);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
@@ -520,7 +516,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
                 salonId, ownerId, "Salon-" + salonId);
 
         String masterEmail = "mbmsf-salon-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);
+        UUID masterUserId = fixtures.createUser(masterEmail, "SALON_MASTER", salonId);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
@@ -529,64 +525,19 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
         return new SalonFixture(salonId, ownerEmail, masterId, masterEmail);
     }
 
-    private UUID createIndependentMaster(String email) {
-        UUID userId = createUser(email, "INDEPENDENT_MASTER", null);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, "
-                        + "created_at, updated_at) VALUES (?, ?, 'INDEPENDENT_MASTER', 0.00, 0, true, NOW(), NOW())",
-                masterId, userId);
-        return masterId;
-    }
-
-    private UUID createUser(String email, String role, UUID salonId) {
-        UUID id = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, ?, ?, true, true)",
-                id, email, passwordEncoder.encode(TEST_PASSWORD), role, salonId);
-        return id;
-    }
-
-    private UUID createIndependentMasterService(UUID masterId) {
-        UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, resolveServiceTypeId());
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, masterId, serviceDefId);
-        return masterServiceId;
-    }
-
     private UUID createSalonService(UUID salonId, UUID masterId) {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
                         + "VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId, resolveServiceTypeId());
+                serviceDefId, salonId, fixtures.resolveServiceTypeId());
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, true, NOW(), NOW())",
                 masterServiceId, masterId, serviceDefId);
         return masterServiceId;
-    }
-
-    /** Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL). */
-    private UUID resolveServiceTypeId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT st.id FROM service_types st "
-                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
-                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
-                        + "ORDER BY st.name_uk LIMIT 1",
-                UUID.class);
     }
 
     /**
@@ -644,29 +595,6 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
             parts.add("size=" + size);
         }
         String url = BOOKINGS_URL + "/me" + (parts.isEmpty() ? "" : "?" + String.join("&", parts));
-        return restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(bearerHeaders(token)), String.class);
-    }
-
-    private List<UUID> extractIds(JsonNode root) {
-        List<UUID> ids = new ArrayList<>();
-        for (JsonNode row : root.path("data").path("data")) {
-            ids.add(UUID.fromString(row.path("id").asText()));
-        }
-        return ids;
-    }
-
-    private String tokenFor(String email) throws Exception {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).as("login must succeed for %s", email).isEqualTo(HttpStatus.OK);
-        return objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {})
-                .data().accessToken();
-    }
-
-    private HttpHeaders bearerHeaders(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return headers;
+        return restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
     }
 }
