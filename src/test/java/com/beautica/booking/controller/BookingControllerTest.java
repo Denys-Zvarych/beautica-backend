@@ -986,10 +986,11 @@ class BookingControllerTest {
     }
 
     @Test
-    @DisplayName("GET /me — 200 and status param is forwarded to the service when ?status=CANCELLED is supplied")
+    @DisplayName("GET /me — 200 and status param is forwarded to the service as a 1-element list "
+            + "when a single ?status=CANCELLED is supplied (Phase 26.1 backward compatibility)")
     void should_return200_and_passStatusParam_when_statusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), eq(BookingStatus.CANCELLED), any()))
+        when(bookingService.getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -999,7 +1000,27 @@ class BookingControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
 
-        org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(), eq(BookingStatus.CANCELLED), any());
+        org.mockito.Mockito.verify(bookingService)
+                .getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any());
+    }
+
+    @Test
+    @DisplayName("GET /me — repeated ?status=A&status=B binds to a 2-element list forwarded to the service (Phase 26.1)")
+    void should_return200_and_passMultiStatusParam_when_repeatedStatusQueryParamProvided() throws Exception {
+        var clientId = UUID.randomUUID();
+        when(bookingService.getMyBookings(any(), any(),
+                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me")
+                        .param("status", "CANCELLED", "DECLINED")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(),
+                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any());
     }
 
     @Test

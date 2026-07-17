@@ -593,7 +593,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         org.assertj.core.groups.Tuple.tuple(reviewed.getId(), true));
     }
 
-    // ── status filter ────────────────────────────────────────────────────────────
+    // ── status filter (Phase 26.1 — widened from a scalar equality to a Collection IN) ───
 
     @Test
     @DisplayName("status filter returns only matching bookings; a null filter returns all")
@@ -610,7 +610,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> filtered = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), BookingStatus.CONFIRMED, PageRequest.of(0, 20));
+                clientUser.getId(), java.util.Set.of(BookingStatus.CONFIRMED), PageRequest.of(0, 20));
         Page<ClientBookingDetailProjection> all = bookingRepository.findClientBookingDetails(
                 clientUser.getId(), null, PageRequest.of(0, 20));
 
@@ -618,6 +618,34 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                 .extracting(ClientBookingDetailProjection::id)
                 .containsExactly(confirmed.getId());
         assertThat(all.getTotalElements()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("a multi-value status set returns the union of matching bookings — proves the widened "
+            + "(:statuses IS NULL OR b.status IN :statuses) idiom against a real Postgres instance (Phase 26.1)")
+    void should_returnUnion_when_multipleStatusesSupplied() {
+        User masterUser = persistMasterUser(null, null, "Sofiivska", "9", null);
+        Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment msa =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Massage", "MASSAGE");
+        Booking cancelled = persistBooking(master, msa, null, BookingStatus.CANCELLED,
+                OffsetDateTime.of(2026, 6, 10, 9, 0, 0, 0, ZoneOffset.UTC));
+        Booking declined = persistBooking(master, msa, null, BookingStatus.DECLINED,
+                OffsetDateTime.of(2026, 6, 11, 9, 0, 0, 0, ZoneOffset.UTC));
+        persistBooking(master, msa, null, BookingStatus.COMPLETED,
+                OffsetDateTime.of(2026, 6, 12, 9, 0, 0, 0, ZoneOffset.UTC));
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> union = bookingRepository.findClientBookingDetails(
+                clientUser.getId(),
+                java.util.EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED),
+                PageRequest.of(0, 20));
+
+        assertThat(union.getContent())
+                .extracting(ClientBookingDetailProjection::id)
+                .containsExactlyInAnyOrder(cancelled.getId(), declined.getId());
+        assertThat(union.getTotalElements()).isEqualTo(2);
     }
 
     // ── bounded query count (no N+1) ─────────────────────────────────────────────

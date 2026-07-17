@@ -57,9 +57,11 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -1441,15 +1443,16 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.CONFIRMED, pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(
+                        List.of(salonId), Set.of(BookingStatus.CONFIRMED), pageable))
                 .thenReturn(Page.empty());
 
-        var result =
-                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), BookingStatus.CONFIRMED, pageable);
+        var result = bookingService.getMyBookings(
+                actorId, buildAuth(Role.SALON_OWNER), List.of(BookingStatus.CONFIRMED), pageable);
 
         assertThat(result.totalElements()).isZero();
-        verify(bookingRepository).findIdsBySalonIdsAndStatus(List.of(salonId), BookingStatus.CONFIRMED, pageable);
-        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
+        verify(bookingRepository)
+                .findIdsBySalonIdsFiltered(List.of(salonId), Set.of(BookingStatus.CONFIRMED), pageable);
     }
 
     @Test
@@ -1460,15 +1463,74 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, pageable))
                 .thenReturn(Page.empty());
 
         var result =
                 bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsBySalonIds(List.of(salonId), pageable);
-        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), null, pageable);
+    }
+
+    @Test
+    @DisplayName("empty status list behaves exactly as absent — normalised to null, not an empty IN list "
+            + "(Phase 26.1: ?status= must not match nothing)")
+    void should_normalizeEmptyStatusList_to_null_when_salonOwnerListsWithEmptyStatusList() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, pageable))
+                .thenReturn(Page.empty());
+
+        var result =
+                bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), List.of(), pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), null, pageable);
+    }
+
+    @Test
+    @DisplayName("repeated/duplicate statuses de-duplicate into a bounded EnumSet before hitting the repository "
+            + "(Phase 26.1: ?status=CONFIRMED&status=CONFIRMED)")
+    void should_deduplicateStatuses_when_salonOwnerRepeatsTheSameStatus() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(
+                        List.of(salonId), Set.of(BookingStatus.CONFIRMED), pageable))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER),
+                List.of(BookingStatus.CONFIRMED, BookingStatus.CONFIRMED), pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository)
+                .findIdsBySalonIdsFiltered(List.of(salonId), Set.of(BookingStatus.CONFIRMED), pageable);
+    }
+
+    @Test
+    @DisplayName("multiple distinct statuses widen into a single filtered query call carrying the whole EnumSet "
+            + "(Phase 26.1: ?status=CANCELLED&status=DECLINED, union in one request)")
+    void should_passUnionOfStatuses_when_salonOwnerListsWithMultipleStatuses() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Set<BookingStatus> expected = EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED);
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), expected, pageable))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER),
+                List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED), pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), expected, pageable);
     }
 
     @Test
@@ -1480,7 +1542,7 @@ class BookingServiceTest {
         Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, pageable))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
@@ -1506,7 +1568,7 @@ class BookingServiceTest {
         setField(guestBooking, "guestSurname", "Гість");
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
-        when(bookingRepository.findIdsBySalonIds(List.of(salonId), pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, pageable))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(guestBooking));
@@ -1535,8 +1597,7 @@ class BookingServiceTest {
                 bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
         assertThat(result.data()).isEmpty();
-        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
-        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
+        verify(bookingRepository, never()).findIdsBySalonIdsFiltered(any(), any(), any());
     }
 
     // ── Finding 1: SALON_OWNER multi-salon tests ───────────────────────────────
@@ -1552,7 +1613,7 @@ class BookingServiceTest {
         Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
 
         when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(salonIds);
-        when(bookingRepository.findIdsBySalonIds(salonIds, pageable))
+        when(bookingRepository.findIdsBySalonIdsFiltered(salonIds, null, pageable))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
@@ -1564,7 +1625,7 @@ class BookingServiceTest {
 
         assertThat(result.totalElements()).isEqualTo(1);
         verify(salonRepository).findIdsByOwnerIdAndIsActiveTrue(actorId);
-        verify(bookingRepository).findIdsBySalonIds(salonIds, pageable);
+        verify(bookingRepository).findIdsBySalonIdsFiltered(salonIds, null, pageable);
     }
 
     @Test
@@ -1579,8 +1640,7 @@ class BookingServiceTest {
                 bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, pageable);
 
         assertThat(result.data()).isEmpty();
-        verify(bookingRepository, never()).findIdsBySalonIds(any(), any());
-        verify(bookingRepository, never()).findIdsBySalonIdsAndStatus(any(), any(), any());
+        verify(bookingRepository, never()).findIdsBySalonIdsFiltered(any(), any(), any());
     }
 
     @Test
@@ -1602,13 +1662,32 @@ class BookingServiceTest {
     void should_returnClientBookings_when_clientListsWithStatus() {
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findClientBookingDetails(clientId, BookingStatus.CONFIRMED, pageable))
+        when(bookingRepository.findClientBookingDetails(clientId, Set.of(BookingStatus.CONFIRMED), pageable))
                 .thenReturn(Page.empty());
 
-        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), BookingStatus.CONFIRMED, pageable);
+        var result = bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), List.of(BookingStatus.CONFIRMED), pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findClientBookingDetails(clientId, BookingStatus.CONFIRMED, pageable);
+        verify(bookingRepository).findClientBookingDetails(clientId, Set.of(BookingStatus.CONFIRMED), pageable);
+    }
+
+    @Test
+    @DisplayName("CLIENT with multiple statuses passes the union to the enriched client projection "
+            + "(Phase 26.1: ?status=CANCELLED&status=DECLINED for CLIENT too)")
+    void should_returnClientBookings_when_clientListsWithMultipleStatuses() {
+        Pageable pageable = Pageable.unpaged();
+        Set<BookingStatus> expected = EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED);
+
+        when(bookingRepository.findClientBookingDetails(clientId, expected, pageable))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT),
+                List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED), pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findClientBookingDetails(clientId, expected, pageable);
     }
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRow(
@@ -1669,12 +1748,12 @@ class BookingServiceTest {
         UUID masterUserId = masterUser.getId();
 
         when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
-        when(bookingRepository.findIdsByMasterId(masterId, pageable)).thenReturn(Page.empty());
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, null, pageable)).thenReturn(Page.empty());
 
         var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER), null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsByMasterId(masterId, pageable);
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, null, pageable);
     }
 
     @Test
@@ -1685,15 +1764,52 @@ class BookingServiceTest {
         UUID salonMasterUserId = salonMasterUser.getId();
 
         when(masterRepository.findByUserId(salonMasterUserId)).thenReturn(Optional.of(master));
-        when(bookingRepository.findIdsByMasterIdAndStatus(masterId, BookingStatus.CONFIRMED, pageable))
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), pageable))
                 .thenReturn(Page.empty());
 
         var result = bookingService.getMyBookings(
-                salonMasterUserId, buildAuth(Role.SALON_MASTER), BookingStatus.CONFIRMED, pageable);
+                salonMasterUserId, buildAuth(Role.SALON_MASTER), List.of(BookingStatus.CONFIRMED), pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsByMasterIdAndStatus(masterId, BookingStatus.CONFIRMED, pageable);
-        verify(bookingRepository, never()).findIdsByMasterId(any(), any());
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), pageable);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER with multiple statuses passes the union to the master-scoped repository method "
+            + "(Phase 26.1: ?status=CANCELLED&status=DECLINED)")
+    void should_returnMasterBookings_when_independentMasterListsWithMultipleStatuses() {
+        Pageable pageable = Pageable.unpaged();
+        User masterUser = buildUser(UUID.randomUUID(), Role.INDEPENDENT_MASTER);
+        UUID masterUserId = masterUser.getId();
+        Set<BookingStatus> expected = EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED);
+
+        when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, expected, pageable)).thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER),
+                List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED), pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, expected, pageable);
+    }
+
+    @Test
+    @DisplayName("repeated/duplicate statuses de-duplicate to a single-element EnumSet before hitting the "
+            + "master-scoped repository method (Phase 26.1: ?status=CONFIRMED&status=CONFIRMED)")
+    void should_deduplicateStatuses_when_independentMasterRepeatsTheSameStatus() {
+        Pageable pageable = Pageable.unpaged();
+        User masterUser = buildUser(UUID.randomUUID(), Role.INDEPENDENT_MASTER);
+        UUID masterUserId = masterUser.getId();
+
+        when(masterRepository.findByUserId(masterUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), pageable))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(masterUserId, buildAuth(Role.INDEPENDENT_MASTER),
+                List.of(BookingStatus.CONFIRMED, BookingStatus.CONFIRMED), pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), pageable);
     }
 
     @Test

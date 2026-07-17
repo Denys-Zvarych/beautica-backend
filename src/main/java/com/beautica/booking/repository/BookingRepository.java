@@ -11,11 +11,12 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.OffsetDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface BookingRepository extends JpaRepository<Booking, UUID> {
+public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
 
     // ── ID-only paginated queries — two-query pattern (Fix H1 — HHH90003004) ──
     //
@@ -49,33 +50,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             @Param("status") BookingStatus status,
             Pageable pageable);
 
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            WHERE b.master.id = :masterId
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.master.id = :masterId
-            """)
-    // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
-    // Scope enforcement: BookingService resolves masterId via masterRepository.findByUserId(actorUserId).
-    Page<UUID> findIdsByMasterId(@Param("masterId") UUID masterId, Pageable pageable);
-
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            WHERE b.master.id = :masterId AND b.status = :status
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.master.id = :masterId AND b.status = :status
-            """)
-    // Callers must supply the authenticated user's own master.id — not an arbitrary UUID.
-    Page<UUID> findIdsByMasterIdAndStatus(
-            @Param("masterId") UUID masterId,
-            @Param("status") BookingStatus status,
-            Pageable pageable);
+    // ── Phase 26.1 — collapsed filtered query family ───────────────────────────
+    //
+    // findIdsByMasterId / findIdsByMasterIdAndStatus and findIdsBySalonIds /
+    // findIdsBySalonIdsAndStatus collapsed into ONE filtered query per scope, so
+    // 26.2 (date range), 26.3 (sort) and 26.4 (service filter) each edit a single
+    // query instead of four.
+    //
+    // Phase 26.1 audit fix (Finding 1 — HIGH, backend-perf): findIdsByMasterIdFiltered and
+    // findIdsBySalonIdsFiltered originally used the (:statuses IS NULL OR b.status IN :statuses)
+    // sentinel idiom here. That idiom is NOT sargable — PgJDBC's default prepareThreshold=5 makes
+    // Postgres fall back to a GENERIC plan after the 5th execution, one that cannot see the bound
+    // value and so cannot fold away the dead OR branch (measured ~19x slower on a 503k-row table,
+    // scaling with the provider's row count). Both methods now live in BookingRepositoryCustom /
+    // BookingRepositoryCustomImpl, built dynamically via org.springframework.data.jpa.domain
+    // .Specification (see BookingSpecifications for the full rationale) so the emitted SQL
+    // contains ONLY the predicates actually requested — no dead branch, and each predicate shape
+    // gets its own Postgres plan-cache entry. Method signatures are unchanged, so every caller
+    // (BookingService) needed no changes. The hardcoded ORDER BY b.startsAt DESC is preserved
+    // exactly (independent of the Pageable's own Sort) — Phase 26.3 owns making it Pageable-driven.
+    //
+    // findClientBookingDetails below still uses the sentinel idiom — Finding 2 (MEDIUM) — left
+    // as-is deliberately; see that method's javadoc for why a Specification rewrite was judged
+    // impractical there.
 
     @Query(value = """
             SELECT b.id FROM Booking b
@@ -133,46 +130,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     // The previous approach resolved salonId via userRepository.findSalonIdById which only
     // returns a value for invited roles (SALON_ADMIN, SALON_MASTER). For SALON_OWNER the
     // relationship is stored on Salon.owner_id, not User.salonId — always returning empty.
-    // These methods accept a pre-resolved list of salonIds (from SalonRepository
-    // .findIdsByOwnerIdAndIsActiveTrue) and join through master → salon, covering all active
-    // salons owned by the actor in a single query.
-
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            """)
-    Page<UUID> findIdsBySalonIds(
-            @Param("salonIds") List<UUID> salonIds,
-            Pageable pageable);
-
-    @Query(value = """
-            SELECT b.id FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            AND b.status = :status
-            ORDER BY b.startsAt DESC
-            """,
-            countQuery = """
-            SELECT COUNT(b) FROM Booking b
-            JOIN b.master m
-            JOIN m.salon s
-            WHERE s.id IN :salonIds
-            AND b.status = :status
-            """)
-    Page<UUID> findIdsBySalonIdsAndStatus(
-            @Param("salonIds") List<UUID> salonIds,
-            @Param("status") BookingStatus status,
-            Pageable pageable);
+    // findIdsBySalonIdsFiltered accepts a pre-resolved list of salonIds (from SalonRepository
+    // .findIdsByOwnerIdAndIsActiveTrue) and joins through master → salon, covering all active
+    // salons owned by the actor in a single query. Implemented in BookingRepositoryCustomImpl
+    // (Specification-based, see the Phase 26.1 audit-fix comment above / BookingSpecifications)
+    // rather than as a @Query here.
 
     // The provider "Графік" (calendar) query — a booking is born CONFIRMED (track 24.x
     // auto-confirm), so it appears here the instant it is created.
@@ -236,9 +198,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      * data (e.g. their home door code) onto a salon booking. Riding the same
      * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
      *
-     * <p>{@code statusFilter} is optional: when {@code null} the
-     * {@code (:statusFilter IS NULL OR b.status = :statusFilter)} idiom matches all rows
-     * (one method covers both the filtered and unfiltered list paths).
+     * <p>{@code statuses} is optional: when {@code null} the
+     * {@code (:statuses IS NULL OR b.status IN :statuses)} idiom matches all rows
+     * (one method covers both the filtered and unfiltered list paths). Phase 26.1 widened
+     * this from a scalar {@code statusFilter} equality to a {@code Collection} {@code IN}
+     * check so {@code GET /bookings/me} can accept repeated {@code status} values.
+     *
+     * <p><b>Phase 26.1 audit fix, Finding 2 (MEDIUM, backend-perf) — sentinel intentionally kept
+     * here.</b> The provider-path sibling queries ({@code findIdsByMasterIdFiltered} /
+     * {@code findIdsBySalonIdsFiltered}) were rewritten onto a dynamic {@code Specification}
+     * (see {@link BookingSpecifications}) to remove this exact {@code (:x IS NULL OR …)} plan-cache
+     * hazard. This query was evaluated for the same treatment and DEFERRED, not overlooked:
+     * it is a single {@code SELECT new ClientBookingDetailProjection(…)} constructor expression
+     * over 26 fields, including a {@code LEFT JOIN Review r ON r.booking = b} and five
+     * {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END} salon-precedence expressions (see
+     * above — the COALESCE-vs-CASE-WHEN distinction here guards a real PII leak). Reproducing that
+     * shape correctly via the JPA Criteria API (a 26-argument {@code CriteriaBuilder.construct}
+     * call, a criteria {@code ON}-join for the review, and five criteria {@code selectCase()}
+     * expressions) is a high-risk rewrite of a query with a locked, security-sensitive precedence
+     * rule, for a MEDIUM finding — the risk of silently reintroducing the salon/master PII leak
+     * this javadoc warns about outweighs the plan-cache benefit. Left as-is; revisit only
+     * alongside a dedicated test pass for this specific query, not as a drive-by extension of the
+     * Finding 1 fix.
      *
      * <p><b>Discovery locality is district-primary via the salon link</b> — the salon's
      * city/district/address wins when the master is salon-employed, else the master's own
@@ -295,17 +276,17 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
             JOIN ms.serviceDefinition sd
             LEFT JOIN Review r ON r.booking = b
             WHERE b.client.id = :clientId
-              AND (:statusFilter IS NULL OR b.status = :statusFilter)
+              AND (:statuses IS NULL OR b.status IN :statuses)
             ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             WHERE b.client.id = :clientId
-              AND (:statusFilter IS NULL OR b.status = :statusFilter)
+              AND (:statuses IS NULL OR b.status IN :statuses)
             """)
     Page<ClientBookingDetailProjection> findClientBookingDetails(
             @Param("clientId") UUID clientId,
-            @Param("statusFilter") BookingStatus statusFilter,
+            @Param("statuses") Collection<BookingStatus> statuses,
             Pageable pageable);
 
     // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────

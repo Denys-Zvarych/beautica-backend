@@ -52,6 +52,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -233,10 +234,18 @@ public class BookingService {
      * graph-hydrate pattern (Fix H1), then add exactly two bounded follow-ups for the page:
      * one batched {@code findReviewedBookingIds} and the two-query label resolution — never a
      * per-row lookup.
+     *
+     * <p><b>Phase 26.1 — multi-select status.</b> {@code status} widened from a single optional
+     * {@link BookingStatus} to a repeatable {@link List}, bound by Spring from both
+     * {@code ?status=A} (1-element list, preserving every pre-26.1 caller byte-for-byte) and
+     * {@code ?status=A&status=B}. Normalised once here to an {@link EnumSet} — {@code null} or
+     * empty means "no predicate" (unfiltered, matching today's behaviour); a non-empty input
+     * de-duplicates and is self-bounded at the enum's cardinality (5), so no caller can build an
+     * unbounded {@code IN} list no matter how many times {@code status} is repeated.
      */
     @Transactional(readOnly = true)
     public PageResponse<BookingDetailResponse> getMyBookings(
-            UUID actorUserId, Authentication auth, BookingStatus status, Pageable pageable) {
+            UUID actorUserId, Authentication auth, List<BookingStatus> status, Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
         Role role = auth.getAuthorities().stream()
@@ -244,9 +253,13 @@ public class BookingService {
                 .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
 
+        Set<BookingStatus> statuses = (status == null || status.isEmpty())
+                ? null
+                : EnumSet.copyOf(status);
+
         Page<BookingDetailResponse> page = role == Role.CLIENT
-                ? listClientBookings(actorUserId, status, pageable)
-                : listProviderBookings(role, actorUserId, status, pageable);
+                ? listClientBookings(actorUserId, statuses, pageable)
+                : listProviderBookings(role, actorUserId, statuses, pageable);
 
         return PageResponse.of(
                 page.getContent(),
@@ -260,9 +273,9 @@ public class BookingService {
      * CLIENT path — one projection query (reviewExists inline) + batched label resolution.
      */
     private Page<BookingDetailResponse> listClientBookings(
-            UUID clientId, BookingStatus status, Pageable pageable) {
+            UUID clientId, Set<BookingStatus> statuses, Pageable pageable) {
         Page<ClientBookingDetailProjection> page =
-                bookingRepository.findClientBookingDetails(clientId, status, pageable);
+                bookingRepository.findClientBookingDetails(clientId, statuses, pageable);
         if (page.isEmpty()) {
             return new PageImpl<>(List.of(), pageable, page.getTotalElements());
         }
@@ -279,7 +292,7 @@ public class BookingService {
      * query and the two-query label resolution for the whole page.
      */
     private Page<BookingDetailResponse> listProviderBookings(
-            Role role, UUID actorUserId, BookingStatus status, Pageable pageable) {
+            Role role, UUID actorUserId, Set<BookingStatus> statuses, Pageable pageable) {
         // Two-query pattern (Fix H1 — HHH90003004): first fetch a page of IDs using
         // plain JPQL with no JOIN FETCH (so the DB applies LIMIT/OFFSET correctly), then
         // batch-hydrate only those IDs with the full association graph in a second query.
@@ -287,9 +300,7 @@ public class BookingService {
             case SALON_MASTER, INDEPENDENT_MASTER -> {
                 Master master = masterRepository.findByUserId(actorUserId)
                         .orElseThrow(() -> new NotFoundException("Master profile not found"));
-                yield status == null
-                        ? bookingRepository.findIdsByMasterId(master.getId(), pageable)
-                        : bookingRepository.findIdsByMasterIdAndStatus(master.getId(), status, pageable);
+                yield bookingRepository.findIdsByMasterIdFiltered(master.getId(), statuses, pageable);
             }
             case SALON_OWNER -> {
                 // Fix HIGH-1: salonId is on Salon.owner_id, NOT on User.salonId.
@@ -301,9 +312,7 @@ public class BookingService {
                 if (salonIds.isEmpty()) {
                     yield Page.empty(pageable);
                 }
-                yield status == null
-                        ? bookingRepository.findIdsBySalonIds(salonIds, pageable)
-                        : bookingRepository.findIdsBySalonIdsAndStatus(salonIds, status, pageable);
+                yield bookingRepository.findIdsBySalonIdsFiltered(salonIds, statuses, pageable);
             }
             // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings.
             // If this restriction is ever relaxed, add a SALON_ADMIN branch scoped to their salon.

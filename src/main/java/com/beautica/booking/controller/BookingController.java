@@ -12,6 +12,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -32,7 +33,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import com.beautica.common.exception.BusinessException;
+import io.swagger.v3.oas.annotations.Parameter;
 
+import java.util.List;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -81,7 +84,19 @@ public class BookingController {
     @GetMapping("/me")
     @PreAuthorize("isAuthenticated()")
     public ApiResponse<PageResponse<BookingDetailResponse>> listMyBookings(
-            @RequestParam(required = false) BookingStatus status,
+            // Phase 26.1: widened from a single optional BookingStatus to a repeatable list.
+            // Spring binds both ?status=A (1-element list — every pre-26.1 caller keeps working
+            // unchanged) and ?status=A&status=B (multi-select). null/absent = no status predicate.
+            // Finding 3 (LOW, backend-security, Phase 26.1 audit): @Size caps the repeated-param
+            // list at the enum's own cardinality (5 values) BEFORE it ever reaches
+            // EnumSet.copyOf in the service. Defense-in-depth — Tomcat's request-line length
+            // limit already bounds a raw ?status=&status=... query string in practice — but a
+            // missing explicit cap here is exactly the bounded-collection pattern Anti-Bug §B1
+            // requires. @Validated on the class (see class-level annotation) makes a violation
+            // surface as a 400 ConstraintViolationException (GlobalExceptionHandler), not a 500.
+            @Parameter(description = "Repeatable status filter, e.g. ?status=CONFIRMED&status=DECLINED. "
+                    + "Omit for no status predicate.")
+            @RequestParam(required = false) @Size(max = 5) List<BookingStatus> status,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
