@@ -1843,6 +1843,189 @@ class BookingServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    // ── getMyBookedDays (Phase 26.5 — GET /bookings/me/booked-days) ──────────────────────────────
+
+    @Test
+    @DisplayName("CLIENT scope: repository result (already distinct/ascending from the native query) "
+            + "is returned as-is, scoped by the caller's own client id — no in-Java re-reduction")
+    void should_returnClientScopedDates_when_clientRequestsBookedDays() {
+        LocalDate from = LocalDate.of(2026, 7, 1);
+        LocalDate to = LocalDate.of(2026, 7, 31);
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 7, 5), LocalDate.of(2026, 7, 20));
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+
+        // Repository returns the raw JDBC java.sql.Date (see BookingRepository's Phase 26.5
+        // javadoc — this is what production reproduces the ConverterNotFoundException with);
+        // BookingService converts to LocalDate via java.sql.Date::toLocalDate.
+        List<java.sql.Date> stubbed = expected.stream().map(java.sql.Date::valueOf).toList();
+        when(bookingRepository.findBookedDatesByClientId(clientId, fromTs, toExclusive)).thenReturn(stubbed);
+
+        var result = bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository).findBookedDatesByClientId(clientId, fromTs, toExclusive);
+        verifyNoInteractions(masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER/SALON_MASTER scope: masterId is resolved from the JWT principal "
+            + "(masterRepository.findByUserId), never taken from a request parameter")
+    void should_returnMasterScopedDates_when_independentMasterRequestsBookedDays() {
+        LocalDate from = LocalDate.of(2026, 8, 1);
+        LocalDate to = LocalDate.of(2026, 8, 10);
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 8, 3));
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID actorUserId = UUID.randomUUID();
+        List<java.sql.Date> stubbed = expected.stream().map(java.sql.Date::valueOf).toList();
+
+        when(masterRepository.findByUserId(actorUserId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findBookedDatesByMasterId(masterId, fromTs, toExclusive)).thenReturn(stubbed);
+
+        var result = bookingService.getMyBookedDays(actorUserId, buildAuth(Role.INDEPENDENT_MASTER), from, to);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository).findBookedDatesByMasterId(masterId, fromTs, toExclusive);
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("NotFoundException when a master-role caller has no Master profile row")
+    void should_throwNotFound_when_masterRoleCallerHasNoMasterProfile() {
+        UUID actorUserId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 8, 1);
+        LocalDate to = LocalDate.of(2026, 8, 10);
+
+        when(masterRepository.findByUserId(actorUserId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(actorUserId, buildAuth(Role.SALON_MASTER), from, to))
+                .isInstanceOf(NotFoundException.class);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER scope: aggregates across every owned active salon (salonRepository"
+            + ".findIdsByOwnerIdAndIsActiveTrue), mirroring getMyBookings' provider dispatch")
+    void should_returnSalonScopedDates_when_salonOwnerRequestsBookedDays() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 9, 12));
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        List<java.sql.Date> stubbed = expected.stream().map(java.sql.Date::valueOf).toList();
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive)).thenReturn(stubbed);
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository).findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER with no active salons short-circuits to an empty list without querying bookings")
+    void should_returnEmptyList_when_salonOwnerHasNoActiveSalonsForBookedDays() {
+        UUID ownerId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to);
+
+        assertThat(result).isEmpty();
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("ForbiddenException when SALON_ADMIN calls getMyBookedDays — same boundary as getMyBookings")
+    void should_throwForbidden_when_salonAdminRequestsBookedDays() {
+        UUID salonAdminId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(salonAdminId, buildAuth(Role.SALON_ADMIN), from, to))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'from' is null — the range is required, unlike getMyBookings' "
+            + "optional from/to")
+    void should_throwBadRequest_when_fromIsNullForBookedDays() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        clientId, buildAuth(Role.CLIENT), null, LocalDate.of(2026, 7, 31)))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'to' is null")
+    void should_throwBadRequest_when_toIsNullForBookedDays() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        clientId, buildAuth(Role.CLIENT), LocalDate.of(2026, 7, 1), null))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'from' is after 'to'")
+    void should_throwBadRequest_when_fromIsAfterToForBookedDays() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        clientId, buildAuth(Role.CLIENT), LocalDate.of(2026, 7, 31), LocalDate.of(2026, 7, 1)))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("the 366-day span cap is delegated to ScheduleDateMath.assertSpanWithinMax, not "
+            + "re-implemented inline — a stub throwing from that guard propagates through getMyBookedDays "
+            + "before any repository call is made")
+    void should_delegateSpanCap_toScheduleDateMathForBookedDays() {
+        LocalDate from = LocalDate.of(2026, 1, 1);
+        LocalDate to = LocalDate.of(2027, 6, 1);
+
+        org.mockito.Mockito.doThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Date range exceeds the maximum of 366 days"))
+                .when(dateMath).assertSpanWithinMax(from, to);
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verify(dateMath).assertToPlusOneDayRepresentable(to);
+        verify(dateMath).assertSpanWithinMax(from, to);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("from/to convert to the same half-open Kyiv-zoned instant range as getMyBookings' "
+            + "date filter (from.atStartOfDay(KYIV), to.plusDays(1).atStartOfDay(KYIV)) — a dot here and "
+            + "a non-empty GET /bookings/me?from=D&to=D for the same date must agree")
+    void should_useHalfOpenKyivRange_matchingGetMyBookings_forBookedDays() {
+        LocalDate from = LocalDate.of(2026, 3, 1);
+        LocalDate to = LocalDate.of(2026, 3, 1);
+        OffsetDateTime expectedFromTs = OffsetDateTime.parse("2026-03-01T00:00:00+02:00");
+        OffsetDateTime expectedToExclusive = OffsetDateTime.parse("2026-03-02T00:00:00+02:00");
+
+        when(bookingRepository.findBookedDatesByClientId(clientId, expectedFromTs, expectedToExclusive))
+                .thenReturn(List.of());
+
+        bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to);
+
+        verify(bookingRepository).findBookedDatesByClientId(clientId, expectedFromTs, expectedToExclusive);
+    }
+
     // ── getMyBookings — sort whitelist tripwire (Phase 26.3, backend-security gap) ──────────────
     //
     // normalizeBookingSort is a security boundary (see its javadoc): both the CLIENT projection

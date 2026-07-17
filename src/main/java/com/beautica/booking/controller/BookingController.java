@@ -132,6 +132,26 @@ public class BookingController {
                 AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, pageable));
     }
 
+    // Phase 26.5: three path segments (/me/booked-days) so it cannot collide with the
+    // two-segment /{bookingId} above — Spring's PathPattern always prefers the more specific
+    // literal match, but this endpoint is pinned by a routing test anyway since /me vs
+    // /{bookingId} ambiguity is a live footgun in this controller.
+    @GetMapping("/me/booked-days")
+    @PreAuthorize("isAuthenticated()")
+    public ApiResponse<List<LocalDate>> listMyBookedDays(
+            // Both required (unlike /me's optional from/to): an unbounded default would scan
+            // the caller's entire booking history. Filter-independent by design — no status/
+            // serviceId param here, see BookingService#getMyBookedDays javadoc.
+            @Parameter(description = "Range start (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            Authentication auth
+    ) {
+        return ApiResponse.ok(bookingService.getMyBookedDays(
+                AuthenticationUtils.userId(auth), auth, from, to));
+    }
+
     /**
      * Provider-initiated cancellation of an already-{@code CONFIRMED} booking (Phase 24.2).
      * Distinct from {@code PATCH /cancel} (client-initiated): this yields {@code DECLINED} so

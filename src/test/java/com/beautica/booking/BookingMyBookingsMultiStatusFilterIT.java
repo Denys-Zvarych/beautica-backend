@@ -199,9 +199,9 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     @DisplayName("GET /me — SALON_OWNER filtering multi-status sees only their own salon's matching "
             + "bookings, never another owner's salon")
     void should_returnOnlyOwnSalonBookings_when_salonOwnerFiltersMultiStatus() throws Exception {
-        SalonFixture salonA = createSalon("mbmsf-owner-a-" + System.nanoTime() + "@beautica.test");
+        BookingTestFixtures.SalonFixture salonA = fixtures.createSalon("mbmsf-owner-a-" + System.nanoTime() + "@beautica.test");
         UUID clientAId = fixtures.createUser("mbmsf-owner-a-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceAId = createSalonService(salonA.salonId(), salonA.masterId());
+        UUID serviceAId = fixtures.createSalonService(salonA.salonId(), salonA.masterId());
 
         OffsetDateTime t = ANCHOR;
         Set<UUID> expectedA = new HashSet<>();
@@ -213,9 +213,9 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
         t = t.plusMinutes(90);
         UUID cancelledA = insertBooking(clientAId, salonA.masterId(), serviceAId, salonA.salonId(), "CANCELLED", t);
 
-        SalonFixture salonB = createSalon("mbmsf-owner-b-" + System.nanoTime() + "@beautica.test");
+        BookingTestFixtures.SalonFixture salonB = fixtures.createSalon("mbmsf-owner-b-" + System.nanoTime() + "@beautica.test");
         UUID clientBId = fixtures.createUser("mbmsf-owner-b-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID serviceBId = createSalonService(salonB.salonId(), salonB.masterId());
+        UUID serviceBId = fixtures.createSalonService(salonB.salonId(), salonB.masterId());
         OffsetDateTime tb = ANCHOR;
         insertBooking(clientBId, salonB.masterId(), serviceBId, salonB.salonId(), "CONFIRMED", tb);
         tb = tb.plusMinutes(90);
@@ -239,7 +239,7 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     @DisplayName("GET /me — SALON_ADMIN is still denied with 403 even with the widened multi-value "
             + "status param (end-to-end, real service — not the mocked ForbiddenException unit test)")
     void should_return403_when_salonAdminListsMyBookingsWithMultiStatusParam() throws Exception {
-        SalonFixture salon = createSalon("mbmsf-admin-owner-" + System.nanoTime() + "@beautica.test");
+        BookingTestFixtures.SalonFixture salon = fixtures.createSalon("mbmsf-admin-owner-" + System.nanoTime() + "@beautica.test");
         String adminEmail = "mbmsf-admin-" + System.nanoTime() + "@beautica.test";
         fixtures.createUser(adminEmail, "SALON_ADMIN", salon.salonId());
 
@@ -503,42 +503,6 @@ class BookingMyBookingsMultiStatusFilterIT extends AbstractIntegrationTest {
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────
-
-    /** Bundle of a seeded salon graph so tests can address the owner, its salon, and its master. */
-    private record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
-
-    private SalonFixture createSalon(String ownerEmail) {
-        UUID ownerId = fixtures.createUser(ownerEmail, "SALON_OWNER", null);
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
-
-        String masterEmail = "mbmsf-salon-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterUserId = fixtures.createUser(masterEmail, "SALON_MASTER", salonId);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
-        return new SalonFixture(salonId, ownerEmail, masterId, masterEmail);
-    }
-
-    private UUID createSalonService(UUID salonId, UUID masterId) {
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId, fixtures.resolveServiceTypeId());
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, masterId, serviceDefId);
-        return masterServiceId;
-    }
 
     /**
      * Inserts a booking row directly via SQL (bypassing the create/decline/complete service

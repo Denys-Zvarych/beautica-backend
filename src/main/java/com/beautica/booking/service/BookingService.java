@@ -285,10 +285,7 @@ public class BookingService {
             LocalDate from, LocalDate to, List<UUID> serviceId, Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
-        Role role = auth.getAuthorities().stream()
-                .findFirst()
-                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        Role role = resolveActorRole(auth);
 
         Set<BookingStatus> statuses = (status == null || status.isEmpty())
                 ? null
@@ -330,6 +327,96 @@ public class BookingService {
                 page.getSize(),
                 page.getTotalElements(),
                 page.getTotalPages());
+    }
+
+    /**
+     * Resolves the caller's role from the JWT-derived granted authority — the same
+     * single-authority-per-principal assumption {@link #getMyBookings} has always relied on.
+     * Extracted (Phase 26.5) so {@code getMyBookings} and {@link #getMyBookedDays} share one
+     * copy of this lookup rather than each inlining it — a second, silently-diverging copy is
+     * exactly how these two endpoints' notion of "who is the caller" would end up disagreeing.
+     */
+    private Role resolveActorRole(Authentication auth) {
+        return auth.getAuthorities().stream()
+                .findFirst()
+                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+    }
+
+    /**
+     * Phase 26.5 — {@code GET /bookings/me/booked-days}: the set of local (Europe/Kyiv) dates
+     * on which the caller has at least one booking in {@code [from, to]}, ascending and
+     * distinct. Backs the day-rail dot on the booking-management design
+     * ({@code SalonManagementDesign/lib/widgets/bookings_toolbar.dart}'s {@code _bookingDays}).
+     *
+     * <p><b>Filter-independent by design.</b> The design computes {@code _bookingDays} from the
+     * screen's full, unfiltered booking list, not the filtered/sorted view — so the dots keep
+     * showing where bookings are even while a status/date/service filter narrows the list below.
+     * This method therefore takes no {@code status} / {@code serviceId} parameter and applies no
+     * status predicate — do not add one "for symmetry" with {@link #getMyBookings}.
+     *
+     * <p><b>{@code from}/{@code to} are required</b> (unlike {@code getMyBookings}'s optional
+     * range) and capped at 366 days via {@link ScheduleDateMath#assertSpanWithinMax} — an
+     * unbounded default would scan the caller's entire booking history. Converted to the same
+     * half-open {@code [from, toExclusive)} Kyiv-zoned instant range {@code getMyBookings} uses,
+     * so a dot returned here and a non-empty {@code GET /bookings/me?from=D&to=D} for the same
+     * date D always agree.
+     *
+     * <p>Role scope mirrors {@link #getMyBookings}: {@code SALON_MASTER}/{@code
+     * INDEPENDENT_MASTER} see their own bookings (scoped by {@code masterId}, resolved from the
+     * JWT principal — never a request parameter), {@code SALON_OWNER} sees bookings across their
+     * owned active salons, {@code CLIENT} sees their own bookings, and {@code SALON_ADMIN} is
+     * forbidden — consistent with {@code getMyBookings} rejecting that role for the same reason
+     * (they manage staff/services, not bookings).
+     *
+     * <p>Aggregation happens in Postgres ({@code SELECT DISTINCT} on a timezone-converted date
+     * expression, at most ~366 rows back) — never by loading the caller's booking history into
+     * heap and reducing with {@code .map(...).distinct()} in Java.
+     */
+    @Transactional(readOnly = true)
+    public List<LocalDate> getMyBookedDays(UUID actorUserId, Authentication auth, LocalDate from, LocalDate to) {
+        if (from == null || to == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Both 'from' and 'to' are required");
+        }
+        if (from.isAfter(to)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "'from' must not be after 'to'");
+        }
+        dateMath.assertToPlusOneDayRepresentable(to);
+        dateMath.assertSpanWithinMax(from, to);
+
+        OffsetDateTime fromTs = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+
+        Role role = resolveActorRole(auth);
+
+        List<java.sql.Date> bookedDates = switch (role) {
+            case CLIENT -> bookingRepository.findBookedDatesByClientId(actorUserId, fromTs, toExclusive);
+            case SALON_MASTER, INDEPENDENT_MASTER -> {
+                Master master = masterRepository.findByUserId(actorUserId)
+                        .orElseThrow(() -> new NotFoundException("Master profile not found"));
+                yield bookingRepository.findBookedDatesByMasterId(master.getId(), fromTs, toExclusive);
+            }
+            case SALON_OWNER -> {
+                List<UUID> salonIds = salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorUserId);
+                yield salonIds.isEmpty()
+                        ? List.of()
+                        : bookingRepository.findBookedDatesBySalonIds(salonIds, fromTs, toExclusive);
+            }
+            // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings —
+            // same boundary getMyBookings enforces via listProviderBookings.
+            case SALON_ADMIN -> throw new ForbiddenException("SALON_ADMIN cannot list bookings via this endpoint");
+        };
+
+        // Conversion lives HERE, not in the repository (CRITICAL fix, backend-qa
+        // BookingMyBookedDaysIT, 2026-07-17). The three native queries above return the raw JDBC
+        // java.sql.Date the driver produces for a `date` column — Spring Data's
+        // QueryExecutionResultHandler has no java.sql.Date -> LocalDate converter for a native
+        // scalar projection, so declaring List<LocalDate> on the repository method made every
+        // request 500 with ConverterNotFoundException. java.sql.Date::toLocalDate reads the
+        // value's stored year/month/day fields directly (no zone reinterpretation), so this is
+        // lossless: the AT TIME ZONE 'Europe/Kyiv' expression in SQL already produced the correct
+        // Kyiv calendar date before JDBC ever sees it — do not move that grouping into Java.
+        return bookedDates.stream().map(java.sql.Date::toLocalDate).toList();
     }
 
     /**

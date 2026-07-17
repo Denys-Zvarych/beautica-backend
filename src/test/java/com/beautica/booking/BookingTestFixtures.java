@@ -37,8 +37,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * parameter shapes: multi-status filter's insert takes a {@code status} enum string, sort's insert
  * additionally takes a {@code price} string, date-range's insert is always {@code CONFIRMED} and
  * takes no status at all), so those stay local to their own IT rather than being force-merged.
- * {@code createSalon}/{@code SalonFixture}/{@code createSalonService} are used only by the
- * multi-status suite and also stay local.
+ *
+ * <p>{@link SalonFixture}/{@code createSalon}/{@code createSalonService} were extracted here per
+ * backend-qa's Phase 26.5 audit (LOW finding — {@code BookingMyBookedDaysIT} became the second IT
+ * to need a full salon graph, crossing the Q4 "2+ occurrences" threshold). The two prior copies
+ * (in {@link BookingMyBookingsMultiStatusFilterIT} and {@code BookingMyBookedDaysIT}) were
+ * byte-identical except for a cosmetic test-suite email prefix on the seeded salon master
+ * ({@code "mbmsf-salon-master-"} vs {@code "mbbd-salon-master-"}) — that field is never read back
+ * by any caller (both suites address the master purely via {@link SalonFixture#masterId()}), so it
+ * was safe to unify on a single generic prefix rather than threading a caller-supplied one through.
  */
 class BookingTestFixtures {
 
@@ -127,5 +134,41 @@ class BookingTestFixtures {
             ids.add(UUID.fromString(row.path("id").asText()));
         }
         return ids;
+    }
+
+    /** Bundle of a seeded salon graph so tests can address the owner, its salon, and its master. */
+    record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
+
+    SalonFixture createSalon(String ownerEmail) {
+        UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, "Salon-" + salonId);
+
+        String masterEmail = "salon-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                masterId, masterUserId, salonId);
+        return new SalonFixture(salonId, ownerEmail, masterId, masterEmail);
+    }
+
+    UUID createSalonService(UUID salonId, UUID masterId) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
+                        + "VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, resolveServiceTypeId());
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId);
+        return masterServiceId;
     }
 }

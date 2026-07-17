@@ -10,6 +10,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.sql.Date;
 import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
@@ -163,6 +164,79 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to,
             Pageable pageable);
+
+    // ── Phase 26.5 — GET /bookings/me/booked-days (day-rail dot set) ──────────
+    //
+    // The rail's dot set must be the caller's FULL booking history for the range — no
+    // status filter (see the design's `_bookingDays` getter, computed from the unfiltered
+    // `widget.bookings`, not the filtered `_visible` view) — so, unlike
+    // findActiveIdsByMasterIdAndStartsAtBetween above, these three queries deliberately
+    // carry no `status IN (...)` predicate.
+    //
+    // Native + SELECT DISTINCT on a timezone-converted date expression: JPQL has no
+    // AT TIME ZONE function, and grouping must happen in Postgres (≤ ~361 rows back), not
+    // by loading every booking row into heap and reducing in Java. The half-open
+    // [:from, :toExclusive) bound on starts_at mirrors BookingService's LocalDate ->
+    // OffsetDateTime conversion (from.atStartOfDay(TimeZones.KYIV), to.plusDays(1)
+    // .atStartOfDay(TimeZones.KYIV)) exactly, so a dot here and a day-filtered result on
+    // GET /bookings/me always agree.
+    //
+    // The 'Europe/Kyiv' literal below cannot be replaced with a bound parameter reliably
+    // (AT TIME ZONE's right-hand operand is polymorphic; Postgres can fail to infer a bound
+    // parameter's type there) nor with a reference to the Java constant TimeZones.KYIV
+    // (native SQL has no access to JVM constants) — it is intentionally a literal, kept in
+    // sync with TimeZones.KYIV's value ("Europe/Kyiv") by convention. Update both together.
+    //
+    // Return type is java.sql.Date, NOT java.time.LocalDate (CRITICAL fix, backend-qa
+    // BookingMyBookedDaysIT, 2026-07-17). A native scalar projection returns the raw JDBC type
+    // the driver produces for a `date` column — java.sql.Date — and Spring Data's
+    // QueryExecutionResultHandler / GenericConversionService has no java.sql.Date -> LocalDate
+    // converter registered for that path (that conversion machinery is Hibernate's
+    // entity-attribute JSR-310 support, which a native scalar projection never goes through).
+    // Declaring List<LocalDate> here made every call 500 with ConverterNotFoundException. The
+    // caller (BookingService#getMyBookedDays) converts via java.sql.Date::toLocalDate, which is
+    // lossless here because the value is already the Kyiv calendar date computed by the
+    // `AT TIME ZONE 'Europe/Kyiv'` expression above, not a UTC-zoned instant — toLocalDate() on a
+    // java.sql.Date reads its stored year/month/day fields directly, no zone reinterpretation.
+
+    @Query(value = """
+            SELECT DISTINCT (b.starts_at AT TIME ZONE 'Europe/Kyiv')::date AS d
+            FROM bookings b
+            WHERE b.master_id = :masterId
+              AND b.starts_at >= :from
+              AND b.starts_at < :toExclusive
+            ORDER BY d
+            """, nativeQuery = true)
+    List<Date> findBookedDatesByMasterId(
+            @Param("masterId") UUID masterId,
+            @Param("from") OffsetDateTime from,
+            @Param("toExclusive") OffsetDateTime toExclusive);
+
+    @Query(value = """
+            SELECT DISTINCT (b.starts_at AT TIME ZONE 'Europe/Kyiv')::date AS d
+            FROM bookings b
+            WHERE b.salon_id IN (:salonIds)
+              AND b.starts_at >= :from
+              AND b.starts_at < :toExclusive
+            ORDER BY d
+            """, nativeQuery = true)
+    List<Date> findBookedDatesBySalonIds(
+            @Param("salonIds") Collection<UUID> salonIds,
+            @Param("from") OffsetDateTime from,
+            @Param("toExclusive") OffsetDateTime toExclusive);
+
+    @Query(value = """
+            SELECT DISTINCT (b.starts_at AT TIME ZONE 'Europe/Kyiv')::date AS d
+            FROM bookings b
+            WHERE b.client_id = :clientId
+              AND b.starts_at >= :from
+              AND b.starts_at < :toExclusive
+            ORDER BY d
+            """, nativeQuery = true)
+    List<Date> findBookedDatesByClientId(
+            @Param("clientId") UUID clientId,
+            @Param("from") OffsetDateTime from,
+            @Param("toExclusive") OffsetDateTime toExclusive);
 
     /**
      * Batch-hydrates a bounded set of booking IDs with the full association graph.

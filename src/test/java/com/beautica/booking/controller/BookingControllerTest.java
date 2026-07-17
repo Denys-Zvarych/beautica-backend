@@ -31,6 +31,7 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.config.WebMvcTestSupport;
 import jakarta.servlet.http.HttpServletResponse;
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import org.slf4j.Logger;
@@ -1099,6 +1100,106 @@ class BookingControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── GET /me/booked-days (Phase 26.5 — day-rail dot set) ──────────────────────
+
+    @Test
+    @DisplayName("GET /me/booked-days — 200, returns the distinct/ascending date list from the service")
+    void should_return200_when_authenticatedListMyBookedDays() throws Exception {
+        var clientId = UUID.randomUUID();
+        when(bookingService.getMyBookedDays(any(), any(), any(), any()))
+                .thenReturn(java.util.List.of(LocalDate.of(2026, 7, 5), LocalDate.of(2026, 7, 20)));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me/booked-days")
+                        .param("from", "2026-07-01")
+                        .param("to", "2026-07-31")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0]").value("2026-07-05"))
+                .andExpect(jsonPath("$.data[1]").value("2026-07-20"));
+    }
+
+    @Test
+    @DisplayName("GET /me/booked-days — the actor id passed to the service is the security principal, "
+            + "never a client-supplied value")
+    void should_usePrincipalAsActor_when_listingMyBookedDays() throws Exception {
+        var principalId = UUID.randomUUID();
+        when(bookingService.getMyBookedDays(eq(principalId), any(), any(), any()))
+                .thenReturn(java.util.List.of());
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me/booked-days")
+                        .param("from", "2026-07-01")
+                        .param("to", "2026-07-31")
+                        .with(authenticatedAs(principalId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
+        org.mockito.Mockito.verify(bookingService)
+                .getMyBookedDays(actorCaptor.capture(), any(), any(), any());
+        org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(principalId);
+    }
+
+    @Test
+    @DisplayName("GET /me/booked-days — 401 when no Authorization header")
+    void should_return401_when_unauthenticatedListMyBookedDays() throws Exception {
+        mockMvc.perform(get(BOOKINGS_URL + "/me/booked-days")
+                        .param("from", "2026-07-01")
+                        .param("to", "2026-07-31")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET /me/booked-days — 400 when 'from' is missing (range is required, unlike /me)")
+    void should_return400_when_fromMissingForBookedDays() throws Exception {
+        var clientId = UUID.randomUUID();
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me/booked-days")
+                        .param("to", "2026-07-31")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .getMyBookedDays(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /me/booked-days — 400 when 'to' is missing (range is required, unlike /me)")
+    void should_return400_when_toMissingForBookedDays() throws Exception {
+        var clientId = UUID.randomUUID();
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me/booked-days")
+                        .param("from", "2026-07-01")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .getMyBookedDays(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /{bookingId} still routes to getBooking and is not shadowed by /me/booked-days "
+            + "(routing collision guard — /me vs /{bookingId} ambiguity is a live footgun here)")
+    void should_routeToGetBooking_when_pathIsNotBookedDays() throws Exception {
+        var clientId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var row = stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID());
+        when(bookingService.getBooking(eq(clientId), eq(bookingId))).thenReturn(row);
+
+        mockMvc.perform(get(BOOKINGS_URL + "/" + bookingId)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.id").value(bookingId.toString()));
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .getMyBookedDays(any(), any(), any(), any());
     }
 
     // ── QA-CRITICAL: clientComment @Pattern — control-char guard ─────────────
