@@ -433,7 +433,7 @@ public class BookingService {
      * path as one string, so an exact-match {@link Set#contains} here rejects any multi-segment
      * path outright — it never inspects only the first segment.
      */
-    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt", "priceAtBooking", "createdAt");
+    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt", "priceAtBooking");
 
     /** Applied when the caller supplies no {@code sort} at all (Phase 26.3). */
     private static final Sort DEFAULT_BOOKING_SORT = Sort.by(Sort.Direction.DESC, "startsAt");

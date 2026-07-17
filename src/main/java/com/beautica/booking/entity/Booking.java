@@ -55,11 +55,35 @@ import java.util.UUID;
                 // direction — V93 declares starts_at DESC; this annotation mirrors the columns
                 // only so ddl-auto=validate sees the index exists.
                 @Index(name = "idx_bookings_master_client_starts_at", columnList = "master_id, client_id, starts_at"),
-                // composite index (V95): BookingRepository.findClientBookingDetails unfiltered
-                // shape — WHERE client_id = ? ORDER BY starts_at DESC. JPA cannot encode the DESC
-                // sort direction — V95 declares starts_at DESC; this annotation mirrors the columns
-                // only so ddl-auto=validate sees the index exists.
-                @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at"),
+                // composite index (V95, widened by V117): BookingRepository.findClientBookingDetails
+                // unfiltered shape — WHERE client_id = ? ORDER BY starts_at DESC, id ASC. JPA cannot
+                // encode the DESC sort direction nor the trailing id tiebreaker column order — V117
+                // declares (client_id, starts_at DESC, id ASC); this annotation mirrors the columns
+                // only so ddl-auto=validate sees the index exists. The trailing id (Phase 26.6) lets
+                // the index alone satisfy the Phase 26.3 `id ASC` tiebreaker at any OFFSET with no
+                // extra sort node — see V117's javadoc-style comment for the EXPLAIN evidence.
+                @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at, id"),
+                // composite index (V18, widened by V117): the provider "Мої записи" default-sort /
+                // date-range shapes — WHERE master_id = ? [AND starts_at BETWEEN ...] ORDER BY
+                // starts_at DESC, id ASC. Same V117 trailing-id widening as
+                // idx_bookings_client_starts_at above, for the master-scope sibling query family
+                // (BookingRepositoryCustomImpl.findIdPage).
+                @Index(name = "idx_bookings_master_starts_at", columnList = "master_id, starts_at, id"),
+                // composite index (V117): GET /bookings/me?sort=priceAtBooking — Phase 26.3 whitelisted
+                // this sort property but left it with no supporting index until V117; without it,
+                // Postgres sequentially scans the caller's ENTIRE booking history to satisfy the sort
+                // (measured: the only shape in the 26.6 EXPLAIN pass that produced a seq scan at
+                // 50,000 rows). JPA cannot encode the DESC direction or trailing id — mirrors columns
+                // only.
+                @Index(name = "idx_bookings_master_price_id", columnList = "master_id, price_at_booking, id"),
+                @Index(name = "idx_bookings_client_price_id", columnList = "client_id, price_at_booking, id"),
+                // composite index (V117): GET /bookings/me?serviceId=... with no date range narrowing
+                // it — Phase 26.4's masterServiceIdIn predicate otherwise applies as a post-scan
+                // Filter on idx_bookings_master_starts_at, which loses early-LIMIT termination for a
+                // rare single-service filter (measured: Rows Removed by Filter scaling with the
+                // master's TOTAL row count, not the service's). Converts that shape to a direct
+                // index-range seek on (master_id, master_service_id).
+                @Index(name = "idx_bookings_master_service_starts_at", columnList = "master_id, master_service_id, starts_at"),
                 // partial index (V112, predicate narrowed by V113): client-scoped cross-master/salon
                 // overlap check (BookingRepository.findFirstConflictingClientBookingId[Excluding]).
                 // JPA cannot encode WHERE status = 'CONFIRMED' AND client_id IS NOT NULL — the

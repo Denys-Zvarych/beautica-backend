@@ -133,6 +133,20 @@ class BookingMyBookingsSortIT extends AbstractIntegrationTest {
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
+    @Test
+    @DisplayName("GET /me — ?sort=createdAt,desc returns 400 — createdAt was DROPPED from "
+            + "SORTABLE_BOOKING_PROPERTIES (the approved design sorts only by time and price, never "
+            + "date-added); pins the new two-property whitelist {startsAt, priceAtBooking} end-to-end "
+            + "over the real HTTP stack, not just by code trace")
+    void should_return400_when_sortPropertyIsCreatedAt() throws Exception {
+        String clientEmail = "mbsort-createdat-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+
+        ResponseEntity<String> resp = callMyBookings(fixtures.tokenFor(clientEmail), "createdAt,desc", null, null);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // The sort must ACTUALLY reorder results — provider path (ID-page + hydrate)
     // ══════════════════════════════════════════════════════════════════════════

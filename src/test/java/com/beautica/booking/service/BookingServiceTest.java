@@ -2085,20 +2085,20 @@ class BookingServiceTest {
     // MAX_SORT_ORDERS caps normalizeBookingSort's effective Sort at 3 entries — each distinct
     // (property, direction) sequence compiles to a textually distinct ORDER BY, so an unbounded
     // sort list inflates plan-cache entries. The two tests below isolate that count bound from the
-    // whitelist check above: every property used here (startsAt, priceAtBooking, createdAt) is
-    // individually whitelisted, so a rejection can ONLY be attributed to cardinality, never to an
-    // unrecognised property name.
+    // whitelist check above: every property used here (startsAt, priceAtBooking — reused with a
+    // different direction to reach the required order count) is individually whitelisted, so a
+    // rejection can ONLY be attributed to cardinality, never to an unrecognised property name.
 
     @Test
     @DisplayName("BusinessException(400) is thrown, and NEITHER repository is ever touched, when sort "
             + "carries 4 orders — all four individually whitelisted properties (startsAt, "
-            + "priceAtBooking, createdAt, startsAt again) so the rejection is attributable ONLY to "
-            + "exceeding MAX_SORT_ORDERS=3, never to the property whitelist")
+            + "priceAtBooking, priceAtBooking desc, startsAt again) so the rejection is attributable "
+            + "ONLY to exceeding MAX_SORT_ORDERS=3, never to the property whitelist")
     void should_rejectSort_when_fourSortOrdersExceedTheCountBound() {
         UUID actorId = UUID.randomUUID();
         Sort fourOrders = Sort.by("startsAt")
                 .and(Sort.by("priceAtBooking"))
-                .and(Sort.by("createdAt"))
+                .and(Sort.by(Sort.Direction.DESC, "priceAtBooking"))
                 .and(Sort.by(Sort.Direction.DESC, "startsAt"));
         Pageable tooManyOrdersPageable = PageRequest.of(0, 20, fourOrders);
 
@@ -2121,7 +2121,7 @@ class BookingServiceTest {
     void should_acceptSort_when_exactlyThreeSortOrdersAtTheCountBound() {
         Sort threeOrders = Sort.by("startsAt")
                 .and(Sort.by("priceAtBooking"))
-                .and(Sort.by("createdAt"));
+                .and(Sort.by(Sort.Direction.DESC, "startsAt"));
         Pageable atBoundPageable = Pageable.unpaged(threeOrders);
         Sort expectedNormalizedSort = threeOrders.and(Sort.by(Sort.Direction.ASC, "id"));
         Pageable expectedNormalizedPageable = Pageable.unpaged(expectedNormalizedSort);

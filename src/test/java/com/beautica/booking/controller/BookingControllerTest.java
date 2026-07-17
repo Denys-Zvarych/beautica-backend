@@ -1102,6 +1102,47 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
     }
 
+    @Test
+    @DisplayName("GET /me — Phase 26.6: a requested size above spring.data.web.pageable.max-page-size "
+            + "(100) is CLAMPED to 100, not served as-is and not rejected with a 400 — pins Spring "
+            + "Data's own clamping behavior against a regression of the application.yml property.")
+    void should_clampPageSizeTo100_when_sizeExceedsMaxPageSize() throws Exception {
+        var clientId = UUID.randomUUID();
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 100, 0L, 0));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me")
+                        .param("size", "100000")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
+        org.mockito.Mockito.verify(bookingService)
+                .getMyBookings(any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
+        org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageSize()).isEqualTo(100);
+    }
+
+    @Test
+    @DisplayName("GET /me — page=999999 still clamps to 1000 (Anti-Bug §J deep-OFFSET guard, "
+            + "BookingController.java:127-130) — existing-cap regression pin, Phase 26.6")
+    void should_clampPageNumberTo1000_when_pageExceeds1000() throws Exception {
+        var clientId = UUID.randomUUID();
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 1000, 20, 0L, 0));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me")
+                        .param("page", "999999")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
+        org.mockito.Mockito.verify(bookingService)
+                .getMyBookings(any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
+        org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
+    }
+
     // ── GET /me/booked-days (Phase 26.5 — day-rail dot set) ──────────────────────
 
     @Test
