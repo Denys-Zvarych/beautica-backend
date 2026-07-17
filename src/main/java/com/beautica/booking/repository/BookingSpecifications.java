@@ -108,4 +108,25 @@ public final class BookingSpecifications {
     public static Specification<Booking> startsAtBefore(OffsetDateTime toExclusive) {
         return (root, query, cb) -> cb.lessThan(root.get("startsAt"), toExclusive);
     }
+
+    /**
+     * Optional predicate: {@code b.masterService.id IN :serviceIds} (Phase 26.4 service filter,
+     * backing the design's «Послуга» multi-select). Callers must omit this predicate entirely —
+     * never call this method / never bind a null or empty collection — when the caller supplied
+     * no {@code serviceId} filter, same optional-predicate contract as {@link #statusIn} /
+     * {@link #startsAtOnOrAfter}.
+     *
+     * <p>Filters on {@code masterService.id} — the direct {@code @ManyToOne} FK {@link Booking}
+     * already carries — never {@code masterService.serviceDefinition.id}. This resolves via
+     * {@link jakarta.persistence.criteria.Path#get(String)} as an implicit single-valued
+     * navigation (a correlated subselect-free {@code =}/{@code IN} against the FK column), not an
+     * explicit {@link jakarta.persistence.criteria.Join} — so, like {@link #masterIdEquals}, it
+     * adds no join and no {@code DISTINCT} requirement; the separate graph-hydrate query
+     * ({@code findAllByIdsWithGraph}) still does the actual {@code JOIN FETCH b.masterService}.
+     * {@code BookingService} de-duplicates and bounds {@code serviceIds} to 50 entries before this
+     * predicate is ever composed — see {@code BookingService#getMyBookings}.
+     */
+    public static Specification<Booking> masterServiceIdIn(Collection<UUID> serviceIds) {
+        return (root, query, cb) -> root.get("masterService").get("id").in(serviceIds);
+    }
 }

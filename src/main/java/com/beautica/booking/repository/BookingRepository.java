@@ -281,6 +281,17 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * which would silently reintroduce a server-default-zone bug). Do not revert to a bare
      * {@code :from IS NULL} — {@code ClientBookingDetailProjectionTest} pins this against a real
      * Postgres instance (Testcontainers), not a mock, specifically to catch a regression here.
+     *
+     * <p><b>Phase 26.4 — optional service filter, {@code :serviceIds} gets NO {@code CAST}.</b>
+     * {@code (:serviceIds IS NULL OR b.masterService.id IN :serviceIds)} mirrors the untyped
+     * {@code :statuses} predicate above, not the {@code CAST}-guarded date predicates — because
+     * {@code serviceIds} is a {@code Collection<UUID>}, bound the same way {@code statuses} is:
+     * Hibernate's collection/{@code IN}-clause binding always assigns the array element type
+     * explicitly (needed to build {@code = ANY(?)}), so Postgres never has to infer an OID from a
+     * lone {@code IS NULL} the way it does for the scalar {@code :from}/{@code :toExclusive}
+     * parameters. {@code ClientBookingDetailProjectionTest} exercises the non-null branch against
+     * a real Postgres instance (Testcontainers) to confirm this — do not add a {@code CAST} here
+     * pre-emptively; it is unneeded for a collection parameter and would be dead defensive code.
      */
     @Query(value = """
             SELECT new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -326,6 +337,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
               AND (:statuses IS NULL OR b.status IN :statuses)
               AND (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)
               AND (CAST(:toExclusive AS java.time.OffsetDateTime) IS NULL OR b.startsAt < :toExclusive)
+              AND (:serviceIds IS NULL OR b.masterService.id IN :serviceIds)
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
@@ -333,12 +345,14 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
               AND (:statuses IS NULL OR b.status IN :statuses)
               AND (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)
               AND (CAST(:toExclusive AS java.time.OffsetDateTime) IS NULL OR b.startsAt < :toExclusive)
+              AND (:serviceIds IS NULL OR b.masterService.id IN :serviceIds)
             """)
     Page<ClientBookingDetailProjection> findClientBookingDetails(
             @Param("clientId") UUID clientId,
             @Param("statuses") Collection<BookingStatus> statuses,
             @Param("from") OffsetDateTime from,
             @Param("toExclusive") OffsetDateTime toExclusive,
+            @Param("serviceIds") Collection<UUID> serviceIds,
             Pageable pageable);
 
     // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────

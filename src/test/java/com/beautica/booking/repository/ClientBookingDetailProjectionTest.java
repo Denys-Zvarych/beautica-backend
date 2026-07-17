@@ -267,7 +267,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         ClientBookingDetailProjection p = page.getContent().get(0);
@@ -334,7 +334,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         assertThat(page.getContent().get(0).masterProfessionalTitle())
@@ -360,7 +360,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent().get(0).masterProfessionalTitle())
                 .as("a master who never set a title must render as null, not an empty-string placeholder")
@@ -410,7 +410,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         ClientBookingDetailProjection p = page.getContent().get(0);
@@ -481,7 +481,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         ClientBookingDetailProjection p = page.getContent().get(0);
@@ -541,7 +541,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
         ClientBookingDetailProjection projection = page.getContent().get(0);
 
         assertThat(projection.street())
@@ -579,7 +579,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         // Two bookings, two rows — the OneToOne LEFT JOIN Review must not duplicate the reviewed row.
         assertThat(page.getTotalElements())
@@ -610,9 +610,9 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> filtered = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), java.util.Set.of(BookingStatus.CONFIRMED), null, null, PageRequest.of(0, 20));
+                clientUser.getId(), java.util.Set.of(BookingStatus.CONFIRMED), null, null, null, PageRequest.of(0, 20));
         Page<ClientBookingDetailProjection> all = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(filtered.getContent())
                 .extracting(ClientBookingDetailProjection::id)
@@ -640,12 +640,112 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         Page<ClientBookingDetailProjection> union = bookingRepository.findClientBookingDetails(
                 clientUser.getId(),
                 java.util.EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED),
-                null, null, PageRequest.of(0, 20));
+                null, null, null, PageRequest.of(0, 20));
 
         assertThat(union.getContent())
                 .extracting(ClientBookingDetailProjection::id)
                 .containsExactlyInAnyOrder(cancelled.getId(), declined.getId());
         assertThat(union.getTotalElements()).isEqualTo(2);
+    }
+
+    // ── service filter (Phase 26.4 — masterService.id IN :serviceIds, no CAST) ───
+    //
+    // Verifies the client-path (:serviceIds IS NULL OR b.masterService.id IN :serviceIds)
+    // predicate against a REAL Postgres instance (Testcontainers, not a mock). serviceIds is a
+    // Collection<UUID>, bound the same way `statuses` is (Hibernate's IN-clause collection
+    // binding assigns the array element type explicitly) — unlike the scalar `from`/`toExclusive`
+    // parameters above, which needed an explicit CAST to avoid "could not determine data type of
+    // parameter" on a bare `IS NULL` check. If this predicate needed the same CAST treatment, the
+    // tests below would fail with that exact Postgres error rather than merely asserting the
+    // wrong rows — they do not, confirming the collection-sentinel form is safe here as-is.
+
+    @Test
+    @DisplayName("serviceId filter returns only bookings of the matching MasterService; a null filter returns all "
+            + "(Phase 26.4 — proves the untyped (:serviceIds IS NULL OR ...) idiom against real Postgres)")
+    void should_filterByServiceId_when_serviceIdFilterSupplied() {
+        User masterUser = persistMasterUser(null, null, "Bankova", "4", null);
+        Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment manicure =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Manicure", "MANICURE");
+        MasterServiceAssignment pedicure =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Pedicure", "PEDICURE");
+        Booking manicureBooking = persistBooking(master, manicure, null, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 13, 9, 0, 0, 0, ZoneOffset.UTC));
+        persistBooking(master, pedicure, null, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 14, 9, 0, 0, 0, ZoneOffset.UTC));
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> filtered = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, null, null, java.util.Set.of(manicure.getId()), PageRequest.of(0, 20));
+        Page<ClientBookingDetailProjection> unfiltered = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
+
+        assertThat(filtered.getContent())
+                .extracting(ClientBookingDetailProjection::id)
+                .containsExactly(manicureBooking.getId());
+        assertThat(filtered.getTotalElements())
+                .as("countQuery must carry the same serviceIds predicate as the content query")
+                .isEqualTo(1);
+        assertThat(unfiltered.getTotalElements()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("a multi-value serviceId set returns the union of matching bookings (Phase 26.4)")
+    void should_returnUnion_when_multipleServiceIdsSupplied() {
+        User masterUser = persistMasterUser(null, null, "Instytutska", "6", null);
+        Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment manicure =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Manicure", "MANICURE");
+        MasterServiceAssignment pedicure =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Pedicure", "PEDICURE");
+        MasterServiceAssignment massage =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Massage", "MASSAGE");
+        Booking manicureBooking = persistBooking(master, manicure, null, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 15, 9, 0, 0, 0, ZoneOffset.UTC));
+        Booking pedicureBooking = persistBooking(master, pedicure, null, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 16, 9, 0, 0, 0, ZoneOffset.UTC));
+        persistBooking(master, massage, null, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 17, 9, 0, 0, 0, ZoneOffset.UTC));
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> union = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, null, null,
+                new java.util.LinkedHashSet<>(java.util.List.of(manicure.getId(), pedicure.getId())),
+                PageRequest.of(0, 20));
+
+        assertThat(union.getContent())
+                .extracting(ClientBookingDetailProjection::id)
+                .containsExactlyInAnyOrder(manicureBooking.getId(), pedicureBooking.getId());
+        assertThat(union.getTotalElements()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("a serviceId belonging to a booking whose MasterService was later deleted still leaves the "
+            + "booking visible in the UNFILTERED list (Phase 26.4 catalogue-limitation acceptance criterion)")
+    void should_stillListBooking_when_itsMasterServiceIsLaterDeleted() {
+        User masterUser = persistMasterUser(null, null, "Predslavynska", "8", null);
+        Master master = persistMaster(masterUser, null, MasterType.INDEPENDENT_MASTER);
+        MasterServiceAssignment msa =
+                persistService(master, OwnerType.INDEPENDENT_MASTER, master.getId(), "Waxing", "WAXING");
+        Booking booking = persistBooking(master, msa, null, BookingStatus.COMPLETED,
+                OffsetDateTime.of(2026, 6, 18, 9, 0, 0, 0, ZoneOffset.UTC));
+        em.flush();
+
+        // Simulate the master deleting the service after the booking was made: the booking's
+        // masterService FK still resolves (bookings never cascade-delete), the catalogue just no
+        // longer lists it as a filter option — see the phase doc's accepted-limitation note.
+        msa.setActive(false);
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> unfiltered = bookingRepository.findClientBookingDetails(
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
+
+        assertThat(unfiltered.getContent())
+                .extracting(ClientBookingDetailProjection::id)
+                .containsExactly(booking.getId());
     }
 
     // ── bounded query count (no N+1) ─────────────────────────────────────────────
@@ -671,7 +771,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
         statistics.clear();
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
         long fiveRowQueries = statistics.getPrepareStatementCount();
 
         assertThat(page.getContent()).hasSize(5);
@@ -687,7 +787,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
         statistics.clear();
         Page<ClientBookingDetailProjection> rerun = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
         long rerunQueries = statistics.getPrepareStatementCount();
 
         assertThat(rerun.getContent()).hasSize(5);
@@ -714,7 +814,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
         UUID otherClientId = UUID.randomUUID();
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                otherClientId, null, null, null, PageRequest.of(0, 20));
+                otherClientId, null, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).isEmpty();
     }

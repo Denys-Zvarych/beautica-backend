@@ -27,6 +27,8 @@ spring:
           batch_size: 50
         order_inserts: true
         order_updates: true
+        query:
+          in_clause_parameter_padding: true
 
   flyway:
     enabled: true

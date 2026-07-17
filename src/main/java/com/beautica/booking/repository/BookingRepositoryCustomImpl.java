@@ -49,24 +49,28 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
     @Override
     public Page<UUID> findIdsByMasterIdFiltered(
             UUID masterId, Collection<BookingStatus> statuses,
-            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
         Specification<Booking> spec = Specification.where(BookingSpecifications.masterIdEquals(masterId));
         if (statuses != null && !statuses.isEmpty()) {
             spec = spec.and(BookingSpecifications.statusIn(statuses));
         }
         spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
         return findIdPage(spec, pageable);
     }
 
     @Override
     public Page<UUID> findIdsBySalonIdsFiltered(
             List<UUID> salonIds, Collection<BookingStatus> statuses,
-            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
         Specification<Booking> spec = Specification.where(BookingSpecifications.salonIdIn(salonIds));
         if (statuses != null && !statuses.isEmpty()) {
             spec = spec.and(BookingSpecifications.statusIn(statuses));
         }
         spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
         return findIdPage(spec, pageable);
     }
 
@@ -85,6 +89,21 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
             result = result.and(BookingSpecifications.startsAtBefore(toExclusive));
         }
         return result;
+    }
+
+    /**
+     * Composes the optional Phase 26.4 {@code masterService.id IN :serviceIds} predicate onto
+     * {@code spec} — applied only when the caller supplied a non-empty set, exactly like
+     * {@code statuses} above, so a caller that omits {@code serviceId} entirely gets byte-for-byte
+     * the same SQL text Phase 26.2 already produces (no dead {@code IS NULL OR} branch — see
+     * {@link BookingSpecifications}'s class javadoc for why that idiom is rejected on this path).
+     */
+    private static Specification<Booking> applyServiceFilter(
+            Specification<Booking> spec, Collection<UUID> serviceIds) {
+        if (serviceIds == null || serviceIds.isEmpty()) {
+            return spec;
+        }
+        return spec.and(BookingSpecifications.masterServiceIdIn(serviceIds));
     }
 
     /**

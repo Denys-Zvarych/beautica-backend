@@ -36,19 +36,27 @@ public interface BookingRepositoryCustom {
      * already-resolved {@code Europe/Kyiv} instants (never {@code LocalDate} — the day/zone
      * conversion happens once in {@code BookingService#getMyBookings}); {@code null} means "no
      * predicate", mirroring the {@code statuses} contract exactly.
+     *
+     * <p><b>Phase 26.4 — optional service filter.</b> {@code serviceIds} is a caller-supplied,
+     * de-duplicated, size-bounded (max 50 — see {@code BookingService#getMyBookings}) set of
+     * {@code MasterService} ids; {@code null} or empty means "no predicate", same optional
+     * contract as {@code statuses}/date range. Matches {@code b.masterService.id}, never
+     * {@code b.masterService.serviceDefinition.id}.
      */
     Page<UUID> findIdsByMasterIdFiltered(
             UUID masterId, Collection<BookingStatus> statuses,
-            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable);
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
 
     /**
      * Callers must supply a pre-resolved, non-empty list of the authenticated owner's OWN active
      * salon ids (Anti-Bug §E-4; enforced by {@link BookingSpecifications#salonIdIn}). Same
-     * status/ordering/date-range contract as {@link #findIdsByMasterIdFiltered} — including the
-     * Phase 26.3 pre-validated-{@code Sort} requirement and the Phase 26.2 optional
-     * already-resolved-instant date bounds.
+     * status/ordering/date-range/service-filter contract as {@link #findIdsByMasterIdFiltered} —
+     * including the Phase 26.3 pre-validated-{@code Sort} requirement, the Phase 26.2 optional
+     * already-resolved-instant date bounds, and the Phase 26.4 optional bounded service filter.
      */
     Page<UUID> findIdsBySalonIdsFiltered(
             List<UUID> salonIds, Collection<BookingStatus> statuses,
-            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable);
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
 }

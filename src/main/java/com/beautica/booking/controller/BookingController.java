@@ -109,6 +109,18 @@ public class BookingController {
             @Parameter(description = "Bookings starting on/before the end of this local day (Europe/Kyiv), "
                     + "inclusive. Omit for an open-ended past window.")
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            // Phase 26.4: optional, repeatable serviceId filter — matches b.masterService.id
+            // (the master's own catalogue entry a booking was placed against), never
+            // masterService.serviceDefinition.id. Spring binds both ?serviceId=<A> (1-element
+            // list) and ?serviceId=<A>&serviceId=<B> (multi-select), same repeatable-param
+            // pattern as `status`. @Size caps the list at 50 — unlike status (self-bounded at the
+            // enum's own cardinality of 5), a UUID list has no natural upper bound, so an explicit
+            // cap is needed to stop an unbounded IN list / plan-cache inflation (Anti-Bug §B1).
+            // No facet endpoint: the existing GET /independent-masters/me/services catalogue is
+            // the option universe (see the phase doc's locked "no facet endpoint" decision).
+            @Parameter(description = "Repeatable MasterService id filter, e.g. "
+                    + "?serviceId=<A>&serviceId=<B>. Omit for no service predicate.")
+            @RequestParam(required = false) @Size(max = 50) List<UUID> serviceId,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
@@ -117,7 +129,7 @@ public class BookingController {
             pageable = PageRequest.of(1000, pageable.getPageSize(), pageable.getSort());
         }
         return ApiResponse.ok(bookingService.getMyBookings(
-                AuthenticationUtils.userId(auth), auth, status, from, to, pageable));
+                AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, pageable));
     }
 
     /**
