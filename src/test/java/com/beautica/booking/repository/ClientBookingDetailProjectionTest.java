@@ -607,6 +607,99 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                 .isNull();
     }
 
+    // ── salon-employed master, salon address PARTIALLY populated (mixed CASE-null / ─
+    // ── CASE-salon within the SAME row — Phase 26.7.2 PII-precedence re-audit) ──────
+    //
+    // The two tests above cover the "salon has NO address at all" (every field null) and
+    // "salon has a FULL address" (every field set) extremes. Phase 26.7.2's re-audit
+    // (phase-207 Step 1) explicitly calls out a THIRD, distinct shape those two do not
+    // exercise: a salon row where SOME address fields are set and ONE (locationNote) is
+    // left null — proving each of the five `CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X
+    // END` expressions resolves independently per column, not as an all-or-nothing switch
+    // keyed on whether the salon row "looks empty". A regression that accidentally shared
+    // one salon-emptiness check across all five columns (e.g. gating every CASE on
+    // `s.street IS NOT NULL` instead of `s.id IS NOT NULL`) would still pass the two
+    // existing all-null/all-populated tests but would fail this one: it would either null
+    // out the populated cityId/street/buildingNo too, or fall through locationNote to the
+    // master's personal note. The master's own row again carries a FULL, DIFFERENT address
+    // plus a personal note (leak canary), so any fall-through is visible.
+
+    @Test
+    @DisplayName("projection resolves populated salon fields (cityId/districtId/street/buildingNo) from "
+            + "the salon and leaves locationNote NULL — never the master's own note — when only the "
+            + "salon's locationNote is unset (mixed populated/null salon row)")
+    void should_resolvePopulatedFieldsAndNullLocationNote_when_salonAddressIsPartiallyPopulated() {
+        UUID[] salonTax = persistTaxonomy();
+        UUID salonCityId = salonTax[0];
+        UUID salonDistrictId = salonTax[1];
+
+        User ownerUser = new User(
+                "owner-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash", Role.SALON_OWNER, "Owner", "Person", "+380505555555");
+        em.persist(ownerUser);
+
+        // Salon sets cityId/districtId/street/buildingNo but deliberately leaves
+        // locationNote unset (NULL) — a salon that filled in its address but never wrote a
+        // door-code note, the realistic "partial" shape.
+        Salon salon = Salon.builder()
+                .owner(ownerUser)
+                .name("Partial Studio")
+                .cityId(salonCityId)
+                .districtId(salonDistrictId)
+                .street("PartialStreet")
+                .buildingNo("21")
+                .isActive(true)
+                .build();
+        em.persist(salon);
+
+        // Master's own user row carries a FULL, DIFFERENT address AND a personal
+        // locationNote — the leak canary: if any field fell through to mu.X instead of
+        // staying CASE-null/CASE-salon, it would show one of these values instead.
+        UUID[] masterOwnTax = persistTaxonomy();
+        User masterUser = persistMasterUser(
+                Role.SALON_MASTER, masterOwnTax[0], masterOwnTax[1],
+                "MasterOwnStreet", "77", "https://cdn.test/salon-master-4.png");
+        masterUser.setLocationNote("Master's personal note - must NOT surface for a salon booking");
+        Master master = persistMaster(masterUser, salon, MasterType.SALON_MASTER);
+        MasterServiceAssignment msa =
+                persistService(master, OwnerType.SALON, salon.getId(), "Styling", "HAIR");
+        Booking booking = persistBooking(master, msa, salon, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 20, 12, 0, 0, 0, ZoneOffset.UTC));
+
+        em.flush();
+        BookingDetailResponse entityResponse =
+                BookingDetailResponse.from(booking, false, "Kyiv", "Podil");
+        em.clear();
+
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).hasSize(1);
+        ClientBookingDetailProjection p = page.getContent().get(0);
+        assertThat(p)
+                .extracting(
+                        ClientBookingDetailProjection::discoveryCityId,
+                        ClientBookingDetailProjection::discoveryDistrictId,
+                        ClientBookingDetailProjection::street,
+                        ClientBookingDetailProjection::buildingNo,
+                        ClientBookingDetailProjection::locationNote)
+                .containsExactly(
+                        salonCityId,
+                        salonDistrictId,
+                        "PartialStreet",
+                        "21",
+                        null);
+
+        // Entity-path parity: BookingDetailResponse.from must agree that the populated
+        // fields come from the salon and the unset field stays null (never the master's).
+        assertThat(entityResponse.street()).isEqualTo("PartialStreet");
+        assertThat(entityResponse.buildingNo()).isEqualTo("21");
+        assertThat(entityResponse.locationNote())
+                .as("entity path must also leave locationNote null, not fall through to the "
+                        + "master's personal note, when the salon set every field EXCEPT locationNote")
+                .isNull();
+    }
+
     // ── reviewExists via LEFT JOIN Review (OneToOne — no row fan-out) ─────────────
 
     @Test
