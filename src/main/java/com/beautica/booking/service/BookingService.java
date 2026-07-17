@@ -14,6 +14,7 @@ import com.beautica.booking.repository.ClientBookingDetailProjection;
 import com.beautica.common.PageResponse;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
@@ -82,6 +83,7 @@ public class BookingService {
     private final Clock clock;
     private final CacheManager cacheManager;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    private final ScheduleDateMath dateMath;
 
     @Transactional
     public BookingResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
@@ -244,10 +246,28 @@ public class BookingService {
      * empty means "no predicate" (unfiltered, matching today's behaviour); a non-empty input
      * de-duplicates and is self-bounded at the enum's cardinality (5), so no caller can build an
      * unbounded {@code IN} list no matter how many times {@code status} is repeated.
+     *
+     * <p><b>Phase 26.2 — optional {@code from}/{@code to} date-range filter.</b> Both are
+     * independent, optional {@link LocalDate} bounds on {@code startsAt}: {@code from} alone is
+     * an open-ended future window, {@code to} alone an open-ended past window. {@code to} is
+     * INCLUSIVE of the whole local day — resolved as a HALF-OPEN {@code Europe/Kyiv} instant
+     * range, {@code [from.atStartOfDay(KYIV), to.plusDays(1).atStartOfDay(KYIV))}, never an
+     * {@code <=} on {@code to} itself (which would silently drop every booking after 00:00 Kyiv
+     * on the final day) and never a UTC/{@code systemDefault()} zone (which would shift every
+     * boundary by the Kyiv offset). {@code from > to} throws a 400 {@link BusinessException}
+     * rather than returning an empty page — an empty page would hide a client bug. A span wider
+     * than 366 days also throws 400, reusing {@link ScheduleDateMath#assertSpanWithinMax} rather
+     * than inventing a new literal. An extreme {@code to} near {@link LocalDate#MAX} (which
+     * {@code @DateTimeFormat(iso = DATE)} parses without complaint) would make
+     * {@code to.plusDays(1)} throw an uncaught {@link java.time.DateTimeException} — guarded by
+     * {@link ScheduleDateMath#assertToPlusOneDayRepresentable}, called unconditionally whenever
+     * {@code to} is present, so both a {@code to}-only request and a valid small span landing on
+     * that boundary get a clean 400 instead of a 500.
      */
     @Transactional(readOnly = true)
     public PageResponse<BookingDetailResponse> getMyBookings(
-            UUID actorUserId, Authentication auth, List<BookingStatus> status, Pageable pageable) {
+            UUID actorUserId, Authentication auth, List<BookingStatus> status,
+            LocalDate from, LocalDate to, Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
         Role role = auth.getAuthorities().stream()
@@ -259,6 +279,18 @@ public class BookingService {
                 ? null
                 : EnumSet.copyOf(status);
 
+        if (to != null) {
+            dateMath.assertToPlusOneDayRepresentable(to);
+        }
+        if (from != null && to != null) {
+            if (from.isAfter(to)) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST, "'from' must not be after 'to'");
+            }
+            dateMath.assertSpanWithinMax(from, to);
+        }
+        OffsetDateTime fromTs = from == null ? null : from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to == null ? null : to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+
         // Phase 26.3: validate/whitelist/default/tiebreak the sort BEFORE the role dispatch, so
         // BOTH the client projection query and the provider ID-page query receive an identical,
         // already-safe Pageable — see normalizeBookingSort's javadoc for why this must happen
@@ -266,8 +298,8 @@ public class BookingService {
         Pageable normalizedPageable = normalizeBookingSort(pageable);
 
         Page<BookingDetailResponse> page = role == Role.CLIENT
-                ? listClientBookings(actorUserId, statuses, normalizedPageable)
-                : listProviderBookings(role, actorUserId, statuses, normalizedPageable);
+                ? listClientBookings(actorUserId, statuses, fromTs, toExclusive, normalizedPageable)
+                : listProviderBookings(role, actorUserId, statuses, fromTs, toExclusive, normalizedPageable);
 
         return PageResponse.of(
                 page.getContent(),
@@ -373,9 +405,10 @@ public class BookingService {
      * CLIENT path — one projection query (reviewExists inline) + batched label resolution.
      */
     private Page<BookingDetailResponse> listClientBookings(
-            UUID clientId, Set<BookingStatus> statuses, Pageable pageable) {
+            UUID clientId, Set<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
         Page<ClientBookingDetailProjection> page =
-                bookingRepository.findClientBookingDetails(clientId, statuses, pageable);
+                bookingRepository.findClientBookingDetails(clientId, statuses, from, toExclusive, pageable);
         if (page.isEmpty()) {
             return new PageImpl<>(List.of(), pageable, page.getTotalElements());
         }
@@ -392,7 +425,8 @@ public class BookingService {
      * query and the two-query label resolution for the whole page.
      */
     private Page<BookingDetailResponse> listProviderBookings(
-            Role role, UUID actorUserId, Set<BookingStatus> statuses, Pageable pageable) {
+            Role role, UUID actorUserId, Set<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
         // Two-query pattern (Fix H1 — HHH90003004): first fetch a page of IDs using
         // plain JPQL with no JOIN FETCH (so the DB applies LIMIT/OFFSET correctly), then
         // batch-hydrate only those IDs with the full association graph in a second query.
@@ -400,7 +434,7 @@ public class BookingService {
             case SALON_MASTER, INDEPENDENT_MASTER -> {
                 Master master = masterRepository.findByUserId(actorUserId)
                         .orElseThrow(() -> new NotFoundException("Master profile not found"));
-                yield bookingRepository.findIdsByMasterIdFiltered(master.getId(), statuses, pageable);
+                yield bookingRepository.findIdsByMasterIdFiltered(master.getId(), statuses, from, toExclusive, pageable);
             }
             case SALON_OWNER -> {
                 // Fix HIGH-1: salonId is on Salon.owner_id, NOT on User.salonId.
@@ -412,7 +446,7 @@ public class BookingService {
                 if (salonIds.isEmpty()) {
                     yield Page.empty(pageable);
                 }
-                yield bookingRepository.findIdsBySalonIdsFiltered(salonIds, statuses, pageable);
+                yield bookingRepository.findIdsBySalonIdsFiltered(salonIds, statuses, from, toExclusive, pageable);
             }
             // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings.
             // If this restriction is ever relaxed, add a SALON_ADMIN branch scoped to their salon.

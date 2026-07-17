@@ -254,6 +254,33 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      *
      * <p>Scope: callers MUST pass the authenticated client's own user id — the predicate
      * {@code b.client.id = :clientId} is the ownership boundary (Anti-Bug §E-4).
+     *
+     * <p><b>Phase 26.2 — optional date range.</b> {@code from}/{@code toExclusive} extend this
+     * method's existing {@code (:x IS NULL OR ...)} sentinel idiom (left as-is here per Finding 2
+     * above — this method was NOT converted to a {@link org.springframework.data.jpa.domain.Specification}).
+     * Both are already-resolved {@code Europe/Kyiv} instants computed once in
+     * {@code BookingService#getMyBookings} — {@code toExclusive} is the HALF-OPEN upper bound
+     * ({@code to.plusDays(1)} at Kyiv midnight), never an {@code <=} on {@code to} itself, so a
+     * {@code to}-day booking after 00:00 Kyiv is not silently dropped.
+     *
+     * <p><b>The two date predicates {@code CAST} the parameter before the null-check</b> —
+     * {@code (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)} — unlike
+     * the untyped {@code (:statuses IS NULL OR ...)} predicate above. This is not stylistic. A
+     * bare {@code :from IS NULL} (tried first, and separately a reordered
+     * {@code b.startsAt >= :from OR :from IS NULL} — {@code OR} is commutative so reordering
+     * changes nothing) both raised {@code ERROR: could not determine data type of parameter $N}
+     * on EVERY execution — a hard 500, not merely the GENERIC-plan slowdown Finding 1 describes.
+     * PostgreSQL's extended-query-protocol parser cannot resolve a parameter's OID from a lone
+     * {@code IS NULL} usage when nothing else in the query pins its type; {@code :statuses IS
+     * NULL} is unaffected only because Hibernate's collection/{@code IN}-clause binding machinery
+     * always assigns the array element type explicitly (needed to build {@code = ANY(?)}), a
+     * guarantee scalar temporal parameters don't get for free. The {@code CAST} gives Postgres an
+     * explicit {@code timestamp(6) with time zone} OID for the SAME parameter used later in the
+     * real {@code >=}/{@code <} comparison — verified against the {@code timestamptz} column, so
+     * this does not shift the compared instant (unlike casting to timezone-less {@code timestamp},
+     * which would silently reintroduce a server-default-zone bug). Do not revert to a bare
+     * {@code :from IS NULL} — {@code ClientBookingDetailProjectionTest} pins this against a real
+     * Postgres instance (Testcontainers), not a mock, specifically to catch a regression here.
      */
     @Query(value = """
             SELECT new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -297,15 +324,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN Review r ON r.booking = b
             WHERE b.client.id = :clientId
               AND (:statuses IS NULL OR b.status IN :statuses)
+              AND (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)
+              AND (CAST(:toExclusive AS java.time.OffsetDateTime) IS NULL OR b.startsAt < :toExclusive)
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             WHERE b.client.id = :clientId
               AND (:statuses IS NULL OR b.status IN :statuses)
+              AND (CAST(:from AS java.time.OffsetDateTime) IS NULL OR b.startsAt >= :from)
+              AND (CAST(:toExclusive AS java.time.OffsetDateTime) IS NULL OR b.startsAt < :toExclusive)
             """)
     Page<ClientBookingDetailProjection> findClientBookingDetails(
             @Param("clientId") UUID clientId,
             @Param("statuses") Collection<BookingStatus> statuses,
+            @Param("from") OffsetDateTime from,
+            @Param("toExclusive") OffsetDateTime toExclusive,
             Pageable pageable);
 
     // ── Full-graph single lookup (Fix M6 — lazy loads on mutation response) ────

@@ -267,7 +267,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         ClientBookingDetailProjection p = page.getContent().get(0);
@@ -334,7 +334,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         assertThat(page.getContent().get(0).masterProfessionalTitle())
@@ -360,7 +360,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent().get(0).masterProfessionalTitle())
                 .as("a master who never set a title must render as null, not an empty-string placeholder")
@@ -410,7 +410,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         ClientBookingDetailProjection p = page.getContent().get(0);
@@ -481,7 +481,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).hasSize(1);
         ClientBookingDetailProjection p = page.getContent().get(0);
@@ -541,7 +541,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
         ClientBookingDetailProjection projection = page.getContent().get(0);
 
         assertThat(projection.street())
@@ -579,7 +579,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
 
         // Two bookings, two rows — the OneToOne LEFT JOIN Review must not duplicate the reviewed row.
         assertThat(page.getTotalElements())
@@ -610,9 +610,9 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
 
         Page<ClientBookingDetailProjection> filtered = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), java.util.Set.of(BookingStatus.CONFIRMED), PageRequest.of(0, 20));
+                clientUser.getId(), java.util.Set.of(BookingStatus.CONFIRMED), null, null, PageRequest.of(0, 20));
         Page<ClientBookingDetailProjection> all = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
 
         assertThat(filtered.getContent())
                 .extracting(ClientBookingDetailProjection::id)
@@ -640,7 +640,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         Page<ClientBookingDetailProjection> union = bookingRepository.findClientBookingDetails(
                 clientUser.getId(),
                 java.util.EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED),
-                PageRequest.of(0, 20));
+                null, null, PageRequest.of(0, 20));
 
         assertThat(union.getContent())
                 .extracting(ClientBookingDetailProjection::id)
@@ -671,7 +671,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
         statistics.clear();
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
         long fiveRowQueries = statistics.getPrepareStatementCount();
 
         assertThat(page.getContent()).hasSize(5);
@@ -687,7 +687,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.clear();
         statistics.clear();
         Page<ClientBookingDetailProjection> rerun = bookingRepository.findClientBookingDetails(
-                clientUser.getId(), null, PageRequest.of(0, 20));
+                clientUser.getId(), null, null, null, PageRequest.of(0, 20));
         long rerunQueries = statistics.getPrepareStatementCount();
 
         assertThat(rerun.getContent()).hasSize(5);
@@ -714,7 +714,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
         UUID otherClientId = UUID.randomUUID();
         Page<ClientBookingDetailProjection> page = bookingRepository.findClientBookingDetails(
-                otherClientId, null, PageRequest.of(0, 20));
+                otherClientId, null, null, null, PageRequest.of(0, 20));
 
         assertThat(page.getContent()).isEmpty();
     }

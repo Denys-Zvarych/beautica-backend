@@ -143,6 +143,43 @@ public class ScheduleDateMath {
     }
 
     /**
+     * Span-ONLY guard reused by Phase 26.2's optional {@code GET /bookings/me} date-range filter.
+     * Deliberately narrower than {@link #assertExpandable}: that method also enforces the
+     * one-year past floor and two-year future cap, which do not apply here — Phase 26.2's
+     * {@code from}/{@code to} are each independently optional (an open-ended future or past
+     * range is valid), so a caller filtering on a genuinely historical or far-future range must
+     * not be rejected. Only the {@link #MAX_EXPANSION_SPAN_DAYS} span cap is reused, so the two
+     * features never drift onto separate literals for the same 366-day bound. Callers must
+     * already know both {@code from} and {@code to} are non-null — unlike
+     * {@link #assertExpandable}, this method does not itself enforce that (Phase 26.2's bounds
+     * are each independently optional, so "only one supplied" is a valid, non-erroring case that
+     * never reaches this method at all).
+     */
+    public void assertSpanWithinMax(LocalDate from, LocalDate to) {
+        if (ChronoUnit.DAYS.between(from, to) > MAX_EXPANSION_SPAN_DAYS) {
+            throw new BusinessException("Date range exceeds the maximum of 366 days");
+        }
+    }
+
+    /**
+     * Guards Phase 26.2's exclusive-end conversion ({@code to.plusDays(1).atStartOfDay(KYIV)} in
+     * {@code BookingService#getMyBookings}) against {@link java.time.DateTimeException} overflow.
+     * {@code @DateTimeFormat(iso = DATE)} parses {@code to=+999999999-12-31} ({@link LocalDate#MAX})
+     * without complaint, but {@code plusDays(1)} on that value throws uncaught — a 500, not a 400.
+     * Must be called unconditionally whenever {@code to} is present, independent of whether
+     * {@code from} is also supplied: the overflow is a property of {@code to} alone, not of the
+     * span between the two bounds, so a valid small span whose {@code to} happens to sit at
+     * {@link LocalDate#MAX} is rejected here too, before {@link #assertSpanWithinMax} would even
+     * see it. {@code from} needs no analogous guard — {@code from.atStartOfDay(...)} performs no
+     * arithmetic, and {@link LocalDate#MIN} converts to a representable instant without overflow.
+     */
+    public void assertToPlusOneDayRepresentable(LocalDate to) {
+        if (to.isAfter(LocalDate.MAX.minusDays(1))) {
+            throw new BusinessException("'to' is out of the supported date range");
+        }
+    }
+
+    /**
      * "Весь поточний місяць" preset: from the later of today and the 1st of the month, through the last
      * day of the current month. {@code lastDayOfMonth()} is leap-aware (Feb → 28 or 29 correctly).
      */

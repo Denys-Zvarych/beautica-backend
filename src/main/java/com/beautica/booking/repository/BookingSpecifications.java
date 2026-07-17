@@ -7,6 +7,7 @@ import com.beautica.salon.entity.Salon;
 import jakarta.persistence.criteria.Join;
 import org.springframework.data.jpa.domain.Specification;
 
+import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
@@ -82,5 +83,29 @@ public final class BookingSpecifications {
      */
     public static Specification<Booking> statusIn(Collection<BookingStatus> statuses) {
         return (root, query, cb) -> root.get("status").in(statuses);
+    }
+
+    /**
+     * Optional predicate: {@code b.startsAt >= :from} (Phase 26.2 date-range filter). Callers
+     * must omit this predicate entirely — never call this method / never bind a null — when the
+     * caller supplied no {@code from} bound, same optional-predicate contract as {@link #statusIn}.
+     * {@code from} is an already-resolved {@code Europe/Kyiv} start-of-day instant; the
+     * {@code LocalDate -> OffsetDateTime} conversion happens in {@code BookingService}, never here
+     * (this class stays instant-only and zone-agnostic).
+     */
+    public static Specification<Booking> startsAtOnOrAfter(OffsetDateTime from) {
+        return (root, query, cb) -> cb.greaterThanOrEqualTo(root.get("startsAt"), from);
+    }
+
+    /**
+     * Optional predicate: {@code b.startsAt < :toExclusive} (Phase 26.2 date-range filter).
+     * Deliberately named {@code toExclusive}, not {@code to} — this is the HALF-OPEN upper bound
+     * that makes an inclusive-of-the-whole-day {@code to} actually inclusive once
+     * {@code BookingService} resolves it as {@code to.plusDays(1).atStartOfDay(KYIV)}. A
+     * {@code <=} predicate here would silently drop every booking after 00:00 Kyiv on the final
+     * day — do not reintroduce it.
+     */
+    public static Specification<Booking> startsAtBefore(OffsetDateTime toExclusive) {
+        return (root, query, cb) -> cb.lessThan(root.get("startsAt"), toExclusive);
     }
 }

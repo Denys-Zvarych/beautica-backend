@@ -975,7 +975,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when authenticated CLIENT lists their bookings")
     void should_return200_when_authenticatedListMyBookings() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -990,7 +990,7 @@ class BookingControllerTest {
             + "when a single ?status=CANCELLED is supplied (Phase 26.1 backward compatibility)")
     void should_return200_and_passStatusParam_when_statusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any()))
+        when(bookingService.getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1001,7 +1001,7 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
 
         org.mockito.Mockito.verify(bookingService)
-                .getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any());
+                .getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any(), any(), any());
     }
 
     @Test
@@ -1009,7 +1009,7 @@ class BookingControllerTest {
     void should_return200_and_passMultiStatusParam_when_repeatedStatusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
         when(bookingService.getMyBookings(any(), any(),
-                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any()))
+                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1020,14 +1020,14 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
 
         org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(),
-                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any());
+                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any(), any(), any());
     }
 
     @Test
     @DisplayName("GET /me — the actor id passed to the service is the security principal, never a client-supplied value")
     void should_usePrincipalAsActor_when_listingMyBookings() throws Exception {
         var principalId = UUID.randomUUID();
-        when(bookingService.getMyBookings(eq(principalId), any(), any(), any()))
+        when(bookingService.getMyBookings(eq(principalId), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         // An attacker-controlled "clientId" query param must be ignored — the actor is the principal.
@@ -1039,7 +1039,7 @@ class BookingControllerTest {
 
         var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
         org.mockito.Mockito.verify(bookingService)
-                .getMyBookings(actorCaptor.capture(), any(), any(), any());
+                .getMyBookings(actorCaptor.capture(), any(), any(), any(), any(), any());
         org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(principalId);
     }
 
@@ -1049,7 +1049,7 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var row = stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID());
-        when(bookingService.getMyBookings(eq(clientId), any(), any(), any()))
+        when(bookingService.getMyBookings(eq(clientId), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(row), 0, 20, 1L, 1));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1077,7 +1077,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when SALON_OWNER lists their bookings")
     void should_return200_when_salonOwnerListsBookings() throws Exception {
         var ownerId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1091,7 +1091,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when INDEPENDENT_MASTER lists their bookings")
     void should_return200_when_independentMasterListsBookings() throws Exception {
         var masterId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")

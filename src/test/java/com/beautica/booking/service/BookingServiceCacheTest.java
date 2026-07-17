@@ -10,6 +10,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.location.DiscoveryLocationResolver;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -117,6 +118,9 @@ class BookingServiceCacheTest {
     // Phase 23.x (perf/security #2): BookingService evicts the salon-service-catalog cache via this
     // collaborator after commit. Not on the @SpringBootTest classes list, so mock it for wiring.
     @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Phase 26.2: BookingService now validates the optional date-range filter via this
+    // collaborator's span-only guard. Not on the @SpringBootTest classes list, so mock it here.
+    @MockBean ScheduleDateMath dateMath;
 
     @Autowired BookingService bookingService;
     @Autowired CacheManager cacheManager;

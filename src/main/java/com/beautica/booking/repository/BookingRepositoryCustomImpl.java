@@ -16,6 +16,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 
+import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
@@ -47,22 +48,43 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
 
     @Override
     public Page<UUID> findIdsByMasterIdFiltered(
-            UUID masterId, Collection<BookingStatus> statuses, Pageable pageable) {
+            UUID masterId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
         Specification<Booking> spec = Specification.where(BookingSpecifications.masterIdEquals(masterId));
         if (statuses != null && !statuses.isEmpty()) {
             spec = spec.and(BookingSpecifications.statusIn(statuses));
         }
+        spec = applyDateRange(spec, from, toExclusive);
         return findIdPage(spec, pageable);
     }
 
     @Override
     public Page<UUID> findIdsBySalonIdsFiltered(
-            List<UUID> salonIds, Collection<BookingStatus> statuses, Pageable pageable) {
+            List<UUID> salonIds, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
         Specification<Booking> spec = Specification.where(BookingSpecifications.salonIdIn(salonIds));
         if (statuses != null && !statuses.isEmpty()) {
             spec = spec.and(BookingSpecifications.statusIn(statuses));
         }
+        spec = applyDateRange(spec, from, toExclusive);
         return findIdPage(spec, pageable);
+    }
+
+    /**
+     * Composes the optional Phase 26.2 date-range predicates onto {@code spec} — each bound
+     * applied only when non-null, exactly like the {@code statuses} predicate above, so a caller
+     * that omits both bounds gets byte-for-byte the same SQL text Phase 26.1 already produces.
+     */
+    private static Specification<Booking> applyDateRange(
+            Specification<Booking> spec, OffsetDateTime from, OffsetDateTime toExclusive) {
+        Specification<Booking> result = spec;
+        if (from != null) {
+            result = result.and(BookingSpecifications.startsAtOnOrAfter(from));
+        }
+        if (toExclusive != null) {
+            result = result.and(BookingSpecifications.startsAtBefore(toExclusive));
+        }
+        return result;
     }
 
     /**

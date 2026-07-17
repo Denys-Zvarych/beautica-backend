@@ -4,6 +4,7 @@ import com.beautica.booking.enums.BookingStatus;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 
+import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
@@ -30,14 +31,24 @@ public interface BookingRepositoryCustom {
      * a guaranteed non-empty {@code Sort} (defaulted to {@code startsAt DESC} when the caller's
      * was unsorted), and a trailing unique-column tiebreaker. This repository method trusts that
      * contract and does not re-validate it.
+     *
+     * <p><b>Phase 26.2 — optional date range.</b> {@code from}/{@code toExclusive} are
+     * already-resolved {@code Europe/Kyiv} instants (never {@code LocalDate} — the day/zone
+     * conversion happens once in {@code BookingService#getMyBookings}); {@code null} means "no
+     * predicate", mirroring the {@code statuses} contract exactly.
      */
-    Page<UUID> findIdsByMasterIdFiltered(UUID masterId, Collection<BookingStatus> statuses, Pageable pageable);
+    Page<UUID> findIdsByMasterIdFiltered(
+            UUID masterId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable);
 
     /**
      * Callers must supply a pre-resolved, non-empty list of the authenticated owner's OWN active
      * salon ids (Anti-Bug §E-4; enforced by {@link BookingSpecifications#salonIdIn}). Same
-     * status/ordering contract as {@link #findIdsByMasterIdFiltered} — including the Phase 26.3
-     * pre-validated-{@code Sort} requirement.
+     * status/ordering/date-range contract as {@link #findIdsByMasterIdFiltered} — including the
+     * Phase 26.3 pre-validated-{@code Sort} requirement and the Phase 26.2 optional
+     * already-resolved-instant date bounds.
      */
-    Page<UUID> findIdsBySalonIdsFiltered(List<UUID> salonIds, Collection<BookingStatus> statuses, Pageable pageable);
+    Page<UUID> findIdsBySalonIdsFiltered(
+            List<UUID> salonIds, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable);
 }

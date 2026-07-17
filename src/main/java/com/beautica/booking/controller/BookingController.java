@@ -18,6 +18,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -35,6 +36,7 @@ import org.springframework.web.bind.annotation.RestController;
 import com.beautica.common.exception.BusinessException;
 import io.swagger.v3.oas.annotations.Parameter;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -97,6 +99,16 @@ public class BookingController {
             @Parameter(description = "Repeatable status filter, e.g. ?status=CONFIRMED&status=DECLINED. "
                     + "Omit for no status predicate.")
             @RequestParam(required = false) @Size(max = 5) List<BookingStatus> status,
+            // Phase 26.2: optional date-range filter on startsAt, independent of each other —
+            // `from` alone is an open-ended future window, `to` alone an open-ended past window.
+            // `to` is INCLUSIVE of its whole local (Europe/Kyiv) day; the half-open instant
+            // conversion happens in BookingService#getMyBookings, never here.
+            @Parameter(description = "Bookings starting on/after the start of this local day (Europe/Kyiv). "
+                    + "Omit for an open-ended future window.")
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @Parameter(description = "Bookings starting on/before the end of this local day (Europe/Kyiv), "
+                    + "inclusive. Omit for an open-ended past window.")
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
@@ -104,7 +116,8 @@ public class BookingController {
         if (pageable.getPageNumber() > 1000) {
             pageable = PageRequest.of(1000, pageable.getPageSize(), pageable.getSort());
         }
-        return ApiResponse.ok(bookingService.getMyBookings(AuthenticationUtils.userId(auth), auth, status, pageable));
+        return ApiResponse.ok(bookingService.getMyBookings(
+                AuthenticationUtils.userId(auth), auth, status, from, to, pageable));
     }
 
     /**
