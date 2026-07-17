@@ -86,6 +86,8 @@ class ReviewServiceCacheTest {
         when(review.getId()).thenReturn(reviewId);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 5);
         when(review.getComment()).thenReturn("Excellent");
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -156,6 +158,8 @@ class ReviewServiceCacheTest {
         when(review.getId()).thenReturn(reviewId);
         when(review.getClient()).thenReturn(client);
         when(review.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
         when(review.getRating()).thenReturn((short) 4);
         when(review.getComment()).thenReturn("Good");
         when(review.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
@@ -218,10 +222,27 @@ class ReviewServiceCacheTest {
         when(r.getId()).thenReturn(id);
         when(r.getClient()).thenReturn(client);
         when(r.getMaster()).thenReturn(master);
+        Booking booking = mockBookingWithServiceName("Manicure");
+        when(r.getBooking()).thenReturn(booking);
         when(r.getRating()).thenReturn(rating);
         when(r.getComment()).thenReturn(comment);
         when(r.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
         return r;
+    }
+
+    // review.booking is NOT NULL (unique FK) and Booking.masterService is NOT NULL, so
+    // ReviewResponse.from never null-checks the chain — every mock that reaches
+    // ReviewResponse.from must stub getBooking(), or the mock's default `null` return NPEs.
+    private static Booking mockBookingWithServiceName(String serviceName) {
+        ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
+        when(serviceDefinition.getName()).thenReturn(serviceName);
+
+        MasterServiceAssignment masterService = mock(MasterServiceAssignment.class);
+        when(masterService.getServiceDefinition()).thenReturn(serviceDefinition);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMasterService()).thenReturn(masterService);
+        return booking;
     }
 
     // ── reviews-by-salon cache (Finding 1 — perf follow-up) ─────────────────────

@@ -4,7 +4,6 @@ import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.entity.Review;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -86,7 +85,13 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     Page<UUID> findIdsByMasterIdOrderByRatingAscCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
 
     /**
-     * Batch-hydrates a bounded set of reviews with their associations.
+     * Batch-hydrates a bounded set of reviews with the associations {@link
+     * com.beautica.review.dto.ReviewResponse} needs: {@code client} (masking), {@code master}
+     * (masterId), and the two-hop {@code booking.masterService.serviceDefinition} chain (service
+     * name). Widened from a {@code booking}/{@code client}/{@code master}-only fetch graph when
+     * {@code serviceName} was added to {@code ReviewResponse} — without the extra two hops, every
+     * row in {@link com.beautica.review.service.ReviewService#getReviewsForMaster}'s page would
+     * lazily N+1 on {@code booking.masterService.serviceDefinition} (anti-bug §E.2).
      *
      * <p><strong>Result order is undefined.</strong> Callers must reorder the returned list
      * using the ID sequence from {@link #findIdsByMasterIdOrderByCreatedAtDesc} — for example,
@@ -95,8 +100,15 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * <p>No {@code ORDER BY} clause: ordering is driven by the caller's ID stream,
      * which is cheaper than a redundant DB sort on an unindexed set.
      */
-    @EntityGraph(attributePaths = {"booking", "client", "master"})
-    @Query("SELECT r FROM Review r WHERE r.id IN :ids")
+    @Query("""
+            SELECT r FROM Review r
+            JOIN FETCH r.client
+            JOIN FETCH r.master
+            JOIN FETCH r.booking b
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE r.id IN :ids
+            """)
     List<Review> findByIdsWithGraph(@Param("ids") List<UUID> ids);
 
     /**
@@ -140,8 +152,18 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
 
     // Named to distinguish from the inherited JpaRepository.findById (which is lazy).
     // Use this method whenever ReviewResponse.from() will be called on the result.
-    @EntityGraph(attributePaths = {"booking", "client", "master"})
-    @Query("SELECT r FROM Review r WHERE r.id = :id")
+    // Widened alongside findByIdsWithGraph above to also JOIN FETCH booking.masterService
+    // .serviceDefinition — ReviewResponse.serviceName needs it, and this single-row lookup backs
+    // GET /reviews/{reviewId}, the second ReviewResponse.from() call site.
+    @Query("""
+            SELECT r FROM Review r
+            JOIN FETCH r.client
+            JOIN FETCH r.master
+            JOIN FETCH r.booking b
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE r.id = :id
+            """)
     Optional<Review> findByIdWithAssociations(@Param("id") UUID id);
 
     // Single-pass native SQL: FROM subquery aggregates AVG + COUNT in one index scan.

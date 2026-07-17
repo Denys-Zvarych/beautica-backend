@@ -11,13 +11,17 @@ public record ReviewResponse(
         UUID id,
         UUID masterId,
         String clientDisplayName,
+        String serviceName,
         Integer rating,
         String comment,
         OffsetDateTime createdAt
 
 ) {
 
-    // Callers must ensure master and client are loaded (JOIN FETCH / @EntityGraph) — both are FetchType.LAZY.
+    // Callers must ensure master, client, and booking.masterService.serviceDefinition are
+    // loaded (JOIN FETCH / @EntityGraph) — all are FetchType.LAZY. review.booking is NOT NULL
+    // (unique FK, Review entity) and Booking.masterService is NOT NULL, so the chain below never
+    // needs a null guard — same contract SalonReviewResponse.from relies on.
     public static ReviewResponse from(Review review) {
         String firstName  = review.getClient().getFirstName();
         String lastName   = review.getClient().getLastName();
@@ -35,6 +39,7 @@ public record ReviewResponse(
                 review.getId(),
                 review.getMaster().getId(),
                 displayName,
+                review.getBooking().getMasterService().getServiceDefinition().getName(),
                 review.getRating().intValue(),
                 review.getComment(),
                 review.getCreatedAt().atOffset(ZoneOffset.UTC)

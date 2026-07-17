@@ -362,6 +362,17 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
         assertThat(idPage.getTotalElements()).isEqualTo(2);
         assertThat(ordered.get(0).getId()).isEqualTo(newerReview.getId());
         assertThat(ordered.get(1).getId()).isEqualTo(olderReview.getId());
+
+        // Regression guard: findByIdsWithGraph was widened with a
+        // booking.masterService.serviceDefinition JOIN FETCH chain so ReviewResponse.serviceName
+        // can be populated without a lazy N+1. em.clear() above already detached the persistence
+        // context, so any of the two new JOIN FETCH hops being silently dropped would surface
+        // here as a LazyInitializationException (open-in-view=false in production) rather than
+        // passing on the ID-only assertions above.
+        assertThat(hydrated.get(0).getBooking().getMasterService().getServiceDefinition().getName())
+                .as("booking.masterService.serviceDefinition must be hydrated after session detachment — "
+                        + "proves both new JOIN FETCH hops are present, not just the pre-existing client/master/booking graph")
+                .isEqualTo("Manicure");
     }
 
     @Test

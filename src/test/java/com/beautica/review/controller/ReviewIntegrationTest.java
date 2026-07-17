@@ -203,6 +203,96 @@ class ReviewIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("GET /masters/{masterId}/reviews — serviceName is hydrated from the real DB for every row (widened JOIN FETCH regression guard)")
+    void should_returnServiceNameFromRealDb_when_listingMasterReviews() throws Exception {
+        UUID masterId        = createIndependentMaster("im-svcname-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        String clientEmail   = "cli-svcname-" + System.nanoTime() + "@beautica.test";
+        String clientToken   = createClientAndGetToken(clientEmail);
+        UUID clientId        = resolveUserIdByEmail(clientEmail);
+        UUID bookingId       = createCompletedBooking(clientId, masterId, masterServiceId);
+
+        log.debug("Act: POST {} rating=5 for bookingId={} then GET the master review list", REVIEWS_URL, bookingId);
+        assertThat(postReview(clientToken, bookingId, 5).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        ResponseEntity<String> listResp = restTemplate.getForEntity(
+                MASTERS_URL + "/" + masterId + "/reviews", String.class);
+        assertThat(listResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        var wrapper = objectMapper.readValue(
+                listResp.getBody(),
+                new TypeReference<ApiResponse<PageResponse<ReviewResponse>>>() {});
+
+        assertThat(wrapper.data().data())
+                .as("serviceName must equal the seeded service_definitions.name — proves findByIdsWithGraph's "
+                        + "booking.masterService.serviceDefinition JOIN FETCH chain actually hydrates in a real query, "
+                        + "not just against a mocked repository")
+                .extracting(ReviewResponse::serviceName)
+                .containsExactly("Test Service");
+    }
+
+    @Test
+    @DisplayName("GET /reviews/{reviewId} — 200 with serviceName hydrated from the real DB (findByIdWithAssociations regression guard)")
+    void should_returnServiceNameFromRealDb_when_gettingSingleReview() throws Exception {
+        UUID masterId        = createIndependentMaster("im-single-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        String clientEmail   = "cli-single-" + System.nanoTime() + "@beautica.test";
+        String clientToken   = createClientAndGetToken(clientEmail);
+        UUID clientId        = resolveUserIdByEmail(clientEmail);
+        UUID bookingId       = createCompletedBooking(clientId, masterId, masterServiceId);
+
+        ResponseEntity<String> createResp = postReview(clientToken, bookingId, 5);
+        assertThat(createResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID reviewId = objectMapper.readValue(createResp.getBody(),
+                new TypeReference<ApiResponse<ReviewResponse>>() {}).data().id();
+
+        // This endpoint was rewritten from @EntityGraph to an explicit JOIN FETCH
+        // (findByIdWithAssociations). open-in-view=false means a missing hop here throws
+        // LazyInitializationException on a real request while every other test in this suite
+        // (WebMvcTest with a mocked service, SpringBootTest with a mocked repository) stays green.
+        log.debug("Act: GET {}/{} — single-review endpoint against the real Testcontainers-backed stack", REVIEWS_URL, reviewId);
+        ResponseEntity<String> resp = restTemplate.getForEntity(REVIEWS_URL + "/" + reviewId, String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("GET /reviews/{reviewId} must return 200 through the real DB, not just a mocked repository")
+                .isEqualTo(HttpStatus.OK);
+
+        ReviewResponse body = objectMapper.readValue(resp.getBody(),
+                new TypeReference<ApiResponse<ReviewResponse>>() {}).data();
+
+        assertThat(body.id()).isEqualTo(reviewId);
+        assertThat(body.serviceName())
+                .as("serviceName must be hydrated by findByIdWithAssociations' widened JOIN FETCH chain, "
+                        + "matching the seeded service_definitions.name — not null and not a lazy-init failure")
+                .isEqualTo("Test Service");
+    }
+
+    @Test
+    @DisplayName("GET /reviews/{reviewId} — 404 against the real DB when the review id does not exist")
+    void should_return404FromRealDb_when_reviewIdUnknown() throws Exception {
+        UUID unknownReviewId = UUID.randomUUID();
+
+        // findByIdWithAssociations' widened JOIN FETCH chain must not turn a genuinely missing
+        // row into a 500 (e.g. an inner-join variant would still correctly return empty here,
+        // but this pins the real end-to-end 404 contract through the rewritten query, not just
+        // the mocked-repository path already covered by ReviewServiceTest).
+        log.debug("Act: GET {}/{} — unknown reviewId against the real Testcontainers-backed stack", REVIEWS_URL, unknownReviewId);
+        ResponseEntity<String> resp = restTemplate.getForEntity(REVIEWS_URL + "/" + unknownReviewId, String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("an unknown reviewId must return 404 through the real DB-backed findByIdWithAssociations")
+                .isEqualTo(HttpStatus.NOT_FOUND);
+
+        var body = objectMapper.readTree(resp.getBody());
+        assertThat(body.path("success").asBoolean())
+                .as("the 404 must use the error envelope with success=false")
+                .isFalse();
+        assertThat(body.path("message").asText())
+                .as("the 404 message must be the generic sentinel, never an internal detail")
+                .isEqualTo("Resource not found");
+    }
+
+    @Test
     @DisplayName("GET /masters/{masterId}/reviews — review list reflects new review after cache eviction on POST")
     void should_returnNewReview_when_cacheEvictedAfterCreate() throws Exception {
         UUID masterId        = createIndependentMaster("im-cache-" + System.nanoTime() + "@beautica.test");

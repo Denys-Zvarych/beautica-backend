@@ -120,6 +120,7 @@ class ReviewControllerTest {
                 UUID.randomUUID(),
                 UUID.randomUUID(),
                 "Іван Франко",
+                "Manicure",
                 5,
                 "Great service",
                 OffsetDateTime.now(ZoneOffset.UTC)
@@ -515,7 +516,8 @@ class ReviewControllerTest {
         mockMvc.perform(get(REVIEWS_URL + "/{reviewId}", reviewId)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.rating").value(5));
+                .andExpect(jsonPath("$.data.rating").value(5))
+                .andExpect(jsonPath("$.data.serviceName").value("Manicure"));
     }
 
     @Test
