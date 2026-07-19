@@ -37,6 +37,15 @@ import java.util.UUID;
                 // partial index (V43): dashboard revenue — INDEPENDENT_MASTER path
                 // JPA cannot encode WHERE status='COMPLETED' — predicate lives in V43 only;
                 // do NOT remove it from the migration thinking the annotation is the source of truth.
+                // LOAD-BEARING (Phase 26.8 audit): this index intentionally has NO id column, unlike
+                // idx_bookings_master_starts_at (V117). BookingMyBookingsSortIT
+                // #should_maintainDeterministicPagination_when_manyBookingsShareIdenticalStartsAt
+                // proves the code-level `id ASC` tiebreaker is necessary ONLY because the
+                // ?status=COMPLETED query plan lands here, where ties resolve by heap physical order
+                // instead of index key order. Widening this index to add id (as V117 did to its
+                // siblings) would silently defang that test — it would stay green whether or not the
+                // tiebreaker exists. Guarded by
+                // V118DropPriceSortIndicesMigrationTest#should_notContainIdColumn_when_completedStartsAtIndexInspected.
                 @Index(name = "idx_bookings_master_completed_starts_at", columnList = "master_id, starts_at"),
                 // partial index (V43): dashboard revenue — SALON_OWNER path
                 // same JPA partial-index limitation as above; V43 is authoritative for the WHERE clause.
@@ -52,14 +61,18 @@ import java.util.UUID;
                 @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
                 // composite index (V93): per-client "latest booking" LATERAL subquery in
                 // FavoriteRepository.findFavoriteMasterRows. JPA cannot encode the DESC sort
-                // direction — V93 declares starts_at DESC; this annotation mirrors the columns
-                // only so ddl-auto=validate sees the index exists.
+                // direction — V93 declares starts_at DESC; this annotation mirrors the columns for
+                // reader accuracy only. It is documentation, not enforcement: empirically verified
+                // (Phase 26.8 audit), Hibernate 6.5's ddl-auto=validate does NOT check
+                // @Table(indexes=...) against the real schema — see the note at
+                // idx_bookings_master_service_starts_at below for the full finding.
                 @Index(name = "idx_bookings_master_client_starts_at", columnList = "master_id, client_id, starts_at"),
                 // composite index (V95, widened by V117): BookingRepository.findClientBookingDetails
                 // unfiltered shape — WHERE client_id = ? ORDER BY starts_at DESC, id ASC. JPA cannot
                 // encode the DESC sort direction nor the trailing id tiebreaker column order — V117
                 // declares (client_id, starts_at DESC, id ASC); this annotation mirrors the columns
-                // only so ddl-auto=validate sees the index exists. The trailing id (Phase 26.6) lets
+                // for reader accuracy only, NOT because ddl-auto=validate enforces it (see the note
+                // at idx_bookings_master_service_starts_at below). The trailing id (Phase 26.6) lets
                 // the index alone satisfy the Phase 26.3 `id ASC` tiebreaker at any OFFSET with no
                 // extra sort node — see V117's javadoc-style comment for the EXPLAIN evidence.
                 @Index(name = "idx_bookings_client_starts_at", columnList = "client_id, starts_at, id"),
@@ -69,14 +82,20 @@ import java.util.UUID;
                 // idx_bookings_client_starts_at above, for the master-scope sibling query family
                 // (BookingRepositoryCustomImpl.findIdPage).
                 @Index(name = "idx_bookings_master_starts_at", columnList = "master_id, starts_at, id"),
-                // composite index (V117): GET /bookings/me?sort=priceAtBooking — Phase 26.3 whitelisted
-                // this sort property but left it with no supporting index until V117; without it,
-                // Postgres sequentially scans the caller's ENTIRE booking history to satisfy the sort
-                // (measured: the only shape in the 26.6 EXPLAIN pass that produced a seq scan at
-                // 50,000 rows). JPA cannot encode the DESC direction or trailing id — mirrors columns
-                // only.
-                @Index(name = "idx_bookings_master_price_id", columnList = "master_id, price_at_booking, id"),
-                @Index(name = "idx_bookings_client_price_id", columnList = "client_id, price_at_booking, id"),
+                // idx_bookings_master_price_id / idx_bookings_client_price_id (V117) served
+                // GET /bookings/me?sort=priceAtBooking. DROPPED by V118 (Phase 26.8) once mobile
+                // Phase 7.8 deleted that sort's only caller (the provider sort sheet, retired for a
+                // timeline where a card's position IS its time). BookingService's
+                // SORTABLE_BOOKING_PROPERTIES was narrowed to {startsAt} in the same change, so the
+                // query shape these indices served can never run again. Do NOT re-add these @Index
+                // entries without also re-creating the migration: empirically (Phase 26.8 audit),
+                // Hibernate 6.5's ddl-auto=validate does NOT check @Table(indexes=...) against the
+                // real schema — an orphaned annotation here would be silently cosmetic, not caught
+                // at boot, contrary to the "ddl-auto=validate sees the index exists" comments
+                // elsewhere in this class (those predate this finding and describe the documentation
+                // *intent*, not a verified enforcement mechanism). Removing the annotation is still
+                // required so the entity doesn't lie about the schema to the next reader; the actual
+                // regression guard is V118DropPriceSortIndicesMigrationTest's direct pg_indexes check.
                 // composite index (V117): GET /bookings/me?serviceId=... with no date range narrowing
                 // it — Phase 26.4's masterServiceIdIn predicate otherwise applies as a post-scan
                 // Filter on idx_bookings_master_starts_at, which loses early-LIMIT termination for a

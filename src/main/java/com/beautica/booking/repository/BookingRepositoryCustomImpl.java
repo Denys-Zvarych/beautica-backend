@@ -132,9 +132,10 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * {@link Sort.Order#getProperty()}. This is safe ONLY because both callers
      * ({@code findIdsByMasterIdFiltered} / {@code findIdsBySalonIdsFiltered}) are reached
      * exclusively through {@code BookingService#getMyBookings}, which normalizes and whitelists
-     * the {@code Sort} (via {@code normalizeBookingSort}) to {@code startsAt} /
-     * {@code priceAtBooking} / {@code createdAt} — plus a trailing {@code id} tiebreaker — before
-     * either method is ever invoked. An unvalidated {@code Sort} reaching this method would let
+     * the {@code Sort} (via {@code normalizeBookingSort}) to {@code startsAt} — plus a trailing
+     * {@code id} tiebreaker — before either method is ever invoked (Phase 26.8 narrowed the
+     * whitelist from {@code {startsAt, priceAtBooking}}; {@code createdAt} was never a member of
+     * it). An unvalidated {@code Sort} reaching this method would let
      * {@link Root#get(String)} resolve an arbitrary property path (including through a join
      * alias), which is exactly the ordering oracle Phase 26.3 closes at the service boundary; do
      * NOT call this method (or its two public callers) with a raw, caller-supplied {@code Sort}.

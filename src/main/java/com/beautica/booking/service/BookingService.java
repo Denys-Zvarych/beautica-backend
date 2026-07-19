@@ -425,8 +425,12 @@ public class BookingService {
 
     /**
      * Property names {@code GET /bookings/me}'s {@code sort} query parameter may reference
-     * (Phase 26.3). Every property here is a scalar column directly on {@code Booking} — no
-     * association traversal.
+     * (Phase 26.3, narrowed by Phase 26.8). {@code priceAtBooking} was removed from this set —
+     * its only caller anywhere in the product was the provider "Мої записи" sort sheet, which
+     * mobile Phase 7.8 deleted once that screen became a timeline (a card's position derives
+     * from {@code startsAt}, so no ordering of the result set can move it). {@code startsAt} is
+     * the sole survivor and is a scalar column directly on {@code Booking} — no association
+     * traversal.
      *
      * <p><b>This is a security boundary, not a nicety.</b> Both {@code findIdsByClientIdFiltered}
      * and the provider ID-page queries join through {@code b.master m JOIN m.user}, so any
@@ -435,9 +439,10 @@ public class BookingService {
      * results by their employees' password-hash column, a credential side channel that never
      * appears in the response body. {@link Sort.Order#getProperty()} returns the FULL dotted
      * path as one string, so an exact-match {@link Set#contains} here rejects any multi-segment
-     * path outright — it never inspects only the first segment.
+     * path outright — it never inspects only the first segment. A one-property whitelist is
+     * strictly less attack surface than the prior two-property one.
      */
-    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt", "priceAtBooking");
+    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt");
 
     /** Applied when the caller supplies no {@code sort} at all (Phase 26.3). */
     private static final Sort DEFAULT_BOOKING_SORT = Sort.by(Sort.Direction.DESC, "startsAt");
@@ -447,12 +452,15 @@ public class BookingService {
 
     /**
      * Max {@link Sort.Order} entries accepted in {@code GET /bookings/me}'s {@code sort} query
-     * parameter (Phase 26.3 audit, finding backend-perf F4). Matches the cardinality of
-     * {@link #SORTABLE_BOOKING_PROPERTIES} — nobody needs to sort by more than all three
-     * whitelisted properties at once. Parity with the existing {@code @Size(max = 5)} bound on
-     * the controller's {@code status} parameter: each distinct {@code (property, direction)}
+     * parameter (Phase 26.3 audit, finding backend-perf F4). Kept at 3 by Phase 26.8 even though
+     * {@link #SORTABLE_BOOKING_PROPERTIES} narrowed to a single property — this bound is a
+     * request-cardinality/DoS guard, not a count that must track the whitelist size. A caller can
+     * still repeat the sole whitelisted property across multiple {@code (property, direction)}
+     * orders (e.g. {@code sort=startsAt,asc&sort=startsAt,desc&sort=startsAt,asc}); each distinct
      * sequence compiles to a textually distinct SQL {@code ORDER BY} (column names can't be bind
-     * params), so an unbounded sort list inflates plan-cache entries.
+     * params), so an unbounded sort list still inflates plan-cache entries regardless of how many
+     * distinct property names exist. Parity with the existing {@code @Size(max = 5)} bound on the
+     * controller's {@code status} parameter.
      */
     private static final int MAX_SORT_ORDERS = 3;
 
@@ -486,17 +494,21 @@ public class BookingService {
      *       {@code Pageable} yields DB-arbitrary order once the JPQL/Criteria layers stop
      *       hardcoding {@code ORDER BY b.startsAt DESC} themselves.</li>
      *   <li><b>Whitelist.</b> Every {@link Sort.Order#getProperty()} must exact-match
-     *       {@link #SORTABLE_BOOKING_PROPERTIES}; anything else — including a dot-path like
+     *       {@link #SORTABLE_BOOKING_PROPERTIES} — {@code startsAt} only as of Phase 26.8, which
+     *       retired {@code priceAtBooking} once its only caller (the provider sort sheet) was
+     *       deleted by mobile Phase 7.8; anything else — including a dot-path like
      *       {@code master.user.passwordHash} — throws a 400 {@link BusinessException} before the
      *       {@code Sort} ever reaches a query.</li>
      *   <li><b>Count bound.</b> More than {@link #MAX_SORT_ORDERS} orders throws a 400
      *       {@link BusinessException} (Phase 26.3 audit F4) — parity with the controller's
      *       {@code @Size(max = 5)} bound on {@code status}.</li>
-     *   <li><b>Mandatory {@code id} tiebreaker.</b> Appended last, always. Price (and, on the
-     *       salon path, {@code startsAt} across different masters) ties are the common case, not
-     *       the edge case — every booking of the same service shares a {@code priceAtBooking}.
-     *       Without a unique trailing column, {@code OFFSET} pagination over tied rows can
-     *       duplicate and skip rows across pages.</li>
+     *   <li><b>Mandatory {@code id} tiebreaker.</b> Appended last, always. {@code startsAt} ties
+     *       are a real case, not a hypothetical one — nothing in the schema prevents two
+     *       terminal-status bookings (e.g. {@code COMPLETED}/{@code CANCELLED}, which fall
+     *       outside the {@code no_overlapping_bookings} EXCLUDE constraint's {@code CONFIRMED}-
+     *       only predicate) from sharing an identical {@code startsAt}. Without a unique trailing
+     *       column, {@code OFFSET} pagination over tied rows can duplicate and skip rows across
+     *       pages.</li>
      * </ol>
      *
      * <p><b>Preserves {@code Pageable.unpaged()}.</b> {@link Pageable#getPageNumber()} and
