@@ -254,7 +254,7 @@ class MasterServiceTest {
     @DisplayName("should_throwNotFound_when_getMasterDetailWithUnknownId")
     void should_throwNotFound_when_getMasterDetailWithUnknownId() {
         UUID masterId = UUID.randomUUID();
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.getMasterDetail(masterId))
                 .isInstanceOf(NotFoundException.class);
@@ -284,7 +284,7 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(wh, "id", UUID.randomUUID());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of(wh));
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
@@ -325,7 +325,7 @@ class MasterServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
         when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.of(city));
 
@@ -352,7 +352,7 @@ class MasterServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
@@ -380,7 +380,7 @@ class MasterServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
         when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.empty());
 
@@ -408,7 +408,7 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(master, "user", user);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         // Stub both caches so the afterCommit eviction path does not NPE.
         Cache masterDetailCache = mock(Cache.class);
@@ -469,7 +469,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(master, "user", user);
         ReflectionTestUtils.setField(master, "salon", salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
@@ -556,7 +556,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(master, "user", user);
         // salon intentionally left null — an independent master owns no salon catalogue entry.
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
@@ -585,7 +585,7 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // upsert merge map is built from ALL rows (incl. inactive) via findByMasterId, not the
         // active-only finder — matching production after the 23505 duplicate-INSERT fix.
         when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
@@ -630,7 +630,7 @@ class MasterServiceTest {
         // Re-enable day 2 with new hours and isActive = true.
         var request = new WorkingHoursRequest(2, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // The merge map MUST be built from the all-rows finder so the inactive row is visible.
         when(workingHoursRepository.findByMasterId(masterId))
                 .thenReturn(List.of(existingInactiveRow));
@@ -678,7 +678,7 @@ class MasterServiceTest {
         UUID masterId = UUID.randomUUID();
         var request = new WorkingHoursRequest(2, LocalTime.of(10, 0), LocalTime.of(18, 0), true);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() ->
                 masterService.upsertWorkingHours(actorId, masterId, List.of(request)))
@@ -711,7 +711,7 @@ class MasterServiceTest {
                 .hasMessageContaining("Duplicate working-hours entry for the same day");
 
         // Guard runs before any repository access — no master lookup, no merge-map fetch, no save.
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(any());
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
         verify(workingHoursRepository, never()).findByMasterId(any());
         verify(workingHoursRepository, never()).saveAll(any());
     }
@@ -735,7 +735,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(savedMon, "id", UUID.randomUUID());
         ReflectionTestUtils.setField(savedTue, "id", UUID.randomUUID());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // upsert merge map uses the all-rows finder (incl. inactive) — see production fix.
         when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of(savedMon, savedTue));
@@ -758,7 +758,7 @@ class MasterServiceTest {
 
         // Empty payload must never trip the duplicate guard; it stays a clean no-op
         // (master is loaded, saveAll receives an empty list, an empty list is returned).
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // upsert merge map uses the all-rows finder (incl. inactive) — see production fix.
         when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of());
@@ -790,7 +790,7 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(master, "user", user);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         masterService.deactivateMaster(ownerId, masterId);
 
@@ -805,7 +805,7 @@ class MasterServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.deactivateMaster(actorId, masterId))
                 .isInstanceOf(NotFoundException.class);

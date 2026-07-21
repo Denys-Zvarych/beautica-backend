@@ -203,7 +203,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getUser()).thenReturn(masterUser);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
 
@@ -226,7 +226,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
@@ -247,7 +247,7 @@ class AuthorizationServiceTest {
         boolean result = authorizationService.canManageMasterSchedule(auth, masterId);
 
         assertThat(result).isFalse();
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+        verify(masterRepository, never()).findByIdWithUserAndSalon(masterId);
     }
 
     @Test
@@ -260,7 +260,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1252,7 +1252,7 @@ class AuthorizationServiceTest {
         boolean result = authorizationService.canManageMaster(auth, masterId);
 
         assertThat(result).isFalse();
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+        verify(masterRepository, never()).findByIdWithUserAndSalon(masterId);
     }
 
     @Test
@@ -1266,7 +1266,7 @@ class AuthorizationServiceTest {
         boolean result = authorizationService.canManageMaster(auth, masterId);
 
         assertThat(result).isFalse();
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+        verify(masterRepository, never()).findByIdWithUserAndSalon(masterId);
     }
 
     // ── canManageMaster — SALON_OWNER branch (Phase 12.1) ─────────────────────
@@ -1287,7 +1287,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1315,7 +1315,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1336,7 +1336,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1360,7 +1360,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1389,7 +1389,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1417,7 +1417,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1438,7 +1438,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 

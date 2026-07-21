@@ -100,7 +100,7 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("returns the existing row on a duplicate — never inserts again (idempotent)")
         void should_returnExistingRow_when_masterAlreadyFavorited() {
-            when(masterRepository.findByIdWithSalonAndOwner(targetId))
+            when(masterRepository.findByIdWithUserAndSalon(targetId))
                     .thenReturn(Optional.of(masterOwnedBy(Role.INDEPENDENT_MASTER)));
             Favorite existing = existingFavorite(clientId, FavoriteTargetType.MASTER, targetId);
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
@@ -121,7 +121,7 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("inserts and returns a new favorite when the master is not yet favorited")
         void should_insertNewFavorite_when_masterNotYetFavorited() {
-            when(masterRepository.findByIdWithSalonAndOwner(targetId))
+            when(masterRepository.findByIdWithUserAndSalon(targetId))
                     .thenReturn(Optional.of(masterOwnedBy(Role.INDEPENDENT_MASTER)));
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
                     clientId, FavoriteTargetType.MASTER, targetId))
@@ -146,7 +146,7 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("rejects a SALON_MASTER target with 400 and writes no row")
         void should_throwBadRequest_when_targetIsSalonMaster() {
-            when(masterRepository.findByIdWithSalonAndOwner(targetId))
+            when(masterRepository.findByIdWithUserAndSalon(targetId))
                     .thenReturn(Optional.of(masterOwnedBy(Role.SALON_MASTER)));
 
             assertThatThrownBy(() ->
@@ -163,7 +163,7 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("throws 404 when the MASTER target does not exist")
         void should_throwNotFound_when_masterMissing() {
-            when(masterRepository.findByIdWithSalonAndOwner(targetId)).thenReturn(Optional.empty());
+            when(masterRepository.findByIdWithUserAndSalon(targetId)).thenReturn(Optional.empty());
 
             assertThatThrownBy(() ->
                     favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId))

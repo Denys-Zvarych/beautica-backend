@@ -252,7 +252,7 @@ public class MasterService {
      * Returns the publicly-visible {@link MasterDetailResponse} for the given master.
      *
      * <p>Cached under {@code master-detail} with a 5-minute TTL so the
-     * {@code findByIdWithSalonAndOwner} JOIN FETCH and the follow-up
+     * {@code findByIdWithUserAndSalon} JOIN FETCH and the follow-up
      * {@code findByMasterIdAndIsActiveTrue} query do not fire on every unauthenticated
      * {@code GET /api/v1/masters/{masterId}} request. {@code sync = true} prevents the
      * thundering-herd on TTL expiry (Anti-Bug §F-7 / HIGH §F rule 7).
@@ -268,11 +268,11 @@ public class MasterService {
      * <p>Do NOT remove the entity overload {@link #getMasterDetail(Master)} — it is
      * used by internal callers that already hold a loaded entity.
      */
-    // Fix 6: use findByIdWithSalonAndOwner to eliminate 2-4 lazy SELECTs per request
+    // Fix 6: use findByIdWithUserAndSalon to eliminate 2-4 lazy SELECTs per request
     @Cacheable(value = "master-detail", key = "#masterId", sync = true)
     @Transactional(readOnly = true)
     public MasterDetailResponse getMasterDetail(UUID masterId) {
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
@@ -281,7 +281,7 @@ public class MasterService {
     }
 
     /**
-     * Entity overload — avoids a redundant {@code findByIdWithSalonAndOwner} graph-fetch when
+     * Entity overload — avoids a redundant {@code findByIdWithUserAndSalon} graph-fetch when
      * the caller already holds the {@link Master} entity in the Hibernate first-level cache
      * (MEDIUM-2). The entity must have its {@code salon} and {@code user} associations
      * reachable (i.e. created via {@link #createMasterForOwner(UUID, UUID)} within the same
@@ -315,7 +315,7 @@ public class MasterService {
 
         // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
         // the controller — no redundant DB round-trip needed here.
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         // Merge against ALL existing rows (incl. inactive). The DB unique key is
@@ -358,7 +358,7 @@ public class MasterService {
      * that the row structure matches expectations.
      *
      * <p>Performance (MEDIUM-1): inlines the deactivation logic instead of delegating to
-     * {@link #deactivateMaster(UUID, UUID)} to avoid a redundant {@code findByIdWithSalonAndOwner}
+     * {@link #deactivateMaster(UUID, UUID)} to avoid a redundant {@code findByIdWithUserAndSalon}
      * graph-fetch. The master loaded via {@code findByUserId} is already in the Hibernate
      * first-level cache; Hibernate dirty-checking flushes {@code is_active = false} on commit
      * without a separate {@code save()} call. Both cache evictions from {@code deactivateMaster}
@@ -427,7 +427,7 @@ public class MasterService {
     public void deactivateMaster(UUID actorId, UUID masterId) {
         // Ownership already enforced by @PreAuthorize("@authz.canManageMaster(...)") on
         // the controller — no redundant DB round-trip needed here.
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         master.setActive(false);
@@ -436,14 +436,14 @@ public class MasterService {
 
         // Deactivation flips is_active FALSE — a sole-performer's SALON service must vanish from
         // the booking master-list and the salon catalogue immediately, not after the 60s TTL.
-        // salon is JOIN-FETCHed by findByIdWithSalonAndOwner and may be null (INDEPENDENT_MASTER,
+        // salon is JOIN-FETCHed by findByIdWithUserAndSalon and may be null (INDEPENDENT_MASTER,
         // a no-op for the catalogue evict); capture its id synchronously inside the tx (§E / §F-2).
         evictBookabilityCachesAfterCommit(
                 masterId,
                 master.getSalon() != null ? master.getSalon().getId() : null);
 
         // Capture the user UUID while the transaction is still open (user is JOIN FETCH-ed by
-        // findByIdWithSalonAndOwner, so getUser() is initialized). A stale master-by-user entry
+        // findByIdWithUserAndSalon, so getUser() is initialized). A stale master-by-user entry
         // would allow the deactivated master to pass the isActive guard for up to the cache TTL.
         final UUID masterUserId = master.getUser().getId();
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -511,7 +511,7 @@ public class MasterService {
         // actorId's management authority over the CURRENT salon is already enforced by
         // @PreAuthorize("@authz.canManageMaster(...)") on the controller — no redundant
         // re-derivation needed here (mirrors upsertWorkingHours / deactivateMaster).
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         if (master.getMasterType() != MasterType.SALON_MASTER) {
@@ -556,7 +556,7 @@ public class MasterService {
         }
         var destinationSalon = destinationSalonLookup.get();
 
-        // `master` was loaded via findByIdWithSalonAndOwner in THIS @Transactional, so it is a
+        // `master` was loaded via findByIdWithUserAndSalon in THIS @Transactional, so it is a
         // managed entity — Hibernate dirty-checking flushes the salon mutation on commit.
         master.setSalon(destinationSalon);
 
@@ -565,7 +565,7 @@ public class MasterService {
         // stale salon for up to the cache TTL (Anti-Bug §F rule 2).
         final UUID rotatedMasterId = master.getId();
         // Captured while the transaction is still open — master.getUser() is JOIN FETCH-ed by
-        // findByIdWithSalonAndOwner, so this is an initialized reference, not a lazy proxy.
+        // findByIdWithUserAndSalon, so this is an initialized reference, not a lazy proxy.
         final UUID rotatedMasterUserId = master.getUser().getId();
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {

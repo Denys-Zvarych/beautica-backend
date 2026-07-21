@@ -122,7 +122,7 @@ class MasterServiceCacheTest {
         assertThat(cache.get(cacheKey)).isNotNull();
 
         Master master = mock(Master.class);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
         // upsert merge map is built from the all-rows finder (incl. inactive), not the
         // active-only finder — matching production after the 23505 duplicate-INSERT fix.
         when(workingHoursRepository.findByMasterId(MASTER_ID)).thenReturn(List.of());
@@ -165,7 +165,7 @@ class MasterServiceCacheTest {
 
         Master master = mock(Master.class);
         when(master.getUser()).thenReturn(user);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
         when(masterRepository.save(master)).thenReturn(master);
 
         // Act — wrap in transaction so afterCommit() fires
@@ -199,7 +199,7 @@ class MasterServiceCacheTest {
 
         Master master = mock(Master.class);
         when(master.getUser()).thenReturn(userA);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
 
         // Act — wrap in transaction so afterCommit() fires
         transactionTemplate.execute(status -> {

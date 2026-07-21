@@ -96,7 +96,7 @@ class MasterServiceRotateTest {
         ReflectionTestUtils.setField(master, "user", user);
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(true);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.of(destSalon));
 
@@ -142,7 +142,7 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, destSalonId))
                 .isInstanceOf(NotFoundException.class);
@@ -160,7 +160,7 @@ class MasterServiceRotateTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, destSalonId))
                 .isInstanceOf(ForbiddenException.class);
@@ -179,7 +179,7 @@ class MasterServiceRotateTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, destSalonId))
                 .isInstanceOf(ForbiddenException.class);
@@ -200,7 +200,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, salonId))
                 .isInstanceOf(BusinessException.class)
@@ -223,7 +223,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(false);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.empty());
 
@@ -251,7 +251,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(true);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.empty());
 
@@ -275,7 +275,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(true);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.of(inactiveDest));
 

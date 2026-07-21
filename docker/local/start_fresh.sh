@@ -4,6 +4,37 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
+# Compose project name — defaults to the compose file's directory name.
+COMPOSE_PROJECT="$(basename "$SCRIPT_DIR")"
+
+# Every service here pins a fixed `container_name:`, so a container holding one
+# of those names blocks `up` with "container name is already in use" — even when
+# it is stopped, and even when it publishes a different port.
+#
+# `docker compose down` cannot clear it: `down` filters by the
+# com.docker.compose.project label, so anything created by a bare `docker run`
+# (or by a different project) is invisible to it. Remove such strays explicitly.
+#
+# Here this must also run BEFORE `down -v`: a stray still attached to the data
+# volume makes the volume "in use" and `down -v` silently fails to remove it,
+# which would leave a "fresh" start running on the OLD database.
+remove_foreign_name_conflicts() {
+  local name owner
+  while read -r name; do
+    [ -n "$name" ] || continue
+    docker container inspect "$name" >/dev/null 2>&1 || continue
+
+    owner="$(docker container inspect "$name" \
+      --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)"
+    # A missing label prints as "<no value>" on some Docker versions.
+    [ "$owner" = "<no value>" ] && owner=""
+    [ "$owner" = "$COMPOSE_PROJECT" ] && continue
+
+    echo "  Removing stray container '$name' (compose project: '${owner:-<none>}', expected '$COMPOSE_PROJECT')."
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  done < <(awk '/^[[:space:]]+container_name:[[:space:]]*/ {print $2}' "$COMPOSE_FILE")
+}
+
 # Returns 0 if host TCP port 5432 is currently bound (listening), 1 otherwise.
 # Works without root: prefer `ss`, fall back to `lsof`.
 port_5432_in_use() {
@@ -47,6 +78,7 @@ diagnose_port_5432() {
 # is a leftover `beautica-postgres` container from a previous run — `down -v`
 # releases its published port. We must do this before blaming system PostgreSQL.
 echo "Removing containers AND volumes (fresh database)..."
+remove_foreign_name_conflicts
 docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
 
 echo "Checking host port 5432..."

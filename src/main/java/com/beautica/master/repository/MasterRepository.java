@@ -107,17 +107,64 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     boolean existsByIdAndSalonIdIn(UUID id, Collection<UUID> salonIds);
 
     /**
-     * Eagerly fetches the master together with its user, salon, and salon owner.
-     * Used in authorization checks that run outside an active JPA session.
+     * Fetches the master together with its {@code user} and {@code salon} associations in a single
+     * query. Backs {@link com.beautica.common.security.AuthorizationService}'s master-scoped
+     * predicates ({@code canManageMaster}, {@code canManageMasterSchedule},
+     * {@code canReadMasterSchedule}) and every by-id master read/write path:
+     * {@code MasterService} (getMasterDetail, upsertWorkingHours, deactivateMaster,
+     * rotateMasterToSalon), {@code MasterScheduleService#loadActiveMaster},
+     * {@code FavoriteService#validateMasterTarget} and {@code BookingService#doCreateBooking}.
+     *
+     * <p><b>Renamed from {@code findByIdWithSalonAndOwner} (Phase 26.9 follow-up).</b> The old name
+     * was wrong twice over once the owner fetch went: it advertised a {@code salon.owner} fetch that
+     * no longer happens, and it never mentioned {@code m.user} even though that association has
+     * always been fetch-joined here. The new name is the by-id sibling of the existing
+     * {@link #findByUserIdWithUserAndSalon} / {@link #findActiveByUserIdWithUserAndSalon} and
+     * introduces no new vocabulary. A name that advertises a fetch the query does not perform is
+     * exactly the condition under which this fetch was previously re-added on the
+     * {@code BookingRepository} side — hence the rename rather than a comment.
+     *
+     * <p><b>Deliberately does NOT fetch {@code salon.owner}</b> — the fourth and final removal of
+     * this dead fetch, after {@code BookingRepository}'s {@code findAllByIdsWithGraph},
+     * {@code findActiveByClientIdAndIdempotencyKey} and {@code findByIdWithFullGraph}. It was dead
+     * for two independent reasons:
+     * <ol>
+     *   <li>{@code Salon.owner} is {@code @ManyToOne(LAZY)} on a {@code nullable = false} column
+     *       whose FK lives on {@code salons}, so Hibernate always hands back a proxy WITHOUT a
+     *       statement. The {@code getOwner() != null} guards on the callers therefore never
+     *       initialise it and never evaluate false — the fetch changed no branch.</li>
+     *   <li>Every {@code getOwner()} in {@code src/main/java} is either such a null check or
+     *       {@code .getId()} ({@code AuthorizationService} x7, {@code MasterService#requireOwner},
+     *       {@code SalonResponse#from}). Entities map their {@code @Id} on the field with no
+     *       {@code @Access} override, so Hibernate serves the identifier straight off the
+     *       uninitialised proxy without a statement.</li>
+     * </ol>
+     * The fetch cost an extra join into {@code users} plus a full hydrated {@code User} row
+     * ({@code password_hash} included) on all ten callers — including the cached, unauthenticated
+     * {@code GET /api/v1/masters/{masterId}} — and bought nothing.
+     *
+     * <p><b>Correction to this method's former javadoc.</b> It justified the fetch as needed for
+     * "authorization checks that run outside an active JPA session". That was wrong on both halves.
+     * Every caller runs inside a {@code @Transactional} service method (the {@code AuthorizationService}
+     * predicates are invoked from {@code @PreAuthorize} SpEL, which Spring Data serves in its own
+     * transaction), so no caller is session-less to begin with; and even where one were, reading an
+     * identifier off a to-one proxy needs no session — it is answered from the FK the proxy was
+     * built with, detached or not, and cannot raise {@code LazyInitializationException}. The owner
+     * remains fully <em>reachable</em> through {@code getSalon().getOwner()}; it is simply no longer
+     * <em>hydrated</em>. A caller that ever needs a non-identifier owner property must add its own
+     * fetch on its own query rather than re-widening this shared one.
+     *
+     * <p>Pinned by {@code MasterOwnerFetchContractIT} — a statement count cannot see a re-added
+     * fetch join (it widens an existing join rather than issuing a statement), so that gate asserts
+     * proxy non-initialisation plus an absolute hydrated-entity count instead.
      */
     @Query("""
             SELECT m FROM Master m
             LEFT JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
-            LEFT JOIN FETCH s.owner
+            LEFT JOIN FETCH m.salon
             WHERE m.id = :masterId
             """)
-    Optional<Master> findByIdWithSalonAndOwner(@Param("masterId") UUID masterId);
+    Optional<Master> findByIdWithUserAndSalon(@Param("masterId") UUID masterId);
 
     /**
      * Re-computes and persists {@code masters.min_effective_price} for a single

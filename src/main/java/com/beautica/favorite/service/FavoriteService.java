@@ -177,7 +177,7 @@ public class FavoriteService {
     }
 
     private void validateMasterTarget(UUID masterId) {
-        Master master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        Master master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
         Role role = master.getUser().getRole();
         if (role != Role.INDEPENDENT_MASTER) {

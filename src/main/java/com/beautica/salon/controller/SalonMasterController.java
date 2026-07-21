@@ -58,7 +58,7 @@ public class SalonMasterController {
 
         UUID actorId = AuthenticationUtils.userId(authentication);
         Master master = masterService.createMasterForOwner(actorId, salonId);
-        // MEDIUM-2: use entity overload to avoid a redundant findByIdWithSalonAndOwner
+        // MEDIUM-2: use entity overload to avoid a redundant findByIdWithUserAndSalon
         // graph-fetch — the master entity is already in the Hibernate first-level cache.
         return ApiResponse.ok(masterService.getMasterDetail(master));
     }

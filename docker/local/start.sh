@@ -9,6 +9,37 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
+# Compose project name — defaults to the compose file's directory name.
+COMPOSE_PROJECT="$(basename "$SCRIPT_DIR")"
+
+# Every service here pins a fixed `container_name:`, so a container holding one
+# of those names blocks `up` with "container name is already in use" — even when
+# it is stopped, and even when it publishes a different port.
+#
+# `docker compose down` cannot clear it: `down` filters by the
+# com.docker.compose.project label, so anything created by a bare `docker run`
+# (or by a different project) is invisible to it. Remove such strays explicitly.
+#
+# Only the CONTAINER is removed — named volumes are never touched, so the
+# database survives. Containers owned by THIS project are left to `down`.
+remove_foreign_name_conflicts() {
+  local name owner
+  while read -r name; do
+    [ -n "$name" ] || continue
+    docker container inspect "$name" >/dev/null 2>&1 || continue
+
+    owner="$(docker container inspect "$name" \
+      --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)"
+    # A missing label prints as "<no value>" on some Docker versions.
+    [ "$owner" = "<no value>" ] && owner=""
+    [ "$owner" = "$COMPOSE_PROJECT" ] && continue
+
+    echo "  Removing stray container '$name' (compose project: '${owner:-<none>}', expected '$COMPOSE_PROJECT')."
+    echo "  Its named volumes are preserved — only the container is discarded."
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  done < <(awk '/^[[:space:]]+container_name:[[:space:]]*/ {print $2}' "$COMPOSE_FILE")
+}
+
 # Returns 0 if host TCP port 5432 is currently bound (listening), 1 otherwise.
 # Works without root: prefer `ss`, fall back to `lsof`.
 port_5432_in_use() {
@@ -48,6 +79,11 @@ diagnose_port_5432() {
 # This releases the published port while preserving the database.
 echo "Stopping existing stack (keeping database volume)..."
 docker compose -f "$COMPOSE_FILE" down 2>/dev/null || true
+
+# Runs AFTER `down` (so our own containers are already gone) and BEFORE the port
+# probe below — a stray container may itself be the thing holding 5432, and
+# clearing it first stops the probe from misattributing that to system Postgres.
+remove_foreign_name_conflicts
 
 echo "Checking host port 5432..."
 if port_5432_in_use; then

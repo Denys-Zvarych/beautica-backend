@@ -248,7 +248,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Always called with the result of an ID-only page query, so the IN list size
      * equals the configured page size (default 20) — never unbounded.
      *
-     * <p><b>Deliberately does NOT fetch {@code s.owner}</b>, unlike {@link #findByIdWithFullGraph}.
+     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — as with {@link #findByIdWithFullGraph}.
      * {@code Salon.owner} is {@code LAZY}, so the fetch join was never an EAGER mitigation, and
      * none of this method's three callers dereferences it: {@code BookingDetailResponse#from}
      * (via {@code BookingService#listProviderBookings}) reads only the salon's name / street /
@@ -257,10 +257,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * {@code NotificationOutboxDrainWorker#dispatchAll} never calls {@code getSalon()}. Restoring
      * it costs an extra join to {@code users} and a full {@code User} row — {@code password_hash}
      * included — hydrated per distinct salon on every provider booking-list and master-calendar
-     * page. {@code findByIdWithFullGraph} keeps its own {@code s.owner} fetch because the mutation
-     * paths that use it feed {@code AuthorizationService}'s
-     * {@code master.getSalon().getOwner().getId()} ownership checks; this batch path never reaches
-     * those.
+     * page. {@link #findByIdWithFullGraph} does not fetch {@code s.owner} either, for the same
+     * reason: the {@code AuthorizationService} ownership checks its callers feed read
+     * {@code master.getSalon().getOwner().getId()}, and an identifier is served off the
+     * uninitialised proxy without a statement — so the fetch bought nothing there and was removed
+     * alongside this one.
      *
      * <p>The "no caller dereferences it" half of that claim is now enforced, not merely asserted:
      * {@code BookingPriceRangeContractIT#should_notScaleStatementCount_when_salonMasterPageHasManyBookings}
@@ -406,6 +407,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * ({@code GET /bookings/{id}}) 404 for ANY guest booking — the entire provider-side guest
      * lifecycle was unreachable (CRITICAL finding, track 24.7 audit). See
      * {@link #findAllByIdsWithGraph} for the sibling batch-hydrate query with the same fix.
+     *
+     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — the third and last removal of this
+     * dead fetch, after {@link #findAllByIdsWithGraph} and
+     * {@code findActiveByClientIdAndIdempotencyKey}. It was dead for two independent reasons:
+     * <ol>
+     *   <li>Every {@code getOwner()} in {@code src/main/java} is either a null check or
+     *       {@code .getId()} ({@code AuthorizationService} x7, {@code MasterService#requireOwner},
+     *       {@code SalonResponse#from}). Hibernate serves an identifier off an uninitialised proxy
+     *       without a statement, so nothing on these paths ever needed the row.</li>
+     *   <li>{@code Salon.owner} is {@code @ManyToOne(LAZY)} on a {@code nullable = false} column
+     *       ({@code Salon}), so Hibernate always hands back a proxy without a DB hit — the
+     *       {@code getOwner() != null} guards never initialise it and never evaluate false.</li>
+     * </ol>
+     * The fetch therefore cost an extra join into {@code users} plus a full {@code User} row
+     * ({@code password_hash} included) on all six callers — {@code BookingService} (getBooking,
+     * loadBookingOrThrow and the cancel/reschedule paths) and {@code ReviewService#createReview} —
+     * and bought nothing. Pinned by
+     * {@code BookingPriceRangeContractIT#should_notHydrateTheSalonOwner_when_loadingABookingDetail}:
+     * a statement count cannot detect a re-added fetch join (a fetch join widens an existing join
+     * rather than issuing a statement), so that gate counts HYDRATED ENTITIES instead — the same
+     * split of responsibilities as {@code SALON_MASTER_PAGE_ENTITIES} guarding
+     * {@link #findAllByIdsWithGraph}.
      */
     @Query("""
             SELECT b FROM Booking b
@@ -413,7 +436,6 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.master m
             JOIN FETCH m.user
             LEFT JOIN FETCH m.salon s
-            LEFT JOIN FETCH s.owner
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id = :id

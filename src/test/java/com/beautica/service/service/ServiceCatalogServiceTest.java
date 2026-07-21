@@ -551,6 +551,69 @@ class ServiceCatalogServiceTest {
         assertThat(item.isActive()).isTrue();
     }
 
+    /**
+     * The public/authenticated split for {@code priceOverride}. {@code getMasterServices} backs the
+     * {@code permitAll} browse route {@code GET /masters/&#123;masterId&#125;/services}, so an
+     * anonymous caller must not be able to read whether — or by how much — a master prices away
+     * from their salon's definition price. {@code getMyServices} serves the master themselves and
+     * must keep it.
+     *
+     * <p>Both halves are asserted in ONE test on purpose: the property under test is the
+     * DIFFERENCE between the two paths, and split across two tests a refactor that accidentally
+     * masked both (or neither) could leave one green in isolation. The override value here is
+     * deliberately different from {@code basePrice} so that {@code effectivePrice} proves the
+     * override is still APPLIED — masking must hide the provider's bookkeeping field without
+     * changing the price the client is quoted.
+     */
+    @Test
+    @DisplayName("getMasterServices masks priceOverride for the public browse route while "
+            + "getMyServices keeps it — and the masked row still quotes the overridden price")
+    void should_maskPriceOverrideOnPublicPathOnly_when_masterHasAnOverride() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        BigDecimal override = new BigDecimal("700.00");
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure")
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(UUID.randomUUID());
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(override);
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+
+        MasterServiceResponse publicRow = serviceCatalogService.getMasterServices(masterId).get(0);
+        MasterServiceResponse ownRow = serviceCatalogService.getMyServices(userId).get(0);
+
+        assertThat(publicRow.priceOverride())
+                .as("an anonymous caller must not learn that this master deviates from the salon's "
+                        + "definition price")
+                .isNull();
+        assertThat(publicRow.effectivePrice())
+                .as("masking must not change what the client is quoted — the override is still "
+                        + "APPLIED, it is merely not itemised")
+                .isEqualByComparingTo(override);
+        assertThat(ownRow.priceOverride())
+                .as("the master's own authenticated view keeps the field")
+                .isEqualByComparingTo(override);
+    }
+
     // ── getMyServices ───────────────────────────────────────────────────────────
 
     @Test

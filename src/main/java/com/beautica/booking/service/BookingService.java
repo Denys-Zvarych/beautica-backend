@@ -883,7 +883,7 @@ public class BookingService {
         // Master kind is irrelevant to bookability — SALON_MASTER, INDEPENDENT_MASTER,
         // and SALON_OWNER masters are all bookable when active with working hours + a
         // matching master_services row.
-        Master master = masterRepository.findByIdWithSalonAndOwner(request.masterId())
+        Master master = masterRepository.findByIdWithUserAndSalon(request.masterId())
                 .filter(Master::isActive)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
 

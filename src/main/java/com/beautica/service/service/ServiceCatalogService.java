@@ -441,10 +441,19 @@ public class ServiceCatalogService {
         // An unknown masterId produces an empty list — the existsById check was a
         // redundant DB round-trip because the JOIN FETCH graph query already returns
         // nothing for a non-existent master.
+        //
+        // fromPublic masks priceOverride: this method backs ONLY the permitAll browse route
+        // (ServiceController#getMasterServices), so an anonymous caller must not learn whether a
+        // master prices away from their salon's definition. Masking happens INSIDE the cached
+        // method on purpose — the "masterServices" cache is populated by, and read by, this public
+        // path alone, so the cache holds the already-masked shape and no authenticated path can
+        // pick up a masked entry. The provider's own view goes through getMyServices, which is
+        // uncached and keeps the full variant.
         return masterServiceRepository
                 .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
+                .map(MasterServiceResponse::fromPublic)
                 .toList();
     }
 

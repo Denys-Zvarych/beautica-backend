@@ -268,6 +268,58 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .isEqualByComparingTo("500.00");
     }
 
+    /**
+     * The status band-independence case. "Even a COMPLETED booking still shows the band the client
+     * agreed to" is how this phase is framed, but every other freeze test above runs on a
+     * {@code CONFIRMED} row — so the headline claim was structurally true (neither
+     * {@code BookingPriceRange} nor either read path reads {@code status}) yet entirely unpinned.
+     *
+     * <p>Asserted through the CLIENT detail endpoint on a terminal, past booking, because that is
+     * the scenario the claim is about: a service whose price has since moved on, and a booking that
+     * can never be re-priced because it is already done. The status is re-read from the response so
+     * a fixture that silently stopped applying it cannot leave this passing as a duplicate of
+     * {@link #should_keepFrozenCeiling_when_providerEditsServiceAfterBooking}.
+     */
+    @Test
+    @DisplayName("a COMPLETED booking keeps the band agreed at booking time when the service's "
+            + "price is edited afterwards — the freeze is independent of booking status")
+    void should_keepFrozenBand_when_bookingIsCompletedAndServiceIsEditedAfterwards() throws Exception {
+        String masterEmail = "bprc-completed-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        String clientEmail = "bprc-completed-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceId = createRangeService(masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        // A COMPLETED booking is by definition in the past; seeding it before ANCHOR (2032) keeps
+        // the fixture a shape the real lifecycle can actually produce rather than a future
+        // "completed" row that only the absence of a CHECK constraint permits.
+        UUID bookingId = insertBooking(clientId, masterId, serviceId, ANCHOR.minusYears(4),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "COMPLETED");
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        // The provider widens the ceiling and lifts the floor on the LIVE service row, long after
+        // the appointment happened.
+        jdbcTemplate.update(
+                "UPDATE service_definitions SET price_max = 999.00, base_price = 400.00 "
+                        + "WHERE id = (SELECT service_def_id FROM master_services WHERE id = ?)",
+                serviceId);
+
+        JsonNode afterEdit = getDetail(clientToken, bookingId);
+
+        assertThat(afterEdit.path("status").asText())
+                .as("premise of this test — the row must really be COMPLETED, or this silently "
+                        + "degrades into a duplicate of the CONFIRMED freeze test above")
+                .isEqualTo("COMPLETED");
+        assertThat(afterEdit.path("priceMaxAtBooking").decimalValue())
+                .as("a finished booking must still report the band agreed AT BOOKING TIME")
+                .isEqualByComparingTo("500.00");
+        assertThat(afterEdit.path("priceAtBooking").decimalValue())
+                .as("and its floor, likewise frozen")
+                .isEqualByComparingTo("300.00");
+        assertThat(ceilingOf(bookingId))
+                .as("the persisted ceiling must be untouched by the service edit")
+                .isEqualByComparingTo("500.00");
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // V120 BACKFILL — the freshness guard
     // ══════════════════════════════════════════════════════════════════════════
@@ -525,6 +577,85 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .isEqualByComparingTo("500.00");
         assertThat(providerDetail.path("priceMaxAtBooking").decimalValue())
                 .isEqualByComparingTo("500.00");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SALON_OWNER scope — GET /bookings/me across SEVERAL salons
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The fourth list scope. {@code BookingService#listProviderBookings} has three ID-page
+     * branches, and this suite pinned only two of them: {@code CLIENT} (its own projection query)
+     * and {@code SALON_MASTER}/{@code INDEPENDENT_MASTER} (both
+     * {@code findIdsByMasterIdFiltered}). {@code SALON_OWNER} takes a branch of its own —
+     * {@code findIdsByOwnerIdAndIsActiveTrue} feeding {@code findIdsBySalonIdsFiltered}, an
+     * {@code IN (…)} over every salon the owner holds — and no test reached it.
+     *
+     * <p><b>Two salons, not one.</b> A single-salon owner would exercise
+     * {@code findIdsBySalonIdsFiltered} with a one-element {@code IN}, which cannot distinguish a
+     * correct implementation from one that silently collapses to the first salon. The two salons
+     * carry DELIBERATELY DIFFERENT bands (300–500 and 700–900) so a row-to-band mis-join shows up
+     * as a wrong pairing rather than as a coincidentally-equal number — the same
+     * divergent-fixture discipline the block above uses against live re-derivation.
+     *
+     * <p><b>Deliberately NOT given a statement-count gate</b>, unlike the three scopes at the
+     * bottom of this class. Measured on this fixture: 4 statements / 13 entities
+     * ({@code findIdsByOwnerIdAndIsActiveTrue} + the Specification ID page +
+     * {@code findAllByIdsWithGraph} + {@code findReviewedBookingIds}; both locality-label
+     * {@code IN} queries are skipped because this fixture stamps no locality). Pinning 4 would pin
+     * a number produced by what this fixture OMITS rather than by the production path — the
+     * textbook weak gate. Making it comparable to its siblings' 6 would mean rebuilding
+     * {@link #seedSalonBookingsOnDistinctServices} + {@code stampSalonLocality} across two salons,
+     * and the result would then pin the SAME six statements
+     * {@link #SALON_MASTER_PAGE_STATEMENTS} already pins: everything after the ID page
+     * ({@code findAllByIdsWithGraph}, the review batch, both label {@code IN}s) is shared code, and
+     * the only branch-specific statements are {@code findIdsByOwnerIdAndIsActiveTrue} and the ID
+     * page itself — both single, fixed, and independent of row AND salon count (2 salons still
+     * resolve through one {@code IN (…)} page plus one graph hydrate, which the measurement above
+     * confirms). This test therefore covers the scope's CORRECTNESS, which was the actual gap; its
+     * performance shape is already covered by the salon-master gate it shares a pipeline with.
+     */
+    @Test
+    @DisplayName("GET /me (SALON_OWNER) carries each booking's own frozen band across MULTIPLE "
+            + "salons — the findIdsBySalonIdsFiltered scope no other test reaches")
+    void should_carryFrozenBandPerRow_when_ownerListsBookingsAcrossSeveralSalons() throws Exception {
+        String ownerEmail = "bprc-owner-multi-" + System.nanoTime() + "@beautica.test";
+        var firstSalon = fixtures.createSalon(ownerEmail);
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, firstSalon.salonId());
+        UUID secondSalonId = addSalonUnderOwner(ownerId);
+        UUID secondMasterId = masterIdOfSalon(secondSalonId);
+        UUID clientId = fixtures.createUser(
+                "bprc-owner-multi-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        UUID serviceInFirst = createRangeService("SALON", firstSalon.salonId(), firstSalon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        insertBooking(clientId, firstSalon.masterId(), serviceInFirst, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"));
+        UUID serviceInSecond = createRangeService("SALON", secondSalonId, secondMasterId,
+                new BigDecimal("700.00"), new BigDecimal("900.00"), null);
+        insertBooking(clientId, secondMasterId, serviceInSecond, ANCHOR.plusDays(1),
+                new BigDecimal("700.00"), new BigDecimal("900.00"));
+
+        var page = bookingService.getMyBookings(
+                ownerId, authFor(Role.SALON_OWNER), null, null, null, null, PageRequest.of(0, 20));
+
+        assertThat(page.data())
+                .as("premise — the owner must see BOTH salons' bookings, or the multi-salon IN "
+                        + "clause this test exists for was never exercised")
+                .hasSize(2);
+        assertThat(page.data())
+                .extracting(b -> b.salonName())
+                .as("premise — the two rows must come from DIFFERENT salons")
+                .doesNotHaveDuplicates();
+        assertThat(page.data())
+                .as("each row must carry ITS OWN frozen floor/ceiling pair; a mis-join across the "
+                        + "salon IN clause would pair a booking with the other salon's band")
+                .extracting(b -> b.priceAtBooking().stripTrailingZeros().toPlainString(),
+                        b -> b.priceMaxAtBooking().stripTrailingZeros().toPlainString())
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple("300", "500"),
+                        org.assertj.core.groups.Tuple.tuple("700", "900"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -846,6 +977,75 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .isEqualTo(statementsForOneRow);
     }
 
+    /**
+     * Hydrated-entity count for a SINGLE {@code GET /bookings/{id}} served to the salon OWNER —
+     * the detail-path twin of {@link #SALON_MASTER_PAGE_ENTITIES}, and the gate that makes the
+     * {@code s.owner} drop on {@code findByIdWithFullGraph} enforceable instead of merely asserted.
+     *
+     * <p><b>Why an entity count and not a statement count.</b> Restoring
+     * {@code LEFT JOIN FETCH s.owner} widens an existing join rather than issuing a statement, so
+     * every statement-based metric on this path is by construction blind to it — the same argument
+     * that forced {@link #SALON_MASTER_PAGE_ENTITIES} into existence for the list path.
+     * {@code getEntityLoadCount()} does see it: Hibernate materialises the owner's {@code User} row.
+     *
+     * <p><b>Why the OWNER is the actor.</b> This is the one role whose authorization actually walks
+     * the association in question — {@code AuthorizationService#hasProviderAuthorityOverBooking}
+     * evaluates {@code master.getSalon().getOwner().getId()}. Running the gate as the owner
+     * therefore proves BOTH halves of the drop's rationale at once: that the ownership check still
+     * succeeds against an UNINITIALISED proxy (an id is served without a statement, and without a
+     * {@code LazyInitializationException} — the request completes inside the service transaction),
+     * and that no {@code User} row is hydrated to answer it. A master-role actor would exercise
+     * neither.
+     *
+     * <p>7 = 1 {@code Booking} + 1 {@code Master} + 1 master {@code User} + 1 {@code Salon}
+     * + 1 client {@code User} + 1 {@code MasterServiceAssignment} + 1 {@code ServiceDefinition}.
+     * The salon owner's {@code User} is conspicuously NOT among them.
+     *
+     * <p><b>Confirmed against a run, and mutation-verified (Phase 26.9 follow-up):</b> restoring
+     * {@code LEFT JOIN FETCH s.owner} to {@code findByIdWithFullGraph} moves this count 7 -&gt; 8
+     * (the salon owner's {@code User}, {@code password_hash} included) while every statement-count
+     * gate in this class stays exactly where it is — the observed split this gate was added for.
+     * Do not adjust the constant to make a failing run pass without first establishing which
+     * association the extra entity belongs to.
+     */
+    private static final long OWNER_DETAIL_ENTITIES = 7L;
+
+    @Test
+    @DisplayName("GET /bookings/{id} as the salon OWNER authorizes off the uninitialised Salon.owner "
+            + "proxy and hydrates no User row for it — pins the s.owner drop a statement count cannot see")
+    void should_notHydrateTheSalonOwner_when_loadingABookingDetail() {
+        var salon = fixtures.createSalon("bprc-detail-owner-" + System.nanoTime() + "@beautica.test");
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        UUID clientId = fixtures.createUser(
+                "bprc-detail-owner-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"));
+
+        Statistics statistics = statistics();
+        statistics.clear();
+        var detail = bookingService.getBooking(ownerId, bookingId);
+        long entities = statistics.getEntityLoadCount();
+
+        // The authorization walk itself is the premise: reaching a response at all means
+        // getOwner().getId() resolved off the proxy rather than throwing.
+        assertThat(detail.priceMaxAtBooking())
+                .as("premise — the owner must actually be authorized to read this booking")
+                .isEqualByComparingTo("500.00");
+        assertThat(detail.salonName())
+                .as("premise — the row must carry a real salon, or there is no Salon.owner proxy "
+                        + "for this gate to be about")
+                .isNotNull();
+        assertThat(entities)
+                .as("absolute HYDRATED-ENTITY count for one owner-served booking detail. A rise to "
+                        + "%s means s.owner (or another association) was fetch-joined back onto "
+                        + "findByIdWithFullGraph — invisible to any statement count, which is "
+                        + "precisely why this gate counts entities.", OWNER_DETAIL_ENTITIES + 1)
+                .isEqualTo(OWNER_DETAIL_ENTITIES);
+    }
+
     @Test
     @DisplayName("CLIENT scope — a 5-row page costs a fixed, absolute number of JDBC statements, "
             + "each booking on its OWN service definition so a lost join cannot hide in the L1 cache")
@@ -922,6 +1122,37 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                     ANCHOR.plusMinutes(90L * (existing + i)),
                     new BigDecimal("300.00"), new BigDecimal("500.00"));
         }
+    }
+
+    /**
+     * Adds a SECOND active salon (plus its own {@code SALON_MASTER}) under an EXISTING owner, so a
+     * {@code SALON_OWNER} page spans more than one salon.
+     *
+     * <p>Needed because {@code BookingTestFixtures.createSalon} mints a fresh owner per call, which
+     * can only ever produce single-salon owners. {@code BookingService#listProviderBookings} routes
+     * {@code SALON_OWNER} through {@code salonRepository.findIdsByOwnerIdAndIsActiveTrue} into
+     * {@code findIdsBySalonIdsFiltered} — an {@code IN (…)} over every salon the owner holds — and
+     * with one salon that query is indistinguishable from the single-id
+     * {@code findIdsByMasterIdFiltered} the other gates cover.
+     */
+    private UUID addSalonUnderOwner(UUID ownerId) {
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, "Salon-" + salonId);
+        UUID masterUserId = fixtures.createUser(
+                "bprc-owner-salon-master-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId);
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                UUID.randomUUID(), masterUserId, salonId);
+        return salonId;
+    }
+
+    private UUID masterIdOfSalon(UUID salonId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE salon_id = ? ORDER BY created_at LIMIT 1", UUID.class, salonId);
     }
 
     /**
@@ -1070,15 +1301,30 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     private UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId,
                                OffsetDateTime startsAt, BigDecimal priceAtBooking,
                                BigDecimal priceMaxAtBooking) {
+        return insertBooking(clientId, masterId, masterServiceId, startsAt,
+                priceAtBooking, priceMaxAtBooking, "CONFIRMED");
+    }
+
+    /**
+     * Status-parameterised form. Exists so the freeze can be asserted on a {@code COMPLETED}
+     * booking — the phase's headline framing is "even a COMPLETED booking keeps its agreed band",
+     * yet every other freeze test in this class runs on {@code CONFIRMED}. The band is structurally
+     * status-independent ({@code BookingPriceRange} never reads the status, and the read paths
+     * select a stored column), so this pins a claim the suite made but never exercised rather than
+     * covering a distinct code path.
+     */
+    private UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                               OffsetDateTime startsAt, BigDecimal priceAtBooking,
+                               BigDecimal priceMaxAtBooking, String status) {
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
                         + "starts_at, ends_at, price_at_booking, price_max_at_booking, "
                         + "duration_minutes_at_booking, buffer_minutes_at_booking, booking_source, "
                         + "created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, 60, 0, 'APP', NOW(), NOW())",
-                bookingId, clientId, masterId, masterServiceId, startsAt, startsAt.plusMinutes(60),
-                priceAtBooking, priceMaxAtBooking);
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, status, startsAt,
+                startsAt.plusMinutes(60), priceAtBooking, priceMaxAtBooking);
         return bookingId;
     }
 

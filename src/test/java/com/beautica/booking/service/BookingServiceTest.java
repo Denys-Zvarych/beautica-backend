@@ -260,7 +260,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("booking is created and saved when the slot is free and no overlap exists")
     void should_createBooking_when_slotAvailableAndNoConflict() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
@@ -287,7 +287,7 @@ class BookingServiceTest {
         Master ownerMaster = buildMaster(masterId, MasterType.SALON_OWNER);
         MasterServiceAssignment ownerMsa = buildMsa(masterServiceId, ownerMaster, serviceDef, null, null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(ownerMaster));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerMaster));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(ownerMsa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
@@ -324,7 +324,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("409 Conflict is thrown when the requested slot overlaps an existing booking")
     void should_throw409_when_slotOverlapsExistingBooking() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(true);
@@ -339,7 +339,7 @@ class BookingServiceTest {
     @DisplayName("409 CLIENT_BOOKING_CONFLICT is thrown when the client already holds an overlapping "
             + "booking with a DIFFERENT master — the master-busy check never runs")
     void should_throwClientBookingConflict_when_clientAlreadyHasOverlappingBookingWithDifferentMaster() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
 
@@ -377,7 +377,7 @@ class BookingServiceTest {
     @DisplayName("advisory locks are acquired client-then-master (deterministic order, Phase 19.4 "
             + "reorder), and the client-conflict check runs before the master lock is even acquired")
     void should_acquireClientLockBeforeMasterLock_andCheckClientConflictFirst_when_creatingBooking() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
@@ -409,7 +409,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("404 NotFoundException is thrown when the master does not exist")
     void should_throw404_when_masterNotFound() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
                 .isInstanceOf(NotFoundException.class);
@@ -418,7 +418,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("404 NotFoundException is thrown when the master service assignment does not exist")
     void should_throw404_when_masterServiceNotFound() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
@@ -435,7 +435,7 @@ class BookingServiceTest {
                 .isActive(false)
                 .build();
         setField(inactiveMaster, "id", masterId);
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(inactiveMaster));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(inactiveMaster));
 
         // Act + Assert — the filter(Master::isActive) turns the Optional empty
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
@@ -446,7 +446,7 @@ class BookingServiceTest {
     @DisplayName("404 NotFoundException is thrown when the requested service does not belong to the master")
     void should_throwNotFoundException_when_serviceDoesNotBelongToMaster() {
         // Arrange — master is found and active; but the service lookup returns empty
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.empty());
 
@@ -458,7 +458,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("400 is thrown when the requested start time is in the past")
     void should_throw400_when_startsAtInThePast() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest pastRequest = new CreateBookingRequest(
@@ -478,7 +478,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("400 is thrown when the requested start time is exactly 14 minutes from now (below minimum lead time)")
     void should_throw400_when_startsAtIsExactly14MinutesFromNow() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest request = new CreateBookingRequest(
@@ -498,7 +498,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("booking proceeds past time check when start time is exactly 15 minutes from now (minimum lead time boundary)")
     void should_proceedPastTimeCheck_when_startsAtIsExactly15MinutesFromNow() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
@@ -522,7 +522,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("400 is thrown when the requested start time is more than 180 days in the future")
     void should_throw400_when_startsAtMoreThan180DaysAhead() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest farFutureRequest = new CreateBookingRequest(
@@ -544,7 +544,7 @@ class BookingServiceTest {
     void should_snapshotPriceAndDuration_when_masterServiceHasOverrides() {
         MasterServiceAssignment msaWithOverrides = buildMsa(
                 masterServiceId, master, serviceDef, new BigDecimal("250.00"), 45);
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msaWithOverrides));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
@@ -564,7 +564,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("price and duration are snapshotted from base values when no overrides are set")
     void should_fallBackToBaseValues_when_noOverrides() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
@@ -582,7 +582,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("new-booking notification is enqueued when the booking is successfully created")
     void should_enqueueNewBookingNotification_when_bookingCreated() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));

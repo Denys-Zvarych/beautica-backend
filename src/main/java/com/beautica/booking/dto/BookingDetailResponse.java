@@ -79,7 +79,7 @@ public record BookingDetailResponse(
         ZonedDateTime startsAt,
         ZonedDateTime endsAt,
         BigDecimal priceAtBooking,
-        @Schema(types = {"string", "null"}, nullable = true,
+        @Schema(types = {"number", "null"}, nullable = true,
                 description = "The range ceiling agreed AT BOOKING TIME, present ONLY when the "
                         + "master left this service's price as a genuine RANGE (no priceOverride) "
                         + "when the booking was made. Null means a single price — render "

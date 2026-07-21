@@ -100,4 +100,46 @@ public record MasterServiceResponse(
                 sdResponse.serviceTypeSlug()
         );
     }
+
+    /**
+     * Masked variant for the {@code permitAll} browse route
+     * ({@code GET /masters/&#123;masterId&#125;/services}), mirroring the
+     * {@code MasterDetailResponse#fromPublic} precedent.
+     *
+     * <p><b>What is stripped and why.</b> {@code priceOverride} is a PROVIDER-INTERNAL bookkeeping
+     * field: it is non-null exactly when this master charges something other than the salon's
+     * definition price, so serving it raw to an anonymous caller discloses whether — and by how
+     * much — a master deviates from their salon's list price. That is commercially sensitive and
+     * has no consumer: the discovery flow prices off {@code effectivePrice} (the
+     * {@code COALESCE(priceOverride, base_price)} floor) and renders bands off
+     * {@code priceMin}/{@code priceMax}/{@code priceDisplay}, all of which are retained here. The
+     * masked field is the only one dropped; nothing else about the row changes.
+     *
+     * <p><b>Wire compatibility.</b> {@code priceOverride} is already absent from the vast majority
+     * of responses today — any master who has NOT set an override serialises it as null — and it
+     * is not a required property in the generated OpenAPI schema. Masking therefore emits a shape
+     * clients already handle, and does not alter the schema: the property stays declared and
+     * optional, only the runtime value becomes absent on this one anonymous route. Authenticated
+     * routes ({@code GET /masters/me/services} and every write path) keep the full
+     * {@link #from} variant, so a provider still sees their own override.
+     */
+    public static MasterServiceResponse fromPublic(MasterServiceResponse full) {
+        return new MasterServiceResponse(
+                full.id(),
+                full.masterId(),
+                full.serviceDefinition(),
+                null,             // priceOverride — provider-internal, masked for anonymous callers
+                full.durationOverrideMinutes(),
+                full.effectivePrice(),
+                full.effectiveDurationMinutes(),
+                full.isActive(),
+                full.priceType(),
+                full.priceMin(),
+                full.priceMax(),
+                full.priceDisplay(),
+                full.serviceTypeId(),
+                full.serviceTypeNameUk(),
+                full.serviceTypeSlug()
+        );
+    }
 }
