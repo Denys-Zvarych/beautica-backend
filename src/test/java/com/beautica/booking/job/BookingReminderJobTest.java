@@ -84,6 +84,6 @@ class BookingReminderJobTest {
                 master, msa, null,
                 OffsetDateTime.parse("2026-06-02T10:00:00+03:00"),
                 OffsetDateTime.parse("2026-06-02T11:00:00+03:00"),
-                new BigDecimal("350.00"), 60, 0, "Олена", "Коваль", phone);
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", phone);
     }
 }

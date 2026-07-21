@@ -155,6 +155,22 @@ public class Booking extends AuditableEntity {
     @Column(name = "price_at_booking", nullable = false)
     private BigDecimal priceAtBooking;
 
+    /**
+     * Frozen RANGE ceiling (V119), the companion snapshot to {@link #priceAtBooking}'s floor.
+     *
+     * <p>{@code null} means "single price" — render {@code priceAtBooking} alone. That is the
+     * majority case: every FIXED service, and every RANGE service whose master set a
+     * {@code priceOverride} (the override IS the agreed price, so there is no band). The value is
+     * computed once, on the create paths, by
+     * {@link com.beautica.booking.dto.BookingPriceRange#resolveCeiling}.
+     *
+     * <p>Like {@code priceAtBooking} this is a SNAPSHOT and is deliberately never recomputed —
+     * not on read, and not by {@link #reschedule}. A provider editing their service must not
+     * retroactively rewrite the band a client already agreed to.
+     */
+    @Column(name = "price_max_at_booking")
+    private BigDecimal priceMaxAtBooking;
+
     @Column(name = "duration_minutes_at_booking", nullable = false)
     private int durationMinutesAtBooking;
 
@@ -230,9 +246,11 @@ public class Booking extends AuditableEntity {
      * so a partially-populated guest booking can never be constructed in code —
      * mirroring the DB CHECK {@code chk_bookings_guest_fields}.
      *
-     * @param guestName    OTP-verified client's first name (required)
-     * @param guestSurname client's surname (optional — column is nullable)
-     * @param guestPhone   E.164 phone copied from the guest JWT {@code sub} (required)
+     * @param guestName         OTP-verified client's first name (required)
+     * @param guestSurname      client's surname (optional — column is nullable)
+     * @param guestPhone        E.164 phone copied from the guest JWT {@code sub} (required)
+     * @param priceMaxAtBooking frozen RANGE ceiling, or {@code null} for a single price
+     *                          (see {@link #priceMaxAtBooking})
      */
     public static Booking guestBooking(
             Master master,
@@ -241,6 +259,7 @@ public class Booking extends AuditableEntity {
             OffsetDateTime startsAt,
             OffsetDateTime endsAt,
             BigDecimal priceAtBooking,
+            BigDecimal priceMaxAtBooking,
             int durationMinutesAtBooking,
             int bufferMinutesAtBooking,
             String guestName,
@@ -262,6 +281,7 @@ public class Booking extends AuditableEntity {
                 .startsAt(startsAt)
                 .endsAt(endsAt)
                 .priceAtBooking(priceAtBooking)
+                .priceMaxAtBooking(priceMaxAtBooking)
                 .durationMinutesAtBooking(durationMinutesAtBooking)
                 .bufferMinutesAtBooking(bufferMinutesAtBooking)
                 .bookingSource(BookingSource.LINK)
@@ -278,10 +298,12 @@ public class Booking extends AuditableEntity {
      *
      * <p>Per the track 24.x locked state machine (auto-confirm), a booking is always
      * {@code CONFIRMED} from creation, and rescheduling never reverts it — there is no
-     * provider re-approval queue to re-enter. {@code priceAtBooking} and
-     * {@code durationMinutesAtBooking} are frozen at the original booking and are
-     * deliberately NOT recomputed here — the caller computes {@code newEndsAt} from
-     * the frozen duration (+ buffer) before invoking this method.
+     * provider re-approval queue to re-enter. {@code priceAtBooking},
+     * {@code priceMaxAtBooking} and {@code durationMinutesAtBooking} are frozen at the
+     * original booking and are deliberately NOT recomputed here — the caller computes
+     * {@code newEndsAt} from the frozen duration (+ buffer) before invoking this method.
+     * Moving a booking in time must never re-price it, and in particular must never
+     * re-derive the band from the service's CURRENT price_type/price_max.
      *
      * <p>Allowed source-state and slot/overlap validation are the caller's
      * responsibility (see {@code BookingService.rescheduleBooking}); this method only

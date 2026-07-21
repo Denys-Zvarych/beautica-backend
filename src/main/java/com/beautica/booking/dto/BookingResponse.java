@@ -3,6 +3,7 @@ package com.beautica.booking.dto;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.TimeZones;
+import io.swagger.v3.oas.annotations.media.Schema;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -20,7 +21,8 @@ import java.util.UUID;
  * {@code booking.getMasterService().getServiceDefinition().getName()} — the repository query
  * that loads {@link com.beautica.booking.entity.Booking Booking} instances for this DTO
  * must include {@code LEFT JOIN FETCH b.masterService ms LEFT JOIN FETCH ms.serviceDefinition}
- * to avoid N+1 lazy loads.
+ * to avoid N+1 lazy loads. {@code priceMaxAtBooking} does NOT widen that requirement — it is a
+ * frozen column on the booking row itself (V119), not a walk into the service definition.
  */
 public record BookingResponse(
         UUID id,
@@ -32,8 +34,17 @@ public record BookingResponse(
         ZonedDateTime startsAt,
         ZonedDateTime endsAt,
         BigDecimal priceAtBooking,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "The range ceiling agreed AT BOOKING TIME, present ONLY when the "
+                        + "master left this service's price as a genuine RANGE (no priceOverride) "
+                        + "when the booking was made. Null means a single price — render "
+                        + "priceAtBooking alone. The client must never re-derive this from "
+                        + "priceType/priceOverride; the decision is made server-side, once.")
+        BigDecimal priceMaxAtBooking,
         int durationMinutesAtBooking,
-        // snapshot fields — reflects price/duration the client agreed to, not current master_services values
+        // priceAtBooking, priceMaxAtBooking and durationMinutesAtBooking are all snapshot columns
+        // on the bookings row — they reflect the price band/duration the client agreed to, and are
+        // never re-derived from current master_services/service_definitions values.
         OffsetDateTime createdAt
 ) {
     public static BookingResponse from(Booking booking) {
@@ -49,6 +60,7 @@ public record BookingResponse(
                 booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV),
                 booking.getEndsAt().atZoneSameInstant(TimeZones.KYIV),
                 booking.getPriceAtBooking(),
+                booking.getPriceMaxAtBooking(),
                 booking.getDurationMinutesAtBooking(),
                 booking.getCreatedAt().atOffset(ZoneOffset.UTC)
         );

@@ -20,6 +20,21 @@ class BookingEntityImmutabilityTest {
                 .isInstanceOf(NoSuchMethodException.class);
     }
 
+    /**
+     * The frozen RANGE ceiling (V119, Phase 26.9) is the companion snapshot to
+     * {@code priceAtBooking} and must be as unwritable after creation as the floor is. A public
+     * setter is the single cheapest way to reintroduce the defect this phase exists to eliminate:
+     * any post-creation write path — a "refresh the band" helper, a reschedule that re-prices, a
+     * mapper that round-trips — would let a provider's later service edit rewrite a band the client
+     * already agreed to, on an even {@code COMPLETED} booking.
+     */
+    @Test
+    @DisplayName("priceMaxAtBooking has no public setter — the frozen ceiling is as immutable as the floor")
+    void should_haveNoPublicSetter_when_fieldIsPriceMaxAtBooking() {
+        assertThatThrownBy(() -> Booking.class.getMethod("setPriceMaxAtBooking", BigDecimal.class))
+                .isInstanceOf(NoSuchMethodException.class);
+    }
+
     @Test
     @DisplayName("durationMinutesAtBooking has no public setter")
     void should_haveNoPublicSetter_when_fieldIsDurationMinutesAtBooking() {

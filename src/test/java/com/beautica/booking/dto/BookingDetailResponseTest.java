@@ -5,6 +5,7 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -19,6 +20,7 @@ import java.time.ZoneOffset;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -98,6 +100,9 @@ class BookingDetailResponseTest {
         assertThat(response.serviceName()).isEqualTo("Манікюр");
         assertThat(response.status()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(response.priceAtBooking()).isEqualByComparingTo(new BigDecimal("350.00"));
+        assertThat(response.priceMaxAtBooking())
+                .as("no frozen ceiling on the row means a single price")
+                .isNull();
         assertThat(response.durationMinutesAtBooking()).isEqualTo(60);
 
         // time zone conversion
@@ -221,5 +226,60 @@ class BookingDetailResponseTest {
 
         assertThat(response.salonName()).isEqualTo("Glamour Studio");
         assertThat(response.locationNote()).isEqualTo("3-й поверх, код 1234");
+    }
+
+    // ── priceMaxAtBooking — the frozen snapshot column (V119), NOT a live derivation. The
+    //    creation-time rule that produced the stored value is pinned by BookingPriceRangeTest.
+
+    @Test
+    @DisplayName("priceMaxAtBooking carries the frozen ceiling stored on the booking row")
+    void should_returnFrozenCeiling_when_bookingHasOne() {
+        when(booking.getPriceMaxAtBooking()).thenReturn(new BigDecimal("500.00"));
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
+    @Test
+    @DisplayName("priceMaxAtBooking is null when the booking froze no ceiling — a single price")
+    void should_returnNullPriceMax_when_bookingFrozeNoCeiling() {
+        when(booking.getPriceMaxAtBooking()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.priceMaxAtBooking()).isNull();
+    }
+
+    @Test
+    @DisplayName("priceMaxAtBooking ignores the service's CURRENT priceType/priceMax — a provider "
+            + "editing their service must not rewrite a band the client already agreed to")
+    void should_keepFrozenCeiling_when_providerEditsServiceAfterBooking() {
+        when(booking.getPriceMaxAtBooking()).thenReturn(new BigDecimal("500.00"));
+        // The provider has since widened the live service far beyond the agreed band.
+        var serviceDef = booking.getMasterService().getServiceDefinition();
+        lenient().when(serviceDef.getPriceType()).thenReturn(PriceType.RANGE);
+        lenient().when(serviceDef.getPriceMax()).thenReturn(new BigDecimal("9999.00"));
+        lenient().when(booking.getMasterService().getPriceOverride()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.priceMaxAtBooking())
+                .as("the agreed ceiling, not the edited one")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
+    @Test
+    @DisplayName("a FIXED-service booking that froze a ceiling still shows it — the snapshot wins "
+            + "even when the live service could no longer produce one")
+    void should_keepFrozenCeiling_when_providerFlippedServiceToFixedAfterBooking() {
+        when(booking.getPriceMaxAtBooking()).thenReturn(new BigDecimal("500.00"));
+        var serviceDef = booking.getMasterService().getServiceDefinition();
+        lenient().when(serviceDef.getPriceType()).thenReturn(PriceType.FIXED);
+        lenient().when(serviceDef.getPriceMax()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
     }
 }

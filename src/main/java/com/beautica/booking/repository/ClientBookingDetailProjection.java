@@ -38,6 +38,17 @@ import java.util.UUID;
  * <p>{@code canReview} is NOT stored here: it is derived by the service as
  * {@code status == COMPLETED && !reviewExists}, keeping the truth-table logic in one place.
  *
+ * <p>{@code priceMaxAtBooking} is read straight off {@code b} — the frozen snapshot column added
+ * by V119, the companion to {@code priceAtBooking}'s floor. It needs no join and no derivation:
+ * the CLIENT and PROVIDER views of a booking cannot disagree because both now read the same
+ * stored column rather than each re-deriving a rule from live service state.
+ *
+ * <p>It sits LAST, after {@code reviewExists}, rather than beside {@code priceAtBooking} where it
+ * reads more naturally. That is deliberate: the two are both {@code BigDecimal}, so making them
+ * adjacent would let a future reordering of the constructor expression silently swap floor and
+ * ceiling. Wedged between a {@code String} and the end of the list, any such slip fails to
+ * compile.
+ *
  * @param createdAt entity audit timestamp ({@code Instant} — matches {@code AuditableEntity})
  */
 public record ClientBookingDetailProjection(
@@ -69,6 +80,7 @@ public record ClientBookingDetailProjection(
         String buildingNo,
         String locationNote,
         String categoryName,
-        boolean reviewExists
+        boolean reviewExists,
+        BigDecimal priceMaxAtBooking
 ) {
 }

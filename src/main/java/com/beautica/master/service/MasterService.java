@@ -771,7 +771,14 @@ public class MasterService {
                 .orElseThrow(() -> new NotFoundException("Master not found"));
     }
 
-    @Cacheable(value = "master-calendar", key = "{#masterId, #from, #to, #pageable.pageNumber, #pageable.pageSize}")
+    // sync = true (§F-7): the master's app polls this key and the TTL is only 30s, so without it
+    // every expiry admits N concurrent threads into the full two-query hydrate below. Compatible
+    // with BookingService#doEvictMasterCalendarEntries, which evicts by scanning the native
+    // Caffeine keySet for this master's prefix — Caffeine's sync loader holds a per-key lock
+    // during load only, and never blocks or is blocked by a concurrent removal.
+    @Cacheable(value = "master-calendar",
+            key = "{#masterId, #from, #to, #pageable.pageNumber, #pageable.pageSize}",
+            sync = true)
     @Transactional(readOnly = true)
     public Page<BookingResponse> getMasterCalendar(UUID masterId, LocalDate from, LocalDate to, Pageable pageable) {
         OffsetDateTime fromOdt = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();

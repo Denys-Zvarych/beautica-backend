@@ -113,7 +113,7 @@ class BookingControllerTest {
                 BookingStatus.CONFIRMED,
                 ZonedDateTime.now().plusDays(1),
                 ZonedDateTime.now().plusDays(1).plusMinutes(60),
-                new BigDecimal("500.00"), 60,
+                new BigDecimal("500.00"), null, 60,
                 OffsetDateTime.now(ZoneOffset.UTC)
         );
     }
@@ -124,7 +124,7 @@ class BookingControllerTest {
                 BookingStatus.CONFIRMED,
                 ZonedDateTime.now().plusDays(1),
                 ZonedDateTime.now().plusDays(1).plusMinutes(60),
-                new BigDecimal("500.00"), 60,
+                new BigDecimal("500.00"), null, 60,
                 OffsetDateTime.now(ZoneOffset.UTC),
                 "Oksana", "Kovalenko", "Natalia", "Lysenko",
                 // masterProfessionalTitle (additive)

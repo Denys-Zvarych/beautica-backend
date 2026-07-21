@@ -2,6 +2,7 @@ package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.BookingDetailResponse;
+import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
@@ -201,6 +202,7 @@ public class BookingService {
                 p.startsAt().atZoneSameInstant(TimeZones.KYIV),
                 p.endsAt().atZoneSameInstant(TimeZones.KYIV),
                 p.priceAtBooking(),
+                p.priceMaxAtBooking(),
                 p.durationMinutesAtBooking(),
                 p.createdAt().atOffset(ZoneOffset.UTC),
                 p.clientFirstName(),
@@ -950,6 +952,9 @@ public class BookingService {
                 .startsAt(startsAt)
                 .endsAt(endsAt)
                 .priceAtBooking(effectivePrice)
+                // Freeze the RANGE ceiling beside the floor (V119). Null = single price. Computed
+                // HERE, at creation, so a later service edit can never rewrite an agreed band.
+                .priceMaxAtBooking(BookingPriceRange.resolveCeiling(msa))
                 .durationMinutesAtBooking(effectiveDuration)
                 .bufferMinutesAtBooking(bufferMinutes)
                 .idempotencyKey(idempotencyKey)

@@ -1727,7 +1727,8 @@ class BookingServiceTest {
                 "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
                 null, null, "Khreschatyk", "10",
                 locationNote,
-                "MANICURE", false);
+                "MANICURE", false,
+                null);
     }
 
     @Test
@@ -1766,6 +1767,67 @@ class BookingServiceTest {
         assertThat(result.data().get(0).locationNote()).isNull();
     }
 
+    // ── priceMaxAtBooking (CLIENT projection path) ────────────────────────────────────────────
+    //    Since V119 the ceiling is a frozen column on the bookings row, so this path has no rule
+    //    left to apply — the service must pass the projected value through UNTOUCHED. Any
+    //    re-derivation reintroduced here would let a provider's later service edit rewrite an
+    //    agreed band. The creation-time rule that produced the value lives in BookingPriceRange
+    //    and is pinned by BookingPriceRangeTest.
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithCeiling(
+            java.math.BigDecimal priceMaxAtBooking) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("300.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false,
+                priceMaxAtBooking);
+    }
+
+    private com.beautica.booking.dto.BookingDetailResponse firstClientRowFor(
+            com.beautica.booking.repository.ClientBookingDetailProjection row) {
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(bookingId)))
+                .thenReturn(List.of(row));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), null, null, null, null, Pageable.unpaged());
+
+        assertThat(result.data()).hasSize(1);
+        return result.data().get(0);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) passes a frozen priceMaxAtBooking through untouched")
+    void should_passFrozenCeilingThrough_when_clientProjectionRowHasOne() {
+        var row = clientProjectionRowWithCeiling(new BigDecimal("500.00"));
+
+        var booking = firstClientRowFor(row);
+
+        assertThat(booking.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) leaves a null priceMaxAtBooking null — never re-derives a ceiling from live service state")
+    void should_returnNullPriceMax_when_clientProjectionRowHasNoFrozenCeiling() {
+        var row = clientProjectionRowWithCeiling(null);
+
+        var booking = firstClientRowFor(row);
+
+        assertThat(booking.priceMaxAtBooking()).isNull();
+    }
+
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
             UUID id, String serviceName) {
         return new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -1781,7 +1843,8 @@ class BookingServiceTest {
                 "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
                 null, null, "Khreschatyk", "10",
                 null,
-                "MANICURE", false);
+                "MANICURE", false,
+                null);
     }
 
     // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no

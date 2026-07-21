@@ -11,10 +11,10 @@ import jakarta.persistence.criteria.Order;
 import jakarta.persistence.criteria.Predicate;
 import jakarta.persistence.criteria.Root;
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
+import org.springframework.data.support.PageableExecutionUtils;
 
 import java.time.OffsetDateTime;
 import java.util.Collection;
@@ -127,6 +127,11 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * {@link Specification} — the same id-page-plus-count shape the superseded {@code @Query}
      * methods produced.
      *
+     * <p>The count is deferred through {@link PageableExecutionUtils#getPage} rather than executed
+     * unconditionally, so Spring Data's standard short-circuit applies (see
+     * {@link #countMatching}) — the previous {@code new PageImpl<>(ids, pageable, total)} bypassed
+     * it and paid a full-history {@code COUNT(*)} even on a first page that already ended.
+     *
      * <p><b>Trusts an already-validated {@code Sort}.</b> {@code pageable.getSort()} is translated
      * 1:1 into Criteria {@link Order}s via {@link Root#get(String)} on each
      * {@link Sort.Order#getProperty()}. This is safe ONLY because both callers
@@ -157,6 +162,29 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         typedIdQuery.setMaxResults(pageable.getPageSize());
         List<UUID> ids = typedIdQuery.getResultList();
 
+        return PageableExecutionUtils.getPage(ids, pageable, () -> countMatching(spec));
+    }
+
+    /**
+     * Builds and executes the {@code COUNT(*)} companion to {@link #findIdPage}'s id query, from
+     * the same {@link Specification}.
+     *
+     * <p>Invoked <b>only</b> from inside the {@link PageableExecutionUtils#getPage} supplier, which
+     * is why the {@link CriteriaQuery} is constructed here rather than in the caller: Spring Data's
+     * short-circuit rules skip the count entirely when the returned content already determines the
+     * total — an unpaged request, a first page (offset 0) shorter than the page size, or a short
+     * last page — and a query built eagerly in the caller would still cost the round trip this
+     * indirection exists to avoid. That short-circuit is exactly the common case on
+     * {@code GET /bookings/me?size=20}: a user with fewer than 20 bookings previously paid a
+     * {@code COUNT(*)} over their entire booking history on every app open.
+     *
+     * <p>{@code getTotalElements()} stays exact in the skipped cases — the util derives it from
+     * {@code offset + content.size()}, which is the true total precisely when the content is short
+     * (see {@code PageableExecutionUtils#getPage}). No caller's total changes; only the round trip
+     * disappears.
+     */
+    private long countMatching(Specification<Booking> spec) {
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
         CriteriaQuery<Long> countQuery = cb.createQuery(Long.class);
         Root<Booking> countRoot = countQuery.from(Booking.class);
         countQuery.select(cb.count(countRoot));
@@ -164,9 +192,7 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         if (countPredicate != null) {
             countQuery.where(countPredicate);
         }
-        long total = entityManager.createQuery(countQuery).getSingleResult();
-
-        return new PageImpl<>(ids, pageable, total);
+        return entityManager.createQuery(countQuery).getSingleResult();
     }
 
     /**

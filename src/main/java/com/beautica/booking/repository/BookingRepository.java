@@ -247,6 +247,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Batch-hydrates a bounded set of booking IDs with the full association graph.
      * Always called with the result of an ID-only page query, so the IN list size
      * equals the configured page size (default 20) — never unbounded.
+     *
+     * <p><b>Deliberately does NOT fetch {@code s.owner}</b>, unlike {@link #findByIdWithFullGraph}.
+     * {@code Salon.owner} is {@code LAZY}, so the fetch join was never an EAGER mitigation, and
+     * none of this method's three callers dereferences it: {@code BookingDetailResponse#from}
+     * (via {@code BookingService#listProviderBookings}) reads only the salon's name / street /
+     * buildingNo / locationNote plus its cityId / districtId, {@code BookingResponse#from} (via
+     * {@code MasterService#getMasterCalendar}) touches no salon at all, and
+     * {@code NotificationOutboxDrainWorker#dispatchAll} never calls {@code getSalon()}. Restoring
+     * it costs an extra join to {@code users} and a full {@code User} row — {@code password_hash}
+     * included — hydrated per distinct salon on every provider booking-list and master-calendar
+     * page. {@code findByIdWithFullGraph} keeps its own {@code s.owner} fetch because the mutation
+     * paths that use it feed {@code AuthorizationService}'s
+     * {@code master.getSalon().getOwner().getId()} ownership checks; this batch path never reaches
+     * those.
+     *
+     * <p>The "no caller dereferences it" half of that claim is now enforced, not merely asserted:
+     * {@code BookingPriceRangeContractIT#should_notScaleStatementCount_when_salonMasterPageHasManyBookings}
+     * pins the statement count of a provider page whose rows carry a REAL salon — the only fixture
+     * shape in which a {@code Salon.owner} proxy exists at all — so a regression that starts walking
+     * it shows up as 6 -&gt; 7 there. Note the gate detects a dereference of a non-identifier
+     * property; {@code getOwner().getId()} is served off the uninitialised proxy and costs nothing,
+     * which is why {@code AuthorizationService}'s id-only checks would not have needed this fetch
+     * even if they did run here.
      */
     @Query("""
             SELECT b FROM Booking b
@@ -254,7 +277,6 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.master m
             JOIN FETCH m.user
             LEFT JOIN FETCH m.salon s
-            LEFT JOIN FETCH s.owner
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id IN :ids
@@ -359,7 +381,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 CASE WHEN s.id IS NOT NULL THEN s.buildingNo ELSE mu.buildingNo END,
                 CASE WHEN s.id IS NOT NULL THEN s.locationNote ELSE mu.locationNote END,
                 sd.category,
-                CASE WHEN r.id IS NOT NULL THEN true ELSE false END
+                CASE WHEN r.id IS NOT NULL THEN true ELSE false END,
+                b.priceMaxAtBooking
             )
             FROM Booking b
             JOIN b.client
@@ -409,14 +432,31 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * <p>Intentional design: idempotency keys can be reused once a booking reaches a
      * terminal state (COMPLETED, CANCELLED, etc.) — a repeat request creates a new booking.
      * This avoids permanent client-side key exhaustion for long-lived users.
+     *
+     * <p><b>Fetch graph is scoped to exactly what {@link com.beautica.booking.dto.BookingResponse
+     * BookingResponse#from} reads</b>, and no wider. This query runs on EVERY {@code POST /bookings}
+     * that carries an idempotency key — not only on a replay — so every association fetched here is
+     * paid for on the create hot path. Its sole production caller is
+     * {@code BookingService#createBooking}, which maps the {@code Optional} straight through
+     * {@code BookingResponse::from} and returns the record; the entity never escapes that
+     * expression, so nothing downstream can dereference an association this query did not fetch.
+     * {@code BookingResponse#from} touches {@code getId}, {@code getClient().getId()},
+     * {@code getMaster().getId()}, {@code getMasterService().getId()},
+     * {@code getMasterService().getServiceDefinition().getName()} and scalar columns — hence
+     * client + masterService + serviceDefinition are fetched and nothing else is.
+     *
+     * <p><b>Deliberately does NOT fetch {@code m.user}, {@code m.salon} or {@code s.owner}</b>
+     * (all three {@code LAZY}, so the joins were never an EAGER mitigation — same defect class as
+     * {@link #findAllByIdsWithGraph}). Together they cost two extra joins into {@code users} plus
+     * one into {@code salons}, hydrating a full {@code User} row — {@code password_hash} included —
+     * for both the master and the salon owner, on every keyed create. {@code b.master} itself stays
+     * fetch-joined: {@code getMaster().getId()} alone would be served by an uninitialised proxy, so
+     * dropping it is a separate behavioural question this note does not settle.
      */
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.client
-            JOIN FETCH b.master m
-            JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
-            LEFT JOIN FETCH s.owner
+            JOIN FETCH b.master
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.client.id = :clientId
