@@ -65,6 +65,7 @@ public class MasterService {
     private final WorkingHoursRepository workingHoursRepository;
     private final BookingRepository bookingRepository;
     private final CacheManager cacheManager;
+    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final CityRepository cityRepository;
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
     private final AuthorizationService authorizationService;
@@ -688,48 +689,22 @@ public class MasterService {
     }
 
     private void doEvictMasterCalendarByMaster(UUID masterId) {
-        Cache springCache = cacheManager.getCache("master-calendar");
-        if (springCache == null) {
-            return;
-        }
-        Object nativeCache = springCache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            String masterIdPrefix = "[" + masterId + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(masterIdPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            springCache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(masterId, "master-calendar");
     }
 
     /**
      * Evicts only the {@code available-slots} entries that belong to the given master.
      *
-     * <p>The {@code available-slots} cache key is a {@link org.springframework.cache.interceptor.SimpleKey}
-     * whose first element is the masterId UUID (see {@code SlotCalculationService}).
-     * SimpleKey.toString() renders as {@code "[masterId, date, masterServiceId]"} — we filter
-     * on the {@code "[masterId,"} prefix so we touch only the affected master's entries,
-     * avoiding a blanket clear() (Anti-Bug §F rule 6 / PERF-MEDIUM-3).</p>
-     *
-     * <p>Falls back to {@code cache.clear()} for non-Caffeine caches.</p>
+     * <p>{@code SlotCalculationService} declares {@code @Cacheable(key = "{#masterId, #date,
+     * #masterServiceId}")}, so the runtime key is an {@link java.util.List} whose first element is the
+     * masterId — never a {@code SimpleKey}. Matching is delegated to
+     * {@link com.beautica.common.cache.MasterCachePrefixEvictor#evictByKeyPrefixNow} so that key-shape
+     * contract has a single implementation; this method previously carried its own
+     * {@code instanceof SimpleKey} copy, which never matched and made the eviction a silent no-op.
+     * Scoped to the one master rather than a blanket clear() (Anti-Bug §F rule 6 / PERF-MEDIUM-3).</p>
      */
     private void doEvictAvailableSlotsByMaster(UUID masterId) {
-        Cache springCache = cacheManager.getCache("available-slots");
-        if (springCache == null) {
-            return;
-        }
-        Object nativeCache = springCache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            String masterIdPrefix = "[" + masterId + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(masterIdPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            springCache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(masterId, "available-slots");
     }
 
     // Fix 8: use JOIN FETCH query to eliminate per-master user lazy-loads

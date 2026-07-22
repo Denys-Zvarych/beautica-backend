@@ -9,11 +9,46 @@ import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.cache.caffeine.CaffeineCacheManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
 
 import java.util.concurrent.TimeUnit;
 
+/**
+ * <b>Advisor ordering (Perf MEDIUM — {@code @Cacheable(sync = true)} + {@code @Transactional}).</b>
+ * {@code order = Ordered.HIGHEST_PRECEDENCE} pins the caching advisor OUTSIDE the transaction advisor.
+ * It is load-bearing, not decorative — do not drop it back to a bare {@code @EnableCaching}.
+ *
+ * <p>Roughly 38 methods in this codebase pair {@code @Cacheable(..., sync = true)} with
+ * {@code @Transactional} on the same method ({@code SlotCalculationService}, {@code MasterService},
+ * {@code SearchService}, {@code DashboardService}, {@code ReviewService}, {@code LocationQueryService},
+ * …). Caffeine's {@code sync = true} loader funnels through {@code ConcurrentHashMap.compute}, so on a
+ * popular key exactly one thread loads while every other caller BLOCKS on that bin lock for the full
+ * DB round-trip to Neon.
+ *
+ * <p>The ordering decides what those blocked callers are holding while they wait. With the transaction
+ * advisor outer, each waiter has already entered a transaction before reaching the cache advisor and
+ * sits on a Hikari connection out of a pool of ten ({@code application.yml}: {@code maximum-pool-size:
+ * 10}, a Neon-tier ceiling) — one slow query on one hot key can then exhaust the pool. With the cache
+ * advisor outer, a waiter blocks BEFORE any transaction is opened and holds no connection; a cache HIT
+ * likewise returns without ever starting a transaction. The MISS path is unchanged — the cache advisor
+ * proceeds into the target, which is still wrapped by the transaction advisor as before.
+ *
+ * <p>Neither advisor was previously ordered: {@code @EnableCaching} carried no {@code order}, there is
+ * no {@code @EnableTransactionManagement} in this codebase at all (transactions come from Boot's
+ * auto-config), and no {@code BeanFactoryCacheOperationSourceAdvisor} /
+ * {@code BeanFactoryTransactionAttributeSourceAdvisor} bean sets an order. Both therefore defaulted to
+ * {@code Ordered.LOWEST_PRECEDENCE} and the nesting fell out of bean-registration tie-breaking —
+ * undefined by configuration rather than verified-correct. This pins it.
+ *
+ * <p><b>Residual, NOT fixed here:</b> {@code spring.threads.virtual.enabled: true} is set, and on Java
+ * 21 a virtual thread blocking inside {@code ConcurrentHashMap.compute}'s {@code synchronized} bin lock
+ * PINS its carrier thread. Advisor ordering stops a pinned waiter from also holding a connection, but
+ * not the pinning itself; that is a JDK-level fix (JEP 491, JDK 24) and no configuration here can
+ * substitute for it. It is why {@code sync = true} should stay reserved for genuinely hot public keys
+ * rather than applied by default.
+ */
 @Configuration
-@EnableCaching
+@EnableCaching(order = Ordered.HIGHEST_PRECEDENCE)
 public class CacheConfig {
 
     /**

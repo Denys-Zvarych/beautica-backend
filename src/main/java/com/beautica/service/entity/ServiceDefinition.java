@@ -54,9 +54,24 @@ import java.util.UUID;
  * {@code DUPLICATE_SERVICE} 409.
  */
 @Entity
+// Every @Index below mirrors a real index in db/migration — keep it that way. Two entries here once
+// named indices that existed in NO migration: idx_service_def_owner_active (owner_id, is_active) and
+// idx_service_def_owner_type_active (owner_type, owner_id, is_active). V122 resolved them in opposite
+// directions — it CREATED the (owner_type, owner_id, is_active) one (ServiceRepository
+// #findBookableServicesBySalon filters exactly those three columns) and the owner_id-leading one was
+// deleted from this list as unjustified, since nothing queries owner_id without owner_type. V122 also
+// dropped idx_service_def_owner (owner_type, owner_id) — a strict leading prefix of the index below.
+//
+// This drift was invisible rather than loud: Hibernate 6.5's hbm2ddl.auto=validate does NOT verify
+// @Table(indexes = ...) against the live schema, so an @Index naming a nonexistent index is silently
+// cosmetic and will never fail a boot. Only a reader can catch it — hence this note.
+//
+// Not every real index appears here: idx_service_def_category, the GIN trigram
+// idx_service_definitions_name_trgm (V98) and the PARTIAL unique ux_service_def_owner_service_type_active
+// (V121) are absent because JPA's @Index cannot express GIN or partial indices at all — see the class
+// javadoc above for the unique one. Absent-but-real is harmless; declared-but-absent is the drift.
 @Table(name = "service_definitions",
         indexes = {
-                @Index(name = "idx_service_def_owner_active",      columnList = "owner_id, is_active"),
                 @Index(name = "idx_service_def_owner_type_active", columnList = "owner_type, owner_id, is_active"),
                 @Index(name = "idx_service_def_service_type",      columnList = "service_type_id")
         })

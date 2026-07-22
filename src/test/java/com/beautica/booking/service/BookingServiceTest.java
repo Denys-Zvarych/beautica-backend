@@ -140,7 +140,11 @@ class BookingServiceTest {
                 reviewRepository,
                 discoveryLocationResolver,
                 clock,
-                cacheManager,
+                // A REAL evictor over the mocked CacheManager, never a mock: the key-shape predicate it
+                // owns is the thing that silently no-opped for months, so it must actually execute here.
+                // (BookingService no longer holds a CacheManager of its own — both of its former direct
+                // uses were the prefix scans now delegated to this evictor.)
+                new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 salonCatalogCacheEvictor,
                 dateMath
         );

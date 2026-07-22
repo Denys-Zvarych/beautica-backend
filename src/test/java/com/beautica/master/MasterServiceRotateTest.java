@@ -71,6 +71,10 @@ class MasterServiceRotateTest {
     @Mock private CityRepository cityRepository;
     @Mock private com.beautica.booking.service.BookingSlugService bookingSlugService;
     @Mock private AuthorizationService authorizationService;
+    // Prefix-eviction fix: rotation's afterCommit master-calendar eviction delegates to the shared
+    // evictor, so @InjectMocks must have one or the replayed synchronization NPEs. Mock is correct at
+    // this tier — key-shape correctness is proven in CachePrefixEvictionKeyShapeTest.
+    @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
     @InjectMocks
     private MasterService masterService;
@@ -103,11 +107,11 @@ class MasterServiceRotateTest {
         Cache masterDetailCache = mock(Cache.class);
         Cache masterDetailByUserCache = mock(Cache.class);
         Cache masterByUserCache = mock(Cache.class);
-        Cache masterCalendarCache = mock(Cache.class);
         when(cacheManager.getCache("master-detail")).thenReturn(masterDetailCache);
         when(cacheManager.getCache("master-detail-by-user")).thenReturn(masterDetailByUserCache);
         when(cacheManager.getCache("master-by-user")).thenReturn(masterByUserCache);
-        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCache);
+        // No cacheManager stub for master-calendar: that eviction is a prefix scan and now goes
+        // through the injected MasterCachePrefixEvictor mock, so stubbing it here would be unused.
 
         TransactionSynchronizationManager.initSynchronization();
         MasterSummaryResponse response;

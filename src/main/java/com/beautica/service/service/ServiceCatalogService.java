@@ -78,6 +78,7 @@ public class ServiceCatalogService {
     private final ServiceTypeSearchService serviceTypeSearchService;
     private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
+    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -1103,21 +1104,12 @@ public class ServiceCatalogService {
     }
 
     private void doEvictAvailableSlots(List<UUID> masterIds) {
-        var cache = cacheManager.getCache("available-slots");
-        if (cache == null) return;
-        Object nativeCache = cache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            // SimpleKey.toString() renders as "SimpleKey [elem0, elem1, ...]" via Arrays.deepToString.
-            // The first element is the masterId UUID string — detect it by substring presence.
-            for (UUID masterId : masterIds) {
-                String prefix = "[" + masterId + ",";
-                caffeineCache.asMap().keySet().removeIf(k ->
-                        k instanceof org.springframework.cache.interceptor.SimpleKey
-                                && k.toString().contains(prefix));
-            }
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            cache.clear();
+        // available-slots is @Cacheable(key = "{#masterId, #date, #masterServiceId}") — an explicit SpEL
+        // inline list, so the runtime key is an ArrayList whose first element is the masterId, never a
+        // SimpleKey. The local copy of this predicate that used to live here tested `instanceof SimpleKey`
+        // and so evicted nothing at all; the shared evictor owns the one correct key-shape check.
+        for (UUID masterId : masterIds) {
+            cachePrefixEvictor.evictByKeyPrefixNow(masterId, "available-slots");
         }
     }
 

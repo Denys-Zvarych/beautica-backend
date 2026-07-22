@@ -34,8 +34,6 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -82,7 +80,7 @@ public class BookingService {
     private final ReviewRepository reviewRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final Clock clock;
-    private final CacheManager cacheManager;
+    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final ScheduleDateMath dateMath;
 
@@ -1167,17 +1165,17 @@ public class BookingService {
      * Evicts only the cache entries that belong to the given master from the
      * {@code master-calendar} cache, running after the current transaction commits.
      *
-     * <p>The {@code master-calendar} cache key is a {@link org.springframework.cache.interceptor.SimpleKey}
-     * whose first element is the {@code masterId} UUID (see {@code MasterService.getMasterCalendar}).
-     * Because {@code SimpleKey.params} is {@code private final} with no public getter in
-     * Spring 6.x, the filter uses {@code SimpleKey.toString()} — which renders as
-     * {@code "SimpleKey [masterId, from, to, pageNum, pageSize]"} via
-     * {@link java.util.Arrays#deepToString} — and checks whether the first array element
-     * (the UUID string) is present. This avoids blanket {@code cache.clear()} which
-     * would evict ALL masters on every single booking status change (thundering herd).
+     * <p>{@code MasterService.getMasterCalendar} declares an explicit SpEL
+     * {@code key = "{#masterId, #from, #to, #pageable.pageNumber, #pageable.pageSize}"}. An explicit
+     * {@code key} is never wrapped in a {@code SimpleKey} — that type only comes from the default
+     * {@code SimpleKeyGenerator} — so the runtime key is the {@link java.util.List} the {@code {...}}
+     * inline-list literal evaluates to, and its first element is the {@code masterId}. Matching is
+     * delegated to {@link com.beautica.common.cache.MasterCachePrefixEvictor#evictByKeyPrefixNow}.
      *
-     * <p>Falls back to {@code cache.clear()} when the underlying cache is not a Caffeine
-     * instance (e.g., during tests that use a simple ConcurrentMapCache).
+     * <p>This method previously carried its own copy of the predicate that tested
+     * {@code instanceof SimpleKey} against {@code toString()}; that never matched the real keys, so the
+     * eviction was a silent no-op and a stale calendar page survived a booking status change for the
+     * full TTL. Scoped to one master, never a blanket {@code cache.clear()} (thundering herd).
      */
     private void evictMasterCalendarAfterCommit(UUID masterId) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -1193,33 +1191,22 @@ public class BookingService {
     }
 
     private void doEvictMasterCalendarEntries(UUID masterId) {
-        Cache cache = cacheManager.getCache("master-calendar");
-        if (cache == null) {
-            return;
-        }
-        Object nativeCache = cache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            // SimpleKey.toString() renders as "SimpleKey [elem0, elem1, ...]" via Arrays.deepToString.
-            // The first element is the masterId UUID string — detect it by substring match on the
-            // toString output, since SimpleKey.params is private with no public getter in Spring 6.x.
-            String masterIdPrefix = "[" + masterId.toString() + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(masterIdPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            cache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(masterId, "master-calendar");
     }
 
     /**
      * Evicts {@code revenue-dashboard} entries for the given actor after commit.
      *
-     * <p>Uses per-actor prefix eviction when the underlying cache is Caffeine, avoiding
-     * a blanket {@code cache.clear()} that would evict all actors' dashboard entries on
-     * every booking status transition (Anti-Bug §F rule 6 / PERF-MEDIUM-5).</p>
+     * <p>Uses per-actor prefix eviction, avoiding a blanket {@code cache.clear()} that would evict all
+     * actors' dashboard entries on every booking status transition (Anti-Bug §F rule 6 / PERF-MEDIUM-5).
      *
-     * <p>Falls back to {@code cache.clear()} for non-Caffeine caches (e.g. tests).</p>
+     * <p>{@code DashboardService.getRevenueSummary} is keyed
+     * {@code "{#actorId, #from, #to, #filterMasterId, #serviceDefId, #salonIdFilter?.orElse(null)}"} —
+     * an explicit SpEL inline list, so the runtime key is a {@link java.util.List} whose first element
+     * is the {@code actorId}, not a {@code SimpleKey}. The previous local copy of the predicate tested
+     * {@code instanceof SimpleKey} and therefore never evicted anything; matching now goes through
+     * {@link com.beautica.common.cache.MasterCachePrefixEvictor#evictByKeyPrefixNow}, which matches on
+     * key POSITION (first element) and so applies unchanged to an actor-keyed cache.
      */
     private void evictRevenueDashboardAfterCommit(UUID actorId) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -1235,19 +1222,6 @@ public class BookingService {
     }
 
     private void doEvictRevenueDashboard(UUID actorId) {
-        Cache springCache = cacheManager.getCache("revenue-dashboard");
-        if (springCache == null) {
-            return;
-        }
-        Object nativeCache = springCache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            String actorPrefix = "[" + actorId + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(actorPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            springCache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(actorId, "revenue-dashboard");
     }
 }

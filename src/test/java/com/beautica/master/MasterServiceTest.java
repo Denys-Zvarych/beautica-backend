@@ -79,6 +79,13 @@ class MasterServiceTest {
     // under an active transaction synchronization (see should_evict* guard tests below).
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Prefix-eviction fix: the master-calendar / available-slots afterCommit callbacks now delegate to
+    // the shared evictor, so @InjectMocks must have one to wire or every deactivate/reactivate path
+    // NPEs the moment its synchronization replays. A mock is right HERE — this tier asserts that the
+    // write path REQUESTS eviction. Whether the request actually matches a real cache key is a
+    // different question, and one a mock can never answer: it is proven against the live @Cacheable
+    // proxies in CachePrefixEvictionKeyShapeTest.
+    @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
     @InjectMocks
     private MasterService masterService;
@@ -415,9 +422,9 @@ class MasterServiceTest {
         Cache masterByUserCache = mock(Cache.class);
         when(cacheManager.getCache("master-detail")).thenReturn(masterDetailCache);
         when(cacheManager.getCache("master-by-user")).thenReturn(masterByUserCache);
-        // master-calendar is also evicted by deactivateMaster via evictMasterCalendarAfterCommit.
-        Cache masterCalendarCache = mock(Cache.class);
-        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCache);
+        // master-calendar is also evicted by deactivateMaster, but no longer through cacheManager:
+        // that eviction is a prefix scan and now delegates to the injected MasterCachePrefixEvictor
+        // mock, so stubbing cacheManager.getCache("master-calendar") here would be an unused stub.
 
         // deactivateMaster guards eviction registration with isSynchronizationActive().
         // Manually initialise Spring transaction synchronization so the guard passes in this

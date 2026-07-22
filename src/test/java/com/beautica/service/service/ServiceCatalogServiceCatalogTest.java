@@ -76,6 +76,9 @@ class ServiceCatalogServiceCatalogTest {
                 serviceTypeSearchService,
                 serviceTypeRepository,
                 cacheManager,
+                // A REAL evictor over the mocked CacheManager, never a mock: the key-shape predicate it
+                // owns is the thing that silently no-opped for months, so it must actually execute here.
+                new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 authz,
                 slotCalculationService,
                 salonCatalogCacheEvictor

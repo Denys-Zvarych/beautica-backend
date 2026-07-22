@@ -27,7 +27,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.interceptor.SimpleKey;
+import com.beautica.common.cache.CacheKeyFixtures;
 
 import org.springframework.data.domain.Pageable;
 
@@ -49,7 +49,7 @@ import static org.mockito.Mockito.when;
 @SpringBootTest(
         classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class,
                 CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, SalonCatalogCacheEvictor.class,
-                CacheConfig.class},
+                CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
@@ -304,18 +304,27 @@ class ServiceCatalogServiceCacheTest {
     @Test
     @DisplayName("deactivateServiceDefinition evicts available-slots cache entries for affected masters")
     void should_evictAvailableSlotsCache_when_deactivateServiceDefinitionCalled() {
-        // Arrange — pre-populate an available-slots entry whose key contains the affected
-        // master UUID as the first element. The production eviction scans Caffeine's
-        // asMap() for SimpleKey entries whose toString() contains "[<masterId>,".
+        // Arrange — pre-populate an available-slots entry keyed the way SlotCalculationService's
+        // @Cacheable(key = "{#masterId, #date, #masterServiceId}") really keys it: an explicit SpEL
+        // inline list evaluates to a List, and is NEVER wrapped in a SimpleKey (that type comes only
+        // from the default SimpleKeyGenerator, used when no `key` attribute is given).
+        //
+        // SlotCalculationService is a @MockBean in this slice, so its real @Cacheable proxy cannot be
+        // driven from here. The key therefore comes from CacheKeyFixtures.spelKey rather than being
+        // hand-rolled — and that helper is not an assumption: CachePrefixEvictionKeyShapeTest drives
+        // the real getAvailableSlots proxy and asserts Spring's actual key equals its output. This
+        // test covers the write-path wiring (does deactivation evict the affected masters at all);
+        // the shape is proven against ground truth there.
+        //
+        // The previous version seeded `new SimpleKey(...)`, which matched the equally-wrong
+        // production predicate — so it passed while the real eviction removed nothing.
         UUID masterId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
         UUID someServiceId = UUID.randomUUID();
         LocalDate someDate = LocalDate.of(2026, 6, 1);
 
-        // Simulate a slot-cache entry placed by SlotCalculationService's @Cacheable method.
-        // Key shape: SimpleKey[masterId, date, serviceId] as Spring would produce it.
         var slotsCache = cacheManager.getCache("available-slots");
-        var cacheKey = new SimpleKey(masterId, someDate, someServiceId);
+        var cacheKey = CacheKeyFixtures.spelKey(masterId, someDate, someServiceId);
         slotsCache.put(cacheKey, List.of("09:00", "10:00"));
 
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))

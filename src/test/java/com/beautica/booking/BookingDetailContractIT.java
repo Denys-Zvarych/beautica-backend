@@ -23,6 +23,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.lang.reflect.RecordComponent;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -61,7 +63,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * for is "bare" — no city/district/street/buildingNo/locationNote set.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("BookingDetailResponse — entity-path vs CLIENT-projection-path field parity contract")
+@DisplayName("BookingDetailResponse — entity-path vs CLIENT-projection-path field parity contract, "
+        + "plus cross-master read denial on GET /bookings/{id}")
 class BookingDetailContractIT extends AbstractIntegrationTest {
 
     private static final String BOOKINGS_URL = "/api/v1/bookings";
@@ -127,7 +130,124 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .isEqualTo("Contract Bare Salon");
     }
 
+    /**
+     * Cross-master denial at the HTTP layer for {@code GET /bookings/{id}}.
+     *
+     * <p>The endpoint is guarded by {@code AuthorizationService#enforceCanViewBooking} — NOT by the
+     * {@code canViewBooking} SpEL predicate that {@code AuthorizationServiceTest} historically
+     * covered. The two are independently maintained twins, so this drives the real request path end
+     * to end: a SALON_MASTER at the SAME salon as the booking's master (the hardest case — no
+     * salon-level check can separate them; only fix M1's per-master id equality can) must be denied.
+     *
+     * <p>A status-only assertion would be insufficient here, and deliberately is not what this test
+     * makes. The regression actually worth catching is a partial-DTO leak: the request 403s but a
+     * serializer still emits the booking's third-party PII into the error envelope. So the body is
+     * asserted twice over — no PII-bearing KEY anywhere in the JSON tree, and no seeded PII VALUE
+     * anywhere in the raw response text. The legitimate client's 200 read is performed first so the
+     * absence assertions cannot pass vacuously against a booking that never carried the data.
+     */
+    @Test
+    @DisplayName("GET /bookings/{id} — 403 with a PII-free body when a SALON_MASTER fetches a "
+            + "colleague's booking at the same salon (enforceCanViewBooking cross-master denial; "
+            + "the response would otherwise carry a third party's name and arrival address)")
+    void should_return403_when_masterFetchesAnotherMastersBookingDetail() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        // Give the booking's client a real name so "no PII in the 403 body" is a claim about
+        // data that demonstrably exists, not about a fixture that never had any.
+        jdbcTemplate.update("UPDATE users SET first_name = ?, last_name = ? WHERE id = ?",
+                CLIENT_FIRST_NAME, CLIENT_LAST_NAME, fx.clientId());
+        UUID bookingId = insertConfirmedBooking(fx);
+
+        // Non-vacuity gate: the legitimate owner's read really does surface the client's name.
+        JsonNode legitimate = getBookingDetail(bookingId, tokenFor(fx.clientEmail()));
+        assertThat(legitimate.get("clientFirstName").asText())
+                .as("fixture sanity — the booking must actually carry client PII for the absence "
+                        + "assertions below to mean anything")
+                .isEqualTo(CLIENT_FIRST_NAME);
+
+        String foreignMasterEmail = seedForeignMasterAtSameSalon(fx.salonId());
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(tokenFor(foreignMasterEmail))), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("a SALON_MASTER must not read a colleague's booking — expected 403, body=%s",
+                        resp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+
+        JsonNode body = objectMapper.readTree(resp.getBody());
+        assertThat(body.path("data").isNull() || body.path("data").isMissingNode())
+                .as("the 403 envelope must carry no booking payload at all, data=%s",
+                        body.path("data"))
+                .isTrue();
+
+        assertThat(collectFieldNames(body))
+                .as("no PII-bearing key may appear anywhere in the 403 response tree — a partial "
+                        + "DTO serialised into an error envelope leaks a third party's data even "
+                        + "though the status code is correct; body=%s", resp.getBody())
+                .doesNotContainAnyElementsOf(PII_FIELD_NAMES);
+
+        assertThat(resp.getBody())
+                .as("no seeded PII VALUE may appear anywhere in the raw 403 body — catches a leak "
+                        + "smuggled through a renamed or nested field the key scan would miss")
+                .doesNotContain(CLIENT_FIRST_NAME)
+                .doesNotContain(CLIENT_LAST_NAME)
+                .doesNotContain("Contract Bare Salon")
+                .doesNotContain("MasterOwnStreet")
+                .doesNotContain("Майстер стрижки");
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
+
+    private static final String CLIENT_FIRST_NAME = "Оксана";
+    private static final String CLIENT_LAST_NAME = "Кравченко";
+
+    /**
+     * Keys that must never appear in a denied booking read. {@code guestName}/{@code guestSurname}
+     * are not {@link BookingDetailResponse} components today — they fold into
+     * {@code clientFirstName}/{@code clientLastName} for guest (LINK) bookings — and are listed
+     * anyway so a future DTO that starts surfacing them cannot slip through this gate unnoticed.
+     */
+    private static final Set<String> PII_FIELD_NAMES = Set.of(
+            "clientFirstName", "clientLastName", "clientId",
+            "guestName", "guestSurname", "guestPhone",
+            "street", "buildingNo", "locationNote", "salonName",
+            "cityLabel", "districtLabel",
+            "clientComment", "clientCancellationNote", "providerComment");
+
+    /** Every field name in the JSON tree, at any depth. */
+    private static Set<String> collectFieldNames(JsonNode node) {
+        Set<String> names = new HashSet<>();
+        collectFieldNames(node, names);
+        return names;
+    }
+
+    private static void collectFieldNames(JsonNode node, Set<String> sink) {
+        if (node.isObject()) {
+            node.fields().forEachRemaining(e -> {
+                sink.add(e.getKey());
+                collectFieldNames(e.getValue(), sink);
+            });
+        } else if (node.isArray()) {
+            node.forEach(child -> collectFieldNames(child, sink));
+        }
+    }
+
+    /**
+     * A second, genuinely distinct SALON_MASTER employed by the SAME salon as the booking's
+     * master. Same-salon is the sharp case: any salon-scoped authorization check admits them, so
+     * only the per-master id equality in {@code enforceCanViewBooking} can deny them.
+     */
+    private String seedForeignMasterAtSameSalon(UUID salonId) {
+        String email = "contract-foreign-master-" + System.nanoTime() + "@beautica.test";
+        UUID userId = createUser(email, "SALON_MASTER", salonId);
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                UUID.randomUUID(), userId, salonId);
+        return email;
+    }
 
     private record Fixture(UUID salonId, UUID masterId, UUID masterUserId, UUID masterServiceId,
                             String clientEmail, UUID clientId) {

@@ -99,6 +99,13 @@ class ServiceCatalogServiceTest {
     @Mock
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
+    // Prefix-eviction fix: doEvictAvailableSlots now delegates to the shared evictor, so @InjectMocks
+    // must have one to wire or deactivateServiceDefinition NPEs. A mock is right at this tier — it
+    // asserts the write path REQUESTS eviction; that the request matches a real cache key is proven
+    // against the live @Cacheable proxy in CachePrefixEvictionKeyShapeTest.
+    @Mock
+    private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 
