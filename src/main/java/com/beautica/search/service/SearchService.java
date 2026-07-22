@@ -346,13 +346,29 @@ public class SearchService {
         }
         List<ResolvedServiceType> serviceTypes = resolved.get();
 
-        // Phase 20.2: when a per-service filter is active the static repository
-        // projection queries cannot express N dynamic, ANDed correlated EXISTS
-        // predicates (one per slug — locked decision 3 forbids a single IN/ANY),
-        // so the filtered path is assembled dynamically here via the EntityManager
-        // — mirroring the master path and the DashboardService array-binding
-        // precedent. The unfiltered path keeps the tuned repository overloads
-        // (with their no-price COUNT gate) untouched.
+        // Phase 20.2: when a per-service filter is active the static repository projection
+        // queries cannot express the dynamic, slug-count-dependent correlated EXISTS this path
+        // needs, so the filtered path is assembled dynamically here via the EntityManager —
+        // mirroring the master path and the DashboardService array-binding precedent. The
+        // unfiltered path keeps the tuned repository overloads (with their no-price COUNT gate)
+        // untouched.
+        //
+        // WHAT THE SQL ACTUALLY EMITS — read this before "optimising" it:
+        // exactly ONE correlated EXISTS whose inner WHERE is an OR-disjunction across the
+        // selected slugs (see appendSalonServiceTypeExists / appendServiceTypeMatchDisjunction),
+        // i.e. the equivalent of `service_type_id = ANY(:ids)`. It is NOT N ANDed EXISTS
+        // predicates, one per slug. An earlier revision of this comment claimed exactly that,
+        // and the claim caused a performance finding to be filed against correct code — the
+        // "collapse N ANDed EXISTS into a GROUP BY ... HAVING COUNT(DISTINCT ...) = N" rewrite
+        // that finding proposed would silently flip the semantics from OR to AND.
+        //
+        // The OR/union semantics are LOCKED PRODUCT BEHAVIOUR, not an implementation detail: a
+        // provider matches if it offers ANY selected service type. Pinned by
+        // SearchIntegrationTest#should_returnMastersOfferingAnySlug_when_unionOfTwoSlugs
+        // (a master offering only one of two selected slugs must still be returned), with the
+        // salon-side mirror in the same suite. Do not convert this to AND semantics, and do not
+        // introduce a flattened provider→service-type projection table to serve AND semantics,
+        // without a product decision reversing that rule first.
         if (!serviceTypes.isEmpty()) {
             return searchSalonsWithServiceFilter(
                     cityId, districtId, category, likePattern, minPrice, maxPrice,

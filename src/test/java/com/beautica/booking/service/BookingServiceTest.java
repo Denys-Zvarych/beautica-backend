@@ -270,8 +270,10 @@ class BookingServiceTest {
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        BookingResponse result = bookingService.createBooking(clientId, null, validRequest());
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
         ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
         verify(bookingRepository).saveAndFlush(captor.capture());
@@ -298,9 +300,11 @@ class BookingServiceTest {
 
         Booking saved = buildBooking(bookingId, client, ownerMaster, ownerMsa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         // Act
-        BookingResponse result = bookingService.createBooking(clientId, null, validRequest());
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
         // Assert — booking created; master_id is the owner-master's ID
         ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
@@ -318,8 +322,10 @@ class BookingServiceTest {
         Booking existing = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findActiveByClientIdAndIdempotencyKey(clientId, key))
                 .thenReturn(Optional.of(existing));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(existing));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        BookingResponse result = bookingService.createBooking(clientId, key, validRequest());
+        BookingDetailResponse result = bookingService.createBooking(clientId, key, validRequest());
 
         verify(bookingRepository, never()).saveAndFlush(any());
         assertThat(result.id()).isEqualTo(bookingId);
@@ -387,6 +393,8 @@ class BookingServiceTest {
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -508,6 +516,8 @@ class BookingServiceTest {
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         CreateBookingRequest request = new CreateBookingRequest(
                 masterId,
@@ -517,7 +527,7 @@ class BookingServiceTest {
                 null
         );
 
-        BookingResponse result = bookingService.createBooking(clientId, null, request);
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, request);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).saveAndFlush(any());
@@ -556,6 +566,8 @@ class BookingServiceTest {
         setField(saved, "priceAtBooking", new BigDecimal("250.00"));
         setField(saved, "durationMinutesAtBooking", 45);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -574,6 +586,8 @@ class BookingServiceTest {
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -592,6 +606,8 @@ class BookingServiceTest {
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 

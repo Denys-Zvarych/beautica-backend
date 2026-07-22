@@ -1,5 +1,8 @@
 package com.beautica.salon.service;
 
+import org.springframework.data.domain.Sort;
+import java.util.Set;
+import com.beautica.common.web.SortWhitelist;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteRequest;
@@ -240,9 +243,27 @@ public class SalonService {
         return inviteService.sendInvite(inviteRequest, actorId);
     }
 
+    /**
+     * Properties a caller may sort a salon's public master list by. Shares a repository method
+     * (and therefore a {@code Master} root with a {@code JOIN FETCH}ed {@code user}) with
+     * {@code MasterService#getMastersByPage}, so the two whitelists are deliberately identical —
+     * an unguarded dotted sort like {@code user.passwordHash} would otherwise resolve here and
+     * order rows by a credential hash (see {@link SortWhitelist}).
+     */
+    private static final Set<String> SORTABLE_MASTER_PROPERTIES =
+            Set.of("avgRating", "reviewCount", "createdAt");
+
+    /** Applied when the caller supplies no {@code sort}; the query itself has no {@code ORDER BY}. */
+    private static final Sort DEFAULT_MASTER_SORT = Sort.by(Sort.Direction.DESC, "avgRating");
+
+    /** Mandatory unique trailing column, so OFFSET paging cannot duplicate or skip tied rows. */
+    private static final Sort MASTER_ID_TIEBREAKER = Sort.by(Sort.Direction.ASC, "id");
+
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersBySalon(UUID salonId, Pageable pageable) {
-        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable)
+        Pageable safePageable = SortWhitelist.apply(
+                pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
+        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, safePageable)
                 .map(MasterSummaryResponse::from);
     }
 

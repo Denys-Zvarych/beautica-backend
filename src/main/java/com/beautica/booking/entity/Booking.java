@@ -47,9 +47,15 @@ import java.util.UUID;
                 // tiebreaker exists. Guarded by
                 // V118DropPriceSortIndicesMigrationTest#should_notContainIdColumn_when_completedStartsAtIndexInspected.
                 @Index(name = "idx_bookings_master_completed_starts_at", columnList = "master_id, starts_at"),
-                // partial index (V43): dashboard revenue — SALON_OWNER path
-                // same JPA partial-index limitation as above; V43 is authoritative for the WHERE clause.
-                @Index(name = "idx_bookings_salon_completed_starts_at", columnList = "salon_id, starts_at"),
+                // NOTE: idx_bookings_salon_completed_starts_at (V43, salon_id + starts_at WHERE
+                // status='COMPLETED') was DROPPED in V123 and its mirror removed here so this
+                // annotation block does not drift from the schema (§E-6). It was provably subsumed
+                // by idx_bookings_salon_status_starts_at (V22/V113 — salon_id, status, starts_at
+                // DESC WHERE status IN ('CONFIRMED','COMPLETED')): the dashboard revenue query
+                // pins status='COMPLETED', so all four of its predicates remain an Index Cond on
+                // the surviving index with identical row/heap-block counts. Do not re-add.
+                // The master-scope sibling above is NOT redundant — there is no
+                // (master_id, status, starts_at) partial index for it to fall back to.
                 // partial UNIQUE index (V90): cancel-token lookup for the public guest-cancel page.
                 // JPA cannot encode WHERE cancel_token IS NOT NULL nor the partial-uniqueness —
                 // the predicate + UNIQUE live in V90 only (V90 dropped the V89 full unique

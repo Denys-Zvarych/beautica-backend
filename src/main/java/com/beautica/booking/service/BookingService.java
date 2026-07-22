@@ -84,15 +84,53 @@ public class BookingService {
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final ScheduleDateMath dateMath;
 
+    /**
+     * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
+     *
+     * <p><b>Why the enriched shape.</b> This endpoint previously returned the lean
+     * {@link BookingResponse}, which carries only ids — no master name, avatar, salon name or
+     * address. Every client therefore had to follow a successful create with a mandatory
+     * {@code GET /bookings/{id}} purely to render the confirmation screen. Returning
+     * {@link BookingDetailResponse} here removes that second round trip.
+     *
+     * <p><b>The change is strictly additive on the wire.</b> {@link BookingDetailResponse}'s first
+     * twelve components are identical to {@link BookingResponse}'s in name, type, order and
+     * semantics, so the emitted JSON is a superset: every field an existing client reads is still
+     * present and unchanged, and a client that ignores the new fields behaves exactly as before.
+     * Nothing was removed or renamed. The mobile app's redundant follow-up GET keeps working and
+     * can be dropped separately, on its own schedule.
+     *
+     * <p><b>Cost.</b> Enrichment needs the full graph plus locality-label resolution, which the
+     * lean path did not pay for. That is a net saving overall: the follow-up GET it replaces did
+     * exactly this work <em>plus</em> a second HTTP request, authentication and transaction.
+     */
     @Transactional
-    public BookingResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
+    public BookingDetailResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
+        UUID bookingId;
         if (idempotencyKey != null && !idempotencyKey.isBlank()) {
             // Fix M5: use the partial-index-aligned query to avoid full table scan
-            return bookingRepository.findActiveByClientIdAndIdempotencyKey(clientId, idempotencyKey)
-                    .map(BookingResponse::from)
-                    .orElseGet(() -> doCreateBooking(clientId, idempotencyKey, request));
+            bookingId = bookingRepository.findActiveByClientIdAndIdempotencyKey(clientId, idempotencyKey)
+                    .map(Booking::getId)
+                    .orElseGet(() -> doCreateBooking(clientId, idempotencyKey, request).id());
+        } else {
+            bookingId = doCreateBooking(clientId, idempotencyKey, request).id();
         }
-        return doCreateBooking(clientId, idempotencyKey, request);
+        return enrichCreated(bookingId);
+    }
+
+    /**
+     * Re-reads the just-created (or replayed) booking through the full graph and enriches it.
+     *
+     * <p>{@code canReview} is hardcoded {@code false} rather than probed, and that is sound by
+     * construction: a booking is born {@code CONFIRMED} and the idempotent-replay query filters to
+     * {@code CONFIRMED} only, while {@link #canReview} requires {@code COMPLETED}. Computing it
+     * would add a guaranteed-false {@code reviewRepository.existsByBookingId} probe to every
+     * create. If a booking ever becomes creatable in a terminal state, this shortcut must go.
+     */
+    private BookingDetailResponse enrichCreated(UUID bookingId) {
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .orElseThrow(() -> new NotFoundException("Booking not found"));
+        return enrichSingle(booking, false);
     }
 
     @Transactional(readOnly = true)

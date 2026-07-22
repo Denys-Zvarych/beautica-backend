@@ -58,9 +58,20 @@ public class BookingController {
 
     private final BookingService bookingService;
 
+    /**
+     * Creates a booking and returns the enriched detail view.
+     *
+     * <p><b>Additive contract change.</b> This returned the lean {@link BookingResponse} until the
+     * enrichment change; it now returns {@link BookingDetailResponse}, whose first twelve
+     * components are identical to {@code BookingResponse}'s in name, type, order and semantics.
+     * The response body is therefore a strict superset — no field was removed, renamed or
+     * re-typed — so a client that ignores the added fields is unaffected, while a client that
+     * reads them no longer needs the follow-up {@code GET /bookings/{id}} that previously existed
+     * only to fetch master name, avatar, salon name and address for the confirmation screen.
+     */
     @PostMapping
     @PreAuthorize("hasRole('CLIENT')")
-    public ResponseEntity<ApiResponse<BookingResponse>> createBooking(
+    public ResponseEntity<ApiResponse<BookingDetailResponse>> createBooking(
             @Valid @RequestBody CreateBookingRequest request,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKeyHeader,
             Authentication auth
@@ -70,7 +81,8 @@ public class BookingController {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "Idempotency-Key must be 1-64 alphanumeric, dash, or underscore characters");
         }
-        BookingResponse response = bookingService.createBooking(AuthenticationUtils.userId(auth), resolvedKey, request);
+        BookingDetailResponse response =
+                bookingService.createBooking(AuthenticationUtils.userId(auth), resolvedKey, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 

@@ -1,5 +1,10 @@
 package com.beautica.salon;
 
+import static org.mockito.Mockito.verifyNoInteractions;
+import com.beautica.common.exception.BusinessException;
+import org.springframework.http.HttpStatus;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.domain.PageRequest;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteRequest;
@@ -615,14 +620,37 @@ class SalonServiceTest {
                 .build();
         ReflectionTestUtils.setField(master, "id", masterId);
 
-        Page<Master> pageOfMasters = new PageImpl<>(List.of(master), pageable, 1);
-        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable)).thenReturn(pageOfMasters);
+        // The service no longer forwards the caller's Pageable verbatim: SortWhitelist.apply
+        // validates it against SORTABLE_MASTER_PROPERTIES and, because the incoming Pageable is
+        // unsorted and the underlying query has no ORDER BY of its own, substitutes the default
+        // sort plus the mandatory unique `id` tiebreaker. Stubbing/verifying with this exact
+        // normalized instance (rather than any(Pageable.class)) is deliberate — it pins that
+        // contract, so silently dropping the whitelist or the tiebreaker reddens this test.
+        Pageable expectedNormalized = PageRequest.of(0, 10,
+                Sort.by(Sort.Direction.DESC, "avgRating").and(Sort.by(Sort.Direction.ASC, "id")));
+
+        Page<Master> pageOfMasters = new PageImpl<>(List.of(master), expectedNormalized, 1);
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized))
+                .thenReturn(pageOfMasters);
 
         var result = salonService.getMastersBySalon(salonId, pageable);
 
         assertThat(result.getTotalElements()).isEqualTo(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
-        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, pageable);
+        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized);
+    }
+
+    @Test
+    @DisplayName("getMastersBySalon rejects a dotted sort path with a 400 before touching the repository")
+    void should_throwBadRequest_when_getMastersBySalonSortIsDottedPath() {
+        UUID salonId = UUID.randomUUID();
+        Pageable oracleAttempt = PageRequest.of(0, 10, Sort.by(Sort.Direction.ASC, "user.passwordHash"));
+
+        assertThatThrownBy(() -> salonService.getMastersBySalon(salonId, oracleAttempt))
+                .isInstanceOf(BusinessException.class)
+                .hasFieldOrPropertyWithValue("status", HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(masterRepository);
     }
 
     private User buildUser(UUID id, String email, Role role) {

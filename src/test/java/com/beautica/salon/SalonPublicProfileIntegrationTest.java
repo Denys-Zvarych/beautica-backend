@@ -665,8 +665,18 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Resolves a real Flyway-seeded {@code service_types.id} for the FK that V111 made
-     * mandatory on {@code service_definitions} (NOT NULL, ON DELETE RESTRICT).
+     * Per-test-instance set of every {@code service_type_id} already handed out by
+     * {@link #resolveServiceTypeId(String)}, so a later call — even for a different
+     * {@code category} — never repeats one. A plain instance field, not
+     * {@code static}: JUnit 5 builds a fresh test instance per {@code @Test} method,
+     * so this resets naturally and never leaks allocations across tests.
+     */
+    private final java.util.Set<UUID> usedServiceTypeIds = new java.util.HashSet<>();
+
+    /**
+     * Allocates the NEXT unused, real Flyway-seeded {@code service_types.id} for the
+     * FK that V111 made mandatory on {@code service_definitions} (NOT NULL, ON DELETE
+     * RESTRICT).
      *
      * <p>Prefers a type whose platform category equals {@code category}, keeping the row
      * category-coherent for fixtures whose {@code category} the catalog-grouping assertions
@@ -674,19 +684,42 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
      * {@code AAA_LEGACY_CATEGORY}) that have no matching platform category. The
      * {@code service_type_id} itself is never asserted on here — grouping keys off the
      * {@code category} column — so the fallback preserves each test's original intent.
+     *
+     * <p><b>Why "next unused" and not "the first match":</b> V121 added
+     * {@code ux_service_def_owner_service_type_active} — a partial UNIQUE index on
+     * {@code service_definitions(owner_type, owner_id, service_type_id) WHERE
+     * is_active = true} enforcing "reject duplicate active service per owner and
+     * type" (commit 274f15e). This method used to always return the SAME (category,
+     * fallback) type, so a test seeding several active services in one category — or
+     * several fallback-category services — for the SAME salon collided on that
+     * shared type and threw {@code DuplicateKeyException}. Skipping already-used ids
+     * keeps every such fixture's owner-scoped type set collision-free while staying
+     * category-coherent. Ordering ({@code ORDER BY st.name_uk} / {@code slug}) is
+     * deterministic — no random pick — so allocation, and therefore test runs, stay
+     * reproducible.
      */
     private UUID resolveServiceTypeId(String category) {
-        List<UUID> matched = jdbcTemplate.queryForList(
+        List<UUID> candidates = jdbcTemplate.queryForList(
                 "SELECT st.id FROM service_types st " +
                 "JOIN platform_categories pc ON pc.name = st.platform_category_name " +
                 "WHERE st.platform_category_name = ? AND st.is_active = TRUE " +
                 "AND pc.active = TRUE AND pc.status = 'APPROVED' " +
-                "ORDER BY st.name_uk LIMIT 1",
+                "ORDER BY st.name_uk",
                 UUID.class, category);
-        if (!matched.isEmpty()) {
-            return matched.get(0);
+        if (candidates.isEmpty()) {
+            candidates = jdbcTemplate.queryForList(
+                    "SELECT id FROM service_types WHERE is_active = TRUE ORDER BY slug", UUID.class);
         }
-        return anyServiceTypeId();
+        for (UUID candidate : candidates) {
+            if (usedServiceTypeIds.add(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException(
+                "resolveServiceTypeId(" + category + ") pool exhausted (" + candidates.size()
+                        + " candidates) — this test seeds more distinct services under this category "
+                        + "than the seeded service_types supply can cover without repeating a type "
+                        + "(V121 forbids two active service_definitions of the same type for one owner)");
     }
 
     /** Any active seeded {@code service_types.id} — used where the type is FK-only. */

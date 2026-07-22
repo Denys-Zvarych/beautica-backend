@@ -1,5 +1,7 @@
 package com.beautica.master.service;
 
+import org.springframework.data.domain.Sort;
+import com.beautica.common.web.SortWhitelist;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
@@ -707,10 +709,36 @@ public class MasterService {
         cachePrefixEvictor.evictByKeyPrefixNow(masterId, "available-slots");
     }
 
+    /**
+     * Properties a caller may sort a salon's master list by.
+     *
+     * <p>All are scalar columns on the {@code Master} root. Deliberately excludes any path through
+     * {@code m.user} — that association is {@code JOIN FETCH}ed by the query, so a dotted sort such
+     * as {@code user.passwordHash} would resolve as valid JPQL and turn this endpoint into an
+     * ordering oracle over credentials (see {@link SortWhitelist}).
+     */
+    private static final Set<String> SORTABLE_MASTER_PROPERTIES =
+            Set.of("avgRating", "reviewCount", "createdAt");
+
+    /** Applied when the caller supplies no {@code sort}; the query itself has no {@code ORDER BY}. */
+    private static final Sort DEFAULT_MASTER_SORT = Sort.by(Sort.Direction.DESC, "avgRating");
+
+    /** Mandatory unique trailing column, so OFFSET paging cannot duplicate or skip tied rows. */
+    private static final Sort MASTER_ID_TIEBREAKER = Sort.by(Sort.Direction.ASC, "id");
+
+    /**
+     * The only property {@code GET /masters/me/calendar} may be sorted by. Its ID-page query is
+     * rooted on {@code Booking}, so this mirrors {@code BookingService.SORTABLE_BOOKING_PROPERTIES}
+     * exactly — the calendar must not expose a wider sort surface than {@code GET /bookings/me}.
+     */
+    private static final Set<String> SORTABLE_CALENDAR_PROPERTIES = Set.of("startsAt");
+
     // Fix 8: use JOIN FETCH query to eliminate per-master user lazy-loads
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersByPage(UUID salonId, Pageable pageable) {
-        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable)
+        Pageable safePageable = SortWhitelist.apply(
+                pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
+        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, safePageable)
                 .map(MasterSummaryResponse::from);
     }
 
@@ -759,10 +787,18 @@ public class MasterService {
         OffsetDateTime fromOdt = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime toOdt = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
+        // The ID-page query's root is Booking, whose `client`/`master` associations reach User —
+        // so an unguarded sort here resolves `client.passwordHash` / `client.email` as valid JPQL.
+        // Whitelisted to the single property the calendar actually orders by, matching
+        // BookingService.SORTABLE_BOOKING_PROPERTIES. No tiebreaker: the query hardcodes
+        // `ORDER BY b.startsAt ASC` and Spring appends the caller's sort after it.
+        Pageable safePageable = SortWhitelist.apply(
+                pageable, SORTABLE_CALENDAR_PROPERTIES, Sort.unsorted(), null);
+
         // Two-query pattern (Fix H1 — HHH90003004): paginate on IDs only so the DB
         // applies LIMIT/OFFSET correctly, then hydrate the full graph for those IDs.
         Page<UUID> idPage = bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
-                masterId, fromOdt, toOdt, pageable);
+                masterId, fromOdt, toOdt, safePageable);
 
         if (idPage.isEmpty()) {
             return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
