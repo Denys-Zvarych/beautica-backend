@@ -206,7 +206,21 @@ public class ServiceCatalogService {
         applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
         definition.setServiceType(serviceType);
 
-        ServiceDefinition savedDef = persistDefinition(definition);
+        // PERF: plain save, then ONE flush after the assignment save below — deliberately NOT
+        // persistDefinition's saveAndFlush. This path emits two INSERTs (definition, then the
+        // assignment that FKs to it), and be precise about what deferring actually saves:
+        // Hibernate batches PER TABLE, so `service_definitions` and `master_services` are two
+        // separate PreparedStatement batches — two executeBatch round-trips EITHER WAY. What the
+        // single flush eliminates is one FLUSH CYCLE (a dirty-check + auto-flush pass over the
+        // whole persistence context), not a round trip. Neutral-to-marginally-positive, and it
+        // costs nothing: nothing between the two statements reads the DB, the id is available
+        // without a flush (GenerationType.UUID is assigned in-memory at persist time) so the
+        // assignment can reference savedDef immediately, and order_inserts=true emits the
+        // definition before the assignment. Same reasoning as bulkCreateForMaster's save +
+        // flushBulkBatch — where the win IS round trips, because that path queues N rows of the
+        // SAME table into one batch. addServiceToSalon keeps persistDefinition because it has no
+        // second statement to defer for.
+        ServiceDefinition savedDef = serviceRepository.save(definition);
 
         MasterServiceAssignment assignment = MasterServiceAssignment.builder()
                 .master(master)
@@ -215,6 +229,13 @@ public class ServiceCatalogService {
                 .build();
 
         MasterServiceAssignment savedAssignment = masterServiceRepository.save(assignment);
+
+        // The DUPLICATE_SERVICE classification is preserved because it is the FLUSH that must sit
+        // inside the try/catch, never the save: save on a new entity only assigns the id in
+        // memory, so the unique-index violation can only surface when the INSERT actually reaches
+        // the DB. Flushing here rather than at commit is what keeps that violation catchable —
+        // at commit it would land outside any catch and degrade to the generic 409.
+        flushTranslatingDuplicateViolation(definition.getName());
 
         // PERF-M2: keep the pre-computed min_effective_price in sync for the
         // independent master's own search entry.
@@ -1197,14 +1218,18 @@ public class ServiceCatalogService {
      * ({@link ServiceRepository#deactivateById}) — a previously deleted service must stay
      * re-creatable, and the query mirrors that with its own {@code isActive = true} predicate.
      *
-     * <p><b>Accepted cost: one unconditional SELECT on the success path.</b> Single creates pay
-     * this query every time purely so the rare conflict can carry {@code existingServiceDefId}
-     * for the client's deep-link. The obvious lazy alternative — skip the pre-check, let the
-     * index fire, look the id up in the catch — does NOT work: a constraint violation aborts
-     * the Postgres transaction, so no further statement can run in that catch without a
-     * {@code REQUIRES_NEW} sub-transaction (an extra connection from the pool, plus its own
-     * commit, on a path that is meant to be the cheap one). A single indexed equality lookup on
-     * an infrequent write path is the cheaper trade, so it stays. The bulk path is different —
+     * <p><b>Accepted cost: one unconditional SELECT on the success path.</b> Re-examined and
+     * KEPT by the Phase 26.8/26.9 audit (backend-perf, "Accept"): the pre-check stays because the
+     * catch-side alternative trades one indexed equality lookup on an infrequent write for a
+     * second pooled connection on the failing one. Single creates and any PATCH carrying
+     * {@code serviceTypeId} pay this query every time purely so the rare conflict can carry
+     * {@code existingServiceDefId} for the client's deep-link. The obvious lazy alternative —
+     * skip the pre-check, let the index fire, look the id up in the catch — does NOT work: a
+     * constraint violation aborts the Postgres transaction, so no further statement can run in
+     * that catch without a {@code REQUIRES_NEW} sub-transaction (an extra connection from the
+     * pool, plus its own commit, on a path that is meant to be the cheap one). A single indexed
+     * equality lookup on an infrequent write path is the cheaper trade, so it stays; do not
+     * re-open without a measurement showing this SELECT on a hot path. The bulk path is different —
      * there the per-item cost multiplied by 100 and by forced flushes, hence
      * {@link #assertNoActiveDuplicatesInBatch}.
      *
@@ -1285,7 +1310,7 @@ public class ServiceCatalogService {
     /**
      * Flushes a bulk batch's pending inserts in a single round-trip, translating a V121 violation
      * into {@link DuplicateServiceException} exactly as {@link #persistDefinition} does for the
-     * single-item paths.
+     * paths that flush through {@code saveAndFlush}.
      *
      * <p>This is the batch counterpart of {@code saveAndFlush}: the inserts must reach the DB
      * inside this try block, otherwise a violation would surface at commit-time flush — outside
@@ -1301,13 +1326,36 @@ public class ServiceCatalogService {
      * code, which is what it branches on.
      */
     private void flushBulkBatch() {
+        flushTranslatingDuplicateViolation(null);
+    }
+
+    /**
+     * The one place a deferred flush is turned into a branchable {@code DUPLICATE_SERVICE} 409 —
+     * shared by {@link #flushBulkBatch} and by {@code addIndependentMasterService}, which defers
+     * its flush until after the assignment insert so both statements leave in one flush cycle.
+     *
+     * <p>{@code EntityManager#flush} is persistence-context-wide, not repository-scoped, so
+     * flushing through {@code serviceRepository} also emits the pending
+     * {@link MasterServiceAssignment} insert — which is precisely the point on the create path.
+     *
+     * <p>Any violation that is not this migration's unique index is rethrown untouched so
+     * {@code GlobalExceptionHandler#handleDataIntegrityViolation} keeps its deliberately opaque,
+     * anti-enumeration response.
+     *
+     * @param serviceName echoed to the client so it can name the conflicting entry without a
+     *                    second round-trip; {@code null} on the bulk path, where the flush reports
+     *                    the constraint rather than which of the N queued rows lost and the
+     *                    aborted Postgres transaction rules out looking it up
+     */
+    private void flushTranslatingDuplicateViolation(@Nullable String serviceName) {
         try {
             serviceRepository.flush();
         } catch (DataIntegrityViolationException ex) {
             if (!isDuplicateServiceViolation(ex)) {
                 throw ex;
             }
-            throw new DuplicateServiceException(null, null);
+            // The index reports the constraint, not the surviving row — hence a null id.
+            throw new DuplicateServiceException(serviceName, null);
         }
     }
 
@@ -1315,6 +1363,13 @@ public class ServiceCatalogService {
      * Persists a {@link ServiceDefinition} — new (INSERT) or patched (UPDATE) — translating a
      * violation of the duplicate-service index into the same {@link DuplicateServiceException}
      * the pre-check raises.
+     *
+     * <p><b>Scope: the paths with nothing to batch the definition write with</b> —
+     * {@code addServiceToSalon} (a SALON definition has no assignment yet) and
+     * {@code updateServiceDefinition} (a single UPDATE). {@code addIndependentMasterService}
+     * deliberately does NOT use this method: it has a second insert to emit, so it saves plainly
+     * and calls {@link #flushTranslatingDuplicateViolation} once afterwards, keeping both
+     * statements in one flush cycle without weakening the classification below.
      *
      * <p>{@code saveAndFlush} (not {@code save}) is what makes this work: the statement must
      * reach the DB inside this try block, otherwise the violation would surface at commit-time

@@ -363,7 +363,7 @@ class ServiceCatalogServicePricingTest {
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
         stubActiveManicureType(serviceTypeId);
-        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any())).thenReturn(savedAssignment);
 
         var result = serviceCatalogService.addIndependentMasterService(userId, request);
@@ -374,7 +374,7 @@ class ServiceCatalogServicePricingTest {
         assertThat(result.priceDisplay()).isEqualTo("від 600 до 1200 ₴");
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).saveAndFlush(captor.capture());
+        verify(serviceRepository).save(captor.capture());
         assertThat(captor.getValue().getPriceType()).isEqualTo(PriceType.RANGE);
         assertThat(captor.getValue().getBasePrice()).isEqualByComparingTo("600.00");
         assertThat(captor.getValue().getPriceMax()).isEqualByComparingTo("1200.00");

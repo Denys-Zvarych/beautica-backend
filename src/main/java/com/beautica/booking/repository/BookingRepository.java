@@ -345,8 +345,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * <p><b>Ordering is derived upstream, on the ID page — this query carries no {@code ORDER
      * BY}.</b> As of Phase 26.7.1 the {@link Sort} that used to reach this method (pre-validated
      * and pre-normalized by {@code BookingService#normalizeBookingSort}: whitelisted to
-     * {@code startsAt}/{@code priceAtBooking}/{@code createdAt}, defaulted to {@code startsAt
-     * DESC} when unsorted, always carrying a trailing {@code id ASC} tiebreaker) is instead
+     * {@code startsAt} alone since Phase 26.8 retired {@code priceAtBooking} — no repeat of that
+     * property is accepted either — defaulted to {@code startsAt DESC} when unsorted, always
+     * carrying a trailing {@code id ASC} tiebreaker) is instead
      * translated into Criteria {@code Order}s by
      * {@code BookingRepositoryCustomImpl.findIdPage} — the same choke point the provider
      * ID-page queries already use. This unifies both roles' sort discipline onto one code path;

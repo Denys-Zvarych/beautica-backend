@@ -2235,16 +2235,24 @@ class BookingServiceTest {
         verify(masterRepository, never()).findByUserId(any());
     }
 
-    // ── getMyBookings — sort cardinality bound (Phase 26.3 audit, backend-perf F4) ──────────────
+    // ── getMyBookings — sort cardinality bounds (Phase 26.3 audit F4; Phase 26.8 audit) ─────────
     //
-    // MAX_SORT_ORDERS caps normalizeBookingSort's effective Sort at 3 entries — each distinct
-    // (property, direction) sequence compiles to a textually distinct ORDER BY, so an unbounded
-    // sort list inflates plan-cache entries. The two tests below isolate that count bound from the
-    // whitelist check above: every order used here repeats the SOLE whitelisted property as of
-    // Phase 26.8 (startsAt — priceAtBooking was retired from SORTABLE_BOOKING_PROPERTIES once its
-    // only caller, the provider sort sheet, was deleted by mobile Phase 7.8), with alternating
-    // directions to reach the required order count, so a rejection can ONLY be attributed to
-    // cardinality, never to an unrecognised property name.
+    // normalizeBookingSort applies TWO independent cardinality guards, and the tests below pin
+    // each in isolation. Every order used here repeats the SOLE whitelisted property as of Phase
+    // 26.8 (startsAt — priceAtBooking was retired from SORTABLE_BOOKING_PROPERTIES once its only
+    // caller, the provider sort sheet, was deleted by mobile Phase 7.8), so a rejection can ONLY
+    // be attributed to cardinality, never to an unrecognised property name:
+    //
+    //   1. MAX_SORT_ORDERS = 3 — the outer length guard, checked FIRST so a pathological sort list
+    //      is rejected before any per-order work. Distinguished by its "Too many sort properties"
+    //      message.
+    //   2. no repeated property — added by the Phase 26.8 audit. Each distinct (property,
+    //      direction) sequence compiles to a textually distinct ORDER BY hence its own plan-cache
+    //      entry, so repeats (which SQL ignores anyway — the first term for a column wins) were
+    //      minting up to 14 plans where 2 suffice. Distinguished by "Duplicate sort property".
+    //
+    // Ordering between the two matters and is asserted: at 4 repeated orders the LENGTH guard must
+    // win, otherwise MAX_SORT_ORDERS would be unreachable dead configuration.
 
     @Test
     @DisplayName("BusinessException(400) is thrown, and NEITHER repository is ever touched, when sort "
@@ -2272,22 +2280,44 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("exactly 3 sort orders are accepted — the CLIENT projection query is reached with the "
-            + "normalized (3 orders on the sole whitelisted property + mandatory id tiebreaker) sort, "
-            + "proving the bound is \">3 rejects\", not \">=3 rejects\" (no off-by-one against "
-            + "MAX_SORT_ORDERS=3)")
-    void should_acceptSort_when_exactlyThreeSortOrdersAtTheCountBound() {
-        Sort threeOrders = Sort.by(Sort.Direction.ASC, "startsAt")
-                .and(Sort.by(Sort.Direction.DESC, "startsAt"))
-                .and(Sort.by(Sort.Direction.ASC, "startsAt"));
-        Pageable atBoundPageable = Pageable.unpaged(threeOrders);
-        Sort expectedNormalizedSort = threeOrders.and(Sort.by(Sort.Direction.ASC, "id"));
+    @DisplayName("BusinessException(400) 'Duplicate sort property' is thrown, and NEITHER repository is "
+            + "ever touched, when the SAME whitelisted property is sent twice (startsAt asc, startsAt "
+            + "desc) — under MAX_SORT_ORDERS=3, so the rejection is attributable ONLY to the repeat")
+    void should_rejectSort_when_theSameWhitelistedPropertyIsRepeated() {
+        UUID actorId = UUID.randomUUID();
+        Sort repeatedProperty = Sort.by(Sort.Direction.ASC, "startsAt")
+                .and(Sort.by(Sort.Direction.DESC, "startsAt"));
+        Pageable repeatedPropertyPageable = PageRequest.of(0, 20, repeatedProperty);
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, buildAuth(Role.CLIENT), null, null, null, null, repeatedPropertyPageable))
+                .isInstanceOf(BusinessException.class)
+                // Not "Too many sort properties": two orders is within MAX_SORT_ORDERS, so only the
+                // repeat guard can be firing. A generic 400 assertion would pass even if the length
+                // guard had been silently tightened to 1 instead.
+                .hasMessageContaining("Duplicate sort property")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+        verify(salonRepository, never()).findIdsByOwnerIdAndIsActiveTrue(any());
+        verify(masterRepository, never()).findByUserId(any());
+    }
+
+    @Test
+    @DisplayName("a single order on the sole whitelisted property is accepted — the CLIENT projection "
+            + "query is reached with (startsAt asc + mandatory id tiebreaker), proving the two "
+            + "cardinality guards reject only repeats/overflow and never the one legitimate shape")
+    void should_acceptSort_when_singleWhitelistedPropertySupplied() {
+        Sort singleOrder = Sort.by(Sort.Direction.ASC, "startsAt");
+        Pageable requestedPageable = Pageable.unpaged(singleOrder);
+        Sort expectedNormalizedSort = singleOrder.and(Sort.by(Sort.Direction.ASC, "id"));
         Pageable expectedNormalizedPageable = Pageable.unpaged(expectedNormalizedSort);
 
         when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable))
                 .thenReturn(Page.empty());
 
-        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, atBoundPageable);
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, requestedPageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable);

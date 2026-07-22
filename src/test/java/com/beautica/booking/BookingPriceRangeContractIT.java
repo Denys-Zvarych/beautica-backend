@@ -370,14 +370,26 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("the shipped V120 file contains exactly one UPDATE, targeting "
-            + "bookings.price_max_at_booking — the statement the guard tests below re-execute")
+            + "bookings.price_max_at_booking, carrying EVERY predicate the guard tests below "
+            + "exercise — a dropped conjunct fails here as well as behaviourally")
     void should_shipOneBackfillStatement_when_v120IsLoadedFromTheClasspath() throws Exception {
         String backfill = v120BackfillStatement();
 
+        // Every conjunct listed here has a paired behavioural negative test below. The two layers
+        // are deliberately redundant: the behavioural test proves the predicate DOES something,
+        // this one proves the predicate that did it is still the one that SHIPS. Previously only
+        // the two freshness conjuncts were listed, so deleting `sd.price_max >= b.price_at_booking`
+        // — the sanity guard whose removal re-materialises defect #3, the inverted «400–350 ₴»
+        // band — left the whole suite green.
         assertThat(backfill)
                 .as("if V120 ever stops writing this column, the guard tests below would keep "
                         + "passing against a statement that no longer ships")
                 .contains("SET price_max_at_booking = sd.price_max")
+                .contains("b.price_max_at_booking IS NULL")
+                .contains("ms.price_override IS NULL")
+                .contains("sd.price_type = 'RANGE'")
+                .contains("sd.price_max IS NOT NULL")
+                .contains("sd.price_max >= b.price_at_booking")
                 .contains("sd.updated_at <= b.created_at")
                 .contains("ms.updated_at <= b.created_at");
     }
@@ -416,6 +428,162 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         assertThat(ceilingOf(untouchedBookingId))
                 .as("control: an untouched service IS a faithful reconstruction, so the backfill "
                         + "must still populate it — otherwise this test would pass vacuously")
+                .isEqualByComparingTo("500.00");
+    }
+
+    // ── the remaining four backfill predicates ───────────────────────────────
+    //
+    // Until these landed, `sd.updated_at <= b.created_at` was the ONLY conjunct of the seven with
+    // a negative test. Deleting the SANITY GUARD `sd.price_max >= b.price_at_booking` — the one
+    // whose javadoc says removing it "would materialise exactly the «400–350 ₴» defect this change
+    // eliminates" (V120:83-88) — left the entire suite green. Each test below pairs a row that
+    // must be SKIPPED with an otherwise-identical CONTROL row that must be POPULATED, so a
+    // predicate that stopped filtering fails on the skipped row and a backfill that stopped
+    // running altogether fails on the control. Neither can pass vacuously.
+
+    @Test
+    @DisplayName("V120 backfill leaves the ceiling NULL when the service's CURRENT price_max is "
+            + "BELOW the frozen price_at_booking — reconstructing it would materialise an inverted "
+            + "«400–350 ₴» band (the sanity guard, defect #3)")
+    void should_leaveNullCeiling_when_backfillWouldInvertTheBand() throws Exception {
+        String masterEmail = "bprc-invert-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser(
+                "bprc-invert-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        // The service now bands 300–350, but the booking was frozen at 400 — the provider has since
+        // lowered their ceiling below what this client already agreed to pay. Every OTHER predicate
+        // passes on this row (RANGE, no override, ceiling NULL, both timestamps stale), so only the
+        // sanity guard can reject it.
+        UUID invertingServiceId = createRangeService(
+                masterId, new BigDecimal("300.00"), new BigDecimal("350.00"), null);
+        UUID sameCeilingServiceId = createRangeService(
+                masterId, new BigDecimal("300.00"), new BigDecimal("400.00"), null);
+        UUID invertedBookingId = insertBooking(clientId, masterId, invertingServiceId,
+                ANCHOR, new BigDecimal("400.00"), null);
+        UUID boundaryBookingId = insertBooking(clientId, masterId, sameCeilingServiceId,
+                ANCHOR.plusMinutes(90), new BigDecimal("400.00"), null);
+        alignServiceTimestamps(invertingServiceId, invertedBookingId, "-1 day");
+        alignServiceTimestamps(sameCeilingServiceId, boundaryBookingId, "-1 day");
+
+        jdbcTemplate.execute(v120BackfillStatement());
+
+        assertThat(ceilingOf(invertedBookingId))
+                .as("350 < 400 would render as «400–350 ₴» — the row must stay NULL and show the "
+                        + "single frozen price instead")
+                .isNull();
+        assertThat(ceilingOf(boundaryBookingId))
+                .as("the guard is >=, not >: an equal ceiling is a degenerate but SANE band, so the "
+                        + "boundary row must still be populated. This also stops the test passing "
+                        + "vacuously if the backfill stopped writing anything at all.")
+                .isEqualByComparingTo("400.00");
+    }
+
+    @Test
+    @DisplayName("V120 backfill leaves the ceiling NULL for a FIXED-priced service — a booking "
+            + "agreed at one price must never acquire a band")
+    void should_leaveNullCeiling_when_serviceIsFixed() throws Exception {
+        String masterEmail = "bprc-fixed-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser(
+                "bprc-fixed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        UUID fixedServiceId = createFixedService(masterId, new BigDecimal("300.00"));
+        UUID rangeServiceId = createRangeService(
+                masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        UUID fixedBookingId = insertBooking(clientId, masterId, fixedServiceId,
+                ANCHOR, new BigDecimal("300.00"), null);
+        UUID rangeBookingId = insertBooking(clientId, masterId, rangeServiceId,
+                ANCHOR.plusMinutes(90), new BigDecimal("300.00"), null);
+        alignServiceTimestamps(fixedServiceId, fixedBookingId, "-1 day");
+        alignServiceTimestamps(rangeServiceId, rangeBookingId, "-1 day");
+
+        jdbcTemplate.execute(v120BackfillStatement());
+
+        // HONEST SCOPE NOTE: this pins the OUTCOME for a FIXED service, not the `sd.price_type =
+        // 'RANGE'` conjunct in isolation. chk_service_def_price_mode (V67:41) makes the two
+        // co-vary — FIXED requires price_max IS NULL — so `sd.price_max IS NOT NULL` already
+        // excludes every legitimately-FIXED row, and a row that falsifies ONE conjunct without the
+        // other is unreachable through the CHECK. That redundancy is the design; what has value to
+        // pin is that a real FIXED service never grows a ceiling, which is the client-visible claim.
+        assertThat(ceilingOf(fixedBookingId))
+                .as("a FIXED service has no ceiling to freeze — the booking renders as one price")
+                .isNull();
+        assertThat(ceilingOf(rangeBookingId))
+                .as("control: the same master's RANGE service on the same day IS backfilled, so a "
+                        + "backfill that did nothing at all cannot pass this test")
+                .isEqualByComparingTo("500.00");
+    }
+
+    @Test
+    @DisplayName("V120 backfill leaves the ceiling NULL when the master's assignment carries a "
+            + "priceOverride — the master fixed their own price, so there is no band to restore")
+    void should_leaveNullCeiling_when_assignmentHasPriceOverride() throws Exception {
+        String masterEmail = "bprc-override-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser(
+                "bprc-override-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        // Both definitions are RANGE 300–500 and identical in every respect the backfill inspects.
+        // ONLY master_services.price_override separates them — so this test can fail for exactly
+        // one reason.
+        UUID overriddenServiceId = createRangeService(
+                masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), new BigDecimal("400.00"));
+        UUID plainServiceId = createRangeService(
+                masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        UUID overriddenBookingId = insertBooking(clientId, masterId, overriddenServiceId,
+                ANCHOR, new BigDecimal("400.00"), null);
+        UUID plainBookingId = insertBooking(clientId, masterId, plainServiceId,
+                ANCHOR.plusMinutes(90), new BigDecimal("300.00"), null);
+        alignServiceTimestamps(overriddenServiceId, overriddenBookingId, "-1 day");
+        alignServiceTimestamps(plainServiceId, plainBookingId, "-1 day");
+
+        jdbcTemplate.execute(v120BackfillStatement());
+
+        assertThat(ceilingOf(overriddenBookingId))
+                .as("an override means this master charges ONE price (400), not the definition's "
+                        + "300–500 band — attaching 500 would invent a band the client never saw")
+                .isNull();
+        assertThat(ceilingOf(plainBookingId))
+                .as("control: the same definition shape WITHOUT an override is backfilled")
+                .isEqualByComparingTo("500.00");
+    }
+
+    @Test
+    @DisplayName("V120 backfill leaves the ceiling NULL when only the ASSIGNMENT was edited after "
+            + "the booking — the ms.updated_at half of the freshness guard, which the existing "
+            + "service-side test cannot reach")
+    void should_leaveNullCeiling_when_assignmentWasEditedAfterBooking() throws Exception {
+        String masterEmail = "bprc-msfresh-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser(
+                "bprc-msfresh-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        UUID editedServiceId = createRangeService(
+                masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        UUID untouchedServiceId = createRangeService(
+                masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        UUID editedBookingId = insertBooking(clientId, masterId, editedServiceId,
+                ANCHOR, new BigDecimal("300.00"), null);
+        UUID untouchedBookingId = insertBooking(clientId, masterId, untouchedServiceId,
+                ANCHOR.plusMinutes(90), new BigDecimal("300.00"), null);
+        alignServiceTimestamps(editedServiceId, editedBookingId, "-1 day");
+        alignServiceTimestamps(untouchedServiceId, untouchedBookingId, "-1 day");
+        // The master re-points their own assignment AFTER the booking — dropping an override, or
+        // re-activating the row — while the salon's definition is untouched. This is the ONLY way
+        // to exercise `ms.updated_at <= b.created_at`: its sibling test bumps only
+        // service_definitions.updated_at (touchServiceDefinitionAfterBooking), so deleting the
+        // ms half of the guard left every existing test green.
+        touchMasterServiceAfterBooking(editedServiceId, editedBookingId);
+
+        jdbcTemplate.execute(v120BackfillStatement());
+
+        assertThat(ceilingOf(editedBookingId))
+                .as("the ASSIGNMENT moved after the booking, so the definition's current band is "
+                        + "not provably the one the client agreed to — the row must stay NULL")
+                .isNull();
+        assertThat(ceilingOf(untouchedBookingId))
+                .as("control: an assignment still older than its booking IS backfilled")
                 .isEqualByComparingTo("500.00");
     }
 
@@ -1216,6 +1384,54 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 bookingId, masterServiceId);
     }
 
+    /**
+     * Bumps ONLY {@code master_services.updated_at} past the booking, leaving
+     * {@code service_definitions.updated_at} in the past — the exact mirror of
+     * {@link #touchServiceDefinitionAfterBooking}, so a failure isolates the
+     * {@code ms.updated_at <= b.created_at} half of the freshness guard.
+     *
+     * <p>Both halves need their own fixture because the two columns move independently in
+     * production: editing the salon's definition (price, mode, duration) touches only {@code sd},
+     * while a master editing their own assignment (setting or dropping a {@code price_override},
+     * re-activating the row) touches only {@code ms}. With only the {@code sd} fixture in the
+     * suite, deleting the {@code ms} conjunct from V120 changed no test's outcome.
+     */
+    private void touchMasterServiceAfterBooking(UUID masterServiceId, UUID bookingId) {
+        jdbcTemplate.update(
+                "UPDATE master_services SET updated_at = "
+                        + "(SELECT created_at FROM bookings WHERE id = ?) + interval '1 second' "
+                        + "WHERE id = ?",
+                bookingId, masterServiceId);
+    }
+
+    /**
+     * FIXED-priced twin of {@link #createRangeService}, for the backfill's {@code price_type =
+     * 'RANGE'} negative case. {@code price_max} is left NULL because
+     * {@code chk_service_def_price_mode} (V67:41) requires exactly that for a FIXED row — which is
+     * also why the FIXED case cannot falsify the {@code price_type} conjunct independently of the
+     * {@code price_max IS NOT NULL} one; see the note on
+     * {@code should_leaveNullCeiling_when_serviceIsFixed}.
+     */
+    private UUID createFixedService(UUID masterId, BigDecimal basePrice) {
+        UUID userId = jdbcTemplate.queryForObject(
+                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, price_type, base_price, price_max, buffer_minutes_after, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Fixed Service', ?, 60, 'FIXED', ?, NULL, 0, "
+                        + "true, NOW(), NOW())",
+                serviceDefId, userId,
+                fixtures.resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId), basePrice);
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, price_override, is_active, "
+                        + "created_at, updated_at) VALUES (?, ?, ?, NULL, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId);
+        return masterServiceId;
+    }
+
     private BigDecimal ceilingOf(UUID bookingId) {
         return jdbcTemplate.queryForObject(
                 "SELECT price_max_at_booking FROM bookings WHERE id = ?", BigDecimal.class, bookingId);
@@ -1283,7 +1499,8 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                         + "base_duration_minutes, price_type, base_price, price_max, buffer_minutes_after, "
                         + "is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'Range Service', ?, 60, 'RANGE', ?, ?, 0, true, NOW(), NOW())",
-                serviceDefId, ownerType, ownerId, fixtures.resolveServiceTypeId(), basePrice, priceMax);
+                serviceDefId, ownerType, ownerId,
+                fixtures.resolveUnusedServiceTypeId(ownerType, ownerId), basePrice, priceMax);
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, price_override, is_active, "

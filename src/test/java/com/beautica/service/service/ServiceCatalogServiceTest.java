@@ -47,6 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -279,7 +280,7 @@ class ServiceCatalogServiceTest {
                 serviceCatalogService.addIndependentMasterService(userId, differentPriceAndDuration))
                 .isInstanceOf(DuplicateServiceException.class);
 
-        verify(serviceRepository, never()).saveAndFlush(any());
+        verify(serviceRepository, never()).save(any());
     }
 
     @Test
@@ -302,9 +303,70 @@ class ServiceCatalogServiceTest {
         assertThatThrownBy(() ->
                 serviceCatalogService.addServiceToSalon(salonId, buildTypedCreateRequest(serviceTypeId)))
                 .isInstanceOf(DuplicateServiceException.class)
-                .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
-                        .as("the index reports the constraint, not the surviving row")
-                        .isNull());
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getExistingServiceDefId())
+                            .as("the index reports the constraint, not the surviving row")
+                            .isNull();
+                    // serviceName is NOT null on this path, contrary to the obvious reading of
+                    // "the index caught it": the transaction is aborted so nothing can be looked
+                    // up, but the name the caller just SUBMITTED is still in memory and is what
+                    // ships. This is the wire value DuplicateServiceResponse's @Schema documents.
+                    assertThat(dup.getServiceName())
+                            .as("the race path still names the service, from the submitted request")
+                            .isEqualTo("Manicure");
+                });
+    }
+
+    @Test
+    @DisplayName("translates the index violation into DUPLICATE_SERVICE on the independent-master "
+            + "path too, where the flush is DEFERRED until after the assignment insert")
+    void should_translateIndexViolation_when_preCheckRacesOnTheDeferredFlushPath() {
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        ServiceType serviceType = stubActiveManicureType(serviceTypeId);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        // Pre-check passes (a concurrent transaction has not committed yet)…
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.INDEPENDENT_MASTER, masterId, serviceTypeId, null))
+                .thenReturn(Optional.empty());
+        // …and the DB index catches it at the DEFERRED flush. This path no longer goes through
+        // saveAndFlush: the definition and the assignment are saved plainly and one explicit
+        // flush emits both, so the violation must still be classified from THERE. Without the
+        // flush sitting inside the same try/catch it would surface at commit — outside any catch
+        // — and degrade to the generic 409 with no data.code for the client to branch on.
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        doThrow(DuplicateServiceViolations.violationOf(DUPLICATE_SERVICE_INDEX))
+                .when(serviceRepository).flush();
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.addIndependentMasterService(userId, buildTypedCreateRequest(serviceTypeId)))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getExistingServiceDefId())
+                            .as("the index reports the constraint, not the surviving row")
+                            .isNull();
+                    // Same as the saveAndFlush path: the id is unrecoverable, the SUBMITTED name is
+                    // not. Only the BULK path sends a null serviceName — the deferred flush here
+                    // knows exactly which single row it queued.
+                    assertThat(dup.getServiceName())
+                            .as("the deferred-flush race path still names the service")
+                            .isEqualTo("Manicure");
+                });
+
+        // The whole point of deferring: the assignment insert is queued BEFORE the single flush,
+        // so both statements leave in one flush cycle rather than two round-trips.
+        verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
+        verify(serviceRepository).flush();
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -615,7 +677,7 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
         stubActiveManicureType(serviceTypeId);
-        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(
@@ -631,7 +693,7 @@ class ServiceCatalogServiceTest {
         assertThat(result.isActive())
                 .as("isActive on response must be true as returned by the saved assignment")
                 .isTrue();
-        verify(serviceRepository).saveAndFlush(any(ServiceDefinition.class));
+        verify(serviceRepository).save(any(ServiceDefinition.class));
         verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
         // MEDIUM-2: service must refresh the pre-computed min_effective_price index for the independent master.
         verify(masterRepository).refreshMinEffectivePrice(masterId);
@@ -651,7 +713,7 @@ class ServiceCatalogServiceTest {
                 serviceCatalogService.addIndependentMasterService(userId, buildCreateRequest()))
                 .isInstanceOf(ForbiddenException.class);
 
-        verify(serviceRepository, never()).saveAndFlush(any());
+        verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -771,6 +833,75 @@ class ServiceCatalogServiceTest {
         assertThat(ownRow.priceOverride())
                 .as("the master's own authenticated view keeps the field")
                 .isEqualByComparingTo(override);
+    }
+
+    /**
+     * {@code fromPublic} is a 15-argument POSITIONAL copy constructor: it must null out
+     * {@code priceOverride} and copy the other 14 fields VERBATIM. That shape is exactly where a
+     * transposition of two adjacent same-typed arguments (e.g. swapping {@code priceMin} and
+     * {@code priceMax}, or {@code serviceTypeNameUk} and {@code serviceTypeSlug}) compiles cleanly
+     * and passes any assertion that reuses the same value across fields — it is only caught by
+     * asserting every field with a value distinct from its siblings.
+     *
+     * <p>We use AssertJ's recursive comparison instead of 14 {@code extracting(...)} calls for two
+     * reasons: (1) it is future-proof — a 16th field added to the record is covered automatically,
+     * with no test change required, and (2) it directly detects a transposition, because two
+     * same-typed adjacent fields holding swapped (but otherwise valid-looking) values will fail the
+     * per-field equality check that field-by-field extraction could be written to miss if the
+     * assertions were copy-pasted with the wrong accessor.
+     */
+    @Test
+    @DisplayName("fromPublic preserves every field verbatim except priceOverride, which is masked to null")
+    void should_preserveEveryFieldExceptPriceOverride_when_fromPublicIsApplied() {
+        ServiceDefinitionResponse nestedServiceDefinition = new ServiceDefinitionResponse(
+                UUID.randomUUID(),
+                "Класичний манікюр",
+                "Аппаратний манікюр з покриттям гель-лак",
+                "NAILS",
+                45,
+                10,
+                true,
+                UUID.randomUUID(),
+                "Манікюр класичний",
+                "manicure-classic",
+                "https://cdn.beautica.example/photos/manicure-classic.jpg",
+                PriceType.FIXED,
+                new BigDecimal("500.00"),
+                new BigDecimal("600.00"),
+                "500.00 ₴"
+        );
+
+        MasterServiceResponse full = new MasterServiceResponse(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                nestedServiceDefinition,
+                new BigDecimal("111.11"),
+                15,
+                new BigDecimal("222.22"),
+                30,
+                true,
+                PriceType.RANGE,
+                new BigDecimal("333.33"),
+                new BigDecimal("444.44"),
+                "від 333.33 до 444.44 ₴",
+                UUID.randomUUID(),
+                "Манікюр",
+                "manicure"
+        );
+
+        MasterServiceResponse masked = MasterServiceResponse.fromPublic(full);
+
+        assertThat(masked)
+                .as("every field other than priceOverride must survive fromPublic unchanged — "
+                        + "a recursive comparison catches both dropped fields and transposed "
+                        + "same-typed arguments that a partial field-by-field assertion could miss")
+                .usingRecursiveComparison()
+                .ignoringFields("priceOverride")
+                .isEqualTo(full);
+        assertThat(masked.priceOverride())
+                .as("priceOverride is provider-internal bookkeeping and must be masked to null on "
+                        + "the anonymous browse route regardless of every other field surviving intact")
+                .isNull();
     }
 
     // ── getMyServices ───────────────────────────────────────────────────────────
@@ -1036,7 +1167,7 @@ class ServiceCatalogServiceTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "PEDICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
-        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(userId, request);
@@ -1049,7 +1180,7 @@ class ServiceCatalogServiceTest {
         verify(serviceTypeLookup).getById(serviceTypeId);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).saveAndFlush(captor.capture());
+        verify(serviceRepository).save(captor.capture());
         assertThat(captor.getValue().getServiceType())
                 .as("serviceType must be set on the ServiceDefinition before save")
                 .isSameAs(serviceType);
@@ -1074,7 +1205,7 @@ class ServiceCatalogServiceTest {
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Service type not found");
 
-        verify(serviceRepository, never()).saveAndFlush(any());
+        verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -1124,7 +1255,7 @@ class ServiceCatalogServiceTest {
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
-        verify(serviceRepository, never()).saveAndFlush(any());
+        verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -1213,7 +1344,7 @@ class ServiceCatalogServiceTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
-        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(userId, request);
@@ -1245,7 +1376,7 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceTypeLookup, never()).getById(any());
-        verify(serviceRepository, never()).saveAndFlush(any());
+        verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -1279,7 +1410,7 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST))
                 .hasMessageContaining("does not belong to the selected category");
 
-        verify(serviceRepository, never()).saveAndFlush(any());
+        verify(serviceRepository, never()).save(any());
         verify(masterServiceRepository, never()).save(any());
     }
 

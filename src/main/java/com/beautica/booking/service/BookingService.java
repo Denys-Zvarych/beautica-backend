@@ -454,15 +454,20 @@ public class BookingService {
 
     /**
      * Max {@link Sort.Order} entries accepted in {@code GET /bookings/me}'s {@code sort} query
-     * parameter (Phase 26.3 audit, finding backend-perf F4). Kept at 3 by Phase 26.8 even though
-     * {@link #SORTABLE_BOOKING_PROPERTIES} narrowed to a single property — this bound is a
-     * request-cardinality/DoS guard, not a count that must track the whitelist size. A caller can
-     * still repeat the sole whitelisted property across multiple {@code (property, direction)}
-     * orders (e.g. {@code sort=startsAt,asc&sort=startsAt,desc&sort=startsAt,asc}); each distinct
-     * sequence compiles to a textually distinct SQL {@code ORDER BY} (column names can't be bind
-     * params), so an unbounded sort list still inflates plan-cache entries regardless of how many
-     * distinct property names exist. Parity with the existing {@code @Size(max = 5)} bound on the
-     * controller's {@code status} parameter.
+     * parameter (Phase 26.3 audit, finding backend-perf F4) — a cheap O(1) length guard applied
+     * BEFORE the per-order whitelist/duplicate loop, so a pathological
+     * {@code ?sort=…&sort=…&sort=…&…} is rejected without allocating or walking anything.
+     *
+     * <p><b>It is no longer the binding constraint on plan-cache cardinality</b>, and must not be
+     * read as one. Since the Phase 26.8 audit, {@link #normalizeBookingSort} rejects a REPEATED
+     * property outright; combined with {@link #SORTABLE_BOOKING_PROPERTIES} holding exactly one
+     * member, the effective maximum is 1 order and the reachable {@code ORDER BY} texts are
+     * exactly two ({@code startsAt ASC, id ASC} and {@code startsAt DESC, id ASC}). Before that
+     * rejection a caller could send {@code sort=startsAt,asc&sort=startsAt,desc&sort=startsAt,asc}
+     * and mint up to 14 textually distinct {@code ORDER BY} clauses — column names cannot be bind
+     * parameters, so each is its own Postgres prepared-statement/plan-cache entry — where 2
+     * suffice. The duplicate check closed that; this constant is retained only as the outer
+     * length bound, at parity with the controller's {@code @Size(max = 5)} on {@code status}.
      */
     private static final int MAX_SORT_ORDERS = 3;
 
@@ -503,7 +508,16 @@ public class BookingService {
      *       {@code Sort} ever reaches a query.</li>
      *   <li><b>Count bound.</b> More than {@link #MAX_SORT_ORDERS} orders throws a 400
      *       {@link BusinessException} (Phase 26.3 audit F4) — parity with the controller's
-     *       {@code @Size(max = 5)} bound on {@code status}.</li>
+     *       {@code @Size(max = 5)} bound on {@code status}. Checked first, so an absurdly long
+     *       sort list is rejected before any per-order work.</li>
+     *   <li><b>No repeated property.</b> A property that appears twice throws a 400
+     *       {@link BusinessException} (Phase 26.8 audit, backend-perf). A repeat is never
+     *       meaningful — SQL applies the first {@code ORDER BY} term for a column and every later
+     *       one on the same column is dead — but each distinct {@code (property, direction)}
+     *       sequence still compiles to a distinct {@code ORDER BY} text and therefore its own
+     *       plan-cache entry. Rejecting repeats collapses the reachable {@code ORDER BY} texts on
+     *       this endpoint to exactly two. No real caller is affected: the shipped mobile client
+     *       sends at most one order.</li>
      *   <li><b>Mandatory {@code id} tiebreaker.</b> Appended last, always. {@code startsAt} ties
      *       are a real case, not a hypothetical one — nothing in the schema prevents two
      *       terminal-status bookings (e.g. {@code COMPLETED}/{@code CANCELLED}, which fall
@@ -521,6 +535,12 @@ public class BookingService {
      * that legitimate caller. {@link Pageable#isPaged()} branches to
      * {@link Pageable#unpaged(Sort)} instead, carrying the normalized sort without requiring page
      * number/size semantics that don't apply.
+     *
+     * <p>Preserved for SORT normalization only — an {@code Unpaged} that survives this method and
+     * reaches {@code BookingRepositoryCustom} is rejected there with an
+     * {@link IllegalArgumentException} (an unbounded id scan is not a supported query). Those unit
+     * tests only work because they mock the repository; unpaged is NOT a usable production path
+     * through this service.
      */
     private Pageable normalizeBookingSort(Pageable pageable) {
         Sort requestedSort = pageable.getSort();
@@ -531,10 +551,15 @@ public class BookingService {
                     "Too many sort properties");
         }
 
+        Set<String> seenProperties = new HashSet<>();
         for (Sort.Order order : effectiveSort) {
             if (!SORTABLE_BOOKING_PROPERTIES.contains(order.getProperty())) {
                 throw new BusinessException(HttpStatus.BAD_REQUEST,
                         "Unsupported sort property: " + order.getProperty());
+            }
+            if (!seenProperties.add(order.getProperty())) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "Duplicate sort property: " + order.getProperty());
             }
         }
 

@@ -441,7 +441,8 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                         + "service_type_id, base_duration_minutes, base_price, buffer_minutes_after, "
                         + "is_active, created_at, updated_at) VALUES (?, 'INDEPENDENT_MASTER', ?, 'Svc', ?, "
                         + "?, ?, ?, true, NOW(), NOW())",
-                serviceDefId, m.userId(), resolveServiceTypeId(), durationMinutes, PRICE, bufferMinutes);
+                serviceDefId, m.userId(), resolveUnusedServiceTypeId(m.userId()), durationMinutes,
+                PRICE, bufferMinutes);
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO master_services (id, master_id, service_def_id, is_active, "
                         + "created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
@@ -483,12 +484,26 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                 startsAt, endsAt, PRICE, minutes);
     }
 
-    private UUID resolveServiceTypeId() {
+    /**
+     * Resolves a selectable {@code service_types.id} the master does not already offer ACTIVELY.
+     *
+     * <p>V121's {@code ux_service_def_owner_service_type_active} makes a second ACTIVE definition
+     * on the same {@code (owner_type, owner_id, service_type_id)} a unique violation, and cases 2
+     * and 6 below both seed TWO services for ONE master on purpose (a long one and a short one, to
+     * prove the day gate turns on the service's DURATION rather than on the day being free). The
+     * {@code NOT EXISTS} keeps that scenario expressible without weakening the invariant; it
+     * mirrors {@code BookingTestFixtures.resolveUnusedServiceTypeId} (kept local, matching this
+     * suite's existing self-contained-fixture convention).
+     */
+    private UUID resolveUnusedServiceTypeId(UUID ownerUserId) {
         return jdbcTemplate.queryForObject(
                 "SELECT st.id FROM service_types st "
                         + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
                         + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "AND NOT EXISTS (SELECT 1 FROM service_definitions sd "
+                        + "                WHERE sd.owner_type = 'INDEPENDENT_MASTER' AND sd.owner_id = ? "
+                        + "                  AND sd.service_type_id = st.id AND sd.is_active = TRUE) "
                         + "ORDER BY st.name_uk LIMIT 1",
-                UUID.class);
+                UUID.class, ownerUserId);
     }
 }

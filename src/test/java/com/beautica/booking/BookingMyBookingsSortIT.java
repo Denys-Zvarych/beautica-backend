@@ -52,8 +52,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * same-token positive control on {@code sort=startsAt,...} — proving the 400 is attributable
  * specifically to {@code priceAtBooking} no longer being whitelisted, not to some unrelated
  * breakage of the endpoint (auth, pagination, or the whitelist collapsing to reject everything).
- * With only one order ever sent per request in these tests, {@code MAX_SORT_ORDERS} cannot be the
- * trigger either — the whitelist check is the only remaining 400 source for a single-order sort.
+ * With only one order ever sent per request in these tests, neither {@code MAX_SORT_ORDERS} nor
+ * the repeated-property guard (Phase 26.8 audit) can be the trigger either — a single order can
+ * exceed neither bound, so the whitelist check is the only remaining 400 source here.
  * {@link com.beautica.common.exception.GlobalExceptionHandler#handleBusiness} genericises every
  * {@code BAD_REQUEST} {@link com.beautica.common.exception.BusinessException} message to the same
  * static {@code "Invalid request"} string by design (Anti-Bug §I/§N — no enum-surface leak), so

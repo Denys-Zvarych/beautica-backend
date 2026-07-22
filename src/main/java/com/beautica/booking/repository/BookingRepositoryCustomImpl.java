@@ -43,6 +43,16 @@ import java.util.UUID;
  */
 class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
 
+    /**
+     * Message for the {@link IllegalArgumentException} every entry point raises on an
+     * {@code Unpaged} {@link Pageable} — see {@link #findIdPage} for why unpaged is refused here
+     * rather than silently executed as an unbounded scan. Never reaches a client: no HTTP path can
+     * produce an {@code Unpaged} instance.
+     */
+    static final String UNPAGED_REJECTED_MESSAGE =
+            "Pageable.unpaged() is not supported by BookingRepositoryCustom — "
+                    + "an unbounded booking id scan is never a valid query; pass a paged Pageable";
+
     @PersistenceContext
     private EntityManager entityManager;
 
@@ -144,8 +154,24 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * {@link Root#get(String)} resolve an arbitrary property path (including through a join
      * alias), which is exactly the ordering oracle Phase 26.3 closes at the service boundary; do
      * NOT call this method (or its two public callers) with a raw, caller-supplied {@code Sort}.
+     *
+     * <p><b>{@code Pageable.unpaged()} is UNSUPPORTED and rejected with
+     * {@link IllegalArgumentException}.</b> The alternative — skipping
+     * {@code setFirstResult}/{@code setMaxResults} for an {@code Unpaged} instance — is not a
+     * safety guard but its opposite: it would turn a loud failure into a SILENT UNBOUNDED
+     * {@code SELECT b.id} that materialises every matching booking id into a {@code List} and
+     * hydrates all of them (Anti-Bug §E-3). Unreachable over HTTP either way — both entry points
+     * carry {@code @PageableDefault} and {@code spring.data.web.pageable.max-page-size} — but
+     * {@code BookingService#normalizeBookingSort} deliberately PRESERVES {@code Unpaged} for
+     * direct in-process callers, so this boundary is where that must be refused. No production
+     * caller passes one today; the only {@code Pageable.unpaged()} callers are
+     * {@code BookingServiceTest} cases that mock this repository away entirely.
      */
     private Page<UUID> findIdPage(Specification<Booking> spec, Pageable pageable) {
+        if (pageable.isUnpaged()) {
+            throw new IllegalArgumentException(UNPAGED_REJECTED_MESSAGE);
+        }
+
         CriteriaBuilder cb = entityManager.getCriteriaBuilder();
 
         CriteriaQuery<UUID> idQuery = cb.createQuery(UUID.class);
@@ -157,6 +183,8 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         }
         idQuery.orderBy(toCriteriaOrders(cb, idRoot, pageable.getSort()));
 
+        // Unconditional, and safe to be so: the unpaged guard at the top of this method has
+        // already rejected the only Pageable for which getOffset()/getPageSize() throw.
         TypedQuery<UUID> typedIdQuery = entityManager.createQuery(idQuery);
         typedIdQuery.setFirstResult((int) pageable.getOffset());
         typedIdQuery.setMaxResults(pageable.getPageSize());
@@ -172,9 +200,10 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * <p>Invoked <b>only</b> from inside the {@link PageableExecutionUtils#getPage} supplier, which
      * is why the {@link CriteriaQuery} is constructed here rather than in the caller: Spring Data's
      * short-circuit rules skip the count entirely when the returned content already determines the
-     * total — an unpaged request, a first page (offset 0) shorter than the page size, or a short
-     * last page — and a query built eagerly in the caller would still cost the round trip this
-     * indirection exists to avoid. That short-circuit is exactly the common case on
+     * total — a first page (offset 0) shorter than the page size, or a short last page; the util's
+     * third case, an unpaged request, is unreachable here because {@link #findIdPage} rejects
+     * {@code Unpaged} outright — and a query built eagerly in the caller would still cost the
+     * round trip this indirection exists to avoid. That short-circuit is exactly the common case on
      * {@code GET /bookings/me?size=20}: a user with fewer than 20 bookings previously paid a
      * {@code COUNT(*)} over their entire booking history on every app open.
      *

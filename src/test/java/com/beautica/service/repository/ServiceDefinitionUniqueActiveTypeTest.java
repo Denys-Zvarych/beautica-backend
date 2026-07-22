@@ -110,8 +110,13 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
 
     private ServiceDefinition definition(UUID ownerId, ServiceType type, String name,
             String price, int durationMinutes, boolean active) {
+        return definition(OwnerType.SALON, ownerId, type, name, price, durationMinutes, active);
+    }
+
+    private ServiceDefinition definition(OwnerType ownerType, UUID ownerId, ServiceType type, String name,
+            String price, int durationMinutes, boolean active) {
         return ServiceDefinition.builder()
-                .ownerType(OwnerType.SALON)
+                .ownerType(ownerType)
                 .ownerId(ownerId)
                 .name(name)
                 .category("MANICURE")
@@ -203,6 +208,26 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
     }
 
     @Test
+    @DisplayName("V121 index — scoped per owner_type too: the same UUID may be an active SALON owner and an active INDEPENDENT_MASTER owner")
+    void should_allowSameOwnerId_when_ownerTypeDiffers() {
+        // Arrange — a SALON offers «Класичне нарощення» under ownerId = salonId.
+        serviceRepository.saveAndFlush(
+                definition(OwnerType.SALON, salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act + Assert — the SAME UUID, reused as the ownerId of an INDEPENDENT_MASTER-owned
+        // definition of the SAME service type, must not collide. owner_id is a POLYMORPHIC,
+        // un-FK'd column (V6:2 — "owner_type is polymorphic ('SALON' | 'INDEPENDENT_MASTER');
+        // no FK to salons/masters"), so a bare UUID collision across the two owner kinds is legal
+        // and expected; reusing salonId here is the only way to isolate the owner_type dimension
+        // of the index from the owner_id dimension the sibling test above already pins. If
+        // owner_type were dropped from the index key, this insert would 409 a legitimate,
+        // unrelated master's setup purely because it happens to share a UUID with an existing salon.
+        assertThatCode(() -> serviceRepository.saveAndFlush(definition(
+                OwnerType.INDEPENDENT_MASTER, salonId, manicureType, "Класичне нарощення", "500.00", 60, true)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     @DisplayName("findActiveDuplicateId — returns the colliding definition id for the 409 payload")
     void should_returnExistingId_when_activeDuplicateExists() {
         // Arrange
@@ -247,6 +272,25 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
                 OwnerType.SALON, salonId, manicureType.getId(), null);
 
         // Assert
+        assertThat(found).isEmpty();
+    }
+
+    @Test
+    @DisplayName("findActiveDuplicateId — mirrors the index predicate: a row of a DIFFERENT owner_type is not a duplicate")
+    void should_returnEmpty_when_theOnlyMatchIsAnotherOwnerType() {
+        // Arrange — an INDEPENDENT_MASTER offers «Класичне нарощення» under ownerId = salonId
+        // (legal: owner_id is polymorphic and un-FK'd, per V6:2 — see the sibling index-level test).
+        serviceRepository.saveAndFlush(definition(
+                OwnerType.INDEPENDENT_MASTER, salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act — probing for a SALON duplicate at the exact same (ownerId, serviceTypeId).
+        Optional<UUID> found = serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, manicureType.getId(), null);
+
+        // Assert — the finder must mirror the index's full key, including owner_type. If
+        // `sd.ownerType = :ownerType` were dropped from the JPQL WHERE clause, this would return
+        // the INDEPENDENT_MASTER row's id and wrongly 409 a legitimate SALON create with a
+        // DUPLICATE_SERVICE payload pointing at a definition owned by an entirely different party.
         assertThat(found).isEmpty();
     }
 

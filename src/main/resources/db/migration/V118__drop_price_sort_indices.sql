@@ -19,5 +19,20 @@
 -- Hibernate 6.5's hibernate.hbm2ddl.auto=validate does NOT check @Table(indexes=...) against the
 -- real schema. An orphaned @Index annotation here would be silently cosmetic drift, not a boot
 -- failure — see Booking.java's comment at the same annotations for the full note.
+-- Fail fast rather than queue. `DROP INDEX` (not CONCURRENTLY — Flyway wraps each migration in one
+-- transaction and DROP INDEX CONCURRENTLY cannot run inside one) takes ACCESS EXCLUSIVE on
+-- `bookings`, the system's hottest table. Postgres lock requests are FIFO, so a PENDING ACCESS
+-- EXCLUSIVE request blocks every subsequent read AND write on `bookings` behind it — an unbounded
+-- wait here does not merely stall the deploy, it takes the booking table down while the old
+-- instance is still serving traffic through a Railway rolling deploy, and a migration that outlives
+-- the connection timeout crash-loops startup (memory `project_flyway_checksum_recovery.md`). 5s,
+-- then error out: Flyway rolls this transaction back cleanly and the next deploy retries it.
+--
+-- Identical value and identical argument to V119:37, which requests the same lock mode on the same
+-- table. NO statement_timeout, for V119's reason: dropping an index is a catalog edit plus a file
+-- unlink, so once the lock is granted there is no size-dependent execution phase left to bound —
+-- everything that can actually stall here is the lock WAIT.
+SET LOCAL lock_timeout = '5s';
+
 DROP INDEX IF EXISTS idx_bookings_master_price_id;
 DROP INDEX IF EXISTS idx_bookings_client_price_id;

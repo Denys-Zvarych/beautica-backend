@@ -239,6 +239,34 @@ class V121MigrationIntegrationTest {
         assertThat(row.get("deactivated_at")).as("deactivated_at must be populated").isNotNull();
     }
 
+    @Test
+    @DisplayName("every logged loser names the SURVIVOR that kept its (owner, type) slot")
+    void should_recordTheSurvivorId_when_rowIsLogged() {
+        List<UUID> survivors = jdbc.queryForList(
+                "SELECT survivor_id FROM v121_dedup_log ORDER BY id", UUID.class);
+
+        // The second half of the forensic contract: "your service was deactivated" is only
+        // actionable for support alongside "…and THIS is the row that replaced it". It is not
+        // re-derivable after the migration — the window function that chose it ranks the
+        // PRE-migration is_active population, which step 1 destroys milliseconds later.
+        assertThat(survivors)
+                .as("both losers were beaten by the booked definition, so both must name it")
+                .hasSize(2)
+                .containsOnly(bookedDefId);
+    }
+
+    @Test
+    @DisplayName("the survivor is never logged as its own loser — survivor_id never equals id")
+    void should_neverPointARowAtItself_when_survivorIsRecorded() {
+        Long selfReferencing = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM v121_dedup_log WHERE survivor_id = id", Long.class);
+
+        // FIRST_VALUE and ROW_NUMBER must share the SAME window; if they ever diverged (a stray
+        // frame clause, a re-ordered window definition) a row could be told to consult itself,
+        // which is silently useless rather than loud.
+        assertThat(selfReferencing).isEqualTo(0L);
+    }
+
     // ── Step 1 — survivor selection ───────────────────────────────────────────
 
     @Test
@@ -312,12 +340,37 @@ class V121MigrationIntegrationTest {
         // The deduped losers are inactive rows of collidingTypeId. A fresh owner must still be
         // able to offer that type; and more importantly the partial predicate is what keeps the
         // deactivated rows from becoming permanent tombstones.
+        //
+        // This class runs on a single private Testcontainers Postgres shared across every @Test
+        // in the class (see the class javadoc — no per-test rollback, no Spring context/tx to
+        // roll back with). This is the only test in the class that inserts rows outside the
+        // @BeforeAll fixture, so — unlike every other assertion here, which is scoped to the
+        // fixture's fixed UUIDs — its "fresh master" row and "fresh definition" row would
+        // otherwise silently outlive this method for the rest of the run. Nothing currently reads
+        // the whole table without an ID filter, so today that leak happens not to break a sibling
+        // assertion, but leaving it in place would make that true only by accident: a future
+        // exactness check over the full table (the kind every other Step in this class already
+        // does) would pass or fail depending on unspecified JUnit method ordering rather than on
+        // the migration's own correctness. Clean up explicitly instead of relying on order, in FK
+        // order (QA playbook Q17): master_services -> service_definitions -> masters -> users. No
+        // master_services row was created here (insertActiveDefinition alone does not assign it),
+        // so that step is a no-op comment for symmetry with the documented order, not a dead
+        // statement.
         UUID freshMasterId = insertIndependentMaster("fresh-" + UUID.randomUUID() + "@beautica.test");
 
         UUID created = insertActiveDefinition(
                 freshMasterId, collidingTypeId, "Класичне нарощення", "450.00", OffsetDateTime.now());
 
-        assertThat(isActive(created)).isTrue();
+        try {
+            assertThat(isActive(created)).isTrue();
+        } finally {
+            UUID freshUserId = jdbc.queryForObject(
+                    "SELECT user_id FROM masters WHERE id = ?", UUID.class, freshMasterId);
+            // master_services: none inserted by this test, nothing to delete.
+            jdbc.update("DELETE FROM service_definitions WHERE id = ?", created);
+            jdbc.update("DELETE FROM masters WHERE id = ?", freshMasterId);
+            jdbc.update("DELETE FROM users WHERE id = ?", freshUserId);
+        }
     }
 
     // ── Idempotence ───────────────────────────────────────────────────────────
