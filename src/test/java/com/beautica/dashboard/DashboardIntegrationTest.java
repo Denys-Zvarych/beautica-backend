@@ -17,7 +17,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -29,12 +28,16 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 /**
  * Full-stack integration tests for {@code GET /api/v1/dashboard/revenue}.
@@ -66,9 +69,6 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
-
-    @Autowired
-    private CacheManager cacheManager;
 
     private static HttpComponentsClientHttpRequestFactory hc5Factory;
 
@@ -308,9 +308,22 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
         JsonNode byMaster = data.path("byMaster");
         assertThat(byMaster.isArray()).isTrue();
-        assertThat(byMaster.size())
-                .as("byMaster must contain exactly 2 entries — one per master")
-                .isEqualTo(2);
+
+        // Per-master attribution, keyed by masterId and order-independent. Asserting only the
+        // row COUNT would pass on a defect that splits the total evenly (175/175) or swaps the
+        // two masters, because the grand totals below still reconcile to 3 bookings / 350.00.
+        List<JsonNode> masterRows = new ArrayList<>();
+        byMaster.forEach(masterRows::add);
+
+        assertThat(masterRows)
+                .as("byMaster must attribute 300.00 over 2 bookings to master A and 50.00 over 1 booking to master B")
+                .extracting(
+                        row -> UUID.fromString(row.path("masterId").asText()),
+                        row -> row.path("bookingCount").asLong(),
+                        row -> new BigDecimal(row.path("revenue").asText()).setScale(2, RoundingMode.HALF_UP))
+                .containsExactlyInAnyOrder(
+                        tuple(fixtureA.masterId(), 2L, new BigDecimal("300.00")),
+                        tuple(fixtureB.masterId(), 1L, new BigDecimal("50.00")));
 
         // Grand totals must be the sum across both masters: 100 + 200 + 50 = 350
         assertThat(data.path("totalCompletedBookings").asLong())
@@ -391,7 +404,7 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'INDEPENDENT_MASTER', ?, 'Indie Service', ?, 60, 200.00, 0, true, NOW(), NOW())",
-                serviceDefId, masterId, resolveServiceTypeId());
+                serviceDefId, masterId, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", masterId));
 
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -473,8 +486,18 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
 
     // ── 10. Cache eviction after booking COMPLETED (FIX 12) ──────────────────
 
+    /**
+     * Drives the eviction through the REAL production path — {@code PATCH /bookings/{id}/complete}
+     * — rather than calling {@code cacheManager.getCache("revenue-dashboard").clear()} by hand. A
+     * manual clear only proves the endpoint re-reads once the region is empty; it cannot fail when
+     * {@code BookingService.evictRevenueDashboardAfterCommit} is unwired, mis-keyed, or matches on
+     * the wrong key position — the exact defect class that made the prefix evictor a silent no-op
+     * before. Eviction is registered as an {@code afterCommit} synchronisation on the request
+     * thread, so it has already run by the time the PATCH response returns: no wait, no sleep,
+     * no timing sensitivity.
+     */
     @Test
-    @DisplayName("GET /revenue — reflects COMPLETED booking after cache evicted")
+    @DisplayName("GET /revenue — reflects COMPLETED booking after the real complete-transition evicts the cache")
     void should_reflectCompletedBooking_when_revenueCacheEvictedAfterBookingCompleted() throws Exception {
         // Arrange
         String ownerEmail = "dash-evict-owner-" + System.nanoTime() + "@beautica.test";
@@ -484,7 +507,12 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         OffsetDateTime yesterday = ZonedDateTime.now(KYIV).minusDays(1)
                 .withHour(10).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
 
-        // Prime the cache: first GET with no bookings → cache entry for this actor
+        // A CONFIRMED booking is the only legal source state for the complete transition. It is
+        // invisible to the revenue dashboard (COMPLETED-only), so the priming GET below still
+        // caches a zeroed summary.
+        UUID bookingId = insertBookingWithStatus(fixture, yesterday, new BigDecimal("250.00"), "CONFIRMED");
+
+        // Prime the cache: first GET with no COMPLETED bookings → cache entry for this actor
         ResponseEntity<String> primed = restTemplate.exchange(
                 REVENUE_URL, HttpMethod.GET,
                 new HttpEntity<>(bearerHeaders(ownerToken)),
@@ -492,21 +520,20 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         assertThat(primed.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode primedData = objectMapper.readTree(primed.getBody()).path("data");
         assertThat(primedData.path("totalCompletedBookings").asLong())
-                .as("cache should be primed with 0 bookings")
+                .as("cache should be primed with 0 completed bookings")
                 .isEqualTo(0L);
 
-        // Insert a COMPLETED booking directly (simulating state-machine completion)
-        insertCompletedBooking(fixture, yesterday, new BigDecimal("250.00"));
+        log.debug("Act: PATCH /api/v1/bookings/{}/complete then GET {} — eviction must be wired", bookingId, REVENUE_URL);
 
-        // Evict the revenue-dashboard cache to simulate what BookingService does on COMPLETED transition
-        org.springframework.cache.Cache dashCache = cacheManager.getCache("revenue-dashboard");
-        if (dashCache != null) {
-            dashCache.clear();
-        }
+        // Act — the real transition; its after-commit hook must evict this actor's cached summary
+        ResponseEntity<String> completed = restTemplate.exchange(
+                "/api/v1/bookings/" + bookingId + "/complete", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(ownerToken)),
+                String.class);
+        assertThat(completed.getStatusCode())
+                .as("salon owner must be able to complete their salon's CONFIRMED booking")
+                .isEqualTo(HttpStatus.NO_CONTENT);
 
-        log.debug("Act: GET {} after cache eviction — must reflect new COMPLETED booking", REVENUE_URL);
-
-        // Act — second GET after eviction
         ResponseEntity<String> response = restTemplate.exchange(
                 REVENUE_URL, HttpMethod.GET,
                 new HttpEntity<>(bearerHeaders(ownerToken)),
@@ -516,10 +543,10 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
         assertThat(data.path("totalCompletedBookings").asLong())
-                .as("after cache eviction, the new COMPLETED booking must be reflected")
+                .as("the complete transition must have evicted the primed summary — a stale 0 here means eviction never fired")
                 .isEqualTo(1L);
         assertThat(new BigDecimal(data.path("estimatedRevenue").asText()))
-                .as("revenue must show 250.00 from the new booking")
+                .as("revenue must show 250.00 from the newly completed booking")
                 .isEqualByComparingTo(new BigDecimal("250.00"));
     }
 
@@ -573,7 +600,7 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId, resolveServiceTypeId());
+                serviceDefId, salonId, resolveUnusedServiceTypeId("SALON", salonId));
 
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -611,7 +638,7 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) VALUES (?, 'SALON', ?, 'Extra Service', ?, 60, 100.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId, resolveServiceTypeId());
+                serviceDefId, salonId, resolveUnusedServiceTypeId("SALON", salonId));
 
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -634,8 +661,8 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
      * Cancellation constraints require the status to be non-terminal for non-null reason; we never
      * set a cancellation reason on COMPLETED rows.
      */
-    private void insertCompletedBooking(DataFixture f, OffsetDateTime startsAt, BigDecimal price) {
-        insertBookingWithStatus(f, startsAt, price, "COMPLETED");
+    private UUID insertCompletedBooking(DataFixture f, OffsetDateTime startsAt, BigDecimal price) {
+        return insertBookingWithStatus(f, startsAt, price, "COMPLETED");
     }
 
     /**
@@ -646,10 +673,13 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
      *
      * <p>Note: the {@code chk_cancellation_reason_status} constraint (V24) forbids a non-null
      * {@code cancellation_reason} on CONFIRMED rows, so we never set it here.
+     *
+     * @return the id of the inserted booking, so a caller can drive it through a real status
+     *         transition endpoint (see the cache-eviction test)
      */
-    private void insertBookingWithStatus(DataFixture f, OffsetDateTime startsAt,
+    private UUID insertBookingWithStatus(DataFixture f, OffsetDateTime startsAt,
                                          BigDecimal price, String status) {
-        OffsetDateTime endsAt = startsAt.plusMinutes(60);
+        UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(
                 """
                 INSERT INTO bookings (
@@ -664,10 +694,11 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
                     NOW(), NOW()
                 )
                 """,
-                UUID.randomUUID(),
+                bookingId,
                 f.clientId(), f.masterId(), f.masterServiceId(), f.salonId(),
-                status, startsAt, endsAt,
+                status, startsAt, startsAt.plusMinutes(60),
                 price);
+        return bookingId;
     }
 
     private String loginAndGetToken(String email) throws Exception {
@@ -685,14 +716,5 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
         return headers;
-    }
-
-    private UUID resolveServiceTypeId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT st.id FROM service_types st "
-                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
-                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
-                        + "ORDER BY st.name_uk LIMIT 1",
-                UUID.class);
     }
 }

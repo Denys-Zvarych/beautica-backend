@@ -441,7 +441,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                         + "service_type_id, base_duration_minutes, base_price, buffer_minutes_after, "
                         + "is_active, created_at, updated_at) VALUES (?, 'INDEPENDENT_MASTER', ?, 'Svc', ?, "
                         + "?, ?, ?, true, NOW(), NOW())",
-                serviceDefId, m.userId(), resolveUnusedServiceTypeId(m.userId()), durationMinutes,
+                serviceDefId, m.userId(), resolveUnusedIndieServiceTypeId(m.userId()), durationMinutes,
                 PRICE, bufferMinutes);
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO master_services (id, master_id, service_def_id, is_active, "
@@ -495,7 +495,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
      * mirrors {@code BookingTestFixtures.resolveUnusedServiceTypeId} (kept local, matching this
      * suite's existing self-contained-fixture convention).
      */
-    private UUID resolveUnusedServiceTypeId(UUID ownerUserId) {
+    private UUID resolveUnusedIndieServiceTypeId(UUID ownerUserId) {
         return jdbcTemplate.queryForObject(
                 "SELECT st.id FROM service_types st "
                         + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
