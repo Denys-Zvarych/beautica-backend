@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -57,6 +58,79 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     @Modifying
     @Query("UPDATE ServiceDefinition sd SET sd.isActive = false WHERE sd.id = :id")
     int deactivateById(@Param("id") UUID id);
+
+    /**
+     * Finds the id of an existing ACTIVE {@link ServiceDefinition} that would collide with a
+     * write for {@code (ownerType, ownerId, serviceTypeId)} — the exact key of the partial
+     * unique index {@code ux_service_def_owner_service_type_active} (V121), which enforces
+     * "one active service per owner per service type, regardless of price or duration".
+     *
+     * <p>Returns the id only (not the entity): the caller needs it solely to populate the
+     * {@code DUPLICATE_SERVICE} 409 payload, so hydrating the full row would be waste.
+     *
+     * <p><b>Not a security boundary.</b> Like every finder here it is unscoped (anti-bug §E-4)
+     * — the caller must already have established that the actor may write to this owner.
+     *
+     * <p><b>Not a substitute for the index.</b> This is a read-then-write check and therefore
+     * TOCTOU-prone under concurrency; it exists to produce a friendly, branchable error on the
+     * common path. The DB index is the actual guarantee, and the create paths translate its
+     * violation into the same exception.
+     *
+     * @param excludeId the row being updated, so a no-op PATCH cannot collide with itself;
+     *                  pass {@code null} on create paths
+     */
+    @Query("""
+            SELECT sd.id FROM ServiceDefinition sd
+            WHERE sd.ownerType = :ownerType
+              AND sd.ownerId = :ownerId
+              AND sd.serviceType.id = :serviceTypeId
+              AND sd.isActive = true
+              AND (:excludeId IS NULL OR sd.id <> :excludeId)
+            """)
+    Optional<UUID> findActiveDuplicateId(
+            @Param("ownerType") OwnerType ownerType,
+            @Param("ownerId") UUID ownerId,
+            @Param("serviceTypeId") UUID serviceTypeId,
+            @Param("excludeId") UUID excludeId);
+
+    /**
+     * Batched sibling of {@link #findActiveDuplicateId}: resolves, in ONE query, every
+     * {@code (serviceTypeId → existing active ServiceDefinition id)} pair that would collide
+     * with a multi-item write for {@code (ownerType, ownerId)}.
+     *
+     * <p><b>Why this exists.</b> The bulk first-time-setup path accepts up to 100 items
+     * ({@code @Size(max = 100)} on {@code BulkCreateServicesRequest}); calling
+     * {@link #findActiveDuplicateId} per item issued 100 serialized SELECTs, regressing the
+     * one-query batching its sibling steps ({@code resolveBulkServiceTypes},
+     * {@code validateBulkCategoriesActive}) already establish. Each of those per-item SELECTs
+     * additionally forced a Hibernate AUTO flush, defeating JDBC insert batching — so the two
+     * only pay off together.
+     *
+     * <p>Returns the definition id alongside the type id (rather than type ids alone) so the
+     * caller can still populate {@code existingServiceDefId} on the {@code DUPLICATE_SERVICE}
+     * 409 and let the client deep-link to the offending row, exactly as the single-item path does.
+     *
+     * <p>No {@code excludeId} parameter: this serves create paths only, where nothing is being
+     * updated in place. Use {@link #findActiveDuplicateId} for PATCH.
+     *
+     * <p>Bounded by construction — {@code typeIds} is the caller's own validated, deduplicated
+     * request set, so the result can never exceed it (anti-bug §E-3). Like every finder here it
+     * is unscoped (§E-4): the caller must already have established write access to this owner.
+     * And like its sibling it is a read-then-write check, TOCTOU-prone by nature — the partial
+     * unique index {@code ux_service_def_owner_service_type_active} remains the actual guarantee.
+     */
+    @Query("""
+            SELECT new com.beautica.service.repository.ActiveDuplicateProjection(sd.serviceType.id, sd.id)
+            FROM ServiceDefinition sd
+            WHERE sd.ownerType = :ownerType
+              AND sd.ownerId = :ownerId
+              AND sd.isActive = true
+              AND sd.serviceType.id IN :typeIds
+            """)
+    List<ActiveDuplicateProjection> findActiveDuplicateTypeIds(
+            @Param("ownerType") OwnerType ownerType,
+            @Param("ownerId") UUID ownerId,
+            @Param("typeIds") Collection<UUID> typeIds);
 
     /**
      * Resolves the owning salon id for a SALON-owned definition (its {@code ownerId} IS the salon id),

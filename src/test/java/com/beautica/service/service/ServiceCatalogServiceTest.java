@@ -1,6 +1,7 @@
 package com.beautica.service.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -33,6 +34,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 
@@ -107,6 +109,10 @@ class ServiceCatalogServiceTest {
      * canonical INVALID one — every create entry point rejects it with 400 "Service type is
      * required" before touching the repository. Kept for the missing-type negative tests.
      */
+    /** The partial unique index behind {@code DUPLICATE_SERVICE} (V121). */
+    private static final String DUPLICATE_SERVICE_INDEX =
+            DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX;
+
     private CreateServiceDefinitionRequest buildCreateRequest() {
         return new CreateServiceDefinitionRequest(
                 "Manicure",
@@ -182,7 +188,7 @@ class ServiceCatalogServiceTest {
 
         when(salonRepository.existsById(salonId)).thenReturn(true);
         stubActiveManicureType(serviceTypeId);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
 
         ServiceDefinitionResponse result = serviceCatalogService.addServiceToSalon(
                 salonId, buildTypedCreateRequest(serviceTypeId));
@@ -193,7 +199,7 @@ class ServiceCatalogServiceTest {
         assertThat(result.isActive()).as("newly created service definition must be active").isTrue();
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getOwnerType()).isEqualTo(OwnerType.SALON);
         assertThat(captor.getValue().getOwnerId()).isEqualTo(salonId);
     }
@@ -209,7 +215,160 @@ class ServiceCatalogServiceTest {
                 serviceCatalogService.addServiceToSalon(salonId, buildCreateRequest()))
                 .isInstanceOf(NotFoundException.class);
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    // ── duplicate-service guard (V121 ux_service_def_owner_service_type_active) ─
+
+    @Test
+    @DisplayName("throws DUPLICATE_SERVICE 409 when the salon already offers this service type")
+    void should_throwDuplicateService_when_salonAlreadyOffersServiceType() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        ServiceType serviceType = stubActiveManicureType(serviceTypeId);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        when(serviceType.getNameUk()).thenReturn("Класичне нарощення");
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, serviceTypeId, null))
+                .thenReturn(Optional.of(existingDefId));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.addServiceToSalon(salonId, buildTypedCreateRequest(serviceTypeId)))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+                    assertThat(dup.getExistingServiceDefId())
+                            .as("client must be able to deep-link to the existing service")
+                            .isEqualTo(existingDefId);
+                    assertThat(dup.getServiceName()).isEqualTo("Класичне нарощення");
+                });
+
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("price and duration are irrelevant — same service type is still a duplicate")
+    void should_throwDuplicateService_when_sameTypeSubmittedWithDifferentPriceAndDuration() {
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        ServiceType serviceType = stubActiveManicureType(serviceTypeId);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        when(serviceType.getNameUk()).thenReturn("Класичне нарощення");
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.INDEPENDENT_MASTER, masterId, serviceTypeId, null))
+                .thenReturn(Optional.of(UUID.randomUUID()));
+
+        // Deliberately a DIFFERENT price (999.00 vs the helper's 350.00) and duration (30 vs 60):
+        // the locked product rule keys on the service type alone.
+        CreateServiceDefinitionRequest differentPriceAndDuration = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", "MANICURE", 30, 10,
+                PriceType.FIXED, new BigDecimal("999.00"), null, null, serviceTypeId);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.addIndependentMasterService(userId, differentPriceAndDuration))
+                .isInstanceOf(DuplicateServiceException.class);
+
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("translates the index violation into DUPLICATE_SERVICE when the pre-check loses the race")
+    void should_translateIndexViolation_when_preCheckRaces() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        ServiceType serviceType = stubActiveManicureType(serviceTypeId);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        // Pre-check passes (a concurrent transaction has not committed yet)…
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, serviceTypeId, null))
+                .thenReturn(Optional.empty());
+        // …and the DB index is the one that catches it at flush.
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
+                .thenThrow(DuplicateServiceViolations.violationOf(DUPLICATE_SERVICE_INDEX));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.addServiceToSalon(salonId, buildTypedCreateRequest(serviceTypeId)))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
+                        .as("the index reports the constraint, not the surviving row")
+                        .isNull());
+    }
+
+    @Test
+    @DisplayName("rethrows a foreign-key violation untouched even when the caller stuffed the duplicate-index name into a free-text field")
+    void should_rethrowGenericViolation_when_userFieldContainsIndexName() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        // The attacker's payload: the duplicate index's name, verbatim, in a free-text field.
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                "Manicure",
+                DUPLICATE_SERVICE_INDEX,
+                "MANICURE",
+                60,
+                10,
+                PriceType.FIXED,
+                new BigDecimal("350.00"),
+                null,
+                null,
+                serviceTypeId);
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        ServiceType serviceType = stubActiveManicureType(serviceTypeId);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, serviceTypeId, null))
+                .thenReturn(Optional.empty());
+        // A DIFFERENT constraint fails, but PgJDBC renders the offending row — description and
+        // all — into the message, so the message now contains the duplicate index's name while
+        // getConstraintName() correctly reports the FK. Classification must follow the structured
+        // field, never the message, or the caller gets to pick their own error code.
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
+                .thenThrow(DuplicateServiceViolations.violationOf(
+                        "service_definitions_service_type_id_fkey",
+                        "ERROR: insert or update on table \"service_definitions\" violates foreign key "
+                                + "constraint \"service_definitions_service_type_id_fkey\"\n"
+                                + "  Detail: Failing row contains (…, Manicure, "
+                                + DUPLICATE_SERVICE_INDEX + ", …)."));
+
+        assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
+                .as("a caller-supplied string must not be able to buy a DUPLICATE_SERVICE 409")
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .isNotInstanceOf(DuplicateServiceException.class);
+    }
+
+    @Test
+    @DisplayName("rethrows an unrelated integrity violation untouched (generic handler keeps its opacity)")
+    void should_rethrowUnrelatedIntegrityViolation_when_notTheDuplicateIndex() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        ServiceType serviceType = stubActiveManicureType(serviceTypeId);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, serviceTypeId, null))
+                .thenReturn(Optional.empty());
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
+                .thenThrow(DuplicateServiceViolations.violationOf("service_definitions_service_type_id_fkey"));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.addServiceToSalon(salonId, buildTypedCreateRequest(serviceTypeId)))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .isNotInstanceOf(DuplicateServiceException.class);
     }
 
     // ── assignServiceToMaster ──────────────────────────────────────────────────
@@ -456,7 +615,7 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
         stubActiveManicureType(serviceTypeId);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(
@@ -472,7 +631,7 @@ class ServiceCatalogServiceTest {
         assertThat(result.isActive())
                 .as("isActive on response must be true as returned by the saved assignment")
                 .isTrue();
-        verify(serviceRepository).save(any(ServiceDefinition.class));
+        verify(serviceRepository).saveAndFlush(any(ServiceDefinition.class));
         verify(masterServiceRepository).save(any(MasterServiceAssignment.class));
         // MEDIUM-2: service must refresh the pre-computed min_effective_price index for the independent master.
         verify(masterRepository).refreshMinEffectivePrice(masterId);
@@ -492,7 +651,7 @@ class ServiceCatalogServiceTest {
                 serviceCatalogService.addIndependentMasterService(userId, buildCreateRequest()))
                 .isInstanceOf(ForbiddenException.class);
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -780,7 +939,7 @@ class ServiceCatalogServiceTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
 
         ServiceDefinitionResponse result = serviceCatalogService.addServiceToSalon(salonId, request);
 
@@ -789,7 +948,7 @@ class ServiceCatalogServiceTest {
         verify(serviceTypeLookup).getById(serviceTypeId);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getServiceType()).isSameAs(serviceType);
     }
 
@@ -810,7 +969,7 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceTypeLookup, never()).getById(any());
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -829,7 +988,7 @@ class ServiceCatalogServiceTest {
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Service type not found");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     // ── serviceType linkage via addIndependentMasterService ───────────────────
@@ -877,7 +1036,7 @@ class ServiceCatalogServiceTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "PEDICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(userId, request);
@@ -890,7 +1049,7 @@ class ServiceCatalogServiceTest {
         verify(serviceTypeLookup).getById(serviceTypeId);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getServiceType())
                 .as("serviceType must be set on the ServiceDefinition before save")
                 .isSameAs(serviceType);
@@ -915,7 +1074,7 @@ class ServiceCatalogServiceTest {
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Service type not found");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -939,7 +1098,7 @@ class ServiceCatalogServiceTest {
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -965,7 +1124,7 @@ class ServiceCatalogServiceTest {
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -1002,7 +1161,7 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST))
                 .hasMessageContaining("does not belong to the selected category");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     // ── Phase 16.4: serviceTypeNameUk lifted onto the MasterServiceResponse create path ─────
@@ -1054,7 +1213,7 @@ class ServiceCatalogServiceTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(savedDef);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(savedDef);
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         MasterServiceResponse result = serviceCatalogService.addIndependentMasterService(userId, request);
@@ -1086,7 +1245,7 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(serviceTypeLookup, never()).getById(any());
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -1120,7 +1279,7 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST))
                 .hasMessageContaining("does not belong to the selected category");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -1149,12 +1308,12 @@ class ServiceCatalogServiceTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
 
         serviceCatalogService.addServiceToSalon(salonId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getName())
                 .as("blank name on create must default to the type's Ukrainian name — never persist blank")
                 .isEqualTo("Манікюр");
@@ -1180,12 +1339,12 @@ class ServiceCatalogServiceTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
 
         serviceCatalogService.addServiceToSalon(salonId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getName())
                 .as("null name on create must default to the type's Ukrainian name")
                 .isEqualTo("Манікюр");
@@ -1213,7 +1372,7 @@ class ServiceCatalogServiceTest {
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     // ── getSalonServiceCatalog (Phase 13.6 — Public Salon Profile) ──────────────

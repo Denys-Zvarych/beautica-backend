@@ -212,7 +212,7 @@ class ServiceCatalogServiceCacheTest {
                 "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(salonRepository.existsById(salonId1)).thenReturn(true);
         when(salonRepository.existsById(salonId2)).thenReturn(true);
-        when(serviceRepository.save(any(ServiceDefinition.class)))
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
                 .thenReturn(savedDef1)
                 .thenReturn(savedDef2);
 

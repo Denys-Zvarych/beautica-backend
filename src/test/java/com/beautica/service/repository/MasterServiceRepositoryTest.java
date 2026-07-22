@@ -42,6 +42,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
 
     private Master master;
     private ServiceDefinition serviceDefinition;
+    private CatalogCategory defaultCategory;
     private ServiceType defaultServiceType;
 
     @BeforeEach
@@ -85,19 +86,31 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
         em.flush();
     }
 
-    /** Persists a CatalogCategory + ServiceType so fixture ServiceDefinitions satisfy the NOT NULL service_type_id FK. */
+    /**
+     * Persists a ServiceType (creating the shared CatalogCategory on first use) so fixture
+     * ServiceDefinitions satisfy the NOT NULL service_type_id FK.
+     *
+     * <p>Every call returns a DISTINCT ServiceType. That matters since V121: the partial unique
+     * index {@code ux_service_def_owner_service_type_active} allows only ONE active
+     * ServiceDefinition per {@code (owner_type, owner_id, service_type_id)}, so any fixture that
+     * gives one master several active services must give each of them its own service type.
+     * Reusing {@link #defaultServiceType} across active definitions is now a constraint violation.
+     */
     private ServiceType persistServiceType(String nameUk, String nameEn) {
-        // sort_order has a UNIQUE constraint; keep the default helper's value distinct from
-        // the 999 used by the graph test's own category so both can coexist in one test.
-        CatalogCategory category = CatalogCategory.builder()
-                .nameUk("Нігті")
-                .nameEn("Nails")
-                .sortOrder(500)
-                .build();
-        em.persist(category);
+        if (defaultCategory == null) {
+            // sort_order has a UNIQUE constraint; keep this value distinct from the 999 used by
+            // the graph test's own category so both can coexist in one test. Created once and
+            // reused so repeated calls cannot collide on sort_order.
+            defaultCategory = CatalogCategory.builder()
+                    .nameUk("Нігті")
+                    .nameEn("Nails")
+                    .sortOrder(500)
+                    .build();
+            em.persist(defaultCategory);
+        }
 
         ServiceType serviceType = ServiceType.builder()
-                .category(category)
+                .category(defaultCategory)
                 .nameUk(nameUk)
                 .nameEn(nameEn)
                 .slug("type-" + UUID.randomUUID())
@@ -118,7 +131,8 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(45)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("300.00"))
-                .serviceType(defaultServiceType)
+                // Distinct type: V121 allows only one ACTIVE definition per (owner, type).
+                .serviceType(persistServiceType("Класичний манікюр", "Classic Manicure"))
                 .isActive(true)
                 .build();
         em.persist(secondService);
@@ -143,7 +157,9 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .baseDurationMinutes(90)
                 .priceType(PriceType.FIXED)
                 .basePrice(new BigDecimal("500.00"))
-                .serviceType(defaultServiceType)
+                // Distinct type: V121 allows only one ACTIVE definition per (owner, type).
+                // (The definition is active here — it is the ASSIGNMENT below that is inactive.)
+                .serviceType(persistServiceType("Педикюр", "Pedicure"))
                 .isActive(true)
                 .build();
         em.persist(inactiveServiceDef);
@@ -394,7 +410,9 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                     .baseDurationMinutes(30 + i)
                     .priceType(PriceType.FIXED)
                     .basePrice(new BigDecimal("100.00"))
-                    .serviceType(defaultServiceType)
+                    // Distinct type per iteration: V121 allows only one ACTIVE definition
+                    // per (owner, type), and all 5 belong to the same master.
+                    .serviceType(persistServiceType("Тип-" + i, "Type-" + i))
                     .isActive(true)
                     .build();
             em.persist(def);
@@ -477,7 +495,9 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                     .baseDurationMinutes(30)
                     .priceType(PriceType.FIXED)
                     .basePrice(new BigDecimal("100.00"))
-                    .serviceType(defaultServiceType)
+                    // Distinct type per iteration: V121 allows only one ACTIVE definition
+                    // per (owner, type), and all 3 belong to the same master.
+                    .serviceType(persistServiceType("Звʼязка-" + i, "Tie-" + i))
                     .isActive(true)
                     .build();
             em.persist(def);

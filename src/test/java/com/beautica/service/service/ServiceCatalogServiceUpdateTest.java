@@ -1,6 +1,7 @@
 package com.beautica.service.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
@@ -22,6 +23,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
+import org.springframework.dao.DataIntegrityViolationException;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -127,7 +129,7 @@ class ServiceCatalogServiceUpdateTest {
         saved.setBasePrice(new BigDecimal("400.00"));
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(saved);
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -142,7 +144,7 @@ class ServiceCatalogServiceUpdateTest {
         assertThat(result.priceMin()).isEqualByComparingTo("400.00");
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getName()).isEqualTo("New Manicure");
         assertThat(captor.getValue().getBasePrice()).isEqualByComparingTo("400.00");
     }
@@ -158,7 +160,7 @@ class ServiceCatalogServiceUpdateTest {
         saved.setBaseDurationMinutes(90);
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(saved);
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -168,7 +170,7 @@ class ServiceCatalogServiceUpdateTest {
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
 
         ServiceDefinition submitted = captor.getValue();
         assertThat(submitted.getBaseDurationMinutes())
@@ -199,7 +201,7 @@ class ServiceCatalogServiceUpdateTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "HAIRCUT", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(saved);
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -210,7 +212,7 @@ class ServiceCatalogServiceUpdateTest {
         assertThat(result.category()).isEqualTo("HAIRCUT");
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getCategory()).isEqualTo("HAIRCUT");
     }
 
@@ -223,7 +225,7 @@ class ServiceCatalogServiceUpdateTest {
         ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(existing);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenReturn(existing);
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterId));
 
@@ -259,7 +261,7 @@ class ServiceCatalogServiceUpdateTest {
                 .hasMessageContaining("Unknown category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -280,7 +282,7 @@ class ServiceCatalogServiceUpdateTest {
                 .hasMessageContaining("Unknown category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -300,7 +302,7 @@ class ServiceCatalogServiceUpdateTest {
                 .hasMessageContaining("Unknown category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     // ── updateServiceDefinition — error cases ─────────────────────────────────
@@ -319,7 +321,7 @@ class ServiceCatalogServiceUpdateTest {
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining(nonExistentId.toString());
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     // ── updateServicePhoto — happy path ───────────────────────────────────────
@@ -409,7 +411,7 @@ class ServiceCatalogServiceUpdateTest {
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
         when(serviceTypeLookup.getById(newTypeId)).thenReturn(newType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -423,10 +425,171 @@ class ServiceCatalogServiceUpdateTest {
         verify(serviceTypeLookup).getById(newTypeId);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getServiceType())
                 .as("the resolved service type must be set on the entity before save")
                 .isSameAs(newType);
+    }
+
+    // ── duplicate-service guard on PATCH (V121) ────────────────────────────────
+
+    @Test
+    @DisplayName("throws DUPLICATE_SERVICE when a PATCH repoints the service at a type the owner already offers")
+    void should_throwDuplicateService_when_patchRepointsToTypeOwnerAlreadyOffers() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID newTypeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId); // category = MANICURE
+
+        ServiceType newType = mock(ServiceType.class);
+        when(newType.isActive()).thenReturn(true);
+        when(newType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(newType.getId()).thenReturn(newTypeId);
+        when(newType.getNameUk()).thenReturn("Класичне нарощення");
+
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceTypeLookup.getById(newTypeId)).thenReturn(newType);
+        // The owner already has an ACTIVE service of the target type on a DIFFERENT row.
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, ownerId, newTypeId, serviceDefId))
+                .thenReturn(Optional.of(existingDefId));
+
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, null, null, null, null, null, null, null, newTypeId);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
+                        .isEqualTo(existingDefId));
+
+        // The guard must run BEFORE the entity is dirtied and before any write is issued.
+        assertThat(existing.getServiceType())
+                .as("the colliding type must NOT have been assigned to the managed entity — "
+                        + "assigning it first would make Hibernate AUTO-flush the violating UPDATE "
+                        + "inside the guard's own query, defeating the check")
+                .isNull();
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("PATCH re-submitting the type the service already has is not a self-collision (excludeId)")
+    void should_notFlagSelfCollision_when_patchResubmitsTheSameServiceType() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID sameTypeId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
+
+        ServiceType sameType = mock(ServiceType.class);
+        when(sameType.isActive()).thenReturn(true);
+        when(sameType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(sameType.getId()).thenReturn(sameTypeId);
+
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceTypeLookup.getById(sameTypeId)).thenReturn(sameType);
+        // Own row excluded — the finder sees no OTHER active row of this type.
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, ownerId, sameTypeId, serviceDefId))
+                .thenReturn(Optional.empty());
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
+                .thenReturn(List.of());
+
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, null, null, null, null, null, null, null, sameTypeId);
+
+        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+
+        // Pins that excludeId is the definition's own id — passing null here would make every
+        // no-op type re-submit a false 409.
+        verify(serviceRepository).findActiveDuplicateId(
+                OwnerType.SALON, ownerId, sameTypeId, serviceDefId);
+        verify(serviceRepository).saveAndFlush(any(ServiceDefinition.class));
+    }
+
+    @Test
+    @DisplayName("combined category + serviceTypeId PATCH runs the duplicate guard against the NEW category and leaves the entity clean")
+    void should_guardAgainstNewCategory_when_patchChangesCategoryAndServiceTypeTogether() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID newTypeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId); // category = MANICURE
+
+        // The new type belongs to HAIRCUT — i.e. it resolves ONLY against the category arriving in
+        // the same request, which is what makes this the combined-PATCH case rather than two
+        // independent ones.
+        ServiceType hairType = mock(ServiceType.class);
+        when(hairType.isActive()).thenReturn(true);
+        when(hairType.getPlatformCategoryName()).thenReturn("HAIRCUT");
+        when(hairType.getId()).thenReturn(newTypeId);
+        when(hairType.getNameUk()).thenReturn("Стрижка");
+
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "HAIRCUT", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceTypeLookup.getById(newTypeId)).thenReturn(hairType);
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, ownerId, newTypeId, serviceDefId))
+                .thenReturn(Optional.of(existingDefId));
+
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, "HAIRCUT", null, null, null, null, null, null, newTypeId);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
+                        .isEqualTo(existingDefId));
+
+        // This is the regression the two-phase split in resolvePatchServiceType exists to prevent.
+        // In the interleaved version the category setter fired FIRST, so by the time the guard ran
+        // its JPQL over ServiceDefinition, Hibernate's AUTO flush had already pushed a
+        // category-only UPDATE — an extra statement, an early row lock, and (once the type setter
+        // followed) a second UPDATE from saveAndFlush. Asserting the entity is still CLEAN is the
+        // only observable proof the ordering held; a plain "409 was thrown" assertion passes
+        // either way.
+        assertThat(existing.getCategory())
+                .as("phase 1 is query-only — the category setter must not have fired before the guard")
+                .isEqualTo("MANICURE");
+        assertThat(existing.getServiceType())
+                .as("nor the service-type setter")
+                .isNull();
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("translates the index violation on PATCH into DUPLICATE_SERVICE when the guard loses the race")
+    void should_translateIndexViolation_onPatch_when_guardRaces() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID newTypeId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
+
+        ServiceType newType = mock(ServiceType.class);
+        when(newType.isActive()).thenReturn(true);
+        when(newType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(newType.getId()).thenReturn(newTypeId);
+
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceTypeLookup.getById(newTypeId)).thenReturn(newType);
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, ownerId, newTypeId, serviceDefId))
+                .thenReturn(Optional.empty());
+        // Hibernate's STRUCTURED constraint name is what classification reads — a bare
+        // DataIntegrityViolationException whose message merely mentions the index is
+        // deliberately no longer enough (caller text can reach the message), which is exactly
+        // what the shared builder encodes.
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
+                .thenThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX));
+
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, null, null, null, null, null, null, null, newTypeId);
+
+        // Without the translation the PATCH path would surface the GENERIC 409
+        // ("Request conflicts with existing data") carrying no data.code.
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+                .isInstanceOf(DuplicateServiceException.class);
     }
 
     @Test
@@ -447,7 +610,7 @@ class ServiceCatalogServiceUpdateTest {
                 "HAIRCUT", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
         when(serviceTypeLookup.getById(newTypeId)).thenReturn(hairType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -457,7 +620,7 @@ class ServiceCatalogServiceUpdateTest {
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getCategory())
                 .as("category must be updated to the new HAIRCUT value").isEqualTo("HAIRCUT");
         assertThat(captor.getValue().getServiceType())
@@ -485,7 +648,7 @@ class ServiceCatalogServiceUpdateTest {
                 .hasMessageContaining("Service type is not active")
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -511,7 +674,7 @@ class ServiceCatalogServiceUpdateTest {
                 .hasMessageContaining("does not belong to the selected category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -525,7 +688,7 @@ class ServiceCatalogServiceUpdateTest {
         existing.setServiceType(existingType);
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -539,7 +702,7 @@ class ServiceCatalogServiceUpdateTest {
         verify(serviceTypeLookup, never()).getById(any());
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getServiceType())
                 .as("the pre-existing service type must remain set — null serviceTypeId means no change")
                 .isSameAs(existingType);
@@ -580,7 +743,7 @@ class ServiceCatalogServiceUpdateTest {
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
         // The inconsistent pair must never be persisted.
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
         verify(serviceTypeLookup, never()).getById(any());
     }
 
@@ -599,7 +762,7 @@ class ServiceCatalogServiceUpdateTest {
         when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 "HAIR", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -611,7 +774,7 @@ class ServiceCatalogServiceUpdateTest {
         // No re-resolve of the type, but the existing matching type must survive and persist.
         verify(serviceTypeLookup, never()).getById(any());
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getCategory())
                 .as("category must be updated to HAIR").isEqualTo("HAIR");
         assertThat(captor.getValue().getServiceType())
@@ -635,7 +798,7 @@ class ServiceCatalogServiceUpdateTest {
         existing.setServiceType(existingType);
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -646,7 +809,7 @@ class ServiceCatalogServiceUpdateTest {
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getName())
                 .as("blank name must default to the existing service type's Ukrainian name — never persist blank")
                 .isEqualTo("Манікюр");
@@ -667,7 +830,7 @@ class ServiceCatalogServiceUpdateTest {
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
         when(serviceTypeLookup.getById(newTypeId)).thenReturn(newType);
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -679,7 +842,7 @@ class ServiceCatalogServiceUpdateTest {
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getName())
                 .as("blank name must default to the newly-linked type's nameUk, not the old name")
                 .isEqualTo("Френч");
@@ -693,7 +856,7 @@ class ServiceCatalogServiceUpdateTest {
         ServiceDefinition existing = buildDefinition(serviceDefId, ownerId); // name = "Original Name"
 
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
 
@@ -704,7 +867,7 @@ class ServiceCatalogServiceUpdateTest {
         serviceCatalogService.updateServiceDefinition(serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
+        verify(serviceRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getName())
                 .as("absent (null) name must leave the existing name unchanged")
                 .isEqualTo("Original Name");
@@ -727,6 +890,6 @@ class ServiceCatalogServiceUpdateTest {
                 .hasMessageContaining("Name or service type is required")
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).saveAndFlush(any());
     }
 }

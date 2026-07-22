@@ -22,6 +22,37 @@ import lombok.Setter;
 import java.math.BigDecimal;
 import java.util.UUID;
 
+/**
+ * A service offered by an owner (a salon or a master).
+ *
+ * <p><b>Uniqueness — one ACTIVE service per {@code (ownerType, ownerId, serviceType)}.</b>
+ * Enforced by the partial unique index {@code ux_service_def_owner_service_type_active}
+ * (V121):
+ *
+ * <pre>{@code
+ * CREATE UNIQUE INDEX ux_service_def_owner_service_type_active
+ *     ON service_definitions (owner_type, owner_id, service_type_id)
+ *     WHERE is_active = true;
+ * }</pre>
+ *
+ * <p>The key is {@code service_type_id}, never {@code name}: the name is derived from the type
+ * ({@code ServiceCatalogService#resolveCreateName} defaults to {@code serviceType.nameUk}, and
+ * the bulk path always uses it), so a custom name must not be able to bypass the rule. Price and
+ * duration are deliberately NOT part of the key — two rows of the same type at different prices
+ * are duplicates by the locked product decision, not variants.
+ *
+ * <p>The index is <b>partial on {@code is_active = true}</b> because deletion is soft
+ * ({@code ServiceRepository#deactivateById} flips the flag and the row survives). An
+ * unconditional constraint would make a once-deleted service permanently uncreatable, with no
+ * reactivate endpoint to escape.
+ *
+ * <p><b>Intentionally absent from {@code @Table(uniqueConstraints = …)}.</b> Hibernate cannot
+ * express a partial (filtered) unique index; declaring it there would model an
+ * <em>unconditional</em> one, putting {@code ddl-auto=validate} permanently at odds with the
+ * real schema and re-breaking soft-delete on any generated DDL. The migration is the single
+ * source of truth; {@code ServiceCatalogService} translates violations into a
+ * {@code DUPLICATE_SERVICE} 409.
+ */
 @Entity
 @Table(name = "service_definitions",
         indexes = {

@@ -7,6 +7,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
@@ -181,6 +182,108 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 .as("second identical assignment must return 409 CONFLICT, serviceDefId=%s, masterId=%s",
                         serviceDefId, masterId)
                 .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ── V121 one-active-service-per-(owner, type) — full stack ─────────────────
+    //
+    // The @WebMvcTest slice pins the 409's JSON shape against a mocked service, and
+    // ServiceDefinitionUniqueActiveTypeTest pins the partial index against real Postgres.
+    // Neither proves the two meet: that a real HTTP create against a real database produces the
+    // branchable body carrying a REAL, resolvable existingServiceDefId. That composition — the
+    // exact call the mobile add-service screen makes — is only observable here.
+
+    @Test
+    @DisplayName("409 DUPLICATE_SERVICE with the existing service's id when the salon re-adds a service type it already offers")
+    void should_return409WithExistingServiceDefId_when_salonReAddsSameServiceType() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "integ-owner-duptype-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Duplicate Type Salon");
+        UUID serviceTypeId = fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE");
+
+        UUID firstServiceDefId = fixtures.createServiceDefinition(ownerToken, salonId,
+                new CreateServiceDefinitionRequest("Класичне нарощення", null, "NAIL_SERVICE", 60, 10,
+                        PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId));
+
+        // Deliberately a different name, price and duration: the locked product rule keys on the
+        // service type alone, so none of these make it a distinct service.
+        var duplicate = new CreateServiceDefinitionRequest("Класичне нарощення VIP", null, "NAIL_SERVICE", 120, 10,
+                PriceType.FIXED, new BigDecimal("900.00"), null, null, serviceTypeId);
+
+        // Act
+        log.debug("Act: POST /api/v1/salons/{}/services re-adding service type {} at a different price", salonId, serviceTypeId);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(duplicate, fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode())
+                .as("re-adding an already-offered service type must conflict, salonId=%s", salonId)
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<DuplicateServiceResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data())
+                .extracting(DuplicateServiceResponse::code, DuplicateServiceResponse::existingServiceDefId)
+                .as("the client branches on code and deep-links via existingServiceDefId")
+                .containsExactly("DUPLICATE_SERVICE", firstServiceDefId);
+
+        // Nothing was written: a 409 that still inserted would leave the owner with a phantom row.
+        Long definitionCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE owner_id = ?", Long.class, salonId);
+        assertThat(definitionCount).as("the rejected create must persist nothing").isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("re-creating a service type after it was deleted succeeds — the index is partial on is_active")
+    void should_allowRecreation_when_theServiceTypeWasPreviouslyDeleted() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "integ-owner-recreate-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Recreate Salon");
+        UUID serviceTypeId = fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE");
+
+        UUID firstServiceDefId = fixtures.createServiceDefinition(ownerToken, salonId,
+                new CreateServiceDefinitionRequest("Класичне нарощення", null, "NAIL_SERVICE", 60, 10,
+                        PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId));
+
+        log.debug("Act step 1: DELETE /api/v1/services/{} — soft delete flips is_active", firstServiceDefId);
+        ResponseEntity<Void> deleteResp = restTemplate.exchange(
+                "/api/v1/services/" + firstServiceDefId, HttpMethod.DELETE,
+                new HttpEntity<>(null, fixtures.bearerHeaders(ownerToken)), Void.class);
+        assertThat(deleteResp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+
+        // Act — the same service type again. Deletion is SOFT, so the losing row survives; an
+        // unconditional unique constraint (or a pre-check that dropped its isActive predicate)
+        // would make this service permanently uncreatable, with no reactivate endpoint to escape.
+        log.debug("Act step 2: POST /api/v1/salons/{}/services re-creating the deleted service type", salonId);
+        ResponseEntity<String> recreateResp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(new CreateServiceDefinitionRequest(
+                        "Класичне нарощення", null, "NAIL_SERVICE", 60, 10,
+                        PriceType.FIXED, new BigDecimal("650.00"), null, null, serviceTypeId),
+                        fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(recreateResp.getStatusCode())
+                .as("re-creating a soft-deleted service type must succeed, not 409")
+                .isEqualTo(HttpStatus.CREATED);
+
+        var recreated = objectMapper.readValue(
+                recreateResp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
+        assertThat(recreated.data().id())
+                .as("a fresh row is inserted — the soft-deleted definition is never resurrected")
+                .isNotEqualTo(firstServiceDefId);
+
+        Long activeCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE owner_id = ? AND is_active = TRUE",
+                Long.class, salonId);
+        assertThat(activeCount)
+                .as("exactly one ACTIVE definition of this type remains — the invariant V121 enforces")
+                .isEqualTo(1L);
     }
 
 }
