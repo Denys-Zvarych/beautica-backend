@@ -54,6 +54,7 @@ public class BookingCancellationService {
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
+    private final GuestVisitCancellationService guestVisitCancellationService;
     private final BookingRepository bookingRepository;
     private final NotificationOutboxService outboxService;
     private final SmsService smsService;
@@ -63,6 +64,7 @@ public class BookingCancellationService {
     private final Clock kyivClock;
 
     public BookingCancellationService(
+            GuestVisitCancellationService guestVisitCancellationService,
             BookingRepository bookingRepository,
             NotificationOutboxService outboxService,
             SmsService smsService,
@@ -70,6 +72,7 @@ public class BookingCancellationService {
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             Clock clock) {
+        this.guestVisitCancellationService = guestVisitCancellationService;
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
         this.smsService = smsService;
@@ -88,8 +91,10 @@ public class BookingCancellationService {
      */
     @Transactional(readOnly = true)
     public CancelTokenInfoResponse getInfo(UUID token) {
-        Booking booking = loadCancellableOrThrow(token);
-        return buildInfo(booking);
+        // BE-7: a token on an Appointment is a multi-service visit — served by the visit service. Only a
+        // token that resolves to no visit falls through to the legacy single-booking path below.
+        return guestVisitCancellationService.getInfo(token)
+                .orElseGet(() -> buildInfo(loadCancellableOrThrow(token)));
     }
 
     /**
@@ -101,6 +106,12 @@ public class BookingCancellationService {
      */
     @Transactional
     public void cancel(UUID token) {
+        // BE-7: a token on an Appointment cancels the WHOLE visit (header + all items) via the visit
+        // service; it returns true when it handled the token. Only a non-visit token falls through to
+        // the legacy single-booking cancel below (byte-for-byte unchanged).
+        if (guestVisitCancellationService.cancel(token)) {
+            return;
+        }
         Booking booking = loadCancellableOrThrow(token);
 
         if (!isCancellable(booking)) {

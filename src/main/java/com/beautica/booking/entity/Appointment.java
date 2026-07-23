@@ -148,4 +148,49 @@ public class Appointment extends AuditableEntity {
 
     @Column(name = "guest_phone", length = 20)
     private String guestPhone;
+
+    /**
+     * Factory for an auto-confirmed guest (LINK) multi-service visit header (BE-7). Enforces the LINK
+     * invariant (guest identity + cancel token non-null, no registered client) before the row exists —
+     * mirroring {@link com.beautica.booking.entity.Booking#guestBooking} and the DB CHECK
+     * {@code chk_appointment_guest_fields} (V126): a partially-populated guest visit can never be
+     * constructed in code.
+     *
+     * <p>The header carries the ONE cancel token the guest uses to cancel the WHOLE visit (surfaced in
+     * the confirmation SMS). The chained child {@code Booking} rows each carry their OWN token (the V91
+     * {@code chk_bookings_guest_fields} CHECK requires a non-null token on every CONFIRMED LINK row);
+     * those per-item tokens are never surfaced and are nulled together with the header's on cancel.
+     *
+     * @param salon        the visit's salon, or {@code null} for an independent-master visit
+     * @param guestName    OTP-verified guest first name (required)
+     * @param guestSurname guest surname (optional — column is nullable)
+     * @param guestPhone   E.164 phone copied from the guest JWT {@code sub} (required)
+     * @param cancelToken  the visit-level one-time cancel token (required)
+     */
+    public static Appointment guestAppointment(
+            Salon salon,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            UUID cancelToken) {
+        if (guestName == null || guestName.isBlank()) {
+            throw new IllegalArgumentException("guestName must not be blank for a LINK appointment");
+        }
+        if (guestPhone == null || guestPhone.isBlank()) {
+            throw new IllegalArgumentException("guestPhone must not be blank for a LINK appointment");
+        }
+        if (cancelToken == null) {
+            throw new IllegalArgumentException("cancelToken must not be null for a LINK appointment");
+        }
+        return Appointment.builder()
+                // No client FK: a guest visit has no registered account (V126 enforces LINK ⇒ client NULL).
+                .salon(salon)
+                .status(BookingStatus.CONFIRMED)
+                .bookingSource(BookingSource.LINK)
+                .guestName(guestName)
+                .guestSurname(guestSurname)
+                .guestPhone(guestPhone)
+                .cancelToken(cancelToken)
+                .build();
+    }
 }

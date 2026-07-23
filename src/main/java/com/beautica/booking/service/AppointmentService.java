@@ -2,7 +2,6 @@ package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.AppointmentDetailResponse;
-import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.CreateAppointmentRequest;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
@@ -22,8 +21,6 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.salon.entity.Salon;
-import com.beautica.service.entity.MasterServiceAssignment;
-import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -35,7 +32,6 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -83,7 +79,6 @@ public class AppointmentService {
     private final AppointmentRepository appointmentRepository;
     private final BookingRepository bookingRepository;
     private final MasterRepository masterRepository;
-    private final MasterServiceRepository masterServiceRepository;
     private final UserRepository userRepository;
     private final ReviewRepository reviewRepository;
     private final NotificationOutboxService outboxService;
@@ -91,6 +86,7 @@ public class AppointmentService {
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final AuthorizationService authz;
     private final DiscoveryLocationResolver discoveryLocationResolver;
+    private final VisitPlanner visitPlanner;
     private final Clock clock;
 
     /**
@@ -204,24 +200,15 @@ public class AppointmentService {
                 .filter(Master::isActive)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
 
-        List<UUID> serviceIds = request.masterServiceIds();
-        // Defensive belt behind the DTO's @NotEmpty/@Size — the service must never trust an empty or
-        // unbounded list (mirrors SlotCalculationService#assertServiceIds). Duplicates are allowed
-        // verbatim (locked decision): the block sums repeats, staying consistent with BE-2 availability.
-        if (serviceIds == null || serviceIds.isEmpty()) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "At least one service is required");
-        }
-        if (serviceIds.size() > SlotCalculationService.MAX_SERVICES_PER_VISIT) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "At most " + SlotCalculationService.MAX_SERVICES_PER_VISIT
-                            + " services can be booked in a single visit");
-        }
-
         OffsetDateTime firstStart = request.startsAt().toOffsetDateTime();
         // Same lead-time floor + max-window cap as the single-service create path (DRY).
         BookingStartsAtValidator.validate(firstStart, clock);
 
-        List<PlannedItem> items = planChainedItems(master, serviceIds, firstStart);
+        // Resolve + chain + price-freeze + Σ-cap + list-size guard (BE-7: shared verbatim with the guest
+        // LINK path via VisitPlanner, so the two create paths cannot drift on the pieces that must match
+        // BE-2 availability). Duplicates are allowed verbatim; an unknown/foreign/inactive service → 404.
+        List<VisitPlanner.PlannedItem> items =
+                visitPlanner.planChainedItems(master, request.masterServiceIds(), firstStart);
         OffsetDateTime lastEnd = items.get(items.size() - 1).endsAt();
 
         // Fix H3 shape: load + validate the client BEFORE the locks to keep the lock window tight.
@@ -278,7 +265,7 @@ public class AppointmentService {
                 .build();
 
         List<Booking> bookings = new ArrayList<>(items.size());
-        for (PlannedItem item : items) {
+        for (VisitPlanner.PlannedItem item : items) {
             bookings.add(Booking.builder()
                     .client(client)
                     .master(master)
@@ -321,68 +308,6 @@ public class AppointmentService {
         return appointment.getId();
     }
 
-    /**
-     * Resolves each service in list order and chains their windows back-to-back, freezing the
-     * per-item price/duration snapshot. Item 0 starts at {@code firstStart}; item {@code i} starts
-     * when item {@code i-1} ends, where each item's length is its effective duration (override beats
-     * base) PLUS its own {@code bufferMinutesAfter} — identical to BE-2's {@code effectiveDuration},
-     * so the summed block equals the slot the client was offered. Enforces the
-     * {@link SlotCalculationService#MAX_TOTAL_DURATION_MINUTES} ceiling on the sum.
-     */
-    private List<PlannedItem> planChainedItems(Master master, List<UUID> serviceIds, OffsetDateTime firstStart) {
-        List<PlannedItem> items = new ArrayList<>(serviceIds.size());
-        OffsetDateTime cursor = firstStart;
-        long totalMinutes = 0;
-        for (UUID masterServiceId : serviceIds) {
-            // Master-scoped fetch: an empty result means the service is unknown, foreign OR inactive —
-            // all three answer 404 uniformly, the same contract BE-2 uses.
-            MasterServiceAssignment msa = masterServiceRepository
-                    .findByMasterIdAndIdWithGraph(master.getId(), masterServiceId)
-                    .filter(MasterServiceAssignment::isActive)
-                    .orElseThrow(() -> new NotFoundException("Master service not found"));
-
-            int duration = msa.getDurationOverrideMinutes() != null
-                    ? msa.getDurationOverrideMinutes()
-                    : msa.getServiceDefinition().getBaseDurationMinutes();
-            int buffer = msa.getServiceDefinition().getBufferMinutesAfter();
-            BigDecimal price = msa.getPriceOverride() != null
-                    ? msa.getPriceOverride()
-                    : msa.getServiceDefinition().getBasePrice();
-
-            OffsetDateTime start = cursor;
-            OffsetDateTime end = start.plusMinutes((long) duration + buffer);
-            items.add(new PlannedItem(
-                    msa, start, end, duration, buffer, price, BookingPriceRange.resolveCeiling(msa)));
-
-            totalMinutes += (long) duration + buffer;
-            cursor = end;
-        }
-        if (totalMinutes > SlotCalculationService.MAX_TOTAL_DURATION_MINUTES) {
-            throw new BusinessException("total service duration exceeds maximum allowed");
-        }
-        assertContiguous(items);
-        return items;
-    }
-
-    /**
-     * Defensive invariant guard (never client-triggered — the chain is built contiguous above): each
-     * item is positive-width and each item starts exactly where the previous one ended, so no two
-     * chained items can ever overlap or leave a negative gap.
-     */
-    private void assertContiguous(List<PlannedItem> items) {
-        for (int i = 0; i < items.size(); i++) {
-            PlannedItem item = items.get(i);
-            if (!item.endsAt().isAfter(item.startsAt())) {
-                throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
-                        "Appointment item has non-positive duration");
-            }
-            if (i > 0 && !item.startsAt().isEqual(items.get(i - 1).endsAt())) {
-                throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
-                        "Chained appointment items are not contiguous");
-            }
-        }
-    }
-
     private void acquireClientLock(UUID clientId) {
         Integer lockResult = bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId);
         if (lockResult == null) {
@@ -416,9 +341,9 @@ public class AppointmentService {
      * collected across every item (and both the start and end day, in the rare event a service spans
      * midnight), then the per-master free-slot verdict and the salon catalogue are evicted once.
      */
-    private void registerSlotEviction(UUID masterId, UUID salonId, List<PlannedItem> items) {
+    private void registerSlotEviction(UUID masterId, UUID salonId, List<VisitPlanner.PlannedItem> items) {
         Set<SlotKey> slotKeys = new LinkedHashSet<>();
-        for (PlannedItem item : items) {
+        for (VisitPlanner.PlannedItem item : items) {
             UUID serviceId = item.masterService().getId();
             slotKeys.add(new SlotKey(item.startsAt().toLocalDate(), serviceId));
             slotKeys.add(new SlotKey(item.endsAt().toLocalDate(), serviceId));
@@ -443,16 +368,6 @@ public class AppointmentService {
             task.run();
         }
     }
-
-    /** One resolved, priced service line ready to become a chained {@link Booking} row. */
-    private record PlannedItem(
-            MasterServiceAssignment masterService,
-            OffsetDateTime startsAt,
-            OffsetDateTime endsAt,
-            int duration,
-            int buffer,
-            BigDecimal price,
-            BigDecimal priceMax) {}
 
     /** Distinct availability-cache eviction key: one Kyiv-civil date × one master-service. */
     private record SlotKey(LocalDate date, UUID masterServiceId) {}

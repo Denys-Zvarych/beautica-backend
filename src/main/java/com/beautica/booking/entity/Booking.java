@@ -8,6 +8,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.user.User;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -243,6 +244,12 @@ public class Booking extends AuditableEntity {
     // Uniqueness is enforced by the V90 partial-unique index (UNIQUE only over non-NULL
     // rows). `unique = true` here would direct Hibernate ddl-auto to recreate the full
     // unique constraint V90 deliberately dropped, so it is intentionally omitted.
+    //
+    // @JsonIgnore: cancel_token is a guest-cancel CAPABILITY token — whoever holds it can cancel
+    // this booking. With multi-service visits (BE-7) each item carries its own per-item token, so
+    // there are now N per visit; shield every JSON serialization path so a future accidental
+    // entity-return can never leak them (mirrors Appointment.cancelToken).
+    @JsonIgnore
     @Column(name = "cancel_token")
     private UUID cancelToken;
 

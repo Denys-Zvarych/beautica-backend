@@ -4,6 +4,7 @@ import com.beautica.booking.entity.Appointment;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -35,4 +36,37 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     Optional<Appointment> findActiveByClientIdAndIdempotencyKey(
             @Param("clientId") UUID clientId,
             @Param("idempotencyKey") String idempotencyKey);
+
+    // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
+    /**
+     * Resolves a guest (LINK) visit by its one-time {@code cancel_token} for the public cancel page —
+     * the visit-level analogue of {@code BookingRepository#findByCancelTokenWithGraph}. Rides the V124
+     * partial-unique index {@code ux_appointments_cancel_token} (UNIQUE over non-NULL rows only). A
+     * consumed token is {@code NULL} (nulled by {@link #consumeCancelToken}), so a replayed link returns
+     * empty. Header only — the caller reads the chained items via
+     * {@code BookingRepository#findByAppointmentIdWithGraph} for the master/service labels + eviction.
+     */
+    @Query("SELECT a FROM Appointment a WHERE a.cancelToken = :cancelToken")
+    Optional<Appointment> findByCancelToken(@Param("cancelToken") UUID cancelToken);
+
+    /**
+     * Atomically consumes a visit's cancel token: flips a still-{@code CONFIRMED} guest visit HEADER to
+     * {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls the token, in a single conditional
+     * UPDATE. Mirrors {@code BookingRepository#consumeCancelToken} lifted to the aggregate header: of N
+     * concurrent {@code POST /cancel/{token}} requests, exactly ONE affects 1 row (the winner cancels
+     * the visit's items + fires the side-effects); every other affects 0 → mapped to 404. The child
+     * {@code bookings} rows are cancelled separately by {@code BookingRepository#cancelItemsByAppointmentId}.
+     *
+     * @return the number of header rows updated — {@code 1} for the winner, {@code 0} otherwise
+     */
+    @Modifying
+    @Query("""
+            UPDATE Appointment a
+               SET a.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
+                   a.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
+                   a.cancelToken = null
+             WHERE a.cancelToken = :cancelToken
+               AND a.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    int consumeCancelToken(@Param("cancelToken") UUID cancelToken);
 }

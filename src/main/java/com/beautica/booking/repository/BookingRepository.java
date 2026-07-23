@@ -822,12 +822,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * job inside its transaction, so the {@code masterService}/{@code serviceDefinition}
      * graph is joined to render the reminder text without a lazy load.
      */
+    // {@code LEFT JOIN FETCH b.appointment} (BE-7): a multi-service guest visit's N item rows share one
+    // appointment_id, so the reminder sweep groups by it to send ONE reminder per visit (not one per
+    // item). The fetch hydrates the header eagerly so BookingReminderJob can read appointment id with no
+    // lazy load / N+1; legacy single guest bookings LEFT-join to a null header and each get their own
+    // reminder, unchanged.
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
             JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
+            LEFT JOIN FETCH b.appointment
             WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
               AND b.reminderSent = false
               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
@@ -836,6 +842,47 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<Booking> findGuestBookingsForReminder(
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to);
+
+    // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
+    /**
+     * Cancels every still-{@code CONFIRMED} child booking of a guest visit in ONE conditional UPDATE:
+     * flips each to {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls its per-item cancel
+     * token (V91 permits a NULL token on a terminal LINK row). Called by
+     * {@code GuestVisitCancellationService} right after {@code AppointmentRepository#consumeCancelToken}
+     * wins the header race, so the header and all N items reach {@code CANCELLED} atomically in the same
+     * transaction — freeing every item's slot (the {@code no_overlapping_bookings} EXCLUDE predicate is
+     * {@code status = 'CONFIRMED'} only). Rides the partial index {@code idx_bookings_appointment}.
+     *
+     * @return the number of item rows cancelled
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
+                   b.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
+                   b.cancelToken = null
+             WHERE b.appointment.id = :appointmentId
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    int cancelItemsByAppointmentId(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Marks every item of the given guest visits as reminded (BE-7). Called by
+     * {@code BookingReminderJob} after it sends ONE reminder per visit: this flips ALL of a visit's
+     * item rows — including any tail item whose own {@code starts_at} falls outside the sweep's 2h
+     * reminder window (a visit can span up to 10h) — so no later sweep can re-remind the visit's tail.
+     * Bounded to the visits actually reminded in one sweep.
+     *
+     * @return the number of item rows updated
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.reminderSent = true
+             WHERE b.appointment.id IN :appointmentIds
+               AND b.reminderSent = false
+            """)
+    int markVisitRemindersSentByAppointmentIds(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
     /**
@@ -848,6 +895,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      *
      * <p>A consumed token is {@code NULL} (set by {@link #consumeCancelToken}), so a
      * replayed link returns empty → 404 (no info leak about token state).
+     *
+     * <p><b>BE-7 (guest visits).</b> The {@code b.appointment IS NULL} guard confines this legacy
+     * single-booking path to true standalone guest bookings. A multi-service visit's child item
+     * carries its own per-item {@code cancel_token} (mandated by the V91 {@code chk_bookings_guest_fields}
+     * CHECK) but MUST only be cancellable as a whole visit via the header token
+     * ({@code GuestVisitCancellationService}). Were a per-item token accepted here it would cancel one
+     * item and desync the {@code Appointment} header + siblings. Excluding {@code appointment_id IS NOT
+     * NULL} makes such a token resolve to empty → the existing 404 path, identical to an unknown token
+     * (no state oracle).
      */
     @Query("""
             SELECT b FROM Booking b
@@ -856,6 +912,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.cancelToken = :cancelToken
+              AND b.appointment IS NULL
             """)
     Optional<Booking> findByCancelTokenWithGraph(@Param("cancelToken") UUID cancelToken);
 

@@ -181,7 +181,9 @@ class PublicBookingControllerTest {
     @DisplayName("GET /book/{slug}/availability — 400 when date is in the past / over the window")
     void should_return400_when_availabilityDateOutOfWindow() throws Exception {
         UUID svc = UUID.randomUUID();
-        when(guestBookingService.availableSlots(anyString(), any(), any()))
+        // A single serviceId param routes to the single-UUID availableSlots overload; disambiguate the
+        // mock from the multi-service List overload added in BE-7.
+        when(guestBookingService.availableSlots(anyString(), any(), any(UUID.class)))
                 .thenThrow(new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "date is in the past"));
 
         mockMvc.perform(get("/api/v1/book/marija-l-cd34/availability")
