@@ -65,6 +65,9 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM favorites");
         jdbcTemplate.execute("DELETE FROM reviews");
         jdbcTemplate.execute("DELETE FROM bookings");
+        // BE-1 (V124/V125): bookings.appointment_id FK → appointments(id), so bookings above must
+        // be deleted FIRST; appointments in turn FK users(id)/salons(id), so it precedes both.
+        jdbcTemplate.execute("DELETE FROM appointments");
         jdbcTemplate.execute("DELETE FROM media_files");
         jdbcTemplate.execute("DELETE FROM master_services");
         jdbcTemplate.execute("DELETE FROM service_definitions");

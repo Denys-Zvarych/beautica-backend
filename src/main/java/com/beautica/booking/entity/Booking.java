@@ -116,7 +116,11 @@ import java.util.UUID;
                 // keyed by client_id. client_id IS NOT NULL excludes guest (LINK) bookings, which
                 // always have a null client_id (V89 chk_bookings_guest_fields) and can never match
                 // this query's client_id equality — indexing them would be pure write amplification.
-                @Index(name = "idx_bookings_client_slot_overlap", columnList = "client_id, starts_at, ends_at")
+                @Index(name = "idx_bookings_client_slot_overlap", columnList = "client_id, starts_at, ends_at"),
+                // partial index (V125): "fetch all rows of this multi-service visit" lookup.
+                // JPA cannot encode WHERE appointment_id IS NOT NULL — the predicate lives in V125
+                // only; this annotation mirrors the column for reader accuracy, not enforcement.
+                @Index(name = "idx_bookings_appointment", columnList = "appointment_id")
         }
 )
 @Getter
@@ -245,6 +249,17 @@ public class Booking extends AuditableEntity {
     @Setter
     @Column(name = "reminder_sent", nullable = false)
     private boolean reminderSent;
+
+    // ── Multi-service single-visit aggregate (BE-1 / V125) ────────────────────
+    // Nullable by design: a legacy single-service booking has no appointment (appointment_id stays
+    // NULL). A multi-service visit (BE-3) groups its N chained booking rows under one Appointment
+    // header. This is the OWNING side of the FK. LAZY so existing single-service reads never
+    // trigger an extra load — nothing in BE-1 traverses this association. Purely additive: no
+    // existing field, query or the no_overlapping_bookings EXCLUDE constraint is affected.
+    @Setter
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "appointment_id")
+    private Appointment appointment;
 
     /**
      * Factory for an auto-confirmed guest (LINK) booking. Enforces the LINK
