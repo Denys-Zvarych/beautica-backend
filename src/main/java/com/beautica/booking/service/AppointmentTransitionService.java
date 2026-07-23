@@ -133,9 +133,12 @@ public class AppointmentTransitionService {
      * {@link AuthorizationService#enforceCanCompleteBooking}); no note, no cancellation reason. Also
      * evicts the actor's revenue dashboard after commit (COMPLETED feeds revenue).
      *
-     * <p>Deliberately enqueues NO per-item review prompt — reviews are one-per-visit and owned by the
-     * BE-6 phase (see class/handoff notes). Exactly one status-changed notification fires, as for
-     * every visit transition.
+     * <p>Enqueues EXACTLY ONE review prompt for the whole visit (BE-6) — the client may leave ONE
+     * review per completed visit (via {@code POST /appointments/{id}/review}), so the prompt fires
+     * once, referencing the FIRST item (never one per service), mirroring how the single status-changed
+     * notification is enqueued. The drain worker rehydrates that booking → its client (= the visit
+     * client) as the recipient. Skipped for a guest (LINK) visit with no registered account to review
+     * with, exactly as {@code BookingService#completeBooking} skips it.
      */
     @Transactional
     public void completeAppointment(UUID actorId, UUID appointmentId) {
@@ -149,6 +152,14 @@ public class AppointmentTransitionService {
         // Evict the actor's revenue dashboard (COMPLETED feeds revenue), keyed on the actor id
         // exactly as BookingService#completeBooking does.
         persistAndNotify(ctx.appointment(), ctx.items(), actorId);
+
+        // ONE review prompt for the visit (BE-6) — never one per item. Enqueued in this same
+        // completion transaction (enqueueReviewRequested is MANDATORY-propagation); a second complete
+        // is impossible (assertHeaderTransition rejects a non-CONFIRMED header), so it is at-most-once
+        // by construction. Guest visits have no client to review with — skip (mirrors the single path).
+        if (ctx.appointment().getClient() != null) {
+            outboxService.enqueueReviewRequested(ctx.firstItem().getId());
+        }
     }
 
     /**

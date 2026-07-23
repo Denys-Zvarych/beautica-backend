@@ -1,5 +1,6 @@
 package com.beautica.review.entity;
 
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.common.AuditableEntity;
 import com.beautica.master.entity.Master;
@@ -55,6 +56,16 @@ public class Review extends AuditableEntity {
     @OneToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "booking_id", nullable = false, unique = true)
     private Booking booking;
+
+    // BE-6 (V127): NON-NULL for a multi-service visit review — the review targets the whole
+    // appointment, and booking (above) then points at the visit's FIRST child booking. NULL for a
+    // legacy single-booking review. One-review-per-visit is enforced by the partial unique index
+    // ux_reviews_appointment (V127, WHERE appointment_id IS NOT NULL) — not expressible as a JPA
+    // @Table @Index/unique, so no annotation mirrors it (same convention as the partial salon
+    // indexes noted on this @Table).
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "appointment_id")
+    private Appointment appointment;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "client_id", nullable = false)

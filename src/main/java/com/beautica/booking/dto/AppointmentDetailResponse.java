@@ -67,6 +67,12 @@ public record AppointmentDetailResponse(
         String clientComment,
         OffsetDateTime createdAt,
         List<AppointmentItemResponse> items,
+        @Schema(description = "True iff this visit is COMPLETED, has a registered client, and the "
+                + "client has not yet reviewed it — the CLIENT's one-review-per-visit CTA gate "
+                + "(BE-6). The COMPLETED + no-existing-review predicate, computed by the service, "
+                + "mirrors BookingDetailResponse.canReview lifted to the visit. A visit review is "
+                + "left via POST /appointments/{id}/review.")
+        boolean canReview,
         // ── BE-5 visit-detail enrichment (mirrors BookingDetailResponse) ─────────────
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Written by the provider on the visit /decline or /not-complete. Shown "
@@ -113,7 +119,8 @@ public record AppointmentDetailResponse(
      * locked invariant).
      */
     public static AppointmentDetailResponse from(
-            Appointment appointment, List<Booking> orderedItems, String cityLabel, String districtLabel) {
+            Appointment appointment, List<Booking> orderedItems, boolean canReview,
+            String cityLabel, String districtLabel) {
         Booking first = orderedItems.get(0);
         Booking last = orderedItems.get(orderedItems.size() - 1);
         Master master = first.getMaster();
@@ -165,6 +172,7 @@ public record AppointmentDetailResponse(
                 appointment.getClientComment(),
                 appointment.getCreatedAt().atOffset(ZoneOffset.UTC),
                 items,
+                canReview,
                 // Notes are read from the HEADER (mutually visible), never the child items.
                 appointment.getProviderComment(),
                 appointment.getClientCancellationNote(),

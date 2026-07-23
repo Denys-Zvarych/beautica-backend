@@ -3,8 +3,10 @@ package com.beautica.review.service;
 import org.springframework.data.domain.Sort;
 import java.util.Set;
 import com.beautica.common.web.SortWhitelist;
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
@@ -12,6 +14,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.review.dto.CreateAppointmentReviewRequest;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MasterReviewSummaryResponse;
 import com.beautica.review.dto.MyReviewResponse;
@@ -51,6 +54,7 @@ public class ReviewService {
 
     private final ReviewRepository reviewRepository;
     private final BookingRepository bookingRepository;
+    private final AppointmentRepository appointmentRepository;
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
     private final ApplicationEventPublisher eventPublisher;
@@ -70,6 +74,17 @@ public class ReviewService {
         // non-reviewable (no account exists to leave a review with).
         if (booking.getClient() == null || !booking.getClient().getId().equals(clientId)) {
             throw new ForbiddenException("Not authorized to review this booking");
+        }
+
+        // BE-6 per-item review guard (checked AFTER ownership so a foreign booking still 403s — no
+        // existence oracle). A booking that is one item of a multi-service visit carries a non-null
+        // appointment FK; a review must be left ONCE for the WHOLE visit, never per child, or the
+        // visit would collect N reviews. Mirrors BookingService#assertNotAppointmentChild (409, same
+        // envelope). The FK id is on the booking row itself, so getAppointment() needs no query.
+        if (booking.getAppointment() != null) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "This booking is part of a multi-service visit; leave one review for the whole "
+                            + "visit via POST /appointments/{id}/review");
         }
 
         if (booking.getStatus() != BookingStatus.COMPLETED) {
@@ -104,6 +119,78 @@ public class ReviewService {
         // owned this booking at completion time"). null for an INDEPENDENT_MASTER booking.
         UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
         eventPublisher.publishEvent(new ReviewCreatedEvent(booking.getMaster().getId(), salonId));
+        return ReviewResponse.from(saved);
+    }
+
+    /**
+     * Creates the ONE review a client may leave for a COMPLETED multi-service visit (BE-6). The
+     * appointment is the review target — {@code appointment_id} is set and is the authoritative
+     * one-review-per-visit dedup key (partial unique index {@code ux_reviews_appointment}, V127) —
+     * while {@code booking_id} points at the visit's FIRST child booking so the whole existing
+     * review read/render surface (masters/salon reviews lists, {@code GET /reviews/{id}},
+     * {@code /reviews/me}) keeps working unchanged. {@code master_id}/{@code salon_id} come from the
+     * visit (single master; the header salon is the same value stamped on every item at create time).
+     *
+     * <p>Authorization + status + duplicate handling mirror {@link #createReview} exactly: a missing
+     * visit is a 404, a foreign/guest visit collapses to the same 403 (no existence oracle), a
+     * non-COMPLETED visit is a 400 with the same message, and a second review is a 409 — the exact
+     * same envelopes the single-booking path returns (no new error shapes). {@code clientId} comes
+     * only from the authenticated principal, never the body.
+     */
+    @Transactional
+    public ReviewResponse createAppointmentReview(
+            UUID clientId, UUID appointmentId, CreateAppointmentReviewRequest request) {
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new NotFoundException("Appointment not found"));
+
+        // A guest (LINK) visit has a null client (no registered account), so no authenticated CLIENT
+        // can own it — guarding against null here turns a would-be 500 into the same uniform 403 a
+        // foreign visit gets (mirrors createReview above and AppointmentTransitionService).
+        if (appointment.getClient() == null || !appointment.getClient().getId().equals(clientId)) {
+            throw new ForbiddenException("Not authorized to review this appointment");
+        }
+
+        if (appointment.getStatus() != BookingStatus.COMPLETED) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Review can only be submitted for completed bookings");
+        }
+
+        if (reviewRepository.existsByAppointmentId(appointmentId)) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Review already exists for this appointment");
+        }
+
+        // Ordered, graph-hydrated items (master.user, master.salon, masterService.serviceDefinition
+        // all fetched) — needed for the master, the first-child booking_id, and ReviewResponse.from's
+        // serviceName. Never empty for a real visit (≥1 chained row); guard defensively.
+        List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
+        if (items.isEmpty()) {
+            throw new NotFoundException("Appointment not found");
+        }
+        Booking first = items.get(0);
+
+        Review review = Review.builder()
+                .booking(first)
+                .appointment(appointment)
+                .client(appointment.getClient())
+                .master(first.getMaster())
+                .salon(appointment.getSalon())
+                .rating(request.rating().shortValue())
+                .comment(request.comment())
+                .build();
+
+        Review saved;
+        try {
+            saved = reviewRepository.saveAndFlush(review);
+        } catch (DataIntegrityViolationException e) {
+            // A same-visit race that slips past existsByAppointmentId above trips ux_reviews_appointment
+            // — same 409 the single-booking duplicate path returns.
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Review already exists for this appointment");
+        }
+
+        UUID salonId = appointment.getSalon() != null ? appointment.getSalon().getId() : null;
+        eventPublisher.publishEvent(new ReviewCreatedEvent(first.getMaster().getId(), salonId));
         return ReviewResponse.from(saved);
     }
 

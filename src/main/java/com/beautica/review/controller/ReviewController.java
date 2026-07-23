@@ -3,6 +3,7 @@ package com.beautica.review.controller;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.review.dto.CreateAppointmentReviewRequest;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MasterReviewSummaryResponse;
 import com.beautica.review.dto.MyReviewResponse;
@@ -44,6 +45,27 @@ public class ReviewController {
             @Valid @RequestBody CreateReviewRequest request,
             Authentication auth) {
         ReviewResponse response = reviewService.createReview(AuthenticationUtils.userId(auth), request);
+        return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    /**
+     * Creates the ONE review a client may leave for a COMPLETED multi-service visit (BE-6).
+     *
+     * <p>Kept in the review feature (not {@code AppointmentController}) so all review-creation logic
+     * lives in one package — the visit-scoped path {@code /appointments/{appointmentId}/review} is
+     * mapped here under this controller's {@code /api/v1} base and is unambiguous against
+     * {@code AppointmentController}'s routes (different {@code /review} suffix). Role gate mirrors the
+     * legacy {@code POST /reviews}: {@code hasRole('CLIENT')} plus the ownership/status/duplicate
+     * checks in the service. Same 201 + {@link ApiResponse} envelope as the single-booking path.
+     */
+    @PreAuthorize("hasRole('CLIENT')")
+    @PostMapping("/appointments/{appointmentId}/review")
+    public ResponseEntity<ApiResponse<ReviewResponse>> createAppointmentReview(
+            @PathVariable UUID appointmentId,
+            @Valid @RequestBody CreateAppointmentReviewRequest request,
+            Authentication auth) {
+        ReviewResponse response = reviewService.createAppointmentReview(
+                AuthenticationUtils.userId(auth), appointmentId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 

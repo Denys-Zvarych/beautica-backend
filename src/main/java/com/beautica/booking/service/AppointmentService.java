@@ -20,6 +20,7 @@ import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.review.repository.ReviewRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -84,6 +85,7 @@ public class AppointmentService {
     private final MasterRepository masterRepository;
     private final MasterServiceRepository masterServiceRepository;
     private final UserRepository userRepository;
+    private final ReviewRepository reviewRepository;
     private final NotificationOutboxService outboxService;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -180,7 +182,21 @@ public class AppointmentService {
                 districtId == null ? List.of() : List.of(districtId));
 
         return AppointmentDetailResponse.from(
-                appointment, items, labels.cityLabel(cityId), labels.districtLabel(districtId));
+                appointment, items, computeCanReview(appointment),
+                labels.cityLabel(cityId), labels.districtLabel(districtId));
+    }
+
+    /**
+     * The visit-level {@code canReview} gate (BE-6) — mirrors {@code BookingService#canReview}
+     * ({@code hasClient && COMPLETED && !reviewExists}) lifted to the visit: a registered client,
+     * a COMPLETED visit, and no existing visit review. The {@code existsByAppointmentId} probe is
+     * short-circuited to run ONLY for a COMPLETED visit, so the create path (CONFIRMED) never issues
+     * it and always resolves {@code false} — a just-created visit is never reviewable.
+     */
+    private boolean computeCanReview(Appointment appointment) {
+        return appointment.getClient() != null
+                && appointment.getStatus() == BookingStatus.COMPLETED
+                && !reviewRepository.existsByAppointmentId(appointment.getId());
     }
 
     private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {
