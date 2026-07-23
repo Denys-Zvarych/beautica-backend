@@ -58,6 +58,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *       status-coupling, guest_phone E.164 format, the partial-unique cancel_token index, and the
  *       partial-unique {@code (client_id, idempotency_key)} dedup index (BE-1 idempotency guard,
  *       mirroring bookings' {@code uq_client_idempotency_key_active}).</li>
+ *   <li>The deferred polymorphic guest-fields CHECK {@code chk_appointment_guest_fields} added in
+ *       BE-3 (V126): APP ⇒ client_id NOT NULL + no guest identity + no cancel token; LINK ⇒ the
+ *       inverse, with V91's cancel-token-by-status relaxation mirrored.</li>
  * </ol>
  */
 class AppointmentEntityIT extends AbstractDataJpaTest {
@@ -145,11 +148,16 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
     // ── 1. Appointment round-trip ─────────────────────────────────────────────
 
     @Test
-    @DisplayName("V124 mapping — an Appointment persists every column and round-trips via the DB")
-    void should_persistAndRetrieveAppointment_withAllFields() {
+    @DisplayName("V124/V126 mapping — a LINK (guest) Appointment persists every guest column and round-trips")
+    void should_persistAndRetrieveGuestAppointment_withAllFields() {
         UUID cancelToken = UUID.randomUUID();
+        // A LINK visit has NO registered account: chk_appointment_guest_fields (V126) requires
+        // client_id NULL + guest identity + a cancel token on an active (CONFIRMED) row. This is the
+        // valid all-guest-columns shape — the earlier fixture set BOTH client_id and the guest
+        // identity, which V126 now (correctly) rejects. The account-bound columns round-trip in the
+        // APP twin below.
         Appointment appointment = Appointment.builder()
-                .client(client)
+                .client(null)
                 .salon(null)
                 .status(BookingStatus.CONFIRMED)
                 .clientComment("Please arrive 5 minutes early")
@@ -176,10 +184,35 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
         assertThat(loaded.getGuestName()).isEqualTo("Iryna");
         assertThat(loaded.getGuestSurname()).isEqualTo("Melnyk");
         assertThat(loaded.getGuestPhone()).isEqualTo("+380631234567");
-        assertThat(loaded.getClient().getId()).isEqualTo(client.getId());
+        assertThat(loaded.getClient()).as("a LINK visit carries no registered client (V126)").isNull();
         assertThat(loaded.getSalon()).isNull();
         assertThat(loaded.getCreatedAt()).as("@CreationTimestamp populated").isNotNull();
         assertThat(loaded.getUpdatedAt()).as("@UpdateTimestamp populated").isNotNull();
+    }
+
+    @Test
+    @DisplayName("V124/V126 mapping — an APP Appointment persists its account-bound columns and round-trips")
+    void should_persistAndRetrieveAppAppointment_withAllFields() {
+        // The APP twin of the LINK round-trip above: chk_appointment_guest_fields (V126) requires an
+        // APP visit to carry a client_id and NO guest identity / cancel token.
+        Appointment appointment = Appointment.builder()
+                .client(client)
+                .salon(null)
+                .status(BookingStatus.CONFIRMED)
+                .clientComment("Please use the side entrance")
+                .idempotencyKey("appt-idem-" + UUID.randomUUID())
+                .bookingSource(BookingSource.APP)
+                .build();
+
+        Appointment saved = em.persistFlushFind(appointment);
+
+        assertThat(saved.getClient().getId()).isEqualTo(client.getId());
+        assertThat(saved.getBookingSource()).isEqualTo(BookingSource.APP);
+        assertThat(saved.getClientComment()).isEqualTo("Please use the side entrance");
+        assertThat(saved.getIdempotencyKey()).isEqualTo(appointment.getIdempotencyKey());
+        assertThat(saved.getGuestName()).as("an APP visit carries no guest identity (V126)").isNull();
+        assertThat(saved.getGuestPhone()).isNull();
+        assertThat(saved.getCancelToken()).as("an APP visit carries no cancel token (V126)").isNull();
     }
 
     @Test
@@ -360,9 +393,11 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
     @Test
     @DisplayName("chk_appointment_guest_phone_format — a non-E.164 guest_phone is rejected by the DB")
     void should_rejectAppointment_when_guestPhoneNotE164() {
-        Appointment appointment = Appointment.builder()
-                .client(client)
-                .status(BookingStatus.CONFIRMED)
+        // A LINK visit so the row satisfies chk_appointment_guest_fields (V126) in every respect
+        // EXCEPT the phone format — isolating chk_appointment_guest_phone_format as the sole violation.
+        // (An APP row cannot carry a guest_phone at all under V126, which would mask this constraint.)
+        Appointment appointment = guestVisit(BookingStatus.CONFIRMED)
+                .cancelToken(UUID.randomUUID())
                 .guestPhone("0631234567") // missing leading + → violates ^\+[0-9]{6,18}$
                 .build();
 
@@ -370,22 +405,74 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
                 .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
     }
 
+    // ── V126 — the deferred polymorphic guest-fields CHECK (BE-3) ──────────────
+
+    @Test
+    @DisplayName("chk_appointment_guest_fields (V126) — an APP visit carrying a guest identity is rejected")
+    void should_rejectAppointment_when_appVisitHasGuestIdentity() {
+        Appointment appointment = Appointment.builder()
+                .client(client)
+                .status(BookingStatus.CONFIRMED)
+                .bookingSource(BookingSource.APP)
+                .guestName("Should not be on an APP visit")
+                .build();
+
+        assertThatThrownBy(() -> em.persistAndFlush(appointment))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("chk_appointment_guest_fields (V126) — a LINK visit carrying a client_id is rejected")
+    void should_rejectAppointment_when_linkVisitHasClientId() {
+        Appointment appointment = Appointment.builder()
+                .client(client) // LINK requires client_id NULL
+                .status(BookingStatus.CONFIRMED)
+                .bookingSource(BookingSource.LINK)
+                .guestName("Iryna")
+                .guestPhone("+380631234567")
+                .cancelToken(UUID.randomUUID())
+                .build();
+
+        assertThatThrownBy(() -> em.persistAndFlush(appointment))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("chk_appointment_guest_fields (V126) — an active (CONFIRMED) LINK visit with a NULL "
+            + "cancel_token is rejected")
+    void should_rejectLinkVisit_when_confirmedWithoutCancelToken() {
+        Appointment stillActive = guestVisit(BookingStatus.CONFIRMED).build(); // no cancel token
+
+        assertThatThrownBy(() -> em.persistAndFlush(stillActive))
+                .isInstanceOfAny(PersistenceException.class, DataIntegrityViolationException.class);
+    }
+
+    @Test
+    @DisplayName("chk_appointment_guest_fields (V126) — a terminal (CANCELLED) LINK visit may drop its "
+            + "cancel_token (V91 relaxation, mirrored — the guest-cancel UPDATE nulls it)")
+    void should_acceptLinkVisit_when_cancelledWithoutCancelToken() {
+        Appointment terminal = guestVisit(BookingStatus.CANCELLED).build(); // no cancel token
+
+        Appointment saved = em.persistFlushFind(terminal);
+
+        assertThat(saved.getCancelToken()).isNull();
+    }
+
     @Test
     @DisplayName("ux_appointments_cancel_token — a duplicate non-null cancel_token is rejected (partial-unique index)")
     void should_rejectAppointment_when_duplicateCancelToken() {
         UUID sharedToken = UUID.randomUUID();
 
-        Appointment first = Appointment.builder()
-                .client(client)
-                .status(BookingStatus.CONFIRMED)
+        // Only a LINK visit may carry a cancel_token: chk_appointment_guest_fields (V126) forbids it
+        // on an APP row. Both rows are otherwise valid LINK visits (client_id NULL + guest identity),
+        // so the ONLY constraint that can fire on the second is ux_appointments_cancel_token.
+        Appointment first = guestVisit(BookingStatus.CONFIRMED)
                 .cancelToken(sharedToken)
                 .build();
         em.persist(first);
         em.flush();
 
-        Appointment second = Appointment.builder()
-                .client(client)
-                .status(BookingStatus.CONFIRMED)
+        Appointment second = guestVisit(BookingStatus.CONFIRMED)
                 .cancelToken(sharedToken)
                 .build();
 
@@ -463,6 +550,21 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
 
         assertThat(first.getId()).isNotNull();
         assertThat(second.getId()).isNotNull();
+    }
+
+    /**
+     * A valid LINK (guest) visit builder: {@code client_id} NULL + guest identity, satisfying
+     * chk_appointment_guest_fields (V126) apart from the token/format the caller then tweaks. The
+     * caller adds a {@code cancelToken} for an active (CONFIRMED) row; a terminal-status row may omit
+     * it (V91 relaxation, mirrored).
+     */
+    private Appointment.AppointmentBuilder guestVisit(BookingStatus status) {
+        return Appointment.builder()
+                .client(null)
+                .status(status)
+                .bookingSource(BookingSource.LINK)
+                .guestName("Iryna")
+                .guestPhone("+380631234567");
     }
 
     private Booking baseBooking(BookingStatus status) {

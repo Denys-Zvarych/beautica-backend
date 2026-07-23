@@ -17,15 +17,16 @@ import java.io.IOException;
 import java.util.UUID;
 
 /**
- * Per-authenticated-user rate limit on the four booking write endpoints that either take the
+ * Per-authenticated-user rate limit on the booking write endpoints that either take the
  * per-client advisory lock or dispatch a note into a client-facing notification channel:
- * {@code POST /api/v1/bookings}, {@code PATCH /api/v1/bookings/{bookingId}/reschedule},
+ * {@code POST /api/v1/bookings}, {@code POST /api/v1/appointments} (BE-3 multi-service visit
+ * create), {@code PATCH /api/v1/bookings/{bookingId}/reschedule},
  * {@code PATCH /api/v1/bookings/{bookingId}/decline}, and
  * {@code PATCH /api/v1/bookings/{bookingId}/not-complete}. These map to TWO independent buckets
  * with different capacities, because they close two different threat models:
  *
  * <ul>
- *   <li><b>create/reschedule → {@code bookingWriteBuckets}:</b> both take the per-client advisory
+ *   <li><b>create/appointment-create/reschedule → {@code bookingWriteBuckets}:</b> all take the per-client advisory
  *   lock ({@code BookingRepository.acquireClientAdvisoryLockWithTimeout}). The per-client
  *   advisory lock is salted by the CALLER'S OWN authenticated user id, so a single CLIENT account
  *   needs no IP diversity at all to serialize every one of its own requests on the identical
@@ -79,6 +80,8 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
 
     private static final String BOOKINGS_PATH = "/api/v1/bookings";
     private static final String BOOKINGS_PATH_PREFIX = "/api/v1/bookings/";
+    /** BE-3: the multi-service single-visit create endpoint, throttled on the create/reschedule budget. */
+    private static final String APPOINTMENTS_PATH = "/api/v1/appointments";
     private static final String RESCHEDULE_SUFFIX = "/reschedule";
     private static final String DECLINE_SUFFIX = "/decline";
     private static final String NOT_COMPLETE_SUFFIX = "/not-complete";
@@ -134,7 +137,10 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         String path = request.getRequestURI();
         String method = request.getMethod();
 
-        if (HttpMethod.POST.matches(method) && BOOKINGS_PATH.equals(path)) {
+        // POST /bookings (single-service create) and POST /appointments (BE-3 multi-service visit
+        // create) share the bookingWriteBuckets budget: both take the per-client advisory lock, so a
+        // visit create is one token on the same threat model as a single-service create.
+        if (HttpMethod.POST.matches(method) && (BOOKINGS_PATH.equals(path) || APPOINTMENTS_PATH.equals(path))) {
             return new BucketRoute(bookingWriteBuckets, CREATE_RESCHEDULE_RETRY_AFTER_SECONDS);
         }
         if (HttpMethod.PATCH.matches(method) && path.startsWith(BOOKINGS_PATH_PREFIX)) {

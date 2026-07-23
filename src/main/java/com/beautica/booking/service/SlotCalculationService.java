@@ -42,8 +42,16 @@ public class SlotCalculationService {
     private static final String BOOKABLE_CACHE = "master-service-bookable";
     private static final String BOOKABLE_DAYS_CACHE = "master-bookable-days";
 
-    /** durationOverride max (480 min) + bufferMinutesAfter max (120 min) — see the DTO validation matrix. */
-    private static final int MAX_TOTAL_DURATION_MINUTES = 600;
+    /**
+     * durationOverride max (480 min) + bufferMinutesAfter max (120 min) — see the DTO validation matrix.
+     *
+     * <p><b>Public since BE-3:</b> the appointment (multi-service single-visit) create path
+     * ({@code AppointmentService}) enforces the identical Σ-duration ceiling on the chained block it
+     * persists, so it references THIS constant rather than re-declaring the literal — the create cap
+     * and the availability cap can never drift apart. Visibility only; the value/semantics are
+     * unchanged from BE-2.
+     */
+    public static final int MAX_TOTAL_DURATION_MINUTES = 600;
 
     /**
      * Upper bound on the number of services chained into ONE single-visit slot/day request (BE-2). The

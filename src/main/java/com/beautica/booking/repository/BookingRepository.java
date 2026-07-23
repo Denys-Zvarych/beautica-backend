@@ -443,6 +443,31 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
 
+    /**
+     * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt} so the
+     * items read back in the exact back-to-back order they were performed.
+     *
+     * <p>Naturally bounded — a visit holds at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT}
+     * (10) rows — so no {@code Pageable} is needed (§E-3). Rides the partial index
+     * {@code idx_bookings_appointment} (V125, {@code WHERE appointment_id IS NOT NULL}). Hydrates the
+     * SAME graph as {@link #findByIdWithFullGraph} ({@code master.user}, {@code master.salon},
+     * {@code masterService.serviceDefinition}) so {@code AppointmentDetailResponse.from} reads the
+     * master summary + per-item service name with no lazy load or N+1. {@code b.client} is deliberately
+     * NOT fetched — the appointment header carries the client, and the item projection does not read
+     * it.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon s
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id = :appointmentId
+            ORDER BY b.startsAt ASC
+            """)
+    List<Booking> findByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
+
     // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
     // ── Idempotency lookup — partial-index aligned (Fix M5) ───────────────────

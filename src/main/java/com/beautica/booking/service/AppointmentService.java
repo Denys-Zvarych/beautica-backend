@@ -1,0 +1,382 @@
+package com.beautica.booking.service;
+
+import com.beautica.auth.Role;
+import com.beautica.booking.dto.AppointmentDetailResponse;
+import com.beautica.booking.dto.BookingPriceRange;
+import com.beautica.booking.dto.CreateAppointmentRequest;
+import com.beautica.booking.entity.Appointment;
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingSource;
+import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.repository.AppointmentRepository;
+import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ClientBookingConflictException;
+import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.NotFoundException;
+import com.beautica.master.entity.Master;
+import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.salon.entity.Salon;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.service.SalonCatalogCacheEvictor;
+import com.beautica.user.User;
+import com.beautica.user.UserRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * Creates a multi-service single-visit {@link Appointment} (BE-3): ONE master, ONE chosen start
+ * time, and N services performed back-to-back as N chained {@code CONFIRMED} {@link Booking} rows,
+ * all-or-nothing in one transaction.
+ *
+ * <p><b>Reuses {@code BookingService}'s proven single-service concurrency machinery</b>, applied to a
+ * chain instead of one row. In-transaction step order (identical shape to
+ * {@code BookingService#doCreateBooking}, widened to the visit span):
+ * <ol>
+ *   <li>resolve the master (active) and each {@code masterServiceId} in list order (uniform 404);</li>
+ *   <li>compute per-item windows + the summed block, capped at
+ *       {@link SlotCalculationService#MAX_TOTAL_DURATION_MINUTES} (the same ceiling BE-2 offers
+ *       against), and freeze per-item price/duration snapshots;</li>
+ *   <li>resolve the CLIENT principal (defence-in-depth role check);</li>
+ *   <li>acquire the per-CLIENT advisory lock (salt 1) FIRST, then re-check idempotency under the lock
+ *       (deterministic replay), then the per-MASTER advisory lock (salt 0) — the same
+ *       client-then-master order that keeps the two lock classes deadlock-free;</li>
+ *   <li>client-conflict check over the WHOLE visit span {@code [firstStart, lastEnd)};</li>
+ *   <li>ONE span overlap check against existing CONFIRMED bookings over {@code [firstStart, lastEnd)}
+ *       (internal items are contiguous by construction, so their union equals the span; the
+ *       {@code no_overlapping_bookings} GIST EXCLUDE still backstops each insert);</li>
+ *   <li>persist the appointment + all N bookings atomically;</li>
+ *   <li>enqueue EXACTLY ONE new-visit notification (referencing the first item, never one per
+ *       service);</li>
+ *   <li>evict the master's availability caches for the affected day(s) after commit.</li>
+ * </ol>
+ *
+ * <p>The legacy single-service {@code POST /bookings} path ({@code BookingService}) and the
+ * {@code no_overlapping_bookings} constraint are untouched (D5).
+ */
+@Service
+@RequiredArgsConstructor
+public class AppointmentService {
+
+    private final AppointmentRepository appointmentRepository;
+    private final BookingRepository bookingRepository;
+    private final MasterRepository masterRepository;
+    private final MasterServiceRepository masterServiceRepository;
+    private final UserRepository userRepository;
+    private final NotificationOutboxService outboxService;
+    private final SlotCalculationService slotCalculationService;
+    private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    private final Clock clock;
+
+    /**
+     * Creates a multi-service visit, or replays the idempotent one, and returns the enriched detail.
+     *
+     * <p>Idempotency mirrors {@code BookingService#createBooking}: a present key first probes for an
+     * existing CONFIRMED appointment (fast path, no lock). The authoritative, race-free replay is the
+     * re-check under the per-client advisory lock inside {@link #doCreateAppointment}; the
+     * partial-unique index {@code ux_appointments_client_idempotency_key_active} is the final backstop
+     * — a duplicate insert that slips past both surfaces as a 409, never a second visit.
+     */
+    @Transactional
+    public AppointmentDetailResponse createAppointment(
+            UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {
+        UUID appointmentId;
+        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+            appointmentId = appointmentRepository
+                    .findActiveByClientIdAndIdempotencyKey(clientId, idempotencyKey)
+                    .map(Appointment::getId)
+                    .orElseGet(() -> doCreateAppointment(clientId, idempotencyKey, request));
+        } else {
+            appointmentId = doCreateAppointment(clientId, null, request);
+        }
+        return enrichCreated(appointmentId);
+    }
+
+    private AppointmentDetailResponse enrichCreated(UUID appointmentId) {
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new NotFoundException("Appointment not found"));
+        List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
+        if (items.isEmpty()) {
+            // Unreachable for a just-created visit (always ≥1 chained row) — guard so from(...)
+            // never dereferences an empty list.
+            throw new NotFoundException("Appointment has no booking items");
+        }
+        return AppointmentDetailResponse.from(appointment, items);
+    }
+
+    private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {
+        Master master = masterRepository.findByIdWithUserAndSalon(request.masterId())
+                .filter(Master::isActive)
+                .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
+
+        List<UUID> serviceIds = request.masterServiceIds();
+        // Defensive belt behind the DTO's @NotEmpty/@Size — the service must never trust an empty or
+        // unbounded list (mirrors SlotCalculationService#assertServiceIds). Duplicates are allowed
+        // verbatim (locked decision): the block sums repeats, staying consistent with BE-2 availability.
+        if (serviceIds == null || serviceIds.isEmpty()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "At least one service is required");
+        }
+        if (serviceIds.size() > SlotCalculationService.MAX_SERVICES_PER_VISIT) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "At most " + SlotCalculationService.MAX_SERVICES_PER_VISIT
+                            + " services can be booked in a single visit");
+        }
+
+        OffsetDateTime firstStart = request.startsAt().toOffsetDateTime();
+        // Same lead-time floor + max-window cap as the single-service create path (DRY).
+        BookingStartsAtValidator.validate(firstStart, clock);
+
+        List<PlannedItem> items = planChainedItems(master, serviceIds, firstStart);
+        OffsetDateTime lastEnd = items.get(items.size() - 1).endsAt();
+
+        // Fix H3 shape: load + validate the client BEFORE the locks to keep the lock window tight.
+        User client = userRepository.findById(clientId)
+                .orElseThrow(() -> new NotFoundException("Client not found"));
+        // Defence in depth: the controller @PreAuthorize already restricts to CLIENT.
+        if (client.getRole() != Role.CLIENT) {
+            throw new ForbiddenException("Only clients can create appointments");
+        }
+
+        // Client lock (salt 1) ALWAYS before the master lock (salt 0) — deadlock-free ordering. The
+        // fused query also sets the transaction-scoped lock_timeout, bounding the master lock below.
+        acquireClientLock(clientId);
+
+        // Race-free idempotent replay: two concurrent same-key requests serialize on the client lock;
+        // the second re-reads the committed visit here and returns it without inserting a duplicate.
+        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+            Optional<UUID> existing = appointmentRepository
+                    .findActiveByClientIdAndIdempotencyKey(clientId, idempotencyKey)
+                    .map(Appointment::getId);
+            if (existing.isPresent()) {
+                return existing.get();
+            }
+        }
+
+        // Client-conflict check over the WHOLE visit span, BEFORE the master lock is taken — same
+        // precedence and rationale as the single-service create path.
+        assertNoClientConflict(clientId, firstStart, lastEnd);
+
+        Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
+
+        // Overlap against existing CONFIRMED bookings, checked ONCE over the whole visit span. The
+        // chained items are contiguous by construction (assertContiguous: item[i].startsAt ==
+        // item[i-1].endsAt, no gaps), so the union of all per-item intervals is EXACTLY
+        // [firstStart, lastEnd) — a single span check is logically identical to N per-item checks,
+        // but holds the contended per-master advisory lock for one round-trip instead of N. The
+        // per-row no_overlapping_bookings GIST EXCLUDE remains the authoritative backstop on each
+        // insert (see the DataIntegrityViolation→409 mapping below), so an overlapping chain still
+        // yields the same 409; correctness is unchanged.
+        if (bookingRepository.existsOverlap(master.getId(), firstStart, lastEnd)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        Appointment appointment = Appointment.builder()
+                .client(client)
+                .salon(master.getSalon())
+                .status(BookingStatus.CONFIRMED)
+                .clientComment(BookingComments.normalize(request.clientComment()))
+                .idempotencyKey(idempotencyKey)
+                .bookingSource(BookingSource.APP)
+                .build();
+
+        List<Booking> bookings = new ArrayList<>(items.size());
+        for (PlannedItem item : items) {
+            bookings.add(Booking.builder()
+                    .client(client)
+                    .master(master)
+                    .masterService(item.masterService())
+                    // salon is null for an INDEPENDENT_MASTER (V18 nullable salon_id intent).
+                    .salon(master.getSalon())
+                    .status(BookingStatus.CONFIRMED)
+                    .startsAt(item.startsAt())
+                    .endsAt(item.endsAt())
+                    .priceAtBooking(item.price())
+                    .priceMaxAtBooking(item.priceMax())
+                    .durationMinutesAtBooking(item.duration())
+                    .bufferMinutesAtBooking(item.buffer())
+                    .bookingSource(BookingSource.APP)
+                    .appointment(appointment)
+                    .build());
+        }
+
+        List<Booking> savedBookings;
+        try {
+            // The appointment is saved first so the FK bookings.appointment_id resolves; the flush
+            // makes both the EXCLUDE constraint and the idempotency partial-unique index authoritative.
+            appointmentRepository.save(appointment);
+            savedBookings = bookingRepository.saveAll(bookings);
+            bookingRepository.flush();
+        } catch (DataIntegrityViolationException e) {
+            // Either no_overlapping_bookings (a slot was taken between check and insert) or the
+            // idempotency partial-unique index (a same-key race past the re-check) — both map to the
+            // same 409 the single-service path returns; no partial visit is ever persisted (atomic).
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        // EXACTLY ONE new-visit notification for the whole appointment — the master is notified once,
+        // referencing the first chained booking (NOT one per service). Notes are never logged nor put
+        // in the outbox payload (CLAUDE.md booking-notes contract).
+        outboxService.enqueueNewBooking(savedBookings.get(0).getId());
+
+        registerSlotEviction(master.getId(), salonIdOf(master), items);
+
+        return appointment.getId();
+    }
+
+    /**
+     * Resolves each service in list order and chains their windows back-to-back, freezing the
+     * per-item price/duration snapshot. Item 0 starts at {@code firstStart}; item {@code i} starts
+     * when item {@code i-1} ends, where each item's length is its effective duration (override beats
+     * base) PLUS its own {@code bufferMinutesAfter} — identical to BE-2's {@code effectiveDuration},
+     * so the summed block equals the slot the client was offered. Enforces the
+     * {@link SlotCalculationService#MAX_TOTAL_DURATION_MINUTES} ceiling on the sum.
+     */
+    private List<PlannedItem> planChainedItems(Master master, List<UUID> serviceIds, OffsetDateTime firstStart) {
+        List<PlannedItem> items = new ArrayList<>(serviceIds.size());
+        OffsetDateTime cursor = firstStart;
+        long totalMinutes = 0;
+        for (UUID masterServiceId : serviceIds) {
+            // Master-scoped fetch: an empty result means the service is unknown, foreign OR inactive —
+            // all three answer 404 uniformly, the same contract BE-2 uses.
+            MasterServiceAssignment msa = masterServiceRepository
+                    .findByMasterIdAndIdWithGraph(master.getId(), masterServiceId)
+                    .filter(MasterServiceAssignment::isActive)
+                    .orElseThrow(() -> new NotFoundException("Master service not found"));
+
+            int duration = msa.getDurationOverrideMinutes() != null
+                    ? msa.getDurationOverrideMinutes()
+                    : msa.getServiceDefinition().getBaseDurationMinutes();
+            int buffer = msa.getServiceDefinition().getBufferMinutesAfter();
+            BigDecimal price = msa.getPriceOverride() != null
+                    ? msa.getPriceOverride()
+                    : msa.getServiceDefinition().getBasePrice();
+
+            OffsetDateTime start = cursor;
+            OffsetDateTime end = start.plusMinutes((long) duration + buffer);
+            items.add(new PlannedItem(
+                    msa, start, end, duration, buffer, price, BookingPriceRange.resolveCeiling(msa)));
+
+            totalMinutes += (long) duration + buffer;
+            cursor = end;
+        }
+        if (totalMinutes > SlotCalculationService.MAX_TOTAL_DURATION_MINUTES) {
+            throw new BusinessException("total service duration exceeds maximum allowed");
+        }
+        assertContiguous(items);
+        return items;
+    }
+
+    /**
+     * Defensive invariant guard (never client-triggered — the chain is built contiguous above): each
+     * item is positive-width and each item starts exactly where the previous one ended, so no two
+     * chained items can ever overlap or leave a negative gap.
+     */
+    private void assertContiguous(List<PlannedItem> items) {
+        for (int i = 0; i < items.size(); i++) {
+            PlannedItem item = items.get(i);
+            if (!item.endsAt().isAfter(item.startsAt())) {
+                throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "Appointment item has non-positive duration");
+            }
+            if (i > 0 && !item.startsAt().isEqual(items.get(i - 1).endsAt())) {
+                throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "Chained appointment items are not contiguous");
+            }
+        }
+    }
+
+    private void acquireClientLock(UUID clientId) {
+        Integer lockResult = bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId);
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
+    }
+
+    private void assertNoClientConflict(UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt) {
+        bookingRepository.findFirstConflictingClientBookingId(clientId, startsAt, endsAt)
+                .ifPresent(conflictId -> {
+                    throw clientConflictException(conflictId);
+                });
+    }
+
+    private ClientBookingConflictException clientConflictException(UUID conflictingBookingId) {
+        Booking conflict = bookingRepository.findByIdWithFullGraph(conflictingBookingId)
+                .orElseThrow(() -> new BusinessException(
+                        HttpStatus.INTERNAL_SERVER_ERROR, "Conflicting booking could not be loaded"));
+        return new ClientBookingConflictException(conflict);
+    }
+
+    private static UUID salonIdOf(Master master) {
+        Salon salon = master.getSalon();
+        return salon != null ? salon.getId() : null;
+    }
+
+    /**
+     * Evicts the master's availability caches for every (date, service) the visit touches, after
+     * commit — reusing the exact single-service booking-write eviction hooks so a parallel reader
+     * cannot repopulate stale data mid-write. Distinct (local date, masterServiceId) keys are
+     * collected across every item (and both the start and end day, in the rare event a service spans
+     * midnight), then the per-master free-slot verdict and the salon catalogue are evicted once.
+     */
+    private void registerSlotEviction(UUID masterId, UUID salonId, List<PlannedItem> items) {
+        Set<SlotKey> slotKeys = new LinkedHashSet<>();
+        for (PlannedItem item : items) {
+            UUID serviceId = item.masterService().getId();
+            slotKeys.add(new SlotKey(item.startsAt().toLocalDate(), serviceId));
+            slotKeys.add(new SlotKey(item.endsAt().toLocalDate(), serviceId));
+        }
+        Runnable task = () -> {
+            for (SlotKey key : slotKeys) {
+                slotCalculationService.evictAvailableSlots(masterId, key.date(), key.masterServiceId());
+            }
+            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            if (salonId != null) {
+                salonCatalogCacheEvictor.evict(salonId);
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    task.run();
+                }
+            });
+        } else {
+            task.run();
+        }
+    }
+
+    /** One resolved, priced service line ready to become a chained {@link Booking} row. */
+    private record PlannedItem(
+            MasterServiceAssignment masterService,
+            OffsetDateTime startsAt,
+            OffsetDateTime endsAt,
+            int duration,
+            int buffer,
+            BigDecimal price,
+            BigDecimal priceMax) {}
+
+    /** Distinct availability-cache eviction key: one Kyiv-civil date × one master-service. */
+    private record SlotKey(LocalDate date, UUID masterServiceId) {}
+}
