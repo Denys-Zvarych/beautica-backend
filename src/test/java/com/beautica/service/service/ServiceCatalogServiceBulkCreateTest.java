@@ -1,6 +1,7 @@
 package com.beautica.service.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -16,6 +17,7 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
+import com.beautica.service.repository.ActiveDuplicateProjection;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
@@ -114,7 +116,14 @@ class ServiceCatalogServiceBulkCreateTest {
                 serviceTypeId, duration, PriceType.RANGE, null, new BigDecimal(min), new BigDecimal(max));
     }
 
-    /** Echoes the saved definition back with a generated id so MasterServiceResponse.from can map it. */
+    /**
+     * Echoes the saved definition back with a generated id so MasterServiceResponse.from can map it.
+     *
+     * <p>Stubs {@code save}, NOT {@code saveAndFlush}: the bulk path deliberately queues plain
+     * saves and flushes the batch ONCE at the end, so per-item flushing cannot defeat
+     * {@code hibernate.jdbc.batch_size}. Mirrors production — {@code GenerationType.UUID} means
+     * the id exists before any flush.
+     */
     private void stubSaveEchoesEntities() {
         when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> {
             ServiceDefinition def = inv.getArgument(0);
@@ -164,6 +173,16 @@ class ServiceCatalogServiceBulkCreateTest {
         ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository, times(2)).save(defCaptor.capture());
         verify(masterServiceRepository, times(2)).save(any(MasterServiceAssignment.class));
+
+        // PERF: the batch reaches the DB in ONE flush, not one per item — per-item flushing
+        // would defeat hibernate.jdbc.batch_size=50 + order_inserts=true. Never saveAndFlush here.
+        verify(serviceRepository, never()).saveAndFlush(any(ServiceDefinition.class));
+        verify(serviceRepository, times(1)).flush();
+
+        // PERF: and the V121 duplicate guard is ONE query for the whole batch, not one per item.
+        verify(serviceRepository, times(1)).findActiveDuplicateTypeIds(
+                OwnerType.INDEPENDENT_MASTER, masterId, java.util.Set.of(fixedTypeId, rangeTypeId));
+        verify(serviceRepository, never()).findActiveDuplicateId(any(), any(), any(), any());
 
         List<ServiceDefinition> savedDefs = defCaptor.getAllValues();
 
@@ -255,7 +274,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 .extracting(ex -> ((BusinessException) ex).getStatus())
                 .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
         verify(masterServiceRepository, never()).save(any());
         verify(serviceTypeRepository, never()).findAllById(any());
     }
@@ -282,7 +301,160 @@ class ServiceCatalogServiceBulkCreateTest {
                 .hasMessageContaining("Duplicate service type");
 
         verify(serviceTypeRepository, never()).findAllById(any());
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    // ── Duplicate against ALREADY-EXISTING services (V121 guard) ───────────────
+
+    @Test
+    @DisplayName("409 DUPLICATE_SERVICE + nothing persisted when a batch item duplicates a service the owner already has")
+    void should_throwDuplicateServiceAndPersistNothing_when_bulkItemDuplicatesExistingService() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID freshTypeId = UUID.randomUUID();
+        UUID takenTypeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType freshType = serviceType(freshTypeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceType takenType = serviceType(takenTypeId, "Класичне нарощення", "NAIL_SERVICE", true);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(freshTypeId, 60, "350.00"),
+                fixedItem(takenTypeId, 90, "500.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        // The batch precondition is ASSIGNMENT-level and passes: the master has no active
+        // assignment. The V121 index is DEFINITION-level, so an active definition owned by this
+        // master with no active assignment still collides — exactly the gap this guard closes.
+        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(freshType, takenType));
+        when(platformCategoryRepository.findSelectableNamesIn(any()))
+                .thenReturn(List.of("NAIL_SERVICE"));
+        // ONE batched lookup covering both items: item 1's type is free, item 2's is taken, so
+        // only the taken one comes back. This is the whole point of the batched guard — a
+        // per-item guard would have issued two round-trips here (and up to 100 on a full batch).
+        when(serviceRepository.findActiveDuplicateTypeIds(
+                OwnerType.INDEPENDENT_MASTER, masterId, java.util.Set.of(freshTypeId, takenTypeId)))
+                .thenReturn(List.of(new ActiveDuplicateProjection(takenTypeId, existingDefId)));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getExistingServiceDefId()).isEqualTo(existingDefId);
+                    assertThat(dup.getServiceName()).isEqualTo("Класичне нарощення");
+                });
+
+        // The guard is consulted EXACTLY ONCE for the whole batch, before the persist loop —
+        // this assertion is what a regression back to per-item findActiveDuplicateId would break.
+        verify(serviceRepository, times(1)).findActiveDuplicateTypeIds(any(), any(), any());
+        verify(serviceRepository, never()).findActiveDuplicateId(any(), any(), any(), any());
+
+        // Running before the loop also means the colliding batch never reaches the DB at all:
+        // strictly better than the old per-item behaviour, which persisted item 1 and relied on
+        // the @Transactional rollback to discard it.
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        verify(serviceRepository, never()).flush();
+        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
+    }
+
+    @Test
+    @DisplayName("409 DUPLICATE_SERVICE naming the FIRST colliding item in request order when several collide")
+    void should_reportFirstCollidingItemInRequestOrder_when_multipleBulkItemsDuplicate() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID firstTakenTypeId = UUID.randomUUID();
+        UUID secondTakenTypeId = UUID.randomUUID();
+        UUID firstDefId = UUID.randomUUID();
+        UUID secondDefId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType firstTaken = serviceType(firstTakenTypeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceType secondTaken = serviceType(secondTakenTypeId, "Класичне нарощення", "NAIL_SERVICE", true);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(firstTakenTypeId, 60, "350.00"),
+                fixedItem(secondTakenTypeId, 90, "500.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(firstTaken, secondTaken));
+        when(platformCategoryRepository.findSelectableNamesIn(any()))
+                .thenReturn(List.of("NAIL_SERVICE"));
+        // The query's row order is unspecified — return the SECOND item's collision first to
+        // prove the reported item is chosen by request order, not by result order. Otherwise two
+        // identical requests could blame different items.
+        when(serviceRepository.findActiveDuplicateTypeIds(any(), any(), any()))
+                .thenReturn(List.of(
+                        new ActiveDuplicateProjection(secondTakenTypeId, secondDefId),
+                        new ActiveDuplicateProjection(firstTakenTypeId, firstDefId)));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getServiceName()).isEqualTo("Манікюр");
+                    assertThat(dup.getExistingServiceDefId()).isEqualTo(firstDefId);
+                });
+    }
+
+    @Test
+    @DisplayName("409 DUPLICATE_SERVICE when the batch flush loses the race the pre-check won")
+    void should_translateIndexViolation_when_bulkFlushRaces() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+        // Batched pre-check passes (default empty list), then a concurrent transaction commits
+        // and the V121 index catches it at the single batch flush. The translation must survive
+        // the move off per-item saveAndFlush, or the caller would get a generic 409 with no
+        // data.code to branch on.
+        org.mockito.Mockito.doThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX))
+                .when(serviceRepository).flush();
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
+                        .as("the index reports the constraint, not which queued row lost")
+                        .isNull());
+    }
+
+    @Test
+    @DisplayName("rethrows an unrelated integrity violation from the batch flush untouched")
+    void should_rethrowUnrelatedIntegrityViolation_when_bulkFlushViolatesOtherConstraint() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+        // Same builder, a DIFFERENT constraint: the negative case must differ from the positive
+        // one only in the constraint name, or it would not isolate the classification branch.
+        org.mockito.Mockito.doThrow(DuplicateServiceViolations.violationOf(
+                        "service_definitions_service_type_id_fkey"))
+                .when(serviceRepository).flush();
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class)
+                .isNotInstanceOf(DuplicateServiceException.class);
     }
 
     // ── All-or-nothing: unknown / inactive serviceTypeId aborts the whole batch ─
@@ -310,7 +482,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("ServiceType not found");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
         verify(masterServiceRepository, never()).save(any());
     }
 
@@ -337,7 +509,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Service type is not active");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
     @Test
@@ -362,7 +534,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Unknown category");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
     // ── Authorization ──────────────────────────────────────────────────────────
@@ -382,7 +554,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
     @Test
@@ -407,7 +579,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 .hasMessageContaining("Access denied");
 
         verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
     @Test
@@ -423,6 +595,6 @@ class ServiceCatalogServiceBulkCreateTest {
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Master not found");
 
-        verify(serviceRepository, never()).save(any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 }

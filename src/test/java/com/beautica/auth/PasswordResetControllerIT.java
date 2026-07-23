@@ -38,7 +38,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -59,6 +61,25 @@ import static org.mockito.Mockito.verify;
 class PasswordResetControllerIT extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(PasswordResetControllerIT.class);
+
+    /**
+     * Upper bound for awaiting an asynchronously-dispatched reset OTP email.
+     * {@code PasswordResetService.scheduleResetOtpEmail} hands the send to the
+     * {@code emailExecutor} pool from inside an {@code afterCommit} callback, so the HTTP
+     * response returns strictly <em>before</em> the mock is invoked — a bare {@code verify}
+     * races the executor and reddens under a saturated batch. {@code timeout} returns as soon
+     * as the invocation lands, so the happy path pays no wall-clock cost.
+     */
+    private static final long EMAIL_DISPATCH_TIMEOUT_MS = 5_000L;
+
+    /**
+     * Settle window for asserting that <em>no</em> email was dispatched. Deliberately
+     * {@code after} rather than {@code timeout}: {@code timeout(...).never()} returns
+     * immediately and would pass spuriously by checking before a regressed async send could
+     * land — i.e. it fails open, which is worse than the flake it would be papering over.
+     * {@code after} always waits the full duration, giving a leaked send time to surface.
+     */
+    private static final long NO_EMAIL_SETTLE_MS = 1_000L;
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -104,7 +125,8 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
 
         var user = transactionTemplate.execute(s -> userRepository.findByEmail(email).orElseThrow());
         assertThat(user.getPasswordResetCodeHash()).isNotNull();
-        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), any(String.class));
+        verify(emailNotificationService, timeout(EMAIL_DISPATCH_TIMEOUT_MS))
+                .sendPasswordResetOtpEmail(any(User.class), any(String.class));
     }
 
     @Test
@@ -122,7 +144,8 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         assertThat(unknownResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(unknownResp.getBody()).isEqualTo(alsoUnknownResp.getBody());
 
-        verify(emailNotificationService, never()).sendPasswordResetOtpEmail(any(), any());
+        verify(emailNotificationService, after(NO_EMAIL_SETTLE_MS).never())
+                .sendPasswordResetOtpEmail(any(), any());
     }
 
     @Test
@@ -477,7 +500,8 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         assertThat(otpReq.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         ArgumentCaptor<String> otpCaptor = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
+        verify(emailNotificationService, timeout(EMAIL_DISPATCH_TIMEOUT_MS))
+                .sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
         String rawOtp = otpCaptor.getValue();
 
         ResponseEntity<String> verifyResp = restTemplate.postForEntity(
@@ -547,7 +571,8 @@ class PasswordResetControllerIT extends AbstractIntegrationTest {
         ArgumentCaptor<String> otpCaptor = ArgumentCaptor.forClass(String.class);
         restTemplate.postForEntity("/api/v1/auth/forgot-password",
                 new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
+        verify(emailNotificationService, timeout(EMAIL_DISPATCH_TIMEOUT_MS))
+                .sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
         return otpCaptor.getValue();
     }
 

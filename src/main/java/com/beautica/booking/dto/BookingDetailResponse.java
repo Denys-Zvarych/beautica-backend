@@ -61,6 +61,13 @@ import java.util.UUID;
  * Do NOT add audience-based suppression of either field — a prior architect review flagged this
  * as a leak and that recommendation was explicitly rejected by the product owner. See
  * {@code BookingNoteVisibilityIT} for the tests that pin this behaviour.
+ *
+ * <p><b>{@code priceMaxAtBooking}</b> — a frozen snapshot column on the booking row (V119), the
+ * companion to {@code priceAtBooking}'s floor; see {@link BookingPriceRange} for the rule that
+ * computed it at creation. In short: non-null only when the master left this service's price as a
+ * genuine RANGE (no {@code priceOverride}) at the moment of booking; otherwise null, meaning
+ * "single price, render {@code priceAtBooking} alone". Never re-derived on read — a later service
+ * edit must not rewrite a band the client already agreed to.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -72,6 +79,13 @@ public record BookingDetailResponse(
         ZonedDateTime startsAt,
         ZonedDateTime endsAt,
         BigDecimal priceAtBooking,
+        @Schema(types = {"number", "null"}, nullable = true,
+                description = "The range ceiling agreed AT BOOKING TIME, present ONLY when the "
+                        + "master left this service's price as a genuine RANGE (no priceOverride) "
+                        + "when the booking was made. Null means a single price — render "
+                        + "priceAtBooking alone. The client must never re-derive this from "
+                        + "priceType/priceOverride; the decision is made server-side, once.")
+        BigDecimal priceMaxAtBooking,
         int durationMinutesAtBooking,
         OffsetDateTime createdAt,
         String clientFirstName,
@@ -125,7 +139,14 @@ public record BookingDetailResponse(
      *
      * <p>The caller MUST have hydrated the full graph (client, master.user, master.salon,
      * masterService.serviceDefinition) — e.g. via {@code BookingRepository.findByIdWithFullGraph}
-     * — so the field reads below trigger no lazy SELECTs.
+     * or {@code findAllByIdsWithGraph}, both of which carry
+     * {@code JOIN FETCH b.masterService ms JOIN FETCH ms.serviceDefinition} — so the field reads
+     * below trigger no lazy SELECTs. That two-hop chain remains load-bearing for
+     * {@code serviceDefinition.name}/{@code .category}: a caller that hydrates the booking WITHOUT
+     * it N+1s (or throws {@code LazyInitializationException} on a detached entity). Fix the query,
+     * never weaken this contract. {@code priceMaxAtBooking} does NOT contribute to that
+     * requirement — since V119 it is a frozen column on the booking row itself, not a walk into
+     * the current service definition.
      *
      * <p>The master's discovery address (salon vs own-user) is resolved by the salon-primary
      * rule: a salon-employed master surfaces the salon's name + street/building; an independent
@@ -158,6 +179,7 @@ public record BookingDetailResponse(
                 booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV),
                 booking.getEndsAt().atZoneSameInstant(TimeZones.KYIV),
                 booking.getPriceAtBooking(),
+                booking.getPriceMaxAtBooking(),
                 booking.getDurationMinutesAtBooking(),
                 booking.getCreatedAt().atOffset(ZoneOffset.UTC),
                 // Fall back to the OTP-verified guest identity so the owning provider still sees

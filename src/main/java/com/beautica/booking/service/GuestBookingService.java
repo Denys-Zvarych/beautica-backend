@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
+import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.entity.Booking;
@@ -206,9 +207,13 @@ public class GuestBookingService {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }
 
+        // Freeze the RANGE ceiling beside the floor (V119), by the same rule and at the same
+        // moment as the registered-client path (BookingService#doCreateBooking). Null = single
+        // price. A LINK booking must be as immune to a later service edit as an APP one.
         Booking booking = Booking.guestBooking(
                 master, msa, master.getSalon(), startsAt, endsAt,
-                price, duration, buffer, req.name(), req.surname(), guestPhone);
+                price, BookingPriceRange.resolveCeiling(msa),
+                duration, buffer, req.name(), req.surname(), guestPhone);
         try {
             return bookingRepository.saveAndFlush(booking);
         } catch (DataIntegrityViolationException e) {

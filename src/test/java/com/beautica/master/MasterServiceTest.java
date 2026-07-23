@@ -1,5 +1,8 @@
 package com.beautica.master;
 
+import org.springframework.http.HttpStatus;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.domain.PageRequest;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
@@ -79,6 +82,13 @@ class MasterServiceTest {
     // under an active transaction synchronization (see should_evict* guard tests below).
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Prefix-eviction fix: the master-calendar / available-slots afterCommit callbacks now delegate to
+    // the shared evictor, so @InjectMocks must have one to wire or every deactivate/reactivate path
+    // NPEs the moment its synchronization replays. A mock is right HERE — this tier asserts that the
+    // write path REQUESTS eviction. Whether the request actually matches a real cache key is a
+    // different question, and one a mock can never answer: it is proven against the live @Cacheable
+    // proxies in CachePrefixEvictionKeyShapeTest.
+    @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
     @InjectMocks
     private MasterService masterService;
@@ -254,7 +264,7 @@ class MasterServiceTest {
     @DisplayName("should_throwNotFound_when_getMasterDetailWithUnknownId")
     void should_throwNotFound_when_getMasterDetailWithUnknownId() {
         UUID masterId = UUID.randomUUID();
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.getMasterDetail(masterId))
                 .isInstanceOf(NotFoundException.class);
@@ -284,7 +294,7 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(wh, "id", UUID.randomUUID());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of(wh));
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
@@ -325,7 +335,7 @@ class MasterServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
         when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.of(city));
 
@@ -352,7 +362,7 @@ class MasterServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
@@ -380,7 +390,7 @@ class MasterServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
         when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.empty());
 
@@ -408,16 +418,16 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(master, "user", user);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         // Stub both caches so the afterCommit eviction path does not NPE.
         Cache masterDetailCache = mock(Cache.class);
         Cache masterByUserCache = mock(Cache.class);
         when(cacheManager.getCache("master-detail")).thenReturn(masterDetailCache);
         when(cacheManager.getCache("master-by-user")).thenReturn(masterByUserCache);
-        // master-calendar is also evicted by deactivateMaster via evictMasterCalendarAfterCommit.
-        Cache masterCalendarCache = mock(Cache.class);
-        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCache);
+        // master-calendar is also evicted by deactivateMaster, but no longer through cacheManager:
+        // that eviction is a prefix scan and now delegates to the injected MasterCachePrefixEvictor
+        // mock, so stubbing cacheManager.getCache("master-calendar") here would be an unused stub.
 
         // deactivateMaster guards eviction registration with isSynchronizationActive().
         // Manually initialise Spring transaction synchronization so the guard passes in this
@@ -469,7 +479,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(master, "user", user);
         ReflectionTestUtils.setField(master, "salon", salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
@@ -556,7 +566,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(master, "user", user);
         // salon intentionally left null — an independent master owns no salon catalogue entry.
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
@@ -585,7 +595,7 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // upsert merge map is built from ALL rows (incl. inactive) via findByMasterId, not the
         // active-only finder — matching production after the 23505 duplicate-INSERT fix.
         when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
@@ -630,7 +640,7 @@ class MasterServiceTest {
         // Re-enable day 2 with new hours and isActive = true.
         var request = new WorkingHoursRequest(2, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // The merge map MUST be built from the all-rows finder so the inactive row is visible.
         when(workingHoursRepository.findByMasterId(masterId))
                 .thenReturn(List.of(existingInactiveRow));
@@ -678,7 +688,7 @@ class MasterServiceTest {
         UUID masterId = UUID.randomUUID();
         var request = new WorkingHoursRequest(2, LocalTime.of(10, 0), LocalTime.of(18, 0), true);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() ->
                 masterService.upsertWorkingHours(actorId, masterId, List.of(request)))
@@ -711,7 +721,7 @@ class MasterServiceTest {
                 .hasMessageContaining("Duplicate working-hours entry for the same day");
 
         // Guard runs before any repository access — no master lookup, no merge-map fetch, no save.
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(any());
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
         verify(workingHoursRepository, never()).findByMasterId(any());
         verify(workingHoursRepository, never()).saveAll(any());
     }
@@ -735,7 +745,7 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(savedMon, "id", UUID.randomUUID());
         ReflectionTestUtils.setField(savedTue, "id", UUID.randomUUID());
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // upsert merge map uses the all-rows finder (incl. inactive) — see production fix.
         when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of(savedMon, savedTue));
@@ -758,7 +768,7 @@ class MasterServiceTest {
 
         // Empty payload must never trip the duplicate guard; it stays a clean no-op
         // (master is loaded, saveAll receives an empty list, an empty list is returned).
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         // upsert merge map uses the all-rows finder (incl. inactive) — see production fix.
         when(workingHoursRepository.findByMasterId(masterId)).thenReturn(List.of());
         when(workingHoursRepository.saveAll(anyList())).thenReturn(List.of());
@@ -790,7 +800,7 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(master, "user", user);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         masterService.deactivateMaster(ownerId, masterId);
 
@@ -805,7 +815,7 @@ class MasterServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.deactivateMaster(actorId, masterId))
                 .isInstanceOf(NotFoundException.class);
@@ -1219,8 +1229,17 @@ class MasterServiceTest {
                 .build();
         ReflectionTestUtils.setField(master, "id", masterId);
 
-        Page<Master> masterPage = new PageImpl<>(List.of(master), pageable, 1);
-        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable))
+        // The service no longer forwards the caller's Pageable verbatim: SortWhitelist.apply
+        // validates it against SORTABLE_MASTER_PROPERTIES and, because the incoming Pageable is
+        // unsorted and the underlying query has no ORDER BY of its own, substitutes the default
+        // sort plus the mandatory unique `id` tiebreaker. Stubbing/verifying with this exact
+        // normalized instance (rather than any(Pageable.class)) is deliberate — it pins that
+        // contract, so silently dropping the whitelist or the tiebreaker reddens this test.
+        Pageable expectedNormalized = PageRequest.of(0, 10,
+                Sort.by(Sort.Direction.DESC, "avgRating").and(Sort.by(Sort.Direction.ASC, "id")));
+
+        Page<Master> masterPage = new PageImpl<>(List.of(master), expectedNormalized, 1);
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized))
                 .thenReturn(masterPage);
 
         Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, pageable);
@@ -1229,6 +1248,19 @@ class MasterServiceTest {
         assertThat(result.getContent()).hasSize(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
         assertThat(result.getContent().get(0).masterType()).isEqualTo(MasterType.SALON_MASTER);
-        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, pageable);
+        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized);
+    }
+
+    @Test
+    @DisplayName("getMastersByPage rejects a dotted sort path with a 400 before touching the repository")
+    void should_throwBadRequest_when_getMastersByPageSortIsDottedPath() {
+        UUID salonId = UUID.randomUUID();
+        Pageable oracleAttempt = PageRequest.of(0, 10, Sort.by(Sort.Direction.ASC, "user.passwordHash"));
+
+        assertThatThrownBy(() -> masterService.getMastersByPage(salonId, oracleAttempt))
+                .isInstanceOf(BusinessException.class)
+                .hasFieldOrPropertyWithValue("status", HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(masterRepository);
     }
 }

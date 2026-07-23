@@ -22,10 +22,56 @@ import lombok.Setter;
 import java.math.BigDecimal;
 import java.util.UUID;
 
+/**
+ * A service offered by an owner (a salon or a master).
+ *
+ * <p><b>Uniqueness — one ACTIVE service per {@code (ownerType, ownerId, serviceType)}.</b>
+ * Enforced by the partial unique index {@code ux_service_def_owner_service_type_active}
+ * (V121):
+ *
+ * <pre>{@code
+ * CREATE UNIQUE INDEX ux_service_def_owner_service_type_active
+ *     ON service_definitions (owner_type, owner_id, service_type_id)
+ *     WHERE is_active = true;
+ * }</pre>
+ *
+ * <p>The key is {@code service_type_id}, never {@code name}: the name is derived from the type
+ * ({@code ServiceCatalogService#resolveCreateName} defaults to {@code serviceType.nameUk}, and
+ * the bulk path always uses it), so a custom name must not be able to bypass the rule. Price and
+ * duration are deliberately NOT part of the key — two rows of the same type at different prices
+ * are duplicates by the locked product decision, not variants.
+ *
+ * <p>The index is <b>partial on {@code is_active = true}</b> because deletion is soft
+ * ({@code ServiceRepository#deactivateById} flips the flag and the row survives). An
+ * unconditional constraint would make a once-deleted service permanently uncreatable, with no
+ * reactivate endpoint to escape.
+ *
+ * <p><b>Intentionally absent from {@code @Table(uniqueConstraints = …)}.</b> Hibernate cannot
+ * express a partial (filtered) unique index; declaring it there would model an
+ * <em>unconditional</em> one, putting {@code ddl-auto=validate} permanently at odds with the
+ * real schema and re-breaking soft-delete on any generated DDL. The migration is the single
+ * source of truth; {@code ServiceCatalogService} translates violations into a
+ * {@code DUPLICATE_SERVICE} 409.
+ */
 @Entity
+// Every @Index below mirrors a real index in db/migration — keep it that way. Two entries here once
+// named indices that existed in NO migration: idx_service_def_owner_active (owner_id, is_active) and
+// idx_service_def_owner_type_active (owner_type, owner_id, is_active). V122 resolved them in opposite
+// directions — it CREATED the (owner_type, owner_id, is_active) one (ServiceRepository
+// #findBookableServicesBySalon filters exactly those three columns) and the owner_id-leading one was
+// deleted from this list as unjustified, since nothing queries owner_id without owner_type. V122 also
+// dropped idx_service_def_owner (owner_type, owner_id) — a strict leading prefix of the index below.
+//
+// This drift was invisible rather than loud: Hibernate 6.5's hbm2ddl.auto=validate does NOT verify
+// @Table(indexes = ...) against the live schema, so an @Index naming a nonexistent index is silently
+// cosmetic and will never fail a boot. Only a reader can catch it — hence this note.
+//
+// Not every real index appears here: idx_service_def_category, the GIN trigram
+// idx_service_definitions_name_trgm (V98) and the PARTIAL unique ux_service_def_owner_service_type_active
+// (V121) are absent because JPA's @Index cannot express GIN or partial indices at all — see the class
+// javadoc above for the unique one. Absent-but-real is harmless; declared-but-absent is the drift.
 @Table(name = "service_definitions",
         indexes = {
-                @Index(name = "idx_service_def_owner_active",      columnList = "owner_id, is_active"),
                 @Index(name = "idx_service_def_owner_type_active", columnList = "owner_type, owner_id, is_active"),
                 @Index(name = "idx_service_def_service_type",      columnList = "service_type_id")
         })

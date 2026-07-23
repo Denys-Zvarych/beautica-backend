@@ -203,7 +203,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
         when(master.getUser()).thenReturn(masterUser);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
 
@@ -226,7 +226,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
@@ -247,7 +247,7 @@ class AuthorizationServiceTest {
         boolean result = authorizationService.canManageMasterSchedule(auth, masterId);
 
         assertThat(result).isFalse();
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+        verify(masterRepository, never()).findByIdWithUserAndSalon(masterId);
     }
 
     @Test
@@ -260,7 +260,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1239,6 +1239,89 @@ class AuthorizationServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    // Cross-master denial on the ENFORCE twin. GET /bookings/{id} calls
+    // enforceCanViewBooking(actorUserId, booking) — NOT the canViewBooking SpEL predicate tested
+    // above. The two are independently maintained and nothing in the type system keeps them in
+    // step, so the cross-master cases must be pinned on BOTH. The stakes rose with the booking
+    // detail enrichment: this response carries a THIRD party's name, guest name and arrival
+    // address, so drift here leaks other people's PII, not the caller's own.
+
+    @Test
+    @DisplayName("enforceCanViewBooking throws ForbiddenException when an INDEPENDENT_MASTER views "
+            + "another independent master's booking — the entity-path twin of "
+            + "canViewBooking's cross-master denial, exercising the "
+            + "isAuthorizedToManageBooking INDEPENDENT_MASTER id-equality branch")
+    void should_throwForbidden_when_independentMasterViewsAnotherMastersBooking() {
+        UUID actorMasterUserId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+
+        User otherMasterUser = mock(User.class);
+        when(otherMasterUser.getId()).thenReturn(otherMasterUserId);
+
+        // Independent-master booking: no salon at all, so authority rests entirely on the
+        // master-user id equality inside isAuthorizedToManageBooking. INDEPENDENT_MASTER is
+        // neither CLIENT nor SALON_MASTER, so there is no second branch to fall through to.
+        Master otherMaster = mock(Master.class);
+        when(otherMaster.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(otherMaster.getUser()).thenReturn(otherMasterUser);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(otherMaster);
+
+        SecurityContextHolder.getContext()
+                .setAuthentication(mockAuth(actorMasterUserId, "ROLE_INDEPENDENT_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(actorMasterUserId, booking))
+                .as("an INDEPENDENT_MASTER must never read a booking belonging to a different "
+                        + "independent master — that response carries the other master's client "
+                        + "name and arrival address")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking throws ForbiddenException when a SALON_MASTER views a "
+            + "booking belonging to a master at a different salon — neither the salon-owner "
+            + "branch nor the SALON_MASTER own-booking branch may admit them, and no DB "
+            + "round-trip is made")
+    void should_throwForbidden_when_salonMasterViewsAnotherSalonsBooking() {
+        UUID actorMasterUserId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+        UUID otherSalonOwnerId = UUID.randomUUID();
+
+        User otherSalonOwner = mock(User.class);
+        when(otherSalonOwner.getId()).thenReturn(otherSalonOwnerId);
+
+        Salon otherSalon = mock(Salon.class);
+        when(otherSalon.getOwner()).thenReturn(otherSalonOwner);
+
+        User otherMasterUser = mock(User.class);
+        when(otherMasterUser.getId()).thenReturn(otherMasterUserId);
+
+        Master otherMaster = mock(Master.class);
+        when(otherMaster.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(otherMaster.getSalon()).thenReturn(otherSalon);
+        when(otherMaster.getUser()).thenReturn(otherMasterUser);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(otherMaster);
+
+        SecurityContextHolder.getContext()
+                .setAuthentication(mockAuth(actorMasterUserId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(actorMasterUserId, booking))
+                .as("a SALON_MASTER must only ever read bookings assigned to them — not another "
+                        + "salon's, and (per fix M1) not a same-salon colleague's either")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+
+        // Guard assertion (not decoration): the entity graph answers this in memory. A regression
+        // that re-broadened the check to "any master at a salon I can manage" would reach
+        // hasManagementAccess and hit the DB — this fails the moment that happens.
+        verify(userRepository, never()).findSalonIdById(any());
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
     // ── canManageMaster — role fast-path (no DB hit) ──────────────────────────
 
     @Test
@@ -1252,7 +1335,7 @@ class AuthorizationServiceTest {
         boolean result = authorizationService.canManageMaster(auth, masterId);
 
         assertThat(result).isFalse();
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+        verify(masterRepository, never()).findByIdWithUserAndSalon(masterId);
     }
 
     @Test
@@ -1266,7 +1349,7 @@ class AuthorizationServiceTest {
         boolean result = authorizationService.canManageMaster(auth, masterId);
 
         assertThat(result).isFalse();
-        verify(masterRepository, never()).findByIdWithSalonAndOwner(masterId);
+        verify(masterRepository, never()).findByIdWithUserAndSalon(masterId);
     }
 
     // ── canManageMaster — SALON_OWNER branch (Phase 12.1) ─────────────────────
@@ -1287,7 +1370,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1315,7 +1398,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1336,7 +1419,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1360,7 +1443,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1389,7 +1472,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1417,7 +1500,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1438,7 +1521,7 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
         when(master.getSalon()).thenReturn(null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 

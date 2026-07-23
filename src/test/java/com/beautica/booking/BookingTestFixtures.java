@@ -94,7 +94,7 @@ class BookingTestFixtures {
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
                         + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, resolveServiceTypeId());
+                serviceDefId, userId, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId));
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
@@ -111,6 +111,42 @@ class BookingTestFixtures {
                         + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
                         + "ORDER BY st.name_uk LIMIT 1",
                 UUID.class);
+    }
+
+    /**
+     * Resolves a real, selectable {@code service_types.id} that {@code (ownerType, ownerId)} does
+     * NOT already hold an ACTIVE {@code service_definitions} row for.
+     *
+     * <p><b>Why this exists.</b> V121 added
+     * {@code ux_service_def_owner_service_type_active} — a partial UNIQUE index on
+     * {@code (owner_type, owner_id, service_type_id) WHERE is_active}. {@link
+     * #resolveServiceTypeId()} is deterministic ({@code ORDER BY st.name_uk LIMIT 1}), so every
+     * definition seeded for one owner through it collided on the SAME type: the second insert for
+     * a master now raises a unique violation. Seeding a multi-service owner is a legitimate,
+     * widespread fixture need across the 26.x IT family (a serviceId filter needs two services to
+     * filter BETWEEN, a per-row statement gate needs a distinct service per booking), so the fix
+     * belongs here rather than in each caller.
+     *
+     * <p>Deliberately a {@code NOT EXISTS} against live rows rather than an in-memory
+     * counter/OFFSET: it is stateless (correct no matter how many fixture instances a test builds),
+     * it mirrors the invariant it is dodging exactly, and it degenerates to the SAME type
+     * {@link #resolveServiceTypeId()} returns on an owner's first service — so single-service
+     * fixtures keep their previous, deterministic behaviour.
+     *
+     * <p>Note the query is only sound because the caller INSERTs the definition before asking
+     * again; every fixture here does. It throws (empty result) rather than silently reusing a type
+     * if an owner ever exhausts the ~20 seeded selectable types — a loud failure, not a 409.
+     */
+    UUID resolveUnusedServiceTypeId(String ownerType, UUID ownerId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "AND NOT EXISTS (SELECT 1 FROM service_definitions sd "
+                        + "                WHERE sd.owner_type = ? AND sd.owner_id = ? "
+                        + "                  AND sd.service_type_id = st.id AND sd.is_active = TRUE) "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class, ownerType, ownerId);
     }
 
     String tokenFor(String email) throws Exception {
@@ -163,7 +199,7 @@ class BookingTestFixtures {
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
                         + "VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId, resolveServiceTypeId());
+                serviceDefId, salonId, resolveUnusedServiceTypeId("SALON", salonId));
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "

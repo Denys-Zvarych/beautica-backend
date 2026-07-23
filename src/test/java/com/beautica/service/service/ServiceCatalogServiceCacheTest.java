@@ -1,11 +1,14 @@
 package com.beautica.service.service;
 
 import com.beautica.config.CacheConfig;
+import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.entity.CatalogCategory;
+import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PlatformCategoryStatus;
 import com.beautica.service.entity.PriceType;
@@ -24,7 +27,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.interceptor.SimpleKey;
+import com.beautica.common.cache.CacheKeyFixtures;
 
 import org.springframework.data.domain.Pageable;
 
@@ -46,7 +49,7 @@ import static org.mockito.Mockito.when;
 @SpringBootTest(
         classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class,
                 CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, SalonCatalogCacheEvictor.class,
-                CacheConfig.class},
+                CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
@@ -212,7 +215,7 @@ class ServiceCatalogServiceCacheTest {
                 "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
         when(salonRepository.existsById(salonId1)).thenReturn(true);
         when(salonRepository.existsById(salonId2)).thenReturn(true);
-        when(serviceRepository.save(any(ServiceDefinition.class)))
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
                 .thenReturn(savedDef1)
                 .thenReturn(savedDef2);
 
@@ -301,18 +304,27 @@ class ServiceCatalogServiceCacheTest {
     @Test
     @DisplayName("deactivateServiceDefinition evicts available-slots cache entries for affected masters")
     void should_evictAvailableSlotsCache_when_deactivateServiceDefinitionCalled() {
-        // Arrange — pre-populate an available-slots entry whose key contains the affected
-        // master UUID as the first element. The production eviction scans Caffeine's
-        // asMap() for SimpleKey entries whose toString() contains "[<masterId>,".
+        // Arrange — pre-populate an available-slots entry keyed the way SlotCalculationService's
+        // @Cacheable(key = "{#masterId, #date, #masterServiceId}") really keys it: an explicit SpEL
+        // inline list evaluates to a List, and is NEVER wrapped in a SimpleKey (that type comes only
+        // from the default SimpleKeyGenerator, used when no `key` attribute is given).
+        //
+        // SlotCalculationService is a @MockBean in this slice, so its real @Cacheable proxy cannot be
+        // driven from here. The key therefore comes from CacheKeyFixtures.spelKey rather than being
+        // hand-rolled — and that helper is not an assumption: CachePrefixEvictionKeyShapeTest drives
+        // the real getAvailableSlots proxy and asserts Spring's actual key equals its output. This
+        // test covers the write-path wiring (does deactivation evict the affected masters at all);
+        // the shape is proven against ground truth there.
+        //
+        // The previous version seeded `new SimpleKey(...)`, which matched the equally-wrong
+        // production predicate — so it passed while the real eviction removed nothing.
         UUID masterId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
         UUID someServiceId = UUID.randomUUID();
         LocalDate someDate = LocalDate.of(2026, 6, 1);
 
-        // Simulate a slot-cache entry placed by SlotCalculationService's @Cacheable method.
-        // Key shape: SimpleKey[masterId, date, serviceId] as Spring would produce it.
         var slotsCache = cacheManager.getCache("available-slots");
-        var cacheKey = new SimpleKey(masterId, someDate, someServiceId);
+        var cacheKey = CacheKeyFixtures.spelKey(masterId, someDate, someServiceId);
         slotsCache.put(cacheKey, List.of("09:00", "10:00"));
 
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
@@ -419,5 +431,106 @@ class ServiceCatalogServiceCacheTest {
 
         verify(masterServiceRepository, times(2)).findBookableAssignmentsBySalon(salonA);
         verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonB);
+    }
+
+    // ── masterServices cache SHAPE (QA gap G6, Q7) ──────────────────────────────
+    //
+    // getMasterServices' javadoc makes a load-bearing safety claim: masking (fromPublic,
+    // dropping priceOverride) happens INSIDE the @Cacheable method, so the "masterServices"
+    // cache entry itself is already masked — not just the value handed back to this call's
+    // caller. Prior tests above only pin call counts (cache hit/miss), which would stay green
+    // even if masking moved OUT of the cached method (e.g. into the controller) and the cache
+    // started holding the unmasked shape — a priceOverride leak to anonymous callers. These two
+    // tests read the actual stored cache entry via the injected real CacheManager (this class's
+    // Spring context has CacheConfig on the @SpringBootTest classes list, so @Cacheable's AOP
+    // proxy is genuinely active here — this is NOT a plain-Mockito unit test) to pin the shape
+    // claim behaviourally.
+
+    @Test
+    @DisplayName("public getMasterServices call caches the already-masked shape (priceOverride null in the stored entry, effectivePrice still derived from the override)")
+    void should_cacheTheAlreadyMaskedShape_when_publicPathPopulatesMasterServices() {
+        UUID masterId = UUID.randomUUID();
+        BigDecimal override = new BigDecimal("123.45");
+
+        ServiceDefinition definition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .name("Manicure")
+                .category("MANICURE")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("300.00"))
+                .build();
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(definition)
+                .priceOverride(override)
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+
+        List<MasterServiceResponse> returned = serviceCatalogService.getMasterServices(masterId);
+
+        // The returned value is masked, and the mask is a projection: effectivePrice still
+        // reflects the override that priceOverride itself no longer discloses.
+        assertThat(returned).hasSize(1);
+        assertThat(returned.get(0).priceOverride()).isNull();
+        assertThat(returned.get(0).effectivePrice()).isEqualByComparingTo(override);
+
+        // The whole point of this test: assert the STORED cache value, not just the return
+        // value — this is what distinguishes "masked on the way out" from "masked before storing".
+        List<?> cachedRaw = cacheManager.getCache("masterServices").get(masterId, List.class);
+        assertThat(cachedRaw).isNotNull().hasSize(1);
+        MasterServiceResponse cachedEntry = (MasterServiceResponse) cachedRaw.get(0);
+        assertThat(cachedEntry.priceOverride()).isNull();
+        assertThat(cachedEntry.effectivePrice()).isEqualByComparingTo(override);
+    }
+
+    @Test
+    @DisplayName("provider's own getMyServices call after the public path has cached the master does not pick up the masked entry — priceOverride comes back unmasked")
+    void should_returnUnmaskedPriceOverride_when_providerReadsOwnServicesAfterPublicPathCached() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        BigDecimal override = new BigDecimal("77.00");
+
+        ServiceDefinition definition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .name("Manicure")
+                .category("MANICURE")
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("300.00"))
+                .build();
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(definition)
+                .priceOverride(override)
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        // Populate the "masterServices" cache with the masked shape via the public path first.
+        serviceCatalogService.getMasterServices(masterId);
+
+        // getMyServices is uncached (no @Cacheable) and must not read the masked cache entry —
+        // it re-queries the repository directly and returns the full, unmasked variant.
+        List<MasterServiceResponse> own = serviceCatalogService.getMyServices(userId);
+
+        assertThat(own).hasSize(1);
+        assertThat(own.get(0).priceOverride()).isEqualByComparingTo(override);
     }
 }

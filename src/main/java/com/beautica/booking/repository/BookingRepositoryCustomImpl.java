@@ -11,10 +11,10 @@ import jakarta.persistence.criteria.Order;
 import jakarta.persistence.criteria.Predicate;
 import jakarta.persistence.criteria.Root;
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
+import org.springframework.data.support.PageableExecutionUtils;
 
 import java.time.OffsetDateTime;
 import java.util.Collection;
@@ -42,6 +42,16 @@ import java.util.UUID;
  * {@link #findIdPage}).
  */
 class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
+
+    /**
+     * Message for the {@link IllegalArgumentException} every entry point raises on an
+     * {@code Unpaged} {@link Pageable} — see {@link #findIdPage} for why unpaged is refused here
+     * rather than silently executed as an unbounded scan. Never reaches a client: no HTTP path can
+     * produce an {@code Unpaged} instance.
+     */
+    static final String UNPAGED_REJECTED_MESSAGE =
+            "Pageable.unpaged() is not supported by BookingRepositoryCustom — "
+                    + "an unbounded booking id scan is never a valid query; pass a paged Pageable";
 
     @PersistenceContext
     private EntityManager entityManager;
@@ -127,19 +137,41 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * {@link Specification} — the same id-page-plus-count shape the superseded {@code @Query}
      * methods produced.
      *
+     * <p>The count is deferred through {@link PageableExecutionUtils#getPage} rather than executed
+     * unconditionally, so Spring Data's standard short-circuit applies (see
+     * {@link #countMatching}) — the previous {@code new PageImpl<>(ids, pageable, total)} bypassed
+     * it and paid a full-history {@code COUNT(*)} even on a first page that already ended.
+     *
      * <p><b>Trusts an already-validated {@code Sort}.</b> {@code pageable.getSort()} is translated
      * 1:1 into Criteria {@link Order}s via {@link Root#get(String)} on each
      * {@link Sort.Order#getProperty()}. This is safe ONLY because both callers
      * ({@code findIdsByMasterIdFiltered} / {@code findIdsBySalonIdsFiltered}) are reached
      * exclusively through {@code BookingService#getMyBookings}, which normalizes and whitelists
-     * the {@code Sort} (via {@code normalizeBookingSort}) to {@code startsAt} /
-     * {@code priceAtBooking} / {@code createdAt} — plus a trailing {@code id} tiebreaker — before
-     * either method is ever invoked. An unvalidated {@code Sort} reaching this method would let
+     * the {@code Sort} (via {@code normalizeBookingSort}) to {@code startsAt} — plus a trailing
+     * {@code id} tiebreaker — before either method is ever invoked (Phase 26.8 narrowed the
+     * whitelist from {@code {startsAt, priceAtBooking}}; {@code createdAt} was never a member of
+     * it). An unvalidated {@code Sort} reaching this method would let
      * {@link Root#get(String)} resolve an arbitrary property path (including through a join
      * alias), which is exactly the ordering oracle Phase 26.3 closes at the service boundary; do
      * NOT call this method (or its two public callers) with a raw, caller-supplied {@code Sort}.
+     *
+     * <p><b>{@code Pageable.unpaged()} is UNSUPPORTED and rejected with
+     * {@link IllegalArgumentException}.</b> The alternative — skipping
+     * {@code setFirstResult}/{@code setMaxResults} for an {@code Unpaged} instance — is not a
+     * safety guard but its opposite: it would turn a loud failure into a SILENT UNBOUNDED
+     * {@code SELECT b.id} that materialises every matching booking id into a {@code List} and
+     * hydrates all of them (Anti-Bug §E-3). Unreachable over HTTP either way — both entry points
+     * carry {@code @PageableDefault} and {@code spring.data.web.pageable.max-page-size} — but
+     * {@code BookingService#normalizeBookingSort} deliberately PRESERVES {@code Unpaged} for
+     * direct in-process callers, so this boundary is where that must be refused. No production
+     * caller passes one today; the only {@code Pageable.unpaged()} callers are
+     * {@code BookingServiceTest} cases that mock this repository away entirely.
      */
     private Page<UUID> findIdPage(Specification<Booking> spec, Pageable pageable) {
+        if (pageable.isUnpaged()) {
+            throw new IllegalArgumentException(UNPAGED_REJECTED_MESSAGE);
+        }
+
         CriteriaBuilder cb = entityManager.getCriteriaBuilder();
 
         CriteriaQuery<UUID> idQuery = cb.createQuery(UUID.class);
@@ -151,11 +183,37 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         }
         idQuery.orderBy(toCriteriaOrders(cb, idRoot, pageable.getSort()));
 
+        // Unconditional, and safe to be so: the unpaged guard at the top of this method has
+        // already rejected the only Pageable for which getOffset()/getPageSize() throw.
         TypedQuery<UUID> typedIdQuery = entityManager.createQuery(idQuery);
         typedIdQuery.setFirstResult((int) pageable.getOffset());
         typedIdQuery.setMaxResults(pageable.getPageSize());
         List<UUID> ids = typedIdQuery.getResultList();
 
+        return PageableExecutionUtils.getPage(ids, pageable, () -> countMatching(spec));
+    }
+
+    /**
+     * Builds and executes the {@code COUNT(*)} companion to {@link #findIdPage}'s id query, from
+     * the same {@link Specification}.
+     *
+     * <p>Invoked <b>only</b> from inside the {@link PageableExecutionUtils#getPage} supplier, which
+     * is why the {@link CriteriaQuery} is constructed here rather than in the caller: Spring Data's
+     * short-circuit rules skip the count entirely when the returned content already determines the
+     * total — a first page (offset 0) shorter than the page size, or a short last page; the util's
+     * third case, an unpaged request, is unreachable here because {@link #findIdPage} rejects
+     * {@code Unpaged} outright — and a query built eagerly in the caller would still cost the
+     * round trip this indirection exists to avoid. That short-circuit is exactly the common case on
+     * {@code GET /bookings/me?size=20}: a user with fewer than 20 bookings previously paid a
+     * {@code COUNT(*)} over their entire booking history on every app open.
+     *
+     * <p>{@code getTotalElements()} stays exact in the skipped cases — the util derives it from
+     * {@code offset + content.size()}, which is the true total precisely when the content is short
+     * (see {@code PageableExecutionUtils#getPage}). No caller's total changes; only the round trip
+     * disappears.
+     */
+    private long countMatching(Specification<Booking> spec) {
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
         CriteriaQuery<Long> countQuery = cb.createQuery(Long.class);
         Root<Booking> countRoot = countQuery.from(Booking.class);
         countQuery.select(cb.count(countRoot));
@@ -163,9 +221,7 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         if (countPredicate != null) {
             countQuery.where(countPredicate);
         }
-        long total = entityManager.createQuery(countQuery).getSingleResult();
-
-        return new PageImpl<>(ids, pageable, total);
+        return entityManager.createQuery(countQuery).getSingleResult();
     }
 
     /**

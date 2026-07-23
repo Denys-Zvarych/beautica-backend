@@ -6,6 +6,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
+import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.service.ServiceCatalogService;
@@ -253,6 +254,166 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         assertThat(fixtures.countServiceDefinitionsForMaster(masterInSalonB))
                 .as("the denied request must not persist anything for the salon-B master")
                 .isEqualTo(0L);
+    }
+
+    // ── V121 DUPLICATE_SERVICE on the bulk path, full stack ────────────────────
+    //
+    // Until these landed, the bulk path's V121 behaviour was proven ONLY by Mockito
+    // (ServiceCatalogServiceBulkCreateTest), which stubs serviceRepository.flush() to throw. A
+    // stub cannot prove that flush() emits the queued batch, that Hibernate reports THIS index,
+    // that the exception survives GlobalExceptionHandler as a branchable body, or that the real
+    // transaction rolls back — the four things a client actually depends on. This class was
+    // untouched by the V121 branch.
+    //
+    // SCOPE, stated honestly: both tests below take the PRE-CHECK route
+    // (assertNoActiveDuplicatesInBatch). The flush route inside flushTranslatingDuplicateViolation
+    // is reachable only when a concurrent transaction wins the race between the pre-check and the
+    // flush — and that window is exactly what pg_advisory_xact_lock (see the TOCTOU test below)
+    // exists to close for this endpoint, so it has no deterministic full-stack trigger. It stays
+    // mock-covered by design, not by omission.
+
+    /**
+     * The case {@code ServiceCatalogService#assertNoActiveDuplicatesInBatch}'s javadoc cites as the
+     * reason it is NOT redundant with the caller's {@code existsActiveServiceForMaster}
+     * precondition, quoted: "A definition owned by this master that is active but carries no active
+     * assignment passes the bulk precondition and still collides with the index — this check turns
+     * that into a clean 409 instead of a 500 at flush."
+     *
+     * <p>That claim had no test at any layer. It is reachable in production whenever an assignment
+     * is deactivated without its definition (the assignment and the definition are separate rows
+     * with separate lifecycles), and the difference it makes is a branchable 409 versus an
+     * unhandled constraint violation.
+     *
+     * <p>The decisive assertion is not merely "409" — the first-time precondition ALSO returns 409
+     * — but that the body carries {@code code = DUPLICATE_SERVICE}. If the precondition had fired
+     * instead, the body would carry no {@code data.code} at all, and this test would fail.
+     */
+    @Test
+    @DisplayName("bulk setup returns 409 DUPLICATE_SERVICE — not the first-time-precondition 409 "
+            + "— when an item collides with an ACTIVE definition that carries no active assignment")
+    void should_return409_when_bulkCollidesWithAnAssignmentlessActiveDefinition() throws Exception {
+        String email = "indep-orphan-def-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        // An ACTIVE definition with NO master_services row at all. existsActiveServiceForMaster is
+        // assignment-level, so it reads false here and the first-time gate lets the request through
+        // — while the definition-level V121 index would still reject the insert.
+        UUID orphanDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "350.00")));
+
+        log.debug("Act: bulk setup for a master whose only existing service is an ACTIVE definition "
+                + "with no active assignment, re-requesting that same service type");
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<DuplicateServiceResponse>>() {});
+        assertThat(body.data())
+                .extracting(DuplicateServiceResponse::code, DuplicateServiceResponse::existingServiceDefId)
+                .as("a DUPLICATE_SERVICE code proves assertNoActiveDuplicatesInBatch caught this, "
+                        + "not the first-time precondition (which returns a 409 with no data.code) "
+                        + "and not the flush (which cannot name the surviving row, so its "
+                        + "existingServiceDefId would be null)")
+                .containsExactly("DUPLICATE_SERVICE", orphanDefId);
+
+        assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
+                .as("only the pre-existing orphan definition remains — the rejected batch added nothing")
+                .isEqualTo(1L);
+    }
+
+    /**
+     * All-or-nothing across a REAL transaction when one item of a multi-item batch duplicates an
+     * existing active definition: the valid items must not survive, and the client must still
+     * receive the branchable {@code DUPLICATE_SERVICE} body rather than the generic 409.
+     *
+     * <p>The three-item shape matters. The single-item test above cannot distinguish "the batch
+     * rolled back" from "there was nothing to roll back"; here two items are perfectly valid and
+     * would persist if the transaction leaked. It also puts the colliding item LAST, so a
+     * pre-check that stopped scanning the whole batch would let the first two through.
+     */
+    @Test
+    @DisplayName("a bulk batch whose LAST item duplicates an existing active service returns 409 "
+            + "DUPLICATE_SERVICE and persists ZERO of the batch's rows")
+    void should_return409AndPersistNothing_when_oneBulkItemDuplicatesAnExistingService() throws Exception {
+        List<ServiceTestFixtures.SeededServiceType> types = fixtures.activeSelectableServiceTypes(3);
+        assertThat(types)
+                .as("this test needs three distinct selectable service types to put the colliding "
+                        + "item last behind two valid ones")
+                .hasSize(3);
+
+        String email = "indep-bulk-dup-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        // Assignmentless again — the only way past the first-time precondition into the duplicate
+        // check (see the test above); the property under test here is the ROLLBACK, not the route.
+        UUID existingDefId = insertActiveDefinitionWithoutAssignment(masterId, types.get(2).id());
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixed(types.get(0).id(), 60, "350.00"),
+                range(types.get(1).id(), 120, "800.00", "1500.00"),
+                fixed(types.get(2).id(), 45, "275.00")));
+
+        log.debug("Act: POST a 3-item bulk batch whose THIRD item duplicates an existing active "
+                + "definition — expect 409 DUPLICATE_SERVICE and a full rollback");
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<DuplicateServiceResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data())
+                .extracting(DuplicateServiceResponse::code, DuplicateServiceResponse::existingServiceDefId)
+                .as("the mobile setup screen branches on code and deep-links via existingServiceDefId; "
+                        + "a generic DataIntegrityViolation 409 would carry neither")
+                .containsExactly("DUPLICATE_SERVICE", existingDefId);
+
+        assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
+                .as("all-or-nothing: the two VALID items must not survive the rejected batch — only "
+                        + "the pre-existing definition remains")
+                .isEqualTo(1L);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services ms JOIN service_definitions sd "
+                        + "ON sd.id = ms.service_def_id WHERE sd.owner_id = ?", Long.class, masterId))
+                .as("the assignments queued alongside the definitions must roll back too — the "
+                        + "definition count alone would not catch a leaked master_services row")
+                .isEqualTo(0L);
+    }
+
+    /**
+     * Inserts an ACTIVE {@code service_definitions} row owned by {@code masterId} with NO
+     * {@code master_services} assignment, via JDBC.
+     *
+     * <p>Direct SQL is required, not a bug: no endpoint can produce this state in one call, because
+     * every create path writes the definition and its assignment together. It arises in production
+     * over time — an assignment deactivated while its definition stays active — and it is precisely
+     * the state that separates the assignment-level first-time precondition from the
+     * definition-level V121 index.
+     *
+     * <p>{@code owner_type = 'INDEPENDENT_MASTER'} with {@code owner_id = masters.id} mirrors what
+     * {@code bulkCreateForMaster} itself persists for BOTH entry points ("services are owned by the
+     * master row regardless of how the master was created"), so the seeded row lands in the same
+     * V121 key space the batch is about to insert into.
+     */
+    private UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId) {
+        UUID defId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Orphaned Active Service', ?, 60, "
+                        + "'FIXED', 400.00, 0, true, NOW(), NOW())",
+                defId, masterId, serviceTypeId);
+        return defId;
     }
 
     // ── TOCTOU concurrency regression (Step 2.7 Rule 3) ────────────────────────

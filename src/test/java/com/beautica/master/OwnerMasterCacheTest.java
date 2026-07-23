@@ -33,9 +33,17 @@ import java.time.LocalDate;
 import java.util.Optional;
 import java.util.UUID;
 
-import org.springframework.cache.interceptor.SimpleKey;
+import com.beautica.common.cache.CacheKeyFixtures;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+
+import java.time.OffsetDateTime;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -53,7 +61,9 @@ import static org.mockito.Mockito.when;
  * within the same thread as the test assertion.
  */
 @SpringBootTest(
-        classes = {MasterService.class, CacheConfig.class},
+        // The REAL prefix evictor, never a @MockBean: it owns the cache-key-shape predicate whose
+        // silent mismatch made five evictions no-ops, so these tests must execute it.
+        classes = {MasterService.class, CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @Import(OwnerMasterCacheTest.TransactionConfig.class)
@@ -185,13 +195,11 @@ class OwnerMasterCacheTest {
         Cache calendarCache = cacheManager.getCache("master-calendar");
         assertThat(calendarCache).isNotNull();
 
-        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
-        // A plain String sentinel is not a SimpleKey and would survive the removeIf predicate.
-        SimpleKey calendarKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        calendarCache.put(calendarKey, "sentinel-value");
-        assertThat(calendarCache.get(calendarKey))
-                .as("sentinel must be in master-calendar cache before deactivation")
-                .isNotNull();
+        // Populated through the REAL @Cacheable proxy on MasterService#getMasterCalendar, so the key
+        // under test is the one Spring computes rather than one this test invented. The previous
+        // version seeded `new SimpleKey(...)`, which an explicit-`key` @Cacheable never produces — it
+        // matched the equally-wrong production predicate and so kept a broken eviction green.
+        Object calendarKey = populateRealCalendarEntry(MASTER_ID);
 
         stubOwnerMasterForDeactivation();
 
@@ -217,9 +225,8 @@ class OwnerMasterCacheTest {
         assertThat(calendarCache).isNotNull();
 
         masterByUserCache.put(ACTOR_USER_ID, "cached-master");
-        // PERF-MEDIUM-4: use a SimpleKey sentinel so the removeIf predicate recognises it.
-        SimpleKey calendarKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        calendarCache.put(calendarKey, "calendar-data");
+        // Real proxy again — see should_clearMasterCalendarCache_when_deactivateOwnerMasterCommits.
+        Object calendarKey = populateRealCalendarEntry(MASTER_ID);
 
         stubOwnerMasterForDeactivation();
 
@@ -247,9 +254,14 @@ class OwnerMasterCacheTest {
         Cache availableSlotsCache = cacheManager.getCache("available-slots");
         assertThat(availableSlotsCache).isNotNull();
 
-        // PERF-MEDIUM-3: available-slots eviction filters by SimpleKey whose toString() starts
-        // with "[masterId," — the key shape is SimpleKey[masterId, date, masterServiceId].
-        SimpleKey slotKey = new SimpleKey(MASTER_ID, LocalDate.now(), UUID.randomUUID());
+        // SlotCalculationService is a @MockBean here (MasterService only calls it, it is not the
+        // subject), so its real @Cacheable proxy is not reachable from this context — the key is
+        // seeded via CacheKeyFixtures.spelKey instead of by hand. That helper is not a guess: it is
+        // pinned against the real SlotCalculationService#getAvailableSlots proxy by
+        // CachePrefixEvictionKeyShapeTest, which asserts Spring's actual key equals its output. This
+        // test therefore covers the WRITE-PATH wiring (does deactivation register a slot eviction at
+        // all), while the key shape itself is proven against ground truth over there.
+        Object slotKey = CacheKeyFixtures.spelKey(MASTER_ID, LocalDate.now(), UUID.randomUUID());
         availableSlotsCache.put(slotKey, "sentinel-slots-value");
         assertThat(availableSlotsCache.get(slotKey))
                 .as("sentinel must be present in available-slots cache before deactivation")
@@ -270,6 +282,35 @@ class OwnerMasterCacheTest {
     }
 
     // ── helper ────────────────────────────────────────────────────────────────
+
+    /**
+     * Populates one {@code master-calendar} entry by calling the REAL {@code @Cacheable} method on
+     * {@link MasterService}, and returns the key Spring stored for it — read back off the native
+     * Caffeine map, never constructed here.
+     *
+     * <p>This is the difference that matters: the assertion that follows compares against a key the
+     * framework produced, so it cannot silently agree with a broken eviction predicate the way a
+     * hand-seeded {@code SimpleKey} sentinel did. The booking id-page is stubbed empty purely so the
+     * method returns a cacheable non-null {@code Page} without touching hydration.
+     */
+    private Object populateRealCalendarEntry(UUID masterId) {
+        when(bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
+                eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(), PageRequest.of(0, 20), 0));
+
+        masterService.getMasterCalendar(masterId, LocalDate.now(), LocalDate.now().plusDays(7),
+                PageRequest.of(0, 20));
+
+        Cache calendarCache = cacheManager.getCache("master-calendar");
+        assertThat(calendarCache).isNotNull();
+        Object nativeCache = calendarCache.getNativeCache();
+        assertThat(nativeCache).isInstanceOf(com.github.benmanes.caffeine.cache.Cache.class);
+        var keys = ((com.github.benmanes.caffeine.cache.Cache<?, ?>) nativeCache).asMap().keySet();
+        assertThat(keys)
+                .as("the real @Cacheable proxy must have stored exactly one master-calendar entry")
+                .hasSize(1);
+        return keys.iterator().next();
+    }
 
     /**
      * Stubs the {@link MasterRepository#findByUserId} call that {@code deactivateOwnerMaster}

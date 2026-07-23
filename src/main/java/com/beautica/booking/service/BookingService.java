@@ -2,6 +2,7 @@ package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.BookingDetailResponse;
+import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
@@ -33,8 +34,6 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -81,19 +80,57 @@ public class BookingService {
     private final ReviewRepository reviewRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final Clock clock;
-    private final CacheManager cacheManager;
+    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final ScheduleDateMath dateMath;
 
+    /**
+     * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
+     *
+     * <p><b>Why the enriched shape.</b> This endpoint previously returned the lean
+     * {@link BookingResponse}, which carries only ids — no master name, avatar, salon name or
+     * address. Every client therefore had to follow a successful create with a mandatory
+     * {@code GET /bookings/{id}} purely to render the confirmation screen. Returning
+     * {@link BookingDetailResponse} here removes that second round trip.
+     *
+     * <p><b>The change is strictly additive on the wire.</b> {@link BookingDetailResponse}'s first
+     * twelve components are identical to {@link BookingResponse}'s in name, type, order and
+     * semantics, so the emitted JSON is a superset: every field an existing client reads is still
+     * present and unchanged, and a client that ignores the new fields behaves exactly as before.
+     * Nothing was removed or renamed. The mobile app's redundant follow-up GET keeps working and
+     * can be dropped separately, on its own schedule.
+     *
+     * <p><b>Cost.</b> Enrichment needs the full graph plus locality-label resolution, which the
+     * lean path did not pay for. That is a net saving overall: the follow-up GET it replaces did
+     * exactly this work <em>plus</em> a second HTTP request, authentication and transaction.
+     */
     @Transactional
-    public BookingResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
+    public BookingDetailResponse createBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {
+        UUID bookingId;
         if (idempotencyKey != null && !idempotencyKey.isBlank()) {
             // Fix M5: use the partial-index-aligned query to avoid full table scan
-            return bookingRepository.findActiveByClientIdAndIdempotencyKey(clientId, idempotencyKey)
-                    .map(BookingResponse::from)
-                    .orElseGet(() -> doCreateBooking(clientId, idempotencyKey, request));
+            bookingId = bookingRepository.findActiveByClientIdAndIdempotencyKey(clientId, idempotencyKey)
+                    .map(Booking::getId)
+                    .orElseGet(() -> doCreateBooking(clientId, idempotencyKey, request).id());
+        } else {
+            bookingId = doCreateBooking(clientId, idempotencyKey, request).id();
         }
-        return doCreateBooking(clientId, idempotencyKey, request);
+        return enrichCreated(bookingId);
+    }
+
+    /**
+     * Re-reads the just-created (or replayed) booking through the full graph and enriches it.
+     *
+     * <p>{@code canReview} is hardcoded {@code false} rather than probed, and that is sound by
+     * construction: a booking is born {@code CONFIRMED} and the idempotent-replay query filters to
+     * {@code CONFIRMED} only, while {@link #canReview} requires {@code COMPLETED}. Computing it
+     * would add a guaranteed-false {@code reviewRepository.existsByBookingId} probe to every
+     * create. If a booking ever becomes creatable in a terminal state, this shortcut must go.
+     */
+    private BookingDetailResponse enrichCreated(UUID bookingId) {
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .orElseThrow(() -> new NotFoundException("Booking not found"));
+        return enrichSingle(booking, false);
     }
 
     @Transactional(readOnly = true)
@@ -201,6 +238,7 @@ public class BookingService {
                 p.startsAt().atZoneSameInstant(TimeZones.KYIV),
                 p.endsAt().atZoneSameInstant(TimeZones.KYIV),
                 p.priceAtBooking(),
+                p.priceMaxAtBooking(),
                 p.durationMinutesAtBooking(),
                 p.createdAt().atOffset(ZoneOffset.UTC),
                 p.clientFirstName(),
@@ -425,8 +463,12 @@ public class BookingService {
 
     /**
      * Property names {@code GET /bookings/me}'s {@code sort} query parameter may reference
-     * (Phase 26.3). Every property here is a scalar column directly on {@code Booking} — no
-     * association traversal.
+     * (Phase 26.3, narrowed by Phase 26.8). {@code priceAtBooking} was removed from this set —
+     * its only caller anywhere in the product was the provider "Мої записи" sort sheet, which
+     * mobile Phase 7.8 deleted once that screen became a timeline (a card's position derives
+     * from {@code startsAt}, so no ordering of the result set can move it). {@code startsAt} is
+     * the sole survivor and is a scalar column directly on {@code Booking} — no association
+     * traversal.
      *
      * <p><b>This is a security boundary, not a nicety.</b> Both {@code findIdsByClientIdFiltered}
      * and the provider ID-page queries join through {@code b.master m JOIN m.user}, so any
@@ -435,9 +477,10 @@ public class BookingService {
      * results by their employees' password-hash column, a credential side channel that never
      * appears in the response body. {@link Sort.Order#getProperty()} returns the FULL dotted
      * path as one string, so an exact-match {@link Set#contains} here rejects any multi-segment
-     * path outright — it never inspects only the first segment.
+     * path outright — it never inspects only the first segment. A one-property whitelist is
+     * strictly less attack surface than the prior two-property one.
      */
-    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt", "priceAtBooking");
+    private static final Set<String> SORTABLE_BOOKING_PROPERTIES = Set.of("startsAt");
 
     /** Applied when the caller supplies no {@code sort} at all (Phase 26.3). */
     private static final Sort DEFAULT_BOOKING_SORT = Sort.by(Sort.Direction.DESC, "startsAt");
@@ -447,12 +490,20 @@ public class BookingService {
 
     /**
      * Max {@link Sort.Order} entries accepted in {@code GET /bookings/me}'s {@code sort} query
-     * parameter (Phase 26.3 audit, finding backend-perf F4). Matches the cardinality of
-     * {@link #SORTABLE_BOOKING_PROPERTIES} — nobody needs to sort by more than all three
-     * whitelisted properties at once. Parity with the existing {@code @Size(max = 5)} bound on
-     * the controller's {@code status} parameter: each distinct {@code (property, direction)}
-     * sequence compiles to a textually distinct SQL {@code ORDER BY} (column names can't be bind
-     * params), so an unbounded sort list inflates plan-cache entries.
+     * parameter (Phase 26.3 audit, finding backend-perf F4) — a cheap O(1) length guard applied
+     * BEFORE the per-order whitelist/duplicate loop, so a pathological
+     * {@code ?sort=…&sort=…&sort=…&…} is rejected without allocating or walking anything.
+     *
+     * <p><b>It is no longer the binding constraint on plan-cache cardinality</b>, and must not be
+     * read as one. Since the Phase 26.8 audit, {@link #normalizeBookingSort} rejects a REPEATED
+     * property outright; combined with {@link #SORTABLE_BOOKING_PROPERTIES} holding exactly one
+     * member, the effective maximum is 1 order and the reachable {@code ORDER BY} texts are
+     * exactly two ({@code startsAt ASC, id ASC} and {@code startsAt DESC, id ASC}). Before that
+     * rejection a caller could send {@code sort=startsAt,asc&sort=startsAt,desc&sort=startsAt,asc}
+     * and mint up to 14 textually distinct {@code ORDER BY} clauses — column names cannot be bind
+     * parameters, so each is its own Postgres prepared-statement/plan-cache entry — where 2
+     * suffice. The duplicate check closed that; this constant is retained only as the outer
+     * length bound, at parity with the controller's {@code @Size(max = 5)} on {@code status}.
      */
     private static final int MAX_SORT_ORDERS = 3;
 
@@ -486,17 +537,30 @@ public class BookingService {
      *       {@code Pageable} yields DB-arbitrary order once the JPQL/Criteria layers stop
      *       hardcoding {@code ORDER BY b.startsAt DESC} themselves.</li>
      *   <li><b>Whitelist.</b> Every {@link Sort.Order#getProperty()} must exact-match
-     *       {@link #SORTABLE_BOOKING_PROPERTIES}; anything else — including a dot-path like
+     *       {@link #SORTABLE_BOOKING_PROPERTIES} — {@code startsAt} only as of Phase 26.8, which
+     *       retired {@code priceAtBooking} once its only caller (the provider sort sheet) was
+     *       deleted by mobile Phase 7.8; anything else — including a dot-path like
      *       {@code master.user.passwordHash} — throws a 400 {@link BusinessException} before the
      *       {@code Sort} ever reaches a query.</li>
      *   <li><b>Count bound.</b> More than {@link #MAX_SORT_ORDERS} orders throws a 400
      *       {@link BusinessException} (Phase 26.3 audit F4) — parity with the controller's
-     *       {@code @Size(max = 5)} bound on {@code status}.</li>
-     *   <li><b>Mandatory {@code id} tiebreaker.</b> Appended last, always. Price (and, on the
-     *       salon path, {@code startsAt} across different masters) ties are the common case, not
-     *       the edge case — every booking of the same service shares a {@code priceAtBooking}.
-     *       Without a unique trailing column, {@code OFFSET} pagination over tied rows can
-     *       duplicate and skip rows across pages.</li>
+     *       {@code @Size(max = 5)} bound on {@code status}. Checked first, so an absurdly long
+     *       sort list is rejected before any per-order work.</li>
+     *   <li><b>No repeated property.</b> A property that appears twice throws a 400
+     *       {@link BusinessException} (Phase 26.8 audit, backend-perf). A repeat is never
+     *       meaningful — SQL applies the first {@code ORDER BY} term for a column and every later
+     *       one on the same column is dead — but each distinct {@code (property, direction)}
+     *       sequence still compiles to a distinct {@code ORDER BY} text and therefore its own
+     *       plan-cache entry. Rejecting repeats collapses the reachable {@code ORDER BY} texts on
+     *       this endpoint to exactly two. No real caller is affected: the shipped mobile client
+     *       sends at most one order.</li>
+     *   <li><b>Mandatory {@code id} tiebreaker.</b> Appended last, always. {@code startsAt} ties
+     *       are a real case, not a hypothetical one — nothing in the schema prevents two
+     *       terminal-status bookings (e.g. {@code COMPLETED}/{@code CANCELLED}, which fall
+     *       outside the {@code no_overlapping_bookings} EXCLUDE constraint's {@code CONFIRMED}-
+     *       only predicate) from sharing an identical {@code startsAt}. Without a unique trailing
+     *       column, {@code OFFSET} pagination over tied rows can duplicate and skip rows across
+     *       pages.</li>
      * </ol>
      *
      * <p><b>Preserves {@code Pageable.unpaged()}.</b> {@link Pageable#getPageNumber()} and
@@ -507,6 +571,12 @@ public class BookingService {
      * that legitimate caller. {@link Pageable#isPaged()} branches to
      * {@link Pageable#unpaged(Sort)} instead, carrying the normalized sort without requiring page
      * number/size semantics that don't apply.
+     *
+     * <p>Preserved for SORT normalization only — an {@code Unpaged} that survives this method and
+     * reaches {@code BookingRepositoryCustom} is rejected there with an
+     * {@link IllegalArgumentException} (an unbounded id scan is not a supported query). Those unit
+     * tests only work because they mock the repository; unpaged is NOT a usable production path
+     * through this service.
      */
     private Pageable normalizeBookingSort(Pageable pageable) {
         Sort requestedSort = pageable.getSort();
@@ -517,10 +587,15 @@ public class BookingService {
                     "Too many sort properties");
         }
 
+        Set<String> seenProperties = new HashSet<>();
         for (Sort.Order order : effectiveSort) {
             if (!SORTABLE_BOOKING_PROPERTIES.contains(order.getProperty())) {
                 throw new BusinessException(HttpStatus.BAD_REQUEST,
                         "Unsupported sort property: " + order.getProperty());
+            }
+            if (!seenProperties.add(order.getProperty())) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "Duplicate sort property: " + order.getProperty());
             }
         }
 
@@ -869,7 +944,7 @@ public class BookingService {
         // Master kind is irrelevant to bookability — SALON_MASTER, INDEPENDENT_MASTER,
         // and SALON_OWNER masters are all bookable when active with working hours + a
         // matching master_services row.
-        Master master = masterRepository.findByIdWithSalonAndOwner(request.masterId())
+        Master master = masterRepository.findByIdWithUserAndSalon(request.masterId())
                 .filter(Master::isActive)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
 
@@ -938,6 +1013,9 @@ public class BookingService {
                 .startsAt(startsAt)
                 .endsAt(endsAt)
                 .priceAtBooking(effectivePrice)
+                // Freeze the RANGE ceiling beside the floor (V119). Null = single price. Computed
+                // HERE, at creation, so a later service edit can never rewrite an agreed band.
+                .priceMaxAtBooking(BookingPriceRange.resolveCeiling(msa))
                 .durationMinutesAtBooking(effectiveDuration)
                 .bufferMinutesAtBooking(bufferMinutes)
                 .idempotencyKey(idempotencyKey)
@@ -1125,17 +1203,17 @@ public class BookingService {
      * Evicts only the cache entries that belong to the given master from the
      * {@code master-calendar} cache, running after the current transaction commits.
      *
-     * <p>The {@code master-calendar} cache key is a {@link org.springframework.cache.interceptor.SimpleKey}
-     * whose first element is the {@code masterId} UUID (see {@code MasterService.getMasterCalendar}).
-     * Because {@code SimpleKey.params} is {@code private final} with no public getter in
-     * Spring 6.x, the filter uses {@code SimpleKey.toString()} — which renders as
-     * {@code "SimpleKey [masterId, from, to, pageNum, pageSize]"} via
-     * {@link java.util.Arrays#deepToString} — and checks whether the first array element
-     * (the UUID string) is present. This avoids blanket {@code cache.clear()} which
-     * would evict ALL masters on every single booking status change (thundering herd).
+     * <p>{@code MasterService.getMasterCalendar} declares an explicit SpEL
+     * {@code key = "{#masterId, #from, #to, #pageable.pageNumber, #pageable.pageSize}"}. An explicit
+     * {@code key} is never wrapped in a {@code SimpleKey} — that type only comes from the default
+     * {@code SimpleKeyGenerator} — so the runtime key is the {@link java.util.List} the {@code {...}}
+     * inline-list literal evaluates to, and its first element is the {@code masterId}. Matching is
+     * delegated to {@link com.beautica.common.cache.MasterCachePrefixEvictor#evictByKeyPrefixNow}.
      *
-     * <p>Falls back to {@code cache.clear()} when the underlying cache is not a Caffeine
-     * instance (e.g., during tests that use a simple ConcurrentMapCache).
+     * <p>This method previously carried its own copy of the predicate that tested
+     * {@code instanceof SimpleKey} against {@code toString()}; that never matched the real keys, so the
+     * eviction was a silent no-op and a stale calendar page survived a booking status change for the
+     * full TTL. Scoped to one master, never a blanket {@code cache.clear()} (thundering herd).
      */
     private void evictMasterCalendarAfterCommit(UUID masterId) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -1151,33 +1229,22 @@ public class BookingService {
     }
 
     private void doEvictMasterCalendarEntries(UUID masterId) {
-        Cache cache = cacheManager.getCache("master-calendar");
-        if (cache == null) {
-            return;
-        }
-        Object nativeCache = cache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            // SimpleKey.toString() renders as "SimpleKey [elem0, elem1, ...]" via Arrays.deepToString.
-            // The first element is the masterId UUID string — detect it by substring match on the
-            // toString output, since SimpleKey.params is private with no public getter in Spring 6.x.
-            String masterIdPrefix = "[" + masterId.toString() + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(masterIdPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            cache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(masterId, "master-calendar");
     }
 
     /**
      * Evicts {@code revenue-dashboard} entries for the given actor after commit.
      *
-     * <p>Uses per-actor prefix eviction when the underlying cache is Caffeine, avoiding
-     * a blanket {@code cache.clear()} that would evict all actors' dashboard entries on
-     * every booking status transition (Anti-Bug §F rule 6 / PERF-MEDIUM-5).</p>
+     * <p>Uses per-actor prefix eviction, avoiding a blanket {@code cache.clear()} that would evict all
+     * actors' dashboard entries on every booking status transition (Anti-Bug §F rule 6 / PERF-MEDIUM-5).
      *
-     * <p>Falls back to {@code cache.clear()} for non-Caffeine caches (e.g. tests).</p>
+     * <p>{@code DashboardService.getRevenueSummary} is keyed
+     * {@code "{#actorId, #from, #to, #filterMasterId, #serviceDefId, #salonIdFilter?.orElse(null)}"} —
+     * an explicit SpEL inline list, so the runtime key is a {@link java.util.List} whose first element
+     * is the {@code actorId}, not a {@code SimpleKey}. The previous local copy of the predicate tested
+     * {@code instanceof SimpleKey} and therefore never evicted anything; matching now goes through
+     * {@link com.beautica.common.cache.MasterCachePrefixEvictor#evictByKeyPrefixNow}, which matches on
+     * key POSITION (first element) and so applies unchanged to an actor-keyed cache.
      */
     private void evictRevenueDashboardAfterCommit(UUID actorId) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -1193,19 +1260,6 @@ public class BookingService {
     }
 
     private void doEvictRevenueDashboard(UUID actorId) {
-        Cache springCache = cacheManager.getCache("revenue-dashboard");
-        if (springCache == null) {
-            return;
-        }
-        Object nativeCache = springCache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            String actorPrefix = "[" + actorId + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(actorPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            springCache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(actorId, "revenue-dashboard");
     }
 }

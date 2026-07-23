@@ -71,6 +71,10 @@ class MasterServiceRotateTest {
     @Mock private CityRepository cityRepository;
     @Mock private com.beautica.booking.service.BookingSlugService bookingSlugService;
     @Mock private AuthorizationService authorizationService;
+    // Prefix-eviction fix: rotation's afterCommit master-calendar eviction delegates to the shared
+    // evictor, so @InjectMocks must have one or the replayed synchronization NPEs. Mock is correct at
+    // this tier — key-shape correctness is proven in CachePrefixEvictionKeyShapeTest.
+    @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
     @InjectMocks
     private MasterService masterService;
@@ -96,18 +100,18 @@ class MasterServiceRotateTest {
         ReflectionTestUtils.setField(master, "user", user);
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(true);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.of(destSalon));
 
         Cache masterDetailCache = mock(Cache.class);
         Cache masterDetailByUserCache = mock(Cache.class);
         Cache masterByUserCache = mock(Cache.class);
-        Cache masterCalendarCache = mock(Cache.class);
         when(cacheManager.getCache("master-detail")).thenReturn(masterDetailCache);
         when(cacheManager.getCache("master-detail-by-user")).thenReturn(masterDetailByUserCache);
         when(cacheManager.getCache("master-by-user")).thenReturn(masterByUserCache);
-        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCache);
+        // No cacheManager stub for master-calendar: that eviction is a prefix scan and now goes
+        // through the injected MasterCachePrefixEvictor mock, so stubbing it here would be unused.
 
         TransactionSynchronizationManager.initSynchronization();
         MasterSummaryResponse response;
@@ -142,7 +146,7 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, destSalonId))
                 .isInstanceOf(NotFoundException.class);
@@ -160,7 +164,7 @@ class MasterServiceRotateTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, destSalonId))
                 .isInstanceOf(ForbiddenException.class);
@@ -179,7 +183,7 @@ class MasterServiceRotateTest {
                 .isActive(true)
                 .build();
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, destSalonId))
                 .isInstanceOf(ForbiddenException.class);
@@ -200,7 +204,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", salon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
         assertThatThrownBy(() -> masterService.rotateMasterToSalon(actorId, masterId, salonId))
                 .isInstanceOf(BusinessException.class)
@@ -223,7 +227,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(false);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.empty());
 
@@ -251,7 +255,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(true);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.empty());
 
@@ -275,7 +279,7 @@ class MasterServiceRotateTest {
                 .build();
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(authorizationService.salonsShareOwner(sourceSalonId, destSalonId)).thenReturn(true);
         when(salonRepository.findById(destSalonId)).thenReturn(Optional.of(inactiveDest));
 

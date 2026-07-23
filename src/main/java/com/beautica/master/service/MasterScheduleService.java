@@ -401,7 +401,7 @@ public class MasterScheduleService {
     // ---- write helpers ------------------------------------------------------------------
 
     private Master loadActiveMaster(UUID masterId) {
-        Master master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        Master master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
         if (!master.isActive()) {
             throw new BusinessException("Master is inactive");

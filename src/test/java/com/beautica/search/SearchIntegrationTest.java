@@ -2263,16 +2263,29 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters — matchedServiceNames present (distinct, capped at 3) when filtering; EMPTY when no serviceTypeSlugs")
     void should_populateMatchedServiceNames_whenFiltering_andEmptyOtherwise() throws Exception {
         ensureHttpClient();
+        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // service_definitions sharing one service_type_id for the same owner — the original fixture
+        // seeded all four names under the SAME typeIdA. Rewritten to use FOUR DISTINCT searchable
+        // types instead, filtered together via serviceTypeSlugs' OR/union semantics (a provider
+        // matches if it offers ANY selected type — see
+        // should_returnMastersOfferingAnySlug_when_unionOfTwoSlugs): the union of all four types still
+        // yields exactly this one master with four matching services, exercising the identical
+        // matchedServiceNames cap/distinct code path.
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+        UUID typeIdSearch = serviceTypeIdBySlug(SLUG_SEARCH);
+        String slugD = nextSearchableSlug();
+        UUID typeIdD = serviceTypeIdBySlug(slugD);
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Matched", "Master");
-        // Four DISTINCT matching service names (all via FK A) → cap to 3, distinct.
+        // Four DISTINCT matching service names, each on its own distinct type → cap to 3, distinct.
         seedTypedServiceForMaster(master, "Догляд Альфа", "HAIRCUT", new BigDecimal("300.00"), typeIdA, true, true);
-        seedTypedServiceForMaster(master, "Догляд Бета", "HAIRCUT", new BigDecimal("310.00"), typeIdA, true, true);
-        seedTypedServiceForMaster(master, "Догляд Гамма", "HAIRCUT", new BigDecimal("320.00"), typeIdA, true, true);
-        seedTypedServiceForMaster(master, "Догляд Дельта", "HAIRCUT", new BigDecimal("330.00"), typeIdA, true, true);
+        seedTypedServiceForMaster(master, "Догляд Бета", "HAIRCUT", new BigDecimal("310.00"), typeIdB, true, true);
+        seedTypedServiceForMaster(master, "Догляд Гамма", "HAIRCUT", new BigDecimal("320.00"), typeIdSearch, true, true);
+        seedTypedServiceForMaster(master, "Догляд Дельта", "HAIRCUT", new BigDecimal("330.00"), typeIdD, true, true);
 
-        // Filtering → matchedServiceNames populated.
-        JsonNode filtered = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        // Filtering (union of all four types) → matchedServiceNames populated.
+        JsonNode filtered = masterSearch("?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B
+                + "&serviceTypeSlugs=" + SLUG_SEARCH + "&serviceTypeSlugs=" + slugD + "&page=0&size=20");
         JsonNode matched = filtered.path("data").get(0).path("matchedServiceNames");
         assertThat(matched.isArray()).as("matchedServiceNames is a JSON array").isTrue();
         java.util.List<String> matchedNames = new java.util.ArrayList<>();
@@ -2623,16 +2636,25 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/salons — matchedServiceNames is aggregated across the salon's masters when filtering, and empty when unfiltered")
     void should_aggregateSalonMatchedServiceNames_acrossMasters_whenFiltering() throws Exception {
         ensureHttpClient();
+        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // service_definitions sharing one service_type_id for the same owner — the original fixture
+        // put BOTH masters' defs under the SAME typeIdA. Rewritten so master2's def carries a DISTINCT
+        // searchable type (typeIdB), filtered together via serviceTypeSlugs' OR/union semantics (a
+        // provider matches if it offers ANY selected type — see
+        // should_returnSalonsOfferingAnySlug_when_unionOfTwoSlugs): the salon still matches exactly
+        // once (both defs belong to it) and matchedServiceNames still aggregates both masters' names.
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
         UUID salon = seedActiveSalon("Київ", null);
         UUID master1 = seedSalonMasterFor(salon, "Київ", "4.00");
         UUID master2 = seedSalonMasterFor(salon, "Київ", "4.00");
         seedTypedSalonServiceForMaster(master1, salon, "Догляд М1", "HAIRCUT",
                 new BigDecimal("300.00"), typeIdA, true, true);
         seedTypedSalonServiceForMaster(master2, salon, "Догляд М2", "HAIRCUT",
-                new BigDecimal("310.00"), typeIdA, true, true);
+                new BigDecimal("310.00"), typeIdB, true, true);
 
-        JsonNode filtered = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        JsonNode filtered = salonSearch(
+                "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20");
         assertThat(filtered.path("totalElements").asLong()).isEqualTo(1L);
         JsonNode matched = filtered.path("data").get(0).path("matchedServiceNames");
         java.util.List<String> matchedNames = new java.util.ArrayList<>();
@@ -3055,7 +3077,15 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable price band): with a single performing master and no override the band collapses to that master's base_price; an UNBOOKABLE owned type-T service does NOT drag the band")
     void should_collapseSalonPriceBand_toBasePrice_ignoringUnbookableOwnedService() throws Exception {
         ensureHttpClient();
+        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // service_definitions sharing one service_type_id for the same owner — the original fixture
+        // put BOTH defs under the SAME typeIdA. Rewritten so the unbookable def carries a DISTINCT
+        // searchable type (typeIdB), filtered together via serviceTypeSlugs' OR/union semantics (a
+        // provider matches if it offers ANY selected type — see
+        // should_returnSalonsOfferingAnySlug_when_unionOfTwoSlugs). The point survives unchanged: the
+        // owned-but-unbookable service is selected by the (wider) filter and must still not drag the band.
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
 
         UUID salonC = seedActiveSalon("Київ", null);
         // Performed type-A def: base 1500, one active master, no override → effective 1500.
@@ -3063,11 +3093,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "FIXED", new BigDecimal("1500.00"), null, typeIdA, true);
         UUID masterC = seedSalonMasterFor(salonC, "Київ", "4.00");
         linkMasterToOwnedDef(masterC, performed, null, true);
-        // Unbookable type-A def: base 100, NO master performs it → must NOT count in the band.
+        // Unbookable type-B def: base 100, NO master performs it → must NOT count in the band.
         seedTypedSalonOwnedDef(salonC, "Кератин без майстра", "HAIRCUT",
-                "FIXED", new BigDecimal("100.00"), null, typeIdA, true);
+                "FIXED", new BigDecimal("100.00"), null, typeIdB, true);
 
-        JsonNode row = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+        JsonNode row = salonSearch(
+                "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20")
                 .path("data").get(0);
 
         assertThat(new BigDecimal(row.path("priceMin").asText()))
@@ -3083,7 +3114,16 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (matched lines): matchedServiceNames reflects ONLY master-performed type-T services; an unbookable owned type-T service is NOT listed")
     void should_limitSalonMatchedServiceNames_toMasterPerformedServices() throws Exception {
         ensureHttpClient();
+        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // service_definitions sharing one service_type_id for the same owner — the original fixture
+        // put BOTH defs under the SAME typeIdA. Rewritten so the unbookable def carries a DISTINCT
+        // searchable type (typeIdB), filtered together via serviceTypeSlugs' OR/union semantics (a
+        // provider matches if it offers ANY selected type — see
+        // should_returnSalonsOfferingAnySlug_when_unionOfTwoSlugs). This is exactly what makes the test
+        // non-vacuous: the unbookable def IS selected by the (wider) filter and must still be excluded
+        // from matchedServiceNames on bookability grounds, not on a type mismatch it no longer has.
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
 
         UUID salon = seedActiveSalon("Київ", null);
         // Performed type-A def — an active master performs it → must appear.
@@ -3091,11 +3131,12 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
         UUID master = seedSalonMasterFor(salon, "Київ", "4.00");
         linkMasterToOwnedDef(master, performed, null, true);
-        // Unbookable type-A def — same salon, NO master performs it → must NOT appear.
+        // Unbookable type-B def — same salon, NO master performs it → must NOT appear.
         seedTypedSalonOwnedDef(salon, "Кератин недоступний", "HAIRCUT",
-                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+                "FIXED", new BigDecimal("300.00"), null, typeIdB, true);
 
-        JsonNode row = salonSearch("?serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+        JsonNode row = salonSearch(
+                "?serviceTypeSlugs=" + SLUG_A + "&serviceTypeSlugs=" + SLUG_B + "&page=0&size=20")
                 .path("data").get(0);
         java.util.List<String> matched = new java.util.ArrayList<>();
         row.path("matchedServiceNames").forEach(n -> matched.add(n.asText()));
@@ -3220,25 +3261,107 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Resolves an arbitrary Flyway-seeded {@code service_type_id} that is NEVER
-     * used as a search predicate anywhere in this suite (the {@code beard-correction}
-     * trap slug — only ever seeded to assert it is absent, never searched via
-     * {@code serviceTypeSlugs}).
+     * Per-test-instance cursor over {@link #unrelatedServiceTypeId()}'s allocation
+     * pool. {@code null} until the first allocation (lazy — {@code jdbcTemplate} is
+     * field-injected by Spring AFTER construction, so the pool cannot be built in a
+     * field initializer). A plain instance field, not {@code static}: JUnit 5
+     * constructs a fresh test instance per {@code @Test} method, so the cursor (and
+     * therefore the "already allocated" set) resets naturally between tests without
+     * leaking allocations across the suite.
+     */
+    private java.util.List<UUID> unrelatedServiceTypeIdPool;
+    private int unrelatedServiceTypeIdCursor = 0;
+
+    /**
+     * Allocates the NEXT distinct, unused Flyway-seeded {@code service_type_id} out
+     * of a deterministically-ordered pool — NEVER one of the slugs this suite
+     * asserts on as a search predicate ({@code SLUG_A}, {@code SLUG_B},
+     * {@code SLUG_SEARCH}) or the dedicated substring-collision trap
+     * ({@code SLUG_SUBSTRING_SIBLING}, which several fixtures seed and assert
+     * against explicitly by name).
      *
      * <p>Since V111 made {@code service_definitions.service_type_id} mandatory
-     * (NOT NULL), fixture rows can no longer carry a NULL FK. This id is the
-     * substitute for the historical "type-less / legacy NULL" fixtures:
-     * <ul>
-     *   <li>type-agnostic rows (name / price / category paths) that never assert
-     *       on the FK at all; and</li>
-     *   <li>explicit FK-only <em>NON-match</em> rows — an "unrelated" type that is
-     *       guaranteed distinct from every slug under assertion ({@code SLUG_A},
-     *       {@code SLUG_B}, {@code SLUG_SEARCH}), so the row stays correctly
-     *       excluded from those searches exactly as the NULL FK once did.</li>
-     * </ul>
+     * (NOT NULL), fixture rows can no longer carry a NULL FK, so every helper that
+     * doesn't receive an explicit {@code serviceTypeId} substitutes a call to this
+     * method. It used to return ONE fixed type (the {@code beard-correction} slug)
+     * for every call. That broke once V121 added
+     * {@code ux_service_def_owner_service_type_active} — a partial UNIQUE index on
+     * {@code service_definitions(owner_type, owner_id, service_type_id) WHERE
+     * is_active = true} enforcing the product rule "reject duplicate active service
+     * per owner and type" (commit 274f15e). Any fixture seeding TWO OR MORE active,
+     * null-typed service_definitions for the SAME owner — a common shape for "an
+     * owner has several distinct services" tests — collided on that single shared
+     * filler type and threw {@code DuplicateKeyException}. Handing out a fresh,
+     * never-repeated type per call keeps every such fixture's owner-scoped type set
+     * collision-free while preserving the original "FK-only guaranteed NON-match"
+     * property for every excluded slug.
+     *
+     * <p>Deterministic {@code ORDER BY slug} keeps allocation order — and therefore
+     * test runs — reproducible; no {@code gen_random_uuid()} / random pick. The
+     * ~140-row Flyway-seeded {@code service_types} table comfortably covers this
+     * suite's per-test fixture counts; exhaustion throws rather than silently
+     * wrapping back onto an already-used (and therefore colliding) type.
      */
     private UUID unrelatedServiceTypeId() {
-        return serviceTypeIdBySlug(SLUG_SUBSTRING_SIBLING);
+        if (unrelatedServiceTypeIdPool == null) {
+            unrelatedServiceTypeIdPool = jdbcTemplate.queryForList(
+                    "SELECT id FROM service_types WHERE slug NOT IN (?, ?, ?, ?) ORDER BY slug",
+                    UUID.class, SLUG_A, SLUG_B, SLUG_SEARCH, SLUG_SUBSTRING_SIBLING);
+        }
+        if (unrelatedServiceTypeIdCursor >= unrelatedServiceTypeIdPool.size()) {
+            throw new IllegalStateException(
+                    "unrelatedServiceTypeId() pool exhausted (" + unrelatedServiceTypeIdPool.size()
+                            + " candidates) — this test seeds more distinct null-typed service_definitions "
+                            + "for a single owner than the Flyway-seeded service_types supply can cover");
+        }
+        return unrelatedServiceTypeIdPool.get(unrelatedServiceTypeIdCursor++);
+    }
+
+    /**
+     * Per-test-instance cursor over Flyway-seeded {@code service_types.slug}
+     * values, excluding the four named constants (SLUG_A, SLUG_B, SLUG_SEARCH,
+     * SLUG_SUBSTRING_SIBLING) so it never repeats one already spoken for by name.
+     * Backs {@link #nextSearchableSlug()}.
+     */
+    private java.util.List<String> searchableSlugPool;
+    private int searchableSlugCursor = 0;
+
+    /**
+     * Allocates the NEXT distinct, unused Flyway-seeded service-type slug for
+     * fixtures that need an ADDITIONAL genuinely-SEARCHABLE slug beyond the named
+     * constants — i.e. a slug meant to be passed as a real {@code ?serviceTypeSlugs=}
+     * filter value, not excluded from search like {@link #unrelatedServiceTypeId()}.
+     *
+     * <p><b>Deliberately a SEPARATE pool from {@link #unrelatedServiceTypeId()}:</b>
+     * that allocator's entire contract is "NEVER used as a search predicate" (a
+     * guaranteed FK-only non-match for SLUG_A/B/SEARCH). This one is the opposite —
+     * every slug it returns is meant to be searched on. Do not merge the two or
+     * share a cursor between them; doing so would silently break
+     * {@code unrelatedServiceTypeId()}'s non-match guarantee the moment a test
+     * happened to also filter on an id this pool had handed out.
+     *
+     * <p>Added for the V121 rewrite of the four "two+ active defs sharing one
+     * service_type_id for a single owner" fixtures (see
+     * {@code ux_service_def_owner_service_type_active}, commit 274f15e): each needed
+     * a domain-legal way to produce several DISTINCT-typed active services that
+     * still all match a single combined filter, exploiting the OR/union semantics
+     * of {@code serviceTypeSlugs} (a provider matches if it offers ANY selected
+     * type — see {@link #should_returnMastersOfferingAnySlug_when_unionOfTwoSlugs()}
+     * / {@link #should_returnSalonsOfferingAnySlug_when_unionOfTwoSlugs()}).
+     * Deterministic {@code ORDER BY slug}; per-test-instance field, resets
+     * naturally per JUnit 5's one-instance-per-{@code @Test}-method lifecycle.
+     */
+    private String nextSearchableSlug() {
+        if (searchableSlugPool == null) {
+            searchableSlugPool = jdbcTemplate.queryForList(
+                    "SELECT slug FROM service_types WHERE slug NOT IN (?, ?, ?, ?) ORDER BY slug",
+                    String.class, SLUG_A, SLUG_B, SLUG_SEARCH, SLUG_SUBSTRING_SIBLING);
+        }
+        if (searchableSlugCursor >= searchableSlugPool.size()) {
+            throw new IllegalStateException(
+                    "nextSearchableSlug() pool exhausted (" + searchableSlugPool.size() + " candidates)");
+        }
+        return searchableSlugPool.get(searchableSlugCursor++);
     }
 
     /**

@@ -1,0 +1,77 @@
+-- ─────────────────────────────────────────────────────────────────────────────────────────────
+-- Drop idx_bookings_salon_completed_starts_at (V43) — provably subsumed.
+--
+-- V43 created:
+--     idx_bookings_salon_completed_starts_at
+--         ON bookings(salon_id, starts_at) WHERE status = 'COMPLETED'
+--
+-- The surviving index (V22, rebuilt by V113) is:
+--     idx_bookings_salon_status_starts_at
+--         ON bookings(salon_id, status, starts_at DESC) WHERE status IN ('CONFIRMED','COMPLETED')
+--
+-- ── Why this is safe, verified rather than assumed ───────────────────────────────────────────
+-- The V43 index's only consumer is DashboardService.REVENUE_SQL, whose bookings predicate is
+--     b.status = 'COMPLETED' AND b.starts_at >= :fromDate AND b.starts_at < :toDate
+--     AND b.salon_id = ANY(:salonIds)
+-- Against the surviving index that is equality(salon_id), equality(status), range(starts_at) —
+-- a textbook 3-column btree match, and the query's `status = 'COMPLETED'` implies the index's
+-- `status IN ('CONFIRMED','COMPLETED')` predicate, so the partial index is usable.
+--
+-- Measured on PostgreSQL 16 against a 300,000-row `bookings` reproduction (40 salons, 400
+-- masters, 3 years, even status mix), comparing the plan with and without the V43 index:
+--
+--   WITH V43 index:     Bitmap Index Scan on idx_bookings_salon_completed_starts_at
+--                       rows=651, heap blocks=531, index buffers ~5
+--   WITHOUT V43 index:  Bitmap Index Scan on idx_bookings_salon_status_starts_at
+--                       rows=651, heap blocks=531, index buffers ~6
+--                       Index Cond: (salon_id = ANY(...)) AND (status = 'COMPLETED')
+--                                   AND (starts_at >= ...) AND (starts_at < ...)
+--
+-- The decisive detail is that ALL FOUR predicates remain an Index Cond after the drop — nothing
+-- degrades to a post-scan Filter — with identical row and heap-block counts. Warm-cache timings
+-- were statistically indistinguishable (0.23-2.03ms with, 0.32-0.68ms without; the spread is
+-- cache warming, not the index).
+--
+-- ── Checks made before dropping (this is an irreversible production change) ───────────────────
+--   * NOT unique      — V43 uses plain CREATE INDEX, so no uniqueness semantics are lost.
+--   * Backs no constraint — no PK/UNIQUE/FK/EXCLUDE references it (the exclusion constraint
+--     no_overlapping_bookings and uq_client_idempotency_key_active use their own indexes).
+--   * No differing opclass, collation, INCLUDE or NULLS ordering on either index.
+--   * Queries that the surviving PARTIAL index cannot serve were checked explicitly, because a
+--     partial index never subsumes a full one: a salon-scoped query with NO status predicate, or
+--     one naming a status outside ('CONFIRMED','COMPLETED'), cannot use it. Neither could use the
+--     V43 index either (it is partial on status = 'COMPLETED'), so nothing regresses — those
+--     paths use the FULL idx_bookings_salon_starts_at (V19) / idx_bookings_salon_id (V18), both
+--     still present. EXPLAIN confirmed: the no-status query chose idx_bookings_salon_starts_at
+--     and the status='CANCELLED' query chose idx_bookings_salon_id, in both cases regardless of
+--     whether the V43 index existed.
+--
+-- Dropping it removes write amplification on every bookings INSERT/UPDATE for zero read benefit.
+--
+-- No CONCURRENTLY: Flyway runs each migration inside a transaction, and DROP INDEX CONCURRENTLY
+-- cannot run in one. IF EXISTS keeps the migration replayable on a database where an operator
+-- already dropped it by hand.
+-- ─────────────────────────────────────────────────────────────────────────────────────────────
+
+DROP INDEX IF EXISTS idx_bookings_salon_completed_starts_at;
+
+-- ── Deliberately NOT added here: the (salon_id, master_service_id, starts_at) index ──────────
+-- Backlog finding 4 asks for composite indexes covering BookingSpecifications#masterServiceIdIn,
+-- naming both a master-scope and a salon-scope variant. Neither is created, for separate reasons
+-- that were each verified rather than assumed:
+--
+--   * Master scope — ALREADY EXISTS. V117 created
+--         idx_bookings_master_service_starts_at ON bookings (master_id, master_service_id, starts_at DESC)
+--     for exactly this predicate. EXPLAIN confirms `master_id = ? AND master_service_id = ANY(...)`
+--     is served by it as a direct Index Cond (not a post-scan Filter). The backlog row is stale.
+--
+--   * Salon scope — WOULD BE DEAD WEIGHT. BookingSpecifications#salonIdIn does NOT filter
+--     bookings.salon_id; it joins `root.join("master").join("salon")` and filters salons.id, so
+--     bookings.salon_id never appears in that WHERE clause. Measured: creating
+--     (salon_id, master_service_id, starts_at DESC) and re-running the salon-scope query, the
+--     planner still chose idx_bookings_master_service_starts_at via the master join and never
+--     touched the new index — identical plan, identical warm timings. It would be pure write
+--     amplification. Making a salon-scope index useful first requires rewriting salonIdIn to
+--     filter the denormalized bookings.salon_id column directly; that is a behavioural change
+--     needing its own measurement pass, which V117 already flagged and deferred for the same
+--     "measure before indexing" reason.

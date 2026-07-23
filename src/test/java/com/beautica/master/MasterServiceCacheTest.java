@@ -36,7 +36,13 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-import org.springframework.cache.interceptor.SimpleKey;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+
+import java.time.OffsetDateTime;
+
+import static org.mockito.ArgumentMatchers.eq;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -44,7 +50,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {MasterService.class, CacheConfig.class},
+        // The REAL prefix evictor, never a @MockBean: it owns the cache-key-shape predicate whose
+        // silent mismatch made five evictions no-ops, so these tests must execute it.
+        classes = {MasterService.class, CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @Import(MasterServiceCacheTest.TransactionConfig.class)
@@ -115,14 +123,14 @@ class MasterServiceCacheTest {
     void should_evictMasterCalendarCache_when_upsertWorkingHours() {
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
-        // A plain String sentinel is not a SimpleKey, so the removeIf predicate would not touch it.
-        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        cache.put(cacheKey, "value");
-        assertThat(cache.get(cacheKey)).isNotNull();
+        // Populated through the REAL @Cacheable proxy on MasterService#getMasterCalendar so the key
+        // asserted below is the one Spring computed, not one this test invented. The previous
+        // `new SimpleKey(...)` sentinel matched the equally-wrong production predicate, which is how
+        // a permanently no-op eviction stayed green here.
+        Object cacheKey = populateRealCalendarEntry(MASTER_ID);
 
         Master master = mock(Master.class);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
         // upsert merge map is built from the all-rows finder (incl. inactive), not the
         // active-only finder — matching production after the 23505 duplicate-INSERT fix.
         when(workingHoursRepository.findByMasterId(MASTER_ID)).thenReturn(List.of());
@@ -155,17 +163,15 @@ class MasterServiceCacheTest {
     void should_evictMasterCalendarCache_when_deactivateMaster() {
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        // PERF-MEDIUM-4: eviction filters by SimpleKey whose toString() starts with "[masterId,".
-        SimpleKey cacheKey = new SimpleKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        cache.put(cacheKey, "value");
-        assertThat(cache.get(cacheKey)).isNotNull();
+        // Real proxy again — see should_evictMasterCalendarCache_when_upsertWorkingHours.
+        Object cacheKey = populateRealCalendarEntry(MASTER_ID);
 
         User user = mock(User.class);
         when(user.getId()).thenReturn(UUID.randomUUID());
 
         Master master = mock(Master.class);
         when(master.getUser()).thenReturn(user);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
         when(masterRepository.save(master)).thenReturn(master);
 
         // Act — wrap in transaction so afterCommit() fires
@@ -199,7 +205,7 @@ class MasterServiceCacheTest {
 
         Master master = mock(Master.class);
         when(master.getUser()).thenReturn(userA);
-        when(masterRepository.findByIdWithSalonAndOwner(MASTER_ID)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
 
         // Act — wrap in transaction so afterCommit() fires
         transactionTemplate.execute(status -> {
@@ -214,5 +220,34 @@ class MasterServiceCacheTest {
         assertThat(masterByUserCache.get(userBId))
                 .as("master-by-user cache entry for userB must NOT be evicted")
                 .isNotNull();
+    }
+
+    /**
+     * Populates one {@code master-calendar} entry via the REAL {@code @Cacheable} method and returns
+     * the key Spring stored, read back off the native Caffeine map rather than constructed here.
+     *
+     * <p>Driving the proxy is the whole point: an explicit SpEL {@code key = "{...}"} evaluates to a
+     * {@code List}, never the {@code SimpleKey} these tests used to seed, and asserting against a
+     * self-invented key is what let five silently-unsatisfiable eviction predicates ship. The
+     * booking id-page is stubbed empty so the method returns a cacheable non-null {@code Page}
+     * without reaching hydration.
+     */
+    private Object populateRealCalendarEntry(UUID masterId) {
+        when(bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
+                eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(), PageRequest.of(0, 20), 0));
+
+        masterService.getMasterCalendar(masterId, LocalDate.now(), LocalDate.now().plusDays(7),
+                PageRequest.of(0, 20));
+
+        Cache calendarCache = cacheManager.getCache("master-calendar");
+        assertThat(calendarCache).isNotNull();
+        Object nativeCache = calendarCache.getNativeCache();
+        assertThat(nativeCache).isInstanceOf(com.github.benmanes.caffeine.cache.Cache.class);
+        var keys = ((com.github.benmanes.caffeine.cache.Cache<?, ?>) nativeCache).asMap().keySet();
+        assertThat(keys)
+                .as("the real @Cacheable proxy must have stored exactly one master-calendar entry")
+                .hasSize(1);
+        return keys.iterator().next();
     }
 }

@@ -29,7 +29,9 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.EnableCaching;
-import org.springframework.cache.concurrent.ConcurrentMapCache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.beautica.common.cache.CacheKeyFixtures;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.cache.support.SimpleCacheManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
@@ -42,6 +44,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -56,7 +59,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {BookingService.class},
+        // The REAL prefix evictor, never a @MockBean: it owns the cache-key-shape predicate whose
+        // silent mismatch made five evictions no-ops, so these tests must execute it.
+        classes = {BookingService.class, com.beautica.common.cache.MasterCachePrefixEvictor.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @Import(BookingServiceCacheTest.FixedClockConfig.class)
@@ -71,13 +76,21 @@ class BookingServiceCacheTest {
             return Clock.fixed(Instant.parse("2026-05-08T10:00:00Z"), ZoneId.of("Europe/Kyiv"));
         }
 
+        /**
+         * CAFFEINE, deliberately — not ConcurrentMapCache. The production evictions scan the native
+         * Caffeine keyset and match each key's first element; against a non-Caffeine cache the
+         * evictor takes its coarse {@code clear()} fallback instead, which succeeds no matter how
+         * wrong the key predicate is. These tests previously used ConcurrentMapCache with a plain
+         * "sentinel" String key and so passed against a predicate that could never match a real
+         * entry. Keep these Caffeine, and keep the seeded keys realistically shaped.
+         */
         @Bean
         CacheManager cacheManager() {
             SimpleCacheManager m = new SimpleCacheManager();
             m.setCaches(List.of(
-                    new ConcurrentMapCache("master-calendar"),
-                    new ConcurrentMapCache("revenue-dashboard"),
-                    new ConcurrentMapCache("available-slots")
+                    new CaffeineCache("master-calendar", Caffeine.newBuilder().build()),
+                    new CaffeineCache("revenue-dashboard", Caffeine.newBuilder().build()),
+                    new CaffeineCache("available-slots", Caffeine.newBuilder().build())
             ));
             return m;
         }
@@ -122,6 +135,9 @@ class BookingServiceCacheTest {
     // collaborator's span-only guard. Not on the @SpringBootTest classes list, so mock it here.
     @MockBean ScheduleDateMath dateMath;
 
+    /** Fixed so a test can seed a master-calendar key that really belongs to the booking's master. */
+    private static final UUID MASTER_ID = UUID.randomUUID();
+
     @Autowired BookingService bookingService;
     @Autowired CacheManager cacheManager;
     @Autowired TransactionTemplate transactionTemplate;
@@ -146,8 +162,10 @@ class BookingServiceCacheTest {
         // Arrange — put a sentinel entry in master-calendar to confirm eviction
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        Object calendarKey = CacheKeyFixtures.spelKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        Object bystanderKey = CacheKeyFixtures.spelKey(UUID.randomUUID(), LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(calendarKey, "value");
+        cache.put(bystanderKey, "value");
 
         // Phase 24.2: declineBooking now transitions CONFIRMED → DECLINED (provider-initiated
         // cancellation) — there is no more PENDING source state.
@@ -169,8 +187,12 @@ class BookingServiceCacheTest {
         });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
-        assertThat(cache.get("sentinel"))
-                .as("master-calendar cache must be fully evicted after declineBooking")
+        assertThat(cache.get(bystanderKey))
+                .as("eviction is scoped to the booking's master — an unrelated master's calendar "
+                        + "page must survive, so a regression cannot hide behind a blanket clear()")
+                .isNotNull();
+        assertThat(cache.get(calendarKey))
+                .as("the booking master's master-calendar entry must be evicted after declineBooking")
                 .isNull();
     }
 
@@ -183,8 +205,10 @@ class BookingServiceCacheTest {
         // Arrange — put a sentinel entry in master-calendar to confirm eviction
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        Object calendarKey = CacheKeyFixtures.spelKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        Object bystanderKey = CacheKeyFixtures.spelKey(UUID.randomUUID(), LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(calendarKey, "value");
+        cache.put(bystanderKey, "value");
 
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
 
@@ -200,8 +224,12 @@ class BookingServiceCacheTest {
         });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
-        assertThat(cache.get("sentinel"))
-                .as("master-calendar cache must be fully evicted after completeBooking")
+        assertThat(cache.get(bystanderKey))
+                .as("eviction is scoped to the booking's master — an unrelated master's calendar "
+                        + "page must survive, so a regression cannot hide behind a blanket clear()")
+                .isNotNull();
+        assertThat(cache.get(calendarKey))
+                .as("the booking master's master-calendar entry must be evicted after completeBooking")
                 .isNull();
     }
 
@@ -214,8 +242,10 @@ class BookingServiceCacheTest {
         // Arrange — put a sentinel entry in master-calendar to confirm eviction
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        Object calendarKey = CacheKeyFixtures.spelKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        Object bystanderKey = CacheKeyFixtures.spelKey(UUID.randomUUID(), LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(calendarKey, "value");
+        cache.put(bystanderKey, "value");
 
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
 
@@ -235,8 +265,12 @@ class BookingServiceCacheTest {
         });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
-        assertThat(cache.get("sentinel"))
-                .as("master-calendar cache must be fully evicted after notCompleteBooking")
+        assertThat(cache.get(bystanderKey))
+                .as("eviction is scoped to the booking's master — an unrelated master's calendar "
+                        + "page must survive, so a regression cannot hide behind a blanket clear()")
+                .isNotNull();
+        assertThat(cache.get(calendarKey))
+                .as("the booking master's master-calendar entry must be evicted after notCompleteBooking")
                 .isNull();
     }
 
@@ -249,8 +283,10 @@ class BookingServiceCacheTest {
         // Arrange — put a sentinel entry in master-calendar to confirm eviction
         Cache cache = cacheManager.getCache("master-calendar");
         assertThat(cache).isNotNull();
-        cache.put("sentinel", "value");
-        assertThat(cache.get("sentinel")).isNotNull();
+        Object calendarKey = CacheKeyFixtures.spelKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        Object bystanderKey = CacheKeyFixtures.spelKey(UUID.randomUUID(), LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
+        cache.put(calendarKey, "value");
+        cache.put(bystanderKey, "value");
 
         // cancelBooking checks booking.getClient().getId().equals(clientUserId) — wire it
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
@@ -271,8 +307,12 @@ class BookingServiceCacheTest {
         });
 
         // Assert — sentinel must be gone: allEntries=true evicts the entire cache
-        assertThat(cache.get("sentinel"))
-                .as("master-calendar cache must be fully evicted after cancelBooking")
+        assertThat(cache.get(bystanderKey))
+                .as("eviction is scoped to the booking's master — an unrelated master's calendar "
+                        + "page must survive, so a regression cannot hide behind a blanket clear()")
+                .isNotNull();
+        assertThat(cache.get(calendarKey))
+                .as("the booking master's master-calendar entry must be evicted after cancelBooking")
                 .isNull();
     }
 
@@ -295,7 +335,7 @@ class BookingServiceCacheTest {
         when(msa.getServiceDefinition()).thenReturn(serviceDef);
         when(msa.getId()).thenReturn(UUID.randomUUID());
         when(client.getId()).thenReturn(UUID.randomUUID());
-        when(master.getId()).thenReturn(UUID.randomUUID());
+        when(master.getId()).thenReturn(MASTER_ID);
         when(serviceDef.getName()).thenReturn("Test Service");
         when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).plusHours(2));
         when(booking.getEndsAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).plusHours(3));

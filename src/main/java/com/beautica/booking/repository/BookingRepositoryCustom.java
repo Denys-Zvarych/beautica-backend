@@ -14,6 +14,12 @@ import java.util.UUID;
  * ID-page queries introduced by the Phase 26.1 audit fix (Finding 1 — HIGH, backend-perf).
  * Implemented by {@link BookingRepositoryCustomImpl}; see {@link BookingSpecifications} for the
  * full rationale on why the prior {@code (:statuses IS NULL OR …)} sentinel idiom was replaced.
+ *
+ * <p><b>Every method here requires a PAGED {@link Pageable}.</b> {@code Pageable.unpaged()} is
+ * rejected with {@link IllegalArgumentException} rather than executed: an unbounded
+ * {@code SELECT b.id} over a caller's whole booking history, fully hydrated afterwards, is never a
+ * valid query on this fragment (Anti-Bug §E-3). {@code BookingService#normalizeBookingSort}
+ * preserves {@code Unpaged} for its own callers, so the refusal has to live at this boundary.
  */
 public interface BookingRepositoryCustom {
 

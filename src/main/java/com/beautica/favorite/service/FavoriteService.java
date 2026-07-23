@@ -1,5 +1,7 @@
 package com.beautica.favorite.service;
 
+import org.springframework.data.domain.Sort;
+import com.beautica.common.web.SortWhitelist;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
@@ -100,7 +102,8 @@ public class FavoriteService {
      */
     @Transactional(readOnly = true)
     public Page<FavoriteMasterResponse> listMasterFavorites(UUID clientUserId, Pageable pageable) {
-        Page<Object[]> rows = favoriteRepository.findFavoriteMasterRows(clientUserId, pageable);
+        Page<Object[]> rows = favoriteRepository.findFavoriteMasterRows(
+                clientUserId, SortWhitelist.stripSort(pageable));
         if (rows.isEmpty()) {
             // No label resolution for an empty page (no N+1); preserve page metadata.
             return rows.map(row -> (FavoriteMasterResponse) null);
@@ -116,7 +119,8 @@ public class FavoriteService {
      */
     @Transactional(readOnly = true)
     public Page<FavoriteSalonResponse> listSalonFavorites(UUID clientUserId, Pageable pageable) {
-        Page<Object[]> rows = favoriteRepository.findFavoriteSalonRows(clientUserId, pageable);
+        Page<Object[]> rows = favoriteRepository.findFavoriteSalonRows(
+                clientUserId, SortWhitelist.stripSort(pageable));
         if (rows.isEmpty()) {
             // No label resolution for an empty page (no N+1); preserve page metadata.
             return rows.map(row -> (FavoriteSalonResponse) null);
@@ -177,7 +181,7 @@ public class FavoriteService {
     }
 
     private void validateMasterTarget(UUID masterId) {
-        Master master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        Master master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
         Role role = master.getUser().getRole();
         if (role != Role.INDEPENDENT_MASTER) {

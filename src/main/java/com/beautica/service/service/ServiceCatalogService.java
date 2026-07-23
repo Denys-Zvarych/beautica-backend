@@ -1,6 +1,7 @@
 package com.beautica.service.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -26,6 +27,7 @@ import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
+import com.beautica.service.repository.ActiveDuplicateProjection;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
@@ -33,6 +35,7 @@ import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
@@ -56,6 +59,13 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class ServiceCatalogService {
 
+    /**
+     * Name of the partial unique index added in V121 that enforces one ACTIVE service per
+     * {@code (owner_type, owner_id, service_type_id)}. Matched against the DB's constraint-violation
+     * report to translate it into a {@link DuplicateServiceException}.
+     */
+    private static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_service_type_active";
+
     private final ServiceRepository serviceRepository;
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
@@ -68,6 +78,7 @@ public class ServiceCatalogService {
     private final ServiceTypeSearchService serviceTypeSearchService;
     private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
+    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -85,6 +96,11 @@ public class ServiceCatalogService {
 
         ServiceType serviceType = resolveRequiredServiceType(request.serviceTypeId(), request.category());
 
+        // One extra SELECT on the success path, accepted deliberately so the conflict can carry
+        // existingServiceDefId — the lazy "look it up in the catch" alternative needs
+        // REQUIRES_NEW (the violation aborts the tx). Rationale in full on the method.
+        assertNoActiveDuplicate(OwnerType.SALON, salonId, serviceType, null);
+
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonId)
@@ -99,7 +115,7 @@ public class ServiceCatalogService {
         applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
         definition.setServiceType(serviceType);
 
-        ServiceDefinition saved = serviceRepository.save(definition);
+        ServiceDefinition saved = persistDefinition(definition);
         // A new SALON-owned definition has no assignment yet (not bookable), but evict the salon
         // catalogue for consistency with the other mutation sites (perf/security #2) — cheap per-key.
         evictSalonCatalogAfterCommit(salonId);
@@ -173,6 +189,10 @@ public class ServiceCatalogService {
 
         ServiceType serviceType = resolveRequiredServiceType(request.serviceTypeId(), request.category());
 
+        // Same accepted trade-off as addServiceToSalon: one SELECT on the success path buys the
+        // client a deep-linkable existingServiceDefId on the rare conflict. See the method javadoc.
+        assertNoActiveDuplicate(OwnerType.INDEPENDENT_MASTER, master.getId(), serviceType, null);
+
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
@@ -187,6 +207,20 @@ public class ServiceCatalogService {
         applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
         definition.setServiceType(serviceType);
 
+        // PERF: plain save, then ONE flush after the assignment save below — deliberately NOT
+        // persistDefinition's saveAndFlush. This path emits two INSERTs (definition, then the
+        // assignment that FKs to it), and be precise about what deferring actually saves:
+        // Hibernate batches PER TABLE, so `service_definitions` and `master_services` are two
+        // separate PreparedStatement batches — two executeBatch round-trips EITHER WAY. What the
+        // single flush eliminates is one FLUSH CYCLE (a dirty-check + auto-flush pass over the
+        // whole persistence context), not a round trip. Neutral-to-marginally-positive, and it
+        // costs nothing: nothing between the two statements reads the DB, the id is available
+        // without a flush (GenerationType.UUID is assigned in-memory at persist time) so the
+        // assignment can reference savedDef immediately, and order_inserts=true emits the
+        // definition before the assignment. Same reasoning as bulkCreateForMaster's save +
+        // flushBulkBatch — where the win IS round trips, because that path queues N rows of the
+        // SAME table into one batch. addServiceToSalon keeps persistDefinition because it has no
+        // second statement to defer for.
         ServiceDefinition savedDef = serviceRepository.save(definition);
 
         MasterServiceAssignment assignment = MasterServiceAssignment.builder()
@@ -196,6 +230,13 @@ public class ServiceCatalogService {
                 .build();
 
         MasterServiceAssignment savedAssignment = masterServiceRepository.save(assignment);
+
+        // The DUPLICATE_SERVICE classification is preserved because it is the FLUSH that must sit
+        // inside the try/catch, never the save: save on a new entity only assigns the id in
+        // memory, so the unique-index violation can only surface when the INSERT actually reaches
+        // the DB. Flushing here rather than at commit is what keeps that violation catchable —
+        // at commit it would land outside any catch and degrade to the generic 409.
+        flushTranslatingDuplicateViolation(definition.getName());
 
         // PERF-M2: keep the pre-computed min_effective_price in sync for the
         // independent master's own search entry.
@@ -307,11 +348,20 @@ public class ServiceCatalogService {
         // SELECT EXISTS per item. Both walks share this resolved-types map.
         Map<UUID, ServiceType> typesById = resolveBulkServiceTypes(request.items());
         validateBulkCategoriesActive(typesById.values());
+        // PERF: and the V121 duplicate guard for the WHOLE batch in ONE query too, rather than
+        // one findActiveDuplicateId per item. See assertNoActiveDuplicatesInBatch.
+        assertNoActiveDuplicatesInBatch(ownerType, ownerId, request.items(), typesById);
 
         List<MasterServiceResponse> created = request.items().stream()
                 .map(item -> createSingleFromBulkItem(
                         master, ownerType, ownerId, item, typesById.get(item.serviceTypeId())))
                 .toList();
+
+        // Push the whole batch to the DB in one go, translating a V121 violation exactly as the
+        // single-item persistDefinition does. Must happen BEFORE refreshMinEffectivePrice below:
+        // that is a JPQL @Modifying query, so Hibernate's AUTO flush would emit the inserts from
+        // inside it — outside any catch — and the race would degrade to a generic 409.
+        flushBulkBatch();
 
         // Keep the pre-computed min_effective_price in sync for the master's search entry
         // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
@@ -378,10 +428,15 @@ public class ServiceCatalogService {
 
     /**
      * Creates one {@link ServiceDefinition} + {@link MasterServiceAssignment} from a bulk
-     * item, using the pre-resolved {@link ServiceType} (type existence, active-check, and
-     * category validation are already done in batch by the caller). The service-type's name
-     * + parent category are the source of truth for the persisted name and category (no
-     * free-text name accepted).
+     * item, using the pre-resolved {@link ServiceType} (type existence, active-check,
+     * category validation, and the V121 duplicate guard are all already done in batch by the
+     * caller). The service-type's name + parent category are the source of truth for the
+     * persisted name and category (no free-text name accepted).
+     *
+     * <p><b>Deliberately does no I/O beyond the two {@code save} calls.</b> Every check that
+     * would need a query lives in {@link #bulkCreateForMaster} so the per-item cost stays
+     * O(0) queries — see {@link #assertNoActiveDuplicatesInBatch}. Nothing is flushed here;
+     * the caller flushes the batch once.
      */
     private MasterServiceResponse createSingleFromBulkItem(
             Master master,
@@ -405,6 +460,13 @@ public class ServiceCatalogService {
         applyPriceMode(definition, item.priceType(), item.price(), item.priceMin(), item.priceMax());
         definition.setServiceType(serviceType);
 
+        // PERF: plain save, NOT persistDefinition's saveAndFlush. Flushing per item turns the
+        // batch's ~4 batched round-trips (hibernate.jdbc.batch_size=50 + order_inserts=true)
+        // into ~2N. The caller flushes the whole batch once via flushBulkBatch, inside the same
+        // DataIntegrityViolationException translation, so the DUPLICATE_SERVICE 409 is preserved.
+        // The id is available without a flush — GenerationType.UUID is assigned in-memory at
+        // persist time — so the assignment below can reference savedDef immediately, and
+        // order_inserts emits every definition before any assignment that FKs to it.
         ServiceDefinition savedDef = serviceRepository.save(definition);
 
         MasterServiceAssignment assignment = MasterServiceAssignment.builder()
@@ -420,6 +482,25 @@ public class ServiceCatalogService {
      * Rejects a batch that toggles the same service type on twice. Without this guard a
      * caller could create two near-identical services in one call, which the first-time
      * setup screen never intends.
+     *
+     * <p><b>Deliberately a 400, NOT the {@code DUPLICATE_SERVICE} 409</b> (decision made
+     * explicit alongside V121, previously accidental). The two failures are different kinds:
+     * <ul>
+     *   <li>409 {@code DUPLICATE_SERVICE} = the request conflicts with <em>server state</em> —
+     *       the owner already has this service. The client's remedy is to look at the existing
+     *       row (hence the {@code existingServiceDefId} in the payload).</li>
+     *   <li>400 here = the <em>payload itself</em> is self-inconsistent; nothing exists yet and
+     *       no server state is involved. The client's remedy is to deduplicate its own rows
+     *       before resubmitting. Returning a 409 with a null {@code existingServiceDefId} would
+     *       give the mobile screen a code it cannot act on and would blur the two branches.</li>
+     * </ul>
+     *
+     * <p>Known gap (not introduced here, out of scope for V121): {@code handleBusiness}
+     * genericises every {@code BAD_REQUEST} body to {@code "Invalid request"} with no
+     * {@code errors} map, so this 400 currently carries no {@code items[i].serviceTypeId} field
+     * path for the setup screen to resolve back to a row. The structured-field-error channel is
+     * driven by Bean Validation ({@code MethodArgumentNotValidException}); wiring a service-layer
+     * throw into it needs a new exception type + handler and belongs in its own change.
      */
     private void rejectDuplicateServiceTypeIds(List<BulkServiceItemRequest> items) {
         long distinct = items.stream()
@@ -441,10 +522,19 @@ public class ServiceCatalogService {
         // An unknown masterId produces an empty list — the existsById check was a
         // redundant DB round-trip because the JOIN FETCH graph query already returns
         // nothing for a non-existent master.
+        //
+        // fromPublic masks priceOverride: this method backs ONLY the permitAll browse route
+        // (ServiceController#getMasterServices), so an anonymous caller must not learn whether a
+        // master prices away from their salon's definition. Masking happens INSIDE the cached
+        // method on purpose — the "masterServices" cache is populated by, and read by, this public
+        // path alone, so the cache holds the already-masked shape and no authenticated path can
+        // pick up a masked entry. The provider's own view goes through getMyServices, which is
+        // uncached and keeps the full variant.
         return masterServiceRepository
                 .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
+                .map(MasterServiceResponse::fromPublic)
                 .toList();
     }
 
@@ -543,9 +633,16 @@ public class ServiceCatalogService {
         ServiceDefinition definition = serviceRepository.findByIdWithServiceType(serviceDefId)
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
 
+        // The duplicate guard lives INSIDE applyPatchFields, in its query-only first phase before
+        // any setter fires — see the comment there. It cannot run after this call: by then the
+        // entity is dirty and its own query would trigger the flush that violates the index.
         applyPatchFields(definition, request);
 
-        ServiceDefinition saved = serviceRepository.save(definition);
+        // saveAndFlush + translation as the race backstop, mirroring the create paths: if a
+        // concurrent transaction commits the same (owner, type) between the guard and this
+        // write, the violation surfaces HERE (inside the catch) rather than at commit-time
+        // flush outside any handler, so the caller still gets DUPLICATE_SERVICE.
+        ServiceDefinition saved = persistDefinition(definition);
 
         List<UUID> affectedMasterIds =
                 masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
@@ -591,33 +688,30 @@ public class ServiceCatalogService {
      * and the existing pricing is preserved. When any price field is non-null the full
      * mode payload has already been validated by {@code @ServicePriceValid}; this method
      * applies all three price columns atomically.
+     *
+     * <p><b>Two strictly ordered phases.</b> Every query this PATCH needs runs first
+     * ({@link #resolvePatchServiceType}) while the managed entity is still CLEAN; only then
+     * does any setter fire. Interleaving them cost a second UPDATE: a PATCH carrying BOTH
+     * {@code category} and {@code serviceTypeId} used to set the category, then run the
+     * duplicate guard's JPQL over {@code ServiceDefinition} — an overlapping query space, so
+     * Hibernate's AUTO flush mode pushed the category-only UPDATE mid-method, the remaining
+     * setters re-dirtied the entity, and {@code persistDefinition}'s {@code saveAndFlush}
+     * emitted a second UPDATE. That early flush also took the row's write lock sooner than
+     * necessary. Keeping the entity clean until the mutate phase collapses it back to one
+     * flush and one lock acquisition at the end of the transaction.
      */
     private void applyPatchFields(ServiceDefinition definition,
             UpdateServiceDefinitionRequest request) {
 
-        // Category first: it determines the target category against which a
-        // service-type change is consistency-checked below.
+        // ---- Phase 1: resolve + validate. Queries only; the entity stays clean. ----
+        ServiceType resolvedServiceType = resolvePatchServiceType(definition, request);
+
+        // ---- Phase 2: mutate. The entity goes dirty here; no query may run past this line. ----
         if (request.category() != null) {
-            validateCategoryActive(request.category());
             definition.setCategory(request.category());
         }
-
-        // Service type (PATCH): null = leave unchanged (never clears). When present,
-        // resolve + active-check + cross-category consistency against the *effective*
-        // category — the just-applied new category, or the existing one if unchanged.
-        if (request.serviceTypeId() != null) {
-            ServiceType serviceType = resolveServiceType(request.serviceTypeId(), definition.getCategory());
-            definition.setServiceType(serviceType);
-        } else if (request.category() != null && definition.getServiceType() != null) {
-            // Category-only PATCH: the existing service type is not re-resolved, so re-check
-            // that it still belongs to the just-applied category. Without this guard a
-            // category change silently orphans the existing service type (effective pair
-            // inconsistent: definition.category != serviceType.platformCategoryName).
-            ServiceType existing = definition.getServiceType();
-            if (!Objects.equals(existing.getPlatformCategoryName(), definition.getCategory())) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST,
-                        "service type does not belong to the selected category");
-            }
+        if (resolvedServiceType != null) {
+            definition.setServiceType(resolvedServiceType);
         }
 
         applyNamePatch(definition, request);
@@ -642,6 +736,71 @@ public class ServiceCatalogService {
         if (priceBlockPresent) {
             applyPriceMode(definition, request.priceType(), request.price(), request.priceMin(), request.priceMax());
         }
+    }
+
+    /**
+     * Phase 1 of {@link #applyPatchFields}: runs every query the PATCH needs and returns the
+     * resolved {@link ServiceType} to assign, or {@code null} to leave the existing type alone.
+     *
+     * <p>Writes NOTHING to {@code definition} — that is the whole point. Both checks below issue
+     * SQL, and Hibernate's AUTO flush mode pushes pending changes whose query space overlaps
+     * before executing a query. Two consequences, both load-bearing:
+     * <ul>
+     *   <li>The duplicate guard MUST see a clean entity. If the colliding {@code service_type_id}
+     *       were already assigned, the flush would emit the UPDATE and the V121 index would fire
+     *       INSIDE the finder call — the check could never win, and the caller would get the
+     *       generic {@code DataIntegrityViolationException} 409 with no {@code data.code} instead
+     *       of {@code DUPLICATE_SERVICE}.</li>
+     *   <li>A category-only dirty is harmless to the index (category is not part of the key) but
+     *       still forces its own UPDATE + row lock, which is the perf half of the same fix.</li>
+     * </ul>
+     *
+     * <p>Validation ordering is preserved from the interleaved version: the category is validated
+     * first, then the type is resolved + active-checked + category-matched, so an invalid request
+     * still gets its 400 rather than a 409.
+     *
+     * <p>The effective category — the request's new one, or the entity's existing one when the
+     * PATCH does not change it — is computed into a local precisely because the setter has not
+     * run yet.
+     *
+     * @return the type to assign, or {@code null} when the request does not change it
+     * @throws BusinessException          (400) unknown/inactive category, or a type that does not
+     *                                    belong to the effective category
+     * @throws DuplicateServiceException  (409) the owner already offers an active service of this type
+     */
+    @Nullable
+    private ServiceType resolvePatchServiceType(ServiceDefinition definition,
+            UpdateServiceDefinitionRequest request) {
+
+        if (request.category() != null) {
+            validateCategoryActive(request.category());
+        }
+        String effectiveCategory =
+                request.category() != null ? request.category() : definition.getCategory();
+
+        // Service type (PATCH): null = leave unchanged (never clears).
+        if (request.serviceTypeId() == null) {
+            // Category-only PATCH: the existing service type is not re-resolved, so re-check that
+            // it still belongs to the incoming category. Without this guard a category change
+            // silently orphans the existing service type (effective pair inconsistent:
+            // definition.category != serviceType.platformCategoryName).
+            ServiceType existing = definition.getServiceType();
+            if (request.category() != null && existing != null
+                    && !Objects.equals(existing.getPlatformCategoryName(), effectiveCategory)) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "service type does not belong to the selected category");
+            }
+            return null;
+        }
+
+        ServiceType serviceType = resolveServiceType(request.serviceTypeId(), effectiveCategory);
+
+        // excludeId = this row, so re-submitting the type the definition already has is a no-op
+        // rather than a self-collision.
+        assertNoActiveDuplicate(definition.getOwnerType(), definition.getOwnerId(),
+                serviceType, definition.getId());
+
+        return serviceType;
     }
 
     /**
@@ -945,21 +1104,12 @@ public class ServiceCatalogService {
     }
 
     private void doEvictAvailableSlots(List<UUID> masterIds) {
-        var cache = cacheManager.getCache("available-slots");
-        if (cache == null) return;
-        Object nativeCache = cache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            // SimpleKey.toString() renders as "SimpleKey [elem0, elem1, ...]" via Arrays.deepToString.
-            // The first element is the masterId UUID string — detect it by substring presence.
-            for (UUID masterId : masterIds) {
-                String prefix = "[" + masterId + ",";
-                caffeineCache.asMap().keySet().removeIf(k ->
-                        k instanceof org.springframework.cache.interceptor.SimpleKey
-                                && k.toString().contains(prefix));
-            }
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            cache.clear();
+        // available-slots is @Cacheable(key = "{#masterId, #date, #masterServiceId}") — an explicit SpEL
+        // inline list, so the runtime key is an ArrayList whose first element is the masterId, never a
+        // SimpleKey. The local copy of this predicate that used to live here tested `instanceof SimpleKey`
+        // and so evicted nothing at all; the shared evictor owns the one correct key-shape check.
+        for (UUID masterId : masterIds) {
+            cachePrefixEvictor.evictByKeyPrefixNow(masterId, "available-slots");
         }
     }
 
@@ -1043,6 +1193,245 @@ public class ServiceCatalogService {
         } else {
             task.run();
         }
+    }
+
+    /**
+     * Rejects a write that would leave {@code (ownerType, ownerId)} with two ACTIVE services of
+     * the same {@link ServiceType} — the locked product rule "one active service per owner per
+     * service type, <em>regardless of price or duration</em>".
+     *
+     * <p>This is the friendly path only. The real guarantee is the partial unique index
+     * {@code ux_service_def_owner_service_type_active} (V121); this pre-check exists so the
+     * common case yields a branchable {@code DUPLICATE_SERVICE} 409 naming the existing service
+     * instead of a bare constraint violation. Being a read-then-write check it is TOCTOU-prone,
+     * which {@link #persistDefinition} closes on every write path.
+     *
+     * <p>The index is partial on {@code is_active = true} because deletion is soft
+     * ({@link ServiceRepository#deactivateById}) — a previously deleted service must stay
+     * re-creatable, and the query mirrors that with its own {@code isActive = true} predicate.
+     *
+     * <p><b>Accepted cost: one unconditional SELECT on the success path.</b> Re-examined and
+     * KEPT by the Phase 26.8/26.9 audit (backend-perf, "Accept"): the pre-check stays because the
+     * catch-side alternative trades one indexed equality lookup on an infrequent write for a
+     * second pooled connection on the failing one. Single creates and any PATCH carrying
+     * {@code serviceTypeId} pay this query every time purely so the rare conflict can carry
+     * {@code existingServiceDefId} for the client's deep-link. The obvious lazy alternative —
+     * skip the pre-check, let the index fire, look the id up in the catch — does NOT work: a
+     * constraint violation aborts the Postgres transaction, so no further statement can run in
+     * that catch without a {@code REQUIRES_NEW} sub-transaction (an extra connection from the
+     * pool, plus its own commit, on a path that is meant to be the cheap one). A single indexed
+     * equality lookup on an infrequent write path is the cheaper trade, so it stays; do not
+     * re-open without a measurement showing this SELECT on a hot path. The bulk path is different —
+     * there the per-item cost multiplied by 100 and by forced flushes, hence
+     * {@link #assertNoActiveDuplicatesInBatch}.
+     *
+     * @param excludeId the row being updated (so a PATCH cannot collide with itself), or
+     *                  {@code null} on a create path
+     * @throws DuplicateServiceException (409) when an active service of this type already exists
+     */
+    private void assertNoActiveDuplicate(OwnerType ownerType, UUID ownerId,
+            @Nullable ServiceType serviceType, @Nullable UUID excludeId) {
+
+        // Null-safe: service_type_id is NOT NULL since V111 and every create path resolves a
+        // non-null type, so this is unreachable in practice — but a null here must never become
+        // an NPE 500. The DB index remains the backstop.
+        if (serviceType == null || serviceType.getId() == null) {
+            return;
+        }
+
+        serviceRepository
+                .findActiveDuplicateId(ownerType, ownerId, serviceType.getId(), excludeId)
+                .ifPresent(existingId -> {
+                    throw new DuplicateServiceException(serviceType.getNameUk(), existingId);
+                });
+    }
+
+    /**
+     * Batch form of {@link #assertNoActiveDuplicate} for the bulk first-time-setup path: ONE
+     * query covering every item, instead of one per item.
+     *
+     * <p><b>Why batched.</b> The request accepts up to 100 items, and the per-item form issued
+     * 100 serialized SELECTs — regressing the explicit one-query batching the neighbouring steps
+     * ({@link #resolveBulkServiceTypes}, {@link #validateBulkCategoriesActive}) already establish.
+     * It also cost more than the SELECTs themselves: each JPQL query triggers a Hibernate AUTO
+     * flush of the pending inserts, so the per-item guard is what forced the per-item flush that
+     * defeated JDBC insert batching. Batching the guard and batching the flush only pay off
+     * together.
+     *
+     * <p><b>NOT redundant with the caller's {@code existsActiveServiceForMaster} precondition:</b>
+     * that gate is assignment-level (active {@link MasterServiceAssignment} + active definition),
+     * whereas the V121 index is definition-level. A definition owned by this master that is
+     * active but carries no active assignment passes the bulk precondition and still collides
+     * with the index — this check turns that into a clean 409 instead of a 500 at flush.
+     *
+     * <p>Reported collision is the FIRST in <em>request order</em>, not in result order: the
+     * query's row order is unspecified, and blaming a later item for an earlier item's conflict
+     * would make the error non-deterministic across identical requests.
+     *
+     * @throws DuplicateServiceException (409) naming the first item whose type is already taken
+     */
+    private void assertNoActiveDuplicatesInBatch(OwnerType ownerType, UUID ownerId,
+            List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
+
+        if (typesById.isEmpty()) {
+            return;
+        }
+
+        Map<UUID, UUID> existingDefIdByTypeId = serviceRepository
+                .findActiveDuplicateTypeIds(ownerType, ownerId, typesById.keySet())
+                .stream()
+                .collect(Collectors.toMap(
+                        ActiveDuplicateProjection::serviceTypeId,
+                        ActiveDuplicateProjection::serviceDefinitionId,
+                        (first, second) -> first));
+
+        if (existingDefIdByTypeId.isEmpty()) {
+            return;
+        }
+
+        for (BulkServiceItemRequest item : items) {
+            UUID existingId = existingDefIdByTypeId.get(item.serviceTypeId());
+            if (existingId != null) {
+                ServiceType type = typesById.get(item.serviceTypeId());
+                throw new DuplicateServiceException(
+                        type != null ? type.getNameUk() : null, existingId);
+            }
+        }
+    }
+
+    /**
+     * Flushes a bulk batch's pending inserts in a single round-trip, translating a V121 violation
+     * into {@link DuplicateServiceException} exactly as {@link #persistDefinition} does for the
+     * paths that flush through {@code saveAndFlush}.
+     *
+     * <p>This is the batch counterpart of {@code saveAndFlush}: the inserts must reach the DB
+     * inside this try block, otherwise a violation would surface at commit-time flush — outside
+     * any catch — and degrade to the generic {@code DataIntegrityViolationException} 409 with no
+     * {@code data.code} for the client to branch on. With {@code hibernate.jdbc.batch_size=50}
+     * and {@code order_inserts=true} the whole batch leaves as a handful of round-trips.
+     *
+     * <p><b>Carries no service name or id</b>, unlike every other {@code DUPLICATE_SERVICE}
+     * site. Reaching here means {@link #assertNoActiveDuplicatesInBatch} passed and a concurrent
+     * transaction won the race in between; the flush reports the constraint, not which of the N
+     * queued rows lost, and the Postgres transaction is aborted at that point so nothing further
+     * can be queried to find out. The client still gets the stable {@code DUPLICATE_SERVICE}
+     * code, which is what it branches on.
+     */
+    private void flushBulkBatch() {
+        flushTranslatingDuplicateViolation(null);
+    }
+
+    /**
+     * The one place a deferred flush is turned into a branchable {@code DUPLICATE_SERVICE} 409 —
+     * shared by {@link #flushBulkBatch} and by {@code addIndependentMasterService}, which defers
+     * its flush until after the assignment insert so both statements leave in one flush cycle.
+     *
+     * <p>{@code EntityManager#flush} is persistence-context-wide, not repository-scoped, so
+     * flushing through {@code serviceRepository} also emits the pending
+     * {@link MasterServiceAssignment} insert — which is precisely the point on the create path.
+     *
+     * <p>Any violation that is not this migration's unique index is rethrown untouched so
+     * {@code GlobalExceptionHandler#handleDataIntegrityViolation} keeps its deliberately opaque,
+     * anti-enumeration response.
+     *
+     * @param serviceName echoed to the client so it can name the conflicting entry without a
+     *                    second round-trip; {@code null} on the bulk path, where the flush reports
+     *                    the constraint rather than which of the N queued rows lost and the
+     *                    aborted Postgres transaction rules out looking it up
+     */
+    private void flushTranslatingDuplicateViolation(@Nullable String serviceName) {
+        try {
+            serviceRepository.flush();
+        } catch (DataIntegrityViolationException ex) {
+            if (!isDuplicateServiceViolation(ex)) {
+                throw ex;
+            }
+            // The index reports the constraint, not the surviving row — hence a null id.
+            throw new DuplicateServiceException(serviceName, null);
+        }
+    }
+
+    /**
+     * Persists a {@link ServiceDefinition} — new (INSERT) or patched (UPDATE) — translating a
+     * violation of the duplicate-service index into the same {@link DuplicateServiceException}
+     * the pre-check raises.
+     *
+     * <p><b>Scope: the paths with nothing to batch the definition write with</b> —
+     * {@code addServiceToSalon} (a SALON definition has no assignment yet) and
+     * {@code updateServiceDefinition} (a single UPDATE). {@code addIndependentMasterService}
+     * deliberately does NOT use this method: it has a second insert to emit, so it saves plainly
+     * and calls {@link #flushTranslatingDuplicateViolation} once afterwards, keeping both
+     * statements in one flush cycle without weakening the classification below.
+     *
+     * <p>{@code saveAndFlush} (not {@code save}) is what makes this work: the statement must
+     * reach the DB inside this try block, otherwise the violation would surface at commit-time
+     * flush — outside any catch — and degrade to the generic
+     * {@code DataIntegrityViolationException} 409 with no {@code data.code} for the client to
+     * branch on. This closes the TOCTOU window that {@link #assertNoActiveDuplicate} alone
+     * leaves open. It matters doubly on the UPDATE path, where {@code save} on an already-managed
+     * entity is a no-op that would defer the write to commit.
+     *
+     * <p>Flush ordering is deliberately unchanged in substance: every subsequent statement on
+     * these paths ({@code masterRepository.refreshMinEffectivePrice}, the assignment insert, the
+     * affected-master lookup) is JPQL, and Hibernate's AUTO flush mode already flushed the
+     * pending write before executing them. {@code saveAndFlush} only makes that flush explicit
+     * and earlier. Cache evictions are unaffected — they are all {@code afterCommit} callbacks,
+     * not flush-ordered.
+     *
+     * <p>Any other integrity violation is rethrown untouched so the generic handler keeps its
+     * deliberately opaque, anti-enumeration response.
+     */
+    private ServiceDefinition persistDefinition(ServiceDefinition definition) {
+        try {
+            return serviceRepository.saveAndFlush(definition);
+        } catch (DataIntegrityViolationException ex) {
+            if (!isDuplicateServiceViolation(ex)) {
+                throw ex;
+            }
+            // The index reports the constraint, not the surviving row — hence a null id. The
+            // client still gets the DUPLICATE_SERVICE code plus the name it just submitted.
+            throw new DuplicateServiceException(definition.getName(), null);
+        }
+    }
+
+    /**
+     * True when the violation came from {@code ux_service_def_owner_service_type_active}.
+     *
+     * <p>Matches ONLY on Hibernate's structured {@code getConstraintName()}. Be precise about what
+     * that is: in Hibernate 6 {@code PostgreSQLDialect}'s {@code ViolatedConstraintNameExtractor}
+     * calls {@code extractUsingTemplate("violates unique constraint \"", "\"", sqle.getMessage())}
+     * — it IS message parsing, just anchored to a fixed server-emitted template rather than a free
+     * substring scan. The security conclusion holds regardless: Postgres emits that anchor in the
+     * primary message BEFORE the {@code Detail: Failing row contains (…)} line, and
+     * {@code extractUsingTemplate} returns the FIRST match, so caller-supplied {@code name} /
+     * {@code description} text rendered into the detail cannot steer the extracted name. The
+     * value is trustworthy because of where the anchor sits, not because it bypassed the message.
+     * {@code ServiceDefinitionUniqueActiveTypeTest} asserts the extraction against real Postgres,
+     * since a dialect that returned null or an unqualified name here would silently degrade every
+     * genuine duplicate race to a generic 409 with no {@code data.code}.
+     *
+     * <p><b>Deliberately no message-substring fallback.</b> Scanning {@code cause.getMessage()}
+     * for the index name was attacker-steerable: PgJDBC renders {@code Detail: Failing row
+     * contains (…)} into the exception message, echoing the caller's own {@code name} /
+     * {@code description}. A request carrying
+     * {@code description = "ux_service_def_owner_service_type_active"} that tripped a
+     * <em>different</em> constraint would then be misclassified as {@code DUPLICATE_SERVICE},
+     * turning an opaque 409 into a wrong, caller-chosen error code. A
+     * {@code org.postgresql.util.PSQLException#getServerErrorMessage().getConstraint()} fallback
+     * would also be structurally safe, but the driver is {@code runtimeOnly} (not on the compile
+     * classpath) and the Hibernate extractor already reads exactly that signal.
+     *
+     * <p>Any non-match returns false so the exception is rethrown unchanged and the generic
+     * handler keeps its anti-enumeration response.
+     */
+    private static boolean isDuplicateServiceViolation(DataIntegrityViolationException ex) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.hibernate.exception.ConstraintViolationException hce
+                    && DUPLICATE_SERVICE_INDEX.equals(hce.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

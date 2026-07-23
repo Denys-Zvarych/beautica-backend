@@ -1,5 +1,8 @@
 package com.beautica.review.service;
 
+import org.springframework.data.domain.Sort;
+import java.util.Set;
+import com.beautica.common.web.SortWhitelist;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
@@ -136,7 +139,7 @@ public class ReviewService {
 
         // Strip caller-supplied sort: each JPQL query below hardcodes its own ORDER BY.
         // A caller-supplied sort field can trigger PropertyReferenceException, leaking entity property names.
-        Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
+        Pageable unsortedPage = SortWhitelist.stripSort(pageable);
         Page<UUID> idPage = switch (effectiveSort) {
             case NEWEST -> reviewRepository.findIdsByMasterIdOrderByCreatedAtDesc(masterId, unsortedPage);
             case OLDEST -> reviewRepository.findIdsByMasterIdOrderByCreatedAtAsc(masterId, unsortedPage);
@@ -169,7 +172,7 @@ public class ReviewService {
         }
         // Strip caller-supplied sort: the JPQL has ORDER BY r.createdAt DESC hardcoded.
         // An arbitrary sort field would trigger PropertyReferenceException, leaking property names.
-        Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
+        Pageable unsortedPage = SortWhitelist.stripSort(pageable);
         Page<MyReviewResponse> page = reviewRepository.findMyReviews(clientUserId, unsortedPage);
         return PageResponse.of(
                 page.getContent(),
@@ -290,7 +293,7 @@ public class ReviewService {
         // Strip caller-supplied sort: each JPQL query below hardcodes its own ORDER BY.
         // A caller-supplied sort field can trigger PropertyReferenceException, leaking
         // entity property names.
-        Pageable unsortedPage = PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
+        Pageable unsortedPage = SortWhitelist.stripSort(pageable);
         Page<UUID> idPage = switch (effectiveSort) {
             case NEWEST -> reviewRepository.findIdsBySalonIdOrderByCreatedAtDesc(salonId, unsortedPage);
             case OLDEST -> reviewRepository.findIdsBySalonIdOrderByCreatedAtAsc(salonId, unsortedPage);

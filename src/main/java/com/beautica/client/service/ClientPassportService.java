@@ -1,5 +1,7 @@
 package com.beautica.client.service;
 
+import org.springframework.data.domain.Sort;
+import com.beautica.common.web.SortWhitelist;
 import com.beautica.client.dto.BudgetBand;
 import com.beautica.client.dto.PassportResponse;
 import com.beautica.client.dto.TimelineItemResponse;
@@ -65,12 +67,26 @@ public class ClientPassportService {
     }
 
     /**
+     * The only property {@code GET /clients/me/timeline} may be sorted by — mirrors
+     * {@code BookingService.SORTABLE_BOOKING_PROPERTIES}, since this query shares the
+     * {@code Booking} root and must not expose a wider sort surface than {@code GET /bookings/me}.
+     */
+    private static final Set<String> SORTABLE_TIMELINE_PROPERTIES = Set.of("startsAt");
+
+    /**
      * Most-recent-first page of COMPLETED procedures. The {@code categoryKey} slug and the
      * Kyiv {@code LocalDate} are derived in-memory from the scalar projection (no N+1).
      */
     @Transactional(readOnly = true)
     public PageResponse<TimelineItemResponse> getTimeline(UUID clientUserId, Pageable pageable) {
-        Page<TimelineItemProjection> page = aggregationRepository.findTimeline(clientUserId, pageable);
+        // findTimeline's root is Booking, whose `master`/`client` associations reach User — an
+        // unguarded sort resolves `client.passwordHash` as valid JPQL and orders rows by it.
+        // Whitelisted to the property @PageableDefault already supplies, matching
+        // BookingService.SORTABLE_BOOKING_PROPERTIES. No tiebreaker: the JPQL hardcodes
+        // `ORDER BY b.startsAt DESC` and Spring appends the caller's sort after it.
+        Pageable safePageable = SortWhitelist.apply(
+                pageable, SORTABLE_TIMELINE_PROPERTIES, Sort.unsorted(), null);
+        Page<TimelineItemProjection> page = aggregationRepository.findTimeline(clientUserId, safePageable);
         ZoneId kyiv = TimeZones.KYIV;
         List<TimelineItemResponse> content = page.getContent().stream()
                 .map(p -> toTimelineResponse(p, kyiv))

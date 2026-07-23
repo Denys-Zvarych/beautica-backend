@@ -22,6 +22,8 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
 
+import java.util.UUID;
+
 /**
  * Singleton-container base class for all full-context integration tests.
  *
@@ -110,6 +112,38 @@ public abstract class AbstractIntegrationTest {
         factory.setConnectTimeout(10_000);
         factory.setReadTimeout(10_000);
         baseRestTemplate.getRestTemplate().setRequestFactory(factory);
+    }
+
+    /**
+     * Resolves a selectable service type this owner does not already have an ACTIVE service
+     * definition for.
+     *
+     * <p>Owner-scoped on purpose: V121 added {@code ux_service_def_owner_service_type_active}, a
+     * partial UNIQUE index on {@code (owner_type, owner_id, service_type_id) WHERE is_active}. A
+     * deterministic resolver ({@code ORDER BY st.name_uk LIMIT 1}) hands back the SAME type on
+     * every call, so seeding a second ACTIVE definition for one owner raises a unique violation.
+     * The {@code NOT EXISTS} guard mirrors that index predicate exactly, is stateless, and
+     * degenerates to the previous behaviour for an owner's first definition.
+     *
+     * <p>Sound only because callers INSERT the definition before asking again. Throws on an empty
+     * result rather than silently reusing a type if an owner exhausts the seeded selectable types.
+     *
+     * @param ownerType {@code service_definitions.owner_type} — e.g. {@code SALON},
+     *                  {@code INDEPENDENT_MASTER}
+     * @param ownerId   {@code service_definitions.owner_id} — the salon or master id
+     */
+    protected UUID resolveUnusedServiceTypeId(String ownerType, UUID ownerId) {
+        return jdbcTemplate.queryForObject(
+                """
+                SELECT st.id FROM service_types st
+                JOIN platform_categories pc ON pc.name = st.platform_category_name
+                WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED'
+                  AND NOT EXISTS (SELECT 1 FROM service_definitions sd
+                                  WHERE sd.owner_type = ? AND sd.owner_id = ?
+                                    AND sd.service_type_id = st.id AND sd.is_active = TRUE)
+                ORDER BY st.name_uk LIMIT 1
+                """,
+                UUID.class, ownerType, ownerId);
     }
 
     private static final PostgreSQLContainer<?> POSTGRES =

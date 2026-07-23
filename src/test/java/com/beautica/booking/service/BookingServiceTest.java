@@ -140,7 +140,11 @@ class BookingServiceTest {
                 reviewRepository,
                 discoveryLocationResolver,
                 clock,
-                cacheManager,
+                // A REAL evictor over the mocked CacheManager, never a mock: the key-shape predicate it
+                // owns is the thing that silently no-opped for months, so it must actually execute here.
+                // (BookingService no longer holds a CacheManager of its own — both of its former direct
+                // uses were the prefix scans now delegated to this evictor.)
+                new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 salonCatalogCacheEvictor,
                 dateMath
         );
@@ -260,14 +264,16 @@ class BookingServiceTest {
     @Test
     @DisplayName("booking is created and saved when the slot is free and no overlap exists")
     void should_createBooking_when_slotAvailableAndNoConflict() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        BookingResponse result = bookingService.createBooking(clientId, null, validRequest());
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
         ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
         verify(bookingRepository).saveAndFlush(captor.capture());
@@ -287,16 +293,18 @@ class BookingServiceTest {
         Master ownerMaster = buildMaster(masterId, MasterType.SALON_OWNER);
         MasterServiceAssignment ownerMsa = buildMsa(masterServiceId, ownerMaster, serviceDef, null, null);
 
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(ownerMaster));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerMaster));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(ownerMsa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
 
         Booking saved = buildBooking(bookingId, client, ownerMaster, ownerMsa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         // Act
-        BookingResponse result = bookingService.createBooking(clientId, null, validRequest());
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
         // Assert — booking created; master_id is the owner-master's ID
         ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
@@ -314,8 +322,10 @@ class BookingServiceTest {
         Booking existing = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findActiveByClientIdAndIdempotencyKey(clientId, key))
                 .thenReturn(Optional.of(existing));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(existing));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        BookingResponse result = bookingService.createBooking(clientId, key, validRequest());
+        BookingDetailResponse result = bookingService.createBooking(clientId, key, validRequest());
 
         verify(bookingRepository, never()).saveAndFlush(any());
         assertThat(result.id()).isEqualTo(bookingId);
@@ -324,7 +334,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("409 Conflict is thrown when the requested slot overlaps an existing booking")
     void should_throw409_when_slotOverlapsExistingBooking() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(true);
@@ -339,7 +349,7 @@ class BookingServiceTest {
     @DisplayName("409 CLIENT_BOOKING_CONFLICT is thrown when the client already holds an overlapping "
             + "booking with a DIFFERENT master — the master-busy check never runs")
     void should_throwClientBookingConflict_when_clientAlreadyHasOverlappingBookingWithDifferentMaster() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
 
@@ -377,12 +387,14 @@ class BookingServiceTest {
     @DisplayName("advisory locks are acquired client-then-master (deterministic order, Phase 19.4 "
             + "reorder), and the client-conflict check runs before the master lock is even acquired")
     void should_acquireClientLockBeforeMasterLock_andCheckClientConflictFirst_when_creatingBooking() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -409,7 +421,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("404 NotFoundException is thrown when the master does not exist")
     void should_throw404_when_masterNotFound() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.empty());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
                 .isInstanceOf(NotFoundException.class);
@@ -418,7 +430,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("404 NotFoundException is thrown when the master service assignment does not exist")
     void should_throw404_when_masterServiceNotFound() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
@@ -435,7 +447,7 @@ class BookingServiceTest {
                 .isActive(false)
                 .build();
         setField(inactiveMaster, "id", masterId);
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(inactiveMaster));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(inactiveMaster));
 
         // Act + Assert — the filter(Master::isActive) turns the Optional empty
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
@@ -446,7 +458,7 @@ class BookingServiceTest {
     @DisplayName("404 NotFoundException is thrown when the requested service does not belong to the master")
     void should_throwNotFoundException_when_serviceDoesNotBelongToMaster() {
         // Arrange — master is found and active; but the service lookup returns empty
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.empty());
 
@@ -458,7 +470,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("400 is thrown when the requested start time is in the past")
     void should_throw400_when_startsAtInThePast() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest pastRequest = new CreateBookingRequest(
@@ -478,7 +490,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("400 is thrown when the requested start time is exactly 14 minutes from now (below minimum lead time)")
     void should_throw400_when_startsAtIsExactly14MinutesFromNow() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest request = new CreateBookingRequest(
@@ -498,12 +510,14 @@ class BookingServiceTest {
     @Test
     @DisplayName("booking proceeds past time check when start time is exactly 15 minutes from now (minimum lead time boundary)")
     void should_proceedPastTimeCheck_when_startsAtIsExactly15MinutesFromNow() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         CreateBookingRequest request = new CreateBookingRequest(
                 masterId,
@@ -513,7 +527,7 @@ class BookingServiceTest {
                 null
         );
 
-        BookingResponse result = bookingService.createBooking(clientId, null, request);
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, request);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).saveAndFlush(any());
@@ -522,7 +536,7 @@ class BookingServiceTest {
     @Test
     @DisplayName("400 is thrown when the requested start time is more than 180 days in the future")
     void should_throw400_when_startsAtMoreThan180DaysAhead() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
 
         CreateBookingRequest farFutureRequest = new CreateBookingRequest(
@@ -544,7 +558,7 @@ class BookingServiceTest {
     void should_snapshotPriceAndDuration_when_masterServiceHasOverrides() {
         MasterServiceAssignment msaWithOverrides = buildMsa(
                 masterServiceId, master, serviceDef, new BigDecimal("250.00"), 45);
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msaWithOverrides));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
@@ -552,6 +566,8 @@ class BookingServiceTest {
         setField(saved, "priceAtBooking", new BigDecimal("250.00"));
         setField(saved, "durationMinutesAtBooking", 45);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -564,12 +580,14 @@ class BookingServiceTest {
     @Test
     @DisplayName("price and duration are snapshotted from base values when no overrides are set")
     void should_fallBackToBaseValues_when_noOverrides() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -582,12 +600,14 @@ class BookingServiceTest {
     @Test
     @DisplayName("new-booking notification is enqueued when the booking is successfully created")
     void should_enqueueNewBookingNotification_when_bookingCreated() {
-        when(masterRepository.findByIdWithSalonAndOwner(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -1727,7 +1747,8 @@ class BookingServiceTest {
                 "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
                 null, null, "Khreschatyk", "10",
                 locationNote,
-                "MANICURE", false);
+                "MANICURE", false,
+                null);
     }
 
     @Test
@@ -1766,6 +1787,67 @@ class BookingServiceTest {
         assertThat(result.data().get(0).locationNote()).isNull();
     }
 
+    // ── priceMaxAtBooking (CLIENT projection path) ────────────────────────────────────────────
+    //    Since V119 the ceiling is a frozen column on the bookings row, so this path has no rule
+    //    left to apply — the service must pass the projected value through UNTOUCHED. Any
+    //    re-derivation reintroduced here would let a provider's later service edit rewrite an
+    //    agreed band. The creation-time rule that produced the value lives in BookingPriceRange
+    //    and is pinned by BookingPriceRangeTest.
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithCeiling(
+            java.math.BigDecimal priceMaxAtBooking) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("300.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false,
+                priceMaxAtBooking);
+    }
+
+    private com.beautica.booking.dto.BookingDetailResponse firstClientRowFor(
+            com.beautica.booking.repository.ClientBookingDetailProjection row) {
+        when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.hydrateClientBookingDetails(List.of(bookingId)))
+                .thenReturn(List.of(row));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), null, null, null, null, Pageable.unpaged());
+
+        assertThat(result.data()).hasSize(1);
+        return result.data().get(0);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) passes a frozen priceMaxAtBooking through untouched")
+    void should_passFrozenCeilingThrough_when_clientProjectionRowHasOne() {
+        var row = clientProjectionRowWithCeiling(new BigDecimal("500.00"));
+
+        var booking = firstClientRowFor(row);
+
+        assertThat(booking.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) leaves a null priceMaxAtBooking null — never re-derives a ceiling from live service state")
+    void should_returnNullPriceMax_when_clientProjectionRowHasNoFrozenCeiling() {
+        var row = clientProjectionRowWithCeiling(null);
+
+        var booking = firstClientRowFor(row);
+
+        assertThat(booking.priceMaxAtBooking()).isNull();
+    }
+
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
             UUID id, String serviceName) {
         return new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -1781,7 +1863,8 @@ class BookingServiceTest {
                 "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
                 null, null, "Khreschatyk", "10",
                 null,
-                "MANICURE", false);
+                "MANICURE", false,
+                null);
     }
 
     // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no
@@ -2172,25 +2255,35 @@ class BookingServiceTest {
         verify(masterRepository, never()).findByUserId(any());
     }
 
-    // ── getMyBookings — sort cardinality bound (Phase 26.3 audit, backend-perf F4) ──────────────
+    // ── getMyBookings — sort cardinality bounds (Phase 26.3 audit F4; Phase 26.8 audit) ─────────
     //
-    // MAX_SORT_ORDERS caps normalizeBookingSort's effective Sort at 3 entries — each distinct
-    // (property, direction) sequence compiles to a textually distinct ORDER BY, so an unbounded
-    // sort list inflates plan-cache entries. The two tests below isolate that count bound from the
-    // whitelist check above: every property used here (startsAt, priceAtBooking — reused with a
-    // different direction to reach the required order count) is individually whitelisted, so a
-    // rejection can ONLY be attributed to cardinality, never to an unrecognised property name.
+    // normalizeBookingSort applies TWO independent cardinality guards, and the tests below pin
+    // each in isolation. Every order used here repeats the SOLE whitelisted property as of Phase
+    // 26.8 (startsAt — priceAtBooking was retired from SORTABLE_BOOKING_PROPERTIES once its only
+    // caller, the provider sort sheet, was deleted by mobile Phase 7.8), so a rejection can ONLY
+    // be attributed to cardinality, never to an unrecognised property name:
+    //
+    //   1. MAX_SORT_ORDERS = 3 — the outer length guard, checked FIRST so a pathological sort list
+    //      is rejected before any per-order work. Distinguished by its "Too many sort properties"
+    //      message.
+    //   2. no repeated property — added by the Phase 26.8 audit. Each distinct (property,
+    //      direction) sequence compiles to a textually distinct ORDER BY hence its own plan-cache
+    //      entry, so repeats (which SQL ignores anyway — the first term for a column wins) were
+    //      minting up to 14 plans where 2 suffice. Distinguished by "Duplicate sort property".
+    //
+    // Ordering between the two matters and is asserted: at 4 repeated orders the LENGTH guard must
+    // win, otherwise MAX_SORT_ORDERS would be unreachable dead configuration.
 
     @Test
     @DisplayName("BusinessException(400) is thrown, and NEITHER repository is ever touched, when sort "
-            + "carries 4 orders — all four individually whitelisted properties (startsAt, "
-            + "priceAtBooking, priceAtBooking desc, startsAt again) so the rejection is attributable "
-            + "ONLY to exceeding MAX_SORT_ORDERS=3, never to the property whitelist")
+            + "carries 4 orders — all four repeat the sole whitelisted property (startsAt asc, desc, "
+            + "asc, desc) so the rejection is attributable ONLY to exceeding MAX_SORT_ORDERS=3, never "
+            + "to the property whitelist")
     void should_rejectSort_when_fourSortOrdersExceedTheCountBound() {
         UUID actorId = UUID.randomUUID();
-        Sort fourOrders = Sort.by("startsAt")
-                .and(Sort.by("priceAtBooking"))
-                .and(Sort.by(Sort.Direction.DESC, "priceAtBooking"))
+        Sort fourOrders = Sort.by(Sort.Direction.ASC, "startsAt")
+                .and(Sort.by(Sort.Direction.DESC, "startsAt"))
+                .and(Sort.by(Sort.Direction.ASC, "startsAt"))
                 .and(Sort.by(Sort.Direction.DESC, "startsAt"));
         Pageable tooManyOrdersPageable = PageRequest.of(0, 20, fourOrders);
 
@@ -2207,21 +2300,44 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("exactly 3 sort orders are accepted — the CLIENT projection query is reached with the "
-            + "normalized (3 whitelisted orders + mandatory id tiebreaker) sort, proving the bound is "
-            + "\">3 rejects\", not \">=3 rejects\" (no off-by-one against MAX_SORT_ORDERS=3)")
-    void should_acceptSort_when_exactlyThreeSortOrdersAtTheCountBound() {
-        Sort threeOrders = Sort.by("startsAt")
-                .and(Sort.by("priceAtBooking"))
+    @DisplayName("BusinessException(400) 'Duplicate sort property' is thrown, and NEITHER repository is "
+            + "ever touched, when the SAME whitelisted property is sent twice (startsAt asc, startsAt "
+            + "desc) — under MAX_SORT_ORDERS=3, so the rejection is attributable ONLY to the repeat")
+    void should_rejectSort_when_theSameWhitelistedPropertyIsRepeated() {
+        UUID actorId = UUID.randomUUID();
+        Sort repeatedProperty = Sort.by(Sort.Direction.ASC, "startsAt")
                 .and(Sort.by(Sort.Direction.DESC, "startsAt"));
-        Pageable atBoundPageable = Pageable.unpaged(threeOrders);
-        Sort expectedNormalizedSort = threeOrders.and(Sort.by(Sort.Direction.ASC, "id"));
+        Pageable repeatedPropertyPageable = PageRequest.of(0, 20, repeatedProperty);
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, buildAuth(Role.CLIENT), null, null, null, null, repeatedPropertyPageable))
+                .isInstanceOf(BusinessException.class)
+                // Not "Too many sort properties": two orders is within MAX_SORT_ORDERS, so only the
+                // repeat guard can be firing. A generic 400 assertion would pass even if the length
+                // guard had been silently tightened to 1 instead.
+                .hasMessageContaining("Duplicate sort property")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+        verify(salonRepository, never()).findIdsByOwnerIdAndIsActiveTrue(any());
+        verify(masterRepository, never()).findByUserId(any());
+    }
+
+    @Test
+    @DisplayName("a single order on the sole whitelisted property is accepted — the CLIENT projection "
+            + "query is reached with (startsAt asc + mandatory id tiebreaker), proving the two "
+            + "cardinality guards reject only repeats/overflow and never the one legitimate shape")
+    void should_acceptSort_when_singleWhitelistedPropertySupplied() {
+        Sort singleOrder = Sort.by(Sort.Direction.ASC, "startsAt");
+        Pageable requestedPageable = Pageable.unpaged(singleOrder);
+        Sort expectedNormalizedSort = singleOrder.and(Sort.by(Sort.Direction.ASC, "id"));
         Pageable expectedNormalizedPageable = Pageable.unpaged(expectedNormalizedSort);
 
         when(bookingRepository.findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable))
                 .thenReturn(Page.empty());
 
-        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, atBoundPageable);
+        var result = bookingService.getMyBookings(clientId, buildAuth(Role.CLIENT), null, null, null, null, requestedPageable);
 
         assertThat(result).isNotNull();
         verify(bookingRepository).findIdsByClientIdFiltered(clientId, null, null, null, null, expectedNormalizedPageable);

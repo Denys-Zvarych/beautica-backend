@@ -5,6 +5,7 @@ import com.beautica.auth.dto.EmailNotVerifiedResponse;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.service.dto.DuplicateServiceResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -113,6 +114,33 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         new BookingElapsedResponse(BookingElapsedException.ERROR_CODE),
                         "This booking's time has already passed"));
+    }
+
+    /**
+     * Distinct 409 for a provider adding a service they already offer — one ACTIVE service per
+     * {@code (owner, service type)}, price/duration irrelevant (V121's partial unique index
+     * {@code ux_service_def_owner_service_type_active}).
+     *
+     * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
+     * declaration order) {@link #handleBusiness} so the structured {@link DuplicateServiceResponse}
+     * body — carrying the {@code DUPLICATE_SERVICE} code plus the existing service's name and id —
+     * is emitted instead of the generic conflict message. The mobile "add service" screen branches
+     * on {@code data.code} to highlight the existing row rather than showing a dead-end error.
+     *
+     * <p>Deliberately NOT folded into {@link #handleDataIntegrityViolation}: that handler stays
+     * generic on purpose (anti-enumeration). This one is reachable only from an authenticated,
+     * ownership-checked write on the caller's OWN menu, so naming the caller's own service is not
+     * a disclosure.
+     */
+    @ExceptionHandler(DuplicateServiceException.class)
+    public ResponseEntity<ApiResponse<DuplicateServiceResponse>> handleDuplicateService(
+            DuplicateServiceException ex) {
+        log.debug("Duplicate service rejected: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        DuplicateServiceResponse.from(ex),
+                        "This service already exists"));
     }
 
     @ExceptionHandler(BusinessException.class)

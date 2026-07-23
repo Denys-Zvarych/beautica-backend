@@ -5,6 +5,7 @@ import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.dto.DuplicateServiceErrorResponse;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
@@ -12,6 +13,8 @@ import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -34,8 +37,29 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ServiceController {
 
+    /**
+     * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on every write
+     * endpoint that can raise {@code DuplicateServiceException} — the five below, i.e. every path
+     * that inserts or re-types a {@code ServiceDefinition} and so can collide with V121's
+     * {@code ux_service_def_owner_service_type_active}.
+     *
+     * <p>Declared explicitly because springdoc scans controller signatures, not
+     * {@code @RestControllerAdvice} handlers: without these annotations the 409's body has no
+     * schema in {@code /api-docs}, and the generated mobile client has no model for the payload
+     * it must branch on. The swagger {@code @ApiResponse} annotation is written fully qualified
+     * throughout this file — its simple name collides with {@link com.beautica.common.ApiResponse},
+     * this project's response envelope, which is the return type of nearly every method here.
+     */
+    private static final String DUPLICATE_SERVICE_409 =
+            "The owner already offers an active service of this type. One active service per "
+                    + "(owner, service type); price and duration are irrelevant. Branch on "
+                    + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
+
     private final ServiceCatalogService serviceCatalogService;
 
+    @io.swagger.v3.oas.annotations.responses.ApiResponse(
+            responseCode = "409", description = DUPLICATE_SERVICE_409,
+            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
     @PostMapping("/salons/{salonId}/services")
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> addServiceToSalon(
@@ -115,6 +139,9 @@ public class ServiceController {
         return ApiResponse.ok(serviceCatalogService.getMyServices(userId));
     }
 
+    @io.swagger.v3.oas.annotations.responses.ApiResponse(
+            responseCode = "409", description = DUPLICATE_SERVICE_409,
+            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
     @PostMapping("/independent-masters/me/services")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> addIndependentMasterService(
@@ -139,6 +166,9 @@ public class ServiceController {
     @Operation(summary = "Bulk-create my services (first-time setup)",
             description = "Creates every selected service in one transaction. Only valid when "
                     + "the master has no active services yet (409 otherwise).")
+    @io.swagger.v3.oas.annotations.responses.ApiResponse(
+            responseCode = "409", description = DUPLICATE_SERVICE_409,
+            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
     @PostMapping("/independent-masters/me/services/bulk")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMyServices(
@@ -168,6 +198,9 @@ public class ServiceController {
             description = "Creates every selected service for the given master in one "
                     + "transaction. Only valid when the master has no active services yet "
                     + "(409 otherwise).")
+    @io.swagger.v3.oas.annotations.responses.ApiResponse(
+            responseCode = "409", description = DUPLICATE_SERVICE_409,
+            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
     @PostMapping("/salons/{salonId}/masters/{masterId}/services/bulk")
     @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMasterServices(
@@ -204,6 +237,9 @@ public class ServiceController {
      * authenticated principal. No redundant role guard is added at the controller level
      * because ownership implies the required role (anti-bug §D).
      */
+    @io.swagger.v3.oas.annotations.responses.ApiResponse(
+            responseCode = "409", description = DUPLICATE_SERVICE_409,
+            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
     @PatchMapping("/services/{serviceDefId}")
     @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> updateServiceDefinition(

@@ -74,7 +74,7 @@ public class AuthorizationService {
     /**
      * Role-aware fast path (symmetry with {@link #canManageMasterSchedule}): the
      * {@code SALON_MASTER} (read-only) and {@code CLIENT} roles can never manage a master,
-     * so they are rejected immediately without the {@code findByIdWithSalonAndOwner}
+     * so they are rejected immediately without the {@code findByIdWithUserAndSalon}
      * DB round-trip (the role is read from the JWT-derived authorities, not the database).
      *
      * <p>{@code INDEPENDENT_MASTER} is intentionally NOT short-circuited: an independent
@@ -92,7 +92,7 @@ public class AuthorizationService {
         }
         UUID actorId = principalId(auth);
         Role actorRole = roleFromAuthentication(auth);
-        return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
+        return masterRepository.findByIdWithUserAndSalon(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
                 return m.getUser().getId().equals(actorId);
             }
@@ -122,7 +122,7 @@ public class AuthorizationService {
         if (cannotManage) return false;
         UUID actorId = principalId(auth);
         Role actorRole = roleFromAuthentication(auth);
-        return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
+        return masterRepository.findByIdWithUserAndSalon(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
                 return m.getUser().getId().equals(actorId);
             }
@@ -157,7 +157,7 @@ public class AuthorizationService {
         if (isClient) return false;
         UUID actorId = principalId(auth);
         Role actorRole = roleFromAuthentication(auth);
-        return masterRepository.findByIdWithSalonAndOwner(masterId).map(m -> {
+        return masterRepository.findByIdWithUserAndSalon(masterId).map(m -> {
             // The owning master (INDEPENDENT_MASTER or any salon-bound master, incl. SALON_MASTER
             // reading his own id) is always granted read access to his own schedule.
             if (m.getUser() != null && m.getUser().getId().equals(actorId)) {
@@ -398,11 +398,19 @@ public class AuthorizationService {
      * guards.
      *
      * <p><b>Perf finding 5 (track 24.7 audit):</b> every caller of this overload loads the
-     * booking via {@code BookingRepository#findByIdWithFullGraph}, which already
-     * {@code LEFT JOIN FETCH}es {@code m.salon s} AND {@code s.owner} — so a {@code SALON_OWNER}
-     * actor can be authorized purely in memory, with zero extra round trip. Only the
-     * {@code SALON_ADMIN} case falls back to {@link #hasManagementAccess}, a real DB query,
-     * because the admin's assigned-salon id genuinely is not present in the loaded graph.
+     * booking via {@code BookingRepository#findByIdWithFullGraph}, which {@code LEFT JOIN FETCH}es
+     * {@code m.salon s} — so a {@code SALON_OWNER} actor can be authorized purely in memory, with
+     * zero extra round trip. Only the {@code SALON_ADMIN} case falls back to
+     * {@link #hasManagementAccess}, a real DB query, because the admin's assigned-salon id
+     * genuinely is not present in the loaded graph.
+     *
+     * <p><b>{@code s.owner} is deliberately NOT fetched</b>, and this check does not need it to be.
+     * The owner comparison below reads {@code getOwner().getId()} only; Hibernate serves an
+     * identifier off an uninitialised proxy without issuing a statement, and {@code Salon.owner} is
+     * a {@code nullable = false} {@code @ManyToOne(LAZY)} so the proxy always exists. Fetching the
+     * owner would hydrate a full {@code User} row ({@code password_hash} included) to answer a
+     * question already answered by the FK sitting in the {@code salons} row. Do not "restore" the
+     * fetch join for this method's benefit — see {@code BookingRepository#findByIdWithFullGraph}.
      *
      * <p>Evaluation is branch-local: the in-memory owner comparison runs first and short-circuits
      * on a match; {@link #hasManagementAccess} is invoked only when it does not, so this never

@@ -1644,4 +1644,156 @@ class ServiceControllerTest {
         org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
                 .bulkCreateSalonMasterServices(any(), any(), any());
     }
+
+    // ── DUPLICATE_SERVICE 409 — the HTTP/JSON contract the mobile client branches on ────
+    //
+    // The service-layer tests prove ServiceCatalogService THROWS DuplicateServiceException; they
+    // cannot prove the exception ever becomes a 409 with a `data.code`. That depends on
+    // GlobalExceptionHandler#handleDuplicateService being selected over #handleBusiness (Spring
+    // resolves by exception-hierarchy depth — DuplicateServiceException extends BusinessException,
+    // so a missing/removed @ExceptionHandler silently degrades to the generic
+    // ApiResponse<Void> body with `data: null`), and on DuplicateServiceResponse's field names
+    // surviving serialisation. Both are wire contract: the add-service screen keys off
+    // `data.code == "DUPLICATE_SERVICE"` and deep-links via `data.existingServiceDefId`.
+    //
+    // A @WebMvcTest slice is the right layer (QA pattern Q3): the handler is a
+    // @RestControllerAdvice inside the MVC slice, so no database or full context is needed.
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — 409 DUPLICATE_SERVICE naming the existing service the owner already offers")
+    void should_return409WithDuplicateServiceCode_when_salonAlreadyOffersServiceType() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var existingServiceDefId = UUID.randomUUID();
+        var request = new CreateServiceDefinitionRequest(
+                "Класичне нарощення", "Volume set", "MANICURE", 120, 15,
+                PriceType.FIXED, new BigDecimal("900.00"), null, null, UUID.randomUUID());
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
+                .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
+                        "Класичне нарощення", existingServiceDefId));
+
+        log.debug("Act: POST /api/v1/salons/{}/services for a service type the salon already offers", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                // The stable code is the ONLY field the client routes on — never the message,
+                // which is generic copy shared with the other 409s.
+                .andExpect(jsonPath("$.data.code").value("DUPLICATE_SERVICE"))
+                .andExpect(jsonPath("$.data.existingServiceDefId").value(existingServiceDefId.toString()))
+                .andExpect(jsonPath("$.data.serviceName").value("Класичне нарощення"));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{id}/services — generic conflict 409 carries NO data.code, so the code alone distinguishes the branches")
+    void should_return409WithoutCode_when_conflictIsNotADuplicateService() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var request = new CreateServiceDefinitionRequest(
+                "Classic Manicure", "Basic nail care", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, UUID.randomUUID());
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
+                .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Some other conflict"));
+
+        // Negative half of the contract: without this, a handler that stamped DUPLICATE_SERVICE
+        // onto EVERY 409 would still pass the positive test above, and the add-service screen
+        // would offer a deep-link to a service that has nothing to do with the failure.
+        log.debug("Act: POST /api/v1/salons/{}/services when the service raises an unrelated 409", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.data").value(org.hamcrest.Matchers.nullValue()));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services — 409 DUPLICATE_SERVICE with null details when the DB index caught a race")
+    void should_return409WithNullDetails_when_duplicateDetectedByIndexRace() throws Exception {
+        var userId = UUID.randomUUID();
+        var request = new CreateServiceDefinitionRequest(
+                "Lash Extensions", "Volume set", "MANICURE", 120, 15,
+                PriceType.FIXED, new BigDecimal("900.00"), null, null, UUID.randomUUID());
+
+        // persistDefinition / flushBulkBatch raise this shape when the pre-check lost the race:
+        // the index reports the constraint, not the surviving row, and the aborted Postgres
+        // transaction rules out looking it up.
+        when(serviceCatalogService.addIndependentMasterService(eq(userId), any(CreateServiceDefinitionRequest.class)))
+                .thenThrow(new com.beautica.common.exception.DuplicateServiceException(null, null));
+
+        log.debug("Act: POST /api/v1/independent-masters/me/services when the V121 index (not the pre-check) rejects it");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                // The code survives even with no detail — it is the only field the client
+                // branches on, so the race must not degrade to a codeless generic 409.
+                .andExpect(jsonPath("$.data.code").value("DUPLICATE_SERVICE"))
+                // Both detail keys must still be PRESENT (as JSON null), never dropped: the
+                // client reads them optionally and an absent key would change the wire shape.
+                .andExpect(jsonPath("$.data.existingServiceDefId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.serviceName").value(org.hamcrest.Matchers.nullValue()));
+    }
+
+    @Test
+    @DisplayName("PATCH /services/{id} — 409 DUPLICATE_SERVICE when repointed at a service type the owner already offers")
+    void should_return409WithDuplicateServiceCode_when_patchRepointsToTakenServiceType() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var existingServiceDefId = UUID.randomUUID();
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, null, null, null, null, null, null, null, UUID.randomUUID());
+
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+        when(serviceCatalogService.updateServiceDefinition(eq(serviceDefId), any(UpdateServiceDefinitionRequest.class)))
+                .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
+                        "Класичне нарощення", existingServiceDefId));
+
+        log.debug("Act: PATCH /api/v1/services/{} repointing it at an already-offered service type", serviceDefId);
+        mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.data.code").value("DUPLICATE_SERVICE"))
+                .andExpect(jsonPath("$.data.existingServiceDefId").value(existingServiceDefId.toString()));
+    }
+
+    @Test
+    @DisplayName("POST /independent-masters/me/services/bulk — 409 DUPLICATE_SERVICE naming the first colliding item")
+    void should_return409WithDuplicateServiceCode_when_bulkItemDuplicatesExistingService() throws Exception {
+        var userId = UUID.randomUUID();
+        var existingServiceDefId = UUID.randomUUID();
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        when(serviceCatalogService.bulkCreateIndependentMasterServices(eq(userId), any(BulkCreateServicesRequest.class)))
+                .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
+                        "Манікюр", existingServiceDefId));
+
+        // The bulk path is the first-time-setup screen; it must get the SAME branchable shape as
+        // the single create, not the 409 envelope used for "master already has services".
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with an item the master already offers");
+        mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
+                        .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.data.code").value("DUPLICATE_SERVICE"))
+                .andExpect(jsonPath("$.data.existingServiceDefId").value(existingServiceDefId.toString()))
+                .andExpect(jsonPath("$.data.serviceName").value("Манікюр"));
+    }
 }

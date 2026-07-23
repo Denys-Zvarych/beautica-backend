@@ -1,5 +1,7 @@
 package com.beautica.master.service;
 
+import org.springframework.data.domain.Sort;
+import com.beautica.common.web.SortWhitelist;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
@@ -65,6 +67,7 @@ public class MasterService {
     private final WorkingHoursRepository workingHoursRepository;
     private final BookingRepository bookingRepository;
     private final CacheManager cacheManager;
+    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final CityRepository cityRepository;
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
     private final AuthorizationService authorizationService;
@@ -252,7 +255,7 @@ public class MasterService {
      * Returns the publicly-visible {@link MasterDetailResponse} for the given master.
      *
      * <p>Cached under {@code master-detail} with a 5-minute TTL so the
-     * {@code findByIdWithSalonAndOwner} JOIN FETCH and the follow-up
+     * {@code findByIdWithUserAndSalon} JOIN FETCH and the follow-up
      * {@code findByMasterIdAndIsActiveTrue} query do not fire on every unauthenticated
      * {@code GET /api/v1/masters/{masterId}} request. {@code sync = true} prevents the
      * thundering-herd on TTL expiry (Anti-Bug §F-7 / HIGH §F rule 7).
@@ -268,11 +271,11 @@ public class MasterService {
      * <p>Do NOT remove the entity overload {@link #getMasterDetail(Master)} — it is
      * used by internal callers that already hold a loaded entity.
      */
-    // Fix 6: use findByIdWithSalonAndOwner to eliminate 2-4 lazy SELECTs per request
+    // Fix 6: use findByIdWithUserAndSalon to eliminate 2-4 lazy SELECTs per request
     @Cacheable(value = "master-detail", key = "#masterId", sync = true)
     @Transactional(readOnly = true)
     public MasterDetailResponse getMasterDetail(UUID masterId) {
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
@@ -281,7 +284,7 @@ public class MasterService {
     }
 
     /**
-     * Entity overload — avoids a redundant {@code findByIdWithSalonAndOwner} graph-fetch when
+     * Entity overload — avoids a redundant {@code findByIdWithUserAndSalon} graph-fetch when
      * the caller already holds the {@link Master} entity in the Hibernate first-level cache
      * (MEDIUM-2). The entity must have its {@code salon} and {@code user} associations
      * reachable (i.e. created via {@link #createMasterForOwner(UUID, UUID)} within the same
@@ -315,7 +318,7 @@ public class MasterService {
 
         // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
         // the controller — no redundant DB round-trip needed here.
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         // Merge against ALL existing rows (incl. inactive). The DB unique key is
@@ -358,7 +361,7 @@ public class MasterService {
      * that the row structure matches expectations.
      *
      * <p>Performance (MEDIUM-1): inlines the deactivation logic instead of delegating to
-     * {@link #deactivateMaster(UUID, UUID)} to avoid a redundant {@code findByIdWithSalonAndOwner}
+     * {@link #deactivateMaster(UUID, UUID)} to avoid a redundant {@code findByIdWithUserAndSalon}
      * graph-fetch. The master loaded via {@code findByUserId} is already in the Hibernate
      * first-level cache; Hibernate dirty-checking flushes {@code is_active = false} on commit
      * without a separate {@code save()} call. Both cache evictions from {@code deactivateMaster}
@@ -427,7 +430,7 @@ public class MasterService {
     public void deactivateMaster(UUID actorId, UUID masterId) {
         // Ownership already enforced by @PreAuthorize("@authz.canManageMaster(...)") on
         // the controller — no redundant DB round-trip needed here.
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         master.setActive(false);
@@ -436,14 +439,14 @@ public class MasterService {
 
         // Deactivation flips is_active FALSE — a sole-performer's SALON service must vanish from
         // the booking master-list and the salon catalogue immediately, not after the 60s TTL.
-        // salon is JOIN-FETCHed by findByIdWithSalonAndOwner and may be null (INDEPENDENT_MASTER,
+        // salon is JOIN-FETCHed by findByIdWithUserAndSalon and may be null (INDEPENDENT_MASTER,
         // a no-op for the catalogue evict); capture its id synchronously inside the tx (§E / §F-2).
         evictBookabilityCachesAfterCommit(
                 masterId,
                 master.getSalon() != null ? master.getSalon().getId() : null);
 
         // Capture the user UUID while the transaction is still open (user is JOIN FETCH-ed by
-        // findByIdWithSalonAndOwner, so getUser() is initialized). A stale master-by-user entry
+        // findByIdWithUserAndSalon, so getUser() is initialized). A stale master-by-user entry
         // would allow the deactivated master to pass the isActive guard for up to the cache TTL.
         final UUID masterUserId = master.getUser().getId();
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -511,7 +514,7 @@ public class MasterService {
         // actorId's management authority over the CURRENT salon is already enforced by
         // @PreAuthorize("@authz.canManageMaster(...)") on the controller — no redundant
         // re-derivation needed here (mirrors upsertWorkingHours / deactivateMaster).
-        var master = masterRepository.findByIdWithSalonAndOwner(masterId)
+        var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         if (master.getMasterType() != MasterType.SALON_MASTER) {
@@ -556,7 +559,7 @@ public class MasterService {
         }
         var destinationSalon = destinationSalonLookup.get();
 
-        // `master` was loaded via findByIdWithSalonAndOwner in THIS @Transactional, so it is a
+        // `master` was loaded via findByIdWithUserAndSalon in THIS @Transactional, so it is a
         // managed entity — Hibernate dirty-checking flushes the salon mutation on commit.
         master.setSalon(destinationSalon);
 
@@ -565,7 +568,7 @@ public class MasterService {
         // stale salon for up to the cache TTL (Anti-Bug §F rule 2).
         final UUID rotatedMasterId = master.getId();
         // Captured while the transaction is still open — master.getUser() is JOIN FETCH-ed by
-        // findByIdWithSalonAndOwner, so this is an initialized reference, not a lazy proxy.
+        // findByIdWithUserAndSalon, so this is an initialized reference, not a lazy proxy.
         final UUID rotatedMasterUserId = master.getUser().getId();
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -688,54 +691,54 @@ public class MasterService {
     }
 
     private void doEvictMasterCalendarByMaster(UUID masterId) {
-        Cache springCache = cacheManager.getCache("master-calendar");
-        if (springCache == null) {
-            return;
-        }
-        Object nativeCache = springCache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            String masterIdPrefix = "[" + masterId + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(masterIdPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            springCache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(masterId, "master-calendar");
     }
 
     /**
      * Evicts only the {@code available-slots} entries that belong to the given master.
      *
-     * <p>The {@code available-slots} cache key is a {@link org.springframework.cache.interceptor.SimpleKey}
-     * whose first element is the masterId UUID (see {@code SlotCalculationService}).
-     * SimpleKey.toString() renders as {@code "[masterId, date, masterServiceId]"} — we filter
-     * on the {@code "[masterId,"} prefix so we touch only the affected master's entries,
-     * avoiding a blanket clear() (Anti-Bug §F rule 6 / PERF-MEDIUM-3).</p>
-     *
-     * <p>Falls back to {@code cache.clear()} for non-Caffeine caches.</p>
+     * <p>{@code SlotCalculationService} declares {@code @Cacheable(key = "{#masterId, #date,
+     * #masterServiceId}")}, so the runtime key is an {@link java.util.List} whose first element is the
+     * masterId — never a {@code SimpleKey}. Matching is delegated to
+     * {@link com.beautica.common.cache.MasterCachePrefixEvictor#evictByKeyPrefixNow} so that key-shape
+     * contract has a single implementation; this method previously carried its own
+     * {@code instanceof SimpleKey} copy, which never matched and made the eviction a silent no-op.
+     * Scoped to the one master rather than a blanket clear() (Anti-Bug §F rule 6 / PERF-MEDIUM-3).</p>
      */
     private void doEvictAvailableSlotsByMaster(UUID masterId) {
-        Cache springCache = cacheManager.getCache("available-slots");
-        if (springCache == null) {
-            return;
-        }
-        Object nativeCache = springCache.getNativeCache();
-        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            String masterIdPrefix = "[" + masterId + ",";
-            caffeineCache.asMap().keySet().removeIf(k ->
-                    k instanceof org.springframework.cache.interceptor.SimpleKey
-                            && k.toString().contains(masterIdPrefix));
-        } else {
-            // Fallback for non-Caffeine caches (e.g., ConcurrentMapCache in tests).
-            springCache.clear();
-        }
+        cachePrefixEvictor.evictByKeyPrefixNow(masterId, "available-slots");
     }
+
+    /**
+     * Properties a caller may sort a salon's master list by.
+     *
+     * <p>All are scalar columns on the {@code Master} root. Deliberately excludes any path through
+     * {@code m.user} — that association is {@code JOIN FETCH}ed by the query, so a dotted sort such
+     * as {@code user.passwordHash} would resolve as valid JPQL and turn this endpoint into an
+     * ordering oracle over credentials (see {@link SortWhitelist}).
+     */
+    private static final Set<String> SORTABLE_MASTER_PROPERTIES =
+            Set.of("avgRating", "reviewCount", "createdAt");
+
+    /** Applied when the caller supplies no {@code sort}; the query itself has no {@code ORDER BY}. */
+    private static final Sort DEFAULT_MASTER_SORT = Sort.by(Sort.Direction.DESC, "avgRating");
+
+    /** Mandatory unique trailing column, so OFFSET paging cannot duplicate or skip tied rows. */
+    private static final Sort MASTER_ID_TIEBREAKER = Sort.by(Sort.Direction.ASC, "id");
+
+    /**
+     * The only property {@code GET /masters/me/calendar} may be sorted by. Its ID-page query is
+     * rooted on {@code Booking}, so this mirrors {@code BookingService.SORTABLE_BOOKING_PROPERTIES}
+     * exactly — the calendar must not expose a wider sort surface than {@code GET /bookings/me}.
+     */
+    private static final Set<String> SORTABLE_CALENDAR_PROPERTIES = Set.of("startsAt");
 
     // Fix 8: use JOIN FETCH query to eliminate per-master user lazy-loads
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersByPage(UUID salonId, Pageable pageable) {
-        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, pageable)
+        Pageable safePageable = SortWhitelist.apply(
+                pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
+        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, safePageable)
                 .map(MasterSummaryResponse::from);
     }
 
@@ -771,16 +774,31 @@ public class MasterService {
                 .orElseThrow(() -> new NotFoundException("Master not found"));
     }
 
-    @Cacheable(value = "master-calendar", key = "{#masterId, #from, #to, #pageable.pageNumber, #pageable.pageSize}")
+    // sync = true (§F-7): the master's app polls this key and the TTL is only 30s, so without it
+    // every expiry admits N concurrent threads into the full two-query hydrate below. Compatible
+    // with BookingService#doEvictMasterCalendarEntries, which evicts by scanning the native
+    // Caffeine keySet for this master's prefix — Caffeine's sync loader holds a per-key lock
+    // during load only, and never blocks or is blocked by a concurrent removal.
+    @Cacheable(value = "master-calendar",
+            key = "{#masterId, #from, #to, #pageable.pageNumber, #pageable.pageSize}",
+            sync = true)
     @Transactional(readOnly = true)
     public Page<BookingResponse> getMasterCalendar(UUID masterId, LocalDate from, LocalDate to, Pageable pageable) {
         OffsetDateTime fromOdt = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime toOdt = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
+        // The ID-page query's root is Booking, whose `client`/`master` associations reach User —
+        // so an unguarded sort here resolves `client.passwordHash` / `client.email` as valid JPQL.
+        // Whitelisted to the single property the calendar actually orders by, matching
+        // BookingService.SORTABLE_BOOKING_PROPERTIES. No tiebreaker: the query hardcodes
+        // `ORDER BY b.startsAt ASC` and Spring appends the caller's sort after it.
+        Pageable safePageable = SortWhitelist.apply(
+                pageable, SORTABLE_CALENDAR_PROPERTIES, Sort.unsorted(), null);
+
         // Two-query pattern (Fix H1 — HHH90003004): paginate on IDs only so the DB
         // applies LIMIT/OFFSET correctly, then hydrate the full graph for those IDs.
         Page<UUID> idPage = bookingRepository.findActiveIdsByMasterIdAndStartsAtBetween(
-                masterId, fromOdt, toOdt, pageable);
+                masterId, fromOdt, toOdt, safePageable);
 
         if (idPage.isEmpty()) {
             return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());

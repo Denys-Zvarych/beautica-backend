@@ -2,7 +2,6 @@ package com.beautica.booking.controller;
 
 import com.beautica.booking.service.BookingService;
 import com.beautica.booking.dto.CreateBookingRequest;
-import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
@@ -107,24 +106,13 @@ class BookingControllerTest {
         return authentication(token);
     }
 
-    private BookingResponse stubResponse(UUID bookingId, UUID clientId, UUID masterId, UUID serviceId) {
-        return new BookingResponse(
-                bookingId, clientId, masterId, serviceId, "Manicure",
-                BookingStatus.CONFIRMED,
-                ZonedDateTime.now().plusDays(1),
-                ZonedDateTime.now().plusDays(1).plusMinutes(60),
-                new BigDecimal("500.00"), 60,
-                OffsetDateTime.now(ZoneOffset.UTC)
-        );
-    }
-
     private BookingDetailResponse stubDetailResponse(UUID bookingId, UUID clientId, UUID masterId, UUID serviceId) {
         return new BookingDetailResponse(
                 bookingId, clientId, masterId, serviceId, "Manicure",
                 BookingStatus.CONFIRMED,
                 ZonedDateTime.now().plusDays(1),
                 ZonedDateTime.now().plusDays(1).plusMinutes(60),
-                new BigDecimal("500.00"), 60,
+                new BigDecimal("500.00"), null, 60,
                 OffsetDateTime.now(ZoneOffset.UTC),
                 "Oksana", "Kovalenko", "Natalia", "Lysenko",
                 // masterProfessionalTitle (additive)
@@ -153,7 +141,7 @@ class BookingControllerTest {
         var body = objectMapper.writeValueAsString(
                 new CreateBookingRequest(masterId, serviceId, ZonedDateTime.now().plusDays(1), null, null));
         when(bookingService.createBooking(eq(clientId), any(), any()))
-                .thenReturn(stubResponse(bookingId, clientId, masterId, serviceId));
+                .thenReturn(stubDetailResponse(bookingId, clientId, masterId, serviceId));
 
         mockMvc.perform(post(BOOKINGS_URL)
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -161,7 +149,13 @@ class BookingControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.data.status").value("CONFIRMED"));
+                .andExpect(jsonPath("$.data.status").value("CONFIRMED"))
+                // Phase 19.3/25.x-equivalent — POST /bookings now returns the enriched
+                // BookingDetailResponse instead of the lean BookingResponse (contract change
+                // under test here), so the confirmation payload carries the master's name
+                // without a follow-up GET /bookings/{id}.
+                .andExpect(jsonPath("$.data.masterFirstName").value("Natalia"))
+                .andExpect(jsonPath("$.data.masterLastName").value("Lysenko"));
     }
 
     @Test
@@ -300,7 +294,7 @@ class BookingControllerTest {
         var body = objectMapper.writeValueAsString(
                 new CreateBookingRequest(masterId, serviceId, ZonedDateTime.now().plusDays(1), null, null));
         when(bookingService.createBooking(eq(clientId), any(), any()))
-                .thenReturn(stubResponse(bookingId, clientId, masterId, serviceId));
+                .thenReturn(stubDetailResponse(bookingId, clientId, masterId, serviceId));
 
         mockMvc.perform(post(BOOKINGS_URL)
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -354,7 +348,7 @@ class BookingControllerTest {
         var body = objectMapper.writeValueAsString(
                 new CreateBookingRequest(masterId, serviceId, ZonedDateTime.now().plusDays(1), null, null));
         when(bookingService.createBooking(eq(clientId), any(), any()))
-                .thenReturn(stubResponse(bookingId, clientId, masterId, serviceId));
+                .thenReturn(stubDetailResponse(bookingId, clientId, masterId, serviceId));
 
         mockMvc.perform(post(BOOKINGS_URL)
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
@@ -1279,7 +1273,7 @@ class BookingControllerTest {
                 + "\",\"startsAt\":\"2027-01-01T10:00:00+02:00\""
                 + ",\"clientComment\":\"Будь ласка, тихіше\"}";
         when(bookingService.createBooking(eq(clientId), any(), any()))
-                .thenReturn(stubResponse(bookingId, clientId, masterId, serviceId));
+                .thenReturn(stubDetailResponse(bookingId, clientId, masterId, serviceId));
 
         mockMvc.perform(post(BOOKINGS_URL)
                         .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))

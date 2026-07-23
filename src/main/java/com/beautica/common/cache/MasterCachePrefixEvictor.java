@@ -58,8 +58,31 @@ public class MasterCachePrefixEvictor {
      */
     @Async("cacheEvictionExecutor")
     public void evictByMasterPrefix(UUID masterId, String... cacheNames) {
+        evictByKeyPrefixNow(masterId, cacheNames);
+    }
+
+    /**
+     * Synchronous variant of {@link #evictByMasterPrefix}, for callers that must observe the eviction
+     * before returning.
+     *
+     * <p>Identical scan and key predicate — it exists so the (subtle, previously-miswritten) key-shape
+     * check has exactly ONE implementation in the codebase. Five call sites in {@code MasterService},
+     * {@code BookingService} and {@code ServiceCatalogService} each carried their own hand-rolled copy
+     * that tested {@code instanceof SimpleKey}; because every one of those caches declares an explicit
+     * SpEL {@code key = "{...}"} (runtime type {@link java.util.ArrayList}, never {@code SimpleKey}),
+     * all five {@code removeIf} predicates were unsatisfiable and every eviction was a silent no-op.
+     * Delegating here instead of re-copying the corrected predicate is what stops that recurring.
+     *
+     * <p>{@code keyPrefix} is the FIRST element of the cache key, which is not always a masterId —
+     * {@code revenue-dashboard} is keyed {@code {#actorId, …}}. The match is on key position, not on
+     * the identifier's domain meaning.
+     *
+     * <p>Prefer {@link #evictByMasterPrefix} on request-serving paths; this variant runs the O(cacheSize)
+     * scan on the calling thread.
+     */
+    public void evictByKeyPrefixNow(UUID keyPrefix, String... cacheNames) {
         for (String cacheName : cacheNames) {
-            evictOne(cacheName, masterId);
+            evictOne(cacheName, keyPrefix);
         }
     }
 
@@ -75,7 +98,7 @@ public class MasterCachePrefixEvictor {
      * <p>A non-Caffeine {@link Cache} implementation exposes no keyset, so it falls back to
      * {@link Cache#clear()} — correct, if coarser.
      */
-    private void evictOne(String cacheName, UUID masterId) {
+    private void evictOne(String cacheName, UUID keyPrefix) {
         Cache springCache = cacheManager.getCache(cacheName);
         if (springCache == null) {
             return;
@@ -85,7 +108,7 @@ public class MasterCachePrefixEvictor {
             caffeineCache.asMap().keySet().removeIf(k ->
                     k instanceof List<?> keyParts
                             && !keyParts.isEmpty()
-                            && masterId.equals(keyParts.get(0)));
+                            && keyPrefix.equals(keyParts.get(0)));
         } else {
             springCache.clear();
         }
