@@ -46,6 +46,14 @@ public class SlotCalculationService {
     private static final int MAX_TOTAL_DURATION_MINUTES = 600;
 
     /**
+     * Upper bound on the number of services chained into ONE single-visit slot/day request (BE-2). The
+     * {@value #MAX_TOTAL_DURATION_MINUTES}-min total-duration ceiling already caps a realistic chain far
+     * below this, so this is the belt-and-braces size guard against an oversized {@code serviceId} list
+     * (each id costs a master-service lookup). Mirrored by {@code @Size(max = …)} at the controller boundary.
+     */
+    public static final int MAX_SERVICES_PER_VISIT = 10;
+
+    /**
      * Maximum span (in days BETWEEN the endpoints, so 63 inclusive dates) of the {@code serviceId}-PRESENT
      * mode of {@code GET /masters/{masterId}/working-days} — see {@link #getBookableWorkingDays}.
      * Deliberately far tighter than {@code ScheduleDateMath}'s 366-day read window, which still governs the
@@ -78,9 +86,62 @@ public class SlotCalculationService {
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
 
+    /**
+     * <b>Legacy single-service slot list</b> — behind {@code GET /masters/{id}/slots?serviceId=…} for a
+     * one-service request, and called directly by {@code GuestBookingService#availableSlots} and
+     * {@code BookingService}'s on-schedule create check. Left byte-for-byte UNCHANGED: the same cache
+     * ({@code available-slots}, key {@code {masterId, date, masterServiceId}}, {@code sync=true}) and the
+     * same eviction (per-key {@link #evictAvailableSlots} + the master-prefix sweeps) it always had.
+     *
+     * <p>Delegates to the N-service core {@link #computeAvailableSlots} with a 1-element list; the summed
+     * duration of a 1-element list is exactly that service's effective duration, so the output is identical
+     * to the pre-BE-2 implementation.
+     */
     @Transactional(readOnly = true)
     @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}", sync = true)
     public List<AvailableSlotResponse> getAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {
+        return computeAvailableSlots(masterId, date, List.of(masterServiceId));
+    }
+
+    /**
+     * <b>Multi-service single-visit slot list (BE-2).</b> Sizes each candidate slot to the SUM of the
+     * ordered {@code masterServiceIds}' effective durations — one contiguous back-to-back block performed
+     * by a single master — and otherwise reuses the exact free-range subtraction the single-service path
+     * uses (only the duration handed to {@link TimeSlotCalculator} changes).
+     *
+     * <p><b>D4 buffer policy.</b> Each service's own {@code bufferMinutesAfter} is applied after it —
+     * between chained services and at the tail — because {@link #effectiveDuration} already folds a
+     * service's buffer into its effective length, so summing the effective durations yields exactly
+     * {@code Σ (duration_i + buffer_i)}. The server always sums server-side from the resolved assignments;
+     * a client-supplied duration is never trusted.
+     *
+     * <p><b>Cap.</b> The summed duration is bounded by the same {@value #MAX_TOTAL_DURATION_MINUTES}-min
+     * ceiling the single-service path enforces (via {@link #validatedTotalDuration}); an over-long chain
+     * fails with the same {@link BusinessException}, never a silent truncation.
+     *
+     * <p><b>Not cached — deliberately.</b> For {@code N=1} the controller routes to the cached single-arg
+     * overload above (identical legacy key), so single-element requests key identically to the legacy
+     * value. The {@code N&gt;1} path is intentionally left uncached: the booking-write eviction hook
+     * ({@code BookingService}/{@code GuestBookingService}/{@code BookingCancellationService}) evicts
+     * {@code available-slots} only per single-UUID key, so a list-keyed entry would go stale after a
+     * single-service booking write on any chained service. Caching the ordered-list key is deferred to
+     * BE-3, where the write path gains multi-key (master-prefix) eviction — until then a never-evicted
+     * key is not introduced.
+     */
+    @Transactional(readOnly = true)
+    public List<AvailableSlotResponse> getAvailableSlots(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds) {
+        assertServiceIds(masterServiceIds);
+        return computeAvailableSlots(masterId, date, masterServiceIds);
+    }
+
+    /**
+     * Shared slot-list core for both the single-service and multi-service entry points. Identical to the
+     * pre-BE-2 single-service body except that the block length is the SUM of the ordered assignments'
+     * effective durations ({@link #validatedTotalDuration}) rather than one service's.
+     */
+    private List<AvailableSlotResponse> computeAvailableSlots(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds) {
         // Step 1: date range validation — cheapest guard, no DB.
         // ONE clock read for the whole request (Perf LOW-2): `today`, the horizon and the bookable cutoff
         // are all derived from the same Instant, so no two checks can straddle a clock tick.
@@ -93,20 +154,22 @@ public class SlotCalculationService {
             throw new BusinessException("date too far ahead");
         }
 
-        // Step 2: load master service — validated first to close the working-hours oracle. Shared with
-        // getBookableWorkingDays, so an unknown / foreign / inactive service answers identically on the
-        // slot endpoint and on the availability-aware working-days endpoint.
-        MasterServiceAssignment msa = loadBookableAssignment(masterId, masterServiceId);
+        // Step 2: load each master service in order — validated first to close the working-hours oracle.
+        // Shared with getBookableWorkingDays, so an unknown / foreign / inactive service answers identically
+        // on the slot endpoint and on the availability-aware working-days endpoint.
+        List<MasterServiceAssignment> assignments = loadBookableAssignments(masterId, masterServiceIds);
 
-        // Guard: master must be active to expose any bookable slots.
+        // Guard: master must be active to expose any bookable slots. All chained assignments share the same
+        // master (they are loaded master-scoped), so the first one's master carries the liveness flag.
         // deactivateOwnerMaster (and the general deactivateMaster) sets masters.is_active = false
         // but leaves master_services rows intact — check the master entity itself here.
-        if (!msa.getMaster().isActive()) {
+        if (!assignments.get(0).getMaster().isActive()) {
             return List.of();
         }
 
-        // Steps 3+4: effective duration (override beats base) with the upper-bound guard.
-        Duration totalDuration = validatedEffectiveDuration(msa);
+        // Steps 3+4: summed effective duration (override beats base, plus each service's own buffer) with
+        // the upper-bound guard.
+        Duration totalDuration = validatedTotalDuration(assignments);
 
         // Slot calculation is master-type agnostic: the effective-availability resolver
         // (weekly templates + per-date overrides) and bookings are keyed by master_id alone.
@@ -223,6 +286,34 @@ public class SlotCalculationService {
             key = "{#masterId, #from, #to, #masterServiceId}", sync = true)
     public List<MasterWorkingDayResponse> getBookableWorkingDays(
             UUID masterId, LocalDate from, LocalDate to, UUID masterServiceId) {
+        // Legacy single-service calendar day-gate — UNCHANGED cache key/eviction. Delegates to the
+        // N-service core with a 1-element list (its summed duration is exactly this service's), so a
+        // single-service request is byte-for-byte identical to before.
+        return computeBookableWorkingDays(masterId, from, to, List.of(masterServiceId));
+    }
+
+    /**
+     * <b>Multi-service single-visit calendar day-gate (BE-2).</b> The N-service counterpart of the
+     * single-service {@link #getBookableWorkingDays(UUID, LocalDate, LocalDate, UUID)} — a date is bookable
+     * iff the master's schedule leaves a free range fitting the SUM of the ordered services' effective
+     * durations (D4 buffer policy, see {@link #getAvailableSlots(UUID, LocalDate, List)}), so the calendar
+     * day-gate agrees with the multi-service slot list. Not cached for the same reason the multi-service
+     * slot list is not (see that method) — the controller routes {@code N=1} to the cached single-arg
+     * overload above.
+     */
+    @Transactional(readOnly = true)
+    public List<MasterWorkingDayResponse> getBookableWorkingDays(
+            UUID masterId, LocalDate from, LocalDate to, List<UUID> masterServiceIds) {
+        assertServiceIds(masterServiceIds);
+        return computeBookableWorkingDays(masterId, from, to, masterServiceIds);
+    }
+
+    /**
+     * Shared calendar day-gate core for both entry points. Identical to the pre-BE-2 single-service body
+     * except the fitted block length is the summed effective duration of the ordered assignments.
+     */
+    private List<MasterWorkingDayResponse> computeBookableWorkingDays(
+            UUID masterId, LocalDate from, LocalDate to, List<UUID> masterServiceIds) {
 
         // Range guards FIRST — pure in-memory arithmetic, zero DB (Perf LOW-1). A malformed or oversized
         // range now 400s without a round-trip, where it previously paid for loadBookableAssignment first.
@@ -237,17 +328,17 @@ public class SlotCalculationService {
         dateMath.assertExpandable(from, to);
         assertBookableSpan(from, to);
 
-        MasterServiceAssignment msa = loadBookableAssignment(masterId, masterServiceId);
+        List<MasterServiceAssignment> assignments = loadBookableAssignments(masterId, masterServiceIds);
 
         List<EffectiveDayResponse> days = masterScheduleService.resolveEffectiveRange(masterId, from, to);
 
-        if (!msa.getMaster().isActive()) {
+        if (!assignments.get(0).getMaster().isActive()) {
             return days.stream()
                     .map(day -> new MasterWorkingDayResponse(day.date(), false))
                     .toList();
         }
 
-        Duration totalDuration = validatedEffectiveDuration(msa);
+        Duration totalDuration = validatedTotalDuration(assignments);
         Map<LocalDate, List<TimeRange>> occupiedByDay = loadOccupiedByDay(masterId, from, to);
         // ONE clock read for the whole projection (Perf LOW-2): today, the horizon and the cutoff all
         // derive from the same Instant, and that same cutoff is threaded down into TimeSlotCalculator so
@@ -413,15 +504,53 @@ public class SlotCalculationService {
     }
 
     /**
-     * {@link #effectiveDuration} plus the upper-bound guard (durationOverride max 480 min +
-     * bufferMinutesAfter max 120 min). Shared by the slot list and the day projection.
+     * Resolves each {@code masterServiceId} in order via {@link #loadBookableAssignment}, preserving the
+     * caller-supplied ordering (the D4 buffer policy chains the services in that order). Every id is
+     * validated with the same unknown/foreign/inactive → 404 semantics as the single-service path, so a
+     * chain containing one bad id fails identically to a single bad id. The list is small (bounded by
+     * {@link #assertServiceIds}), so the per-id lookups are acceptable.
      */
-    private Duration validatedEffectiveDuration(MasterServiceAssignment msa) {
-        Duration totalDuration = effectiveDuration(msa);
-        if (totalDuration.toMinutes() > MAX_TOTAL_DURATION_MINUTES) {
+    private List<MasterServiceAssignment> loadBookableAssignments(UUID masterId, List<UUID> masterServiceIds) {
+        List<MasterServiceAssignment> assignments = new ArrayList<>(masterServiceIds.size());
+        for (UUID masterServiceId : masterServiceIds) {
+            assignments.add(loadBookableAssignment(masterId, masterServiceId));
+        }
+        return assignments;
+    }
+
+    /**
+     * Sum of the ordered assignments' effective durations ({@link #effectiveDuration}, which already folds
+     * each service's own {@code bufferMinutesAfter} — the D4 policy: buffer applied between chained services
+     * and at the tail), guarded by the {@value #MAX_TOTAL_DURATION_MINUTES}-min ceiling. For a 1-element
+     * list this equals the single service's effective duration, so the single-service path is unchanged.
+     * The duration is always summed server-side from the resolved assignments — a client-supplied duration
+     * is never trusted.
+     */
+    private Duration validatedTotalDuration(List<MasterServiceAssignment> assignments) {
+        long totalMinutes = assignments.stream()
+                .mapToLong(msa -> effectiveDuration(msa).toMinutes())
+                .sum();
+        if (totalMinutes > MAX_TOTAL_DURATION_MINUTES) {
             throw new BusinessException("total service duration exceeds maximum allowed");
         }
-        return totalDuration;
+        return Duration.ofMinutes(totalMinutes);
+    }
+
+    /**
+     * Boundary guard for the ordered service-id list shared by the multi-service slot list and calendar
+     * day-gate: non-empty and within {@value #MAX_SERVICES_PER_VISIT}. Defensive second line behind the
+     * controller's {@code @NotEmpty}/{@code @Size} — the service must never trust an empty or unbounded
+     * list (an empty list would NPE on {@code assignments.get(0)}; an unbounded one is a slot-calculator
+     * amplifier).
+     */
+    private void assertServiceIds(List<UUID> masterServiceIds) {
+        if (masterServiceIds == null || masterServiceIds.isEmpty()) {
+            throw new BusinessException("at least one serviceId is required");
+        }
+        if (masterServiceIds.size() > MAX_SERVICES_PER_VISIT) {
+            throw new BusinessException(
+                    "at most " + MAX_SERVICES_PER_VISIT + " services can be booked in a single visit");
+        }
     }
 
     /** Effective service duration + buffer (override beats base). Shared by the slot list and the gate. */

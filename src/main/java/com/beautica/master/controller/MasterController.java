@@ -26,6 +26,7 @@ import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.MasterService;
 import com.beautica.user.UserService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
@@ -271,14 +272,26 @@ public class MasterController {
             @PathVariable UUID masterId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
-            @RequestParam(required = false) UUID serviceId
+            @RequestParam(name = "serviceId", required = false)
+            @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT,
+                    message = "at most {max} services can be booked in a single visit")
+            List<UUID> serviceIds
     ) {
         // Mode selection only — each branch delegates the whole decision to its owning service. The
         // cached methods live on two different beans, so dispatching here (rather than inside one of
-        // them) also keeps both @Cacheable proxies effective (self-invocation would bypass AOP — §F-3).
-        return ApiResponse.ok(serviceId == null
-                ? masterScheduleService.getClientWorkingDays(masterId, from, to)
-                : slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceId));
+        // them) also keeps every @Cacheable proxy effective (self-invocation would bypass AOP — §F-3).
+        //  • serviceId ABSENT      → schedule-shape mode (unchanged).
+        //  • one serviceId (N=1)   → cached single-service bookability day-gate (byte-for-byte legacy).
+        //  • several serviceIds    → multi-service single-visit day-gate (BE-2), summed duration.
+        List<MasterWorkingDayResponse> result;
+        if (serviceIds == null || serviceIds.isEmpty()) {
+            result = masterScheduleService.getClientWorkingDays(masterId, from, to);
+        } else if (serviceIds.size() == 1) {
+            result = slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds.get(0));
+        } else {
+            result = slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds);
+        }
+        return ApiResponse.ok(result);
     }
 
     @DeleteMapping("/{masterId}")
@@ -347,14 +360,31 @@ public class MasterController {
         ));
     }
 
+    /**
+     * Bookable slots for a single-visit request of ONE or MORE services performed back-to-back by this
+     * master (BE-2). {@code serviceId} is a repeatable query param: {@code ?serviceId=a&serviceId=b}
+     * binds to an ordered {@code List}, and each candidate slot is sized to the SUM of the selected
+     * services' durations (D4 buffer policy — see {@link SlotCalculationService}). A single
+     * {@code ?serviceId=x} binds to a 1-element list and returns the exact legacy single-service result.
+     *
+     * <p>Mode dispatch is done HERE, not inside a {@code @Cacheable} method, so the single-service
+     * ({@code N=1}) call still hits its cache proxy — a self-invocation would bypass AOP (§F-3), the same
+     * reason {@link #getWorkingDays} dispatches its two modes in the controller.
+     */
     @GetMapping("/{masterId}/slots")
     @PreAuthorize("isAuthenticated()")
     public ApiResponse<AvailableSlotsResponse> getAvailableSlots(
             @PathVariable UUID masterId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
-            @RequestParam UUID serviceId
+            @RequestParam("serviceId")
+            @NotEmpty(message = "at least one serviceId is required")
+            @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT,
+                    message = "at most {max} services can be booked in a single visit")
+            List<UUID> serviceIds
     ) {
-        List<AvailableSlotResponse> slots = slotCalculationService.getAvailableSlots(masterId, date, serviceId);
+        List<AvailableSlotResponse> slots = serviceIds.size() == 1
+                ? slotCalculationService.getAvailableSlots(masterId, date, serviceIds.get(0))
+                : slotCalculationService.getAvailableSlots(masterId, date, serviceIds);
         return ApiResponse.ok(new AvailableSlotsResponse(date, slots));
     }
 

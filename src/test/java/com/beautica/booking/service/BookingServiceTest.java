@@ -1042,7 +1042,7 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         // Guard short-circuits ahead of the whole reschedule critical section (Q6 verify-not-called).
-        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any());
+        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any());
@@ -1243,7 +1243,7 @@ class BookingServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         // Guard fires before any slot lookup / lock / persistence
-        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any());
+        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any());
