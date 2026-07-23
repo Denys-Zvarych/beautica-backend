@@ -732,6 +732,8 @@ public class BookingService {
         }
         Booking booking = loadBookingOrThrow(bookingId);
         authz.enforceCanCancelBooking(actorUserId, booking);
+        // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
+        assertNotAppointmentChild(booking);
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.DECLINED);
         booking.setStatus(BookingStatus.DECLINED);
         booking.setCancellationReason(req.cancellationReason());
@@ -750,6 +752,8 @@ public class BookingService {
         // provider-authority shape (admits SALON_ADMIN) — see AuthorizationService.enforceCanCompleteBooking
         // / enforceCanCancelBooking.
         authz.enforceCanCompleteBooking(actorUserId, booking);
+        // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
+        assertNotAppointmentChild(booking);
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.COMPLETED);
         booking.setStatus(BookingStatus.COMPLETED);
         Booking saved = bookingRepository.save(booking);
@@ -774,6 +778,8 @@ public class BookingService {
         // declineBooking (admits SALON_ADMIN) — leaving admin able to complete/decline but not
         // mark a no-show would be an incoherent permission set (decision D2).
         authz.enforceCanCancelBooking(actorUserId, booking);
+        // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
+        assertNotAppointmentChild(booking);
         if (req.cancellationReason() == null) {
             throw new BusinessException("Cancellation reason required");
         }
@@ -797,6 +803,10 @@ public class BookingService {
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .filter(b -> b.getClient() != null && b.getClient().getId().equals(clientUserId))
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
+        // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
+        // Placed before the status guard — a visit child is never individually cancellable
+        // regardless of its status, so membership is the more fundamental rejection.
+        assertNotAppointmentChild(booking);
         BookingStatus current = booking.getStatus();
         if (current != BookingStatus.CONFIRMED) {
             throw new BusinessException("Cannot cancel a booking in status %s".formatted(current));
@@ -1196,6 +1206,34 @@ public class BookingService {
         if (booking.getStatus() != expected) {
             throw new BusinessException(
                     "Cannot transition from %s to %s".formatted(booking.getStatus(), target));
+        }
+    }
+
+    /**
+     * Rejects a single-booking transition on a booking that is one item of a multi-service
+     * visit (BE-3/BE-4). Such a booking carries a non-null {@link Booking#getAppointment()}
+     * FK; its status is owned by the {@link com.beautica.booking.entity.Appointment} header,
+     * which moves the header <em>and every sibling item</em> in lockstep only through the
+     * {@code PATCH /appointments/{id}/...} endpoints (all-or-nothing). Transitioning a single
+     * child through {@code PATCH /bookings/{id}/cancel|decline|complete|not-complete} would
+     * desync the visit header from its items, so it is refused here with a 409.
+     *
+     * <p><b>Defense-in-depth at the service layer</b> — this is the single choke point every
+     * one of the four single-booking public transitions passes through, so no controller/API
+     * path can bypass it. It is deliberately NOT reachable from the appointment-level lockstep
+     * updates (those legitimately set item status while {@code appointment} is non-null; they
+     * never enter these {@code BookingService} entry points).
+     *
+     * <p><b>Legacy single-service bookings</b> have {@code appointment_id = null} and pass
+     * through untouched — their transition behaviour is byte-for-byte unchanged. The FK is a
+     * {@code @ManyToOne(LAZY)} whose id is on the {@code bookings} row itself, so the null vs
+     * non-null check needs no extra query (a null FK yields {@code null}, a non-null FK yields
+     * an un-initialised proxy — neither hits the DB).
+     */
+    private void assertNotAppointmentChild(Booking booking) {
+        if (booking.getAppointment() != null) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "This booking is part of a multi-service visit; use /appointments/{id} to change it");
         }
     }
 
