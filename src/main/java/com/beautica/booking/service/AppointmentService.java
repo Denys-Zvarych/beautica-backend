@@ -14,6 +14,9 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.security.AuthorizationService;
+import com.beautica.location.DiscoveryLocationResolver;
+import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -84,6 +87,8 @@ public class AppointmentService {
     private final NotificationOutboxService outboxService;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    private final AuthorizationService authz;
+    private final DiscoveryLocationResolver discoveryLocationResolver;
     private final Clock clock;
 
     /**
@@ -119,7 +124,63 @@ public class AppointmentService {
             // never dereferences an empty list.
             throw new NotFoundException("Appointment has no booking items");
         }
-        return AppointmentDetailResponse.from(appointment, items);
+        return enrich(appointment, items);
+    }
+
+    /**
+     * Reads the enriched detail of a single multi-service visit (BE-5) —
+     * {@code GET /api/v1/appointments/{id}}.
+     *
+     * <p><b>Authorization mirrors {@code GET /bookings/{id}} exactly</b> (see
+     * {@code BookingService#getBooking}). A visit is single-master, so provider view-access is
+     * evaluated against the first item and client access against that item's client (which equals
+     * the header's client — both are stamped identically at create time) via the shared
+     * {@link AuthorizationService#enforceCanViewBooking} guard: the owning CLIENT, the visit's
+     * INDEPENDENT_MASTER / salon owner / salon admin, or the assigned SALON_MASTER are admitted;
+     * everyone else gets a 403. Existence and authorization collapse to a single uniform 403 (no
+     * existence oracle): a missing / itemless appointment short-circuits to the SAME 403 the
+     * ownership guard throws for a foreign visit, so a caller cannot probe whether an arbitrary
+     * appointment id exists.
+     *
+     * <p>Built from the existing {@link BookingRepository#findByAppointmentIdWithGraph} (bounded,
+     * graph-fetched, ordered by {@code startsAt} — no N+1) plus the appointment header, then enriched
+     * with the mutually-visible header notes and the district-primary discovery locality labels,
+     * exactly as {@code BookingDetailResponse} is.
+     */
+    @Transactional(readOnly = true)
+    public AppointmentDetailResponse getAppointment(UUID actorUserId, UUID appointmentId) {
+        List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
+        if (items.isEmpty()) {
+            // Uniform 403 for a missing/itemless visit — no existence oracle (mirrors getBooking).
+            throw new ForbiddenException("Access denied");
+        }
+        authz.enforceCanViewBooking(actorUserId, items.get(0));
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        return enrich(appointment, items);
+    }
+
+    /**
+     * Resolves the district-primary discovery locality labels (salon when salon-employed, else the
+     * master's own user row — the same {@code COALESCE(salon, user)} rule {@code BookingService} and
+     * {@code SearchService} use) and builds the enriched {@link AppointmentDetailResponse}. The
+     * street/building/locationNote resolution and the header-note reads live inside
+     * {@link AppointmentDetailResponse#from}; only the FK→label lookup is not derivable from the
+     * fetched graph and is done here.
+     */
+    private AppointmentDetailResponse enrich(Appointment appointment, List<Booking> items) {
+        Master master = items.get(0).getMaster();
+        Salon salon = master.getSalon();
+        User masterUser = master.getUser();
+        UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
+        UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
+
+        DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
+                cityId == null ? List.of() : List.of(cityId),
+                districtId == null ? List.of() : List.of(districtId));
+
+        return AppointmentDetailResponse.from(
+                appointment, items, labels.cityLabel(cityId), labels.districtLabel(districtId));
     }
 
     private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {

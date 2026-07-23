@@ -384,7 +384,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 CASE WHEN s.id IS NOT NULL THEN s.locationNote ELSE mu.locationNote END,
                 sd.category,
                 CASE WHEN r.id IS NOT NULL THEN true ELSE false END,
-                b.priceMaxAtBooking
+                b.priceMaxAtBooking,
+                b.appointment.id
             )
             FROM Booking b
             JOIN b.client

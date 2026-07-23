@@ -81,6 +81,12 @@ public record ClientBookingDetailProjection(
         String locationNote,
         String categoryName,
         boolean reviewExists,
-        BigDecimal priceMaxAtBooking
+        BigDecimal priceMaxAtBooking,
+        // BE-5: the visit (appointments) this booking belongs to, or null for a legacy single-service
+        // booking. SELECT-only via the FK column (b.appointment.id), never a join — a null FK yields
+        // null here and the row is NOT filtered out, so every legacy booking still appears with a
+        // null appointmentId. Populates BookingDetailResponse.appointmentId on the CLIENT
+        // GET /bookings/me projection path.
+        UUID appointmentId
 ) {
 }

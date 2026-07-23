@@ -1,0 +1,430 @@
+package com.beautica.booking;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.beautica.AbstractIntegrationTest;
+import com.beautica.common.TimeZones;
+import com.beautica.config.TestSecurityConfig;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
+import java.util.UUID;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import org.springframework.security.crypto.password.PasswordEncoder;
+
+/**
+ * Full-HTTP-stack smoke suite for BE-5's read model of multi-service visits:
+ *
+ * <ol>
+ *   <li><b>Additive {@code appointmentId}</b> on the booking read model — {@code GET /bookings/me}
+ *       and {@code GET /bookings/{id}} both surface the populated {@code appointmentId} for a visit
+ *       child, and {@code null} for a legacy single-service booking. The row shape is otherwise
+ *       unchanged (grouping N item rows into one card stays the mobile client's job, MO-5).</li>
+ *   <li><b>New {@code GET /api/v1/appointments/{id}}</b> — returns the full enriched visit for the
+ *       owning CLIENT and for the owning provider (the visit's master), and a uniform {@code 403}
+ *       for a foreign client / foreign provider (no existence oracle, mirroring
+ *       {@code GET /bookings/{id}}).</li>
+ * </ol>
+ *
+ * <p>Reuses {@link BookingTestFixtures} + the local {@code addWorkingHoursForEveryDay}/{@code
+ * postVisit} helpers established by {@link AppointmentCreateIT} (the BE-3 create smoke) rather than
+ * re-seeding by hand.
+ */
+@Import(TestSecurityConfig.class)
+@DisplayName("BE-5 read model — appointmentId on bookings + GET /appointments/{id} over real Postgres")
+class AppointmentReadIT extends AbstractIntegrationTest {
+
+    private static final String APPOINTMENTS_URL = "/api/v1/appointments";
+    private static final String BOOKINGS_URL = "/api/v1/bookings";
+
+    @Autowired
+    private TestRestTemplate restTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    private BookingTestFixtures fixtures;
+
+    @BeforeEach
+    void configureHttpClient() {
+        restTemplate.getRestTemplate().setRequestFactory(
+                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 1. appointmentId is additive on the booking read model
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("GET /bookings/me and GET /bookings/{id} both carry the populated appointmentId for a "
+            + "visit child; a legacy single-service booking returns appointmentId = null")
+    void should_exposeAppointmentId_when_bookingIsVisitChild_andNull_forLegacyBooking() throws Exception {
+        String masterEmail = "be5-read-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        String clientEmail = "be5-read-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceA = fixtures.createIndependentMasterService(masterId);
+        UUID serviceB = fixtures.createIndependentMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        // A two-service visit → one appointment, two chained bookings.
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        JsonNode visit = objectMapper.readTree(
+                postVisit(clientToken, masterId, startsAt, serviceA, serviceB).getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visit.path("id").asText());
+        UUID childBookingId = UUID.fromString(visit.path("items").get(0).path("bookingId").asText());
+
+        // A legacy single-service booking for the same client — appointment_id stays NULL.
+        UUID legacyBookingId = insertLegacyBooking(clientId, masterId, serviceA);
+
+        // GET /bookings/{id} — the visit child carries the appointmentId; the legacy booking is null.
+        JsonNode childDetail = getJson(BOOKINGS_URL + "/" + childBookingId, clientToken).path("data");
+        assertThat(childDetail.path("appointmentId").asText())
+                .as("a visit child's GET /bookings/{id} must surface its appointment_id")
+                .isEqualTo(appointmentId.toString());
+
+        JsonNode legacyDetail = getJson(BOOKINGS_URL + "/" + legacyBookingId, clientToken).path("data");
+        assertThat(legacyDetail.path("appointmentId").isNull())
+                .as("a legacy single-service booking has no appointment — appointmentId must be null")
+                .isTrue();
+
+        // GET /bookings/me — the same populated/null split holds on the CLIENT projection path.
+        JsonNode meRows = getJson(BOOKINGS_URL + "/me?size=50", clientToken).path("data").path("data");
+        JsonNode childRow = findRow(meRows, childBookingId);
+        JsonNode legacyRow = findRow(meRows, legacyBookingId);
+
+        assertThat(childRow).as("the visit child must appear on the client's GET /bookings/me").isNotNull();
+        assertThat(childRow.path("appointmentId").asText())
+                .as("GET /bookings/me must surface the visit child's appointment_id (CLIENT projection)")
+                .isEqualTo(appointmentId.toString());
+        assertThat(legacyRow).as("the legacy booking must appear on GET /bookings/me").isNotNull();
+        assertThat(legacyRow.path("appointmentId").isNull())
+                .as("the legacy booking's appointmentId must be null on GET /bookings/me too")
+                .isTrue();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 2. GET /appointments/{id} — owning client + owning provider 200; foreign 403
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("GET /appointments/{id} returns the full enriched visit for the owning CLIENT and the "
+            + "owning provider, and 403 for a foreign client and a foreign provider (uniform, no oracle)")
+    void should_returnVisitForOwnerAndProvider_andDenyForeignViewers() throws Exception {
+        String masterEmail = "be5-appt-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        String clientEmail = "be5-appt-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceA = fixtures.createIndependentMasterService(masterId);
+        UUID serviceB = fixtures.createIndependentMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(3).withHour(9).withMinute(0).withSecond(0).withNano(0);
+        JsonNode visit = objectMapper.readTree(
+                postVisit(clientToken, masterId, startsAt, serviceA, serviceB).getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visit.path("id").asText());
+
+        // Owning CLIENT → 200 with the full visit (two items) and the BE-5 enrichment fields present.
+        ResponseEntity<String> ownerResp = getRaw(APPOINTMENTS_URL + "/" + appointmentId, clientToken);
+        assertThat(ownerResp.getStatusCode())
+                .as("the owning client must read their own visit — body: %s", ownerResp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        JsonNode ownerData = objectMapper.readTree(ownerResp.getBody()).path("data");
+        assertThat(ownerData.path("id").asText()).isEqualTo(appointmentId.toString());
+        assertThat(ownerData.path("items")).as("the visit returns its ordered items").hasSize(2);
+        // BE-5 enrichment: the mutually-visible note fields exist (null on a CONFIRMED visit) and the
+        // locality fields exist — proving AppointmentDetailResponse gained them.
+        assertThat(ownerData.has("providerComment")
+                && ownerData.has("clientCancellationNote")
+                && ownerData.has("clientComment")
+                && ownerData.has("cityLabel") && ownerData.has("districtLabel")
+                && ownerData.has("street") && ownerData.has("buildingNo")
+                && ownerData.has("locationNote"))
+                .as("the enriched visit-detail fields must be present on the response")
+                .isTrue();
+
+        // Owning provider (the visit's master) → 200.
+        String masterToken = fixtures.tokenFor(masterEmail);
+        assertThat(getRaw(APPOINTMENTS_URL + "/" + appointmentId, masterToken).getStatusCode())
+                .as("the visit's own master must be able to read the visit")
+                .isEqualTo(HttpStatus.OK);
+
+        // Foreign CLIENT → 403.
+        String foreignClientEmail = "be5-appt-foreign-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(foreignClientEmail, "CLIENT", null);
+        assertThat(getRaw(APPOINTMENTS_URL + "/" + appointmentId, fixtures.tokenFor(foreignClientEmail))
+                .getStatusCode())
+                .as("a different client must never read another client's visit")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+
+        // Foreign provider (a different independent master) → 403.
+        String foreignMasterEmail = "be5-appt-foreign-master-" + System.nanoTime() + "@beautica.test";
+        fixtures.createIndependentMaster(foreignMasterEmail);
+        assertThat(getRaw(APPOINTMENTS_URL + "/" + appointmentId, fixtures.tokenFor(foreignMasterEmail))
+                .getStatusCode())
+                .as("a master who does not own the visit must be denied")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 3. GET /appointments/{id} — enriched payload: ordered items, frozen totals,
+    //    and mutually-visible provider note after a DECLINE (client sees it)
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("GET /appointments/{id} carries the ordered contiguous items and the frozen visit "
+            + "totals; after a provider DECLINE the owning CLIENT sees the header providerComment "
+            + "(mutually-visible notes rule)")
+    void should_exposeOrderedItemsTotalsAndDeclineNote_toOwningClient() throws Exception {
+        String masterEmail = "be5-note-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        String clientEmail = "be5-note-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceA = fixtures.createIndependentMasterService(masterId);
+        UUID serviceB = fixtures.createIndependentMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(4).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        JsonNode visit = objectMapper.readTree(
+                postVisit(clientToken, masterId, startsAt, serviceA, serviceB).getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visit.path("id").asText());
+
+        // Enriched read while CONFIRMED: ordered, contiguous items + frozen totals.
+        JsonNode confirmed = getJson(APPOINTMENTS_URL + "/" + appointmentId, clientToken).path("data");
+        assertThat(confirmed.path("status").asText()).isEqualTo("CONFIRMED");
+
+        JsonNode items = confirmed.path("items");
+        assertThat(items).as("a two-service visit returns two ordered item lines").hasSize(2);
+        ZonedDateTime item0End = ZonedDateTime.parse(items.get(0).path("endsAt").asText());
+        ZonedDateTime item1Start = ZonedDateTime.parse(items.get(1).path("startsAt").asText());
+        assertThat(item0End.isEqual(item1Start))
+                .as("items must be ordered and contiguous — item[1].startsAt == item[0].endsAt")
+                .isTrue();
+        assertThat(items.get(0).path("serviceName").asText()).isNotBlank();
+        assertThat(items.get(0).path("bookingId").isNull())
+                .as("each item line carries its child bookingId").isFalse();
+
+        // Frozen totals: two 500.00 base-price, 60-min, zero-buffer services → 1000.00 / 120 min,
+        // single price (no range) → totalPriceMax null. Never re-derived on read.
+        assertThat(new BigDecimal(confirmed.path("totalPrice").asText()))
+                .as("totalPrice = Σ item price floors (2 × 500.00)")
+                .isEqualByComparingTo("1000.00");
+        assertThat(confirmed.path("totalPriceMax").isNull())
+                .as("no service was a genuine range → totalPriceMax must be null")
+                .isTrue();
+        assertThat(confirmed.path("totalDurationMinutes").asInt())
+                .as("totalDurationMinutes = endsAt − startsAt = 2 × (60 + 0)")
+                .isEqualTo(120);
+        assertThat(confirmed.path("providerComment").isNull())
+                .as("a CONFIRMED visit has no provider note yet").isTrue();
+
+        // Provider (the independent master) declines the whole visit with a note.
+        String masterToken = fixtures.tokenFor(masterEmail);
+        String note = "Майстер захворів — переносимо візит";
+        ResponseEntity<Void> declineResp = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{\"providerComment\":\"" + note + "\"}", jsonHeaders(masterToken)),
+                Void.class);
+        assertThat(declineResp.getStatusCode())
+                .as("the visit's own master must be able to decline it").isEqualTo(HttpStatus.NO_CONTENT);
+
+        // The mutually-visible header note is surfaced to the OWNING CLIENT on the DECLINED visit —
+        // by the locked "all notes visible for all sides" decision (mirrors BookingNoteVisibilityIT).
+        JsonNode declined = getJson(APPOINTMENTS_URL + "/" + appointmentId, clientToken).path("data");
+        assertThat(declined.path("status").asText()).isEqualTo("DECLINED");
+        assertThat(declined.path("providerComment").asText())
+                .as("the owning client must see the provider's decline note on the visit header")
+                .isEqualTo(note);
+    }
+
+    @Test
+    @DisplayName("GET /appointments/{id} for an UNKNOWN id returns 403 (not 404) — uniform with "
+            + "GET /bookings/{id}, no existence oracle")
+    void should_return403_when_appointmentIdIsUnknown() throws Exception {
+        String clientEmail = "be5-missing-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        assertThat(getRaw(APPOINTMENTS_URL + "/" + UUID.randomUUID(), clientToken).getStatusCode())
+                .as("a non-existent appointment id must be a uniform 403, never a 404 that reveals "
+                        + "existence")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 4. PII / address masking — a salon visit surfaces the SALON's address and
+    //    NEVER the salon-employed master's PERSONAL street/door code (leak class)
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("GET /appointments/{id} for a SALON visit returns the SALON address and NEVER the "
+            + "salon-employed master's personal street / building / door code (no PII leak)")
+    void should_returnSalonAddress_andNeverMasterPersonalDoorCode_forSalonVisit() throws Exception {
+        BookingTestFixtures.SalonFixture salon =
+                fixtures.createSalon("be5-salon-owner-" + System.nanoTime() + "@beautica.test");
+
+        // The salon's own arrival address — what a client MUST see.
+        String salonStreet = "вул. Салонна-" + System.nanoTime();
+        String salonBuildingNo = "10-САЛОН";
+        String salonNote = "2-й поверх, вхід з вулиці";
+        jdbcTemplate.update(
+                "UPDATE salons SET street = ?, building_no = ?, location_note = ? WHERE id = ?",
+                salonStreet, salonBuildingNo, salonNote, salon.salonId());
+
+        // The salon-employed master's DISTINCT personal home address — must NEVER surface on a salon
+        // visit (this is the door-code leak class the booking-detail path was pinned against).
+        String masterPersonalStreet = "вул-Приватна-СЕКРЕТ-" + System.nanoTime();
+        String masterPersonalBuildingNo = "99-ПРИВАТ";
+        String masterPersonalNote = "приватний код дверей 4321 — не показувати";
+        jdbcTemplate.update(
+                "UPDATE users SET street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                masterPersonalStreet, masterPersonalBuildingNo, masterPersonalNote, salon.masterId());
+
+        UUID serviceA = fixtures.createSalonService(salon.salonId(), salon.masterId());
+        addWorkingHoursForEveryDay(salon.masterId());
+
+        String clientEmail = "be5-salon-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(5).withHour(12).withMinute(0).withSecond(0).withNano(0);
+        JsonNode visit = objectMapper.readTree(
+                postVisit(clientToken, salon.masterId(), startsAt, serviceA).getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visit.path("id").asText());
+
+        ResponseEntity<String> resp = getRaw(APPOINTMENTS_URL + "/" + appointmentId, clientToken);
+        assertThat(resp.getStatusCode())
+                .as("the owning client must read their salon visit — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+
+        // The SALON's address wins outright (salon-employed → salon locality, never the master's own).
+        assertThat(data.path("street").asText())
+                .as("a salon visit must arrive at the SALON's street").isEqualTo(salonStreet);
+        assertThat(data.path("buildingNo").asText()).isEqualTo(salonBuildingNo);
+        assertThat(data.path("locationNote").asText()).isEqualTo(salonNote);
+
+        // THE CRITICAL non-leak assertion: the master's PERSONAL address never appears ANYWHERE in the
+        // response — not in the address fields, not smuggled into any other field.
+        String rawBody = resp.getBody();
+        assertThat(rawBody)
+                .as("the salon-master's personal street must NEVER leak onto a salon visit")
+                .doesNotContain(masterPersonalStreet);
+        assertThat(rawBody)
+                .as("the salon-master's personal building number must NEVER leak onto a salon visit")
+                .doesNotContain(masterPersonalBuildingNo);
+        assertThat(rawBody)
+                .as("the salon-master's personal door code must NEVER leak onto a salon visit")
+                .doesNotContain(masterPersonalNote);
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    private HttpHeaders jsonHeaders(String token) {
+        HttpHeaders headers = fixtures.bearerHeaders(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        return headers;
+    }
+
+    private ResponseEntity<String> postVisit(
+            String clientToken, UUID masterId, ZonedDateTime startsAt, UUID... serviceIds) {
+        StringBuilder ids = new StringBuilder();
+        for (int i = 0; i < serviceIds.length; i++) {
+            if (i > 0) {
+                ids.append(',');
+            }
+            ids.append('"').append(serviceIds[i]).append('"');
+        }
+        String body = """
+                {"masterId":"%s","masterServiceIds":[%s],"startsAt":"%s"}
+                """.formatted(masterId, ids, startsAt.toOffsetDateTime());
+        HttpHeaders headers = fixtures.bearerHeaders(clientToken);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                APPOINTMENTS_URL, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+        assertThat(resp.getStatusCode())
+                .as("visit creation must succeed — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        return resp;
+    }
+
+    private ResponseEntity<String> getRaw(String url, String token) {
+        return restTemplate.exchange(
+                url, HttpMethod.GET, new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
+    }
+
+    private JsonNode getJson(String url, String token) throws Exception {
+        ResponseEntity<String> resp = getRaw(url, token);
+        assertThat(resp.getStatusCode()).as("GET %s must succeed — body: %s", url, resp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(resp.getBody());
+    }
+
+    private static JsonNode findRow(JsonNode rows, UUID bookingId) {
+        for (JsonNode row : rows) {
+            if (row.path("id").asText().equals(bookingId.toString())) {
+                return row;
+            }
+        }
+        return null;
+    }
+
+    /** A legacy single-service CONFIRMED booking (appointment_id stays NULL) for the given client. */
+    private UUID insertLegacyBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime start = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(6).withHour(14).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "booking_source, starts_at, ends_at, price_at_booking, "
+                        + "duration_minutes_at_booking, buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', 'APP', ?, ?, 500.00, 60, 0, NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, start, start.plusMinutes(60));
+        return bookingId;
+    }
+
+    /**
+     * Open-ended weekly schedule with all seven ISO weekdays 08:00–20:00 so a near-future visit can be
+     * booked on any day — mirrors {@link AppointmentCreateIT}'s local helper of the same name.
+     */
+    private void addWorkingHoursForEveryDay(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to) "
+                        + "VALUES (?, ?, DATE '2020-01-01', NULL)",
+                scheduleId, masterId);
+        for (int day = 1; day <= 7; day++) {
+            jdbcTemplate.update(
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                            + "VALUES (?, ?, ?, '08:00', '20:00')",
+                    UUID.randomUUID(), scheduleId, day);
+        }
+    }
+}

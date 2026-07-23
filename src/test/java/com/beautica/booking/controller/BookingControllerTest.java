@@ -125,7 +125,9 @@ class BookingControllerTest {
                 "Kyiv", null, null, null,
                 // locationNote (additive)
                 null,
-                "MANICURE", false
+                "MANICURE", false,
+                // appointmentId (BE-5 additive) — legacy single-service booking has no visit
+                null
         );
     }
 

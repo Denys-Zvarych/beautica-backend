@@ -129,7 +129,14 @@ public record BookingDetailResponse(
                         + "own note. Nullable — most providers never set one.")
         String locationNote,
         String categoryName,
-        boolean canReview
+        boolean canReview,
+        @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
+                description = "The multi-service visit (BE-5) this booking belongs to, or null for a "
+                        + "legacy single-service booking (appointment_id IS NULL). Strictly additive; "
+                        + "when non-null the client can fetch the full visit via "
+                        + "GET /appointments/{appointmentId}. Both mapper paths (entity + CLIENT "
+                        + "projection) read the SAME appointment_id column, so they never diverge.")
+        UUID appointmentId
 ) {
 
     /**
@@ -201,7 +208,11 @@ public record BookingDetailResponse(
                 resolvedBuildingNo,
                 resolvedLocationNote,
                 booking.getMasterService().getServiceDefinition().getCategory(),
-                canReview
+                canReview,
+                // appointment is a LAZY @ManyToOne on a nullable FK — the identifier is served off
+                // the proxy (or resolved as null) from the booking row itself, so this reads with no
+                // extra SELECT and no widening of findByIdWithFullGraph / findAllByIdsWithGraph.
+                booking.getAppointment() != null ? booking.getAppointment().getId() : null
         );
     }
 }

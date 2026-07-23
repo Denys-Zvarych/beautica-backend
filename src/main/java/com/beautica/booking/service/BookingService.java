@@ -260,7 +260,8 @@ public class BookingService {
                 p.categoryName(),
                 // Defensive only: this projection is CLIENT-scoped (WHERE client_id = :clientId),
                 // so p.clientId() is always non-null in practice — never a guest booking.
-                canReview(p.status(), p.reviewExists(), p.clientId() != null));
+                canReview(p.status(), p.reviewExists(), p.clientId() != null),
+                p.appointmentId());
     }
 
     /**

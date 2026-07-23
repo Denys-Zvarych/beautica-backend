@@ -16,6 +16,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -69,6 +70,26 @@ public class AppointmentController {
         AppointmentDetailResponse response =
                 appointmentService.createAppointment(AuthenticationUtils.userId(auth), resolvedKey, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    /**
+     * Reads the full enriched detail of one multi-service visit (BE-5) —
+     * {@code GET /api/v1/appointments/{appointmentId}}.
+     *
+     * <p>Authorization mirrors {@code GET /bookings/{id}} exactly: a role-agnostic
+     * {@code isAuthenticated()} gate here, then {@code AuthorizationService.enforceCanViewBooking}
+     * inside the service after the visit is loaded once (the owning client OR the provider with
+     * view-access to the visit's single master). A missing/foreign visit is a uniform 403 — no
+     * existence oracle.
+     */
+    @GetMapping("/{appointmentId}")
+    @PreAuthorize("isAuthenticated()")
+    public ApiResponse<AppointmentDetailResponse> getAppointment(
+            @PathVariable UUID appointmentId,
+            Authentication auth
+    ) {
+        return ApiResponse.ok(
+                appointmentService.getAppointment(AuthenticationUtils.userId(auth), appointmentId));
     }
 
     /**

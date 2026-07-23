@@ -66,7 +66,42 @@ public record AppointmentDetailResponse(
                 description = "The client's booking-creation note for the whole visit.")
         String clientComment,
         OffsetDateTime createdAt,
-        List<AppointmentItemResponse> items
+        List<AppointmentItemResponse> items,
+        // ── BE-5 visit-detail enrichment (mirrors BookingDetailResponse) ─────────────
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Written by the provider on the visit /decline or /not-complete. Shown "
+                        + "to the CLIENT on both DECLINED and NOT_COMPLETED visits — intentional, by "
+                        + "the locked \"all notes visible for all sides\" decision, NOT a privacy "
+                        + "leak. Do not suppress for any audience. Same field/rule as "
+                        + "BookingDetailResponse.providerComment, lifted to the visit header.")
+        String providerComment,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Written by the CLIENT on the visit /cancel — the symmetric counterpart "
+                        + "of providerComment, shown to the provider. Only ever non-null on a "
+                        + "CANCELLED visit. Same field/rule as "
+                        + "BookingDetailResponse.clientCancellationNote.")
+        String clientCancellationNote,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Discovery city label (Ukrainian). Resolved by the service through the "
+                        + "same district-primary DiscoveryLocationResolver seam as "
+                        + "BookingDetailResponse — salon locality when salon-employed, else the "
+                        + "master's own user row.")
+        String cityLabel,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Discovery district label (Ukrainian). Same resolution as cityLabel.")
+        String districtLabel,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Arrival street — the salon's when salon-employed, else the master's "
+                        + "own. Same salon-vs-independent rule as BookingDetailResponse.street; a "
+                        + "salon-employed master's PERSONAL street never leaks onto a salon visit.")
+        String street,
+        @Schema(types = {"string", "null"}, nullable = true, description = "Arrival building number.")
+        String buildingNo,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Provider's free-text arrival hint (e.g. \"3-й поверх, код 1234\"). "
+                        + "Same salon-vs-independent resolution as street/buildingNo — a salon "
+                        + "booking surfaces the salon's own note, never the master's personal one.")
+        String locationNote
 ) {
 
     /**
@@ -77,12 +112,20 @@ public record AppointmentDetailResponse(
      * graph hydrated. The master summary is read off the first item (single master per visit — a
      * locked invariant).
      */
-    public static AppointmentDetailResponse from(Appointment appointment, List<Booking> orderedItems) {
+    public static AppointmentDetailResponse from(
+            Appointment appointment, List<Booking> orderedItems, String cityLabel, String districtLabel) {
         Booking first = orderedItems.get(0);
         Booking last = orderedItems.get(orderedItems.size() - 1);
         Master master = first.getMaster();
         User masterUser = master.getUser();
         Salon salon = master.getSalon();
+
+        // Same salon-vs-independent PII rule as BookingDetailResponse#from — the salon's own values
+        // win outright when salon-employed (even when null), so a salon-master's personal address
+        // never leaks onto a salon visit.
+        String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
+        String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
+        String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
 
         BigDecimal totalPrice = BigDecimal.ZERO;
         BigDecimal totalCeiling = BigDecimal.ZERO;
@@ -121,6 +164,14 @@ public record AppointmentDetailResponse(
                 anyRange ? totalCeiling : null,
                 appointment.getClientComment(),
                 appointment.getCreatedAt().atOffset(ZoneOffset.UTC),
-                items);
+                items,
+                // Notes are read from the HEADER (mutually visible), never the child items.
+                appointment.getProviderComment(),
+                appointment.getClientCancellationNote(),
+                cityLabel,
+                districtLabel,
+                resolvedStreet,
+                resolvedBuildingNo,
+                resolvedLocationNote);
     }
 }

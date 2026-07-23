@@ -1748,6 +1748,7 @@ class BookingServiceTest {
                 null, null, "Khreschatyk", "10",
                 locationNote,
                 "MANICURE", false,
+                null,
                 null);
     }
 
@@ -1810,7 +1811,8 @@ class BookingServiceTest {
                 null, null, "Khreschatyk", "10",
                 null,
                 "MANICURE", false,
-                priceMaxAtBooking);
+                priceMaxAtBooking,
+                null);
     }
 
     private com.beautica.booking.dto.BookingDetailResponse firstClientRowFor(
@@ -1864,6 +1866,7 @@ class BookingServiceTest {
                 null, null, "Khreschatyk", "10",
                 null,
                 "MANICURE", false,
+                null,
                 null);
     }
 
