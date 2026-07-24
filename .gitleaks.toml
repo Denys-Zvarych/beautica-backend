@@ -1,0 +1,102 @@
+title = "Beautica backend — gitleaks configuration"
+
+# ──────────────────────────────────────────────────────────────────────────
+# Why this file exists
+#
+# The repo is PUBLIC, so the secret scan is a real gate. Every gitleaks rule
+# stays enabled, everywhere, including in test sources. What is listed below
+# is a small set of EXACT literal values that are known-benign.
+#
+# ── Trap 1: fingerprints do not survive a squash merge ────────────────────
+# The first attempt at this used a `.gitleaksignore` fingerprint list. A
+# fingerprint is <commit>:<file>:<rule>:<line>, and `dev` -> `main` releases
+# are SQUASH-merged: the squash mints ONE brand-new commit containing the
+# whole tree as a single diff, so every finding reappears under a new
+# fingerprint at a new line number and the ignore list silently stops
+# matching. It failed on the very first release (run 30083114232, commit
+# fe01ce1). Everything below is keyed on the VALUE, so it survives squash,
+# rebase, cherry-pick and line renumbering.
+#
+# ── Trap 2: `paths` allowlists blind every rule, not just the noisy one ───
+# The obvious fix -- allowlist `^src/test/` so the entropy heuristic stops
+# firing on fixtures -- is UNSAFE and was rejected. Verified against gitleaks
+# 8.24.3: a `paths` allowlist suppresses ALL rules for those files. A planted
+# AWS key and Stripe key inside a test file were both silently swallowed.
+# `targetRules` does NOT constrain this: 8.24.3 parses the key and ignores it.
+# The plural `[[allowlists]]` form is likewise parsed and silently ignored --
+# only the singular `[allowlist]` below has any effect. Do not "improve" this
+# file into either form without re-running the negative control.
+#
+# ── Trap 3: this block REPLACES the default global allowlist ──────────────
+# Because `[allowlist]` overrides rather than merges, findings the upstream
+# default used to suppress come back. That is why the base64 alphabet entry
+# is here explicitly -- it is not noise, removing it re-breaks the build.
+#
+# ── Maintaining this list ─────────────────────────────────────────────────
+# A new high-entropy test fixture may trip `generic-api-key` and fail CI.
+# That is the intended failure direction: it fails CLOSED, and the fix is to
+# add the literal here after confirming it is not a credential.
+#
+# AN ENTRY HERE HIDES AN ALERT, IT DOES NOT MAKE A LEAKED KEY SAFE.
+# If a real credential is ever committed, ROTATE IT FIRST.
+# ──────────────────────────────────────────────────────────────────────────
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-benign literals: test fixtures and retired local-dev-profile values"
+regexes = [
+  # ── Test fixtures ──────────────────────────────────────────────────────
+  # GuestTokenProviderTest / GuestTokenConfusionTest: HMAC key for the guest
+  # token tests. Spelled out in plain English; long enough to clear the
+  # 32-byte minimum and nothing more.
+  '''test-secret-that-is-at-least-32-bytes-long-xx''',
+
+  # EmailServiceTest: dummy query value asserting the rendered href is not
+  # line-broken by the Thymeleaf template.
+  '''tok-EN_unbroken-123''',
+
+  # OutboxPayloadCipherTest: hand-typed value in a fake invite URL on the
+  # reserved .example domain, used as round-trip plaintext.
+  '''abcDEF123456''',
+
+  # OutboxKeyDevGuardTest: a BLOCKLIST sentinel. The guard under test exists
+  # to REJECT this exact key at startup, so the test has to name it.
+  # Removing it would delete the assertion that the dev key cannot boot prod.
+  '''xqXxTzEL0\+Xlq/iNHyBgKG/nRxIiKedVmGonbisH2KM=''',
+
+  # CatalogRepositoryTest: service-type slugs, flagged purely on entropy.
+  # Matched as a family so a new brow-shaping-N fixture does not re-break CI.
+  '''brow-shaping-[A-Za-z0-9_-]+''',
+
+  # JwtConfigTest: the literal base64 ALPHABET, used to build a 64-byte
+  # "realistic secret" for a length assertion. Suppressed by the upstream
+  # default allowlist, which the block above replaces -- so it must be
+  # restated here. See Trap 3.
+  '''ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\+/''',
+
+  # ── Retired local-dev values, still present in `dev` history ───────────
+  # All three lived in application-local.yml, loaded ONLY under the `local`
+  # Spring profile against localhost Docker Postgres. Production (Railway)
+  # has always read JWT_SECRET / OUTBOX_PAYLOAD_KEY from the environment
+  # (ARCHITECTURE-backend.md § 0.5) and current code env-wraps all three.
+  # Confirmed with the repo owner on 2026-07-24 that none was ever reused as
+  # a Railway value, so there is nothing to rotate. Matched on the exact
+  # value, so a genuinely new secret in that file still fails the scan.
+
+  # app.jwt.secret — the earliest local value (2026-04-18). Reachable only
+  # on a FULL-history walk, not on the --first-parent range the PR/push
+  # scans use, so it surfaces in the weekly scheduled sweep.
+  '''O3afk2paSYBc0Z7rObB5f9uCaFJsZ\+JmSZagE8YuuH8=''',
+
+  # app.jwt.secret — base64 of the placeholder text
+  # "test-local-dev-secret-needs-to-be-random-256bit!"
+  '''dGVzdC1sb2NhbC1kZXYtc2VjcmV0LW5lZWRzLXRvLWJlLXJhbmRvbS0yNTZiaXQh''',
+
+  # app.jwt.secret — random local value, superseded by ${JWT_SECRET}
+  '''Ys9eSVVCRjTO8UIMW36Gj5mEuJVPtYRL1cja0XG5JnL\+Fdv2osHaBqnP\+NXX1hUm''',
+
+  # app.outbox.payload-key — superseded by ${OUTBOX_PAYLOAD_KEY}
+  '''w\+ZLcc1IXPaNHEmD3o7EZu5yS\+Uq97Wz61pmYe8NmIc=''',
+]
