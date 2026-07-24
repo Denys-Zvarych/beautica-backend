@@ -1,0 +1,23 @@
+package com.beautica.config;
+
+import com.beautica.notification.crypto.OutboxCipherProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@EnableConfigurationProperties({
+        JwtConfig.class,
+        OutboxCipherProperties.class,
+        OtpPepperConfig.class,
+        VerificationPolicyConfig.class,
+        PasswordResetPolicyConfig.class,
+        PasswordResetOtpPolicyConfig.class,
+        InternalApiKeyProperties.class,
+        PublicBaseUrlProperties.class,
+        SupportProperties.class,
+        TurbosmsProperties.class,
+        BookingSmsProperties.class,
+        OutboxReclaimPolicyConfig.class
+})
+public class AppConfigProperties {
+}

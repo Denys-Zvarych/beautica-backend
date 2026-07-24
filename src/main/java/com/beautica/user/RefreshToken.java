@@ -1,0 +1,76 @@
+package com.beautica.user;
+
+import com.beautica.common.AuditableEntity;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Index;
+import jakarta.persistence.Table;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+// Mirrors the DB index created in V16__Add_missing_indexes.sql so the mapping documents
+// it and ddl-auto=create would reproduce it. The physical index is owned by Flyway; this
+// is documentation only (Hibernate ddl-auto=validate does not verify indexes).
+@Table(name = "refresh_tokens", indexes = {
+        @Index(name = "idx_refresh_tokens_user_id", columnList = "user_id")
+})
+public class RefreshToken extends AuditableEntity {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "id", updatable = false, nullable = false)
+    private UUID id;
+
+    @Column(name = "token", nullable = false, unique = true, length = 512)
+    private String token;
+
+    @Column(name = "user_id", nullable = false)
+    private UUID userId;
+
+    @Column(name = "expires_at", nullable = false)
+    private Instant expiresAt;
+
+    @Column(name = "is_revoked", nullable = false)
+    private boolean isRevoked = false;
+
+    protected RefreshToken() {
+    }
+
+    public RefreshToken(String token, UUID userId, Instant expiresAt) {
+        this.token = token;
+        this.userId = userId;
+        this.expiresAt = expiresAt;
+        this.isRevoked = false;
+    }
+
+    public UUID getId() {
+        return id;
+    }
+
+    @JsonIgnore
+    public String getToken() {
+        return token;
+    }
+
+    public UUID getUserId() {
+        return userId;
+    }
+
+    public Instant getExpiresAt() {
+        return expiresAt;
+    }
+
+    public boolean isRevoked() {
+        return isRevoked;
+    }
+
+    public void revoke() {
+        this.isRevoked = true;
+    }
+}

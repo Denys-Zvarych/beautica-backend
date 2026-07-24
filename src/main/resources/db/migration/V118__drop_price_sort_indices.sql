@@ -1,0 +1,38 @@
+-- Phase 26.8 — retire GET /bookings/me's priceAtBooking sort. Mobile Phase 7.8 deleted the
+-- provider "Мої записи" sort sheet (the ONLY caller of ?sort=priceAtBooking anywhere in the
+-- product — the shipped client screen only ever sent startsAt,asc/desc) once that screen became
+-- a timeline: on a timeline a card's position IS its time, so no ordering of the result set can
+-- move a card. BookingService#SORTABLE_BOOKING_PROPERTIES was narrowed to {startsAt} in the same
+-- change, so ?sort=priceAtBooking,desc / ,asc now return 400 before any query is built — the
+-- only query shape idx_bookings_master_price_id / idx_bookings_client_price_id existed to serve
+-- can never execute again. Every bookings insert/update was paying to maintain two indices with
+-- zero remaining read benefit; dropping them is a pure write-throughput win.
+--
+-- idx_bookings_master_starts_at / idx_bookings_client_starts_at (V117) are NOT touched — they
+-- serve the surviving startsAt sort, the DEFAULT_BOOKING_SORT substitution, and the timeline's
+-- day-rail queries.
+--
+-- Both indices were created by V117__my_bookings_filter_indices.sql:44,47 (Phase 26.6). The
+-- corresponding @Index entries on Booking.java are removed in the same commit for reader
+-- accuracy, NOT because ddl-auto=validate would fail otherwise: empirically verified (Phase 26.8
+-- audit — booted cleanly with the DB indices dropped and the @Index annotations still present),
+-- Hibernate 6.5's hibernate.hbm2ddl.auto=validate does NOT check @Table(indexes=...) against the
+-- real schema. An orphaned @Index annotation here would be silently cosmetic drift, not a boot
+-- failure — see Booking.java's comment at the same annotations for the full note.
+-- Fail fast rather than queue. `DROP INDEX` (not CONCURRENTLY — Flyway wraps each migration in one
+-- transaction and DROP INDEX CONCURRENTLY cannot run inside one) takes ACCESS EXCLUSIVE on
+-- `bookings`, the system's hottest table. Postgres lock requests are FIFO, so a PENDING ACCESS
+-- EXCLUSIVE request blocks every subsequent read AND write on `bookings` behind it — an unbounded
+-- wait here does not merely stall the deploy, it takes the booking table down while the old
+-- instance is still serving traffic through a Railway rolling deploy, and a migration that outlives
+-- the connection timeout crash-loops startup (memory `project_flyway_checksum_recovery.md`). 5s,
+-- then error out: Flyway rolls this transaction back cleanly and the next deploy retries it.
+--
+-- Identical value and identical argument to V119:37, which requests the same lock mode on the same
+-- table. NO statement_timeout, for V119's reason: dropping an index is a catalog edit plus a file
+-- unlink, so once the lock is granted there is no size-dependent execution phase left to bound —
+-- everything that can actually stall here is the lock WAIT.
+SET LOCAL lock_timeout = '5s';
+
+DROP INDEX IF EXISTS idx_bookings_master_price_id;
+DROP INDEX IF EXISTS idx_bookings_client_price_id;

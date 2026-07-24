@@ -13,6 +13,18 @@
         </root>
     </springProfile>
 
+    <springProfile name="test">
+        <!-- Suppress Hibernate SQL and HikariCP noise in test output -->
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
     <springProfile name="!prod">
         <!-- Human-readable logs for local dev -->
         <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">

@@ -1,53 +1,140 @@
 name: PR Validate
 
+# ──────────────────────────────────────────────────────────────────────────
+# REGRESSION MERGE-GATE
+#
+# This workflow is the regression gate for the backend. It compiles main +
+# test sources and runs the FULL test suite on every pull request targeting
+# `dev` and `main`. A failure of the `Compile (gate)`, `Build`, or
+# `Run tests` step fails the whole check.
+#
+# REQUIRED GITHUB SETTING (cannot be set from code — the repo admin must do this):
+#   In GitHub → Settings → Branches → Branch protection rules, for both `dev`
+#   and `main`, enable "Require status checks to pass before merging" and add
+#   the "Build & Test" check (this job) as a required status check. Without
+#   that setting a red check does NOT block the merge button.
+# ──────────────────────────────────────────────────────────────────────────
+
 on:
   pull_request:
     branches:
       - main
       - dev
+  # Defense-in-depth: also compile + test the merged tip of the
+  # protected branches. The pull_request trigger does not cover a
+  # merge-commit or a direct push reaching dev/main. This job is
+  # prod-secret-free (test profile + CI dummy JWT only), so it is
+  # safe to run on push.
+  push:
+    branches:
+      - main
+      - dev
+
+# CI-only, non-production dummy value. The `test` Spring profile
+# (src/test/resources/application-test.yml) hardcodes all other infrastructure
+# placeholders and Testcontainers supplies the real PostgreSQL via
+# @ServiceConnection, so the only env var the test profile actually consumes
+# is JWT_SECRET. This is a fixed throwaway value and MUST NOT be a real secret.
+env:
+  CI_DUMMY_JWT_SECRET: ci-only-dummy-jwt-secret-not-a-real-secret-min-32-bytes
 
 jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      pull-requests: write
+      contents: read
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+
+      # Phase 25.6 — email is the one place in this app that renders free-text user input
+      # (booking notes). th:utext bypasses Thymeleaf's HTML escaping; this gate fails the
+      # build immediately if it is ever introduced under templates/email/.
+      - name: Forbid th:utext in email templates
+        run: ./scripts/forbid_th_utext_in_email.sh
+
+      # Fast fail: compile main + test sources before the heavier build/test
+      # steps. This is the explicit compile half of the regression gate and
+      # surfaces a broken build in seconds rather than after the full suite.
+      - name: Compile (gate)
+        run: ./gradlew compileJava compileTestJava
+        env:
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
 
       - name: Build
         run: ./gradlew build -x test
         env:
-          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
 
       - name: Run tests
-        run: ./gradlew test
+        run: ./gradlew test -PtestLogLevel=INFO -PtestRootLogLevel=INFO
         env:
-          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
 
-      - name: Upload test reports on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - name: Publish test results
+        uses: dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5 # v1.9.1
+        if: always()
+        with:
+          name: JUnit Tests
+          path: build/test-results/test/**/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-reports
           path: build/reports/tests/
           retention-days: 7
+
+      # ────────────────────────────────────────────────────────────────────
+      # OpenAPI contract artifact (mobile contract-drift source)
+      #
+      # The mobile client (beautica-mobile) is code-generated from this
+      # backend's SpringDoc spec. To let a mobile contract-drift job consume a
+      # known-good spec we want to publish the serialized OpenAPI JSON here as
+      # a build artifact.
+      #
+      # NOT WIRED AS A FULL IN-CI EXPORT — and intentionally so:
+      #   The spec is served at runtime from /api-docs by the live Spring
+      #   context. Serializing it in CI means *booting the app*, which under
+      #   the `test` profile requires a real PostgreSQL (Testcontainers
+      #   supplies it only during `./gradlew test`, not for a standalone
+      #   `bootRun`) plus R2 / Firebase / SMTP placeholders. The `prod`
+      #   profile additionally sets `springdoc.api-docs.enabled: false`, so the
+      #   deployed instance does not expose it either. Standing all of that up
+      #   purely to dump a JSON file is the kind of heavy boot the task scope
+      #   explicitly asks us to avoid.
+      #
+      # HOW THE MOBILE SIDE SHOULD FETCH THE SPEC (current contract):
+      #   1. Run the backend locally with the `local` profile
+      #      (`./gradlew bootRun --args='--spring.profiles.active=local'`),
+      #      which keeps `springdoc.api-docs.enabled: true`.
+      #   2. Fetch the serialized spec:
+      #         curl -fsS http://localhost:8080/api-docs > openapi.json
+      #      (Swagger UI lives at http://localhost:8080/swagger-ui.html.)
+      #   3. Feed openapi.json to the mobile OpenAPI-codegen client
+      #      (see beautica-backend/openapi_generator_config.json).
+      #
+      # TODO(contract-drift): When a dedicated spec-export is justified, add a
+      #   `springdoc-openapi-gradle-plugin` `generateOpenApiDocs` task here,
+      #   backed by a `services: postgres` container + the `local`/`test`
+      #   profile, and upload the resulting openapi.json as an artifact named
+      #   `openapi-spec`. The mobile contract-drift job then downloads that
+      #   artifact instead of pointing at a running backend. Tracked so the
+      #   mobile client never silently drifts from the backend contract.
+      # ────────────────────────────────────────────────────────────────────

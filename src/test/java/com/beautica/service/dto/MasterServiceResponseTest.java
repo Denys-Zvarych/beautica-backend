@@ -1,0 +1,300 @@
+package com.beautica.service.dto;
+
+import com.beautica.master.entity.Master;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
+import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.entity.ServiceType;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.math.BigDecimal;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class MasterServiceResponseTest {
+
+    private static final int BASE_DURATION = 60;
+    private static final int OVERRIDE_DURATION = 45;
+    private static final BigDecimal BASE_PRICE = new BigDecimal("500.00");
+    private static final BigDecimal OVERRIDE_PRICE = new BigDecimal("450.00");
+
+    @Test
+    @DisplayName("effective duration is the override value when a duration override is set")
+    void should_computeEffectiveDurationAsOverride_when_durationOverrideSet() {
+        var msa = buildAssignment(OVERRIDE_PRICE, OVERRIDE_DURATION);
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.effectiveDurationMinutes()).isEqualTo(OVERRIDE_DURATION);
+    }
+
+    @Test
+    @DisplayName("effective duration falls back to base duration when no duration override is set")
+    void should_computeEffectiveDurationAsBase_when_noOverride() {
+        var msa = buildAssignment(null, null);
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.effectiveDurationMinutes()).isEqualTo(BASE_DURATION);
+    }
+
+    @Test
+    @DisplayName("effective price is the override value when a price override is set")
+    void should_computeEffectivePriceAsOverride_when_priceOverrideSet() {
+        var msa = buildAssignment(OVERRIDE_PRICE, null);
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.effectivePrice()).isEqualByComparingTo(OVERRIDE_PRICE);
+    }
+
+    @Test
+    @DisplayName("effective price falls back to base price when no price override is set")
+    void should_computeEffectivePriceAsBasePrice_when_noOverride() {
+        var msa = buildAssignment(null, null);
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.effectivePrice()).isEqualByComparingTo(BASE_PRICE);
+    }
+
+    @Test
+    @DisplayName("all passthrough fields are mapped correctly when a fully-populated MSA is converted")
+    void should_mapAllPassthroughFields_when_msaMapped() {
+        UUID expectedMsaId = UUID.randomUUID();
+        UUID expectedMasterId = UUID.randomUUID();
+        UUID expectedSdId = UUID.randomUUID();
+
+        var serviceDefinition = ServiceDefinition.builder()
+                .id(expectedSdId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure Classic")
+                .description("Classic manicure service")
+                .category("MANICURE")
+                .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
+                .basePrice(BASE_PRICE)
+                .priceMax(null)
+                .bufferMinutesAfter(10)
+                .isActive(true)
+                .build();
+
+        var master = Master.builder()
+                .id(expectedMasterId)
+                .build();
+
+        var msa = MasterServiceAssignment.builder()
+                .id(expectedMsaId)
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .priceOverride(OVERRIDE_PRICE)
+                .durationOverrideMinutes(OVERRIDE_DURATION)
+                .isActive(true)
+                .build();
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.id()).isEqualTo(expectedMsaId);
+        assertThat(response.masterId()).isEqualTo(expectedMasterId);
+        assertThat(response.priceOverride()).isEqualByComparingTo(OVERRIDE_PRICE);
+        assertThat(response.durationOverrideMinutes()).isEqualTo(OVERRIDE_DURATION);
+        assertThat(response.isActive()).isTrue();
+        assertThat(response.serviceDefinition().id()).isEqualTo(expectedSdId);
+    }
+
+    @Test
+    @DisplayName("effective price is null when neither base price nor price override is set")
+    void should_returnNullEffectivePrice_when_noPriceSetAnywhere() {
+        var serviceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure Classic")
+                .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
+                .basePrice(null)
+                .priceMax(null)
+                .isActive(true)
+                .build();
+
+        var master = Master.builder()
+                .id(UUID.randomUUID())
+                .build();
+
+        var msa = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .priceOverride(null)
+                .isActive(true)
+                .build();
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.effectivePrice()).isNull();
+    }
+
+    // ── HIGH-2: RANGE pricing fields surfaced through MasterServiceResponse ──────
+
+    @Test
+    @DisplayName("RANGE priceType, priceMin, priceMax and priceDisplay are surfaced when MSA has a RANGE ServiceDefinition")
+    void should_surfaceRangePriceFields_when_msaHasRangeServiceDefinition() {
+        var rangeServiceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Range Manicure")
+                .description("Flexible pricing manicure")
+                .category("MANICURE")
+                .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.RANGE)
+                .basePrice(new BigDecimal("600.00"))
+                .priceMax(new BigDecimal("1200.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        var master = Master.builder()
+                .id(UUID.randomUUID())
+                .build();
+
+        var msa = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(rangeServiceDefinition)
+                .priceOverride(null)
+                .durationOverrideMinutes(null)
+                .isActive(true)
+                .build();
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.priceType())
+                .as("priceType must be RANGE for a RANGE service definition")
+                .isEqualTo(PriceType.RANGE);
+        assertThat(response.priceMin())
+                .as("priceMin must equal base_price (600) — the RANGE floor")
+                .isEqualByComparingTo(new BigDecimal("600.00"));
+        assertThat(response.priceMax())
+                .as("priceMax must equal price_max (1200) — the RANGE ceiling")
+                .isEqualByComparingTo(new BigDecimal("1200.00"));
+        assertThat(response.priceDisplay())
+                .as("priceDisplay must use PriceDisplayFormatter RANGE format — whole hryvnia, no .00")
+                .isEqualTo("від 600 до 1200 ₴");
+    }
+
+    // ── Phase 16.4: serviceTypeId + serviceTypeNameUk lifted from the nested definition ──
+
+    @Test
+    @DisplayName("serviceTypeId + serviceTypeNameUk + serviceTypeSlug are lifted from the nested ServiceDefinition's ServiceType")
+    void should_mapServiceTypeFields_when_serviceDefinitionHasServiceType() {
+        UUID serviceTypeId = UUID.randomUUID();
+        var serviceType = ServiceType.builder()
+                .id(serviceTypeId)
+                .nameUk("Манікюр")
+                .slug("manicure")
+                .platformCategoryName("MANICURE")
+                .active(true)
+                .build();
+
+        var response = MasterServiceResponse.from(buildAssignmentWithType(serviceType));
+
+        assertThat(response.serviceTypeId())
+                .as("serviceTypeId must be lifted from the nested ServiceDefinition's ServiceType")
+                .isEqualTo(serviceTypeId);
+        assertThat(response.serviceTypeNameUk())
+                .as("serviceTypeNameUk must be the chosen type's Ukrainian display name")
+                .isEqualTo("Манікюр");
+        assertThat(response.serviceTypeSlug())
+                .as("serviceTypeSlug must be lifted from the nested ServiceDefinition's ServiceType.slug")
+                .isEqualTo("manicure");
+        assertThat(response.serviceDefinition().serviceTypeSlug())
+                .as("the nested ServiceDefinitionResponse must also carry the slug it was lifted from")
+                .isEqualTo("manicure");
+    }
+
+    @Test
+    @DisplayName("serviceTypeId + serviceTypeNameUk + serviceTypeSlug are all null when the ServiceDefinition has no ServiceType")
+    void should_mapNullServiceTypeFields_when_serviceDefinitionHasNoServiceType() {
+        var response = MasterServiceResponse.from(buildAssignmentWithType(null));
+
+        assertThat(response.serviceTypeId())
+                .as("serviceTypeId must be null when no service type was chosen (picker is optional)")
+                .isNull();
+        assertThat(response.serviceTypeNameUk())
+                .as("serviceTypeNameUk must be null when no service type was chosen")
+                .isNull();
+        assertThat(response.serviceTypeSlug())
+                .as("serviceTypeSlug must be null when no service type was chosen (nullable-link case)")
+                .isNull();
+        assertThat(response.serviceDefinition().serviceTypeSlug())
+                .as("the nested ServiceDefinitionResponse slug must also be null")
+                .isNull();
+    }
+
+    // --- helpers ---
+
+    private MasterServiceAssignment buildAssignmentWithType(ServiceType serviceType) {
+        var serviceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure Classic")
+                .category("MANICURE")
+                .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
+                .basePrice(BASE_PRICE)
+                .priceMax(null)
+                .bufferMinutesAfter(10)
+                .isActive(true)
+                .serviceType(serviceType)
+                .build();
+
+        var master = Master.builder()
+                .id(UUID.randomUUID())
+                .build();
+
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .priceOverride(null)
+                .durationOverrideMinutes(null)
+                .isActive(true)
+                .build();
+    }
+
+    private MasterServiceAssignment buildAssignment(BigDecimal priceOverride, Integer durationOverride) {
+        var serviceDefinition = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure Classic")
+                .description("Classic manicure service")
+                .category("MANICURE")
+                .baseDurationMinutes(BASE_DURATION)
+                .priceType(PriceType.FIXED)
+                .basePrice(BASE_PRICE)
+                .priceMax(null)
+                .bufferMinutesAfter(10)
+                .isActive(true)
+                .build();
+
+        var master = Master.builder()
+                .id(UUID.randomUUID())
+                .build();
+
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .priceOverride(priceOverride)
+                .durationOverrideMinutes(durationOverride)
+                .isActive(true)
+                .build();
+    }
+}

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="uk">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Підтвердьте вашу електронну пошту</title>
+</head>
+<body style="margin:0;padding:0;background-color:#E6DDD0;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#E6DDD0;">
+    <tr><td align="center" style="padding:32px 16px;">
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0"
+             style="background:#FDFAF7;border:1px solid #D4C5B5;border-radius:16px;max-width:480px;width:100%;">
+        <tr><td style="padding:40px 40px 0;">
+
+          <!-- Logo -->
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr><td align="center" style="padding-bottom:28px;">
+              <img src="cid:beauticaLogo"
+                   alt="Beautica"
+                   width="64" height="64"
+                   style="display:block;border:0;outline:none;border-radius:14px;"/>
+            </td></tr>
+
+            <!-- Heading -->
+            <tr><td style="color:#0D0906;font-size:22px;font-weight:700;line-height:1.3;padding-bottom:12px;
+                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+              Підтвердьте вашу електронну пошту
+            </td></tr>
+
+            <!-- Body text -->
+            <tr><td style="color:#3D2B1A;font-size:15px;line-height:1.7;padding-bottom:28px;
+                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+              Введіть цей код у застосунку Beautica, щоб завершити реєстрацію.
+            </td></tr>
+
+            <!-- OTP code block -->
+            <tr><td align="center" style="padding-bottom:28px;">
+              <span th:text="${code}"
+                    style="display:inline-block;font-size:36px;font-weight:700;
+                           letter-spacing:12px;color:#0D0906;
+                           background:#E6DDD0;border:2px solid #B89A7A;
+                           padding:18px 32px;border-radius:12px;
+                           font-family:'Courier New',Courier,monospace;">
+                000000
+              </span>
+            </td></tr>
+
+            <!-- Validity note -->
+            <tr><td style="color:#6A4A28;font-size:13px;padding-bottom:8px;
+                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+              Код дійсний протягом 15 хвилин.
+            </td></tr>
+          </table>
+
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="padding:24px 40px 32px;border-top:1px solid #EDE4D7;margin-top:16px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr><td style="color:#9A836E;font-size:12px;line-height:1.6;
+                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+              Якщо ви не реєструвалися в Beautica, проігноруйте цей лист.
+            </td></tr>
+          </table>
+        </td></tr>
+      </table>
+
+      <!-- Bottom tagline -->
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;">
+        <tr><td align="center" style="padding-top:20px;">
+          <span style="color:#9A836E;font-size:12px;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+            © Beautica — платформа краси
+          </span>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

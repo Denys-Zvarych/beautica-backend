@@ -1,19 +1,61 @@
 # Test profile — placeholder values so Spring context loads without real infrastructure
 spring:
+  main:
+    allow-bean-definition-overriding: true
+    banner-mode: "off"
   datasource:
     # Overridden at runtime by Testcontainers @ServiceConnection
     url: jdbc:postgresql://localhost:5432/beautica_test
     username: test
     password: test
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
   mail:
     host: localhost
     port: 25
     username: test
     password: test
+    test-connection: false
+    properties:
+      '[mail.smtp.connectiontimeout]': 1000
+      '[mail.smtp.timeout]': 1000
+      '[mail.smtp.writetimeout]': 1000
 
 app:
+  rate-limit:
+    register-capacity: 100000
+    login-capacity: 100000
+    refresh-capacity: 100000
+    slots-capacity: 100000
+    device-token-capacity: 100000
+    media-upload-capacity: 100000
+    verify-email-capacity: 100000
+    resend-verification-capacity: 100000
+    forgot-password-capacity: 100000
+    reset-password-capacity: 100000
+    profile-update-capacity: 100000
+    support-contact-capacity: 100000
+    verify-password-reset-otp-capacity: 100000
+    change-password-otp-capacity: 100000
+    # High so BookingConcurrencyTest's 10-concurrent-requests-from-one-client scenario (and
+    # any other IT firing several POST /bookings / PATCH /bookings/{id}/reschedule calls for
+    # the same authenticated client) is not itself rate-limited — mirrors every other capacity
+    # above (production default stays the tight 5/10s in RateLimitConfig).
+    booking-write-capacity: 100000
+    # High so an IT firing several PATCH /bookings/{id}/decline or /not-complete calls for the
+    # same authenticated provider (e.g. GuestBookingDeclineNotificationIT, BookingCommentPersistenceIT)
+    # is not itself rate-limited — production default stays 10/60s in RateLimitConfig.
+    # BookingRateLimitFilterTest's decline/not-complete throttling assertions build the filter
+    # directly against a hand-built single-slot LoadingCache (bypassing this property entirely),
+    # so this override does not neuter that coverage.
+    booking-decline-capacity: 100000
   jwt:
-    secret: test-secret-that-is-long-enough-for-hs256-ok-padding-here
+    # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
+    # integration tests loaded via this profile use the placeholder below. Keep both in sync.
+    secret: ${JWT_SECRET:test-jwt-secret-placeholder-min-32-bytes-testonly}
+    access-token-expiration: 3600000
+    refresh-token-expiration: 604800000
   cloudflare-r2:
     access-key-id: test
     secret-access-key: test
@@ -23,3 +65,69 @@ app:
     service-account: test
   frontend:
     base-url: http://localhost:3000
+  invite:
+    token-expiration-hours: 72
+    from-email: noreply@beautica.app
+  admin-email: admin@beautica.test
+  public-base-url: http://localhost:8080
+  security:
+    # Test profile only — fixed 32+ char value so the context loads under `test`.
+    otp-pepper: test-otp-pepper-fixed-value-min-32-characters
+  verification:
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    stale-code-retention: 24h
+    resend-cooldown: 60s   # Integration tests use the production default; unit tests pass Duration directly
+  password-reset:
+    cleanup-retention: 7d
+  password-reset-otp:
+    otp-ttl: 15m
+    max-attempts-per-code: 5
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    resend-cooldown: 60s   # Integration tests use the production default; unit tests pass Duration directly
+    ticket-ttl: 10m
+  outbox:
+    # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
+    payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  internal-api-key: test-internal-api-key
+
+notification:
+  outbox:
+    drain:
+      # QA fix (track 25.x booking-enrichment audit, 2026-07-14): the real
+      # @Scheduled(fixedDelayString) NotificationOutboxDrainWorker.drain() timer is live in
+      # every full @SpringBootTest context (SchedulingConfig is not profile-gated). Integration
+      # tests drive draining deterministically via a direct drainWorker.drain() call — the
+      # background timer racing that manual call over the same PENDING row
+      # (SELECT ... FOR UPDATE SKIP LOCKED) caused a rare "expected: SENT but was: PENDING"
+      # flake in NotificationOutboxIntegrationTest, plus a logged
+      # ObjectOptimisticLockingFailureException when the background worker's phase-3 save()
+      # later targeted a row a test had already deleteAll()'d. One hour comfortably exceeds any
+      # single test-suite run, so the background timer never fires during tests; production
+      # keeps the 5000ms default (see NotificationOutboxDrainWorker#drain javadoc).
+      fixed-delay-ms: 3600000
+      # fixedDelay does NOT delay the FIRST @Scheduled fire — without this, drain() fires once at
+      # t≈0 on EVERY @SpringBootTest context startup (SchedulingConfig#EnableScheduling is not
+      # profile-gated). This keeps the background scheduler quiet during tests (hygiene). NOTE: this
+      # does NOT fix the NotificationOutboxIntegrationTest concurrency flake — that flake was proven
+      # to reproduce with the scheduler fully suppressed (root cause is elsewhere; see below).
+      initial-delay-ms: 3600000
+    reclaim:
+      # Same one-hour-comfortably-exceeds-any-test-run reasoning as drain.fixed-delay-ms above —
+      # the background NotificationOutboxReclaimJob timer must not fire mid-test and reclaim a
+      # row a test is still in the middle of asserting on. Tests that need to exercise the
+      # reclaim sweep itself call NotificationOutboxReclaimJob#sweep() directly with a pinned
+      # Clock, bypassing the scheduler entirely.
+      fixed-delay-ms: 3600000
+      # Suppress the reclaim job's t≈0 first fire too (same fixedDelay-first-fire reason as drain).
+      initial-delay-ms: 3600000
+      # Config-record binding requires SOME positive value even though tests never wait for the
+      # scheduler; unit/repository tests pass an explicit staleBefore Instant directly and never
+      # read this property.
+      stale-claim-threshold: 60m
+
+management:
+  health:
+    mail:
+      enabled: false

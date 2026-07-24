@@ -5,61 +5,278 @@ spring:
   datasource:
     url: ${DATABASE_URL}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      keepalive-time: 120000
+      max-lifetime: 1200000
+      idle-timeout: 300000
+      minimum-idle: 2              # Low startup footprint on Railway 512MB; pool grows on demand
+      maximum-pool-size: 10        # Neon free tier hard ceiling — do not raise without a plan upgrade
+      connection-timeout: 20000    # Fail faster under pool saturation; 30s was masking exhaustion (was 30000)
+      leak-detection-threshold: 10000  # Alert on connections held > 10 s — indicates a blocking or long-running query
 
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: validate
     show-sql: false
     properties:
       hibernate:
-        dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: true
+        default_batch_fetch_size: 50
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+        query:
+          in_clause_parameter_padding: true
 
   flyway:
     enabled: true
     locations: classpath:db/migration
 
+  data:
+    web:
+      pageable:
+        max-page-size: 100
+
+  cache:
+    type: caffeine
+
+  thymeleaf:
+    cache: true   # explicit — prevents accidental cache=false if a sibling profile adds thymeleaf.* keys
+
+  threads:
+    virtual:
+      enabled: true
+
+  servlet:
+    multipart:
+      # Image uploads are bounded at 5 MB — aligned with MediaService.MAX_FILE_BYTES (5 MB).
+      # Oversized requests are rejected at the Tomcat layer before reaching the controller.
+      max-file-size: 5MB
+      max-request-size: 5MB
+      # Explicit temp directory avoids platform-specific default locations on non-Railway hosts.
+      location: ${java.io.tmpdir}/beautica-uploads
+
   mail:
-    host: smtp.sendgrid.net
+    host: smtp-relay.brevo.com
     port: 587
-    username: apikey
-    password: ${SENDGRID_API_KEY}
+    username: ${BREVO_SMTP_LOGIN}
+    password: ${BREVO_SMTP_KEY}
     properties:
       mail:
         smtp:
           auth: true
           starttls:
             enable: true
+          connectiontimeout: 5000
+          timeout: 10000
+          writetimeout: 10000
 
 server:
   port: 8080
+  # forward-headers-strategy is intentionally omitted (defaults to 'none').
+  # Setting it to 'native' would cause Spring's ForwardedHeaderFilter to strip
+  # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
+  # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
+  tomcat:
+    # Swallow up to 5 MB of an oversized request body so Tomcat returns a clean 413
+    # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.
+    max-swallow-size: 5MB
+
+notification:
+  outbox:
+    reclaim:
+      # Minimum age (from updated_at) before a PROCESSING notification_outbox row is treated as
+      # stranded by a crashed/killed instance (most commonly a Railway rolling-deploy teardown
+      # mid-dispatch) and reclaimed back to PENDING (or DEAD if retries are exhausted) by
+      # NotificationOutboxReclaimJob. Must comfortably exceed NotificationOutboxDrainWorker's
+      # worst-case Phase 2 dispatch window for a full batch (~33 min at BATCH_SIZE=50) — see
+      # NotificationOutboxDrainWorker#drain() javadoc.
+      stale-claim-threshold: 60m
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health
   endpoint:
     health:
-      show-details: when-authorized
+      show-details: never
+  health:
+    # Mail health disabled: SMTP (Brevo) failures are non-fatal.
+    # The email service degrades gracefully (silent log on MailException).
+    # Fix BREVO_SMTP_KEY / BREVO_SMTP_LOGIN in Railway env vars separately.
+    mail:
+      enabled: false
+
+logging:
+  level:
+    root: INFO
+    com.beautica: INFO
+    org.springframework: WARN
+    org.hibernate: WARN
+    org.flywaydb: INFO
 
 springdoc:
   api-docs:
     path: /api-docs
+    enabled: false
   swagger-ui:
     path: /swagger-ui.html
+    enabled: false
 
 app:
   jwt:
     secret: ${JWT_SECRET}
-    access-token-expiration: 900000       # 15 min in ms
-    refresh-token-expiration: 2592000000  # 30 days in ms
+    access-token-expiration: 3600000      # 1 hour in ms
+    refresh-token-expiration: 604800000   # 7 days in ms
   cloudflare-r2:
-    access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID}
-    secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY}
+    # Master kill-switch. When false (default), S3Config does NOT register an S3Client bean and
+    # R2StorageService (Phase 7.4) will run in stub-safe mode. Set R2_ENABLED=true only when all
+    # four CLOUDFLARE_R2_* env vars below are populated; S3Config fails fast otherwise.
+    enabled: ${R2_ENABLED:false}
+    account-id: ${CLOUDFLARE_R2_ACCOUNT_ID:}
+    access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID:}
+    secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY:}
     bucket: ${CLOUDFLARE_R2_BUCKET:beautica-media}
-    endpoint: ${CLOUDFLARE_R2_ENDPOINT}
+    endpoint: ${CLOUDFLARE_R2_ENDPOINT:}
+    public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
   firebase:
-    service-account: ${FIREBASE_SERVICE_ACCOUNT}
+    service-account: ${FIREBASE_SERVICE_ACCOUNT:}
   frontend:
     base-url: ${FRONTEND_BASE_URL:http://localhost:3000}
+  invite:
+    token-expiration-hours: 48
+    from-email: noreply@beautica.app
+  booking:
+    # Phase 13.3 — guest booking. How many days ahead the public availability
+    # endpoint (GET /book/{slug}/availability) will serve slots.
+    availability-max-days: ${BOOKING_AVAILABILITY_MAX_DAYS:60}
+    # Phase 13.4 — guest cancel by link. Minimum lead time (hours) before the
+    # appointment during which a guest may still cancel via the cancel link.
+    # A cancel request inside this window returns 422.
+    cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
+    sms:
+      # Ukrainian SMS copy with {placeholder} tokens substituted at send time
+      # (GuestBookingService / BookingReminderJob). Multiline via YAML block scalar.
+      # Rendered text (a guest's appointment details) is never logged.
+      confirmation: |-
+        Beautica: Запис підтверджено!
+        {masterName}, {serviceName}
+        {date} о {time}
+
+        Скасувати: {cancelUrl}
+      reminder: |-
+        Beautica: Нагадуємо!
+        {serviceName} у {masterName}
+        Завтра о {time}
+      cancellation: |-
+        Beautica: Ваш запис скасовано.
+        {serviceName} у {masterName}
+        {date} о {time}
+      # Phase 25.7 — sent to a GUEST (LINK) booking's phone when the provider declines. A guest
+      # has no account for email/push, so this SMS is the only channel that tells them at all.
+      # Deliberately does NOT include the reason clause — see decline-reason below — the
+      # provider's note is optional (Phase 25.9) and this template must stand alone, coherently,
+      # without one.
+      decline: |-
+        Beautica: На жаль, ваш запис скасовано.
+        {serviceName} у {masterName}
+        {date} о {time}
+      # Phase 25.9 — appended to `decline` above ONLY when the provider actually left a note, so
+      # an optional/absent note never leaves a dangling "Причина: " label with nothing after it.
+      # {comment} is the provider's decline note, truncated to ~120 chars before substitution.
+      # Double-quoted (not a block scalar) so the leading "\n\n" separator is unambiguous.
+      decline-reason: "\n\nПричина: {comment}"
+  admin-email: ${ADMIN_EMAIL:admin@beautica.app}
+  support:
+    # Fixed destination inbox for the Help / Contact-us feature
+    # (POST /api/v1/support/contact). Env-driven; blank default does NOT fail
+    # startup — when unset, the contact endpoint returns a clean 503 business
+    # error instead of crashing the app or emailing an empty recipient.
+    email: ${SUPPORT_EMAIL:}
+  sms:
+    # Turbosms SMS provider (Phase 13.1) — cheapest UA provider, shared SMS layer
+    # for Phase 13 OTP + notifications. Env-driven token; blank default does NOT
+    # fail startup (graceful degradation like app.support / R2 / Firebase) — a send
+    # attempt with no token throws a clean SmsDeliveryException. The token is a
+    # secret and is never logged.
+    turbosms:
+      token: ${TURBOSMS_TOKEN:}
+      sender-name: ${TURBOSMS_SENDER_NAME:Beautica}
+      base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
+  json:
+    # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
+    # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB
+    # value (e.g. a `comment`/`note`) is rejected before it is materialised onto the heap
+    # and before @Size validation runs — closing a cross-cutting DoS-amplification gap.
+    # 65536 chars = 64 KB: >16x headroom over the 4000-char largest free-text @Size field
+    # while still blocking multi-MB payloads. Applies in every profile (incl. test).
+    max-string-length: ${APP_JSON_MAX_STRING_LENGTH:65536}
+    max-nesting-depth: ${APP_JSON_MAX_NESTING_DEPTH:64}
+    max-number-length: ${APP_JSON_MAX_NUMBER_LENGTH:100}
+  # Externally-reachable base URL of THIS backend. Used to build the admin
+  # category-approval link in the notification email. Distinct from
+  # app.frontend.base-url (the app origin) — the approval page is served here.
+  public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
+  security:
+    # Keyed HMAC-SHA256 pepper for the 6-digit verification OTP. Distinct from
+    # JWT_SECRET. Generate: openssl rand -base64 32. Empty default forces every
+    # profile to supply a value or fail fast at startup (>= 32 chars required).
+    otp-pepper: ${APP_OTP_PEPPER:}
+  verification:
+    # Resend-surviving cumulative brute-force bound: after this many lifetime
+    # failed verifies (NOT reset by resend) the account is locked for
+    # lockout-duration. A couple of honest mistakes + a resend never trips it.
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    # Abandoned unverified OTP rows older than this are nulled by the daily sweep.
+    stale-code-retention: 24h
+    # Minimum time between two consecutive OTP resend requests for the same account.
+    # Overridden to 10s in the local profile so developers don't wait 60s during testing.
+    resend-cooldown: 60s
+  password-reset:
+    # Reset tickets expired longer than this are hard-deleted by the daily sweep
+    # (PasswordResetTokenCleanupJob) — keeps password_reset_tickets from growing
+    # unbounded. A few days of buffer past the 10 min ticket TTL for support/forensic lookup.
+    cleanup-retention: 7d
+  password-reset-otp:
+    # 6-digit OTP lifetime for the password-reset request/verify step (mirrors
+    # app.verification's shape). Kept short — 15 minutes is plenty to check an inbox.
+    otp-ttl: 15m
+    # Per-code attempt cap before PasswordResetOtpProcessor treats the code as expired.
+    max-attempts-per-code: 5
+    # Resend-surviving cumulative brute-force bound: after this many lifetime failed
+    # verifies (NOT reset by a fresh OTP request) the account is locked for lockout-duration.
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    # Minimum time between two consecutive OTP requests for the same account. Shared by
+    # both entry points (forgot-password and the authenticated change-password-from-settings
+    # request-otp). Overridden to a shorter value in the local profile.
+    resend-cooldown: 60s
+    # Lifetime of the PasswordResetTicket minted after a successful OTP verification. Short
+    # — the caller has just proven account ownership and is expected to complete the reset
+    # immediately (unlike the old 1-hour email-link TTL).
+    ticket-ttl: 10m
+  rate-limit:
+    # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
+    # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.
+    device-token-capacity: 30
+    # POST/DELETE /api/v1/media/* — 10/min per IP; balances upload retries
+    # (after a 400 on wrong MIME / oversize) with abuse prevention.
+    media-upload-capacity: 10
+    # POST /api/v1/auth/forgot-password — 3/hr per IP (60-min window).
+    # Email-bomb surface; kept low. Decoupled from reset-password so a NAT-shared
+    # client spamming forgot-password cannot lock out their own reset-confirm.
+    forgot-password-capacity: 3
+    # POST /api/v1/auth/reset-password — 10/hr per IP (60-min window).
+    # Sends no email; higher cap tolerates legitimate new-password typo retries
+    # against a single emailed token.
+    reset-password-capacity: 10
+  outbox:
+    # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
+    # Generate with: openssl rand -base64 32
+    # Empty default forces every profile (incl. test) to provide a value or fail fast at startup.
+    payload-key: ${OUTBOX_PAYLOAD_KEY:}
+  internal-api-key: ${INTERNAL_API_KEY:changeme-dev-only}

@@ -1,0 +1,84 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/beautica
+    username: beautica
+    password: beautica
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  thymeleaf:
+    cache: false  # live-reload during local development
+
+  cache:
+    type: caffeine
+    caffeine:
+      spec: maximumSize=200,expireAfterWrite=60m
+
+  mail:
+    host: localhost
+    port: 1025
+    username: ""
+    password: ""
+    properties:
+      mail:
+        smtp:
+          auth: false
+          starttls:
+            enable: false
+
+app:
+  jwt:
+    secret: ${JWT_SECRET}
+    access-token-expiration: 3600000
+    refresh-token-expiration: 604800000
+  cloudflare-r2:
+    access-key-id: local
+    secret-access-key: local
+    bucket: beautica-media
+    endpoint: http://localhost:9000
+  firebase:
+    service-account: ""
+  frontend:
+    base-url: http://localhost:3000
+  invite:
+    token-expiration-hours: 48
+    from-email: noreply@beautica.app
+  admin-email: ${ADMIN_EMAIL:dev-admin@localhost}
+  public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
+  security:
+    # Local dev only — never use in prod. Generate prod value: openssl rand -base64 32.
+    # Env-wrapped so a future profile copy can't silently reuse the committed dev value;
+    # the default keeps local behaviour unchanged.
+    otp-pepper: ${APP_OTP_PEPPER:local-dev-otp-pepper-not-for-prod-min32chars}
+  verification:
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    stale-code-retention: 24h
+    resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between resend attempts
+  password-reset:
+    cleanup-retention: 7d
+  password-reset-otp:
+    otp-ttl: 15m
+    max-attempts-per-code: 5
+    cumulative-failure-threshold: 10
+    lockout-duration: 15m
+    resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between requests
+    ticket-ttl: 10m
+  outbox:
+    # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
+    payload-key: ${OUTBOX_PAYLOAD_KEY}
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true

@@ -1,0 +1,183 @@
+package com.beautica.config;
+
+import com.beautica.auth.AccessTokenDenylist;
+import com.beautica.auth.JwtAuthenticationFilter;
+import com.beautica.auth.JwtTokenProvider;
+import com.beautica.auth.PasswordResetService;
+import com.beautica.auth.TokensValidAfterCache;
+import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import io.github.bucket4j.Bucket;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import org.mockito.Mockito;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
+
+/**
+ * Shared {@code @TestConfiguration} for all {@code @WebMvcTest} slices.
+ *
+ * <p>Replaces the two {@code @Component} filters that Spring Boot auto-registers
+ * with stateless pass-through implementations. Without this override, Mockito
+ * mocks of these filters swallow the request and return an empty 200, preventing
+ * the DispatcherServlet from ever being reached.
+ *
+ * <h2>Usage</h2>
+ * <pre>{@code
+ * @WebMvcTest(MyController.class)
+ * @Import(WebMvcTestSupport.class)
+ * class MyControllerTest { ... }
+ * }</pre>
+ *
+ * <p>Tests that need public (unauthenticated) endpoints or method-security
+ * ({@code @PreAuthorize}) must additionally declare their own
+ * {@code @TestConfiguration}-inner class with a {@code SecurityFilterChain} bean
+ * and annotate that inner class with {@code @EnableMethodSecurity}.
+ *
+ * <h2>Authentication in tests</h2>
+ * Inject auth directly via
+ * {@code SecurityMockMvcRequestPostProcessors.authentication()} — do not use
+ * {@code @WithMockUser}, which never populates the {@code details} field read by
+ * controllers via {@code authentication.getDetails()}.
+ */
+@TestConfiguration
+public class WebMvcTestSupport {
+
+    /**
+     * Pass-through {@link JwtAuthenticationFilter}: never parses a real JWT.
+     * Tests inject authentication directly via the {@code authentication()}
+     * post-processor, so no JWT validation is needed in the filter chain.
+     */
+    @Bean
+    @Primary
+    public JwtAuthenticationFilter jwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
+                                                           AccessTokenDenylist accessTokenDenylist,
+                                                           TokensValidAfterCache tokensValidAfterCache) {
+        return new JwtAuthenticationFilter(jwtTokenProvider, accessTokenDenylist, tokensValidAfterCache) {
+            @Override
+            protected void doFilterInternal(HttpServletRequest req,
+                                            HttpServletResponse res,
+                                            FilterChain chain)
+                    throws ServletException, IOException {
+                chain.doFilter(req, res);
+            }
+        };
+    }
+
+    /**
+     * Mock {@link AccessTokenDenylist}: not a {@code Filter}/{@code Controller}, so it
+     * is excluded from {@code @WebMvcTest} component scanning like every other plain
+     * {@code @Component}. Provided here (once) so the {@link JwtAuthenticationFilter}
+     * constructor above resolves without every importing test class needing its own
+     * {@code @MockBean}.
+     */
+    @Bean
+    @Primary
+    public AccessTokenDenylist accessTokenDenylist() {
+        return Mockito.mock(AccessTokenDenylist.class);
+    }
+
+    /**
+     * Mock {@link TokensValidAfterCache}: same rationale as {@link #accessTokenDenylist()}
+     * above — a plain {@code @Component}, excluded from {@code @WebMvcTest} scanning,
+     * provided here once so the {@link JwtAuthenticationFilter} constructor resolves
+     * without every importing test class needing its own {@code @MockBean}.
+     */
+    @Bean
+    @Primary
+    public TokensValidAfterCache tokensValidAfterCache() {
+        return Mockito.mock(TokensValidAfterCache.class);
+    }
+
+    /**
+     * Pass-through {@link AuthRateLimitFilter}: rate limiting is not under test
+     * in a controller slice. {@link #shouldNotFilter} returns {@code true} so
+     * the filter is skipped entirely by the servlet container.
+     */
+    @Bean
+    @Primary
+    @SuppressWarnings("unchecked")
+    public AuthRateLimitFilter authRateLimitFilter() {
+        LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
+        return new AuthRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy,
+                dummy, dummy) {
+            @Override
+            protected void doFilterInternal(HttpServletRequest req,
+                                            HttpServletResponse res,
+                                            FilterChain chain)
+                    throws ServletException, IOException {
+                chain.doFilter(req, res);
+            }
+
+            @Override
+            public boolean shouldNotFilter(HttpServletRequest request) {
+                return true;
+            }
+        };
+    }
+
+    // NOTE: BookingRateLimitFilter deliberately has NO stand-in here. It is not a @Component —
+    // it is an explicit @Bean in RateLimitConfig, co-located with the bookingWriteBuckets
+    // LoadingCache it consumes (see its javadoc). A @WebMvcTest slice loads neither, so no slice
+    // can be broken by it and none needs a mock. Keep it that way: re-annotating it @Component
+    // would make every narrow slice — including the ones that do NOT import this class — fail to
+    // refresh with "No qualifying bean of type LoadingCache<String, Bucket>".
+
+    /**
+     * Mock {@link PasswordResetService}: the password-reset business logic is not
+     * under test in an {@code AuthController} slice. Provided so the
+     * {@code AuthController} constructor can be satisfied without loading the real
+     * service and its persistence collaborators.
+     */
+    @Bean
+    @Primary
+    public PasswordResetService passwordResetService() {
+        return Mockito.mock(PasswordResetService.class);
+    }
+
+    /**
+     * {@code InternalApiKeyProperties} is a {@code @ConfigurationProperties} bean
+     * that {@code @WebMvcTest} does not auto-bind, yet the auto-detected
+     * {@link InternalApiKeyFilter} {@code @Component} requires it. Provide a fixed
+     * test value so every slice that imports this support config loads without
+     * standing up the full {@code app.internal-api-key} property binding.
+     */
+    @Bean
+    @Primary
+    public InternalApiKeyProperties internalApiKeyProperties() {
+        InternalApiKeyProperties props = new InternalApiKeyProperties();
+        props.setInternalApiKey("test-internal-api-key");
+        return props;
+    }
+
+    /**
+     * Pass-through {@link InternalApiKeyFilter}: internal-key enforcement is not
+     * under test in the general controller slices, but the bean must exist because
+     * Spring auto-detects the {@code @Component} filter. {@link #shouldNotFilter}
+     * short-circuits it entirely.
+     */
+    @Bean
+    @Primary
+    public InternalApiKeyFilter internalApiKeyFilter(InternalApiKeyProperties props,
+                                                     ObjectMapper objectMapper) {
+        return new InternalApiKeyFilter(props, objectMapper) {
+            @Override
+            protected void doFilterInternal(HttpServletRequest req,
+                                            HttpServletResponse res,
+                                            FilterChain chain)
+                    throws ServletException, IOException {
+                chain.doFilter(req, res);
+            }
+
+            @Override
+            public boolean shouldNotFilter(HttpServletRequest request) {
+                return true;
+            }
+        };
+    }
+}

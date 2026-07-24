@@ -1,0 +1,27 @@
+package com.beautica.notification.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+
+/**
+ * Request body for {@code POST /api/v1/devices/token}.
+ *
+ * <p>{@code platform} is bound as a {@link String} (not the {@code Platform} enum)
+ * so an invalid value yields a clean Bean Validation 400 instead of leaking the
+ * valid enum constants through Jackson's deserialization error message.
+ */
+public record RegisterDeviceTokenRequest(
+
+        @NotBlank(message = "Device token is required")
+        @Size(max = 500, message = "Device token must be at most 500 characters")
+        @Pattern(
+                regexp = "^[A-Za-z0-9\\-_:]+$",
+                message = "Device token must contain only alphanumeric characters, hyphens, underscores, or colons"
+        )
+        String token,
+
+        @NotBlank(message = "Platform is required")
+        @Pattern(regexp = "^(ANDROID|IOS)$", message = "Platform must be ANDROID or IOS")
+        String platform
+) {}

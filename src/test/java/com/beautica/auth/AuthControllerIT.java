@@ -1,0 +1,389 @@
+package com.beautica.auth;
+
+import com.beautica.auth.dto.AuthResponse;
+import com.beautica.auth.dto.LoginRequest;
+import com.beautica.auth.dto.RefreshRequest;
+import com.beautica.auth.dto.RegisterRequest;
+import com.beautica.auth.dto.RegistrationResponse;
+import com.beautica.auth.dto.SelfRegistrationRole;
+import com.beautica.common.ApiResponse;
+import com.beautica.AbstractIntegrationTest;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
+import com.beautica.config.TestSecurityConfig;
+import com.beautica.user.UserRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@Import(TestSecurityConfig.class)
+@DisplayName("Auth endpoints — integration")
+class AuthControllerIT extends AbstractIntegrationTest {
+
+    private static final Logger log = LoggerFactory.getLogger(AuthControllerIT.class);
+
+    @Autowired
+    private TestRestTemplate restTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    private void verifyEmailInDb(String email) {
+        transactionTemplate.executeWithoutResult(status ->
+            userRepository.findByEmail(email).ifPresent(user -> {
+                user.setEmailVerified(true);
+                userRepository.save(user);
+            })
+        );
+    }
+
+    @Test
+    @DisplayName("should return 200 with RegistrationResponse when registering with valid data")
+    void should_return201_when_registerWithValidData() throws Exception {
+        var request = new RegisterRequest(
+                "register@beautica.com", "Str0ngP@ss1!",
+                SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null);
+        log.debug("Arrange: register request for email={}", request.email());
+
+        log.debug("Act: POST /auth/register with valid CLIENT payload");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/register", request, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status for valid CLIENT registration, email=%s", request.email())
+                .isEqualTo(HttpStatus.OK);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<RegistrationResponse>>() {});
+        assertThat(apiResponse.success()).isTrue();
+        assertThat(apiResponse.data().email()).isEqualTo("register@beautica.com");
+        assertThat(apiResponse.data().message()).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("should return 409 with EMAIL_ALREADY_REGISTERED code when registering with duplicate email")
+    void should_return409_when_registerWithDuplicateEmail() throws Exception {
+        // Arrange — first registration seeds the email, second hits the duplicate branch.
+        log.debug("Arrange: registering email={} twice", "duplicate@beautica.com");
+        var request = new RegisterRequest(
+                "duplicate@beautica.com", "Str0ngP@ss1!",
+                SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null);
+
+        ResponseEntity<String> firstResponse = restTemplate.postForEntity(
+                "/api/v1/auth/register", request, String.class);
+        assertThat(firstResponse.getStatusCode())
+                .as("seed registration must succeed with 200 OK")
+                .isEqualTo(HttpStatus.OK);
+
+        // Act — second POST with the same email triggers the duplicate branch.
+        log.debug("Act: POST /auth/register with already-registered duplicate@beautica.com");
+        ResponseEntity<String> secondResponse = restTemplate.postForEntity(
+                "/api/v1/auth/register", request, String.class);
+
+        // Assert — HTTP status is 409 Conflict (the silent-200 anti-enumeration branch
+        // was removed; the honest 409 is now the only duplicate-email path).
+        assertThat(secondResponse.getStatusCode())
+                .as("duplicate registration must surface as 409 Conflict")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        // Assert — body matches the wire contract, parsed via ObjectMapper so a
+        // malformed JSON change fails fast instead of passing a substring assertion.
+        JsonNode body = objectMapper.readTree(secondResponse.getBody());
+
+        assertThat(body.path("success").isBoolean())
+                .as("body must contain a boolean 'success' field")
+                .isTrue();
+        assertThat(body.path("success").asBoolean())
+                .as("success must be false on the 409 path")
+                .isFalse();
+
+        assertThat(body.path("data").isObject())
+                .as("body must contain a structured 'data' object")
+                .isTrue();
+        // Reference the constant — a rename of EmailAlreadyRegisteredException.ERROR_CODE
+        // must fail this test, not silently break the mobile client's routing logic.
+        assertThat(body.path("data").path("code").asText())
+                .as("data.code must equal the EMAIL_ALREADY_REGISTERED constant")
+                .isEqualTo(EmailAlreadyRegisteredException.ERROR_CODE);
+
+        assertThat(body.path("message").asText())
+                .as("message must be the stable wire-contract string")
+                .isEqualTo("Email already registered");
+    }
+
+    @Test
+    @DisplayName("should return 400 when register password is length-valid but has no uppercase (@StrongPassword)")
+    void should_return400_when_registerPasswordHasNoUppercase() {
+        var request = new RegisterRequest(
+                "no.uppercase@beautica.com", "str0ngp@ss1",
+                SelfRegistrationRole.CLIENT, "Anna", "Test", "+380501234567", null);
+        log.debug("Arrange: register request with length-valid but no-uppercase password for email={}",
+                request.email());
+
+        log.debug("Act: POST /auth/register with no-uppercase password");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/register", request, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status for register with no-uppercase password, email=%s", request.email())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("should return 200 with access and refresh tokens when login credentials are valid")
+    void should_return200WithTokenPair_when_loginWithValidCredentials() throws Exception {
+        var email = "login.valid@beautica.com";
+        var password = "Mypassword1";
+        log.debug("Arrange: pre-registering email={} with known password", email);
+
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
+                String.class);
+        verifyEmailInDb(email);
+
+        log.debug("Act: POST /auth/login with correct credentials for email={}", email);
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, password),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status for login with correct credentials, email=%s", email)
+                .isEqualTo(HttpStatus.OK);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        assertThat(apiResponse.success()).isTrue();
+        assertThat(apiResponse.data().accessToken()).isNotBlank();
+        assertThat(apiResponse.data().refreshToken()).isNotBlank();
+        assertThat(apiResponse.data().tokenType()).isEqualTo("Bearer");
+        assertThat(apiResponse.data().email()).isEqualTo(email);
+    }
+
+    @Test
+    @DisplayName("should return 401 when login is attempted with a non-existent email and wrong password")
+    void should_return401_when_loginWithBadCredentials() throws Exception {
+        log.debug("Arrange: no pre-existing user");
+
+        log.debug("Act: POST /auth/login with unknown email nonexistent@beautica.com");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest("nonexistent@beautica.com", "wrongpass"),
+                String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status for login with unknown email")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        assertThat(apiResponse.success()).isFalse();
+        assertThat(apiResponse.message()).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("should return 200 with a new rotated token pair when refresh token is valid")
+    void should_return200WithNewTokenPair_when_refreshWithValidToken() throws Exception {
+        var email = "refresh.user@beautica.com";
+        var password = "Refreshpass1";
+        log.debug("Arrange: user {} registered and logged in", email);
+
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
+                String.class);
+        verifyEmailInDb(email);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, password),
+                String.class);
+
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String originalRefreshToken = loginBody.data().refreshToken();
+
+        log.debug("Act: POST /auth/refresh using the original refresh token for email={}", email);
+        ResponseEntity<String> refreshResp = restTemplate.postForEntity(
+                "/api/v1/auth/refresh",
+                new RefreshRequest(originalRefreshToken),
+                String.class);
+
+        assertThat(refreshResp.getStatusCode())
+                .as("status for valid token refresh, email=%s", email)
+                .isEqualTo(HttpStatus.OK);
+
+        var refreshBody = objectMapper.readValue(
+                refreshResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        assertThat(refreshBody.success()).isTrue();
+        assertThat(refreshBody.data().accessToken()).isNotBlank();
+        assertThat(refreshBody.data().refreshToken()).isNotBlank();
+        assertThat(refreshBody.data().refreshToken()).isNotEqualTo(originalRefreshToken);
+    }
+
+    @Test
+    @DisplayName("should return 204 when logout is called with a valid Bearer JWT")
+    void should_return204_when_logoutWithValidJwt() throws Exception {
+        var email = "logout.user@beautica.com";
+        var password = "Logoutpass1";
+        log.debug("Arrange: obtained access token for {}", email);
+
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
+                String.class);
+        verifyEmailInDb(email);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, password),
+                String.class);
+
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String accessToken = loginBody.data().accessToken();
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(accessToken);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        log.debug("Act: POST /auth/logout with valid Bearer token for email={}", email);
+        ResponseEntity<Void> logoutResp = restTemplate.exchange(
+                "/api/v1/auth/logout",
+                HttpMethod.POST,
+                new HttpEntity<>(headers),
+                Void.class);
+
+        assertThat(logoutResp.getStatusCode())
+                .as("status for logout with valid Bearer token")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    @Test
+    @DisplayName("should return 401 when logout is called without an Authorization header")
+    void should_return401_when_logoutWithoutJwt() {
+        log.debug("Arrange: no Authorization header prepared");
+
+        log.debug("Act: POST /auth/logout with no Authorization header");
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/logout", null, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status for logout without Authorization header")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("should return 401 when reusing an access token after logout")
+    void should_return401_when_reusingAccessTokenAfterLogout() throws Exception {
+        var email = "logout.reuse@beautica.com";
+        var password = "Logoutreuse1";
+        log.debug("Arrange: obtained access token for {}", email);
+
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
+                String.class);
+        verifyEmailInDb(email);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, password),
+                String.class);
+
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String accessToken = loginBody.data().accessToken();
+
+        HttpHeaders authHeaders = new HttpHeaders();
+        authHeaders.setBearerAuth(accessToken);
+        authHeaders.setContentType(MediaType.APPLICATION_JSON);
+
+        // Sanity check: the freshly-issued access token works on an authenticated endpoint
+        // before logout, so the eventual 401 below is attributable to the logout, not to
+        // some unrelated authentication failure.
+        ResponseEntity<String> preLogoutMe = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(authHeaders), String.class);
+        assertThat(preLogoutMe.getStatusCode())
+                .as("access token must authenticate GET /users/me before logout")
+                .isEqualTo(HttpStatus.OK);
+
+        log.debug("Act: POST /auth/logout with the access token for email={}", email);
+        ResponseEntity<Void> logoutResp = restTemplate.exchange(
+                "/api/v1/auth/logout",
+                HttpMethod.POST,
+                new HttpEntity<>(authHeaders),
+                Void.class);
+        assertThat(logoutResp.getStatusCode())
+                .as("status for logout with valid Bearer token")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        log.debug("Act: replay the SAME (now-denylisted) access token on an authenticated endpoint");
+        ResponseEntity<String> postLogoutMe = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(authHeaders), String.class);
+
+        assertThat(postLogoutMe.getStatusCode())
+                .as("a denylisted access token must be rejected even though its own `exp` has not elapsed")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("should return 401 when old refresh token is replayed after rotation")
+    void should_return401_when_oldRefreshTokenReplayedAfterRotation() throws Exception {
+        var email = "replay.user@beautica.com";
+        var password = "Replaypass1";
+        log.debug("Arrange: register user email={}", email);
+
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, password, SelfRegistrationRole.CLIENT, "Test", "User", "+380501234567", null),
+                String.class);
+        verifyEmailInDb(email);
+
+        ResponseEntity<String> loginResp = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(email, password),
+                String.class);
+
+        var loginBody = objectMapper.readValue(
+                loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        String originalRefreshToken = loginBody.data().refreshToken();
+
+        log.debug("Act: first refresh — rotates the token for email={}", email);
+        restTemplate.postForEntity(
+                "/api/v1/auth/refresh",
+                new RefreshRequest(originalRefreshToken),
+                String.class);
+
+        log.debug("Act: replay the original (now-rotated) refresh token for email={}", email);
+        ResponseEntity<String> replayResp = restTemplate.postForEntity(
+                "/api/v1/auth/refresh",
+                new RefreshRequest(originalRefreshToken),
+                String.class);
+
+        assertThat(replayResp.getStatusCode())
+                .as("status when replaying a rotated-out refresh token")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+        var body = objectMapper.readValue(replayResp.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        assertThat(body.success())
+                .as("success flag must be false for revoked token replay")
+                .isFalse();
+    }
+}

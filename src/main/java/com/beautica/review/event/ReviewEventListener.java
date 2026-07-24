@@ -1,0 +1,116 @@
+package com.beautica.review.event;
+
+import com.beautica.review.repository.ReviewRepository;
+import com.github.benmanes.caffeine.cache.Cache;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.cache.CacheManager;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+import java.util.UUID;
+
+@Component
+@RequiredArgsConstructor
+public class ReviewEventListener {
+
+    private static final Logger log = LoggerFactory.getLogger(ReviewEventListener.class);
+
+    private final ReviewRepository reviewRepository;
+    private final CacheManager cacheManager;
+
+    // Runs after the outer transaction (review INSERT) commits.
+    // REQUIRES_NEW opens a separate transaction for the rating UPDATE so that a
+    // failure there does not roll back the already-committed review.
+    // Cache eviction is placed AFTER the try-catch — it runs unconditionally
+    // regardless of whether the rating recalculation succeeded or failed.
+    // This prevents stale avg_rating being served from cache after a failed recalc.
+    //
+    // TransactionSynchronizationManager is intentionally NOT used here.
+    // If eviction were registered inside the REQUIRES_NEW transaction body, a
+    // rollback of that transaction would discard the synchronization callback,
+    // leaving the cache unreachable until TTL expiry.
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void onReviewCreated(ReviewCreatedEvent event) {
+        try {
+            reviewRepository.recalculateMasterRating(event.masterId());
+        } catch (Exception ex) {
+            log.error("recalculateMasterRating failed for master={} — {}",
+                      event.masterId(), ex.getClass().getSimpleName());
+        }
+        // Eviction always runs — even if rating recalc failed — so stale pages
+        // are not served from cache.
+        evictMasterReviewPages(event.masterId());
+
+        // Symmetric salon branch (Phase 13.6): only runs when the reviewed booking
+        // belonged to a salon-affiliated master. Same fire-and-log-don't-fail contract —
+        // a salon-recalc failure must never roll back the already-committed review, and
+        // this method already runs in its own REQUIRES_NEW transaction.
+        //
+        // No "salon-detail" cache eviction here, deliberately — this mirrors the existing
+        // "master-detail" precedent (see MasterService#getMasterDetail Javadoc): the
+        // 5-minute TTL is an accepted staleness bound for rating updates reaching the
+        // public detail cache, and this listener does not evict "master-detail" either.
+        if (event.salonId() != null) {
+            try {
+                reviewRepository.recalculateSalonRating(event.salonId());
+            } catch (Exception ex) {
+                log.error("recalculateSalonRating failed for salon={} — {}",
+                          event.salonId(), ex.getClass().getSimpleName());
+            }
+            // Eviction always runs — even if rating recalc failed — so stale salon
+            // review pages are not served from cache (mirrors the master branch above).
+            evictSalonReviewPages(event.salonId());
+        }
+    }
+
+    // Evicts only the cached review pages belonging to the given master.
+    //
+    // Cache keys use the format "master:<uuid>:page:<n>:size:<m>" (set in ReviewService).
+    // Prefix scan on "master:<uuid>:" is safe — the UUID delimiter ':' cannot appear inside a UUID.
+    //
+    // Coupling note: getNativeCache() returns Caffeine's public Cache<Object,Object>.
+    // If the cache manager backend ever changes away from Caffeine, this method must be updated.
+    @SuppressWarnings("unchecked")
+    private void evictMasterReviewPages(UUID masterId) {
+        org.springframework.cache.Cache springCache = cacheManager.getCache("reviews-by-master");
+        if (springCache == null) {
+            log.warn("Cache 'reviews-by-master' not found during eviction for master={}", masterId);
+            return;
+        }
+        Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
+        String prefix = "master:" + masterId + ":";
+        nativeCache.invalidateAll(
+                nativeCache.asMap().keySet().stream()
+                        .filter(k -> k instanceof String s && s.startsWith(prefix))
+                        .toList()
+        );
+    }
+
+    // Evicts only the cached review pages belonging to the given salon.
+    //
+    // Cache keys use the format "salon:<uuid>:sort:<sort>:page:<n>:size:<m>" (set in
+    // ReviewService#getSalonReviews). Prefix scan on "salon:<uuid>:" matches every sort
+    // dimension for that salon — the UUID delimiter ':' cannot appear inside a UUID.
+    // Same Caffeine-coupling caveat as evictMasterReviewPages above.
+    @SuppressWarnings("unchecked")
+    private void evictSalonReviewPages(UUID salonId) {
+        org.springframework.cache.Cache springCache = cacheManager.getCache("reviews-by-salon");
+        if (springCache == null) {
+            log.warn("Cache 'reviews-by-salon' not found during eviction for salon={}", salonId);
+            return;
+        }
+        Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
+        String prefix = "salon:" + salonId + ":";
+        nativeCache.invalidateAll(
+                nativeCache.asMap().keySet().stream()
+                        .filter(k -> k instanceof String s && s.startsWith(prefix))
+                        .toList()
+        );
+    }
+}

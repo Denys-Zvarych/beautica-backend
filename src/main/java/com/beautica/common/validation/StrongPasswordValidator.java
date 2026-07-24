@@ -1,0 +1,80 @@
+package com.beautica.common.validation;
+
+import jakarta.validation.ConstraintValidator;
+import jakarta.validation.ConstraintValidatorContext;
+
+import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+/**
+ * Shared implementation backing {@link StrongPassword}. Used by the self-registration,
+ * independent-master registration and the password-reset DTOs so those flows can never
+ * diverge on password strength.
+ *
+ * <p>Rules (a strict superset of the mobile {@code validateNewPassword} policy):
+ * <ul>
+ *   <li>Length 8–128 (the historical bound; below 8 is rejected, above 128 guards the
+ *       BCrypt 72-byte-relevant input and oversized payloads).</li>
+ *   <li>At least one digit {@code [0-9]} — mirrors the mobile registration validator.</li>
+ *   <li>At least one uppercase ASCII letter {@code [A-Z]} — mirrors the mobile validator.</li>
+ *   <li>Case-insensitive denylist of the most trivially-guessable values (OWASP ASVS 2.1
+ *       common-password rejection). Kept deliberately small and in-process — this is a
+ *       last-line guard against the worst offenders, not a substitute for a breach-corpus
+ *       check.</li>
+ * </ul>
+ *
+ * <p>{@code null} / blank values return {@code true} (valid) — Bean Validation skips them
+ * here so {@code @NotBlank} owns the "required" message. This matches the matrix in §A of
+ * the Anti-Bug Playbook (pair the format constraint with {@code @NotBlank}).
+ */
+public class StrongPasswordValidator implements ConstraintValidator<StrongPassword, String> {
+
+    static final int MIN_LENGTH = 8;
+    static final int MAX_LENGTH = 128;
+
+    /** Precompiled once — finds at least one ASCII digit anywhere in the string. */
+    private static final Pattern HAS_DIGIT = Pattern.compile("[0-9]");
+
+    /** Precompiled once — finds at least one uppercase ASCII letter anywhere in the string. */
+    private static final Pattern HAS_UPPERCASE = Pattern.compile("[A-Z]");
+
+    /**
+     * Lower-cased denylist of trivially-weak passwords. Compared case-insensitively, so
+     * "Password" and "PASSWORD" are both rejected via a single lower-cased lookup.
+     */
+    static final Set<String> COMMON_PASSWORDS = Set.of(
+            "password",
+            "password1",
+            "password123",
+            "passw0rd",
+            "12345678",
+            "123456789",
+            "1234567890",
+            "qwerty123",
+            "qwertyuiop",
+            "11111111",
+            "00000000",
+            "iloveyou",
+            "admin123",
+            "letmein1",
+            "welcome1",
+            "abc12345",
+            "changeme"
+    );
+
+    @Override
+    public boolean isValid(String value, ConstraintValidatorContext context) {
+        // Null/blank handled by @NotBlank — skip here so messages stay distinct.
+        if (value == null || value.isBlank()) {
+            return true;
+        }
+        if (value.length() < MIN_LENGTH || value.length() > MAX_LENGTH) {
+            return false;
+        }
+        if (!HAS_DIGIT.matcher(value).find() || !HAS_UPPERCASE.matcher(value).find()) {
+            return false;
+        }
+        return !COMMON_PASSWORDS.contains(value.toLowerCase(Locale.ROOT));
+    }
+}

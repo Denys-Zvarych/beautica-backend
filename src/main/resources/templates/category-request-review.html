@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="uk">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Перегляд запиту на категорію</title>
+</head>
+<body style="margin:0;padding:0;background-color:#E6DDD0;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+  <div style="max-width:480px;margin:48px auto;padding:0 16px;">
+    <div style="background:#FDFAF7;border:1px solid #D4C5B5;border-radius:16px;padding:40px;">
+      <h1 style="color:#0D0906;font-size:22px;font-weight:700;margin:0 0 16px;">
+        Запит на нову категорію
+      </h1>
+      <p style="color:#3D2B1A;font-size:15px;line-height:1.7;margin:0 0 24px;">
+        Підтвердьте або відхиліть цей запит. Дія є остаточною.
+      </p>
+
+      <div style="background:#F3EBE0;border-radius:10px;padding:16px 18px;margin-bottom:28px;
+                  color:#3D2B1A;font-size:14px;line-height:1.8;">
+        <strong>Код:</strong> <span th:text="${categoryName}">CATEGORY</span><br/>
+        <strong>Назва:</strong> <span th:text="${displayName}">Назва</span>
+      </div>
+
+      <!-- State change happens ONLY on these POST forms, never on the GET above. -->
+      <form th:action="@{/api/v1/service-categories/requests/approve}" method="post"
+            style="display:inline-block;margin-right:12px;">
+        <input type="hidden" name="token" th:value="${token}"/>
+        <button type="submit"
+                style="background:#3F6F3F;color:#F5EDE0;border:0;cursor:pointer;
+                       font-size:16px;font-weight:700;padding:14px 30px;border-radius:12px;">
+          Підтвердити
+        </button>
+      </form>
+
+      <form th:action="@{/api/v1/service-categories/requests/reject}" method="post"
+            style="display:inline-block;">
+        <input type="hidden" name="token" th:value="${token}"/>
+        <button type="submit"
+                style="background:#8A3A2E;color:#F5EDE0;border:0;cursor:pointer;
+                       font-size:16px;font-weight:700;padding:14px 30px;border-radius:12px;">
+          Відхилити
+        </button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,74 @@
+-- V51: media_files constraint hardening — documentation/checkpoint migration
+--
+-- ============================================================================
+-- WORK ITEM 1 — media_files hardening: ALREADY APPLIED IN V39 (no DDL here)
+-- ============================================================================
+-- All four objects requested for this hardening pass were already created by
+-- V39__harden_media_files_constraints.sql. V45__harden_media_files_constraints.sql
+-- is the existing no-op checkpoint that first recorded this overlap; this file
+-- re-documents it at the current head and adds the future-author notes below.
+--
+-- Re-issuing any of these here would FAIL checksum-clean environments:
+--   * Postgres `ALTER TABLE ... ADD CONSTRAINT <name>` has no IF NOT EXISTS
+--     form (V39 uses bare ADD CONSTRAINT — matched style), so a re-add throws
+--     "constraint already exists".
+--   * `CREATE UNIQUE INDEX ux_media_files_avatar` (no IF NOT EXISTS in V39 —
+--     matched style) would throw "relation already exists".
+-- Therefore this migration intentionally contains NO DDL.
+--
+-- Constraints/index confirmed present from V39 (rationale restated for the
+-- maintainer reading this at the schema head):
+--
+--   chk_media_files_r2_key_shape
+--       CHECK (r2_key ~ '^[a-zA-Z0-9/_.\-]+$'
+--              AND r2_key NOT LIKE '%..%'
+--              AND r2_key NOT LIKE '/%')
+--       Defense-in-depth path-traversal guard if an R2 key is ever joined into
+--       a filesystem path. SKIPPED here — V39 already added it under this exact
+--       name; do NOT add a second r2_key CHECK (would be a duplicate/conflict).
+--
+--   chk_media_files_r2_url_scheme
+--       CHECK (r2_url LIKE 'https://%')
+--       Rejects non-HTTPS stored URLs. SKIPPED here — V39 already added it.
+--
+--   chk_media_files_media_type_entity_type
+--       CHECK ((media_type = 'PORTFOLIO' AND entity_type IN ('SALON','MASTER'))
+--              OR media_type = 'AVATAR')
+--       PORTFOLIO is only meaningful for SALON/MASTER; AVATAR is valid for any
+--       entity_type. SKIPPED here — V39 already added it.
+--
+--   ux_media_files_avatar  (partial UNIQUE index)
+--       ON media_files (entity_type, entity_id) WHERE media_type = 'AVATAR'
+--       Enforces 1:1 AVATAR per entity so a controller bug cannot persist
+--       duplicate avatar rows. SKIPPED here — V39 already created it.
+--
+-- Safety note: media_files has no production write path yet (the media upload
+-- controller is Phase 7.6, not built). The table is empty in every environment,
+-- so the V39 constraints could never have failed on existing data, and nothing
+-- in the current tree contradicts that assumption.
+--
+-- ============================================================================
+-- WORK ITEM 6 — Notes for future migration authors
+-- ============================================================================
+-- idx_users_city_region (created in V35__add_search_indexes_and_user_geo.sql as
+-- `CREATE INDEX IF NOT EXISTS idx_users_city_region ON users(city, region);`)
+-- has an INTENTIONAL column order: (city, region). The leftmost-prefix rule
+-- means this single composite index already serves both `WHERE city = ?` and
+-- `WHERE city = ? AND region = ?` discovery queries — which is why V35 was able
+-- to drop the redundant single-column idx_salons_city for the salons mirror.
+-- A future author MUST NOT reorder these columns to (region, city): doing so
+-- would stop serving the city-only predicate via prefix match and silently
+-- regress the master/salon search queries from Phase 6. There is no JPA
+-- @Index/@Table anchor for this index (users.city / users.region are plain
+-- columns added via raw ALTER TABLE in V35, with no entity mapping), so this
+-- migration header is the canonical record of the column-order intent.
+--
+-- ============================================================================
+-- WORK ITEM 5 — recorded in code, not here
+-- ============================================================================
+-- notification/entity/Platform.java now carries an inline comment pointing at
+-- chk_device_tokens_platform (CHECK platform IN ('ANDROID','IOS')) created in
+-- V29__create_device_tokens.sql, so a future enum value change triggers a
+-- follow-up migration. No DDL change is needed for that here.
+--
+-- This file is a version checkpoint only — it deliberately performs no DDL.

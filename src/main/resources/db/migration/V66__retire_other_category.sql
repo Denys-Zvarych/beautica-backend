@@ -1,0 +1,23 @@
+-- Retire the legacy "Інше" / OTHER catch-all platform category.
+--
+-- OTHER was an obsolete fallback inherited from the original ServiceCategory
+-- enum. With the self-service category-request workflow (V65) it has no purpose
+-- and hurts discovery, so it is removed from the selectable set.
+--
+-- Soft-disable (active = FALSE) rather than DELETE: the row is referenced by the
+-- self-service workflow's UNIQUE(name) guard and may be the recorded category on
+-- legacy service_definitions rows. Flipping active to FALSE drops OTHER out of
+-- GET /api/v1/service-categories/approved (PlatformCategoryRepository
+-- .findApprovedActive filters status='APPROVED' AND active=TRUE) and causes
+-- ServiceCatalogService.validateCategoryActive to reject it for new/edited
+-- services -- both intended.
+--
+-- Existing-data note: this is pre-launch, so there is likely no
+-- service_definitions row with category='OTHER'. No bulk reassignment is done
+-- (there is no sensible target category). If any OTHER service exists it remains
+-- valid in place but must be re-categorized on its next edit -- accepted.
+--
+-- The ServiceCategory Java enum's OTHER constant is intentionally left untouched;
+-- it is internal and is no longer the source of truth for the category picker.
+
+UPDATE platform_categories SET active = FALSE WHERE name = 'OTHER';

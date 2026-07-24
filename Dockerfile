@@ -28,4 +28,16 @@ COPY --from=builder /app/build/libs/*.jar app.jar
 
 EXPOSE 8080
 
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# IMPORTANT: Do NOT change the GC flags below without a Railway plan upgrade.
+# ZGC was tried twice (Phase 9 and Phase 12 audit) and caused a silent OOM crash-loop
+# on Railway 512 MB in both cases — fixed by 32a3799, re-introduced by Phase 12.
+# SerialGC + explicit heap cap is the only proven-stable config on 512 MB.
+ENTRYPOINT ["java", \
+  "-XX:+UseSerialGC", \
+  "-XX:+ExitOnOutOfMemoryError", \
+  "-Xms128m", \
+  "-Xmx256m", \
+  "-XX:MaxMetaspaceSize=192m", \
+  "-XX:ReservedCodeCacheSize=64m", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]
