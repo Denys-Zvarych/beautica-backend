@@ -1749,7 +1749,9 @@ class BookingServiceTest {
                 locationNote,
                 "MANICURE", false,
                 null,
-                null);
+                null,
+                // clientAvatarUrl — the CLIENT projection path's own photo column.
+                "https://cdn.test/client-avatar.png");
     }
 
     @Test
@@ -1812,6 +1814,8 @@ class BookingServiceTest {
                 null,
                 "MANICURE", false,
                 priceMaxAtBooking,
+                null,
+                // clientAvatarUrl — irrelevant to this fixture's price-ceiling assertions.
                 null);
     }
 
@@ -1867,6 +1871,8 @@ class BookingServiceTest {
                 null,
                 "MANICURE", false,
                 null,
+                null,
+                // clientAvatarUrl — irrelevant to this fixture's ordering assertions.
                 null);
     }
 

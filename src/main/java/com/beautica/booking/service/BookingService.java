@@ -261,7 +261,11 @@ public class BookingService {
                 // Defensive only: this projection is CLIENT-scoped (WHERE client_id = :clientId),
                 // so p.clientId() is always non-null in practice — never a guest booking.
                 canReview(p.status(), p.reviewExists(), p.clientId() != null),
-                p.appointmentId());
+                p.appointmentId(),
+                // No null-guard needed (unlike BookingDetailResponse#from's entity path): this
+                // projection is CLIENT-scoped via `JOIN b.client`, so a guest booking cannot
+                // appear here at all. A client with no uploaded photo yields null naturally.
+                p.clientAvatarUrl());
     }
 
     /**

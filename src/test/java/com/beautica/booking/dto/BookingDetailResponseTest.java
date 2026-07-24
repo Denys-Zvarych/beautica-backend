@@ -282,4 +282,84 @@ class BookingDetailResponseTest {
 
         assertThat(response.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
     }
+
+    // ── clientAvatarUrl — deliberate client-PII widening (provider timeline photo) ────
+    //
+    // QA-authored. The field ships a provider the LIKENESS of the client who booked with them,
+    // so the three branches below are the whole contract: (1) a registered client's own photo
+    // reaches the DTO and is NOT confused with the master's, (2) a guest booking has no photo
+    // and deliberately no fallback, (3) a registered client who never uploaded one is null.
+    //
+    // Why the distinct-URL fixture in (1) matters: clientAvatarUrl and masterAvatarUrl are
+    // adjacent String reads off two different User graphs (client vs master.getUser()). The
+    // shipped mapper is `client != null ? client.getAvatarUrl() : null` — one edit away from
+    // `masterUser.getAvatarUrl()`. Every pre-existing fixture in this suite leaves the master's
+    // avatar unstubbed (null) and the client's unstubbed (null), so that swap would have been
+    // invisible: null == null. Seeding two DIFFERENT non-null URLs is what makes the swap fail.
+
+    private static final String CLIENT_AVATAR = "https://cdn.beautica.test/avatars/client-olena.jpg";
+    private static final String MASTER_AVATAR = "https://cdn.beautica.test/avatars/master-nataliia.jpg";
+
+    @Test
+    @DisplayName("clientAvatarUrl carries the CLIENT's own photo — never the master's — when the "
+            + "booking has a registered client (the two avatar fields read two different User "
+            + "graphs and must not be swapped)")
+    void should_returnClientsOwnAvatar_when_bookingHasRegisteredClient() {
+        when(clientUser.getAvatarUrl()).thenReturn(CLIENT_AVATAR);
+        when(masterUser.getAvatarUrl()).thenReturn(MASTER_AVATAR);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientAvatarUrl())
+                .as("must be booking.getClient().getAvatarUrl(); a copy-paste of the adjacent "
+                        + "masterUser.getAvatarUrl() read would show the provider their OWN photo "
+                        + "on every client card, actual=%s", response.clientAvatarUrl())
+                .isEqualTo(CLIENT_AVATAR)
+                .isNotEqualTo(MASTER_AVATAR);
+        assertThat(response.masterAvatarUrl())
+                .as("the sibling field must be unaffected — proves the assertion above is not "
+                        + "passing because both fields collapsed onto the client")
+                .isEqualTo(MASTER_AVATAR);
+    }
+
+    @Test
+    @DisplayName("clientAvatarUrl is null (not NPE, and deliberately NOT falling back to the guest "
+            + "identity the way clientFirstName/clientLastName do) on a guest (LINK) booking, while "
+            + "masterAvatarUrl is still served")
+    void should_returnNullClientAvatar_when_bookingHasNoRegisteredClient() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestName()).thenReturn("Оксана");
+        when(booking.getGuestSurname()).thenReturn("Мельник");
+        when(masterUser.getAvatarUrl()).thenReturn(MASTER_AVATAR);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientAvatarUrl())
+                .as("a guest has no account and so no photo — and unlike the name there is nothing "
+                        + "to fall back TO; the card renders the generic glyph")
+                .isNull();
+        assertThat(response.clientFirstName())
+                .as("non-vacuity: the guest identity fallback that DOES exist still fired, so the "
+                        + "null above is the avatar branch specifically, not a dead fixture")
+                .isEqualTo("Оксана");
+        assertThat(response.masterAvatarUrl())
+                .as("the master's likeness is unaffected by the client being absent — it hangs off "
+                        + "master.getUser(), never the (null) client")
+                .isEqualTo(MASTER_AVATAR);
+    }
+
+    @Test
+    @DisplayName("clientAvatarUrl is null for a registered client who never uploaded a photo — the "
+            + "second documented null case, indistinguishable from the guest case by contract")
+    void should_returnNullClientAvatar_when_registeredClientNeverUploadedOne() {
+        when(clientUser.getAvatarUrl()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientAvatarUrl()).isNull();
+        assertThat(response.clientId())
+                .as("non-vacuity: this IS a registered client, so the null came from an empty "
+                        + "avatar column and not from the guest null-guard")
+                .isEqualTo(clientId);
+    }
 }

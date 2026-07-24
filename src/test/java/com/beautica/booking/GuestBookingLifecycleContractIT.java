@@ -69,6 +69,10 @@ class GuestBookingLifecycleContractIT extends AbstractIntegrationTest {
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
+    /** The owning master's own avatar — the decoy the guest-null assertion must not pick up. */
+    private static final String MASTER_AVATAR_URL =
+            "https://cdn.beautica.test/avatars/guest-lifecycle-master.jpg";
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -137,6 +141,22 @@ class GuestBookingLifecycleContractIT extends AbstractIntegrationTest {
                 .as("owner must see the OTP-verified guest name, not a crash or a blank field")
                 .isEqualTo("Оксана");
         assertThat(ownerView.get("clientLastName").asText()).isEqualTo("Мельник");
+        // Sibling of the clientId assertion above, and the asymmetry is the contract: the NAME
+        // falls back to the OTP-verified guest identity, the AVATAR deliberately does not fall
+        // back at all — there is no account, hence no photo and nothing to fall back TO. This is
+        // the only place the guest branch of `client != null ? client.getAvatarUrl() : null` is
+        // reached over a real HTTP provider read of a real null-client row, so it is also the
+        // gate against someone "helpfully" adding a guest avatar fallback later.
+        assertThat(ownerView.get("clientAvatarUrl").isNull())
+                .as("a guest booking has no account and therefore no photo — clientAvatarUrl must "
+                        + "be null with no fallback, unlike the name; actual=%s",
+                        ownerView.get("clientAvatarUrl"))
+                .isTrue();
+        assertThat(ownerView.get("masterAvatarUrl").asText())
+                .as("discrimination gate for the null above: the master DOES have an avatar on "
+                        + "this booking's graph, so the null client avatar is a real absence and "
+                        + "not merely everything-is-null")
+                .isEqualTo(MASTER_AVATAR_URL);
         assertThat(ownerView.get("status").asText()).isEqualTo("CONFIRMED");
 
         // ── 3. FOREIGN-CLIENT VIEW — an unrelated authenticated CLIENT must be denied cleanly ──
@@ -217,10 +237,16 @@ class GuestBookingLifecycleContractIT extends AbstractIntegrationTest {
      */
     private UUID createLoginableIndependentMaster(String email, String slug) {
         UUID userId = UUID.randomUUID();
+        // avatar_url is seeded deliberately. The guest-booking assertion downstream is
+        // "clientAvatarUrl IS NULL", which is only discriminating if some OTHER avatar exists on
+        // this booking's graph to be wrongly picked up. With the master's avatar also null, a
+        // mapper that read the MASTER's avatar into the client slot would still yield null and
+        // the assertion would pass on a broken build (mutation-verified).
         jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified, first_name, last_name) "
-                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', true, true, 'Наталія', 'Бойко')",
-                userId, email, passwordEncoder.encode(TEST_PASSWORD));
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified, "
+                        + "first_name, last_name, avatar_url) "
+                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', true, true, 'Наталія', 'Бойко', ?)",
+                userId, email, passwordEncoder.encode(TEST_PASSWORD), MASTER_AVATAR_URL);
 
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(

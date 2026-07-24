@@ -127,7 +127,9 @@ class BookingControllerTest {
                 null,
                 "MANICURE", false,
                 // appointmentId (BE-5 additive) — legacy single-service booking has no visit
-                null
+                null,
+                // clientAvatarUrl (additive) — the provider timeline's client photo
+                "https://cdn.test/client-avatar.png"
         );
     }
 
