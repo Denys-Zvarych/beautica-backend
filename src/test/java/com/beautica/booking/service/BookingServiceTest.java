@@ -2210,6 +2210,207 @@ class BookingServiceTest {
         verify(bookingRepository).findBookedDatesByClientId(clientId, expectedFromTs, expectedToExclusive);
     }
 
+    // ── actor-role resolution at BOTH /bookings/me entry points ────────────────────────────────
+    //
+    // getMyBookings and getMyBookedDays are the only two BookingService methods that derive the
+    // caller's role from the Authentication rather than from a loaded entity, and both now route
+    // that read through AuthenticationUtils.role. The local resolveActorRole they used to share
+    // was:
+    //
+    //     auth.getAuthorities().stream().findFirst()
+    //         .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
+    //         .orElseThrow(() -> new ForbiddenException("Access denied"));
+    //
+    // which differed from the replacement in four observable ways, none of which had a test:
+    //   1. an unrecognised ROLE_* string threw a raw IllegalArgumentException out of
+    //      Role.valueOf -> 500, not 403;
+    //   2. a multi-role principal was resolved by getAuthorities() iteration order, silently
+    //      granting whichever scope happened to come first;
+    //   3. a valid role positioned AFTER an unrecognised authority was never seen at all,
+    //      because findFirst() looked at exactly one element;
+    //   4. a null Authentication NPE'd on getAuthorities() -> 500, not 403.
+    //
+    // The tests below pin all four at BOTH entry points rather than only at
+    // AuthenticationUtilsTest, because the two methods invoke the resolver at DIFFERENT points in
+    // their control flow (getMyBookings resolves first thing; getMyBookedDays resolves only after
+    // its from/to validation), so a regression that reintroduced a local extractor in one of them
+    // would leave AuthenticationUtilsTest fully green.
+
+    /** A UPAT carrying an arbitrary authority set — the shape JwtAuthenticationFilter produces. */
+    private Authentication authWithAuthorities(String... authorities) {
+        return new UsernamePasswordAuthenticationToken(
+                "test@example.com",
+                null,
+                java.util.Arrays.stream(authorities).map(SimpleGrantedAuthority::new).toList());
+    }
+
+    /** A non-UPAT Authentication — the shape AuthenticationUtils rejects outright. */
+    private Authentication nonUpatAuth() {
+        return new org.springframework.security.authentication.AnonymousAuthenticationToken(
+                "key", "anonymousUser", List.of(new SimpleGrantedAuthority("ROLE_ANONYMOUS")));
+    }
+
+    private static final LocalDate BOOKED_DAYS_FROM = LocalDate.of(2026, 7, 1);
+    private static final LocalDate BOOKED_DAYS_TO = LocalDate.of(2026, 7, 31);
+
+    @Test
+    @DisplayName("getMyBookings — ForbiddenException, and no scope query at all, when the principal "
+            + "carries two distinct ROLE_* authorities; the old findFirst() extractor would have "
+            + "silently served whichever scope iteration order surfaced first")
+    void should_throwForbidden_when_getMyBookingsPrincipalCarriesTwoRoles() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, authWithAuthorities("ROLE_CLIENT", "ROLE_SALON_OWNER"),
+                        null, null, null, null, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Ambiguous role");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookings — ForbiddenException (403), never a raw IllegalArgumentException "
+            + "(500), when the sole authority is a ROLE_* string that is not a known Role")
+    void should_throwForbidden_when_getMyBookingsAuthorityIsUnrecognisedRole() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, authWithAuthorities("ROLE_SUPERHERO"),
+                        null, null, null, null, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .isNotInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("No role assigned");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookings — resolves the valid role even when an unrecognised ROLE_* authority "
+            + "precedes it, and dispatches to the CLIENT scope query; the old findFirst() extractor "
+            + "never looked past the first authority")
+    void should_dispatchClientScope_when_getMyBookingsAuthHasUnrecognisedAuthorityFirst() {
+        when(bookingRepository.findIdsByClientIdFiltered(
+                clientId, null, null, null, null, normalizedUnpaged())).thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(
+                clientId, authWithAuthorities("ROLE_SUPERHERO", "ROLE_CLIENT"),
+                null, null, null, null, Pageable.unpaged());
+
+        assertThat(result.data()).isEmpty();
+        verify(bookingRepository).findIdsByClientIdFiltered(
+                clientId, null, null, null, null, normalizedUnpaged());
+        verifyNoInteractions(masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookings — ForbiddenException (403), never a NullPointerException (500), when "
+            + "the Authentication is null")
+    void should_throwForbidden_when_getMyBookingsAuthIsNull() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, null, null, null, null, null, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .isNotInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Not authenticated");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookings — ForbiddenException when the Authentication is not the "
+            + "UsernamePasswordAuthenticationToken JwtAuthenticationFilter installs, even though it "
+            + "does carry a ROLE_* authority")
+    void should_throwForbidden_when_getMyBookingsAuthIsNotUsernamePasswordToken() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        actorId, nonUpatAuth(), null, null, null, null, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Not authenticated");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookedDays — ForbiddenException, and no scope query at all, when the principal "
+            + "carries two distinct ROLE_* authorities (same boundary getMyBookings enforces)")
+    void should_throwForbidden_when_getMyBookedDaysPrincipalCarriesTwoRoles() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        actorId, authWithAuthorities("ROLE_CLIENT", "ROLE_SALON_OWNER"),
+                        BOOKED_DAYS_FROM, BOOKED_DAYS_TO))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Ambiguous role");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookedDays — ForbiddenException (403), never a raw IllegalArgumentException "
+            + "(500), when the sole authority is a ROLE_* string that is not a known Role")
+    void should_throwForbidden_when_getMyBookedDaysAuthorityIsUnrecognisedRole() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        actorId, authWithAuthorities("ROLE_SUPERHERO"), BOOKED_DAYS_FROM, BOOKED_DAYS_TO))
+                .isInstanceOf(ForbiddenException.class)
+                .isNotInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("No role assigned");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookedDays — resolves the valid role even when an unrecognised ROLE_* authority "
+            + "precedes it, and dispatches to the CLIENT scope query")
+    void should_dispatchClientScope_when_getMyBookedDaysAuthHasUnrecognisedAuthorityFirst() {
+        OffsetDateTime fromTs = BOOKED_DAYS_FROM.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = BOOKED_DAYS_TO.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        when(bookingRepository.findBookedDatesByClientId(clientId, fromTs, toExclusive))
+                .thenReturn(List.of(java.sql.Date.valueOf(LocalDate.of(2026, 7, 5))));
+
+        var result = bookingService.getMyBookedDays(
+                clientId, authWithAuthorities("ROLE_SUPERHERO", "ROLE_CLIENT"),
+                BOOKED_DAYS_FROM, BOOKED_DAYS_TO);
+
+        assertThat(result).containsExactly(LocalDate.of(2026, 7, 5));
+        verify(bookingRepository).findBookedDatesByClientId(clientId, fromTs, toExclusive);
+        verifyNoInteractions(masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookedDays — ForbiddenException (403), never a NullPointerException (500), when "
+            + "the Authentication is null")
+    void should_throwForbidden_when_getMyBookedDaysAuthIsNull() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        actorId, null, BOOKED_DAYS_FROM, BOOKED_DAYS_TO))
+                .isInstanceOf(ForbiddenException.class)
+                .isNotInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Not authenticated");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("getMyBookedDays — ForbiddenException when the Authentication is not the "
+            + "UsernamePasswordAuthenticationToken JwtAuthenticationFilter installs, even though it "
+            + "does carry a ROLE_* authority")
+    void should_throwForbidden_when_getMyBookedDaysAuthIsNotUsernamePasswordToken() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                        actorId, nonUpatAuth(), BOOKED_DAYS_FROM, BOOKED_DAYS_TO))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Not authenticated");
+
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
     // ── getMyBookings — sort whitelist tripwire (Phase 26.3, backend-security gap) ──────────────
     //
     // normalizeBookingSort is a security boundary (see its javadoc): both the CLIENT projection

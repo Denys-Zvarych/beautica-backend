@@ -65,9 +65,9 @@ import java.util.UUID;
  *       a field whose emptiness encodes the CALLER'S ROLE rather than the data. Any consumer that
  *       caches by booking id, or diffs the list row against the detail view, sees a phantom
  *       change. Note also that the redundancy is the maximally compressible kind: on the client
- *       path it is the SAME string on every row, so {@code server.compression} (absent from every
- *       profile; backlogged separately, app-wide) collapses it to near nothing — the real fix is
- *       there, not here. {@code BookingDetailContractIT}'s reflective entity-vs-projection parity
+ *       path it is the SAME string on every row, so {@code server.compression} (now enabled
+ *       app-wide in {@code application.yml}: gzip, {@code min-response-size: 1KB}) collapses it to
+ *       near nothing — the real fix was there, not here. {@code BookingDetailContractIT}'s reflective entity-vs-projection parity
  *       loop pins this: it enumerates {@code getRecordComponents()}, so stopping population here
  *       fails that gate BY DESIGN. That failure is a true positive, not collateral — suppressing
  *       it with a per-field carve-out would blunt the gate that exists because a COALESCE

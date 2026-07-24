@@ -22,6 +22,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
@@ -332,7 +333,10 @@ public class BookingService {
             LocalDate from, LocalDate to, List<UUID> serviceId, Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
-        Role role = resolveActorRole(auth);
+        // AuthenticationUtils.role is the single source of truth for this read (B14): it scans
+        // ALL authorities, ignores unrecognised ROLE_* strings instead of throwing, and rejects a
+        // multi-role principal — do NOT reintroduce a local extractor here or in getMyBookedDays.
+        Role role = AuthenticationUtils.role(auth);
 
         Set<BookingStatus> statuses = (status == null || status.isEmpty())
                 ? null
@@ -374,20 +378,6 @@ public class BookingService {
                 page.getSize(),
                 page.getTotalElements(),
                 page.getTotalPages());
-    }
-
-    /**
-     * Resolves the caller's role from the JWT-derived granted authority — the same
-     * single-authority-per-principal assumption {@link #getMyBookings} has always relied on.
-     * Extracted (Phase 26.5) so {@code getMyBookings} and {@link #getMyBookedDays} share one
-     * copy of this lookup rather than each inlining it — a second, silently-diverging copy is
-     * exactly how these two endpoints' notion of "who is the caller" would end up disagreeing.
-     */
-    private Role resolveActorRole(Authentication auth) {
-        return auth.getAuthorities().stream()
-                .findFirst()
-                .map(a -> Role.valueOf(a.getAuthority().replace("ROLE_", "")))
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
     }
 
     /**
@@ -434,7 +424,8 @@ public class BookingService {
         OffsetDateTime fromTs = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
-        Role role = resolveActorRole(auth);
+        // Same shared, hardened role read getMyBookings uses — see the comment there.
+        Role role = AuthenticationUtils.role(auth);
 
         List<java.sql.Date> bookedDates = switch (role) {
             case CLIENT -> bookingRepository.findBookedDatesByClientId(actorUserId, fromTs, toExclusive);
