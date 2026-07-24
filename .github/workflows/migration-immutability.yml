@@ -170,10 +170,20 @@ jobs:
           # C and T are practically unreachable for text V*.sql
           # migrations but are included for defensive completeness
           # (zero behaviour change for normal new-file adds).
+          #
+          # The pathspec is scoped to '*.sql', NOT the whole migration
+          # directory. Only SQL scripts carry a Flyway checksum
+          # identity; housekeeping files that happen to live in the
+          # same directory (a '.gitkeep' placeholder, a README) are not
+          # migrations and removing one can never break 'flyway
+          # validate'. Scoping on the directory made the gate fail a
+          # dev->main PR purely because the original '.gitkeep' had
+          # been deleted once real migrations landed. Scenario 9 in the
+          # mirror pins this.
           run_gate() {
             local base_sha="$1"
             local changed
-            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH/*.sql")
             if [ -z "$changed" ]; then
               return 0
             fi
@@ -184,7 +194,7 @@ jobs:
           # =========================================================
           # >>> SHARED-BLOCK:immutability:END
 
-          CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- "$MIGRATION_PATH")
+          CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- "$MIGRATION_PATH/*.sql")
 
           if run_gate "$BASE_SHA"; then
             echo "No existing migration files were modified, deleted, or renamed. Check passed."
@@ -237,10 +247,20 @@ jobs:
           # C and T are practically unreachable for text V*.sql
           # migrations but are included for defensive completeness
           # (zero behaviour change for normal new-file adds).
+          #
+          # The pathspec is scoped to '*.sql', NOT the whole migration
+          # directory. Only SQL scripts carry a Flyway checksum
+          # identity; housekeeping files that happen to live in the
+          # same directory (a '.gitkeep' placeholder, a README) are not
+          # migrations and removing one can never break 'flyway
+          # validate'. Scoping on the directory made the gate fail a
+          # dev->main PR purely because the original '.gitkeep' had
+          # been deleted once real migrations landed. Scenario 9 in the
+          # mirror pins this.
           run_gate() {
             local base_sha="$1"
             local changed
-            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH/*.sql")
             if [ -z "$changed" ]; then
               return 0
             fi
@@ -371,6 +391,37 @@ jobs:
           git add -A && git commit -q -m "add new migration AND modify existing in one commit"
           if run_gate "$BASE_SHA"; then fail "mixed add+modify should fail (exit 1)"; fi
           echo "OK: mixed add+modify fails (new add does not mask the modify)"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 9: DELETE a non-migration housekeeping file
+          # that lives in the migration directory -> exit 0 ---
+          # A '.gitkeep' placeholder (or a README) has no Flyway
+          # checksum identity, so removing it cannot break 'flyway
+          # validate'. A directory-scoped pathspec used to flag this and
+          # failed a real dev->main PR on the ancient deletion of the
+          # original '.gitkeep'. Pins the '*.sql' scoping.
+          git checkout -q "$BASE_SHA" -- . 2>/dev/null || true
+          printf '' > "$MIGRATION_PATH/.gitkeep"
+          git add -A && git commit -q -m "base: add .gitkeep placeholder"
+          KEEP_BASE="$(git rev-parse HEAD)"
+          git rm -q "$MIGRATION_PATH/.gitkeep"
+          git commit -q -m "delete .gitkeep placeholder"
+          run_gate "$KEEP_BASE" || fail ".gitkeep deletion must pass -- it is not a Flyway migration (exit 0)"
+          echo "OK: non-migration (.gitkeep) deletion passes"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 10: a real migration deletion in the SAME
+          # commit as a .gitkeep deletion -> exit 1 ---
+          # Proves the '*.sql' scoping narrowed the pathspec without
+          # opening a hole: the housekeeping file is ignored, the
+          # co-deleted V*.sql is still caught.
+          printf '' > "$MIGRATION_PATH/.gitkeep"
+          git add -A && git commit -q -m "re-add .gitkeep placeholder"
+          MIXED_BASE="$(git rev-parse HEAD)"
+          git rm -q "$MIGRATION_PATH/.gitkeep" "$MIGRATION_PATH/V1__existing.sql"
+          git commit -q -m "delete .gitkeep AND an already-merged migration"
+          if run_gate "$MIXED_BASE"; then fail ".gitkeep+V1 co-deletion must still fail on the V1 deletion (exit 1)"; fi
+          echo "OK: co-deleted migration still caught alongside an ignored .gitkeep"
           git reset -q --hard "$BASE_SHA"
 
           echo "All self-test scenarios passed."
@@ -1055,11 +1106,13 @@ jobs:
           # immutability stays valid. Scenario 2 still exercises the
           # genuine `git diff --diff-filter=MDRCT base...HEAD` behavior
           # end-to-end on a real V49 mutation -- the headline
-          # regression that crash-looped Railway.
+          # regression that crash-looped Railway. Kept behaviourally
+          # in sync with the shared block, including the '*.sql'
+          # pathspec scoping.
           run_gate() {
             local base_sha="$1"
             local changed
-            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH")
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH/*.sql")
             if [ -z "$changed" ]; then
               return 0
             fi
