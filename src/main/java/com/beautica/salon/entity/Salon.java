@@ -124,6 +124,8 @@ public class Salon extends AuditableEntity {
 
     // True for the salon created during SALON_OWNER registration (Phase 12.1).
     // Only one primary salon per owner — enforced by idx_salons_owner_primary (V56).
+    // No initializer: @Builder ignores field initializers (it warns when one is present),
+    // and the JVM already defaults a primitive boolean to false — which is the intent here.
     @Column(name = "is_primary", nullable = false)
-    private boolean isPrimary = false;
+    private boolean isPrimary;
 }
