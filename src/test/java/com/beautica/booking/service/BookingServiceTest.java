@@ -70,6 +70,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -211,13 +212,24 @@ class BookingServiceTest {
     }
 
     private Booking buildBooking(UUID id, User c, Master m, MasterServiceAssignment a, BookingStatus status) {
+        return buildBookingStartingAt(id, c, m, a, status, ZonedDateTime.now(clock).plusHours(2).toOffsetDateTime());
+    }
+
+    /**
+     * Phase 27.1: {@link #buildBooking} pins {@code startsAt} in the FUTURE (now+2h) — correct
+     * for decline/create/cancel/reschedule fixtures, but wrong for {@code completeBooking}, whose
+     * new {@code assertElapsedForComplete} guard requires {@code now >= startsAt}. This overload
+     * takes an explicit {@code startsAt} so complete-path tests can pin an ELAPSED booking.
+     */
+    private Booking buildBookingStartingAt(
+            UUID id, User c, Master m, MasterServiceAssignment a, BookingStatus status, OffsetDateTime startsAt) {
         Booking b = Booking.builder()
                 .client(c)
                 .master(m)
                 .masterService(a)
                 .status(status)
-                .startsAt(ZonedDateTime.now(clock).plusHours(2).toOffsetDateTime())
-                .endsAt(ZonedDateTime.now(clock).plusHours(3).toOffsetDateTime())
+                .startsAt(startsAt)
+                .endsAt(startsAt.plusHours(1))
                 .priceAtBooking(new BigDecimal("200.00"))
                 .durationMinutesAtBooking(60)
                 .bufferMinutesAtBooking(0)
@@ -225,6 +237,11 @@ class BookingServiceTest {
         setField(b, "id", id);
         ReflectionTestUtils.setField(b, "createdAt", Instant.now());
         return b;
+    }
+
+    /** Booking whose {@code startsAt} has already elapsed relative to the pinned {@link #clock} — for {@code completeBooking} happy-path fixtures (Phase 27.1). */
+    private Booking buildElapsedBooking(UUID id, User c, Master m, MasterServiceAssignment a, BookingStatus status) {
+        return buildBookingStartingAt(id, c, m, a, status, ZonedDateTime.now(clock).minusHours(1).toOffsetDateTime());
     }
 
     private CreateBookingRequest validRequest() {
@@ -693,7 +710,8 @@ class BookingServiceTest {
     @DisplayName("booking moves to COMPLETED and notification is enqueued when a CONFIRMED booking is completed")
     void should_completeBooking_when_confirmedBookingCompleted() {
         UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        // Phase 27.1: assertElapsedForComplete requires now >= startsAt — an elapsed fixture.
+        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
 
@@ -712,7 +730,8 @@ class BookingServiceTest {
         // Guest booking: CONFIRMED with a null client (V89 chk_bookings_guest_fields). A guest has
         // no account to review with, so completion must not enqueue the review prompt (which would
         // NPE on booking.getClient() at drain time and dead-letter the outbox row).
-        Booking booking = buildBooking(bookingId, null, master, msa, BookingStatus.CONFIRMED);
+        // Phase 27.1: assertElapsedForComplete requires now >= startsAt — an elapsed fixture.
+        Booking booking = buildElapsedBooking(bookingId, null, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
 
@@ -758,7 +777,8 @@ class BookingServiceTest {
     void should_evictRevenueDashboardCache_when_bookingCompleted() {
         // Arrange
         UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        // Phase 27.1: assertElapsedForComplete requires now >= startsAt — an elapsed fixture.
+        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         Cache masterCalendarCacheMock = mock(Cache.class);
         Cache revenueCacheMock = mock(Cache.class);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
@@ -1045,7 +1065,7 @@ class BookingServiceTest {
         verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).saveAndFlush(any());
-        verify(outboxService, never()).enqueueBookingRescheduled(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
 
     /** Matrix #3 (boundary, strictly before). endsAt one nanosecond before now → elapsed → rejected. */
@@ -1180,7 +1200,7 @@ class BookingServiceTest {
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
         assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
-        verify(outboxService).enqueueBookingRescheduled(bookingId);
+        verify(outboxService).enqueueBookingRescheduled(bookingId, false);
     }
 
     // ── rescheduleBooking (Phase 19.2) ─────────────────────────────────────────
@@ -1222,7 +1242,7 @@ class BookingServiceTest {
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
         assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
-        verify(outboxService).enqueueBookingRescheduled(bookingId);
+        verify(outboxService).enqueueBookingRescheduled(bookingId, false);
     }
 
     // TODO(24.7): a non-CONFIRMED reschedule source (formerly PENDING) has no replacement —
@@ -1246,7 +1266,7 @@ class BookingServiceTest {
         verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).saveAndFlush(any());
-        verify(outboxService, never()).enqueueBookingRescheduled(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
 
     @Test
@@ -1298,7 +1318,7 @@ class BookingServiceTest {
                         .isEqualTo(HttpStatus.CONFLICT));
         assertThat(booking.getStatus()).isEqualTo(terminal);
         verify(bookingRepository, never()).saveAndFlush(any());
-        verify(outboxService, never()).enqueueBookingRescheduled(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
 
     @Test
@@ -1367,7 +1387,7 @@ class BookingServiceTest {
         // Self-exclusion: overlap is checked excluding this booking's own id
         verify(bookingRepository).existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId));
         verify(bookingRepository, never()).saveAndFlush(any());
-        verify(outboxService, never()).enqueueBookingRescheduled(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
 
     @Test
@@ -1404,7 +1424,7 @@ class BookingServiceTest {
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).existsOverlapExcluding(any(), any(), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
-        verify(outboxService, never()).enqueueBookingRescheduled(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
 
     @Test

@@ -12,6 +12,7 @@ import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.BookingElapsedException;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -51,7 +52,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code 409 BOOKING_ALREADY_ELAPSED}). Locked product rule: once a booking's appointment window
  * has fully passed ({@code endsAt < now}) it becomes read-only for the CLIENT and awaits provider
  * resolution — a client may no longer cancel or reschedule it, while the provider
- * (decline / complete / mark-no-show) still can.
+ * (complete / mark-no-show) still can.
+ *
+ * <p><b>Phase 27.1 update (REVERSES a claim this class used to pin).</b> {@code decline} gained
+ * its OWN, opposite-direction temporal guard: a provider may only decline a booking that has NOT
+ * yet started ({@code now < startsAt}). An elapsed booking (whose {@code startsAt} is necessarily
+ * also in the past) can therefore no longer be declined — {@code complete}/{@code not-complete}
+ * are the only remaining resolution paths once a booking elapses. See Matrix #5 below, which was
+ * updated in place rather than left to silently document stale behaviour.
  *
  * <p><b>Threat model this pins — server-clock authority.</b> The elapsed verdict is computed
  * SOLELY from the injected server {@link java.time.Clock} and the persisted {@code endsAt}; no
@@ -209,23 +217,33 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
                 .isEqualTo(BookingStatus.CONFIRMED.name());
     }
 
-    // ── Matrix #5 — provider resolution paths REMAIN allowed on an elapsed CONFIRMED booking ─────
+    // ── Matrix #5 — provider resolution paths on an elapsed CONFIRMED booking ────────────────────
+    // Phase 27.1: decline itself gained a temporal guard (future-only), so it FLIPPED from
+    // "still allowed" to "now rejected" on an elapsed booking — complete/not-complete remain the
+    // only resolution paths once a booking has started. The old "decline still succeeds" test is
+    // replaced in place with its reversed expectation, not left stale beside a new one.
 
     @Test
-    @DisplayName("provider decline on an elapsed CONFIRMED booking still succeeds → DECLINED (resolution path is NOT guarded)")
-    void should_allowProviderDecline_when_bookingElapsed() {
+    @DisplayName("Phase 27.1: provider decline on an ELAPSED CONFIRMED booking is now REJECTED with 409 "
+            + "(decline is future-only — complete/not-complete are the only resolution paths left once "
+            + "a booking has started)")
+    void should_rejectProviderDecline_when_bookingElapsed() {
         Master master = createIndependentMaster("elapsed-decline-master-" + System.nanoTime() + "@beautica.test");
         UUID serviceId = createMasterService(master.masterId);
         UUID clientId = createClient("elapsed-decline-client-" + System.nanoTime() + "@beautica.test");
         UUID bookingId = insertElapsedConfirmedBooking(clientId, master.masterId, serviceId);
 
         authenticateAs(master.userId);
-        bookingService.declineBooking(master.userId, bookingId,
-                new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        assertThat(org.assertj.core.api.Assertions.catchThrowable(
+                        () -> bookingService.declineBooking(master.userId, bookingId, req)))
+                .as("decline on an already-started booking must be rejected with a 409 BusinessException")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
 
         assertThat(bookingStatus(bookingId))
-                .as("the provider may decline (cancel) an elapsed booking — that is the resolution path")
-                .isEqualTo(BookingStatus.DECLINED.name());
+                .as("a rejected decline must leave the elapsed booking CONFIRMED")
+                .isEqualTo(BookingStatus.CONFIRMED.name());
     }
 
     @Test

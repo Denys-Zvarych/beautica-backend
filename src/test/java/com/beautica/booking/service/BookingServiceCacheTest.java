@@ -141,6 +141,7 @@ class BookingServiceCacheTest {
     @Autowired BookingService bookingService;
     @Autowired CacheManager cacheManager;
     @Autowired TransactionTemplate transactionTemplate;
+    @Autowired Clock clock;
 
     @BeforeEach
     void clearCache() {
@@ -211,6 +212,10 @@ class BookingServiceCacheTest {
         cache.put(bystanderKey, "value");
 
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
+        // Phase 27.1: completeBooking now requires now >= startsAt (assertElapsedForComplete) —
+        // mockBookingInStatus's default startsAt is FUTURE (needed by the decline/not-complete
+        // tests sharing this helper), so override it to an ELAPSED time for this test only.
+        when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(clock).minusHours(1));
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);

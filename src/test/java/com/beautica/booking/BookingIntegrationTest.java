@@ -416,6 +416,13 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 .as("DB status must be CONFIRMED immediately after creation, bookingId=%s", bookingId)
                 .isEqualTo("CONFIRMED");
 
+        // Phase 27.1: completeBooking now requires now >= startsAt (assertElapsedForComplete).
+        // The booking above was legitimately created 2 days in the future (through the real
+        // create flow, to also prove auto-confirm), so time-shift it into the past directly —
+        // simulating the appointment having begun — rather than waiting 2 real days.
+        jdbcTemplate.update(
+                "UPDATE bookings SET starts_at = NOW() - interval '1 hour' WHERE id = ?", bookingId);
+
         // Step 2: SALON_OWNER completes — expect 204
         log.debug("Act: PATCH {}/{}/complete as SALON_OWNER", BOOKINGS_URL, bookingId);
         ResponseEntity<Void> completeResponse = restTemplate.exchange(

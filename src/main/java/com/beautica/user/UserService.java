@@ -44,6 +44,20 @@ public class UserService {
         this.cacheManager = cacheManager;
     }
 
+    /**
+     * The caller's own aggregate client rating (Phase 27.6). Reads the narrow {@link
+     * UserRatingProjection} — never the full {@link User} entity — so this endpoint cannot leak
+     * anything beyond the two rating columns, even in-memory. {@code client_reviews} rows
+     * themselves (comments, author identity) are never surfaced here or anywhere on the CLIENT
+     * side — see {@link UserRatingResponse}'s javadoc.
+     */
+    @Transactional(readOnly = true)
+    public UserRatingResponse getMyRating(UUID userId) {
+        UserRatingProjection projection = userRepository.findRatingById(userId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+        return UserRatingResponse.from(projection);
+    }
+
     @Transactional(readOnly = true)
     public UserProfileResponse getProfile(UUID userId) {
         User user = userRepository.findById(userId)

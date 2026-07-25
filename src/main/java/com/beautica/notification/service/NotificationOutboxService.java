@@ -93,17 +93,44 @@ public class NotificationOutboxService {
     }
 
     /**
-     * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2).
-     *
-     * <p>The drained event notifies the provider (master / salon-admin) that the client
-     * moved the booking and it is awaiting re-approval at the new time.
+     * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2), defaulting to
+     * CLIENT-initiated (Phase 27.3 — see the 2-arg overload). Convenience overload kept so any
+     * existing caller that is unconditionally client-side need not pass the flag.
      *
      * @param bookingId the UUID of the rescheduled booking
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public void enqueueBookingRescheduled(UUID bookingId) {
+        enqueueBookingRescheduled(bookingId, false);
+    }
+
+    /**
+     * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2), recording WHO moved
+     * the booking (Phase 27.3 — reschedule widened to providers).
+     *
+     * <p>The drained event notifies whichever party did NOT initiate the move: a client-initiated
+     * reschedule notifies the provider (master / salon-admin), unchanged pre-27.3 behaviour; a
+     * provider-initiated reschedule notifies the client instead — see
+     * {@code NotificationOutboxDrainWorker}'s {@code BOOKING_RESCHEDULED} case and
+     * {@code NotificationService#notifyBookingRescheduledClient}.
+     *
+     * <p>The payload is a small, unencrypted JSON object ({@code {"initiatedBy":"PROVIDER"}} or
+     * {@code {"initiatedBy":"CLIENT"}}) — the same plain-payload mechanism {@code save}'s third
+     * argument already supports (only {@code INVITE} needs {@link OutboxPayloadCipher} sealing;
+     * this carries no secret). An absent/null payload on an older PENDING row (written before this
+     * overload existed) is read by the drain worker as CLIENT-initiated — see
+     * {@code NotificationOutboxDrainWorker#resolveRescheduleInitiator} — for backward compatibility.
+     *
+     * @param bookingId          the UUID of the rescheduled booking
+     * @param initiatedByProvider {@code true} when a provider (salon owner / assigned salon admin
+     *                             / independent master) moved the booking, {@code false} when the
+     *                             client did
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueBookingRescheduled(UUID bookingId, boolean initiatedByProvider) {
         Objects.requireNonNull(bookingId, "bookingId must not be null");
-        save(OutboxEventType.BOOKING_RESCHEDULED, bookingId, null);
+        String payload = writeJson(Map.of("initiatedBy", initiatedByProvider ? "PROVIDER" : "CLIENT"));
+        save(OutboxEventType.BOOKING_RESCHEDULED, bookingId, payload);
     }
 
     /**

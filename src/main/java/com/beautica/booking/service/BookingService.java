@@ -731,6 +731,10 @@ public class BookingService {
         // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
         assertNotAppointmentChild(booking);
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.DECLINED);
+        // Phase 27.1: decline is future-only — a provider cannot back out of a booking that has
+        // already started. Checked AFTER the status guard so a non-CONFIRMED booking still
+        // reports the more specific status conflict (mirrors assertNotElapsedForClient's ordering).
+        BookingTemporalGuard.assertFutureForProviderCancel(booking.getStartsAt(), clock);
         booking.setStatus(BookingStatus.DECLINED);
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));
@@ -751,6 +755,9 @@ public class BookingService {
         // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
         assertNotAppointmentChild(booking);
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.COMPLETED);
+        // Phase 27.1: complete unlocks once the appointment has begun/elapsed (now >= startsAt) —
+        // no requirement that it has ENDED. Checked AFTER the status guard, same ordering as decline.
+        BookingTemporalGuard.assertElapsedForComplete(booking.getStartsAt(), clock);
         booking.setStatus(BookingStatus.COMPLETED);
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
@@ -847,37 +854,57 @@ public class BookingService {
      * below are the ONLY thing preventing a double-booked slot — they MUST run unweakened on
      * every reschedule.
      *
-     * @param actorUserId the authenticated CLIENT (from the security principal, never the body)
+     * <p><b>Phase 27.2 — widened to providers</b> (REVERSES the previously-locked "reschedule is
+     * client-only" decision). {@code actorRole} branches the ownership/status/elapsed guard only;
+     * everything downstream (window validation, schedule check, locks, conflict/overlap checks,
+     * the mutation, outbox enqueue, cache eviction) is one shared tail both paths fall into — see
+     * the two private branch helpers below. The CLIENT branch is byte-for-byte the pre-27.2
+     * behaviour. The PROVIDER branch authorizes via {@link AuthorizationService#enforceCanRescheduleBooking}
+     * (same provider-authority shape as decline/complete) and guards temporal validity via
+     * {@link BookingTemporalGuard#assertCurrentNotElapsedForReschedule} instead of
+     * {@link #assertNotElapsedForClient} — the two are NOT the same predicate: the client guard
+     * compares {@code endsAt} (a client may still act right up until the appointment has fully
+     * ended), while the provider guard compares {@code startsAt} (a provider can no longer move a
+     * booking that has already begun — {@code /complete}/{@code /not-complete} are the only
+     * remaining resolutions once that happens). They are therefore kept as two independent guards,
+     * not a shared helper.
+     *
+     * <p><b>Whose client-conflict/lock applies on the provider path.</b> The per-client advisory
+     * lock and {@link #assertNoClientConflictExcluding} check the OWNING CLIENT's other bookings
+     * for a conflict — that is {@code booking.getClient().getId()}, never {@code actorUserId},
+     * when the actor is the provider. A guest (LINK) booking has no client account
+     * ({@code booking.getClient() == null}) — there is nothing to lock or conflict-check, so that
+     * step is skipped cleanly for a provider rescheduling a guest booking (mirrors the guest
+     * null-guards elsewhere in this class).
+     *
+     * @param actorUserId the authenticated actor (from the security principal, never the body)
+     * @param actorRole   the actor's role, resolved by the controller from the JWT
      * @param bookingId   the booking to move
      * @param req         the new start time
      * @return the updated booking
-     * @throws ForbiddenException              if the actor is not the owning client (403)
-     * @throws BusinessException               if the source state is not CONFIRMED (409) or
-     *                                          the new slot conflicts with the master's calendar
+     * @throws ForbiddenException              if the actor is not the owning client / an
+     *                                          authorized provider (403)
+     * @throws BusinessException               if the source state is not CONFIRMED (409), the
+     *                                          current booking has already elapsed (409), or the
+     *                                          new slot conflicts with the master's calendar
      *                                          (409); {@link #validateStartsAt} rejects bad times (400)
-     * @throws ClientBookingConflictException  if the new window overlaps another booking this
-     *                                          client already holds (409, {@code CLIENT_BOOKING_CONFLICT})
+     * @throws ClientBookingConflictException  if the new window overlaps another booking the
+     *                                          owning client already holds (409, {@code CLIENT_BOOKING_CONFLICT})
      */
     @Transactional
     public BookingDetailResponse rescheduleBooking(UUID actorUserId, UUID bookingId, RescheduleBookingRequest req) {
-        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring cancelBooking. A guest (LINK) booking has no client account, so getClient()
-        // is null and the actor can never match — it falls into the same uniform 403 as a
-        // missing id or a foreign booking, never a distinguishable 404.
-        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
-                .filter(b -> b.getClient() != null && b.getClient().getId().equals(actorUserId))
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        // Convenience overload for callers that are always the CLIENT path (pre-27.2 signature;
+        // kept so the many existing CLIENT-path unit tests need not pass a role).
+        return rescheduleBooking(actorUserId, Role.CLIENT, bookingId, req);
+    }
 
-        BookingStatus current = booking.getStatus();
-        if (current != BookingStatus.CONFIRMED) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "Cannot reschedule a booking in status %s".formatted(current));
-        }
-        // Track 24.x read-only-after-elapse: an already-elapsed booking is read-only for the
-        // client and awaits provider resolution — the client can no longer move it to a new time.
-        // Checked AFTER the status guard so a non-CONFIRMED booking still reports the more
-        // specific status conflict.
-        assertNotElapsedForClient(booking);
+    @Transactional
+    public BookingDetailResponse rescheduleBooking(
+            UUID actorUserId, Role actorRole, UUID bookingId, RescheduleBookingRequest req) {
+        boolean initiatedByProvider = actorRole != Role.CLIENT;
+        Booking booking = initiatedByProvider
+                ? resolveBookingForProviderReschedule(actorUserId, bookingId)
+                : resolveBookingForClientReschedule(actorUserId, bookingId);
 
         OffsetDateTime newStartsAt = req.newStartsAt();
         validateStartsAt(newStartsAt);
@@ -903,18 +930,32 @@ public class BookingService {
 
         // Same critical section as doCreateBooking, in the same client-then-master order
         // (deadlock freedom — see BookingRepository.acquireClientAdvisoryLockWithTimeout
-        // javadoc). actorUserId IS the owning client here — ownership was already verified
-        // above. acquireClientLock's fused query also sets the transaction-scoped lock_timeout
-        // for the whole transaction, bounding the wait on both this lock and the master lock
-        // below.
-        acquireClientLock(actorUserId);
-
-        // Client-conflict check (excluding this booking's own row) runs BEFORE the master-busy
-        // check — and before the master lock is even acquired — same precedence and rationale
-        // as create; see doCreateBooking.
-        assertNoClientConflictExcluding(actorUserId, newStartsAt, newEndsAt, bookingId);
-
-        Integer lockResult = bookingRepository.acquireAdvisoryLock(masterId);
+        // javadoc). The lock/conflict-check target is the OWNING CLIENT of the booking
+        // (booking.getClient()), never actorUserId — on the CLIENT path the two are the same
+        // (ownership was already verified above), but on the PROVIDER path actorUserId is the
+        // provider, not the client whose calendar is being protected. A guest (LINK) booking has
+        // no client account at all (booking.getClient() == null) — there is no calendar to lock
+        // or conflict-check, so this step is skipped cleanly for a provider rescheduling a guest
+        // booking. acquireClientLock's fused query also sets the transaction-scoped lock_timeout
+        // for the whole transaction, bounding the wait on both this lock and the master lock below.
+        User owningClient = booking.getClient();
+        Integer lockResult;
+        if (owningClient != null) {
+            acquireClientLock(owningClient.getId());
+            // Client-conflict check (excluding this booking's own row) runs BEFORE the
+            // master-busy check — and before the master lock is even acquired — same precedence
+            // and rationale as create; see doCreateBooking.
+            assertNoClientConflictExcluding(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            // acquireClientLock already fused the transaction-scoped lock_timeout — reuse the
+            // plain (untimed-fuse) master lock, same as every other call site that took the
+            // client lock first.
+            lockResult = bookingRepository.acquireAdvisoryLock(masterId);
+        } else {
+            // No client lock was taken (guest booking) — the master lock must fuse its own
+            // lock_timeout here, or an unbounded wait replaces what should be a fast 409 (mirrors
+            // GuestBookingService#persistBooking, which is in exactly this no-client-lock shape).
+            lockResult = bookingRepository.acquireAdvisoryLockWithTimeout(masterId);
+        }
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
@@ -931,7 +972,10 @@ public class BookingService {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }
 
-        outboxService.enqueueBookingRescheduled(saved.getId());
+        // Phase 27.3: the outbox payload records who initiated the move, so the drain worker can
+        // address the notification to the OTHER party (client-initiated -> notify the provider,
+        // unchanged; provider-initiated -> notify the client).
+        outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
         // Evict the freed old-day slots and the now-occupied new-day slots, plus the
         // provider calendar — after commit, so a parallel reader cannot repopulate stale data.
         registerSlotEviction(masterId, salonIdOf(saved), oldDate, saved.getMasterService().getId());
@@ -939,11 +983,62 @@ public class BookingService {
             registerSlotEviction(masterId, salonIdOf(saved), newStartsAt.toLocalDate(), saved.getMasterService().getId());
         }
         evictMasterCalendarAfterCommit(masterId);
-        // A rescheduled booking is always CONFIRMED, so canReview is false by the
-        // COMPLETED predicate — no review-existence query needed on this path. saved.getClient()
-        // is guaranteed non-null here (the ownership filter above only matches account-bound
-        // bookings), passed through for signature consistency with the other call sites.
+        // A rescheduled booking is always CONFIRMED, so canReview is false by the COMPLETED
+        // predicate — no review-existence query needed on this path. saved.getClient() is
+        // guaranteed non-null on the CLIENT path (the ownership filter only matches account-bound
+        // bookings) but CAN be null on the PROVIDER path (a guest/LINK booking) — canReview's
+        // hasClient parameter already null-guards this correctly either way.
         return enrichSingle(saved, canReview(saved.getStatus(), false, saved.getClient() != null));
+    }
+
+    /**
+     * CLIENT-path ownership + status + elapsed resolution for {@link #rescheduleBooking} —
+     * byte-for-byte the pre-27.2 behaviour, extracted unchanged.
+     */
+    private Booking resolveBookingForClientReschedule(UUID actorUserId, UUID bookingId) {
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring cancelBooking. A guest (LINK) booking has no client account, so getClient()
+        // is null and the actor can never match — it falls into the same uniform 403 as a
+        // missing id or a foreign booking, never a distinguishable 404.
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .filter(b -> b.getClient() != null && b.getClient().getId().equals(actorUserId))
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+
+        BookingStatus current = booking.getStatus();
+        if (current != BookingStatus.CONFIRMED) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Cannot reschedule a booking in status %s".formatted(current));
+        }
+        // Track 24.x read-only-after-elapse: an already-elapsed booking is read-only for the
+        // client and awaits provider resolution — the client can no longer move it to a new time.
+        // Checked AFTER the status guard so a non-CONFIRMED booking still reports the more
+        // specific status conflict.
+        assertNotElapsedForClient(booking);
+        return booking;
+    }
+
+    /**
+     * PROVIDER-path authorization + status + elapsed resolution for {@link #rescheduleBooking}
+     * (Phase 27.2). Loads via {@link #loadBookingOrThrow} — the same full-graph load every other
+     * provider action (decline/complete/not-complete) uses — then authorizes via
+     * {@link AuthorizationService#enforceCanRescheduleBooking}, which reuses the same
+     * provider-authority predicate as decline/complete (owner, assigned admin, or the owning
+     * independent master; {@code SALON_MASTER} is never admitted).
+     */
+    private Booking resolveBookingForProviderReschedule(UUID actorUserId, UUID bookingId) {
+        Booking booking = loadBookingOrThrow(bookingId);
+        authz.enforceCanRescheduleBooking(actorUserId, booking);
+
+        BookingStatus current = booking.getStatus();
+        if (current != BookingStatus.CONFIRMED) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Cannot reschedule a booking in status %s".formatted(current));
+        }
+        // Provider-side guard: the CURRENT booking must not have started yet. NOT the same
+        // predicate as assertNotElapsedForClient (which compares endsAt) — see this method's
+        // class-level javadoc cross-reference on rescheduleBooking for why the two stay separate.
+        BookingTemporalGuard.assertCurrentNotElapsedForReschedule(booking.getStartsAt(), clock);
+        return booking;
     }
 
     private BookingResponse doCreateBooking(UUID clientId, String idempotencyKey, CreateBookingRequest request) {

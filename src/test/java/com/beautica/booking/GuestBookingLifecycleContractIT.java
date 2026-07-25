@@ -172,6 +172,12 @@ class GuestBookingLifecycleContractIT extends AbstractIntegrationTest {
         //        loadBookingOrThrow path that 404'd for every guest booking before the
         //        LEFT JOIN FETCH fix, exercised a second time via a different action than the
         //        decline path other tests already cover.
+        // Phase 27.1: completeBooking now requires now >= startsAt (assertElapsedForComplete).
+        // The guest booking above was legitimately created 3 days in the future (through the real
+        // public create flow, to also prove the guest lead-time window), so time-shift it into
+        // the past directly rather than waiting 3 real days.
+        jdbcTemplate.update(
+                "UPDATE bookings SET starts_at = NOW() - interval '1 hour' WHERE id = ?", bookingId);
         ResponseEntity<Void> completeResp = restTemplate.exchange(
                 "/api/v1/bookings/" + bookingId + "/complete", HttpMethod.PATCH,
                 new HttpEntity<>(bearerHeaders(masterToken)), Void.class);

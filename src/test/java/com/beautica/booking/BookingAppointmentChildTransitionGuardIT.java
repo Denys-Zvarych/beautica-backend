@@ -238,9 +238,14 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Seeds a CONFIRMED, FUTURE, single-service standalone booking directly (appointment_id stays
-     * NULL — the legacy path), owned by a fresh CLIENT and served by a fresh INDEPENDENT_MASTER.
-     * FUTURE so the client-cancel path's elapsed-booking guard passes; provider paths ignore it.
+     * Seeds a CONFIRMED single-service standalone booking directly (appointment_id stays NULL —
+     * the legacy path), owned by a fresh CLIENT and served by a fresh INDEPENDENT_MASTER.
+     *
+     * <p>FUTURE by default so the client-cancel path's elapsed-booking guard (endsAt-based) and
+     * decline's new future-only guard (Phase 27.1, startsAt-based) both pass. The {@code
+     * "complete"} tag is the one exception: {@code completeBooking} gained the OPPOSITE guard
+     * (now &gt;= startsAt) in Phase 27.1, so that single fixture is seeded ELAPSED instead —
+     * {@code not-complete} ({@code "noshow"}) is untouched by track 27 and does not care either way.
      */
     private Standalone createLegacyStandaloneBooking(String tag) throws Exception {
         String masterEmail = "child-guard-legacy-" + tag + "-master-" + System.nanoTime() + "@beautica.test";
@@ -249,8 +254,9 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
         UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
         UUID masterServiceId = fixtures.createIndependentMasterService(masterId);
 
-        OffsetDateTime startsAt = OffsetDateTime.now(ZoneOffset.UTC)
-                .plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        OffsetDateTime startsAt = "complete".equals(tag)
+                ? OffsetDateTime.now(ZoneOffset.UTC).minusHours(1)
+                : OffsetDateTime.now(ZoneOffset.UTC).plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "

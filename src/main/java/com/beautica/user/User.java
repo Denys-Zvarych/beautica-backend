@@ -172,6 +172,23 @@ public class User extends AuditableEntity {
     @Column(name = "professional_title", length = 100)
     private String professionalTitle;
 
+    /**
+     * Persisted rating aggregate — a CLIENT's average rating as reviewed by providers via
+     * {@code client_reviews} (Phase 27.4-27.6). Mirrors {@code Master#avgRating}/{@code
+     * Salon#avgRating}'s exact JPA style (bare {@code @Column}, no {@code nullable = false}; the
+     * DB column is nullable — {@code NULL} means never recalculated / zero reviews).
+     *
+     * <p>Written ONLY by {@code ClientReviewRepository#recalculateClientRating} (a native
+     * {@code UPDATE}, never through this entity's Java field) — there is deliberately no public
+     * setter, mirroring the "recalculate on write, read persisted on read" contract.
+     */
+    @Column(name = "avg_rating")
+    private java.math.BigDecimal avgRating;
+
+    /** Count of {@code client_reviews} rows for this user (as the subject). See {@link #avgRating}. */
+    @Column(name = "review_count", nullable = false)
+    private int reviewCount;
+
     @Column(name = "business_name", length = 255)
     private String businessName;
 
@@ -521,5 +538,18 @@ public class User extends AuditableEntity {
 
     public void setProfessionalTitle(String professionalTitle) {
         this.professionalTitle = professionalTitle;
+    }
+
+    /**
+     * No setter — {@code avg_rating}/{@code review_count} are written ONLY via
+     * {@code ClientReviewRepository#recalculateClientRating}'s native {@code UPDATE}, never
+     * through this entity.
+     */
+    public java.math.BigDecimal getAvgRating() {
+        return avgRating;
+    }
+
+    public int getReviewCount() {
+        return reviewCount;
     }
 }

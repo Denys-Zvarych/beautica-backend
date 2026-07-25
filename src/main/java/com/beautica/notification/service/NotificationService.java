@@ -185,6 +185,37 @@ public class NotificationService {
     }
 
     /**
+     * Notifies the CLIENT that the PROVIDER moved their booking to a new time (Phase 27.3 —
+     * REVERSES the previously-locked "reschedule is client-only" decision; this is the
+     * client-facing twin of {@link #notifyBookingRescheduled(Booking)}, which stays unchanged for
+     * the client-initiated case).
+     *
+     * <p>A guest (LINK) booking has no client account ({@code booking.getClient() == null}) — no
+     * email/push channel exists to reach. Skips cleanly, mirroring {@link
+     * #notifyReviewRequested(Booking)}'s guest guard; a provider CAN reach this path for a guest
+     * booking ({@code BookingService.rescheduleBooking}'s provider branch does not require a
+     * client to exist), so this guard is load-bearing, not defensive-only.
+     */
+    public void notifyBookingRescheduledClient(Booking booking) {
+        if (booking.getClient() == null) {
+            log.debug("Skipping client-facing BOOKING_RESCHEDULED for account-less guest booking {}", booking.getId());
+            return;
+        }
+        String clientEmail = booking.getClient().getEmail();
+        UUID clientUserId = booking.getClient().getId();
+        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
+        String bookingId = booking.getId().toString();
+
+        emailService.sendBookingRescheduledClientEmail(clientEmail, booking);
+        pushService.sendToUser(
+                clientUserId,
+                "Бронювання перенесено",
+                truncate("Ваш майстер переніс бронювання на " + serviceName),
+                Map.of("type", "BOOKING_RESCHEDULED", "bookingId", bookingId)
+        );
+    }
+
+    /**
      * Notifies the CLIENT (not the provider) that their completed visit can now be reviewed
      * (Phase 18.5). Builds a {@code /bookings/{id}/review} deep link from the configured frontend
      * base URL — scheme-guarded consistently with {@code InviteService.buildInviteLink} so an

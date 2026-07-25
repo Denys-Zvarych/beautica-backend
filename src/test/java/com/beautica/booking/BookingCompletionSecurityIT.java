@@ -118,6 +118,56 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingId)).isEqualTo("COMPLETED");
     }
 
+    // ── Phase 27.1: complete is elapsed-only ──────────────────────────────────────
+
+    @Test
+    @DisplayName("Phase 27.1: PATCH /complete — 409 when the booking has NOT started yet "
+            + "(assertElapsedForComplete requires now >= startsAt)")
+    void should_return409_when_completingFutureBooking() {
+        Salon salon = createSalon("compl-sec-future-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBookingFuture(salon);
+
+        ResponseEntity<Void> resp = patchComplete(bookingId, tokenFor(salon.ownerEmail));
+
+        assertThat(resp.getStatusCode())
+                .as("completing a booking that has not started yet must be rejected with 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
+    }
+
+    // ── Phase 27.1: decline is future-only (full HTTP stack) ───────────────────────
+    // BookingElapsedClientGuardIT already pins the equivalent 409 at the SERVICE layer
+    // (bookingService.declineBooking called directly — see its Matrix #5). Nothing in this diff
+    // exercised the same guard through the real PATCH /decline endpoint — controller routing,
+    // @PreAuthorize, GlobalExceptionHandler's BusinessException->409 mapping included — so this
+    // closes that full-stack gap, symmetric with should_return409_when_completingFutureBooking
+    // above (which pins the opposite-direction complete guard over HTTP).
+
+    @Test
+    @DisplayName("Phase 27.1: PATCH /decline — 409 when the booking has ALREADY STARTED "
+            + "(assertFutureForProviderCancel requires now < startsAt)")
+    void should_return409_when_decliningAlreadyStartedBooking() {
+        Salon salon = createSalon("compl-sec-decl-elapsed-owner-" + System.nanoTime() + "@beautica.test");
+        // The class default insertConfirmedSalonBooking is ELAPSED (starts_at 2h in the past) —
+        // exactly the fixture needed here, unlike the two pre-existing /decline tests above which
+        // had to switch to insertConfirmedSalonBookingFuture to survive this very guard.
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>(
+                        "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}",
+                        bearerHeaders(tokenFor(salon.ownerEmail))),
+                String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("declining a booking that has already started must be rejected with 409 — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(dbStatus(bookingId))
+                .as("a rejected decline must leave the already-started booking CONFIRMED")
+                .isEqualTo("CONFIRMED");
+    }
+
     // ── negative: role gate ──────────────────────────────────────────────────────
 
     @Test
@@ -227,7 +277,7 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
         Salon salon = createSalon("compl-sec-contain-owner-" + System.nanoTime() + "@beautica.test");
         String adminEmail = "compl-sec-contain-admin-" + System.nanoTime() + "@beautica.test";
         createUser(adminEmail, "SALON_ADMIN", salon.salonId);
-        UUID bookingId = insertConfirmedSalonBooking(salon);
+        UUID bookingId = insertConfirmedSalonBookingFuture(salon);
 
         ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
@@ -269,7 +319,7 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
     @DisplayName("Phase 25.9: PATCH /decline — 204 when comment is absent from the request body")
     void should_return204_when_declineHasNoComment() {
         Salon salon = createSalon("compl-sec-nocomment-decl-owner-" + System.nanoTime() + "@beautica.test");
-        UUID bookingId = insertConfirmedSalonBooking(salon);
+        UUID bookingId = insertConfirmedSalonBookingFuture(salon);
 
         ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
@@ -406,12 +456,34 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
                 UUID.class);
     }
 
+    /** Elapsed fixture — the completion-happy-path default (Phase 27.1's assertElapsedForComplete needs now &gt;= startsAt). */
     private UUID insertConfirmedSalonBooking(Salon salon) {
         UUID clientId = createUser("compl-sec-book-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID masterServiceId = createSalonService(salon.salonId);
         return insertConfirmedBooking(clientId, salon.masterId, masterServiceId, salon.salonId);
     }
 
+    /**
+     * Phase 27.1: FUTURE fixture for this class's two {@code /decline} tests — {@code
+     * insertConfirmedSalonBooking} above is deliberately kept ELAPSED for the many {@code
+     * /complete} tests in this class, so a separate future-dated seed is needed here rather than
+     * flipping the shared one (which would break every /complete happy-path test instead).
+     */
+    private UUID insertConfirmedSalonBookingFuture(Salon salon) {
+        UUID clientId = createUser("compl-sec-book-future-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID masterServiceId = createSalonService(salon.salonId);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, " +
+                        "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
+                        "booking_source, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() + interval '2 hours', NOW() + interval '3 hours', " +
+                        "500.00, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, salon.masterId, masterServiceId, salon.salonId);
+        return bookingId;
+    }
+
+    /** ELAPSED fixture (starts_at 2h in the past) — matches the completion-happy-path default. */
     private UUID insertConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(

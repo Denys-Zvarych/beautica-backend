@@ -502,6 +502,81 @@ public class AuthorizationService {
                 .orElse(false);
     }
 
+    /**
+     * SpEL {@code @PreAuthorize} provider-reschedule predicate (Phase 27.2), backing the provider
+     * arm of {@code PATCH /bookings/{id}/reschedule}'s union role check:
+     * {@code hasRole('CLIENT') or (hasAnyRole(providers) and @authz.canRescheduleBooking(...))}.
+     *
+     * <p>Reuses the exact same {@link BookingCompletionAccess} projection and
+     * {@link #hasProviderAuthorityOverBooking} predicate as {@link #canCancelBooking}/
+     * {@link #canCompleteBooking} — mirrors them verbatim, including the role fast path and the
+     * missing-booking handling.
+     *
+     * <p><b>Why this method never needs to special-case {@code ROLE_CLIENT}:</b> Spring SpEL
+     * evaluates {@code hasRole('CLIENT') or (hasAnyRole(...) and @authz.canRescheduleBooking(...))}
+     * left-to-right with short-circuiting {@code or} — for a CLIENT principal the left operand is
+     * already {@code true}, so the right operand (and therefore this method) is never evaluated at
+     * all. This method is only ever reached once {@code hasAnyRole('SALON_OWNER','SALON_ADMIN',
+     * 'INDEPENDENT_MASTER')} has already narrowed the caller to a provider role, so rejecting
+     * {@code ROLE_SALON_MASTER}/{@code ROLE_CLIENT} here (mirroring {@link #canCancelBooking}) is
+     * purely defensive — the client path structurally never reaches this method.
+     */
+    public boolean canRescheduleBooking(Authentication auth, UUID bookingId) {
+        boolean cannotReschedule = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotReschedule) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findCompletionAccessById(bookingId)
+                .map(v -> hasProviderAuthorityOverBooking(
+                        v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+                .orElse(false);
+    }
+
+    /**
+     * Service-layer provider-reschedule guard (Phase 27.2) — the entity-based twin of
+     * {@link #canRescheduleBooking}, for {@code BookingService.rescheduleBooking}'s provider
+     * branch to call after its own single load (mirrors {@link #enforceCanCancelBooking}/
+     * {@link #enforceCanCompleteBooking}).
+     */
+    public void enforceCanRescheduleBooking(UUID actorUserId, Booking booking) {
+        if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} predicate for {@code POST /client-reviews} (Phase 27.5 — REVERSES
+     * the previously-deferred/out-of-scope status of master&rarr;client reviews). Mirrors {@link
+     * #canCancelBooking}/{@link #canCompleteBooking}/{@link #canRescheduleBooking} verbatim — a
+     * provider may review the CLIENT of any booking they have provider authority over, the exact
+     * same authority shape as decline/complete/reschedule.
+     */
+    public boolean canReviewClient(Authentication auth, UUID bookingId) {
+        boolean cannotReview = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotReview) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findCompletionAccessById(bookingId)
+                .map(v -> hasProviderAuthorityOverBooking(
+                        v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+                .orElse(false);
+    }
+
+    /**
+     * Service-layer defense-in-depth guard (Phase 27.5) — the entity-based twin of {@link
+     * #canReviewClient}, for {@code ClientReviewService.create} to call after its own single load
+     * (mirrors {@link #enforceCanCancelBooking}/{@link #enforceCanRescheduleBooking}).
+     */
+    public void enforceCanReviewClient(UUID actorUserId, Booking booking) {
+        if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
     public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
         if (isAuthorizedToManageBooking(actorUserId, booking)) {
             return;
