@@ -554,15 +554,10 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 27.1: {@code starts_at} is in the FUTURE, not the past. This fixture backs
-     * {@code /decline} tests in this class (never {@code /complete}), and {@code declineBooking}
-     * gained a new {@code assertFutureForProviderCancel} guard (now &lt; startsAt) — an elapsed
-     * booking would now 409 before reaching the authorization assertions this class exists to
-     * pin. Phase 27.x gave {@code /not-complete} the OPPOSITE guard (now &gt;= startsAt), so any
-     * of THIS class's not-complete tests that expect a 204 must use
-     * {@link #insertElapsedConfirmedBooking}/{@link #insertElapsedConfirmedSalonBooking} instead —
-     * the 403 (authorization-denied) not-complete tests are unaffected either way since the authz
-     * check runs before the temporal guard.
+     * {@code starts_at} is in the FUTURE. This fixture backs {@code /decline} tests in this class
+     * (never {@code /complete}) — decline has no temporal guard (product decision: a provider may
+     * decline a CONFIRMED booking at any time, elapsed or not), so a future fixture is just the
+     * conventional default here, not a requirement.
      */
     private UUID insertConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
         UUID bookingId = UUID.randomUUID();
@@ -578,8 +573,9 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
 
     /**
      * ELAPSED counterpart to {@link #insertConfirmedBooking} — backs this class's {@code
-     * /not-complete} 204 (happy-path) tests, whose {@code assertElapsedForNotComplete} guard
-     * (Phase 27.x) requires {@code now >= startsAt}.
+     * /not-complete} 204 (happy-path) tests. {@code /not-complete} has no temporal guard (reverted
+     * along with the rest of the elapsed-only no-show restriction), so an elapsed fixture is just
+     * the conventional default here, not a requirement.
      */
     private UUID insertElapsedConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
         UUID bookingId = UUID.randomUUID();

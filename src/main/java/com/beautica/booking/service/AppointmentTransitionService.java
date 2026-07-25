@@ -175,20 +175,14 @@ public class AppointmentTransitionService {
     /**
      * Provider-initiated visit no-show — the header and every item move to {@code NOT_COMPLETED} with
      * reason {@code CLIENT_NO_SHOW}; the optional provider note is written to the header. Mirrors
-     * {@code BookingService#notCompleteBooking} (same provider authority shape as decline/complete),
-     * including its elapsed guard: a provider cannot mark a visit a no-show before its slot has
-     * begun ({@link BookingTemporalGuard#assertElapsedForNotComplete}, evaluated on the visit's
-     * FIRST item's {@code startsAt} — the instant the whole visit begins — mirroring how
-     * {@link #resolveVisitForProviderReschedule} resolves visit timing off
-     * {@code ctx.firstItem().getStartsAt()}). Also evicts the actor's revenue dashboard after commit
-     * for parity with the single path.
+     * {@code BookingService#notCompleteBooking} (same provider authority shape as decline/complete).
+     * Also evicts the actor's revenue dashboard after commit for parity with the single path.
      */
     @Transactional
     public void notCompleteAppointment(UUID actorId, UUID appointmentId, AppointmentProviderNoteRequest req) {
         VisitContext ctx = loadVisitOrThrow(appointmentId);
         authz.enforceCanCancelBooking(actorId, ctx.firstItem());
         assertHeaderTransition(ctx.appointment(), BookingStatus.NOT_COMPLETED);
-        BookingTemporalGuard.assertElapsedForNotComplete(ctx.firstItem().getStartsAt(), clock);
 
         ctx.appointment().setStatus(BookingStatus.NOT_COMPLETED);
         ctx.appointment().setCancellationReason(CancellationReason.CLIENT_NO_SHOW);

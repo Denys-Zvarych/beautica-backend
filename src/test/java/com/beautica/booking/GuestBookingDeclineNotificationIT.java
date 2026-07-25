@@ -188,9 +188,8 @@ class GuestBookingDeclineNotificationIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 27.1: {@code starts_at} is in the FUTURE — this fixture backs a {@code /decline} test
-     * only, and decline's new {@code assertFutureForProviderCancel} guard (now &lt; startsAt)
-     * would 409 an elapsed booking before this class's SMS assertions ever ran.
+     * {@code starts_at} is in the FUTURE — this fixture backs a {@code /decline} test only.
+     * Decline has no temporal guard, so a future fixture is just the conventional default here.
      */
     private UUID insertConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
         UUID bookingId = UUID.randomUUID();

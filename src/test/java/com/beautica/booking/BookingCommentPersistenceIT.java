@@ -418,11 +418,10 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
     }
 
     /**
-     * ELAPSED variant of {@link #insertBookingWithStatus} — this track's guard
-     * ({@code BookingTemporalGuard#assertElapsedForNotComplete}) now requires {@code now >=
-     * startsAt} for {@code /not-complete}, so the note-persistence/optional-comment tests that
-     * exercise that endpoint need a booking whose slot has already begun, unlike the FUTURE default
-     * (which still backs every {@code /decline} test in this class — decline is future-only).
+     * ELAPSED variant of {@link #insertBookingWithStatus} — used by this class's
+     * {@code /not-complete} tests as the conventional no-show fixture (neither {@code /decline}
+     * nor {@code /not-complete} carries a temporal guard, so this is not a correctness
+     * requirement).
      */
     private UUID insertElapsedBookingWithStatus(Fixture fx, String status, String providerComment) {
         UUID bookingId = UUID.randomUUID();

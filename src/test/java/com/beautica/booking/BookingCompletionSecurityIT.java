@@ -135,37 +135,33 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
     }
 
-    // ── Phase 27.1: decline is future-only (full HTTP stack) ───────────────────────
-    // BookingElapsedClientGuardIT already pins the equivalent 409 at the SERVICE layer
-    // (bookingService.declineBooking called directly — see its Matrix #5). Nothing in this diff
-    // exercised the same guard through the real PATCH /decline endpoint — controller routing,
-    // @PreAuthorize, GlobalExceptionHandler's BusinessException->409 mapping included — so this
-    // closes that full-stack gap, symmetric with should_return409_when_completingFutureBooking
-    // above (which pins the opposite-direction complete guard over HTTP).
+    // ── decline has no temporal guard (full HTTP stack) ─────────────────────────────
+    // Product decision reversal: a provider may decline a CONFIRMED booking at ANY time, future
+    // or already-elapsed — the earlier future-only restriction (Phase 27.1's
+    // assertFutureForProviderCancel) has been removed. This pins that over the real PATCH
+    // /decline endpoint — controller routing, @PreAuthorize, and the service call included.
 
     @Test
-    @DisplayName("Phase 27.1: PATCH /decline — 409 when the booking has ALREADY STARTED "
-            + "(assertFutureForProviderCancel requires now < startsAt)")
-    void should_return409_when_decliningAlreadyStartedBooking() {
+    @DisplayName("PATCH /decline — 204 when the booking has ALREADY STARTED "
+            + "(decline has no temporal guard — a provider may decline at any time)")
+    void should_return204_when_decliningAlreadyStartedBooking() {
         Salon salon = createSalon("compl-sec-decl-elapsed-owner-" + System.nanoTime() + "@beautica.test");
-        // The class default insertConfirmedSalonBooking is ELAPSED (starts_at 2h in the past) —
-        // exactly the fixture needed here, unlike the two pre-existing /decline tests above which
-        // had to switch to insertConfirmedSalonBookingFuture to survive this very guard.
+        // The class default insertConfirmedSalonBooking is ELAPSED (starts_at 2h in the past).
         UUID bookingId = insertConfirmedSalonBooking(salon);
 
-        ResponseEntity<String> resp = restTemplate.exchange(
+        ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/decline", HttpMethod.PATCH,
                 new HttpEntity<>(
                         "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}",
                         bearerHeaders(tokenFor(salon.ownerEmail))),
-                String.class);
+                Void.class);
 
         assertThat(resp.getStatusCode())
-                .as("declining a booking that has already started must be rejected with 409 — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.CONFLICT);
+                .as("declining an already-started booking must succeed with 204 (decline is no longer future-only)")
+                .isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(dbStatus(bookingId))
-                .as("a rejected decline must leave the already-started booking CONFIRMED")
-                .isEqualTo("CONFIRMED");
+                .as("the already-started booking must move to DECLINED")
+                .isEqualTo("DECLINED");
     }
 
     // ── negative: role gate ──────────────────────────────────────────────────────

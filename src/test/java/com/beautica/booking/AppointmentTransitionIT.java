@@ -122,11 +122,6 @@ class AppointmentTransitionIT extends AbstractIntegrationTest {
             + "writes the provider note + CLIENT_NO_SHOW on the header")
     void should_moveAllItemsToNotCompleted_when_providerMarksNoShow() throws Exception {
         Visit visit = createTwoServiceVisit("noshow");
-        // Phase 27.x: notCompleteAppointment now requires the visit to have begun/elapsed
-        // (assertElapsedForNotComplete on the first item's startsAt). POST /appointments only
-        // accepts a future start, so backdate every chained item directly — mirrors how the sibling
-        // ITs (AppointmentTransitionMatrixIT) seed elapsed visits straight via SQL.
-        backdateVisitItems(visit.id());
 
         ResponseEntity<String> resp = patch(visit.masterToken(), visit.id(), "not-complete",
                 "{\"providerComment\":\"Клієнт не прийшов\"}");
@@ -246,27 +241,6 @@ class AppointmentTransitionIT extends AbstractIntegrationTest {
         return jdbcTemplate.queryForMap(
                 "SELECT cancellation_reason, client_cancellation_note, provider_comment "
                         + "FROM appointments WHERE id = ?", appointmentId);
-    }
-
-    /**
-     * Shifts every chained item of a visit three days into the past (preserving each item's
-     * duration and their relative chaining), so a visit created via the future-only {@code POST
-     * /appointments} create path can still be used to exercise a provider guard that requires the
-     * visit to have already begun (Phase 27.x's {@code assertElapsedForNotComplete}). Safe against
-     * the {@code no_overlapping_bookings} EXCLUDE constraint — the visit's master has no other
-     * bookings.
-     *
-     * <p><b>Deliberately 3 days, not 2</b> — {@link #createTwoServiceVisit} anchors the visit at
-     * {@code now+2days} at a FIXED clock hour (e.g. 10:00). Subtracting exactly 2 days would land
-     * on TODAY at that same hour, which is only in the past if the test happens to run after that
-     * hour — a time-of-day-dependent flake. Subtracting 3 days lands on YESTERDAY at that hour,
-     * unambiguously in the past regardless of when the suite runs.
-     */
-    private void backdateVisitItems(UUID appointmentId) {
-        jdbcTemplate.update(
-                "UPDATE bookings SET starts_at = starts_at - interval '3 days', "
-                        + "ends_at = ends_at - interval '3 days' WHERE appointment_id = ?",
-                appointmentId);
     }
 
     private Long statusChangedCount(UUID appointmentId) {

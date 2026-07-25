@@ -191,9 +191,8 @@ class AppointmentTransitionMatrixIT extends AbstractIntegrationTest {
         @DisplayName("provider no-show — header + ALL 3 items → NOT_COMPLETED; provider note only on "
                 + "the header, each item carries CLIENT_NO_SHOW but NOT the note; one STATUS_CHANGED")
         void should_moveAllThreeItemsToNotCompleted_andKeepNoteOnHeaderOnly_when_providerMarksNoShow() throws Exception {
-            // Phase 27.x: notCompleteAppointment now requires the visit to have begun/elapsed
-            // (assertElapsedForNotComplete on the first item's startsAt) — a FUTURE visit would
-            // now 409 before reaching the lockstep/note assertions this test exists to pin.
+            // not-complete has no temporal guard — an elapsed visit is just the conventional
+            // no-show fixture here, not a requirement.
             IndependentVisit v = seedIndependentVisit("noshow3", 3, pastStart());
 
             ResponseEntity<String> resp = patch(v.masterToken(), v.id(), "not-complete",
@@ -472,6 +471,24 @@ class AppointmentTransitionMatrixIT extends AbstractIntegrationTest {
         }
 
         @Test
+        @DisplayName("decline — the provider may decline an ELAPSED visit → DECLINED (decline has no "
+                + "temporal guard — a provider may resolve a past visit by declining it, not only via "
+                + "complete/not-complete)")
+        void should_allowProviderDeclineElapsedVisit() throws Exception {
+            IndependentVisit v = seedIndependentVisit("elapsed-decline", 2, pastStart());
+
+            ResponseEntity<String> resp = patch(v.masterToken(), v.id(), "decline",
+                    "{\"providerComment\":\"Клієнт не з'явився\"}");
+
+            assertThat(resp.getStatusCode())
+                    .as("declining an already-elapsed visit must succeed — body: %s", resp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+            assertVisitStatus(v.id(), "DECLINED");
+            assertAllItemsStatus(v.id(), "DECLINED", 2);
+            assertThat(statusChangedCount(v.id())).isEqualTo(1L);
+        }
+
+        @Test
         @DisplayName("no-show — the provider may mark an ELAPSED visit a no-show → NOT_COMPLETED "
                 + "(same elapsed predicate as complete, satisfied by a past visit)")
         void should_allowProviderMarkNoShowElapsedVisit() throws Exception {
@@ -488,22 +505,19 @@ class AppointmentTransitionMatrixIT extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("Phase 27.x: no-show — 409 when the provider marks a FUTURE (not-yet-started) "
-                + "visit a no-show; the visit + all items stay CONFIRMED, no notification")
-        void should_reject409_when_providerMarksFutureVisitNoShow() throws Exception {
+        @DisplayName("no-show — the provider may also mark a FUTURE (not-yet-started) visit a "
+                + "no-show → NOT_COMPLETED (not-complete has no temporal guard)")
+        void should_allowProviderMarkNoShowFutureVisit() throws Exception {
             IndependentVisit v = seedIndependentVisit("future-noshow", 2, futureStart());
 
             ResponseEntity<String> resp = patch(v.masterToken(), v.id(), "not-complete", null);
 
             assertThat(resp.getStatusCode())
-                    .as("a no-show on a visit that has not started yet must be rejected with 409 "
-                            + "(assertElapsedForNotComplete) — body: %s", resp.getBody())
-                    .isEqualTo(HttpStatus.CONFLICT);
-            assertVisitStatus(v.id(), "CONFIRMED");
-            assertAllItemsStatus(v.id(), "CONFIRMED", 2);
-            assertThat(statusChangedCount(v.id()))
-                    .as("a rejected future no-show enqueues nothing")
-                    .isEqualTo(0L);
+                    .as("marking a not-yet-started visit a no-show must succeed — body: %s", resp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+            assertVisitStatus(v.id(), "NOT_COMPLETED");
+            assertAllItemsStatus(v.id(), "NOT_COMPLETED", 2);
+            assertThat(statusChangedCount(v.id())).isEqualTo(1L);
         }
     }
 

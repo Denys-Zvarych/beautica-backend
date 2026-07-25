@@ -777,10 +777,9 @@ public class BookingService {
         // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
         assertNotAppointmentChild(booking);
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.DECLINED);
-        // Phase 27.1: decline is future-only — a provider cannot back out of a booking that has
-        // already started. Checked AFTER the status guard so a non-CONFIRMED booking still
-        // reports the more specific status conflict (mirrors assertNotElapsedForClient's ordering).
-        BookingTemporalGuard.assertFutureForProviderCancel(booking.getStartsAt(), clock);
+        // Product decision reversal: decline is no longer future-only — a provider may decline a
+        // CONFIRMED booking at any time, elapsed or not (e.g. the client never showed up and the
+        // provider simply wants to close it out via decline rather than a separate no-show action).
         booking.setStatus(BookingStatus.DECLINED);
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));
@@ -833,11 +832,6 @@ public class BookingService {
             throw new BusinessException("Cancellation reason required");
         }
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED);
-        // Phase 27.x: no-show unlocks once the appointment has begun/elapsed (now >= startsAt) —
-        // same predicate as completeBooking's assertElapsedForComplete: a provider cannot claim a
-        // no-show for a slot that hasn't started (nothing to have missed yet). Checked AFTER the
-        // status guard, same ordering as decline/complete.
-        BookingTemporalGuard.assertElapsedForNotComplete(booking.getStartsAt(), clock);
         booking.setStatus(BookingStatus.NOT_COMPLETED);
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));

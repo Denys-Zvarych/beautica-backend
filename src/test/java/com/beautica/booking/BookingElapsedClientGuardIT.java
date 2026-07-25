@@ -12,7 +12,6 @@ import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.BookingElapsedException;
-import com.beautica.common.exception.BusinessException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -54,11 +53,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * resolution — a client may no longer cancel or reschedule it, while the provider
  * (complete / mark-no-show) still can.
  *
- * <p><b>Phase 27.1 update (REVERSES a claim this class used to pin).</b> {@code decline} gained
- * its OWN, opposite-direction temporal guard: a provider may only decline a booking that has NOT
- * yet started ({@code now < startsAt}). An elapsed booking (whose {@code startsAt} is necessarily
- * also in the past) can therefore no longer be declined — {@code complete}/{@code not-complete}
- * are the only remaining resolution paths once a booking elapses. See Matrix #5 below, which was
+ * <p><b>Product decision reversal (REVERSES a claim this class used to pin twice).</b>
+ * {@code decline}'s brief future-only temporal guard, and {@code not-complete}'s brief
+ * elapsed-only temporal guard, have both been removed: a provider may decline OR mark a CONFIRMED
+ * booking a no-show at ANY time, future or already-elapsed. See Matrix #5 below, which was
  * updated in place rather than left to silently document stale behaviour.
  *
  * <p><b>Threat model this pins — server-clock authority.</b> The elapsed verdict is computed
@@ -218,16 +216,14 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
     }
 
     // ── Matrix #5 — provider resolution paths on an elapsed CONFIRMED booking ────────────────────
-    // Phase 27.1: decline itself gained a temporal guard (future-only), so it FLIPPED from
-    // "still allowed" to "now rejected" on an elapsed booking — complete/not-complete remain the
-    // only resolution paths once a booking has started. The old "decline still succeeds" test is
-    // replaced in place with its reversed expectation, not left stale beside a new one.
+    // Product decision reversal: decline no longer carries a temporal guard at all — a provider
+    // may decline a CONFIRMED booking at any time, elapsed or not, exactly like complete/not-complete.
 
     @Test
-    @DisplayName("Phase 27.1: provider decline on an ELAPSED CONFIRMED booking is now REJECTED with 409 "
-            + "(decline is future-only — complete/not-complete are the only resolution paths left once "
-            + "a booking has started)")
-    void should_rejectProviderDecline_when_bookingElapsed() {
+    @DisplayName("provider decline on an ELAPSED CONFIRMED booking succeeds → DECLINED "
+            + "(decline has no temporal guard — a provider may resolve an elapsed booking by "
+            + "declining it, not only via complete/not-complete)")
+    void should_allowProviderDecline_when_bookingElapsed() {
         Master master = createIndependentMaster("elapsed-decline-master-" + System.nanoTime() + "@beautica.test");
         UUID serviceId = createMasterService(master.masterId);
         UUID clientId = createClient("elapsed-decline-client-" + System.nanoTime() + "@beautica.test");
@@ -235,15 +231,11 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
 
         authenticateAs(master.userId);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
-        assertThat(org.assertj.core.api.Assertions.catchThrowable(
-                        () -> bookingService.declineBooking(master.userId, bookingId, req)))
-                .as("decline on an already-started booking must be rejected with a 409 BusinessException")
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+        bookingService.declineBooking(master.userId, bookingId, req);
 
         assertThat(bookingStatus(bookingId))
-                .as("a rejected decline must leave the elapsed booking CONFIRMED")
-                .isEqualTo(BookingStatus.CONFIRMED.name());
+                .as("the provider may decline an already-started booking")
+                .isEqualTo(BookingStatus.DECLINED.name());
     }
 
     @Test
@@ -263,9 +255,7 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("provider mark-no-show on an elapsed CONFIRMED booking still succeeds → NOT_COMPLETED "
-            + "(satisfies Phase 27.x's assertElapsedForNotComplete — an elapsed booking is exactly "
-            + "what that guard requires)")
+    @DisplayName("provider mark-no-show on an elapsed CONFIRMED booking still succeeds → NOT_COMPLETED")
     void should_allowProviderMarkNoShow_when_bookingElapsed() {
         Master master = createIndependentMaster("elapsed-noshow-master-" + System.nanoTime() + "@beautica.test");
         UUID serviceId = createMasterService(master.masterId);
@@ -282,11 +272,10 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Phase 27.x: provider mark-no-show on a FUTURE (not-yet-started) CONFIRMED booking is "
-            + "REJECTED with 409 (assertElapsedForNotComplete — a provider cannot claim a no-show for "
-            + "a slot that hasn't started; the optional providerComment must also be accepted without "
-            + "changing this outcome)")
-    void should_rejectProviderMarkNoShow_when_bookingIsFuture() {
+    @DisplayName("provider mark-no-show on a FUTURE (not-yet-started) CONFIRMED booking succeeds too "
+            + "→ NOT_COMPLETED (not-complete has no temporal guard — reverted along with the rest of "
+            + "the elapsed-only restriction; the optional providerComment is accepted)")
+    void should_allowProviderMarkNoShow_when_bookingIsFuture() {
         Master master = createIndependentMaster("future-noshow-master-" + System.nanoTime() + "@beautica.test");
         UUID serviceId = createMasterService(master.masterId);
         UUID clientId = createClient("future-noshow-client-" + System.nanoTime() + "@beautica.test");
@@ -294,15 +283,11 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
 
         authenticateAs(master.userId);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "Клієнт не з'явився");
-        assertThat(org.assertj.core.api.Assertions.catchThrowable(
-                        () -> bookingService.notCompleteBooking(master.userId, bookingId, req)))
-                .as("a no-show on a booking that has not started yet must be rejected with a 409 BusinessException")
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+        bookingService.notCompleteBooking(master.userId, bookingId, req);
 
         assertThat(bookingStatus(bookingId))
-                .as("a rejected no-show must leave the future booking CONFIRMED")
-                .isEqualTo(BookingStatus.CONFIRMED.name());
+                .as("the provider may mark a future (not-yet-started) booking as a no-show")
+                .isEqualTo(BookingStatus.NOT_COMPLETED.name());
     }
 
     // ── shared assertion ─────────────────────────────────────────────────────────
@@ -402,9 +387,9 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Inserts an APP booking whose slot has NOT started yet (starts in 90 minutes) — the negative
-     * fixture for {@code assertElapsedForNotComplete} (Phase 27.x), the exact mirror of
-     * {@link #insertElapsedConfirmedBooking} above.
+     * Inserts an APP booking whose slot has NOT started yet (starts in 90 minutes) — the future
+     * counterpart to {@link #insertElapsedConfirmedBooking} above, used to prove not-complete
+     * (and decline) succeed regardless of elapsed state.
      */
     private UUID insertFutureConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
         UUID bookingId = UUID.randomUUID();

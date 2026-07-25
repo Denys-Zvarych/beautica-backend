@@ -15,8 +15,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
- * Phase 27.1 — pass/throw branches for the three anti-tamper temporal guards, pinned against a
- * fixed {@link Clock} so the boundary (exactly {@code now}) is deterministic.
+ * Phase 27.1 — pass/throw branches for the remaining anti-tamper temporal guards (complete,
+ * provider reschedule), pinned against a fixed {@link Clock} so the boundary (exactly
+ * {@code now}) is deterministic. Decline and not-complete are deliberately unguarded — see
+ * {@link BookingTemporalGuard}'s class javadoc.
  */
 @DisplayName("BookingTemporalGuard — unit")
 class BookingTemporalGuardTest {
@@ -34,30 +36,6 @@ class BookingTemporalGuardTest {
 
     private static OffsetDateTime exactlyNow() {
         return OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC);
-    }
-
-    // ── assertFutureForProviderCancel (decline) ─────────────────────────────────
-
-    @Test
-    @DisplayName("assertFutureForProviderCancel — passes when startsAt is in the future")
-    void should_pass_when_declineStartsAtIsFuture() {
-        assertThatCode(() -> BookingTemporalGuard.assertFutureForProviderCancel(future(), CLOCK))
-                .doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("assertFutureForProviderCancel — throws 409 when startsAt is in the past")
-    void should_throw409_when_declineStartsAtIsPast() {
-        assertThatThrownBy(() -> BookingTemporalGuard.assertFutureForProviderCancel(past(), CLOCK))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
-    }
-
-    @Test
-    @DisplayName("assertFutureForProviderCancel — throws 409 when startsAt equals now exactly (not strictly future)")
-    void should_throw409_when_declineStartsAtEqualsNow() {
-        assertThatThrownBy(() -> BookingTemporalGuard.assertFutureForProviderCancel(exactlyNow(), CLOCK))
-                .isInstanceOf(BusinessException.class);
     }
 
     // ── assertElapsedForComplete ─────────────────────────────────────────────────
@@ -80,30 +58,6 @@ class BookingTemporalGuardTest {
     @DisplayName("assertElapsedForComplete — throws 409 when startsAt is in the future")
     void should_throw409_when_completeStartsAtIsFuture() {
         assertThatThrownBy(() -> BookingTemporalGuard.assertElapsedForComplete(future(), CLOCK))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
-    }
-
-    // ── assertElapsedForNotComplete (no-show) ───────────────────────────────────
-
-    @Test
-    @DisplayName("assertElapsedForNotComplete — passes when startsAt is in the past")
-    void should_pass_when_notCompleteStartsAtIsPast() {
-        assertThatCode(() -> BookingTemporalGuard.assertElapsedForNotComplete(past(), CLOCK))
-                .doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("assertElapsedForNotComplete — passes when startsAt equals now exactly (begun this instant)")
-    void should_pass_when_notCompleteStartsAtEqualsNow() {
-        assertThatCode(() -> BookingTemporalGuard.assertElapsedForNotComplete(exactlyNow(), CLOCK))
-                .doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("assertElapsedForNotComplete — throws 409 when startsAt is in the future")
-    void should_throw409_when_notCompleteStartsAtIsFuture() {
-        assertThatThrownBy(() -> BookingTemporalGuard.assertElapsedForNotComplete(future(), CLOCK))
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
     }

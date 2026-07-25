@@ -241,11 +241,12 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
      * Seeds a CONFIRMED single-service standalone booking directly (appointment_id stays NULL —
      * the legacy path), owned by a fresh CLIENT and served by a fresh INDEPENDENT_MASTER.
      *
-     * <p>FUTURE by default so the client-cancel path's elapsed-booking guard (endsAt-based) and
-     * decline's new future-only guard (Phase 27.1, startsAt-based) both pass. {@code "complete"}
-     * and {@code "noshow"} are the two exceptions: {@code completeBooking} gained the OPPOSITE
-     * guard (now &gt;= startsAt) in Phase 27.1, and {@code notCompleteBooking} gained the identical
-     * elapsed guard in Phase 27.x — both of those single fixtures are seeded ELAPSED instead.
+     * <p>FUTURE by default so the client-cancel path's elapsed-booking guard (endsAt-based) passes.
+     * {@code "complete"} and {@code "noshow"} are the two exceptions: {@code completeBooking}
+     * requires {@code now >= startsAt} (Phase 27.1), so those two fixtures are seeded ELAPSED
+     * instead — {@code notCompleteBooking} has no temporal guard, but the "noshow" fixture stays
+     * elapsed anyway as the conventional no-show default. {@code declineBooking} has no temporal
+     * guard either, so the "decline" fixture's FUTURE default is likewise just convention.
      */
     private Standalone createLegacyStandaloneBooking(String tag) throws Exception {
         String masterEmail = "child-guard-legacy-" + tag + "-master-" + System.nanoTime() + "@beautica.test";

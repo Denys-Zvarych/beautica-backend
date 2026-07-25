@@ -13,9 +13,12 @@ import java.time.OffsetDateTime;
  * REQUEST-supplied new {@code startsAt} against the lead-time/max-window rule (400 on violation).
  * This class instead guards the PERSISTED booking's existing {@code startsAt} against the action
  * being attempted right now (409 on violation) — a different question entirely. Before this
- * existed, {@code declineBooking}/{@code completeBooking} trusted the {@code CONFIRMED} status
- * guard alone: a provider could decline a booking whose appointment window had already started
- * (or completed), or mark COMPLETED a booking that had not even begun yet.
+ * existed, {@code completeBooking} trusted the {@code CONFIRMED} status guard alone: a provider
+ * could mark COMPLETED a booking that had not even begun yet.
+ *
+ * <p>Decline and not-complete are deliberately NOT guarded here — a provider may resolve either
+ * transition on a CONFIRMED booking at any time, elapsed or not (product decision reversing the
+ * earlier future-only decline guard and the earlier elapsed-only not-complete guard).
  *
  * <p>Every guard throws a 409 {@link BusinessException} — the same status the existing
  * {@code assertNotElapsedForClient}/{@code BookingElapsedException} client-side guard uses, since
@@ -27,18 +30,6 @@ import java.time.OffsetDateTime;
 final class BookingTemporalGuard {
 
     private BookingTemporalGuard() {
-    }
-
-    /**
-     * Decline is future-only: a provider may back out of a booking only before it has begun.
-     * Once {@code now >= startsAt} the appointment is underway or past, and the provider's only
-     * remaining resolution is {@code /complete} (or the untouched {@code /not-complete}).
-     */
-    static void assertFutureForProviderCancel(OffsetDateTime startsAt, Clock clock) {
-        if (!isStrictlyFuture(startsAt, clock)) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "Cannot decline a booking that has already started");
-        }
     }
 
     /**
@@ -54,31 +45,10 @@ final class BookingTemporalGuard {
     }
 
     /**
-     * No-show (not-complete) shares the exact predicate {@link #assertElapsedForComplete} uses —
-     * {@code now >= startsAt} — since recording a client no-show is only meaningful once the
-     * appointment slot has begun/elapsed: a provider cannot claim the client failed to show up for
-     * a slot that has not started yet (there is nothing to have missed). Kept as its own named
-     * method — not a silent alias of {@link #assertElapsedForComplete} — for a no-show-specific
-     * error string and call-site clarity in {@code BookingService#notCompleteBooking} /
-     * {@code AppointmentTransitionService#notCompleteAppointment}, mirroring how
-     * {@link #assertCurrentNotElapsedForReschedule} shares {@link #isStrictlyFuture} with
-     * {@link #assertFutureForProviderCancel} below without becoming an alias of it.
-     */
-    static void assertElapsedForNotComplete(OffsetDateTime startsAt, Clock clock) {
-        if (isStrictlyFuture(startsAt, clock)) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "Cannot mark a booking not-completed before it has started");
-        }
-    }
-
-    /**
-     * Provider-initiated reschedule requires the CURRENT booking to not have started yet — same
-     * boolean predicate as {@link #assertFutureForProviderCancel} (a provider cannot move a
-     * booking that is already underway any more than they can decline one), but kept as its own
-     * named method — not a silent alias — for a reschedule-specific error string and call-site
-     * clarity in {@code BookingService.rescheduleBooking}. See
-     * {@link #assertFutureForProviderCancel} for the shared boolean logic
-     * ({@link #isStrictlyFuture}).
+     * Provider-initiated reschedule requires the CURRENT booking to not have started yet — a
+     * provider cannot move a booking that is already underway. Kept as its own named method for a
+     * reschedule-specific error string and call-site clarity in
+     * {@code BookingService.rescheduleBooking}.
      */
     static void assertCurrentNotElapsedForReschedule(OffsetDateTime startsAt, Clock clock) {
         if (!isStrictlyFuture(startsAt, clock)) {
