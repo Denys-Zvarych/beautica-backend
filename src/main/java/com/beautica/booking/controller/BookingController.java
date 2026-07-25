@@ -191,8 +191,11 @@ public class BookingController {
         return ResponseEntity.noContent().build();
     }
 
+    // Role-only gate here + service-layer @authz.enforceCanCancelBooking ownership guard in
+    // BookingService#notCompleteBooking (§D — ownership enforced once, in the service). Mirrors
+    // the sibling AppointmentController /not-complete, which is likewise role-only.
     @PatchMapping("/{bookingId}/not-complete")
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') and @authz.canCancelBooking(authentication, #bookingId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
     public ResponseEntity<Void> notCompleteBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody StatusUpdateRequest req,

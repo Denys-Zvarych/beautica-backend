@@ -349,6 +349,86 @@ class AppointmentTransitionMatrixIT extends AbstractIntegrationTest {
             assertVisitStatus(v.id(), "CONFIRMED");
             assertThat(statusChangedCount(v.id())).isEqualTo(0L);
         }
+
+        // ── anti-oracle pins: siblings of BookingProviderCancelAuthorizationIT's /not-complete pin ──
+        // Every role-only provider transition on AppointmentController (decline / complete /
+        // not-complete / per-service decline) is @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN',
+        // 'INDEPENDENT_MASTER')") — matching the sibling booking endpoints. Before the MEDIUM oracle
+        // fix, the service loaded the visit via loadVisitOrThrow → 404 for an unknown appointment id
+        // BEFORE the ownership guard, leaking existence (404 for missing vs. 403 for foreign — the
+        // foreignSalonOwner case above). The fix collapses existence + ownership to a uniform 403 on
+        // every one of these endpoints; these pins hold that behaviour for all four uniformly.
+        @Test
+        @DisplayName("not-complete — a valid provider hitting a NONEXISTENT appointment id must be denied "
+                + "403 (uniform with the foreign-owner denial), NOT 404 — anti existence-oracle pin")
+        void should_return403_not404_when_providerNotCompletesNonexistentVisit() throws Exception {
+            // A fully-valid SALON_OWNER provider — the role gate passes, so only the service-layer
+            // existence/ownership handling decides the status code.
+            BookingTestFixtures.SalonFixture salon =
+                    fixtures.createSalon("appt-mx-nc-oracle-owner-" + System.nanoTime() + "@beautica.test");
+            UUID nonexistentAppointmentId = UUID.randomUUID();
+
+            ResponseEntity<String> resp = patch(fixtures.tokenFor(salon.ownerEmail()),
+                    nonexistentAppointmentId, "not-complete", "{\"providerComment\":\"немає такого візиту\"}");
+
+            assertThat(resp.getStatusCode())
+                    .as("a nonexistent appointment id must be indistinguishable from a foreign one — both "
+                            + "403, never a 404 that confirms the id does not exist (existence oracle)")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("decline — a valid provider hitting a NONEXISTENT appointment id must be denied 403 "
+                + "(uniform with the foreign-owner denial), NOT 404 — anti existence-oracle pin")
+        void should_return403_not404_when_providerDeclinesNonexistentVisit() throws Exception {
+            BookingTestFixtures.SalonFixture salon =
+                    fixtures.createSalon("appt-mx-dc-oracle-owner-" + System.nanoTime() + "@beautica.test");
+            UUID nonexistentAppointmentId = UUID.randomUUID();
+
+            ResponseEntity<String> resp = patch(fixtures.tokenFor(salon.ownerEmail()),
+                    nonexistentAppointmentId, "decline", "{\"providerComment\":\"немає такого візиту\"}");
+
+            assertThat(resp.getStatusCode())
+                    .as("a nonexistent appointment id must be indistinguishable from a foreign one — both "
+                            + "403, never a 404 that confirms the id does not exist (existence oracle)")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("complete — a valid provider hitting a NONEXISTENT appointment id must be denied 403 "
+                + "(uniform with the foreign-owner denial), NOT 404 — anti existence-oracle pin")
+        void should_return403_not404_when_providerCompletesNonexistentVisit() throws Exception {
+            BookingTestFixtures.SalonFixture salon =
+                    fixtures.createSalon("appt-mx-cp-oracle-owner-" + System.nanoTime() + "@beautica.test");
+            UUID nonexistentAppointmentId = UUID.randomUUID();
+
+            ResponseEntity<String> resp = patch(fixtures.tokenFor(salon.ownerEmail()),
+                    nonexistentAppointmentId, "complete", null);
+
+            assertThat(resp.getStatusCode())
+                    .as("a nonexistent appointment id must be indistinguishable from a foreign one — both "
+                            + "403, never a 404 that confirms the id does not exist (existence oracle)")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("decline-service — a valid provider declining a service of a NONEXISTENT appointment "
+                + "id must be denied 403, NOT 404 — the missing-visit case collapses to 403 BEFORE the "
+                + "bookingId-not-a-child 404, so no existence oracle")
+        void should_return403_not404_when_providerDeclinesServiceOfNonexistentVisit() throws Exception {
+            BookingTestFixtures.SalonFixture salon =
+                    fixtures.createSalon("appt-mx-psd-oracle-owner-" + System.nanoTime() + "@beautica.test");
+            UUID nonexistentAppointmentId = UUID.randomUUID();
+            UUID anyBookingId = UUID.randomUUID();
+
+            ResponseEntity<String> resp = patchServiceDecline(fixtures.tokenFor(salon.ownerEmail()),
+                    nonexistentAppointmentId, anyBookingId, "{\"providerComment\":\"немає такого візиту\"}");
+
+            assertThat(resp.getStatusCode())
+                    .as("a nonexistent appointment id must be indistinguishable from a foreign one — both "
+                            + "403; the missing-visit case must collapse to 403 BEFORE the child-not-found 404")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════

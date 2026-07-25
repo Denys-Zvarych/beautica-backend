@@ -722,8 +722,11 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
     }
 
-    // Phase 24.2: SALON_ADMIN now passes the controller role gate — this exercises the "role
-    // admitted but @authz.canCancelBooking denies" path (an admin not assigned to the salon).
+    // Phase 24.2: SALON_ADMIN passes the controller role gate. Unlike /decline, the /not-complete
+    // annotation is role-only (§D — the redundant SpEL @authz.canCancelBooking ownership clause was
+    // dropped), so ownership for an admin NOT assigned to the booking's salon is enforced by the
+    // service-layer @authz.enforceCanCancelBooking guard in BookingService#notCompleteBooking. Here
+    // that mocked service throws ForbiddenException, which the controller propagates as 403.
     // TODO(24.7): add the assigned-SALON_ADMIN ✅ 204 case to the authz matrix.
     @Test
     @DisplayName("PATCH /{bookingId}/not-complete — 403 when SALON_ADMIN is not assigned to the booking's salon")
@@ -731,7 +734,8 @@ class BookingControllerTest {
         var adminId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(false);
+        when(bookingService.notCompleteBooking(any(), eq(bookingId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))

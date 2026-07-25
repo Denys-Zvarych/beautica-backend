@@ -221,6 +221,33 @@ class BookingProviderRescheduleIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
     }
 
+    // ── anti-oracle pin: provider reschedule of a NONEXISTENT booking denies UNIFORMLY (403, not 404) ──
+    // Final audit pass: resolveBookingForProviderReschedule loaded via loadBookingOrThrow → 404 for a
+    // missing id BEFORE enforceCanRescheduleBooking — an existence oracle a valid provider could probe.
+    // It now collapses a missing id to the SAME uniform 403 a foreign booking yields (see the two
+    // foreign-actor tests above). Do NOT weaken this to expect 404.
+    @Test
+    @DisplayName("PATCH /reschedule — a valid provider hitting a NONEXISTENT bookingId must be denied with 403 "
+            + "(uniform with the foreign-booking denials), NOT 404 — anti existence-oracle pin")
+    void should_return403_not404_when_providerReschedulesNonexistentBooking() throws Exception {
+        // A fully-valid SALON_OWNER — the role gate passes and the actor routes to the provider
+        // reschedule path, so only the service-layer existence/ownership handling decides the status.
+        var salon = fixtures.createSalon("provresched-oracle-owner-" + System.nanoTime() + "@beautica.test");
+        UUID nonexistentBookingId = UUID.randomUUID();
+        ZonedDateTime newStartsAt = ZonedDateTime.now(KYIV).plusDays(2).withHour(13).withMinute(0).withSecond(0).withNano(0);
+        String body = "{\"newStartsAt\":\"" + newStartsAt.toOffsetDateTime() + "\"}";
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + nonexistentBookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, fixtures.bearerHeaders(fixtures.tokenFor(salon.ownerEmail()))),
+                String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("a nonexistent booking id must be indistinguishable from a foreign one — both 403, "
+                        + "never a 404 that confirms the id does not exist (existence oracle)")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
     @Test
     @DisplayName("PATCH /reschedule — 200 when the provider reschedules a GUEST (LINK, null-client) "
             + "booking — no client account exists to lock/conflict-check or notify, so this pins the "

@@ -119,13 +119,24 @@ public class AppointmentTransitionService {
     /**
      * Provider-initiated visit decline — the header and every item move to {@code DECLINED} with
      * reason {@code PROVIDER_UNAVAILABLE}; the optional provider note is written to the header.
-     * Mirrors {@code BookingService#declineBooking} (authority via
-     * {@link AuthorizationService#enforceCanCancelBooking} — admits SALON_OWNER / SALON_ADMIN /
-     * INDEPENDENT_MASTER). No elapse guard: resolving an elapsed visit is exactly the provider's job.
+     * Mirrors {@code BookingService#declineBooking} exactly on BOTH axes: authority via
+     * {@link AuthorizationService#enforceCanCancelBooking} (admits SALON_OWNER / SALON_ADMIN /
+     * INDEPENDENT_MASTER) AND the missing-id contract — both collapse a missing id to the same
+     * uniform 403 as a foreign visit (Finding 8 — no existence oracle). No elapse guard: resolving
+     * an elapsed visit is exactly the provider's job.
      */
     @Transactional
     public void declineAppointment(UUID actorId, UUID appointmentId, AppointmentProviderNoteRequest req) {
-        VisitContext ctx = loadVisitOrThrow(appointmentId);
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring BookingService#declineBooking / notCompleteAppointment: a missing appointment id
+        // and an existing-but-foreign visit must be indistinguishable to the caller. A plain full load
+        // would surface a 404 for a missing id BEFORE the ownership guard runs, letting a valid provider
+        // distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing appointment
+        // short-circuits to the SAME 403 the ownership guard (enforceCanCancelBooking) throws for
+        // a foreign one. Ownership enforcement is unchanged: a foreign provider still gets 403.
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
         authz.enforceCanCancelBooking(actorId, ctx.firstItem());
         assertHeaderTransition(ctx.appointment(), BookingStatus.DECLINED);
 
@@ -167,14 +178,25 @@ public class AppointmentTransitionService {
      * the single freed (date, service) key, and EXACTLY ONE status-changed notification is enqueued
      * referencing the DECLINED CHILD (never item 0) so the client is told which service was declined.
      *
-     * @throws NotFoundException  the appointment (or the {@code bookingId} within it) does not exist (404)
-     * @throws ForbiddenException the actor lacks provider authority over the visit (403)
+     * @throws NotFoundException  the {@code bookingId} is not a child of an existing, authorized visit (404)
+     * @throws ForbiddenException a missing appointment id, or the actor lacks provider authority over the
+     *                            visit (403) — the missing-id case is collapsed to 403, not 404, to avoid
+     *                            an existence oracle (Finding 8)
      * @throws BusinessException  the target child is not CONFIRMED — already terminal (409)
      */
     @Transactional
     public void declineAppointmentItem(
             UUID actorId, UUID appointmentId, UUID bookingId, AppointmentProviderNoteRequest req) {
-        VisitContext ctx = loadVisitOrThrow(appointmentId);
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring notCompleteAppointment: a missing appointment id and an existing-but-foreign visit
+        // must be indistinguishable to the caller (a plain full load would surface a 404 for a missing id
+        // BEFORE the ownership guard, leaking "doesn't-exist" vs "exists-but-not-mine"). A missing
+        // appointment now short-circuits to the SAME 403 enforceCanCancelBooking throws for a foreign
+        // one. The bookingId-not-a-child 404 below is UNCHANGED — it is reached only after the caller is
+        // authorized on the visit, so it is not an oracle.
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
         authz.enforceCanCancelBooking(actorId, ctx.firstItem());
 
         Booking target = ctx.items().stream()
@@ -216,7 +238,16 @@ public class AppointmentTransitionService {
      */
     @Transactional
     public void completeAppointment(UUID actorId, UUID appointmentId) {
-        VisitContext ctx = loadVisitOrThrow(appointmentId);
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring BookingService#completeBooking / notCompleteAppointment: a missing appointment id
+        // and an existing-but-foreign visit must be indistinguishable to the caller. A plain full load
+        // would surface a 404 for a missing id BEFORE the ownership guard runs, letting a valid provider
+        // distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing appointment
+        // now short-circuits to the SAME 403 the ownership guard (enforceCanCompleteBooking) throws for
+        // a foreign one. Ownership enforcement is unchanged: a foreign provider still gets 403.
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
         authz.enforceCanCompleteBooking(actorId, ctx.firstItem());
         assertHeaderTransition(ctx.appointment(), BookingStatus.COMPLETED);
 
@@ -244,7 +275,16 @@ public class AppointmentTransitionService {
      */
     @Transactional
     public void notCompleteAppointment(UUID actorId, UUID appointmentId, AppointmentProviderNoteRequest req) {
-        VisitContext ctx = loadVisitOrThrow(appointmentId);
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring BookingService#notCompleteBooking / cancelAppointment: a missing appointment id
+        // and an existing-but-foreign visit must be indistinguishable to the caller. A plain full load
+        // would surface a 404 for a missing id BEFORE the ownership guard runs, letting a valid provider
+        // distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing appointment
+        // now short-circuits to the SAME 403 the ownership guard (enforceCanCancelBooking) throws for
+        // a foreign one. Ownership enforcement is unchanged: a foreign provider still gets 403.
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
         authz.enforceCanCancelBooking(actorId, ctx.firstItem());
         assertHeaderTransition(ctx.appointment(), BookingStatus.NOT_COMPLETED);
 
@@ -394,18 +434,6 @@ public class AppointmentTransitionService {
 
     // ── internals ──────────────────────────────────────────────────────────────
 
-    /**
-     * Loads a visit for a PROVIDER transition: a missing appointment (or an orphan header with no
-     * items) is a {@code 404}, matching {@code BookingService#loadBookingOrThrow}. Ownership is then
-     * enforced by the caller's {@code enforceCan*} guard ({@code 403} for a foreign visit) — the same
-     * missing→404 / foreign→403 split the single-service provider paths produce.
-     */
-    private VisitContext loadVisitOrThrow(UUID appointmentId) {
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .orElseThrow(() -> new NotFoundException("Appointment not found"));
-        return new VisitContext(appointment, loadItemsOrThrow(appointmentId));
-    }
-
     private List<Booking> loadItemsOrThrow(UUID appointmentId) {
         List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
         if (items.isEmpty()) {
@@ -497,17 +525,23 @@ public class AppointmentTransitionService {
     }
 
     /**
-     * PROVIDER-path authorization + status + elapsed resolution for {@link #rescheduleAppointment}
-     * — loads via {@link #loadVisitOrThrow} (the same full load every other provider action uses),
-     * authorizes via {@link AuthorizationService#enforceCanRescheduleBooking} on the first item
-     * (same provider-authority shape as decline/complete/not-complete), then guards temporal
-     * validity via {@link BookingTemporalGuard#assertCurrentNotElapsedForReschedule} on the
-     * visit's current start — NOT {@link #assertVisitNotElapsedForClient} (which compares the
-     * visit's END): a provider can no longer move a visit that has already begun, mirroring
-     * {@code BookingService#resolveBookingForProviderReschedule} exactly.
+     * PROVIDER-path authorization + status + elapsed resolution for {@link #rescheduleAppointment}.
+     * Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle): a
+     * missing appointment id and an existing-but-foreign visit are indistinguishable to the caller,
+     * exactly as decline/complete/not-complete now do — a plain full load would surface a 404 for a
+     * missing id BEFORE the ownership guard, leaking existence to a valid provider. Authorizes via
+     * {@link AuthorizationService#enforceCanRescheduleBooking} on the first item (same
+     * provider-authority shape as decline/complete/not-complete), then guards temporal validity via
+     * {@link BookingTemporalGuard#assertCurrentNotElapsedForReschedule} on the visit's current start
+     * — NOT {@link #assertVisitNotElapsedForClient} (which compares the visit's END): a provider can
+     * no longer move a visit that has already begun, mirroring
+     * {@code BookingService#resolveBookingForProviderReschedule} exactly. The CLIENT reschedule path
+     * ({@link #resolveVisitForClientReschedule}) is unaffected — it already collapses to 403.
      */
     private VisitContext resolveVisitForProviderReschedule(UUID actorUserId, UUID appointmentId) {
-        VisitContext ctx = loadVisitOrThrow(appointmentId);
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
         authz.enforceCanRescheduleBooking(actorUserId, ctx.firstItem());
 
         if (ctx.appointment().getStatus() != BookingStatus.CONFIRMED) {

@@ -1967,4 +1967,92 @@ class AuthorizationServiceTest {
                 .as("SALON_OWNER actor must be able to view their own SALON_OWNER-type master booking with full data")
                 .isTrue();
     }
+
+    // ── principalId / roleFromAuthentication — fail-closed delegation (LOW hardening) ──────────
+    // AuthorizationService.principalId and roleFromAuthentication are now thin delegates to
+    // AuthenticationUtils.userId / AuthenticationUtils.role (B14 dedup). Both are private, so they
+    // are pinned through the nearest public predicates that call them:
+    //   • canManageSalon(auth, id) calls principalId(auth) once the OWNER/ADMIN authority check passes.
+    //   • canViewBooking(auth, id) calls principalId(auth) THEN roleFromAuthentication(auth) before
+    //     any repository access, so a bad role fails closed with no stub needed.
+    // The contract these pin: a malformed principal/role surfaces as ForbiddenException (403),
+    // NEVER the raw IllegalStateException/ClassCastException that used to become a 500.
+
+    @Test
+    @DisplayName("principalId — a non-UUID token principal fails closed with ForbiddenException (403), "
+            + "not the pre-hardening IllegalStateException (500), via canManageSalon")
+    void should_throwForbiddenNotIllegalState_when_principalDetailsAreNotUuid() {
+        UUID salonId = UUID.randomUUID();
+
+        // OWNER authority so canManageSalon's role fast-path passes and it reaches principalId(auth);
+        // details is a String, not a UUID — AuthenticationUtils.userId must reject it.
+        var token = new UsernamePasswordAuthenticationToken(
+                "user@example.com", null, List.of(new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails("not-a-uuid");
+
+        assertThatThrownBy(() -> authorizationService.canManageSalon(token, salonId))
+                .as("a non-UUID principal must fail closed as 403 (ForbiddenException), never leak as a 500")
+                .isInstanceOf(ForbiddenException.class)
+                .isNotInstanceOf(IllegalStateException.class);
+        // Fail-closed means no ownership query is ever issued for a malformed principal.
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("roleFromAuthentication — a principal carrying NO recognised role authority fails "
+            + "closed with ForbiddenException (403) before any DB access, via canViewBooking")
+    void should_throwForbidden_when_noRoleAuthorityPresent() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Valid UUID principal (principalId succeeds) but no ROLE_* authority — roleFromAuthentication
+        // must throw before findViewAccessById is consulted, so no repository stub is required.
+        var token = new UsernamePasswordAuthenticationToken(
+                "user@example.com", null, List.of(new SimpleGrantedAuthority("SCOPE_read")));
+        token.setDetails(actorId);
+
+        assertThatThrownBy(() -> authorizationService.canViewBooking(token, bookingId))
+                .isInstanceOf(ForbiddenException.class);
+        verify(bookingRepository, never()).findViewAccessById(any());
+    }
+
+    @Test
+    @DisplayName("roleFromAuthentication — a principal carrying TWO distinct role authorities fails "
+            + "closed (\"Ambiguous role\") with ForbiddenException, never silently over-granting, via canViewBooking")
+    void should_throwForbidden_when_roleIsAmbiguous() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Two valid roles present — resolving by precedence would silently over-grant scope
+        // (e.g. {CLIENT, SALON_OWNER} → owner-wide access), so AuthenticationUtils.role rejects it.
+        var token = new UsernamePasswordAuthenticationToken(
+                "user@example.com", null,
+                List.of(new SimpleGrantedAuthority("ROLE_CLIENT"),
+                        new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails(actorId);
+
+        assertThatThrownBy(() -> authorizationService.canViewBooking(token, bookingId))
+                .as("an ambiguous multi-role principal must be rejected, not resolved to the most-privileged role")
+                .isInstanceOf(ForbiddenException.class);
+        verify(bookingRepository, never()).findViewAccessById(any());
+    }
+
+    @Test
+    @DisplayName("principalId + roleFromAuthentication — happy path (UUID principal + single ROLE_*) "
+            + "still threads the actor id and role through unchanged after the AuthenticationUtils delegation")
+    void should_resolvePrincipalAndRoleUnchanged_onHappyPath() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        // A well-formed SALON_OWNER token: principalId must resolve exactly actorId and the role must
+        // resolve to SALON_OWNER, so the ownership query is issued with the resolved actor id.
+        boolean result = authorizationService.canManageSalon(mockAuth(actorId, "ROLE_SALON_OWNER"), salonId);
+
+        assertThat(result)
+                .as("the delegation must be behaviour-identical on the happy path — owner is granted")
+                .isTrue();
+        verify(salonRepository).existsByIdAndOwnerId(salonId, actorId);
+    }
 }

@@ -772,7 +772,15 @@ public class BookingService {
         if (req.cancellationReason() == null) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required for declining a booking");
         }
-        Booking booking = loadBookingOrThrow(bookingId);
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring notCompleteBooking / cancelBooking: a missing id and an existing-but-foreign
+        // booking must be indistinguishable to the caller. A plain full-graph load surfaced a 404
+        // for a missing id BEFORE the ownership guard ran — letting a valid provider distinguish
+        // "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing booking now
+        // short-circuits to the SAME 403 the ownership guard throws for a foreign one. Ownership
+        // enforcement is unchanged (below): a foreign provider still gets 403.
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
         authz.enforceCanCancelBooking(actorUserId, booking);
         // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
         assertNotAppointmentChild(booking);
@@ -792,7 +800,13 @@ public class BookingService {
 
     @Transactional
     public BookingResponse completeBooking(UUID actorUserId, UUID bookingId) {
-        Booking booking = loadBookingOrThrow(bookingId);
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring notCompleteBooking / declineBooking: a missing id and an existing-but-foreign
+        // booking are indistinguishable to the caller (a plain full-graph load would surface a 404
+        // for a missing id BEFORE the ownership guard, leaking existence). Ownership enforcement is
+        // unchanged (below): a foreign provider still gets 403.
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
         // Phase 18.4 / 24.2: completion, decline, and not-complete all share the same
         // provider-authority shape (admits SALON_ADMIN) — see AuthorizationService.enforceCanCompleteBooking
         // / enforceCanCancelBooking.
@@ -821,7 +835,16 @@ public class BookingService {
 
     @Transactional
     public BookingResponse notCompleteBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
-        Booking booking = loadBookingOrThrow(bookingId);
+        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
+        // mirroring cancelBooking: a missing id and an existing-but-foreign booking must be
+        // indistinguishable to the caller. Since /not-complete dropped its redundant
+        // @authz.canCancelBooking SpEL clause (which duplicated the service-layer fetch), a plain
+        // full-graph load surfaced a 404 for a missing id BEFORE the ownership guard ran — letting
+        // a valid provider distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A
+        // missing booking now short-circuits to the SAME 403 the ownership guard throws for a foreign
+        // one. Ownership enforcement is unchanged (below): a foreign provider still gets 403.
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
         // Phase 24.2: aligned to the same provider-authority shape as completeBooking/
         // declineBooking (admits SALON_ADMIN) — leaving admin able to complete/decline but not
         // mark a no-show would be an incoherent permission set (decision D2).
@@ -1066,14 +1089,18 @@ public class BookingService {
 
     /**
      * PROVIDER-path authorization + status + elapsed resolution for {@link #rescheduleBooking}
-     * (Phase 27.2). Loads via {@link #loadBookingOrThrow} — the same full-graph load every other
-     * provider action (decline/complete/not-complete) uses — then authorizes via
-     * {@link AuthorizationService#enforceCanRescheduleBooking}, which reuses the same
+     * (Phase 27.2). Existence + ownership collapse to a single uniform 403 (Finding 8 — existence
+     * oracle): a missing id and an existing-but-foreign booking are indistinguishable to the caller,
+     * exactly as decline/complete/not-complete now do — a plain full-graph load would surface a 404
+     * for a missing id BEFORE the ownership guard, leaking existence to a valid provider. Authorizes
+     * via {@link AuthorizationService#enforceCanRescheduleBooking}, which reuses the same
      * provider-authority predicate as decline/complete (owner, assigned admin, or the owning
-     * independent master; {@code SALON_MASTER} is never admitted).
+     * independent master; {@code SALON_MASTER} is never admitted). The CLIENT reschedule path
+     * ({@link #resolveBookingForClientReschedule}) is unaffected — it already collapses to 403.
      */
     private Booking resolveBookingForProviderReschedule(UUID actorUserId, UUID bookingId) {
-        Booking booking = loadBookingOrThrow(bookingId);
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
         authz.enforceCanRescheduleBooking(actorUserId, booking);
 
         BookingStatus current = booking.getStatus();
@@ -1314,13 +1341,6 @@ public class BookingService {
             // No active transaction (e.g. unit test context) — evict directly
             task.run();
         }
-    }
-
-    private Booking loadBookingOrThrow(UUID bookingId) {
-        // Fix M6: use full-graph fetch so mutation responses do not trigger
-        // additional SELECTs for masterService and serviceDefinition
-        return bookingRepository.findByIdWithFullGraph(bookingId)
-                .orElseThrow(() -> new NotFoundException("Booking not found"));
     }
 
     /**

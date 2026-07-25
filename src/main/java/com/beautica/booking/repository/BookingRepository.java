@@ -406,7 +406,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     /**
      * <b>Guest (LINK) bookings ({@code client_id IS NULL}, V89) must resolve here too</b> —
      * {@code client} is a {@code LEFT JOIN FETCH}, not an inner join. An inner join here
-     * silently excludes every null-client row, which made {@code loadBookingOrThrow} (backing
+     * silently excludes every null-client row, which made the provider transition paths (backing
      * {@code /complete}, {@code /decline}, {@code /not-complete}) and {@code getBooking}
      * ({@code GET /bookings/{id}}) 404 for ANY guest booking — the entire provider-side guest
      * lifecycle was unreachable (CRITICAL finding, track 24.7 audit). See
@@ -425,8 +425,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      *       {@code getOwner() != null} guards never initialise it and never evaluate false.</li>
      * </ol>
      * The fetch therefore cost an extra join into {@code users} plus a full {@code User} row
-     * ({@code password_hash} included) on all six callers — {@code BookingService} (getBooking,
-     * loadBookingOrThrow and the cancel/reschedule paths) and {@code ReviewService#createReview} —
+     * ({@code password_hash} included) on all six callers — {@code BookingService} (getBooking and
+     * the decline/complete/cancel/reschedule paths) and {@code ReviewService#createReview} —
      * and bought nothing. Pinned by
      * {@code BookingPriceRangeContractIT#should_notHydrateTheSalonOwner_when_loadingABookingDetail}:
      * a statement count cannot detect a re-added fetch join (a fetch join widens an existing join

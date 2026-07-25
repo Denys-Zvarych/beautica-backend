@@ -704,30 +704,16 @@ public class AuthorizationService {
     }
 
     /**
-     * Extracts the {@link Role} from the supplied {@code Authentication} object.
-     * The JWT filter encodes the role as a {@code GrantedAuthority} with the
-     * standard {@code ROLE_} prefix.
+     * Resolves the {@link Role} of the supplied {@code Authentication}.
      *
-     * <p>Wraps {@link Role#valueOf} to prevent an unchecked
-     * {@link IllegalArgumentException} from propagating as a 500 when the token
-     * carries an unrecognised role string. Re-thrown as {@link ForbiddenException}
-     * so the global exception handler maps it to 403.
+     * <p>Delegates to {@link AuthenticationUtils#role(Authentication)} — the single
+     * canonical reader of the {@code Authentication} authorities (B14 dedup). This is the
+     * last {@code AuthorizationService}-local copy of role extraction being routed through
+     * that reader, so there is now exactly one implementation. Fails closed with
+     * {@link ForbiddenException} (403) on a missing/unrecognised/ambiguous role.
      */
     private Role roleFromAuthentication(Authentication auth) {
-        if (auth == null) {
-            throw new IllegalStateException("No authentication in security context");
-        }
-        return auth.getAuthorities().stream()
-                .map(a -> {
-                    String name = a.getAuthority().replace("ROLE_", "");
-                    try {
-                        return Role.valueOf(name);
-                    } catch (IllegalArgumentException ex) {
-                        throw new ForbiddenException("Unrecognized role in security context");
-                    }
-                })
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException("No role in security context"));
+        return AuthenticationUtils.role(auth);
     }
 
     /**
@@ -739,12 +725,17 @@ public class AuthorizationService {
         return roleFromAuthentication(SecurityContextHolder.getContext().getAuthentication());
     }
 
+    /**
+     * Resolves the authenticated principal's UUID from the supplied {@code Authentication}.
+     *
+     * <p>Delegates to {@link AuthenticationUtils#userId(Authentication)} — the single
+     * canonical reader of the token principal/details (B14 dedup). Fails closed with
+     * {@link ForbiddenException} (403) on a missing/non-UUID principal (Anti-Bug §B2),
+     * rather than the previous raw {@link IllegalStateException} that surfaced as a 500.
+     * Not exploitable today — {@code JwtAuthenticationFilter} always sets a UUID — so the
+     * happy path is behaviour-identical; only the malformed-principal error type changes.
+     */
     private UUID principalId(Authentication auth) {
-        // JwtAuthenticationFilter sets the UUID as authentication.getDetails()
-        // and the email string as the principal.
-        if (auth == null || !(auth.getDetails() instanceof UUID id)) {
-            throw new IllegalStateException("No authenticated principal UUID in security context");
-        }
-        return id;
+        return AuthenticationUtils.userId(auth);
     }
 }

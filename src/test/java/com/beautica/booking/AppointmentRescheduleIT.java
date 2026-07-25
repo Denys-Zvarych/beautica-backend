@@ -125,6 +125,30 @@ class AppointmentRescheduleIT extends AbstractIntegrationTest {
         assertOriginalWindowUnchanged(v.id(), futureStart(), 2);
     }
 
+    // ── anti-oracle pin: provider reschedule of a NONEXISTENT visit denies UNIFORMLY (403, not 404) ──
+    // Final audit pass: resolveVisitForProviderReschedule loaded via loadVisitOrThrow → 404 for a missing
+    // appointment id BEFORE enforceCanRescheduleBooking — an existence oracle a valid provider could
+    // probe. It now collapses a missing id to the SAME uniform 403 a foreign visit yields (above),
+    // matching the single-service provider reschedule. Do NOT weaken this to expect 404.
+    @Test
+    @DisplayName("PATCH /appointments/{id}/reschedule — a valid provider hitting a NONEXISTENT appointmentId "
+            + "must be denied with 403 (uniform with the foreign-visit denials), NOT 404 — anti existence-oracle pin")
+    void should_return403_not404_when_providerReschedulesNonexistentVisit() throws Exception {
+        // A fully-valid INDEPENDENT_MASTER — the role gate passes and the actor routes to the provider
+        // reschedule path, so only the service-layer existence/ownership handling decides the status.
+        String providerEmail = "appt-resched-oracle-master-" + System.nanoTime() + "@beautica.test";
+        fixtures.createIndependentMaster(providerEmail);
+        String providerToken = fixtures.tokenFor(providerEmail);
+        UUID nonexistentAppointmentId = UUID.randomUUID();
+
+        ResponseEntity<String> resp = reschedule(providerToken, nonexistentAppointmentId, futureStart().plusDays(1));
+
+        assertThat(resp.getStatusCode())
+                .as("a nonexistent appointment id must be indistinguishable from a foreign one — both 403, "
+                        + "never a 404 that confirms the id does not exist (existence oracle)")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
     @Test
     @DisplayName("a read-only SALON_MASTER attempting to reschedule a visit is denied with 403 "
             + "(role-only gate — SALON_MASTER is excluded from the provider role list)")
