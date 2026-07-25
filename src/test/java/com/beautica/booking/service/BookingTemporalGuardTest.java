@@ -84,6 +84,30 @@ class BookingTemporalGuardTest {
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
     }
 
+    // ── assertElapsedForNotComplete (no-show) ───────────────────────────────────
+
+    @Test
+    @DisplayName("assertElapsedForNotComplete — passes when startsAt is in the past")
+    void should_pass_when_notCompleteStartsAtIsPast() {
+        assertThatCode(() -> BookingTemporalGuard.assertElapsedForNotComplete(past(), CLOCK))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("assertElapsedForNotComplete — passes when startsAt equals now exactly (begun this instant)")
+    void should_pass_when_notCompleteStartsAtEqualsNow() {
+        assertThatCode(() -> BookingTemporalGuard.assertElapsedForNotComplete(exactlyNow(), CLOCK))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("assertElapsedForNotComplete — throws 409 when startsAt is in the future")
+    void should_throw409_when_notCompleteStartsAtIsFuture() {
+        assertThatThrownBy(() -> BookingTemporalGuard.assertElapsedForNotComplete(future(), CLOCK))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+    }
+
     // ── assertCurrentNotElapsedForReschedule (provider reschedule) ──────────────
 
     @Test

@@ -54,6 +54,24 @@ final class BookingTemporalGuard {
     }
 
     /**
+     * No-show (not-complete) shares the exact predicate {@link #assertElapsedForComplete} uses —
+     * {@code now >= startsAt} — since recording a client no-show is only meaningful once the
+     * appointment slot has begun/elapsed: a provider cannot claim the client failed to show up for
+     * a slot that has not started yet (there is nothing to have missed). Kept as its own named
+     * method — not a silent alias of {@link #assertElapsedForComplete} — for a no-show-specific
+     * error string and call-site clarity in {@code BookingService#notCompleteBooking} /
+     * {@code AppointmentTransitionService#notCompleteAppointment}, mirroring how
+     * {@link #assertCurrentNotElapsedForReschedule} shares {@link #isStrictlyFuture} with
+     * {@link #assertFutureForProviderCancel} below without becoming an alias of it.
+     */
+    static void assertElapsedForNotComplete(OffsetDateTime startsAt, Clock clock) {
+        if (isStrictlyFuture(startsAt, clock)) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Cannot mark a booking not-completed before it has started");
+        }
+    }
+
+    /**
      * Provider-initiated reschedule requires the CURRENT booking to not have started yet — same
      * boolean predicate as {@link #assertFutureForProviderCancel} (a provider cannot move a
      * booking that is already underway any more than they can decline one), but kept as its own

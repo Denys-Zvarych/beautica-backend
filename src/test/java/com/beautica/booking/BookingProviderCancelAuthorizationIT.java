@@ -171,7 +171,7 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
         UUID masterId = createIndependentMaster(masterEmail);
         UUID clientId = createUser("provcancel-nc-im-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID masterServiceId = createIndependentMasterService(masterId);
-        UUID bookingId = insertConfirmedBooking(clientId, masterId, masterServiceId, null);
+        UUID bookingId = insertElapsedConfirmedBooking(clientId, masterId, masterServiceId, null);
 
         ResponseEntity<Void> resp = patchNotComplete(bookingId, tokenFor(masterEmail));
 
@@ -252,7 +252,7 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
             + "(the note is optional for all roles)")
     void should_return204_when_notCompleteHasNoComment() {
         Salon salon = createSalon("provcancel-nc-nocomment-owner-" + System.nanoTime() + "@beautica.test");
-        UUID bookingId = insertConfirmedSalonBooking(salon);
+        UUID bookingId = insertElapsedConfirmedSalonBooking(salon);
 
         ResponseEntity<Void> resp = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
@@ -558,7 +558,11 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
      * {@code /decline} tests in this class (never {@code /complete}), and {@code declineBooking}
      * gained a new {@code assertFutureForProviderCancel} guard (now &lt; startsAt) — an elapsed
      * booking would now 409 before reaching the authorization assertions this class exists to
-     * pin. {@code /not-complete} does not care either way (that endpoint is untouched by track 27).
+     * pin. Phase 27.x gave {@code /not-complete} the OPPOSITE guard (now &gt;= startsAt), so any
+     * of THIS class's not-complete tests that expect a 204 must use
+     * {@link #insertElapsedConfirmedBooking}/{@link #insertElapsedConfirmedSalonBooking} instead —
+     * the 403 (authorization-denied) not-complete tests are unaffected either way since the authz
+     * check runs before the temporal guard.
      */
     private UUID insertConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
         UUID bookingId = UUID.randomUUID();
@@ -570,6 +574,29 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
                         "500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, salonId);
         return bookingId;
+    }
+
+    /**
+     * ELAPSED counterpart to {@link #insertConfirmedBooking} — backs this class's {@code
+     * /not-complete} 204 (happy-path) tests, whose {@code assertElapsedForNotComplete} guard
+     * (Phase 27.x) requires {@code now >= startsAt}.
+     */
+    private UUID insertElapsedConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, " +
+                        "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
+                        "booking_source, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '2 hours', NOW() - interval '1 hour', " +
+                        "500.00, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, salonId);
+        return bookingId;
+    }
+
+    private UUID insertElapsedConfirmedSalonBooking(Salon salon) {
+        UUID clientId = createUser("provcancel-book-elapsed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID masterServiceId = createSalonService(salon.salonId);
+        return insertElapsedConfirmedBooking(clientId, salon.masterId, masterServiceId, salon.salonId);
     }
 
     private UUID insertSalonBookingWithStatus(Salon salon, String status) {

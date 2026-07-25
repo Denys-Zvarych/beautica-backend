@@ -833,6 +833,11 @@ public class BookingService {
             throw new BusinessException("Cancellation reason required");
         }
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED);
+        // Phase 27.x: no-show unlocks once the appointment has begun/elapsed (now >= startsAt) —
+        // same predicate as completeBooking's assertElapsedForComplete: a provider cannot claim a
+        // no-show for a slot that hasn't started (nothing to have missed yet). Checked AFTER the
+        // status guard, same ordering as decline/complete.
+        BookingTemporalGuard.assertElapsedForNotComplete(booking.getStartsAt(), clock);
         booking.setStatus(BookingStatus.NOT_COMPLETED);
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));

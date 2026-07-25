@@ -238,6 +238,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         assertThat(dbStatusAfterCreate)
                 .as("booking must be CONFIRMED immediately after creation, before not-complete transition")
                 .isEqualTo("CONFIRMED");
+        // Phase 27.x: notCompleteBooking now requires now >= startsAt (assertElapsedForNotComplete)
+        // — POST /bookings only accepts a future start, so backdate directly after creation.
+        backdateBooking(bookingId);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився вчасно\"}";
         log.debug("Act: PATCH {}/{}/not-complete as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
@@ -276,6 +279,9 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         String clientToken = createClientAndGetToken("integ-notcomplete-nocomment-client-" + System.nanoTime() + "@beautica.test");
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(3).withHour(15).withMinute(0).withSecond(0).withNano(0);
         UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+        // Phase 27.x: notCompleteBooking now requires now >= startsAt (assertElapsedForNotComplete)
+        // — POST /bookings only accepts a future start, so backdate directly after creation.
+        backdateBooking(bookingId);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
         ResponseEntity<Void> response = restTemplate.exchange(
@@ -1107,6 +1113,24 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<BookingResponse>>() {});
         return body.data().id();
+    }
+
+    /**
+     * Overwrites a booking's {@code starts_at}/{@code ends_at} to an ABSOLUTE window that already
+     * ended an hour ago, so a booking created via the future-only {@code POST /bookings} create
+     * path can still be used to exercise a provider guard that requires the slot to have already
+     * begun (Phase 27.x's {@code assertElapsedForNotComplete}). Deliberately absolute, not a
+     * relative subtraction off the booking's own (fixture-specific) future offset — this class's
+     * fixtures anchor at anywhere from {@code now+1day} to {@code now+3days}, so a fixed relative
+     * shift would silently under-shoot for the larger offsets and leave the booking still future
+     * (exactly the bug a first attempt at this helper had: subtracting 2 days from a
+     * {@code now+3days} booking lands at {@code now+1day} — still future, guard still 409s).
+     */
+    private void backdateBooking(UUID bookingId) {
+        jdbcTemplate.update(
+                "UPDATE bookings SET starts_at = NOW() - interval '2 hours', "
+                        + "ends_at = NOW() - interval '1 hour' WHERE id = ?",
+                bookingId);
     }
 
     /**

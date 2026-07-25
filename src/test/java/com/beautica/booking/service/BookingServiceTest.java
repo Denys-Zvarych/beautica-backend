@@ -800,10 +800,13 @@ class BookingServiceTest {
     // ── notCompleteBooking ─────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("booking moves to NOT_COMPLETED with CLIENT_NO_SHOW reason when master records a no-show")
+    @DisplayName("booking moves to NOT_COMPLETED with CLIENT_NO_SHOW reason when master records a no-show on an ELAPSED booking")
     void should_markNotCompleted_when_masterRecordsNoShow() {
         UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        // Phase 27.x: notCompleteBooking now requires now >= startsAt (assertElapsedForNotComplete)
+        // — buildBooking pins startsAt in the FUTURE, so this happy-path fixture uses the elapsed
+        // variant, mirroring completeBooking's own happy-path tests.
+        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
@@ -813,6 +816,24 @@ class BookingServiceTest {
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.NOT_COMPLETED);
         assertThat(booking.getCancellationReason()).isEqualTo(CancellationReason.CLIENT_NO_SHOW);
         verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("409 is thrown when not-complete is called on a booking that has not started yet (assertElapsedForNotComplete guard)")
+    void should_throw409_when_notCompleteCalledOnFutureBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+        assertThat(booking.getStatus())
+                .as("status must remain unchanged after a rejected (not-yet-started) not-complete transition")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(outboxService, never()).enqueueStatusChanged(bookingId);
     }
 
     @Test
@@ -868,7 +889,8 @@ class BookingServiceTest {
     void should_evictRevenueDashboardCache_when_bookingMarkedNotCompleted() {
         // Arrange
         UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        // Elapsed fixture — see should_markNotCompleted_when_masterRecordsNoShow above.
+        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
         Cache masterCalendarCacheMock = mock(Cache.class);
         Cache revenueCacheMock = mock(Cache.class);

@@ -255,6 +255,11 @@ class BookingServiceCacheTest {
         cache.put(bystanderKey, "value");
 
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
+        // Phase 27.x: notCompleteBooking now requires now >= startsAt (assertElapsedForNotComplete)
+        // — mockBookingInStatus's default startsAt is FUTURE (needed by the decline test sharing
+        // this helper), so override it to an ELAPSED time for this test only, mirroring how
+        // should_evictMasterCalendarCache_when_completeBookingCalled does for completeBooking.
+        when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(clock).minusHours(1));
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);

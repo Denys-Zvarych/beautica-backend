@@ -263,7 +263,9 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("provider mark-no-show on an elapsed CONFIRMED booking still succeeds → NOT_COMPLETED (resolution path is NOT guarded)")
+    @DisplayName("provider mark-no-show on an elapsed CONFIRMED booking still succeeds → NOT_COMPLETED "
+            + "(satisfies Phase 27.x's assertElapsedForNotComplete — an elapsed booking is exactly "
+            + "what that guard requires)")
     void should_allowProviderMarkNoShow_when_bookingElapsed() {
         Master master = createIndependentMaster("elapsed-noshow-master-" + System.nanoTime() + "@beautica.test");
         UUID serviceId = createMasterService(master.masterId);
@@ -275,8 +277,32 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
                 new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
 
         assertThat(bookingStatus(bookingId))
-                .as("the provider may mark an elapsed booking as a no-show — the elapsed guard is client-only")
+                .as("the provider may mark an elapsed booking as a no-show")
                 .isEqualTo(BookingStatus.NOT_COMPLETED.name());
+    }
+
+    @Test
+    @DisplayName("Phase 27.x: provider mark-no-show on a FUTURE (not-yet-started) CONFIRMED booking is "
+            + "REJECTED with 409 (assertElapsedForNotComplete — a provider cannot claim a no-show for "
+            + "a slot that hasn't started; the optional providerComment must also be accepted without "
+            + "changing this outcome)")
+    void should_rejectProviderMarkNoShow_when_bookingIsFuture() {
+        Master master = createIndependentMaster("future-noshow-master-" + System.nanoTime() + "@beautica.test");
+        UUID serviceId = createMasterService(master.masterId);
+        UUID clientId = createClient("future-noshow-client-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertFutureConfirmedBooking(clientId, master.masterId, serviceId);
+
+        authenticateAs(master.userId);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "Клієнт не з'явився");
+        assertThat(org.assertj.core.api.Assertions.catchThrowable(
+                        () -> bookingService.notCompleteBooking(master.userId, bookingId, req)))
+                .as("a no-show on a booking that has not started yet must be rejected with a 409 BusinessException")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(bookingStatus(bookingId))
+                .as("a rejected no-show must leave the future booking CONFIRMED")
+                .isEqualTo(BookingStatus.CONFIRMED.name());
     }
 
     // ── shared assertion ─────────────────────────────────────────────────────────
@@ -370,6 +396,23 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
                         + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
                         + "booking_source, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, NULL, 'CONFIRMED', NOW() - interval '90 minutes', NOW() - interval '45 minutes', "
+                        + "500.00, 45, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId);
+        return bookingId;
+    }
+
+    /**
+     * Inserts an APP booking whose slot has NOT started yet (starts in 90 minutes) — the negative
+     * fixture for {@code assertElapsedForNotComplete} (Phase 27.x), the exact mirror of
+     * {@link #insertElapsedConfirmedBooking} above.
+     */
+    private UUID insertFutureConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, 'CONFIRMED', NOW() + interval '90 minutes', NOW() + interval '135 minutes', "
                         + "500.00, 45, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId);
         return bookingId;
