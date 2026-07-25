@@ -345,7 +345,99 @@ class AppointmentReadIT extends AbstractIntegrationTest {
                 .doesNotContain(masterPersonalNote);
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // 5. Partially-declined visit — per-item status surfaced, totals exclude the
+    //    declined line, header time window unchanged
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("GET /appointments/{id} on a PARTIALLY-declined visit surfaces the per-item status "
+            + "(one DECLINED, one CONFIRMED), EXCLUDES the declined line from totalPrice/duration, and "
+            + "leaves the header time window spanning ALL items")
+    void should_exposePerItemStatusAndExcludeDeclinedLineFromTotals_whenVisitPartiallyDeclined() throws Exception {
+        String masterEmail = "be5-partial-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        String clientEmail = "be5-partial-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceA = fixtures.createIndependentMasterService(masterId);
+        UUID serviceB = fixtures.createIndependentMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+        String clientToken = fixtures.tokenFor(clientEmail);
+        String masterToken = fixtures.tokenFor(masterEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(7).withHour(15).withMinute(0).withSecond(0).withNano(0);
+        JsonNode visit = objectMapper.readTree(
+                postVisit(clientToken, masterId, startsAt, serviceA, serviceB).getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visit.path("id").asText());
+
+        // Baseline read while fully CONFIRMED — capture the header window + full totals.
+        JsonNode before = getJson(APPOINTMENTS_URL + "/" + appointmentId, clientToken).path("data");
+        String windowStart = before.path("startsAt").asText();
+        String windowEnd = before.path("endsAt").asText();
+        assertThat(new BigDecimal(before.path("totalPrice").asText()))
+                .as("baseline total = 2 × 500.00").isEqualByComparingTo("1000.00");
+        assertThat(before.path("totalDurationMinutes").asInt())
+                .as("baseline duration = 2 × 60").isEqualTo(120);
+        // item[1] (11:00) is the one we will decline — capture its child booking id.
+        UUID declinedChild = UUID.fromString(before.path("items").get(1).path("bookingId").asText());
+
+        // Provider declines ONE service line.
+        String note = "Другу послугу того дня не робимо";
+        ResponseEntity<String> declineResp = patchServiceDecline(masterToken, appointmentId, declinedChild,
+                "{\"providerComment\":\"" + note + "\"}");
+        assertThat(declineResp.getStatusCode())
+                .as("per-service decline must succeed — body: %s", declineResp.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        // Read the partially-declined visit.
+        JsonNode after = getJson(APPOINTMENTS_URL + "/" + appointmentId, clientToken).path("data");
+
+        // Header stays CONFIRMED (a sibling survives).
+        assertThat(after.path("status").asText())
+                .as("the header stays CONFIRMED while one service remains").isEqualTo("CONFIRMED");
+
+        // Per-item status is surfaced: item[0] CONFIRMED, item[1] DECLINED with its own note+reason.
+        JsonNode items = after.path("items");
+        assertThat(items).as("both service lines are still returned").hasSize(2);
+        assertThat(items.get(0).path("status").asText())
+                .as("the surviving service line stays CONFIRMED").isEqualTo("CONFIRMED");
+        assertThat(items.get(1).path("status").asText())
+                .as("the declined service line reads DECLINED per-item").isEqualTo("DECLINED");
+        assertThat(items.get(1).path("cancellationReason").asText())
+                .as("the declined line carries its own PROVIDER_UNAVAILABLE reason").isEqualTo("PROVIDER_UNAVAILABLE");
+        assertThat(items.get(1).path("providerComment").asText())
+                .as("the per-service note rides on the declined item line (mutually visible)").isEqualTo(note);
+        assertThat(items.get(0).path("providerComment").isNull())
+                .as("the surviving line has no note").isTrue();
+
+        // Totals EXCLUDE the declined line.
+        assertThat(new BigDecimal(after.path("totalPrice").asText()))
+                .as("the declined service is dropped from the owed total — client owes for one 500.00 service")
+                .isEqualByComparingTo("500.00");
+        assertThat(after.path("totalPriceMax").isNull())
+                .as("no genuine range remains → totalPriceMax null").isTrue();
+        assertThat(after.path("totalDurationMinutes").asInt())
+                .as("the declined service's 60 min is dropped from the total duration").isEqualTo(60);
+
+        // The header time window is UNCHANGED — it still spans all items (declined lines included).
+        assertThat(after.path("startsAt").asText())
+                .as("the header window start must NOT shrink when a line is declined").isEqualTo(windowStart);
+        assertThat(after.path("endsAt").asText())
+                .as("the header window end must still span the declined last item").isEqualTo(windowEnd);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /** PATCH the per-service decline route {@code /appointments/{id}/services/{bookingId}/decline}. */
+    private ResponseEntity<String> patchServiceDecline(
+            String token, UUID appointmentId, UUID bookingId, String body) {
+        HttpEntity<String> entity = body == null
+                ? new HttpEntity<>(jsonHeaders(token)) : new HttpEntity<>(body, jsonHeaders(token));
+        return restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + bookingId + "/decline",
+                HttpMethod.PATCH, entity, String.class);
+    }
 
     private HttpHeaders jsonHeaders(String token) {
         HttpHeaders headers = fixtures.bearerHeaders(token);

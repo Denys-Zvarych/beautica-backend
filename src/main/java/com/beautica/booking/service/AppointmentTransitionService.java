@@ -34,6 +34,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -135,6 +136,69 @@ public class AppointmentTransitionService {
 
         // No revenue eviction on a decline (mirrors BookingService#declineBooking).
         persistAndNotify(ctx.appointment(), ctx.items(), null);
+    }
+
+    /**
+     * Provider-initiated PER-SERVICE decline — declines exactly ONE service line of a multi-service
+     * visit, leaving its siblings CONFIRMED. The additive counterpart of {@link #declineAppointment}
+     * (which terminates the WHOLE visit): mirrors {@code BookingService#declineBooking} lifted to a
+     * single chained item, so a client who booked N services with one master can lose ONE without the
+     * others being cancelled.
+     *
+     * <p><b>Authority</b> is the same provider authority as the whole-visit decline
+     * ({@link AuthorizationService#enforceCanCancelBooking} on the visit's single master, evaluated
+     * against the first item — SALON_OWNER / SALON_ADMIN / INDEPENDENT_MASTER). A {@code bookingId}
+     * that is not a child of this appointment is a {@code 404} — same missing→404 shape as a sibling
+     * lookup elsewhere, no existence oracle beyond the visit the caller is already authorized on.
+     *
+     * <p><b>The note lives on the CHILD row</b>, not the header: the declined child's OWN status is
+     * {@code DECLINED}, satisfying the V114 {@code chk_provider_comment_status} CHECK; the header stays
+     * {@code CONFIRMED} while ≥1 sibling remains CONFIRMED, so writing a note to the header would
+     * violate {@code chk_appointment_provider_comment_status} (which requires a terminal header). The
+     * note is OPTIONAL for all roles (locked booking-notes decision) and mutually visible.
+     *
+     * <p><b>Header recompute (locked, safe invariant):</b> while ≥1 child remains CONFIRMED the header
+     * stays CONFIRMED; declining the LAST CONFIRMED child collapses the header to {@code DECLINED}
+     * (reason {@code PROVIDER_UNAVAILABLE}) — no richer mixed-terminal header semantics.
+     *
+     * <p><b>Slot + notification:</b> the {@code no_overlapping_bookings} GIST EXCLUDE is
+     * {@code status = 'CONFIRMED'} only, so the declined child auto-releases its own slot while its
+     * siblings keep their times — no re-plan needed. Availability caches are evicted after commit over
+     * the single freed (date, service) key, and EXACTLY ONE status-changed notification is enqueued
+     * referencing the DECLINED CHILD (never item 0) so the client is told which service was declined.
+     *
+     * @throws NotFoundException  the appointment (or the {@code bookingId} within it) does not exist (404)
+     * @throws ForbiddenException the actor lacks provider authority over the visit (403)
+     * @throws BusinessException  the target child is not CONFIRMED — already terminal (409)
+     */
+    @Transactional
+    public void declineAppointmentItem(
+            UUID actorId, UUID appointmentId, UUID bookingId, AppointmentProviderNoteRequest req) {
+        VisitContext ctx = loadVisitOrThrow(appointmentId);
+        authz.enforceCanCancelBooking(actorId, ctx.firstItem());
+
+        Booking target = ctx.items().stream()
+                .filter(item -> item.getId().equals(bookingId))
+                .findFirst()
+                .orElseThrow(() -> new NotFoundException("Appointment service not found"));
+
+        assertItemTransition(target, BookingStatus.DECLINED);
+
+        target.setStatus(BookingStatus.DECLINED);
+        target.setCancellationReason(CancellationReason.PROVIDER_UNAVAILABLE);
+        // Note on the CHILD (its own status is now DECLINED — legal per chk_provider_comment_status);
+        // the header note is never touched on a partial decline.
+        target.setProviderComment(BookingComments.normalize(req == null ? null : req.providerComment()));
+        bookingRepository.save(target);
+
+        recomputeHeaderAfterItemDecline(ctx.appointment(), ctx.items());
+
+        // Reference the DECLINED CHILD (not item 0) so the client notification names the right service.
+        outboxService.enqueueStatusChanged(target.getId());
+
+        // Single-item availability eviction — reuse the whole-visit after-commit hook over a one-item
+        // list; a declined child frees only its own slot. No revenue impact on a decline (null actor).
+        registerEviction(List.of(target), null);
     }
 
     /**
@@ -251,26 +315,35 @@ public class AppointmentTransitionService {
                 : resolveVisitForClientReschedule(actorUserId, appointmentId);
         Appointment appointment = ctx.appointment();
         List<Booking> items = ctx.items();
+        // Resurrection guard: only CONFIRMED items are re-planned/moved. A per-service-declined child
+        // (DECLINED) keeps its released slot and its old row untouched — it must not be shifted back
+        // onto the calendar by a whole-visit reschedule. A CONFIRMED header guarantees ≥1 CONFIRMED
+        // child (declining the last one collapses the header), so this list is never empty. For the
+        // common all-CONFIRMED visit this equals `items` in the same order — behaviour is unchanged.
+        List<Booking> confirmedItems = items.stream()
+                .filter(b -> b.getStatus() == BookingStatus.CONFIRMED)
+                .toList();
 
         OffsetDateTime newFirstStart = req.newStartsAt();
         BookingStartsAtValidator.validate(newFirstStart, clock);
 
-        Master master = items.get(0).getMaster();
+        Master master = confirmedItems.get(0).getMaster();
         UUID masterId = master.getId();
-        List<UUID> masterServiceIds = items.stream().map(b -> b.getMasterService().getId()).toList();
+        List<UUID> masterServiceIds = confirmedItems.stream().map(b -> b.getMasterService().getId()).toList();
 
         // Same working-hours / effective-day validation the create path relies on, run over the
         // WHOLE multi-service block (BE-2's N-service overload). Run BEFORE any lock, mirroring
         // BookingService#assertStartsOnAvailableSlot's placement.
         assertVisitStartsOnAvailableSlot(masterId, masterServiceIds, newFirstStart);
 
-        // Timing-only re-layout — preserves every item's frozen duration/buffer/price.
-        List<VisitPlanner.PlannedWindow> windows = visitPlanner.replanFromNewStart(items, newFirstStart);
+        // Timing-only re-layout — preserves every item's frozen duration/buffer/price. Re-planned
+        // over the CONFIRMED items only (declined items are excluded from the moving block).
+        List<VisitPlanner.PlannedWindow> windows = visitPlanner.replanFromNewStart(confirmedItems, newFirstStart);
         OffsetDateTime newLastEnd = windows.get(windows.size() - 1).endsAt();
 
         // Old (date, masterServiceId) keys, captured BEFORE any item is mutated, for after-commit
         // cache eviction (mirrors AppointmentService#registerSlotEviction).
-        Set<SlotKey> oldSlotKeys = collectSlotKeys(items);
+        Set<SlotKey> oldSlotKeys = collectSlotKeys(confirmedItems);
 
         // Same critical section as doCreateAppointment / rescheduleBooking, client-then-master
         // order — deadlock freedom (see BookingRepository.acquireClientAdvisoryLockWithTimeout).
@@ -295,26 +368,28 @@ public class AppointmentTransitionService {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }
 
-        for (int i = 0; i < items.size(); i++) {
+        for (int i = 0; i < confirmedItems.size(); i++) {
             VisitPlanner.PlannedWindow window = windows.get(i);
-            items.get(i).reschedule(window.startsAt(), window.endsAt());
+            confirmedItems.get(i).reschedule(window.startsAt(), window.endsAt());
         }
 
         List<Booking> saved;
         try {
-            saved = bookingRepository.saveAll(items);
+            saved = bookingRepository.saveAll(confirmedItems);
             bookingRepository.flush();
         } catch (DataIntegrityViolationException e) {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }
 
-        // Phase 27.3 outbox family, reused verbatim: referencing the FIRST item only (never one
-        // per service) — the drain worker addresses the OTHER party from that one booking.
+        // Phase 27.3 outbox family, reused verbatim: referencing the FIRST (confirmed) item only
+        // (never one per service) — the drain worker addresses the OTHER party from that one booking.
         outboxService.enqueueBookingRescheduled(saved.get(0).getId(), initiatedByProvider);
 
         registerRescheduleEviction(masterId, salonIdOfMaster(master), oldSlotKeys, collectSlotKeys(saved));
 
-        return appointmentService.enrich(appointment, saved);
+        // Render the FULL visit (moved CONFIRMED items are mutated in place within `items`; any
+        // declined item keeps its old row) so the response still shows every service line.
+        return appointmentService.enrich(appointment, items);
     }
 
     // ── internals ──────────────────────────────────────────────────────────────
@@ -352,6 +427,36 @@ public class AppointmentTransitionService {
         if (appointment.getStatus() != BookingStatus.CONFIRMED) {
             throw new BusinessException(
                     "Cannot transition from %s to %s".formatted(appointment.getStatus(), target));
+        }
+    }
+
+    /**
+     * Per-CHILD transition guard for {@link #declineAppointmentItem} — a single service line is only
+     * declinable from {@code CONFIRMED}; an already-terminal child (a prior per-service decline, or a
+     * whole-visit terminal) is a {@code 409}. The visit-level analogue of the header guard, evaluated
+     * on the child row rather than the header (the header may still be CONFIRMED with mixed children).
+     */
+    private void assertItemTransition(Booking item, BookingStatus target) {
+        if (item.getStatus() != BookingStatus.CONFIRMED) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Cannot transition service from %s to %s".formatted(item.getStatus(), target));
+        }
+    }
+
+    /**
+     * Header recompute after a per-service decline (locked, safe invariant): while ≥1 child remains
+     * CONFIRMED the header stays CONFIRMED; declining the LAST CONFIRMED child collapses the header to
+     * {@code DECLINED}. No note is written to the header (it stays untouched — the note lives on the
+     * declined child), so the {@code chk_appointment_provider_comment_status} CHECK is never at risk.
+     * The header is persisted only when it actually transitions.
+     */
+    private void recomputeHeaderAfterItemDecline(Appointment appointment, List<Booking> items) {
+        boolean anyConfirmed = items.stream()
+                .anyMatch(item -> item.getStatus() == BookingStatus.CONFIRMED);
+        if (!anyConfirmed) {
+            appointment.setStatus(BookingStatus.DECLINED);
+            appointment.setCancellationReason(CancellationReason.PROVIDER_UNAVAILABLE);
+            appointmentRepository.save(appointment);
         }
     }
 
@@ -517,19 +622,29 @@ public class AppointmentTransitionService {
     }
 
     /**
-     * Moves every child item to {@code target} in lockstep, stamping {@code reason} when the target is
-     * terminal-with-reason (null for {@code COMPLETED}). Notes are NOT set on items — they live on the
-     * header. The items are managed entities (loaded via the graph fetch); {@code saveAll} makes the
-     * flush explicit so all N updates land in this transaction.
+     * Moves every CONFIRMED child item to {@code target} in lockstep, stamping {@code reason} when the
+     * target is terminal-with-reason (null for {@code COMPLETED}). Notes are NOT set on items — they
+     * live on the header. The items are managed entities (loaded via the graph fetch); {@code saveAll}
+     * makes the flush explicit so all touched updates land in this transaction.
+     *
+     * <p><b>Resurrection guard:</b> only CONFIRMED children are transitioned. A child already moved to
+     * a terminal state by a per-service decline ({@link #declineAppointmentItem}) is skipped, so a
+     * later whole-visit {@code complete}/{@code decline}/{@code not-complete}/{@code cancel} can never
+     * flip an already-DECLINED service back into the whole-visit terminal state.
      */
     private void transitionItems(List<Booking> items, BookingStatus target, CancellationReason reason) {
+        List<Booking> touched = new ArrayList<>(items.size());
         for (Booking item : items) {
+            if (item.getStatus() != BookingStatus.CONFIRMED) {
+                continue;
+            }
             item.setStatus(target);
             if (reason != null) {
                 item.setCancellationReason(reason);
             }
+            touched.add(item);
         }
-        bookingRepository.saveAll(items);
+        bookingRepository.saveAll(touched);
     }
 
     /**

@@ -128,6 +128,31 @@ public class AppointmentController {
     }
 
     /**
+     * Provider-initiated PER-SERVICE decline (additive counterpart of {@code /decline}) — declines
+     * exactly ONE service line of a multi-service visit, leaving its siblings CONFIRMED:
+     * {@code PATCH /api/v1/appointments/{appointmentId}/services/{bookingId}/decline}.
+     *
+     * <p>Same provider authority as the whole-visit decline (role-only gate here +
+     * {@code enforceCanCancelBooking} ownership guard in the service, §D). The optional
+     * {@code providerComment} is written to the declined CHILD row (its own status becomes
+     * {@code DECLINED}), never the header. The header collapses to {@code DECLINED} only once the
+     * declined child was the last CONFIRMED service. A {@code bookingId} not belonging to the
+     * appointment is a 404; a non-CONFIRMED (already terminal) child is a 409.
+     */
+    @PatchMapping("/{appointmentId}/services/{bookingId}/decline")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
+    public ResponseEntity<Void> declineAppointmentItem(
+            @PathVariable UUID appointmentId,
+            @PathVariable UUID bookingId,
+            @Valid @RequestBody(required = false) AppointmentProviderNoteRequest req,
+            Authentication auth
+    ) {
+        appointmentTransitionService.declineAppointmentItem(
+                AuthenticationUtils.userId(auth), appointmentId, bookingId, req);
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
      * Provider-initiated visit completion (BE-4) — moves the whole visit to {@code COMPLETED} in
      * lockstep. Mirrors {@code PATCH /bookings/{id}/complete}: role-only provider gate here + the
      * {@code enforceCanCompleteBooking} ownership guard in the service (§D). No request body.

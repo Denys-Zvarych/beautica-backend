@@ -1,6 +1,8 @@
 package com.beautica.booking.dto;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.common.TimeZones;
 import io.swagger.v3.oas.annotations.media.Schema;
 import java.math.BigDecimal;
@@ -17,6 +19,14 @@ import java.util.UUID;
  * item's {@code endsAt} already includes that service's own {@code bufferMinutesAfter} (D4), so the
  * next item's {@code startsAt} equals this item's {@code endsAt}.
  *
+ * <p>{@code status} is the PER-ITEM status: a service line may be {@code DECLINED} on its own (via
+ * {@code PATCH /appointments/{id}/services/{bookingId}/decline}) while its siblings stay
+ * {@code CONFIRMED} — so the visit screen can strike through the one lost service without cancelling
+ * the visit. {@code cancellationReason}/{@code providerComment} are that line's own terminal
+ * metadata (the per-service decline writes the note to the CHILD row); they are {@code null} on a
+ * CONFIRMED line. Whole-visit decline/no-show notes live on the {@link AppointmentDetailResponse}
+ * header, not here.
+ *
  * @param priceMaxAtBooking the frozen RANGE ceiling for THIS service, or {@code null} when it was a
  *   single price at booking time — same per-row semantics as {@link BookingDetailResponse}. Never
  *   re-derived on read.
@@ -25,6 +35,9 @@ public record AppointmentItemResponse(
         UUID bookingId,
         UUID masterServiceId,
         String serviceName,
+        @Schema(description = "The per-item status. A single service line may be DECLINED "
+                + "independently of its siblings (per-service decline); CONFIRMED means still booked.")
+        BookingStatus status,
         ZonedDateTime startsAt,
         ZonedDateTime endsAt,
         int durationMinutesAtBooking,
@@ -32,7 +45,16 @@ public record AppointmentItemResponse(
         @Schema(types = {"number", "null"}, nullable = true,
                 description = "The frozen RANGE ceiling for this service, present only when it was a "
                         + "genuine range (no priceOverride) at booking time. Null = single price.")
-        BigDecimal priceMaxAtBooking
+        BigDecimal priceMaxAtBooking,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "This service line's own cancellation reason — non-null only when the "
+                        + "line is terminal (e.g. PROVIDER_UNAVAILABLE for a per-service decline).")
+        CancellationReason cancellationReason,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Provider note written on THIS line's per-service decline. Mutually "
+                        + "visible to the client (locked booking-notes decision). Null on a CONFIRMED "
+                        + "line and on whole-visit terminations (whose note lives on the header).")
+        String providerComment
 ) {
 
     /**
@@ -45,10 +67,13 @@ public record AppointmentItemResponse(
                 booking.getId(),
                 booking.getMasterService().getId(),
                 booking.getMasterService().getServiceDefinition().getName(),
+                booking.getStatus(),
                 booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV),
                 booking.getEndsAt().atZoneSameInstant(TimeZones.KYIV),
                 booking.getDurationMinutesAtBooking(),
                 booking.getPriceAtBooking(),
-                booking.getPriceMaxAtBooking());
+                booking.getPriceMaxAtBooking(),
+                booking.getCancellationReason(),
+                booking.getProviderComment());
     }
 }

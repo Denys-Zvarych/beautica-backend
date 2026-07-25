@@ -522,6 +522,150 @@ class AppointmentTransitionMatrixIT extends AbstractIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════
+    // Per-service (per-child) decline authority matrix —
+    // PATCH /appointments/{id}/services/{bookingId}/decline
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Per-service decline — authority matrix")
+    class PerServiceDeclineAuthorization {
+
+        @Test
+        @DisplayName("allow — the INDEPENDENT_MASTER who owns the visit declines one child; that child → "
+                + "DECLINED, the sibling stays CONFIRMED, the header stays CONFIRMED, one STATUS_CHANGED")
+        void should_declineChild_when_owningIndependentMaster() throws Exception {
+            IndependentVisit v = seedIndependentVisit("psd-im-owner", 2, futureStart());
+            UUID child0 = firstChildOf(v.id());
+            UUID child1 = secondChildOf(v.id());
+
+            ResponseEntity<String> resp = patchServiceDecline(v.masterToken(), v.id(), child0, "{}");
+
+            assertThat(resp.getStatusCode())
+                    .as("the visit's own independent master may decline one of its services — body: %s", resp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(childStatus(child0)).isEqualTo("DECLINED");
+            assertThat(childStatus(child1)).as("the sibling stays CONFIRMED").isEqualTo("CONFIRMED");
+            assertVisitStatus(v.id(), "CONFIRMED");
+            assertThat(statusChangedCount(v.id())).isEqualTo(1L);
+        }
+
+        @Test
+        @DisplayName("allow — the SALON_OWNER of the visit's master declines one child of a salon visit; "
+                + "that child → DECLINED, the sibling stays CONFIRMED, the header stays CONFIRMED")
+        void should_declineChild_when_salonOwnerOfTheMaster() throws Exception {
+            SalonVisit v = seedSalonVisit("psd-owner", 2, futureStart());
+            UUID child0 = firstChildOf(v.id());
+            UUID child1 = secondChildOf(v.id());
+
+            ResponseEntity<String> resp = patchServiceDecline(v.ownerToken(), v.id(), child0,
+                    "{\"providerComment\":\"Цю послугу того дня не робимо\"}");
+
+            assertThat(resp.getStatusCode())
+                    .as("the salon owner may decline one service of their salon-master's visit — body: %s", resp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(childStatus(child0)).isEqualTo("DECLINED");
+            assertThat(childStatus(child1)).isEqualTo("CONFIRMED");
+            assertVisitStatus(v.id(), "CONFIRMED");
+            assertThat(statusChangedCount(v.id())).isEqualTo(1L);
+        }
+
+        @Test
+        @DisplayName("allow — a SALON_ADMIN assigned to the visit's salon declines one child; that child "
+                + "→ DECLINED, the sibling stays CONFIRMED (SALON_ADMIN shares the provider authority)")
+        void should_declineChild_when_salonAdminAssignedToTheSalon() throws Exception {
+            SalonVisit v = seedSalonVisit("psd-admin", 2, futureStart());
+            String adminEmail = "appt-mx-psd-admin-" + System.nanoTime() + "@beautica.test";
+            fixtures.createUser(adminEmail, "SALON_ADMIN", v.salonId()); // assigned to THIS salon
+            String adminToken = fixtures.tokenFor(adminEmail);
+            UUID child0 = firstChildOf(v.id());
+            UUID child1 = secondChildOf(v.id());
+
+            ResponseEntity<String> resp = patchServiceDecline(adminToken, v.id(), child0, "{}");
+
+            assertThat(resp.getStatusCode())
+                    .as("a salon admin assigned to the salon may decline one service — body: %s", resp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(childStatus(child0)).isEqualTo("DECLINED");
+            assertThat(childStatus(child1)).isEqualTo("CONFIRMED");
+            assertVisitStatus(v.id(), "CONFIRMED");
+            assertThat(statusChangedCount(v.id())).isEqualTo(1L);
+        }
+
+        @Test
+        @DisplayName("deny 403 — the read-only SALON_MASTER declining a service of their OWN visit is "
+                + "rejected by the role gate; both children stay CONFIRMED, no notification")
+        void should_return403_when_salonMasterDeclinesChild() throws Exception {
+            SalonVisit v = seedSalonVisit("psd-master-ro", 2, futureStart());
+            String salonMasterToken = fixtures.tokenFor(v.masterEmail());
+            UUID child0 = firstChildOf(v.id());
+
+            ResponseEntity<String> resp = patchServiceDecline(salonMasterToken, v.id(), child0, "{}");
+
+            assertThat(resp.getStatusCode())
+                    .as("SALON_MASTER is read-only — excluded from the provider role gate → 403")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+            assertAllItemsStatus(v.id(), "CONFIRMED", 2);
+            assertVisitStatus(v.id(), "CONFIRMED");
+            assertThat(statusChangedCount(v.id())).isEqualTo(0L);
+        }
+
+        @Test
+        @DisplayName("deny 403 — a CLIENT (even the visit's OWN client) hitting the provider-only "
+                + "per-service decline endpoint is rejected by the role gate; nothing changes")
+        void should_return403_when_clientDeclinesChild() throws Exception {
+            IndependentVisit v = seedIndependentVisit("psd-client", 2, futureStart());
+            UUID child0 = firstChildOf(v.id());
+
+            ResponseEntity<String> resp = patchServiceDecline(v.clientToken(), v.id(), child0, "{}");
+
+            assertThat(resp.getStatusCode())
+                    .as("per-service decline is provider-only — a CLIENT must get 403")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+            assertAllItemsStatus(v.id(), "CONFIRMED", 2);
+            assertVisitStatus(v.id(), "CONFIRMED");
+            assertThat(statusChangedCount(v.id())).isEqualTo(0L);
+        }
+
+        @Test
+        @DisplayName("deny 403 — a FOREIGN independent master (no authority over the visit's master) "
+                + "declining a child is rejected by the ownership guard; nothing changes")
+        void should_return403_when_foreignIndependentMasterDeclinesChild() throws Exception {
+            IndependentVisit v = seedIndependentVisit("psd-foreign-im", 2, futureStart());
+            String foreignEmail = "appt-mx-psd-foreign-im-" + System.nanoTime() + "@beautica.test";
+            fixtures.createIndependentMaster(foreignEmail);
+            String foreignToken = fixtures.tokenFor(foreignEmail);
+            UUID child0 = firstChildOf(v.id());
+
+            ResponseEntity<String> resp = patchServiceDecline(foreignToken, v.id(), child0, "{}");
+
+            assertThat(resp.getStatusCode())
+                    .as("a provider with no authority over the visit's master must be forbidden")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+            assertAllItemsStatus(v.id(), "CONFIRMED", 2);
+            assertThat(statusChangedCount(v.id())).isEqualTo(0L);
+        }
+
+        @Test
+        @DisplayName("deny 403 — a FOREIGN salon owner (owns a different salon) declining a child of "
+                + "this salon's visit is rejected by the ownership guard; nothing changes")
+        void should_return403_when_foreignSalonOwnerDeclinesChild() throws Exception {
+            SalonVisit v = seedSalonVisit("psd-foreign-owner", 2, futureStart());
+            BookingTestFixtures.SalonFixture other =
+                    fixtures.createSalon("appt-mx-psd-foreign-owner-" + System.nanoTime() + "@beautica.test");
+            String foreignOwnerToken = fixtures.tokenFor(other.ownerEmail());
+            UUID child0 = firstChildOf(v.id());
+
+            ResponseEntity<String> resp = patchServiceDecline(foreignOwnerToken, v.id(), child0, "{}");
+
+            assertThat(resp.getStatusCode())
+                    .as("a salon owner with no authority over the visit's salon must get 403")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+            assertAllItemsStatus(v.id(), "CONFIRMED", 2);
+            assertThat(statusChangedCount(v.id())).isEqualTo(0L);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
     // helpers
     // ══════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -614,6 +758,32 @@ class AppointmentTransitionMatrixIT extends AbstractIntegrationTest {
         HttpEntity<String> entity = body == null ? new HttpEntity<>(headers) : new HttpEntity<>(body, headers);
         return restTemplate.exchange(
                 APPOINTMENTS_URL + "/" + appointmentId + "/" + action, HttpMethod.PATCH, entity, String.class);
+    }
+
+    /** PATCH the per-service decline route {@code /appointments/{id}/services/{bookingId}/decline}. */
+    private ResponseEntity<String> patchServiceDecline(String token, UUID appointmentId, UUID bookingId, String body) {
+        HttpHeaders headers = fixtures.bearerHeaders(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> entity = body == null ? new HttpEntity<>(headers) : new HttpEntity<>(body, headers);
+        return restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + bookingId + "/decline",
+                HttpMethod.PATCH, entity, String.class);
+    }
+
+    private UUID firstChildOf(UUID appointmentId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1",
+                UUID.class, appointmentId);
+    }
+
+    private UUID secondChildOf(UUID appointmentId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at OFFSET 1 LIMIT 1",
+                UUID.class, appointmentId);
+    }
+
+    private String childStatus(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
     }
 
     private void assertElapsedConflict(ResponseEntity<String> resp) throws Exception {

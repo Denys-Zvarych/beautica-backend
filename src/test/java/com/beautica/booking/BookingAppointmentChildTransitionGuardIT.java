@@ -120,6 +120,40 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
         assertGuardRejected(resp, child, visit.id());
     }
 
+    // ── the per-child endpoint SUCCEEDS where the single-booking path is refused ───────────────────
+
+    @Test
+    @DisplayName("the NEW per-child endpoint PATCH /appointments/{id}/services/{child}/decline succeeds "
+            + "(204) on the exact visit child that the single-booking PATCH /bookings/{child}/decline "
+            + "refuses (409) — declining ONE service leaves the sibling CONFIRMED and the header CONFIRMED")
+    void should_succeedViaPerChildEndpoint_whereSingleBookingPath409d() throws Exception {
+        Visit visit = createTwoServiceVisit("per-child-vs-legacy");
+        UUID child0 = firstChildOf(visit.id());
+        UUID child1 = secondChildOf(visit.id());
+
+        // The OLD single-booking path is refused for a visit child (the existing guard contract).
+        ResponseEntity<String> viaBooking = patch(visit.masterToken(), child0, "decline",
+                "{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}");
+        assertThat(viaBooking.getStatusCode())
+                .as("the single-booking decline path must still refuse a visit child — body: %s", viaBooking.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(dbStatus(child0)).as("refused path left the child CONFIRMED").isEqualTo("CONFIRMED");
+
+        // The NEW per-child appointment path succeeds on the very same child.
+        ResponseEntity<String> viaAppointment = patchAppointmentServiceDecline(visit.masterToken(), visit.id(), child0,
+                "{\"providerComment\":\"скасовуємо одну послугу\"}");
+        assertThat(viaAppointment.getStatusCode())
+                .as("the per-child appointment decline path must succeed on the same child — body: %s",
+                        viaAppointment.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(dbStatus(child0)).as("the targeted child is now DECLINED").isEqualTo("DECLINED");
+        assertThat(dbStatus(child1)).as("the sibling stays CONFIRMED").isEqualTo("CONFIRMED");
+        assertThat(appointmentStatus(visit.id()))
+                .as("the header stays CONFIRMED while a sibling remains").isEqualTo("CONFIRMED");
+        assertThat(childAppointmentId(child0))
+                .as("the declined child stays bound to its appointment header").isEqualTo(visit.id());
+    }
+
     // ── legacy standalone booking (appointment_id NULL) still transitions normally ────────────────
 
     @Test
@@ -280,6 +314,28 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1",
                 UUID.class, appointmentId);
+    }
+
+    private UUID secondChildOf(UUID appointmentId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at OFFSET 1 LIMIT 1",
+                UUID.class, appointmentId);
+    }
+
+    private String appointmentStatus(UUID appointmentId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT status FROM appointments WHERE id = ?", String.class, appointmentId);
+    }
+
+    /** PATCH the per-service decline route {@code /appointments/{id}/services/{bookingId}/decline}. */
+    private ResponseEntity<String> patchAppointmentServiceDecline(
+            String token, UUID appointmentId, UUID bookingId, String body) {
+        HttpHeaders headers = fixtures.bearerHeaders(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> entity = body == null ? new HttpEntity<>(headers) : new HttpEntity<>(body, headers);
+        return restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + bookingId + "/decline",
+                HttpMethod.PATCH, entity, String.class);
     }
 
     private String dbStatus(UUID bookingId) {

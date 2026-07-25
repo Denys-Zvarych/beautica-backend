@@ -134,10 +134,19 @@ public record AppointmentDetailResponse(
         String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
         String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
 
+        // Per-service decline (DECLINED) and no-show (NOT_COMPLETED) lines are excluded from the
+        // owed total and total duration — the client must not be shown a price/duration that
+        // includes a service they will not receive (LOCKED decision). CONFIRMED/COMPLETED/CANCELLED
+        // lines are summed as before; a fully-CONFIRMED visit is byte-for-byte unchanged. The header
+        // time window (startsAt/endsAt below) deliberately still spans ALL items.
         BigDecimal totalPrice = BigDecimal.ZERO;
         BigDecimal totalCeiling = BigDecimal.ZERO;
         boolean anyRange = false;
+        long totalDurationMinutesLong = 0L;
         for (Booking item : orderedItems) {
+            if (isExcludedFromTotals(item.getStatus())) {
+                continue;
+            }
             totalPrice = totalPrice.add(item.getPriceAtBooking());
             if (item.getPriceMaxAtBooking() != null) {
                 anyRange = true;
@@ -145,10 +154,9 @@ public record AppointmentDetailResponse(
             } else {
                 totalCeiling = totalCeiling.add(item.getPriceAtBooking());
             }
+            totalDurationMinutesLong += Duration.between(item.getStartsAt(), item.getEndsAt()).toMinutes();
         }
-
-        int totalDurationMinutes = (int) Duration.between(
-                first.getStartsAt(), last.getEndsAt()).toMinutes();
+        int totalDurationMinutes = (int) totalDurationMinutesLong;
 
         List<AppointmentItemResponse> items = orderedItems.stream()
                 .map(AppointmentItemResponse::from)
@@ -181,5 +189,15 @@ public record AppointmentDetailResponse(
                 resolvedStreet,
                 resolvedBuildingNo,
                 resolvedLocationNote);
+    }
+
+    /**
+     * A service line is excluded from the owed {@code totalPrice}/{@code totalPriceMax} and from
+     * {@code totalDurationMinutes} when it is {@code DECLINED} (per-service or whole-visit decline) or
+     * {@code NOT_COMPLETED} (no-show) — the client does not owe for a service they will not receive.
+     * {@code CONFIRMED}, {@code COMPLETED} and {@code CANCELLED} lines are still summed.
+     */
+    private static boolean isExcludedFromTotals(BookingStatus status) {
+        return status == BookingStatus.DECLINED || status == BookingStatus.NOT_COMPLETED;
     }
 }
