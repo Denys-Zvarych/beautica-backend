@@ -12,6 +12,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
@@ -127,6 +128,7 @@ class BookingServiceCacheTest {
     @MockBean NotificationOutboxService outboxService;
     @MockBean SlotCalculationService slotCalculationService;
     @MockBean ReviewRepository reviewRepository;
+    @MockBean ClientReviewRepository clientReviewRepository;
     @MockBean DiscoveryLocationResolver discoveryLocationResolver;
     // Phase 23.x (perf/security #2): BookingService evicts the salon-service-catalog cache via this
     // collaborator after commit. Not on the @SpringBootTest classes list, so mock it for wiring.

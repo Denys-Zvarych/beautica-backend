@@ -584,7 +584,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
 
         BookingDetailResponse entityResponse =
-                BookingDetailResponse.from(booking, false, "Kyiv", "Podil");
+                BookingDetailResponse.from(booking, false, false, "Kyiv", "Podil");
 
         em.clear();
 
@@ -668,7 +668,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
         em.flush();
         BookingDetailResponse entityResponse =
-                BookingDetailResponse.from(booking, false, "Kyiv", "Podil");
+                BookingDetailResponse.from(booking, false, false, "Kyiv", "Podil");
         em.clear();
 
         Page<ClientBookingDetailProjection> page = findClientBookingDetails(

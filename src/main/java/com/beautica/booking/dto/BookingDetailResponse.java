@@ -126,6 +126,26 @@ import java.util.UUID;
  * genuine RANGE (no {@code priceOverride}) at the moment of booking; otherwise null, meaning
  * "single price, render {@code priceAtBooking} alone". Never re-derived on read — a later service
  * edit must not rewrite a band the client already agreed to.
+ *
+ * <p><b>{@code providerCanReviewClient}</b> (extends track 27.x / Phase 27.5) — the PROVIDER-side
+ * mirror of {@code canReview}, gating the "Залишити відгук про клієнта" CTA on
+ * {@code GET /bookings/{id}} only (NOT on any {@code GET /bookings/me} row — see below). {@code
+ * true} iff ALL of: (1) the CURRENT authenticated viewer has provider review-authority over THIS
+ * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking} — the exact
+ * predicate backing {@code @authz.canReviewClient}/{@code enforceCanReviewClient} on
+ * {@code POST /client-reviews}, so this can never disagree with what the write endpoint will
+ * actually accept; (2) {@code status == COMPLETED}; (3) the booking has a real client (not a
+ * guest/LINK booking); (4) no {@code ClientReview} already exists for this booking. A CLIENT or
+ * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
+ * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
+ * by {@code enforceCanViewBooking}) with this flag honestly {@code false}, or never reaches this
+ * DTO at all. {@code BookingService#getBooking} is the ONLY caller that computes this for real;
+ * every other construction site ({@code enrichCreated}, {@code rescheduleBooking}, the CLIENT
+ * projection path, and the provider {@code GET /bookings/me} listing) hardcodes {@code false} —
+ * a freshly-created or just-rescheduled booking is always {@code CONFIRMED} (never reviewable
+ * yet), the CLIENT projection path's viewer is always CLIENT (structurally excluded), and the
+ * provider listing was out of scope for the CTA this field backs. See each hardcoding site's own
+ * comment before "optimising" this away.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -188,6 +208,16 @@ public record BookingDetailResponse(
         String locationNote,
         String categoryName,
         boolean canReview,
+        @Schema(description = "TRUE only for the CURRENT authenticated viewer, and only on "
+                + "GET /bookings/{id}: the viewer has provider review-authority over this "
+                + "booking, its status is COMPLETED, it has a real (non-guest) client, and no "
+                + "ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
+                + "unauthorized provider, or any row served by GET /bookings/me (both the "
+                + "CLIENT and provider listing paths hardcode false — see "
+                + "BookingDetailResponse's class javadoc). Gates the \"Залишити відгук про "
+                + "клієнта\" CTA; the write endpoint (POST /client-reviews) re-checks the same "
+                + "conditions server-side regardless of this value.")
+        boolean providerCanReviewClient,
         @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
                 description = "The multi-service visit (BE-5) this booking belongs to, or null for a "
                         + "legacy single-service booking (appointment_id IS NULL). Strictly additive; "
@@ -223,8 +253,10 @@ public record BookingDetailResponse(
 
     /**
      * Builds the enriched detail view for the single-entity path. The caller (the service)
-     * must supply {@code canReview} (the COMPLETED + no-existing-review predicate) and the
-     * resolved discovery locality labels — neither is derivable from the entity graph.
+     * must supply {@code canReview} (the COMPLETED + no-existing-review predicate),
+     * {@code providerCanReviewClient} (the viewer-aware provider-side mirror — see this class's
+     * javadoc), and the resolved discovery locality labels — none of the three is derivable from
+     * the entity graph alone.
      *
      * <p>The caller MUST have hydrated the full graph (client, master.user, master.salon,
      * masterService.serviceDefinition) — e.g. via {@code BookingRepository.findByIdWithFullGraph}
@@ -244,6 +276,7 @@ public record BookingDetailResponse(
     public static BookingDetailResponse from(
             Booking booking,
             boolean canReview,
+            boolean providerCanReviewClient,
             String cityLabel,
             String districtLabel
     ) {
@@ -291,6 +324,7 @@ public record BookingDetailResponse(
                 resolvedLocationNote,
                 booking.getMasterService().getServiceDefinition().getCategory(),
                 canReview,
+                providerCanReviewClient,
                 // appointment is a LAZY @ManyToOne on a nullable FK — the identifier is served off
                 // the proxy (or resolved as null) from the booking row itself, so this reads with no
                 // extra SELECT and no widening of findByIdWithFullGraph / findAllByIdsWithGraph.

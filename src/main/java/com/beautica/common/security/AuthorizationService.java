@@ -415,8 +415,16 @@ public class AuthorizationService {
      * <p>Evaluation is branch-local: the in-memory owner comparison runs first and short-circuits
      * on a match; {@link #hasManagementAccess} is invoked only when it does not, so this never
      * unconditionally pays for both checks (the eager-evaluation bug this replaces).
+     *
+     * <p><b>Public since the {@code providerCanReviewClient} viewer-aware DTO field</b> (extends
+     * Phase 27.5): {@code BookingService#getBooking} calls this directly, non-throwing, to
+     * pre-compute whether the CURRENT viewer has provider review-authority over the booking being
+     * fetched — the exact same predicate {@link #enforceCanReviewClient} throws on, reused rather
+     * than re-derived so the two can never diverge. The booking is already loaded once by that
+     * caller (via {@code findByIdWithFullGraph}), so this remains a zero-extra-query call on the
+     * SALON_OWNER branch, same as every other caller of this overload.
      */
-    private boolean hasProviderAuthorityOverBooking(UUID actorId, Booking booking) {
+    public boolean hasProviderAuthorityOverBooking(UUID actorId, Booking booking) {
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             return hasProviderAuthorityOverBooking(true, master.getUser().getId(), null, actorId, null);

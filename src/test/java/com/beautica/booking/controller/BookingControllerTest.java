@@ -126,6 +126,10 @@ class BookingControllerTest {
                 // locationNote (additive)
                 null,
                 "MANICURE", false,
+                // providerCanReviewClient (additive) — viewer-aware, always false in this
+                // controller-slice fixture (BookingService is mocked; the value never reaches
+                // real computation here)
+                false,
                 // appointmentId (BE-5 additive) — legacy single-service booking has no visit
                 null,
                 // clientAvatarUrl (additive) — the provider timeline's client photo

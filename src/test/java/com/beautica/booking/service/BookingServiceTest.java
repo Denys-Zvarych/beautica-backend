@@ -101,6 +101,8 @@ class BookingServiceTest {
     @Mock
     private com.beautica.review.repository.ReviewRepository reviewRepository;
     @Mock
+    private com.beautica.review.repository.ClientReviewRepository clientReviewRepository;
+    @Mock
     private com.beautica.location.DiscoveryLocationResolver discoveryLocationResolver;
     @Mock
     private CacheManager cacheManager;
@@ -139,6 +141,7 @@ class BookingServiceTest {
                 outboxService,
                 slotCalculationService,
                 reviewRepository,
+                clientReviewRepository,
                 discoveryLocationResolver,
                 clock,
                 // A REAL evictor over the mocked CacheManager, never a mock: the key-shape predicate it
@@ -2642,7 +2645,8 @@ class BookingServiceTest {
     void should_returnBooking_when_getBookingCalledByOwner() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        // CONFIRMED (not COMPLETED) short-circuits canReview before the review-existence query —
+        // no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
@@ -2652,6 +2656,7 @@ class BookingServiceTest {
         assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(result.canReview()).isFalse();
         verify(authz).enforceCanViewBooking(clientId, booking);
+        verify(reviewRepository, never()).existsByBookingId(any());
     }
 
     @Test
@@ -2678,7 +2683,8 @@ class BookingServiceTest {
         setField(guestBooking, "guestName", "Оксана");
         setField(guestBooking, "guestSurname", "Мельник");
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        // No client (guest/LINK booking) short-circuits canReview before the review-existence
+        // query — no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         BookingDetailResponse result = bookingService.getBooking(providerActorId, bookingId);
@@ -2689,20 +2695,24 @@ class BookingServiceTest {
         assertThat(result.clientFirstName()).isEqualTo("Оксана");
         assertThat(result.clientLastName()).isEqualTo("Мельник");
         verify(authz).enforceCanViewBooking(providerActorId, guestBooking);
+        verify(reviewRepository, never()).existsByBookingId(any());
     }
 
     @Test
-    @DisplayName("canReview is false for a COMPLETED guest (LINK) booking with no existing review — no account exists to leave one")
+    @DisplayName("canReview is false for a COMPLETED guest (LINK) booking with no existing review — "
+            + "no account exists to leave one, and the review-existence check is never reached")
     void should_returnCanReviewFalse_when_completedGuestBookingHasNoClient() {
         Booking guestBooking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         setField(guestBooking, "client", null);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        // No client short-circuits canReview even though the booking is COMPLETED — the
+        // review-existence query never fires, so no reviewRepository stub is needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         BookingDetailResponse result = bookingService.getBooking(UUID.randomUUID(), bookingId);
 
         assertThat(result.canReview()).isFalse();
+        verify(reviewRepository, never()).existsByBookingId(any());
     }
 
     // ── getBooking — canReview truth table (Phase 19.3) ──────────────────────────
@@ -2714,23 +2724,31 @@ class BookingServiceTest {
     private BookingDetailResponse getBookingWith(BookingStatus status, boolean reviewExists) {
         Booking booking = buildBooking(bookingId, client, master, msa, status);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(reviewExists);
+        // Only a COMPLETED booking can reach the review-existence query (canReview's short
+        // circuit skips it otherwise) — stub it only when the caller needs it to fire.
+        if (status == BookingStatus.COMPLETED) {
+            when(reviewRepository.existsByBookingId(bookingId)).thenReturn(reviewExists);
+        }
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         return bookingService.getBooking(clientId, bookingId);
     }
 
     @Test
-    @DisplayName("canReview is false for a DECLINED booking (not COMPLETED)")
+    @DisplayName("canReview is false for a DECLINED booking (not COMPLETED), and the "
+            + "review-existence check is never reached")
     void should_returnCanReviewFalse_when_bookingDeclined() {
         assertThat(getBookingWith(BookingStatus.DECLINED, false).canReview()).isFalse();
         // A DECLINED booking is never review-eligible, so the existence check is irrelevant
-        // to the outcome — but the predicate must still short-circuit to false on status.
+        // to the outcome — the predicate short-circuits to false on status before the query runs.
+        verify(reviewRepository, never()).existsByBookingId(any());
     }
 
     @Test
-    @DisplayName("canReview is false for a CONFIRMED booking (not COMPLETED)")
+    @DisplayName("canReview is false for a CONFIRMED booking (not COMPLETED), and the "
+            + "review-existence check is never reached")
     void should_returnCanReviewFalse_when_bookingConfirmed() {
         assertThat(getBookingWith(BookingStatus.CONFIRMED, false).canReview()).isFalse();
+        verify(reviewRepository, never()).existsByBookingId(any());
     }
 
     @Test
@@ -2743,6 +2761,105 @@ class BookingServiceTest {
     @DisplayName("canReview is false for a COMPLETED booking that already has a review")
     void should_returnCanReviewFalse_when_bookingCompletedAndReviewExists() {
         assertThat(getBookingWith(BookingStatus.COMPLETED, true).canReview()).isFalse();
+    }
+
+    // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5) ──
+    //
+    // providerCanReviewClient = authz.hasProviderAuthorityOverBooking(actor, booking)
+    //     && status == COMPLETED && booking.getClient() != null
+    //     && !clientReviewRepository.existsByBookingId(booking.getId())
+    //
+    // ProviderCanReviewClientIT already pins this end-to-end through real HTTP + role/authority
+    // resolution. These cases isolate BookingService#computeProviderCanReviewClient itself via a
+    // mocked AuthorizationService/ClientReviewRepository — fast unit coverage of the same 4-way
+    // AND, and (unlike the IT) able to pin the short-circuit ordering: a later collaborator must
+    // never be consulted once an earlier condition has already failed.
+
+    @Test
+    @DisplayName("providerCanReviewClient is true when the actor has provider authority over a COMPLETED, non-guest, unreviewed booking")
+    void should_returnProviderCanReviewClientTrue_when_authorityCompletedNoReview() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
+        when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient()).isTrue();
+        verify(clientReviewRepository).existsByBookingId(bookingId);
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient is false when the actor lacks provider authority, even on a COMPLETED unreviewed booking — and the review-existence check is never reached")
+    void should_returnProviderCanReviewClientFalse_when_actorLacksProviderAuthority() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(false);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient())
+                .as("a CLIENT/SALON_MASTER/foreign viewer must never see the provider-review CTA")
+                .isFalse();
+        verify(clientReviewRepository, never()).existsByBookingId(any());
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient is false for a CONFIRMED (not COMPLETED) booking, even with provider authority — and the review-existence check is never reached")
+    void should_returnProviderCanReviewClientFalse_when_bookingNotCompleted() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // CONFIRMED (not COMPLETED) short-circuits canReview before its own review-existence
+        // query too — no reviewRepository stub needed here.
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient()).isFalse();
+        verify(clientReviewRepository, never()).existsByBookingId(any());
+        verify(reviewRepository, never()).existsByBookingId(any());
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient is false for a COMPLETED guest (LINK, null-client) booking — no account exists to review, and the review-existence check is never reached")
+    void should_returnProviderCanReviewClientFalse_when_bookingHasNoClient() {
+        Booking guestBooking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
+        setField(guestBooking, "client", null);
+        setField(guestBooking, "guestName", "Гість");
+        setField(guestBooking, "guestSurname", "Тестовий");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
+        // No client short-circuits canReview even though the booking is COMPLETED — no
+        // reviewRepository stub needed here.
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, guestBooking)).thenReturn(true);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient()).isFalse();
+        verify(clientReviewRepository, never()).existsByBookingId(any());
+        verify(reviewRepository, never()).existsByBookingId(any());
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient is false once a ClientReview already exists for the booking, even with provider authority and COMPLETED status")
+    void should_returnProviderCanReviewClientFalse_when_clientReviewAlreadyExists() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
+        when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(true);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient())
+                .as("a booking that already has a client review must never re-offer the CTA")
+                .isFalse();
     }
 
     // ── getBooking — enriched fields (Phase 19.3) ────────────────────────────────
@@ -2828,7 +2945,8 @@ class BookingServiceTest {
         MasterServiceAssignment enrichedMsa = buildMsa(masterServiceId, enriched, serviceDef, null, null);
         Booking booking = buildBooking(bookingId, client, enriched, enrichedMsa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        // CONFIRMED (not COMPLETED) short-circuits canReview before the review-existence query —
+        // no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(
                 new com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels(
                         Map.of(salonCityId, "Lviv"), Map.of(salonDistrictId, "Halytskyi")));
@@ -2862,7 +2980,8 @@ class BookingServiceTest {
         setField(guestBooking, "guestName", "Оксана");
         setField(guestBooking, "guestSurname", "Мельник");
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        // No client (guest/LINK booking) short-circuits canReview before the review-existence
+        // query — no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         BookingDetailResponse result = bookingService.getBooking(UUID.randomUUID(), bookingId);
