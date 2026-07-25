@@ -3,6 +3,7 @@ package com.beautica.booking.repository;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingViewAccess;
+import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -604,6 +605,35 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("excludeBookingId") UUID excludeBookingId
     );
 
+    /**
+     * Overlap check that excludes an ENTIRE visit's own chained rows — the appointment-level
+     * (BE-4 reschedule) analogue of {@link #existsOverlapExcluding}. A multi-service visit
+     * occupies N {@code bookings} rows (all sharing {@code appointment_id}), so a single
+     * {@code id <> :excludeBookingId} exclusion is not enough when re-planning the WHOLE block:
+     * the new span can legitimately overlap several of the visit's OWN current rows.
+     * {@code appointment_id IS DISTINCT FROM :appointmentId} is null-safe (legacy single-service
+     * bookings carry a {@code NULL appointment_id} and are never excluded by this predicate).
+     * Same predicate otherwise as {@link #existsOverlap} (CONFIRMED rows only, half-open interval
+     * overlap). Callers must hold the per-master advisory lock (see {@link #acquireAdvisoryLock(UUID)})
+     * before invoking, identical to the single-booking reschedule flow.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+              SELECT 1 FROM bookings
+               WHERE master_id = :masterId
+                 AND appointment_id IS DISTINCT FROM :appointmentId
+                 AND status = 'CONFIRMED'
+                 AND starts_at < :requestedEndsAt
+                 AND ends_at   > :requestedStartsAt
+            )
+            """, nativeQuery = true)
+    boolean existsOverlapExcludingAppointment(
+            @Param("masterId") UUID masterId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("appointmentId") UUID appointmentId
+    );
+
     // ── Client-scoped conflict check (cross-master/salon double-booking) ─────────
     /**
      * Id of the client's earliest {@code CONFIRMED} booking — with ANY
@@ -654,6 +684,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
             @Param("excludeBookingId") UUID excludeBookingId
+    );
+
+    /**
+     * Same as {@link #findFirstConflictingClientBookingIdExcluding} but excludes an ENTIRE visit's
+     * own chained rows via {@code appointment_id} — the appointment-level (BE-4 reschedule)
+     * analogue, used when re-planning a whole multi-service visit rather than one booking. Null-safe
+     * the same way {@link #existsOverlapExcludingAppointment} is.
+     */
+    @Query(value = """
+            SELECT id FROM bookings
+             WHERE client_id = :clientId
+               AND appointment_id IS DISTINCT FROM :appointmentId
+               AND status = 'CONFIRMED'
+               AND starts_at < :requestedEndsAt
+               AND ends_at   > :requestedStartsAt
+             ORDER BY starts_at ASC
+             LIMIT 1
+            """, nativeQuery = true)
+    Optional<UUID> findFirstConflictingClientBookingIdExcludingAppointment(
+            @Param("clientId") UUID clientId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("appointmentId") UUID appointmentId
     );
 
     /**
@@ -765,6 +818,31 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.id = :bookingId
             """)
     Optional<BookingCompletionAccess> findCompletionAccessById(@Param("bookingId") UUID bookingId);
+
+    /**
+     * Visit-level (BE-4 reschedule) analogue of {@link #findCompletionAccessById}, backing
+     * {@code AuthorizationService.canRescheduleAppointment}. A visit is single-master (BE-1 locked
+     * design), so every chained row shares the IDENTICAL {@code (masterUserId, salonId)} pair —
+     * the caller only ever needs one row, so this is capped to a single result via the
+     * {@code Limit} parameter (deterministically ordered by {@code b.id}) instead of fetching
+     * every chained row just to read the first. Naturally bounded by {@code
+     * SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows, §E-3) regardless. Returns empty
+     * when the appointment does not exist or has no items.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingCompletionAccess(
+                bm.user.id,
+                bs.id
+            )
+            FROM Booking b
+            JOIN b.master bm
+            JOIN bm.user
+            LEFT JOIN bm.salon bs
+            WHERE b.appointment.id = :appointmentId
+            ORDER BY b.id
+            """)
+    List<BookingCompletionAccess> findCompletionAccessByAppointmentId(
+            @Param("appointmentId") UUID appointmentId, Limit limit);
 
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)

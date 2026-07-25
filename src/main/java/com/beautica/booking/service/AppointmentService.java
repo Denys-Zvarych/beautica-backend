@@ -165,8 +165,12 @@ public class AppointmentService {
      * street/building/locationNote resolution and the header-note reads live inside
      * {@link AppointmentDetailResponse#from}; only the FK→label lookup is not derivable from the
      * fetched graph and is done here.
+     *
+     * <p>Package-private (not {@code private}) so {@code AppointmentTransitionService.rescheduleAppointment}
+     * (BE-4) can reuse it verbatim to build the re-planned visit's response, instead of
+     * duplicating the discovery-label lookup + {@code canReview} computation a second time.
      */
-    private AppointmentDetailResponse enrich(Appointment appointment, List<Booking> items) {
+    AppointmentDetailResponse enrich(Appointment appointment, List<Booking> items) {
         Master master = items.get(0).getMaster();
         Salon salon = master.getSalon();
         User masterUser = master.getUser();

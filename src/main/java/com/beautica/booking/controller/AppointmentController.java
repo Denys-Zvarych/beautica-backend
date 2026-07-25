@@ -3,6 +3,7 @@ package com.beautica.booking.controller;
 import com.beautica.booking.dto.AppointmentCancelRequest;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.AppointmentProviderNoteRequest;
+import com.beautica.booking.dto.AppointmentRescheduleRequest;
 import com.beautica.booking.dto.CreateAppointmentRequest;
 import com.beautica.booking.service.AppointmentService;
 import com.beautica.booking.service.AppointmentTransitionService;
@@ -156,5 +157,37 @@ public class AppointmentController {
     ) {
         appointmentTransitionService.notCompleteAppointment(AuthenticationUtils.userId(auth), appointmentId, req);
         return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * Moves a WHOLE multi-service visit to a new future time — every chained item shifts
+     * lockstep, back-to-back, preserving order and each item's frozen duration/buffer/price
+     * snapshot. The visit-level analogue of {@code PATCH /bookings/{id}/reschedule} (Phase 27.2):
+     * the client's own visit, OR a provider (salon owner / assigned salon admin / independent
+     * master) with authority over the visit's single master.
+     *
+     * <p>Authorization mirrors the per-booking reschedule union exactly:
+     * {@code hasRole('CLIENT')} short-circuits for a CLIENT principal (so
+     * {@code @authz.canRescheduleAppointment} is never evaluated on that path — see
+     * {@code AuthorizationService.canRescheduleBooking}'s identical short-circuit javadoc), while a
+     * provider role must additionally pass {@code canRescheduleAppointment}'s ownership check.
+     * {@code SALON_MASTER} is excluded from both role lists (read-only calendar access only).
+     *
+     * <p>Actor is resolved from the security principal — never from the body. Returns the
+     * existing {@link AppointmentDetailResponse} shape (the same view
+     * {@code GET /appointments/{id}} returns). Errors: {@code 409} on a conflicting slot, a
+     * non-CONFIRMED visit, or (provider path) an already-elapsed current visit; {@code 403} for a
+     * non-owner/non-authorized provider; {@code 400} for a bad new time.
+     */
+    @PatchMapping("/{appointmentId}/reschedule")
+    @PreAuthorize("hasRole('CLIENT') or (hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') "
+            + "and @authz.canRescheduleAppointment(authentication, #appointmentId))")
+    public ApiResponse<AppointmentDetailResponse> rescheduleAppointment(
+            @PathVariable UUID appointmentId,
+            @Valid @RequestBody AppointmentRescheduleRequest req,
+            Authentication auth
+    ) {
+        return ApiResponse.ok(appointmentTransitionService.rescheduleAppointment(
+                AuthenticationUtils.userId(auth), AuthenticationUtils.role(auth), appointmentId, req));
     }
 }

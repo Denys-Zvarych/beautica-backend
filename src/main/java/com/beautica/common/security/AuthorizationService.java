@@ -15,10 +15,12 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Limit;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.UUID;
 
 @Component("authz")
@@ -552,6 +554,34 @@ public class AuthorizationService {
         if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
             throw new ForbiddenException("Access denied");
         }
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} provider-reschedule predicate for the VISIT-level analogue of
+     * {@link #canRescheduleBooking}, backing the provider arm of
+     * {@code PATCH /appointments/{id}/reschedule}'s union role check: {@code hasRole('CLIENT') or
+     * (hasAnyRole(providers) and @authz.canRescheduleAppointment(...))}.
+     *
+     * <p>A visit is single-master (BE-1 locked design), so every chained row resolves to the
+     * IDENTICAL {@code (masterUserId, salonId)} pair via
+     * {@link BookingRepository#findCompletionAccessByAppointmentId} — only one row is fetched
+     * (capped via {@code Limit.of(1)}, deterministically ordered by the query), authoritative for
+     * the whole visit, exactly as {@link #canRescheduleBooking} uses the single booking's own
+     * pair. Role fast path + missing-visit handling mirror {@link #canRescheduleBooking} exactly
+     * (no existence oracle — a missing/foreign/itemless appointment id answers {@code false}).
+     */
+    public boolean canRescheduleAppointment(Authentication auth, UUID appointmentId) {
+        boolean cannotReschedule = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotReschedule) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        List<BookingCompletionAccess> access =
+                bookingRepository.findCompletionAccessByAppointmentId(appointmentId, Limit.of(1));
+        if (access.isEmpty()) return false;
+        BookingCompletionAccess v = access.get(0);
+        return hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole);
     }
 
     /**

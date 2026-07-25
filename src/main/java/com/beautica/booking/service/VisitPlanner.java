@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.BookingPriceRange;
+import com.beautica.booking.entity.Booking;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -124,6 +125,44 @@ class VisitPlanner {
         }
     }
 
+    /**
+     * Re-lays-out an ALREADY-BOOKED visit's chained items from a new first start, preserving
+     * each item's frozen duration/buffer snapshot (BE-4 visit reschedule) — the timing-only twin
+     * of {@link #planChainedItems}.
+     *
+     * <p>Reuses the identical back-to-back chaining formula this class uses for creation
+     * ({@code start[i] = start[i-1].endsAt}, {@code end[i] = start[i] + duration[i] + buffer[i]})
+     * and the same {@link SlotCalculationService#MAX_TOTAL_DURATION_MINUTES} &Sigma;-cap, but
+     * resolves NOTHING from {@code master_services}: {@code priceAtBooking} /
+     * {@code durationMinutesAtBooking} / {@code bufferMinutesAtBooking} stay frozen at each item's
+     * original booking-time values (mirrors {@code BookingService#rescheduleBooking}, which
+     * freezes the same two fields on the single-service path) — only the clock position of the
+     * whole block moves. A catalogue price/duration change since booking can therefore never leak
+     * into an existing visit via a reschedule.
+     *
+     * <p>{@code orderedItems} must already be ordered by {@code startsAt} ascending — the exact
+     * shape {@code BookingRepository#findByAppointmentIdWithGraph} returns — and the returned list
+     * is parallel (same size, same order): index {@code i} is item {@code i}'s new window.
+     */
+    List<PlannedWindow> replanFromNewStart(List<Booking> orderedItems, OffsetDateTime newFirstStart) {
+        List<PlannedWindow> windows = new ArrayList<>(orderedItems.size());
+        OffsetDateTime cursor = newFirstStart;
+        long totalMinutes = 0;
+        for (Booking item : orderedItems) {
+            int duration = item.getDurationMinutesAtBooking();
+            int buffer = item.getBufferMinutesAtBooking();
+            OffsetDateTime start = cursor;
+            OffsetDateTime end = start.plusMinutes((long) duration + buffer);
+            windows.add(new PlannedWindow(start, end));
+            totalMinutes += (long) duration + buffer;
+            cursor = end;
+        }
+        if (totalMinutes > SlotCalculationService.MAX_TOTAL_DURATION_MINUTES) {
+            throw new BusinessException("total service duration exceeds maximum allowed");
+        }
+        return windows;
+    }
+
     /** One resolved, priced service line ready to become a chained {@code Booking} row. */
     record PlannedItem(
             MasterServiceAssignment masterService,
@@ -133,4 +172,7 @@ class VisitPlanner {
             int buffer,
             BigDecimal price,
             BigDecimal priceMax) {}
+
+    /** One item's re-laid-out window — parallel-indexed to the caller's ordered item list. */
+    record PlannedWindow(OffsetDateTime startsAt, OffsetDateTime endsAt) {}
 }
