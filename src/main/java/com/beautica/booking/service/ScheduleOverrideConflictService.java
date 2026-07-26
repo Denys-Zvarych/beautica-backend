@@ -8,6 +8,7 @@ import com.beautica.booking.repository.OverrideConflictCandidate;
 import com.beautica.common.TimeZones;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ScheduleOverrideDeclineBudgetExceededException;
 import com.beautica.master.dto.OverrideConflictPreviewResponse;
 import com.beautica.master.dto.OverrideConflictResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
@@ -18,7 +19,10 @@ import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.ScheduleConflictCalculator;
 import com.beautica.master.service.ScheduleDateMath;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import io.github.bucket4j.Bucket;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -27,6 +31,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
@@ -82,6 +87,7 @@ import java.util.stream.Collectors;
  */
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class ScheduleOverrideConflictService {
 
     /**
@@ -101,8 +107,15 @@ public class ScheduleOverrideConflictService {
      * message abuse vector to bound. The cap is kept regardless: 100 uninvited, unexplained booking
      * cancellations in one request is still worth rejecting as almost certainly a bug or an abusive
      * account, independent of whether anyone is notified.
+     *
+     * <p>{@code public} (not {@code private}) for two reasons: {@code ScheduleOverrideConflictServiceTest}
+     * pins the CRITICAL "aggregate decline-budget capacity must exceed this constant" invariant
+     * (security audit finding 1) directly against this value, rather than a hand-copied literal that
+     * could silently drift out of sync; and {@link com.beautica.config.RateLimitConfig}'s own
+     * {@code @PostConstruct} boot-time guard on {@code scheduleOverrideDeclineBudgetCapacity}
+     * references it cross-package for the same reason — see that guard's javadoc.
      */
-    private static final int MAX_CONFLICTS_PER_WRITE = 100;
+    public static final int MAX_CONFLICTS_PER_WRITE = 100;
 
     /**
      * Result cap for the read-only preview (perf finding 4) — a range up to 366 days could otherwise
@@ -133,6 +146,15 @@ public class ScheduleOverrideConflictService {
      */
     static final int MAX_CANDIDATES_SCANNED = 5000;
 
+    /**
+     * {@code Retry-After} for {@link ScheduleOverrideDeclineBudgetExceededException} — matches the
+     * 1-hour window of {@code RateLimitConfig#scheduleOverrideDeclineBudgetBuckets} (security audit
+     * finding 1). Mirrors the fixed-value-matching-the-refill-window convention every bucket in
+     * {@code BookingRateLimitFilter} already uses (e.g. {@code SCHEDULE_OVERRIDE_RETRY_AFTER_SECONDS}),
+     * rather than computing a dynamic estimate from Bucket4j's refill state.
+     */
+    private static final long DECLINE_BUDGET_RETRY_AFTER_SECONDS = Duration.ofHours(1).toSeconds();
+
     private final BookingRepository bookingRepository;
     private final BookingService bookingService;
     private final AppointmentTransitionService appointmentTransitionService;
@@ -140,6 +162,15 @@ public class ScheduleOverrideConflictService {
     private final MasterCachePrefixEvictor cachePrefixEvictor;
     private final ScheduleDateMath dateMath;
     private final Clock clock;
+
+    /**
+     * Aggregate per-actor decline-count budget (security audit finding 1, MEDIUM) — see
+     * {@code RateLimitConfig#scheduleOverrideDeclineBudgetCapacity}'s javadoc for the full sizing
+     * arithmetic. Consumed directly here (not by a servlet filter) because the token cost — the
+     * actual conflict count — is only known INSIDE this method, after {@link #findConflictsForDate}
+     * runs.
+     */
+    private final LoadingCache<String, Bucket> scheduleOverrideDeclineBudgetBuckets;
 
     /**
      * Read-only preview backing {@code POST /overrides/conflicts}: every {@code CONFIRMED} booking in
@@ -268,23 +299,52 @@ public class ScheduleOverrideConflictService {
                                     .formatted(conflicts.size()));
         }
 
-        // 2026-07-26 product decision reversal (D6) — this write's ONLY rate-limit exposure is now
+        // 2026-07-26 product decision reversal (D6) — this write's per-request rate-limit exposure is
         // the ordinary destructive-bulk-write concern (see RateLimitConfig#scheduleOverrideWriteBuckets
         // and BookingRateLimitFilter), enforced entirely in the filter BEFORE this method ever runs.
         // There used to be an additional, proportional charge here (one extra token per booking about
         // to be declined, from the SAME bucket PATCH .../decline uses) because a mass-decline could
-        // fan an attacker-authored providerComment out to real guest phone numbers as SMS — that
+        // fan an attacker-authored providerComment out to real guest phone numbers as SMS — that SMS
         // vector no longer exists: an override-driven decline carries no note and dispatches no
-        // notification at all (D6), so there is nothing left to bound proportionally to blast radius.
-        // Removed along with BookingDeclineRateLimiter.
+        // notification at all (D6). Removed along with BookingDeclineRateLimiter.
+        //
+        // 2026-07-26 re-audit, security audit finding 1 (MEDIUM) — a DIFFERENT proportional charge is
+        // reintroduced below, from a bucket dedicated to THIS route (never the SMS-driven
+        // bookingDeclineBuckets): the per-request (100) and per-minute (50) caps are independent, so
+        // their PRODUCT is unbounded without this. All-or-nothing, BEFORE any decline executes — same
+        // placement as the MAX_CONFLICTS_PER_WRITE check above — so a rejection mutates nothing.
+        if (!conflicts.isEmpty()) {
+            consumeDeclineBudget(actorId, conflicts.size());
+        }
 
         ScheduleOverrideResponse response = masterScheduleService.upsertOverride(actorId, masterId, request);
         declineConflicts(actorId, conflicts);
         // The ONLY eviction this class still owns for the write — see the class javadoc's perf note.
         if (!conflicts.isEmpty()) {
             registerMasterCalendarEviction(masterId);
+            // Audit trail (security audit finding 2, LOW): D6 removed the client notification for this
+            // path, so a structured log line is the only operational signal an abusive or accidental
+            // mass-cancellation leaves. Ids and a count only — never a client name, phone, email, or
+            // booking note/comment (Anti-Bug §I, track 25.x rules). INFO (not DEBUG) so it is actually
+            // visible in production by default; the "Schedule override mass-decline:" prefix makes it
+            // greppable for alerting, mirroring MasterService#rotateMasterSalon's audit-log convention.
+            log.info("Schedule override mass-decline: actor={} master={} date={} declinedCount={}",
+                    actorId, masterId, request.date(), conflicts.size());
         }
         return response;
+    }
+
+    /**
+     * Consumes {@code declineCount} tokens from the caller's aggregate decline budget (security audit
+     * finding 1) — see {@code RateLimitConfig#scheduleOverrideDeclineBudgetCapacity}'s javadoc for the
+     * capacity/window and the arithmetic behind them. Throws before any decline executes; nothing is
+     * mutated on rejection.
+     */
+    private void consumeDeclineBudget(UUID actorId, int declineCount) {
+        Bucket bucket = scheduleOverrideDeclineBudgetBuckets.get(actorId.toString());
+        if (!bucket.tryConsume(declineCount)) {
+            throw new ScheduleOverrideDeclineBudgetExceededException(DECLINE_BUDGET_RETRY_AFTER_SECONDS);
+        }
     }
 
     private List<OverrideConflictCandidate> findConflictsForDate(

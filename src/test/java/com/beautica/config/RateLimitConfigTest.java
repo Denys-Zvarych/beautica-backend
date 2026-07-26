@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.booking.service.ScheduleOverrideConflictService;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
 import org.junit.jupiter.api.BeforeEach;
@@ -8,6 +9,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Pins the AS-BUILT verify-email / resend-verification rate-limit ceilings
@@ -38,6 +41,13 @@ class RateLimitConfigTest {
     // Phase A5 — password-reset OTP flow rate-limit ceilings.
     private static final long VERIFY_PASSWORD_RESET_OTP_CAPACITY = 10L;
     private static final long CHANGE_PASSWORD_OTP_CAPACITY = 3L;
+    // 2026-07-26 re-audit, security audit finding 1 — aggregate schedule-override decline budget.
+    // NOTE: the CRITICAL capacity > ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE invariant
+    // is deliberately NOT pinned here as a hand-duplicated literal (that would recreate the exact
+    // drift risk finding 1 warns about) — it is pinned in ScheduleOverrideConflictServiceTest, which
+    // can reference the real MAX_CONFLICTS_PER_WRITE constant directly (same package) against a real
+    // RateLimitConfig-built bucket.
+    private static final long SCHEDULE_OVERRIDE_DECLINE_BUDGET_CAPACITY = 1500L;
 
     private RateLimitConfig config;
 
@@ -49,6 +59,8 @@ class RateLimitConfigTest {
         ReflectionTestUtils.setField(config, "resendVerificationCapacity", RESEND_CAPACITY);
         ReflectionTestUtils.setField(config, "verifyPasswordResetOtpCapacity", VERIFY_PASSWORD_RESET_OTP_CAPACITY);
         ReflectionTestUtils.setField(config, "changePasswordOtpCapacity", CHANGE_PASSWORD_OTP_CAPACITY);
+        ReflectionTestUtils.setField(
+                config, "scheduleOverrideDeclineBudgetCapacity", SCHEDULE_OVERRIDE_DECLINE_BUDGET_CAPACITY);
     }
 
     @Test
@@ -137,5 +149,67 @@ class RateLimitConfigTest {
         assertThat(aggregatePerMinute)
                 .as("as-built verify-email aggregate rate must be far below 5 req/min")
                 .isLessThan(5.0);
+    }
+
+    /**
+     * Pins the AS-BUILT aggregate schedule-override decline budget (2026-07-26 re-audit, security
+     * finding 1, MEDIUM) — capacity 1500 tokens per 1-hour window, charged {@code conflicts.size()}
+     * tokens per write by {@code ScheduleOverrideConflictService}, not the flat 1-per-request charge
+     * every other bucket in this class uses. See {@code scheduleOverrideDeclineBudgetCapacity}'s
+     * javadoc in {@link RateLimitConfig} for the sizing arithmetic. The CRITICAL
+     * capacity-exceeds-{@code MAX_CONFLICTS_PER_WRITE} invariant this bucket depends on is pinned
+     * separately, in {@code ScheduleOverrideConflictServiceTest}, against the real constant.
+     */
+    @Test
+    @DisplayName("should_allowExactlyScheduleOverrideDeclineBudgetCapacityThenThrottle_when_1HourWindow")
+    void should_allowExactlyScheduleOverrideDeclineBudgetCapacityThenThrottle_when_1HourWindow() {
+        LoadingCache<String, Bucket> buckets = config.scheduleOverrideDeclineBudgetBuckets();
+        Bucket bucket = buckets.get(java.util.UUID.randomUUID().toString());
+
+        assertThat(bucket.tryConsume(SCHEDULE_OVERRIDE_DECLINE_BUDGET_CAPACITY))
+                .as("a single burst consuming exactly the full capacity in one shot must be permitted "
+                        + "(this is what a maximal single write, or several writes in the same burst, "
+                        + "against a fresh/full bucket looks like)")
+                .isTrue();
+
+        assertThat(bucket.tryConsume(1))
+                .as("one more token past a fully-exhausted budget must be throttled")
+                .isFalse();
+    }
+
+    /**
+     * Boot-time guard test (2026-07-26 LOW security finding, follow-up to security audit finding 1) —
+     * neither pin test above actually reads the CONFIGURED {@code scheduleOverrideDeclineBudgetCapacity};
+     * both always exercise the hardcoded 1500 default. This test proves the guard itself catches a
+     * misconfiguration an operator could introduce via
+     * {@code app.rate-limit.schedule-override-decline-budget-capacity} (e.g. a Railway env var) that
+     * neither pin test would ever see.
+     */
+    @Test
+    @DisplayName("should_failStartup_when_declineBudgetCapacityDoesNotExceedMaxConflictsPerWrite")
+    void should_failStartup_when_declineBudgetCapacityDoesNotExceedMaxConflictsPerWrite() {
+        // A capacity exactly AT MAX_CONFLICTS_PER_WRITE (100) is the boundary case: it looks plausible
+        // to a careless operator ("100 conflicts, 100 capacity") but a full-capacity single write would
+        // consume the ENTIRE bucket in one shot and every subsequent decline within the window would be
+        // permanently throttled, so it must be rejected exactly like anything strictly lower.
+        ReflectionTestUtils.setField(
+                config, "scheduleOverrideDeclineBudgetCapacity", (long) ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE);
+
+        assertThatThrownBy(config::validateScheduleOverrideDeclineBudgetCapacity)
+                .as("a decline-budget capacity <= MAX_CONFLICTS_PER_WRITE must fail application startup, "
+                        + "not silently 429 legitimate writes in production")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("schedule-override-decline-budget-capacity")
+                .hasMessageContaining(String.valueOf(ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE));
+    }
+
+    @Test
+    @DisplayName("should_initializeCleanly_when_declineBudgetCapacityExceedsMaxConflictsPerWrite")
+    void should_initializeCleanly_when_declineBudgetCapacityExceedsMaxConflictsPerWrite() {
+        // setUp() already reflects the production default (1500), which must exceed
+        // MAX_CONFLICTS_PER_WRITE (100) — proving the happy path does not regress alongside the guard.
+        assertThatCode(config::validateScheduleOverrideDeclineBudgetCapacity)
+                .as("the production default (1500) must clear the guard without throwing")
+                .doesNotThrowAnyException();
     }
 }

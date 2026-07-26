@@ -1,12 +1,14 @@
 package com.beautica.config;
 
 import com.beautica.booking.filter.BookingRateLimitFilter;
+import com.beautica.booking.service.ScheduleOverrideConflictService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.BandwidthBuilder;
 import io.github.bucket4j.Bucket;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -231,6 +233,95 @@ public class RateLimitConfig {
     // the cap.
     @Value("${app.rate-limit.schedule-override-write-capacity:50}")
     private long scheduleOverrideWriteCapacity;
+
+    /**
+     * Per-actor AGGREGATE decline-count budget for {@code PUT /api/v1/masters/{masterId}/overrides/{date}}
+     * (2026-07-26 security audit finding 1 — MEDIUM). {@link #scheduleOverrideWriteCapacity} above and
+     * {@code ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE} (100) are INDEPENDENT caps — one
+     * bounds request frequency, the other bounds conflicts declined per request — so nothing bounds
+     * their PRODUCT: an already-authorized ({@code canManageMasterSchedule}) but compromised account
+     * could mass-decline on the order of 50 req/min &times; 100 conflicts/req = 5,000 {@code CONFIRMED}
+     * bookings per minute across every master it manages, with D6 removing the one signal (a client
+     * notification) that would otherwise surface the damage quickly. This bucket closes that gap by
+     * charging {@code conflicts.size()} tokens per write (not the flat 1-per-request charge every other
+     * bucket in this class uses) — see {@code ScheduleOverrideConflictService}'s consumption call,
+     * placed in the same spot as its {@code MAX_CONFLICTS_PER_WRITE} check: before any decline executes,
+     * all-or-nothing, nothing mutated on rejection.
+     *
+     * <p><b>Sizing arithmetic.</b> The legitimate worst case is a master saving a long vacation: the
+     * mobile client expands a multi-day span into ONE {@code PUT} per date (see
+     * {@link #scheduleOverrideWriteCapacity}'s javadoc), so a month-long holiday is realistically ~31
+     * consecutive requests from one actor. Per date, the physical ceiling on a master's own confirmed
+     * bookings is bounded by the calendar itself — a 10-hour working day at 20-minute slots is ~30
+     * bookings, and {@code MAX_CONFLICTS_PER_WRITE} independently caps any single date at 100 regardless.
+     * Taking the (deliberately unrealistic, upper-bound) case where EVERY one of the 31 dates is maximally
+     * booked: 31 &times; 30 = 930 conflicts declined across the whole save flow. This bucket's capacity
+     * (1500) clears that with the SAME ~61% headroom ratio {@link #scheduleOverrideWriteCapacity}
+     * itself uses (50 vs. a 31-request legitimate worst case is also a ~61% margin: 50 / 31 &asymp; 1.61;
+     * 1500 / 930 &asymp; 1.61) — comfortable room for the occasional 409-then-retry resubmit, while
+     * remaining two orders of magnitude below the ~300,000 conflicts/hour (5,000/min &times; 60) the
+     * uncapped product above would otherwise allow: an attacker sustaining the maximum per-request /
+     * per-minute rate exhausts this budget in about 18 seconds (1500 &divide; 83.3 conflicts/sec) and is
+     * then locked out of further schedule-override declines against this budget for the rest of the
+     * hour, regardless of how many more {@code PUT} requests {@link #scheduleOverrideWriteCapacity}
+     * would otherwise still allow.
+     *
+     * <p><b>Window (1 hour, not 1 minute).</b> A per-minute window would clip the legitimate vacation-save
+     * burst described above if the mobile client fires its ~31 requests faster than tokens refill; a
+     * longer, larger-capacity window absorbs that burst in full while still bounding sustained abuse — see
+     * {@link #SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW}.
+     *
+     * <p><b>CRITICAL invariant (must never regress).</b> Bucket4j's {@code tryConsume(N)} can never
+     * succeed when {@code N} exceeds the bucket's OWN capacity, even fully refilled — an earlier version
+     * of this feature charged proportionally against a capacity-10 bucket and thereby PERMANENTLY 429'd
+     * any override declining 11+ bookings. This capacity (1500) MUST exceed
+     * {@code ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE} (100) so a single maximal
+     * legitimate request (100 conflicts) can always be satisfied by a full bucket — pinned against the
+     * production default by {@code ScheduleOverrideConflictServiceTest
+     * #should_allowSingleRequestDecliningMaxConflictsPerWrite_when_budgetBucketIsFull} and enforced at
+     * boot for ANY configured value (not just the default) by
+     * {@link #validateScheduleOverrideDeclineBudgetCapacity()}, pinned by
+     * {@code RateLimitConfigTest#should_failStartup_when_declineBudgetCapacityDoesNotExceedMaxConflictsPerWrite}.
+     * Configurable so integration tests can raise the cap.
+     */
+    @Value("${app.rate-limit.schedule-override-decline-budget-capacity:1500}")
+    private long scheduleOverrideDeclineBudgetCapacity;
+
+    /** See {@link #scheduleOverrideDeclineBudgetCapacity}'s javadoc for why 1 hour, not 1 minute. */
+    private static final Duration SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW = Duration.ofHours(1);
+
+    /**
+     * Boot-time guard for the CRITICAL invariant documented on
+     * {@link #scheduleOverrideDeclineBudgetCapacity}: that field's capacity MUST exceed
+     * {@link ScheduleOverrideConflictService#MAX_CONFLICTS_PER_WRITE} (100), because Bucket4j's
+     * {@code tryConsume(N)} can never succeed for {@code N} greater than the bucket's OWN capacity,
+     * even fully refilled. Both existing pin tests (this class's and
+     * {@code ScheduleOverrideConflictServiceTest}'s) only ever exercise the hardcoded default (1500)
+     * reflected into the field — neither reads whatever value is ACTUALLY configured at runtime — so
+     * an operator setting {@code app.rate-limit.schedule-override-decline-budget-capacity} (e.g. via a
+     * Railway env var) to anything at or below 100 would silently and PERMANENTLY 429 every legitimate
+     * schedule-override write that declines 51-100 conflicts, with no test catching it. This method
+     * fails application startup instead, referencing
+     * {@link ScheduleOverrideConflictService#MAX_CONFLICTS_PER_WRITE} directly (never a duplicated
+     * literal) so the guard cannot itself drift from the value it protects.
+     */
+    @PostConstruct
+    void validateScheduleOverrideDeclineBudgetCapacity() {
+        int maxConflictsPerWrite = ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE;
+        if (scheduleOverrideDeclineBudgetCapacity <= maxConflictsPerWrite) {
+            throw new IllegalStateException(
+                    ("app.rate-limit.schedule-override-decline-budget-capacity is %d, but it must be "
+                            + "strictly greater than ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE "
+                            + "(%d). Bucket4j's tryConsume(N) can never succeed for N greater than a bucket's "
+                            + "own capacity, even fully refilled, so a decline-budget capacity at or below "
+                            + "the per-write conflict cap would permanently reject (HTTP 429) any legitimate "
+                            + "schedule-override write that declines more conflicts than the configured "
+                            + "capacity allows. Raise "
+                            + "app.rate-limit.schedule-override-decline-budget-capacity to a value strictly "
+                            + "greater than %d.")
+                            .formatted(scheduleOverrideDeclineBudgetCapacity, maxConflictsPerWrite, maxConflictsPerWrite));
+        }
+    }
 
     // 5-minute eviction grace past the rate-limit window so a bucket entry is not
     // evicted the instant its window rolls over (avoids a false-start on the very
@@ -535,6 +626,22 @@ public class RateLimitConfig {
                 ONE_MINUTE.plus(EVICTION_GRACE),
                 scheduleOverrideWriteCapacity,
                 ONE_MINUTE);
+    }
+
+    /**
+     * Per-actor bucket for {@link #scheduleOverrideDeclineBudgetCapacity} (security audit finding 1) —
+     * consumed directly by {@code ScheduleOverrideConflictService}, NOT by {@link BookingRateLimitFilter}
+     * (see that field's javadoc for why this cannot be a flat per-request filter charge). {@code
+     * expireAfterAccess} gives a 5-minute grace past the 1-hour window so a bucket entry is not evicted
+     * the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> scheduleOverrideDeclineBudgetBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW.plus(EVICTION_GRACE),
+                scheduleOverrideDeclineBudgetCapacity,
+                SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW);
     }
 
     /**

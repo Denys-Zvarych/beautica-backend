@@ -171,6 +171,22 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("Please wait before requesting another code"));
     }
 
+    /**
+     * 429 for the aggregate schedule-override decline budget (2026-07-26 security audit finding
+     * 1) — see {@link ScheduleOverrideDeclineBudgetExceededException}'s class javadoc for why this
+     * is thrown from the service rather than caught by a servlet filter. No conflict count or
+     * budget figure is echoed to the caller — a generic message, same posture as
+     * {@link #handleResendThrottled}.
+     */
+    @ExceptionHandler(ScheduleOverrideDeclineBudgetExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleScheduleOverrideDeclineBudgetExceeded(
+            ScheduleOverrideDeclineBudgetExceededException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many bookings declined recently — please wait before retrying"));
+    }
+
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
         // Return a generic message — do not echo ex.getMessage() which may reveal internal

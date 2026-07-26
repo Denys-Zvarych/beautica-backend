@@ -15,11 +15,17 @@ import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
 import com.beautica.master.entity.ScheduleExceptionKind;
 import com.beautica.master.entity.WeekdayMode;
+import com.beautica.common.exception.ScheduleOverrideDeclineBudgetExceededException;
+import com.beautica.config.RateLimitConfig;
 import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.ScheduleDateMath;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import io.github.bucket4j.Bucket;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -33,6 +39,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -58,6 +65,9 @@ class ScheduleOverrideConflictServiceTest {
     private MasterScheduleService masterScheduleService;
     private MasterCachePrefixEvictor cachePrefixEvictor;
     private ScheduleDateMath dateMath;
+    @SuppressWarnings("unchecked")
+    private LoadingCache<String, Bucket> scheduleOverrideDeclineBudgetBuckets;
+    private Bucket declineBudgetBucket;
     private ScheduleOverrideConflictService service;
 
     @BeforeEach
@@ -68,11 +78,18 @@ class ScheduleOverrideConflictServiceTest {
         masterScheduleService = mock(MasterScheduleService.class);
         cachePrefixEvictor = mock(MasterCachePrefixEvictor.class);
         dateMath = mock(ScheduleDateMath.class);
+        scheduleOverrideDeclineBudgetBuckets = mock(LoadingCache.class);
+        declineBudgetBucket = mock(Bucket.class);
+        // Default: budget is never exhausted, so every existing test (none of which cares about the
+        // aggregate budget) keeps passing unchanged — see the dedicated budget tests below for the
+        // rejection path.
+        when(scheduleOverrideDeclineBudgetBuckets.get(any())).thenReturn(declineBudgetBucket);
+        when(declineBudgetBucket.tryConsume(anyLong())).thenReturn(true);
         // Fixed well before DATE so every candidate's startsAt >= now, regardless of clock re-zoning.
         Clock clock = Clock.fixed(Instant.parse("2026-08-01T00:00:00Z"), ZoneOffset.UTC);
         service = new ScheduleOverrideConflictService(
                 bookingRepository, bookingService, appointmentTransitionService, masterScheduleService,
-                cachePrefixEvictor, dateMath, clock);
+                cachePrefixEvictor, dateMath, clock, scheduleOverrideDeclineBudgetBuckets);
         // Every write-path test needs the advisory lock to succeed (finding 2) — a non-null return
         // means "acquired". Not relevant to the authorization-failure test below (the lock is never
         // even attempted once authz throws), so a lenient default here is safe.
@@ -332,14 +349,103 @@ class ScheduleOverrideConflictServiceTest {
 
     // NOTE: this class used to have a "decline-rate-limiter" test section here, proving
     // ScheduleOverrideConflictService charged a proportional per-conflict token from
-    // BookingDeclineRateLimiter (backend-security re-audit finding 1). That charge — and
-    // BookingDeclineRateLimiter itself — was removed on 2026-07-26 (D6, product decision
-    // reversal): an override-driven decline no longer dispatches any notification, so there is no
-    // longer an outbound-message blast radius to bound proportionally. This service no longer
-    // participates in rate limiting at all; the route's ordinary destructive-bulk-write throttling
-    // now lives entirely in BookingRateLimitFilter / RateLimitConfig#scheduleOverrideWriteBuckets
-    // (see ScheduleOverrideConflictServiceTest's counterpart in BookingRateLimitFilterTest and the
-    // real end-to-end coverage in MasterScheduleOverrideConflictIT).
+    // BookingDeclineRateLimiter (backend-security re-audit finding 1, ORIGINAL). That charge — and
+    // BookingDeclineRateLimiter itself — was removed on 2026-07-26 (D6, product decision reversal):
+    // an override-driven decline no longer dispatches any notification, so the SMS/notification
+    // blast-radius concern that charge existed for is gone. A DIFFERENT proportional charge was
+    // reintroduced the same day by the 2026-07-26 re-audit (finding 1, MEDIUM — this class's own
+    // dedicated scheduleOverrideDeclineBudgetBuckets, never the SMS-driven bookingDeclineBuckets):
+    // the per-request (MAX_CONFLICTS_PER_WRITE=100) and per-minute (scheduleOverrideWriteCapacity=50)
+    // caps are independent, so their PRODUCT is unbounded without an aggregate budget. See the
+    // "aggregate decline budget" test section below, plus RateLimitConfigTest for the bucket-capacity
+    // pin, and the real end-to-end coverage in MasterScheduleOverrideConflictIT.
+
+    // ── aggregate decline budget (2026-07-26 re-audit, security finding 1) ───────
+
+    @Test
+    void should_consumeBudgetProportionalToConflictCount_when_conflictsExistAndCancelOverlappingIsTrue() {
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of(standaloneCandidate(bookingId, LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        var request = new ScheduleOverrideRequest(
+                DATE, ScheduleExceptionKind.DAY_OFF, WeekdayMode.INTERVAL, List.of(), null, true);
+        when(masterScheduleService.upsertOverride(ACTOR_ID, MASTER_ID, request))
+                .thenReturn(new ScheduleOverrideResponse(DATE, ScheduleExceptionKind.DAY_OFF, List.of()));
+
+        service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request);
+
+        verify(scheduleOverrideDeclineBudgetBuckets).get(ACTOR_ID.toString());
+        verify(declineBudgetBucket).tryConsume(1L);
+    }
+
+    @Test
+    void should_notTouchBudgetBucket_when_noConflicts() {
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        var request = new ScheduleOverrideRequest(DATE, ScheduleExceptionKind.DAY_OFF, List.of());
+        when(masterScheduleService.upsertOverride(ACTOR_ID, MASTER_ID, request))
+                .thenReturn(new ScheduleOverrideResponse(DATE, ScheduleExceptionKind.DAY_OFF, List.of()));
+
+        service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request);
+
+        verifyNoInteractions(scheduleOverrideDeclineBudgetBuckets);
+    }
+
+    @Test
+    void should_rejectWithBudgetExceededAndDeclineNothing_when_aggregateBudgetExhausted() {
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of(standaloneCandidate(bookingId, LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        when(declineBudgetBucket.tryConsume(anyLong())).thenReturn(false);
+        var request = new ScheduleOverrideRequest(
+                DATE, ScheduleExceptionKind.DAY_OFF, WeekdayMode.INTERVAL, List.of(), null, true);
+
+        assertThatThrownBy(() -> service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request))
+                .isInstanceOf(ScheduleOverrideDeclineBudgetExceededException.class);
+
+        // All-or-nothing: nothing mutated on rejection — same "before any decline executes" placement
+        // as the MAX_CONFLICTS_PER_WRITE check.
+        verify(masterScheduleService, never()).upsertOverride(any(), any(), any());
+        verifyNoInteractions(bookingService, appointmentTransitionService, cachePrefixEvictor);
+    }
+
+    /**
+     * The CRITICAL correctness invariant this whole feature depends on (security audit finding 1's
+     * explicit callout): Bucket4j's {@code tryConsume(N)} can NEVER succeed when {@code N} exceeds the
+     * bucket's own capacity, even fully refilled. An earlier version of this feature charged
+     * proportionally against a capacity-10 bucket and thereby PERMANENTLY 429'd any override declining
+     * 11+ bookings. This test pins {@code RateLimitConfig}'s real production default
+     * ({@code scheduleOverrideDeclineBudgetCapacity}, currently 1500) directly against
+     * {@link ScheduleOverrideConflictService#MAX_CONFLICTS_PER_WRITE} ({@code public} for exactly this
+     * reason — see its javadoc) so the two constants cannot silently drift apart: a single maximal
+     * legitimate request (declining exactly {@code MAX_CONFLICTS_PER_WRITE} bookings) against a FULL
+     * bucket must always be satisfiable in one shot. {@code RateLimitConfig} additionally enforces this
+     * invariant at boot via a {@code @PostConstruct} guard (see
+     * {@code RateLimitConfig#validateScheduleOverrideDeclineBudgetCapacity} and
+     * {@code RateLimitConfigTest#should_failStartup_when_declineBudgetCapacityDoesNotExceedMaxConflictsPerWrite})
+     * — this test additionally pins the correct-configuration happy path against the bucket's actual
+     * consumption behaviour, which the guard alone does not exercise.
+     */
+    @Test
+    @DisplayName("should_allowSingleRequestDecliningMaxConflictsPerWrite_when_budgetBucketIsFull")
+    void should_allowSingleRequestDecliningMaxConflictsPerWrite_when_budgetBucketIsFull() {
+        RateLimitConfig rateLimitConfig = new RateLimitConfig();
+        // Mirrors RateLimitConfigTest's convention: reflect in the production @Value default rather
+        // than relying on Spring property binding, which does not run against a bare `new`.
+        ReflectionTestUtils.setField(rateLimitConfig, "scheduleOverrideDeclineBudgetCapacity", 1500L);
+        LoadingCache<String, Bucket> realBuckets = rateLimitConfig.scheduleOverrideDeclineBudgetBuckets();
+        Bucket freshFullBucket = realBuckets.get(UUID.randomUUID().toString());
+
+        boolean permitted = freshFullBucket.tryConsume(ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE);
+
+        assertThat(permitted)
+                .as("a single write declining exactly MAX_CONFLICTS_PER_WRITE (%d) bookings must always "
+                        + "be satisfiable against a full aggregate budget bucket — capacity must exceed "
+                        + "MAX_CONFLICTS_PER_WRITE, never charge proportionally against a bucket too "
+                        + "small to ever hold one maximal legitimate request",
+                        ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE)
+                .isTrue();
+    }
 
     // ── candidate-scan cap (backend-perf re-audit finding 3) ─────────────────────
 
