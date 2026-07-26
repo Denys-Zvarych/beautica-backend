@@ -187,7 +187,7 @@ public class RateLimitConfig {
 
     private static final Duration BOOKING_WRITE_WINDOW = Duration.ofSeconds(10);
 
-    // Per-user cap for the two SMS/notification-triggering booking-write endpoints:
+    // Per-user cap for the SMS/notification-triggering booking-write endpoints:
     //   - PATCH /api/v1/bookings/{bookingId}/decline
     //   - PATCH /api/v1/bookings/{bookingId}/not-complete
     // Deliberately a SEPARATE bucket from bookingWriteCapacity above (different threat model —
@@ -198,13 +198,39 @@ public class RateLimitConfig {
     // (smishing / SMS-bomb concern), which the tight 5-per-10s create/reschedule budget was never
     // sized to bound. 10 requests / 60s mirrors the other authenticated-write buckets in this
     // class (media upload, profile update, bulk service setup) — generous enough for a provider
-    // clearing a backlog of no-shows/declines in one sitting, while capping a scripted flood to
-    // at most 10 outbound messages per minute per account. Configurable so integration tests can
-    // raise the cap.
+    // clearing a backlog of no-shows/declines in one sitting. Configurable so integration tests
+    // can raise the cap.
+    //
+    // NOT shared with PUT /api/v1/masters/{masterId}/overrides/{date} (2026-07-26 product decision
+    // reversal, D6) — that route used to share this bucket (plus a proportional per-conflict charge
+    // via the now-deleted BookingDeclineRateLimiter) because an override write could fan a
+    // provider-authored note out to guest phones as SMS. An override-driven decline now carries no
+    // note and dispatches no notification at all, so it has its own dedicated bucket instead —
+    // see {@link #scheduleOverrideWriteBuckets()}.
     @Value("${app.rate-limit.booking-decline-capacity:10}")
     private long bookingDeclineCapacity;
 
     private static final Duration BOOKING_DECLINE_WINDOW = Duration.ofSeconds(60);
+
+    // Per-user cap for PUT /api/v1/masters/{masterId}/overrides/{date} (the schedule-override
+    // write). Own bucket, deliberately NOT shared with bookingDeclineBuckets above (2026-07-26
+    // product decision reversal, D6 — see that field's javadoc for why the two used to be one
+    // bucket and no longer are).
+    //
+    // Sized for the mobile client's real fan-out, not for one logical action: a multi-day
+    // save (e.g. a vacation) is expanded CLIENT-SIDE into one PUT per date, so a month-long
+    // vacation is realistically ~31 consecutive requests from one actor in a single save flow.
+    // 50/60s gives that legitimate worst case comfortable headroom (19 requests, ~60% margin) —
+    // enough to also absorb the occasional 409-then-retry round trip (a PUT that 409s because a
+    // booking was created between preview and confirm re-submits with cancelOverlapping=true) —
+    // while still meaningfully bounding a scripted loop far beyond what any real save flow needs.
+    // This is still a destructive bulk write (each request can mass-decline up to
+    // ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE bookings), so it is throttled like
+    // every other authenticated write in this class — just sized for its own fan-out pattern
+    // rather than borrowed from a sibling bucket. Configurable so integration tests can raise
+    // the cap.
+    @Value("${app.rate-limit.schedule-override-write-capacity:50}")
+    private long scheduleOverrideWriteCapacity;
 
     // 5-minute eviction grace past the rate-limit window so a bucket entry is not
     // evicted the instant its window rolls over (avoids a false-start on the very
@@ -478,11 +504,11 @@ public class RateLimitConfig {
 
     /**
      * Per-user bucket (see {@link #bookingDeclineCapacity} field javadoc) shared by
-     * {@code PATCH /api/v1/bookings/{bookingId}/decline} and
-     * {@code PATCH /api/v1/bookings/{bookingId}/not-complete}, consumed by
-     * {@link com.beautica.booking.filter.BookingRateLimitFilter}. {@code expireAfterAccess} gives
-     * a 5-minute grace past the 60-second window so a bucket entry is not evicted the instant the
-     * window rolls over.
+     * {@code PATCH /api/v1/bookings/{bookingId}/decline} and {@code PATCH
+     * /api/v1/bookings/{bookingId}/not-complete}, consumed by
+     * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
+     * charge. {@code expireAfterAccess} gives a 5-minute grace past the 60-second window so a bucket
+     * entry is not evicted the instant the window rolls over.
      */
     @Bean
     public LoadingCache<String, Bucket> bookingDeclineBuckets() {
@@ -491,6 +517,24 @@ public class RateLimitConfig {
                 BOOKING_DECLINE_WINDOW.plus(EVICTION_GRACE),
                 bookingDeclineCapacity,
                 BOOKING_DECLINE_WINDOW);
+    }
+
+    /**
+     * Per-user bucket (see {@link #scheduleOverrideWriteCapacity} field javadoc) for
+     * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}, consumed by
+     * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
+     * charge — the SAME charging shape as every other bucket in this class; this route no longer
+     * carries any additional proportional charge (see {@link #bookingDeclineCapacity}'s javadoc for
+     * why that was removed). {@code expireAfterAccess} gives a 5-minute grace past the 60-second
+     * window so a bucket entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> scheduleOverrideWriteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                ONE_MINUTE.plus(EVICTION_GRACE),
+                scheduleOverrideWriteCapacity,
+                ONE_MINUTE);
     }
 
     /**
@@ -507,18 +551,19 @@ public class RateLimitConfig {
      * {@code InternalCategoryControllerTest}). Binding filter + buckets into one non-scanned
      * {@code @Configuration} makes them all-or-nothing and therefore safe by construction: the
      * full application context loads all of them — so the production per-user rate limits that
-     * close the advisory-lock connection-pool-exhaustion DoS AND the guest-decline-SMS mass-burst
-     * DoS remain fully active and unchanged — while a slice loads none of them and refreshes
-     * cleanly, with no per-test mock or import needed.
+     * close the advisory-lock connection-pool-exhaustion DoS, the guest-decline-SMS mass-burst
+     * DoS, AND the schedule-override bulk-write DoS remain fully active and unchanged — while a
+     * slice loads none of them and refreshes cleanly, with no per-test mock or import needed.
      */
     @Bean
     public BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
         // Direct call (not a LoadingCache<String, Bucket> parameter): this class declares many
         // beans of that exact generic type, so injecting by type would be ambiguous and resolve
         // only by lucky parameter-name matching. @Configuration is CGLIB-proxied, so this returns
-        // the same bookingWriteBuckets/bookingDeclineBuckets singletons — unambiguous by
-        // construction.
-        return new BookingRateLimitFilter(bookingWriteBuckets(), bookingDeclineBuckets(), objectMapper);
+        // the same bookingWriteBuckets/bookingDeclineBuckets/scheduleOverrideWriteBuckets
+        // singletons — unambiguous by construction.
+        return new BookingRateLimitFilter(
+                bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(), objectMapper);
     }
 
     /**

@@ -82,6 +82,13 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
     private record SeededMaster(UUID masterId, Actor owner) {
     }
 
+    /** An invited SALON_MASTER-type master inside a fresh salon — for exercising the SALON
+     *  management branch of {@code canManageMasterSchedule} (owner/admin access via
+     *  {@code hasManagementAccess}, as opposed to the INDEPENDENT_MASTER self-ownership branch
+     *  {@link #seedIndependentMaster} exercises). */
+    private record SeededSalonMaster(UUID masterId, UUID salonId, Actor salonOwner) {
+    }
+
     private Actor seedUser(Role role) {
         UUID userId = UUID.randomUUID();
         String email = role.name().toLowerCase() + "-" + userId + "@beautica.test";
@@ -99,6 +106,41 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
                         + "created_at, updated_at) VALUES (?, ?, 'INDEPENDENT_MASTER', 0, true, NOW(), NOW())",
                 masterId, owner.userId());
         return new SeededMaster(masterId, owner);
+    }
+
+    /**
+     * An invited {@code SALON_MASTER}-type master (never self-managing) inside a fresh salon owned
+     * by a freshly-seeded {@code SALON_OWNER}. Used by the S5 positive-salon-branch cases (finding
+     * 2, 2026-07-26 backend-QA re-audit): this master's {@code canManageMasterSchedule} verdict
+     * comes ONLY from {@code hasManagementAccess(salonId, actorId, actorRole)}, so it exercises the
+     * SAME salon-management branch for both a {@code SALON_OWNER} and a {@code SALON_ADMIN} actor —
+     * unlike a {@code SALON_OWNER}-type (owner-operated) master, whose branch checks direct owner-id
+     * equality instead and would never reach {@code hasManagementAccess} at all.
+     */
+    private SeededSalonMaster seedSalonInvitedMaster() {
+        Actor owner = seedUser(Role.SALON_OWNER);
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
+                salonId, owner.userId(), "S5 positive-branch salon " + salonId);
+        Actor invitedMasterUser = seedUser(Role.SALON_MASTER);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, review_count, is_active, "
+                        + "created_at, updated_at) VALUES (?, ?, ?, 'SALON_MASTER', 0, true, NOW(), NOW())",
+                masterId, invitedMasterUser.userId(), salonId);
+        return new SeededSalonMaster(masterId, salonId, owner);
+    }
+
+    /** An invited {@code SALON_ADMIN} whose {@code users.salon_id} points at {@code salonId}. */
+    private Actor seedSalonAdmin(UUID salonId) {
+        UUID userId = UUID.randomUUID();
+        String email = "salonadmin-" + userId + "@beautica.test";
+        jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, salon_id, first_name, "
+                        + "last_name, is_active, email_verified) VALUES (?, ?, 'x', 'SALON_ADMIN', ?, 'Fn', 'Ln', "
+                        + "true, true)",
+                userId, email, salonId);
+        return new Actor(userId, email, Role.SALON_ADMIN);
     }
 
     private String tokenFor(Actor a) {
@@ -265,6 +307,138 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
             // The management GET now returns WeeklyScheduleResponse.id, so resolve the persisted id from the
             // wire payload itself — the same path a real editor uses to target PUT (no DB-side shortcut).
             return readOnlyListedScheduleId(m, m.owner());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // S5 — POST /overrides/conflicts authorization (2026-07-26 design / backend-security audit
+    // finding 6): this preview is deliberately gated by canManageMasterSchedule (MANAGE, not READ)
+    // because it exposes client/guest identities — a read-only SALON_MASTER (who passes
+    // canReadMasterSchedule) must still be denied. No case for this endpoint previously existed
+    // anywhere in the suite, so a future regression swapping the controller's @PreAuthorize gate to
+    // canReadMasterSchedule would have passed silently. Mirrors the shape of the S1 read/write
+    // matrix above (foreign master, role denial, anonymous, no existence oracle).
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("S5 — POST /overrides/conflicts authorization (MANAGE gate, not READ)")
+    class OverrideConflictsPreviewAuthorization {
+
+        private String previewBody() throws Exception {
+            return objectMapper.writeValueAsString(new com.beautica.master.dto.OverrideConflictQueryRequest(
+                    FUTURE_FROM, FUTURE_FROM, ScheduleExceptionKind.DAY_OFF, null, null, null));
+        }
+
+        private HttpHeaders jsonOnlyHeaders() {
+            HttpHeaders h = new HttpHeaders();
+            h.setContentType(MediaType.APPLICATION_JSON);
+            return h;
+        }
+
+        private ResponseEntity<String> preview(UUID masterId, Actor actor) throws Exception {
+            HttpEntity<String> req = new HttpEntity<>(
+                    previewBody(), actor == null ? jsonOnlyHeaders() : auth(actor));
+            return restTemplate.exchange(
+                    BASE + "/" + masterId + "/overrides/conflicts", HttpMethod.POST, req, String.class);
+        }
+
+        @Test
+        @DisplayName("a FOREIGN master previewing another master's conflicts → 403")
+        void should_forbidForeignMaster_onPreview() throws Exception {
+            SeededMaster victim = seedIndependentMaster();
+            SeededMaster attacker = seedIndependentMaster();
+
+            ResponseEntity<String> resp = preview(victim.masterId(), attacker.owner());
+
+            assertThat(resp.getStatusCode())
+                    .as("a master may never preview another master's booking conflicts")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("a read-only SALON_MASTER previewing conflicts → 403 (MANAGE gate, not READ)")
+        void should_forbidSalonMaster_onPreview() throws Exception {
+            SeededMaster m = seedIndependentMaster();
+            Actor salonMaster = seedUser(Role.SALON_MASTER);
+
+            ResponseEntity<String> resp = preview(m.masterId(), salonMaster);
+
+            assertThat(resp.getStatusCode())
+                    .as("canManageMasterSchedule short-circuits SALON_MASTER — a regression to "
+                            + "canReadMasterSchedule would let a read-only calendar viewer see client names")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("CLIENT previewing conflicts → 403")
+        void should_forbidClient_onPreview() throws Exception {
+            SeededMaster m = seedIndependentMaster();
+            Actor client = seedUser(Role.CLIENT);
+
+            ResponseEntity<String> resp = preview(m.masterId(), client);
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("anonymous previewing conflicts → 401")
+        void should_rejectAnonymous_onPreview() throws Exception {
+            SeededMaster m = seedIndependentMaster();
+
+            ResponseEntity<String> resp = preview(m.masterId(), null);
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        }
+
+        @Test
+        @DisplayName("a nonexistent masterId → the SAME 403 as a foreign master (no existence oracle)")
+        void should_return403_when_masterIdDoesNotExist() throws Exception {
+            SeededMaster owner = seedIndependentMaster();
+
+            ResponseEntity<String> resp = preview(UUID.randomUUID(), owner.owner());
+
+            assertThat(resp.getStatusCode())
+                    .as("a missing master must be indistinguishable from a foreign one")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        // ────────────────────────────────────────────────────────────────────────────
+        // Positive salon-management branch (backend-QA re-audit finding 2, 2026-07-26): every
+        // case above proves the negative matrix, but canManageMasterSchedule's SALON branch
+        // (hasManagementAccess — as opposed to the INDEPENDENT_MASTER self-ownership branch the
+        // rest of this suite exercises) was never positively exercised for THIS endpoint. Not a
+        // live hole (the gate is shared with every other master-schedule write endpoint, which
+        // already has salon-branch coverage elsewhere), but a new route deserves its own positive
+        // proof rather than relying on that sharing implicitly.
+        // ────────────────────────────────────────────────────────────────────────────
+
+        @Test
+        @DisplayName("a SALON_OWNER previewing conflicts for a master in THEIR OWN salon → 200 (positive salon branch)")
+        void should_allowSalonOwnerOfSameSalon_onPreview() throws Exception {
+            SeededSalonMaster m = seedSalonInvitedMaster();
+
+            ResponseEntity<String> resp = preview(m.masterId(), m.salonOwner());
+
+            assertThat(resp.getStatusCode())
+                    .as("canManageMasterSchedule's salon-management branch (hasManagementAccess) must ALLOW "
+                            + "the SALON_OWNER of the master's own salon — never positively exercised for this "
+                            + "endpoint before this test")
+                    .isEqualTo(HttpStatus.OK);
+        }
+
+        @Test
+        @DisplayName("a SALON_ADMIN previewing conflicts for a master in THEIR salon → 200 (positive salon branch)")
+        void should_allowSalonAdminOfSameSalon_onPreview() throws Exception {
+            SeededSalonMaster m = seedSalonInvitedMaster();
+            Actor admin = seedSalonAdmin(m.salonId());
+
+            ResponseEntity<String> resp = preview(m.masterId(), admin);
+
+            assertThat(resp.getStatusCode())
+                    .as("canManageMasterSchedule's salon-management branch (hasManagementAccess) must ALLOW "
+                            + "a SALON_ADMIN of the master's own salon — never positively exercised for this "
+                            + "endpoint before this test")
+                    .isEqualTo(HttpStatus.OK);
         }
     }
 

@@ -37,8 +37,10 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * Appointment-level (visit) status transitions (BE-4): the four lifecycle operations that move a
@@ -165,11 +167,30 @@ public class AppointmentTransitionService {
      * single chained item, so a client who booked N services with one master can lose ONE without the
      * others being cancelled.
      *
-     * <p><b>Authority</b> is the same provider authority as the whole-visit decline
-     * ({@link AuthorizationService#enforceCanCancelBooking} on the visit's single master, evaluated
-     * against the first item — SALON_OWNER / SALON_ADMIN / INDEPENDENT_MASTER). A {@code bookingId}
-     * that is not a child of this appointment is a {@code 404} — same missing→404 shape as a sibling
-     * lookup elsewhere, no existence oracle beyond the visit the caller is already authorized on.
+     * <p><b>Authority</b> is the same provider authority as the whole-visit decline, but resolved via
+     * {@link AuthorizationService#enforceCanManageAppointment} — the projection-only, per-APPOINTMENT
+     * check the three whole-visit methods use — rather than the entity-based
+     * {@link AuthorizationService#enforceCanCancelBooking}. {@code enforceCanManageAppointment}
+     * fetches EVERY chained row's {@code (masterUserId, salonId)} pair via
+     * {@link BookingRepository#findAllCompletionAccessByAppointmentId} and requires provider
+     * authority over ALL of them (not just one), so it is authoritative for this per-ITEM operation
+     * regardless of whether the visit is actually single-master — reusing it does not widen or
+     * weaken the check even if a future writer ever appended a different-master item. A {@code
+     * bookingId} that is not a child of this appointment is a {@code 404} — same missing→404 shape
+     * as a sibling lookup elsewhere, no existence oracle beyond the visit the caller is already
+     * authorized on.
+     *
+     * <p><b>Cycle-4 audit finding 2 (authz before entity load).</b> Authorization now runs BEFORE any
+     * {@code Appointment}/{@code Booking} entity is loaded — a previous version loaded the full
+     * {@code Appointment} ({@code findById}) AND the 5-way {@code JOIN FETCH} item list
+     * ({@link #loadItemsOrThrow}) first, so a foreign appointment id cost a full entity load before
+     * being rejected (an existence-oracle-by-query-cost versus a missing id's instant reject, and
+     * wasted work on a request that was always going to be refused). The pre-check is
+     * projection-only — {@code findAllCompletionAccessByAppointmentId} never touches the persistence
+     * context — so, exactly like the whole-visit methods' {@code enforceCanManageAppointment} calls,
+     * it cannot poison a later "fresh snapshot" read with a stale cached entity. No lock is taken
+     * here either way (the header lock below still runs, unaffected, after the child is located), so
+     * this fix closes a query-cost oracle only, not a timing/lock oracle.
      *
      * <p><b>The note lives on the CHILD row</b>, not the header: the declined child's OWN status is
      * {@code DECLINED}, satisfying the V114 {@code chk_provider_comment_status} CHECK; the header stays
@@ -196,19 +217,16 @@ public class AppointmentTransitionService {
     @Transactional
     public void declineAppointmentItem(
             UUID actorId, UUID appointmentId, UUID bookingId, AppointmentProviderNoteRequest req) {
-        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring notCompleteAppointment: a missing appointment id and an existing-but-foreign visit
-        // must be indistinguishable to the caller (a plain full load would surface a 404 for a missing id
-        // BEFORE the ownership guard, leaking "doesn't-exist" vs "exists-but-not-mine"). A missing
-        // appointment now short-circuits to the SAME 403 enforceCanCancelBooking throws for a foreign
-        // one. The bookingId-not-a-child 404 below is UNCHANGED — it is reached only after the caller is
-        // authorized on the visit, so it is not an oracle.
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
-        VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
-        authz.enforceCanCancelBooking(actorId, ctx.firstItem());
+        // Cycle-4 audit finding 2: authorize via the projection-only, per-APPOINTMENT check BEFORE
+        // loading any entity — no Appointment findById, no 5-way JOIN FETCH item list — collapsing a
+        // missing appointment id to the SAME uniform 403 enforceCanManageAppointment throws for an
+        // existing-but-foreign visit (Finding 8 — no existence oracle), now at projection cost instead
+        // of a full entity-load cost. The bookingId-not-a-child 404 below is UNCHANGED — it is reached
+        // only after the caller is authorized on the visit, so it is not an oracle.
+        authz.enforceCanManageAppointment(actorId, appointmentId);
 
-        Booking target = ctx.items().stream()
+        List<Booking> items = loadItemsOrThrow(appointmentId);
+        Booking target = items.stream()
                 .filter(item -> item.getId().equals(bookingId))
                 .findFirst()
                 .orElseThrow(() -> new NotFoundException("Appointment service not found"));
@@ -241,6 +259,107 @@ public class AppointmentTransitionService {
         // Single-item availability eviction — reuse the whole-visit after-commit hook over a one-item
         // list; a declined child frees only its own slot. No revenue impact on a decline (null actor).
         registerEviction(List.of(target), null);
+    }
+
+    /**
+     * Batched per-service decline for MULTIPLE sibling items of the SAME appointment in ONE write —
+     * the schedule-override-conflict counterpart of {@link #declineAppointmentItem} (perf finding,
+     * 2026-07-26 audit). {@code ScheduleOverrideConflictService} used to call
+     * {@link #declineAppointmentItem} once PER conflicting sibling: for K conflicting items of the
+     * SAME appointment that reloads the appointment's full {@code JOIN FETCH} item list
+     * ({@link #loadItemsOrThrow}) K times, and re-locks/re-collapses the header K times — O(K) reloads
+     * of an O(K)-row list, i.e. O(K²) row reads overall for one appointment. This method authorizes
+     * ONCE, loads the item list ONCE, locks the header ONCE, transitions every targeted item in
+     * memory, saves ONCE (batched {@code saveAll}), and collapses the header ONCE — O(K) total row
+     * reads/writes regardless of how many siblings are declined.
+     *
+     * <p><b>Every invariant {@link #declineAppointmentItem} enforces is preserved</b>, applied
+     * per-item in memory rather than duplicated as transition logic:
+     * <ul>
+     *   <li>the canonical appointments-before-bookings lock order — {@link #lockHeaderBeforeItemTransition}
+     *       still runs BEFORE any target's status is mutated;</li>
+     *   <li>"collapse to DECLINED only when the last CONFIRMED child goes" — the single
+     *       {@link #collapseHeaderAfterItemTransition} call runs AFTER every targeted item's new
+     *       status is flushed via {@code saveAll}, so its {@code NOT EXISTS} sibling check correctly
+     *       observes ALL of them, not just the first;</li>
+     *   <li>the per-item CONFIRMED-only transition guard ({@link #assertItemTransition}), checked for
+     *       EVERY target before ANY of them is mutated — one stale sibling rejects the whole batch
+     *       rather than leaving a partial decline.</li>
+     * </ul>
+     *
+     * <p><b>Eviction is opt-out</b> via {@code evictAfterCommit}: the default single-item path always
+     * evicts (see {@link #declineAppointmentItem}); the schedule-override-conflict caller passes
+     * {@code false} and performs ONE combined after-commit eviction itself, covering every
+     * appointment group AND every standalone booking declined in the same write (perf finding — N
+     * redundant {@code master-service-bookable}/{@code master-bookable-days} prefix scans collapsed
+     * into the ONE scan {@code MasterScheduleService#upsertOverride} already runs for the write).
+     *
+     * <p><b>No notification is ever enqueued by this method (D6, 2026-07-26 product decision
+     * reversal).</b> Unlike {@link #declineAppointmentItem}, which always enqueues a status-changed
+     * notification per decline, THIS method is only ever called by the schedule-override-conflict
+     * write path, and that path enqueues nothing at all: the client discovers the cancellation from
+     * the booking's status alone, and notifying for this flow is deferred to a later phase. This is a
+     * deliberate, permanent property of this method — do not "fix" it back by re-adding an
+     * {@code outboxService.enqueueStatusChanged} call here.
+     *
+     * @param bookingIds     the target children's ids — every one MUST already be a CONFIRMED child of
+     *                       {@code appointmentId} (the caller found them so, in the SAME transaction,
+     *                       moments earlier); a stale/foreign id is a 404/409 exactly as the single-item
+     *                       method throws for it
+     * @param evictAfterCommit whether this call registers its own after-commit availability-cache
+     *                          eviction — {@code false} for the batched schedule-override-conflict path
+     * @return the targeted items, now DECLINED, in the order {@code bookingIds} was supplied
+     * @throws ForbiddenException the actor lacks provider authority over the visit (403)
+     * @throws NotFoundException  a {@code bookingId} is not a child of this appointment (404)
+     * @throws BusinessException  a target child is not CONFIRMED — already terminal (409)
+     */
+    List<Booking> declineAppointmentItems(
+            UUID actorId, UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
+            boolean evictAfterCommit) {
+        // Same projection-only, authz-before-any-load ordering as declineAppointmentItem (cycle-4
+        // audit finding 2) — never an entity load before authorization has already succeeded.
+        authz.enforceCanManageAppointment(actorId, appointmentId);
+
+        List<Booking> items = loadItemsOrThrow(appointmentId);
+        Map<UUID, Booking> itemsById = items.stream().collect(Collectors.toMap(Booking::getId, b -> b));
+
+        // Validate EVERY target before mutating ANY — a batch either fully applies or throws before
+        // touching a single row, rather than leaving a partial decline behind.
+        List<Booking> targets = new ArrayList<>(bookingIds.size());
+        for (UUID bookingId : bookingIds) {
+            Booking target = itemsById.get(bookingId);
+            if (target == null) {
+                throw new NotFoundException("Appointment service not found");
+            }
+            assertItemTransition(target, BookingStatus.DECLINED);
+            targets.add(target);
+        }
+
+        // Canonical appointments-before-bookings lock order (mirrors declineAppointmentItem): the
+        // header lock runs BEFORE any target's own status change is written below.
+        boolean headerWasLocked = lockHeaderBeforeItemTransition(appointmentId);
+
+        String note = BookingComments.normalize(req == null ? null : req.providerComment());
+        for (Booking target : targets) {
+            target.setStatus(BookingStatus.DECLINED);
+            target.setCancellationReason(CancellationReason.PROVIDER_UNAVAILABLE);
+            target.setProviderComment(note);
+        }
+        bookingRepository.saveAll(targets);
+
+        // Collapse runs ONCE, after every target's new status is flushed — so its NOT EXISTS sibling
+        // check sees ALL of them at once, not just the first (the actual O(K²) fix: one collapse
+        // instead of K, each of which would otherwise re-run the same conditional UPDATE).
+        collapseHeaderAfterItemTransition(
+                appointmentId, headerWasLocked, BookingStatus.DECLINED, CancellationReason.PROVIDER_UNAVAILABLE, null);
+
+        // No outboxService.enqueueStatusChanged loop here — see this method's own javadoc (D6): the
+        // schedule-override-conflict write path this method exists for enqueues no notification at all.
+
+        if (evictAfterCommit) {
+            registerEviction(targets, null);
+        }
+        return targets;
     }
 
     /**

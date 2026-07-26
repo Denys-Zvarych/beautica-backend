@@ -712,6 +712,73 @@ class BookingServiceTest {
         verify(outboxService, never()).enqueueStatusChanged(bookingId);
     }
 
+    // ── declineBookingForBatch (2026-07-26 schedule-override-conflict perf fix) ──────────────────
+    // Package-private batched-decline counterpart of declineBooking, used only by
+    // ScheduleOverrideConflictService to decline many standalone bookings for the same master
+    // without each one independently re-scanning the master's availability caches.
+
+    @Test
+    @DisplayName("declineBookingForBatch runs the identical CONFIRMED->DECLINED mutation as declineBooking")
+    void should_declineBooking_when_declineBookingForBatchCalled() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        Booking result = bookingService.declineBookingForBatch(actorId, bookingId, req);
+
+        assertThat(result.getStatus()).isEqualTo(BookingStatus.DECLINED);
+        assertThat(result.getCancellationReason()).isEqualTo(CancellationReason.PROVIDER_UNAVAILABLE);
+    }
+
+    @Test
+    @DisplayName("declineBookingForBatch never enqueues a notification (D6, 2026-07-26 product decision "
+            + "reversal) — the schedule-override-conflict path this method exists for tells the client "
+            + "nothing beyond the booking's own status")
+    void should_notEnqueueNotification_when_declineBookingForBatchCalled() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.declineBookingForBatch(actorId, bookingId, req);
+
+        verify(outboxService, never()).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("declineBookingForBatch skips BOTH of declineBooking's own after-commit cache scans — "
+            + "the caller (ScheduleOverrideConflictService) performs ONE combined eviction itself instead "
+            + "of one pair per declined booking (perf finding 3)")
+    void should_skipOwnCacheEviction_when_declineBookingForBatchCalled() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.declineBookingForBatch(actorId, bookingId, req);
+
+        verifyNoInteractions(slotCalculationService);
+        verify(salonCatalogCacheEvictor, never()).evict(any());
+    }
+
+    @Test
+    @DisplayName("declineBookingForBatch still enforces the same 400/403/409 guards as declineBooking")
+    void should_throwForbidden_when_unauthorizedActorCallsDeclineBookingForBatch() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanCancelBooking(actorId, booking);
+
+        assertThatThrownBy(() -> bookingService.declineBookingForBatch(actorId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
     // ── completeBooking ────────────────────────────────────────────────────────
 
     @Test

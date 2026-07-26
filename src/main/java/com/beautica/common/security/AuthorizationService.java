@@ -15,7 +15,6 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.domain.Limit;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
@@ -463,18 +462,30 @@ public class AuthorizationService {
      * empty projection list, mapped to the same 403 as a genuine authorization failure — mirroring
      * {@link #canRescheduleAppointment}'s missing-visit handling.
      *
+     * <p><b>Does not trust the single-master invariant.</b> A visit is single-master only by
+     * construction of today's writers ({@code VisitPlanner.planChainedItems} resolves every chained
+     * item off one {@code Master}) — there is no DB constraint behind it (see
+     * {@link BookingRepository#findAllCompletionAccessByAppointmentId}'s Javadoc). This method
+     * therefore fetches EVERY item's {@code (masterUserId, salonId)} pair via
+     * {@link BookingRepository#findAllCompletionAccessByAppointmentId} and requires provider
+     * authority over ALL of them; a single disagreeing row denies the whole call, with no
+     * distinguishable error from any other authorization failure. Cheap regardless of the row
+     * count: a visit is capped at {@code SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows,
+     * §E-3). {@link #canRescheduleAppointment} applies the exact same all-rows guard.
+     *
      * @throws ForbiddenException the appointment does not exist, has no items, or the actor lacks
-     *                            provider authority over its single master (403)
+     *                            provider authority over any one of its items' masters (403)
      */
     public void enforceCanManageAppointment(UUID actorUserId, UUID appointmentId) {
         List<BookingCompletionAccess> access =
-                bookingRepository.findCompletionAccessByAppointmentId(appointmentId, Limit.of(1));
+                bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId);
         if (access.isEmpty()) {
             throw new ForbiddenException("Access denied");
         }
-        BookingCompletionAccess v = access.get(0);
         Role actorRole = roleFromCurrentAuthentication();
-        if (!hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorUserId, actorRole)) {
+        boolean authorizedForEveryItem = access.stream().allMatch(v ->
+                hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorUserId, actorRole));
+        if (!authorizedForEveryItem) {
             throw new ForbiddenException("Access denied");
         }
     }
@@ -598,13 +609,19 @@ public class AuthorizationService {
      * {@code PATCH /appointments/{id}/reschedule}'s union role check: {@code hasRole('CLIENT') or
      * (hasAnyRole(providers) and @authz.canRescheduleAppointment(...))}.
      *
-     * <p>A visit is single-master (BE-1 locked design), so every chained row resolves to the
-     * IDENTICAL {@code (masterUserId, salonId)} pair via
-     * {@link BookingRepository#findCompletionAccessByAppointmentId} — only one row is fetched
-     * (capped via {@code Limit.of(1)}, deterministically ordered by the query), authoritative for
-     * the whole visit, exactly as {@link #canRescheduleBooking} uses the single booking's own
-     * pair. Role fast path + missing-visit handling mirror {@link #canRescheduleBooking} exactly
-     * (no existence oracle — a missing/foreign/itemless appointment id answers {@code false}).
+     * <p><b>Does not trust the single-master invariant.</b> A visit is single-master only by
+     * construction of today's writers ({@code VisitPlanner.planChainedItems} resolves every
+     * chained item off one {@code Master}) — there is no DB constraint behind it (see {@link
+     * BookingRepository#findAllCompletionAccessByAppointmentId}'s Javadoc). This method previously
+     * read a single arbitrary row via a now-deleted {@code Limit.of(1)} overload and authorized
+     * the whole visit off that one item's master — the exact bypass {@link
+     * #enforceCanManageAppointment} was fixed against. It now fetches EVERY item's {@code
+     * (masterUserId, salonId)} pair via {@link BookingRepository#findAllCompletionAccessByAppointmentId}
+     * and requires provider authority over ALL of them; a single disagreeing row returns {@code
+     * false}, indistinguishable from any other authorization failure (no existence oracle — a
+     * missing/foreign/itemless appointment id also answers {@code false}). Cheap regardless of the
+     * row count: a visit is capped at {@code SlotCalculationService.MAX_SERVICES_PER_VISIT} (10
+     * rows, §E-3). Role fast path mirrors {@link #canRescheduleBooking} exactly.
      */
     public boolean canRescheduleAppointment(Authentication auth, UUID appointmentId) {
         boolean cannotReschedule = auth.getAuthorities().stream().anyMatch(a ->
@@ -614,10 +631,10 @@ public class AuthorizationService {
         UUID actorId = principalId(auth);
         Role actorRole = roleFromAuthentication(auth);
         List<BookingCompletionAccess> access =
-                bookingRepository.findCompletionAccessByAppointmentId(appointmentId, Limit.of(1));
+                bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId);
         if (access.isEmpty()) return false;
-        BookingCompletionAccess v = access.get(0);
-        return hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole);
+        return access.stream().allMatch(v ->
+                hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole));
     }
 
     /**

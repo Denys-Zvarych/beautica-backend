@@ -19,15 +19,18 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -278,5 +281,180 @@ class AppointmentTransitionServiceTest {
         verify(appointmentRepository, never()).lockHeaderRegardlessOfStatus(any());
         verify(appointmentRepository, never()).findById(any());
         verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItem — cycle-4 audit finding 2: a caller without provider authority "
+            + "over the visit is rejected by the projection-only enforceCanManageAppointment check BEFORE "
+            + "the Appointment entity or the item graph is ever loaded")
+    void should_notLoadAppointmentOrItems_when_declineAppointmentItemCalledByNonOwner() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageAppointment(actorId, appointmentId);
+
+        assertThatThrownBy(() ->
+                appointmentTransitionService.declineAppointmentItem(actorId, appointmentId, bookingId, null))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(authz).enforceCanManageAppointment(actorId, appointmentId);
+        verify(appointmentRepository, never()).findById(any());
+        verify(appointmentRepository, never()).lockHeaderRegardlessOfStatus(any());
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+        verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
+    }
+
+    // ── declineAppointmentItems — batched multi-sibling decline (perf finding 1, 2026-07-26 audit) ──
+
+    private com.beautica.booking.entity.Booking bookingItem(UUID id, com.beautica.booking.enums.BookingStatus status) {
+        com.beautica.master.entity.Master master = com.beautica.master.entity.Master.builder()
+                .id(UUID.randomUUID())
+                .build();
+        com.beautica.service.entity.MasterServiceAssignment msa =
+                com.beautica.service.entity.MasterServiceAssignment.builder()
+                        .id(UUID.randomUUID())
+                        .build();
+        return com.beautica.booking.entity.Booking.builder()
+                .id(id)
+                .master(master)
+                .masterService(msa)
+                .status(status)
+                .startsAt(java.time.OffsetDateTime.parse("2026-08-10T09:00:00Z"))
+                .endsAt(java.time.OffsetDateTime.parse("2026-08-10T10:00:00Z"))
+                .build();
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — a caller without provider authority is rejected BEFORE "
+            + "the item list is ever loaded")
+    void should_notLoadItems_when_declineAppointmentItemsCalledByNonOwner() {
+        UUID actorId = UUID.randomUUID();
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageAppointment(actorId, appointmentId);
+
+        assertThatThrownBy(() -> appointmentTransitionService.declineAppointmentItems(
+                actorId, appointmentId, java.util.List.of(UUID.randomUUID()), null, false))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(authz).enforceCanManageAppointment(actorId, appointmentId);
+        verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — K conflicting siblings of the SAME appointment are "
+            + "declined via ONE item-list load, ONE header lock, and ONE collapse — never one per "
+            + "sibling (the O(K²) regression this batched method exists to close)")
+    void should_declineAllTargetsWithOneLoadOneLockOneCollapse_when_multipleSiblingsProvided() {
+        UUID actorId = UUID.randomUUID();
+        UUID booking1 = UUID.randomUUID();
+        UUID booking2 = UUID.randomUUID();
+        UUID booking3 = UUID.randomUUID();
+        com.beautica.booking.entity.Booking item1 = bookingItem(booking1, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        com.beautica.booking.entity.Booking item2 = bookingItem(booking2, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        com.beautica.booking.entity.Booking item3 = bookingItem(booking3, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId))
+                .thenReturn(java.util.List.of(item1, item2, item3));
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+
+        List<com.beautica.booking.entity.Booking> declined = appointmentTransitionService.declineAppointmentItems(
+                actorId, appointmentId, java.util.List.of(booking1, booking2, booking3),
+                new com.beautica.booking.dto.AppointmentProviderNoteRequest("Sorry, unavailable"), false);
+
+        assertThat(declined).containsExactly(item1, item2, item3);
+        assertThat(item1.getStatus()).isEqualTo(com.beautica.booking.enums.BookingStatus.DECLINED);
+        assertThat(item2.getStatus()).isEqualTo(com.beautica.booking.enums.BookingStatus.DECLINED);
+        assertThat(item3.getStatus()).isEqualTo(com.beautica.booking.enums.BookingStatus.DECLINED);
+        assertThat(item1.getProviderComment()).isEqualTo("Sorry, unavailable");
+
+        // The actual O(K²)→O(K) fix: exactly ONE call each, not K.
+        verify(bookingRepository, org.mockito.Mockito.times(1)).findByAppointmentIdWithGraph(appointmentId);
+        verify(appointmentRepository, org.mockito.Mockito.times(1)).lockHeaderIfConfirmed(appointmentId);
+        verify(appointmentRepository, org.mockito.Mockito.times(1)).collapseHeaderIfNoConfirmedSiblingsRemain(
+                eq(appointmentId), eq("DECLINED"), eq("PROVIDER_UNAVAILABLE"), any());
+        verify(bookingRepository).saveAll(java.util.List.of(item1, item2, item3));
+        // D6 (2026-07-26 product decision reversal): this batched path never enqueues a notification —
+        // see should_notEnqueueAnyNotification_when_decliningMultipleSiblings below for the dedicated
+        // regression guard.
+        verify(outboxService, never()).enqueueStatusChanged(any());
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — never enqueues a notification (D6, 2026-07-26 product "
+            + "decision reversal) — the schedule-override-conflict path this method exists for tells "
+            + "the client nothing beyond the booking's own status")
+    void should_notEnqueueAnyNotification_when_decliningMultipleSiblings() {
+        UUID actorId = UUID.randomUUID();
+        UUID booking1 = UUID.randomUUID();
+        UUID booking2 = UUID.randomUUID();
+        com.beautica.booking.entity.Booking item1 = bookingItem(booking1, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        com.beautica.booking.entity.Booking item2 = bookingItem(booking2, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId))
+                .thenReturn(java.util.List.of(item1, item2));
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+
+        appointmentTransitionService.declineAppointmentItems(
+                actorId, appointmentId, java.util.List.of(booking1, booking2), null, false);
+
+        verifyNoInteractions(outboxService);
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — evictAfterCommit=false (the schedule-override-conflict "
+            + "path) registers no availability-cache eviction at all")
+    void should_skipEviction_when_evictAfterCommitIsFalse() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        com.beautica.booking.entity.Booking item = bookingItem(bookingId, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(java.util.List.of(item));
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+
+        appointmentTransitionService.declineAppointmentItems(
+                actorId, appointmentId, java.util.List.of(bookingId), null, false);
+
+        verifyNoMoreInteractions(slotCalculationService);
+        verify(salonCatalogCacheEvictor, never()).evict(any());
+        verify(cachePrefixEvictor, never()).evictByKeyPrefixNow(any(), any());
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — evictAfterCommit=true (the default single-item shape) "
+            + "registers the SAME after-commit eviction declineAppointmentItem would")
+    void should_registerEviction_when_evictAfterCommitIsTrue() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        com.beautica.booking.entity.Booking item = bookingItem(bookingId, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(java.util.List.of(item));
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+
+        appointmentTransitionService.declineAppointmentItems(
+                actorId, appointmentId, java.util.List.of(bookingId), null, true);
+
+        // No active Spring transaction in this unit test — registerEviction's own "no synchronization
+        // active" branch runs the eviction task immediately rather than skipping it.
+        verify(slotCalculationService).evictAvailableSlots(any(), any(), any());
+        verify(slotCalculationService).evictBookableFutureSlotsByMaster(any());
+        verify(cachePrefixEvictor).evictByKeyPrefixNow(any(), eq("master-calendar"));
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — a bookingId that is not a child of this appointment is a 404, "
+            + "and nothing is mutated")
+    void should_throwNotFound_when_targetBookingIdIsNotAChildOfAppointment() {
+        UUID actorId = UUID.randomUUID();
+        UUID realChild = UUID.randomUUID();
+        UUID foreignBookingId = UUID.randomUUID();
+        com.beautica.booking.entity.Booking item = bookingItem(realChild, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(java.util.List.of(item));
+
+        assertThatThrownBy(() -> appointmentTransitionService.declineAppointmentItems(
+                actorId, appointmentId, java.util.List.of(realChild, foreignBookingId), null, false))
+                .isInstanceOf(com.beautica.common.exception.NotFoundException.class);
+
+        assertThat(item.getStatus())
+                .as("no target may be mutated when any id in the batch fails validation")
+                .isEqualTo(com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+        verify(bookingRepository, never()).saveAll(any());
     }
 }

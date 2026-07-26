@@ -769,6 +769,48 @@ public class BookingService {
      */
     @Transactional
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
+        Booking saved = declineBookingCore(actorUserId, bookingId, req);
+        outboxService.enqueueStatusChanged(saved.getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        evictMasterCalendarAfterCommit(saved.getMaster().getId());
+        return BookingResponse.from(saved);
+    }
+
+    /**
+     * Batched-decline counterpart of {@link #declineBooking}, for the schedule-override-conflict
+     * write path ({@code ScheduleOverrideConflictService}), which can decline many STANDALONE
+     * bookings (no {@code appointmentId}) of the SAME master in one write. Runs the identical
+     * mutation ({@link #declineBookingCore}) but skips BOTH of {@link #declineBooking}'s own
+     * post-mutation steps:
+     * <ul>
+     *   <li>its two after-commit cache scans (perf finding, 2026-07-26 audit) — the caller performs
+     *       ONE combined eviction itself after the whole decline loop instead of one
+     *       {@code registerSlotEviction} + {@code evictMasterCalendarAfterCommit} pair PER declined
+     *       booking, all for the same master;</li>
+     *   <li>the {@code outboxService.enqueueStatusChanged} notification call — a booking declined via
+     *       a schedule-override conflict enqueues NOTHING (D6, 2026-07-26 product decision reversal):
+     *       the client discovers the cancellation from the booking's status alone, and notifying for
+     *       this flow is deferred to a later phase. This is a deliberate, permanent property of THIS
+     *       method, not an oversight — do not "fix" it back by re-adding the enqueue call here.</li>
+     * </ul>
+     *
+     * <p>Package-private: the only caller ({@code ScheduleOverrideConflictService}) lives in this same
+     * package. {@link #declineBooking} itself is completely unchanged — same signature, same eviction,
+     * same notification, same tests — this is purely an additive extraction of the shared core the
+     * two now call.
+     */
+    Booking declineBookingForBatch(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
+        return declineBookingCore(actorUserId, bookingId, req);
+    }
+
+    /**
+     * Shared mutation core of {@link #declineBooking} / {@link #declineBookingForBatch}: existence +
+     * ownership + status validation, then the actual {@code CONFIRMED -> DECLINED} transition and
+     * save. Deliberately does NOT touch any cache and does NOT enqueue any notification — both are
+     * entirely the caller's responsibility, so the two callers above can differ in how (and how
+     * often) they evict and whether they notify at all, never in what the transition itself does.
+     */
+    private Booking declineBookingCore(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         // Fix M4: require a reason, consistent with notCompleteBooking
         if (req.cancellationReason() == null) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required for declining a booking");
@@ -792,11 +834,9 @@ public class BookingService {
         booking.setStatus(BookingStatus.DECLINED);
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));
-        Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
-        evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        return BookingResponse.from(saved);
+        // Notification enqueue is NOT here — see this method's own javadoc: it is the caller's
+        // responsibility (declineBooking always enqueues; declineBookingForBatch never does, D6).
+        return bookingRepository.save(booking);
     }
 
     @Transactional

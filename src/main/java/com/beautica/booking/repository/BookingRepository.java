@@ -3,7 +3,6 @@ package com.beautica.booking.repository;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingViewAccess;
-import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -820,14 +819,23 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<BookingCompletionAccess> findCompletionAccessById(@Param("bookingId") UUID bookingId);
 
     /**
-     * Visit-level (BE-4 reschedule) analogue of {@link #findCompletionAccessById}, backing
-     * {@code AuthorizationService.canRescheduleAppointment}. A visit is single-master (BE-1 locked
-     * design), so every chained row shares the IDENTICAL {@code (masterUserId, salonId)} pair —
-     * the caller only ever needs one row, so this is capped to a single result via the
-     * {@code Limit} parameter (deterministically ordered by {@code b.id}) instead of fetching
-     * every chained row just to read the first. Naturally bounded by {@code
-     * SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows, §E-3) regardless. Returns empty
-     * when the appointment does not exist or has no items.
+     * All-rows visit-level (BE-4 reschedule) analogue of {@link #findCompletionAccessById}, backing
+     * BOTH {@code AuthorizationService.canRescheduleAppointment} AND {@code
+     * AuthorizationService.enforceCanManageAppointment} — the pre-lock authorization check for the
+     * whole-visit decline/complete/not-complete transitions AND the per-ITEM {@code
+     * declineAppointmentItem}. A visit is single-master (BE-1 locked design) BY CONSTRUCTION of the
+     * only writers that create chained bookings ({@code VisitPlanner.planChainedItems} resolves
+     * every item off one {@code Master}) — but that invariant has no DB constraint behind it:
+     * nothing in the schema (see {@code V124__create_appointments.sql} / {@code
+     * V125__add_bookings_appointment_id.sql}) enforces that a future writer cannot append a
+     * different-master item. This query therefore fetches EVERY row, deterministically ordered by
+     * {@code b.id}, and every caller must require provider authority over ALL of them, not just the
+     * first — trusting a single arbitrary row (the previous {@code Limit.of(1)} overload, removed)
+     * would silently authorize the whole visit off one item's master, an authorization bypass the
+     * moment a mixed-master visit exists. Cheap regardless: a visit is capped at {@code
+     * SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows, §E-3), so this is at most a 10-row
+     * projection read — no {@code JOIN FETCH}, same shape as the previous capped query. Returns
+     * empty when the appointment does not exist or has no items (fail-closed at the caller).
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingCompletionAccess(
@@ -841,8 +849,65 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.appointment.id = :appointmentId
             ORDER BY b.id
             """)
-    List<BookingCompletionAccess> findCompletionAccessByAppointmentId(
-            @Param("appointmentId") UUID appointmentId, Limit limit);
+    List<BookingCompletionAccess> findAllCompletionAccessByAppointmentId(
+            @Param("appointmentId") UUID appointmentId);
+
+    // ── Schedule-override conflict check (2026-07-26 design) ──────────────────
+
+    /**
+     * Candidates for the "schedule override over existing bookings" conflict check: every
+     * {@code CONFIRMED} booking of {@code masterId} whose {@code startsAt} falls in
+     * {@code [notBefore, windowEnd)} — ONE query for the caller's WHOLE requested date range
+     * (Anti-Bug §E — never one query per expanded date), joined exactly enough to render an
+     * {@code OverrideConflictResponse} (client/guest name, service name) and to route the eventual
+     * cancellation ({@code appointmentId}, nullable — standalone vs. appointment-child decline).
+     *
+     * <p>{@code notBefore} folds BOTH lower bounds the design's conflict rule needs — "the date
+     * range starts here" and "never a booking that already started/is past on today's date" — into
+     * ONE comparison: the caller passes {@code max(rangeStart, now)}, computed once against the
+     * injected {@code Clock} (never {@code Instant.now()} — Anti-Bug §G).
+     *
+     * <p>{@code b.client} is a {@code LEFT JOIN}, not the implicit inner-join path — a guest
+     * (LINK) booking's {@code client_id} is {@code NULL} (V89), and an inner join here would
+     * silently exclude every guest conflict, the same defect class {@link #findByIdWithFullGraph}'s
+     * javadoc documents at length.
+     *
+     * <p><b>{@code pageable} (backend-perf audit finding 3, 2026-07-26 re-audit).</b> The caller
+     * passes an UNSORTED {@link Pageable} purely to cap the number of rows returned (Spring Data
+     * translates it to a plain SQL {@code LIMIT}/{@code OFFSET} — the query's own
+     * {@code ORDER BY b.startsAt ASC} above is untouched, since the {@code Pageable} carries no
+     * {@code Sort} of its own). Without this, a caller scanning a range up to 366 days wide could
+     * pull every {@code CONFIRMED} booking the master has in that whole span into memory before any
+     * filtering ever ran. See {@code ScheduleOverrideConflictService#MAX_CANDIDATES_SCANNED}'s
+     * javadoc for the caller-side cap value and rationale.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.OverrideConflictCandidate(
+                b.id,
+                b.appointment.id,
+                b.startsAt,
+                b.endsAt,
+                b.client.firstName,
+                b.client.lastName,
+                b.guestName,
+                b.guestSurname,
+                sd.name
+            )
+            FROM Booking b
+            LEFT JOIN b.client
+            JOIN b.masterService ms
+            JOIN ms.serviceDefinition sd
+            WHERE b.master.id = :masterId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt >= :notBefore
+              AND b.startsAt < :windowEnd
+            ORDER BY b.startsAt ASC
+            """)
+    List<OverrideConflictCandidate> findConfirmedCandidatesForOverrideConflictCheck(
+            @Param("masterId") UUID masterId,
+            @Param("notBefore") OffsetDateTime notBefore,
+            @Param("windowEnd") OffsetDateTime windowEnd,
+            Pageable pageable);
 
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
@@ -863,8 +928,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Fused, single-round-trip form of the per-master advisory lock for callers that take
-     * ONLY the master lock (no client lock beforehand) — currently just
-     * {@code GuestBookingService#persistBooking}. Sets this transaction's {@code lock_timeout}
+     * ONLY the master lock (no client lock beforehand). Originally just
+     * {@code GuestBookingService#persistBooking}; now also used by the no-client-lock (guest
+     * visit) branch of {@code BookingService#rescheduleBooking} and
+     * {@code AppointmentTransitionService#rescheduleAppointment} (a guest booking/visit has no
+     * client account to lock or conflict-check against), and by
+     * {@code ScheduleOverrideConflictService#applyOverrideWithConflictHandling} (the
+     * schedule-override write is master-scoped only — it never takes a client lock at all,
+     * regardless of whether the conflicting bookings it may decline are guest or registered-client).
+     * Sets this transaction's {@code lock_timeout}
      * to 3s via {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent
      * to {@code SET LOCAL}) AND acquires the salt-{@code 0} advisory lock in the SAME
      * statement/round-trip — see {@link #acquireClientAdvisoryLockWithTimeout(UUID)} for the
@@ -876,9 +948,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * unbounded lock wait there is an equally viable advisory-lock DoS vector as the
      * authenticated path — hence the timeout is fused here too, not just on the client lock.
      *
-     * <p>{@code BookingService} does NOT use this method for its own master lock: it always
-     * takes the client lock first via {@link #acquireClientAdvisoryLockWithTimeout(UUID)},
-     * which already sets the transaction-scoped timeout, so its later master lock uses the
+     * <p>Every OTHER caller that takes a client lock first (e.g. {@code BookingService}'s own
+     * registered-client create/reschedule path) does NOT use this method for its master lock: the
+     * client lock already sets the transaction-scoped timeout via
+     * {@link #acquireClientAdvisoryLockWithTimeout(UUID)}, so the later master lock uses the
      * plain {@link #acquireAdvisoryLock(UUID)} — re-applying the timeout there would be a
      * redundant round trip.
      */

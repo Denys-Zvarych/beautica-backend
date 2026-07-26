@@ -52,9 +52,22 @@ import java.util.stream.Collectors;
  * the repository finders are intentionally unscoped, so this service is the only gate. A master can
  * never read or write another master's schedule.
  *
- * <p><b>OQ-1 (always allow).</b> No {@code BookingRepository} dependency: override/day-off writes never
- * query, cancel, or notify bookings. <b>OQ-3 (gaps).</b> An uncovered date resolves to
- * {@link EffectiveDaySource#NO_SCHEDULE} with empty intervals.
+ * <p><b>OQ-1 — REVERSED (2026-07-26 design, "schedule override over existing bookings").</b> This
+ * class itself still has no {@code BookingRepository} dependency and {@link #upsertOverride} still
+ * performs an unconditional write when called directly — it remains the low-level "just persist
+ * this override" primitive, and stays booking-agnostic on purpose (no cross-feature repository
+ * coupling in this class; see {@code AuthorizationService}/{@code hasManagementAccess} for the only
+ * kind of cross-feature reach this service makes). The former "always allowed, never blocked by nor
+ * mutating existing bookings" guarantee is what changed: {@code POST /overrides/{date}} is no
+ * longer wired to call this method directly. It is wired to
+ * {@code com.beautica.booking.service.ScheduleOverrideConflictService#applyOverrideWithConflictHandling},
+ * which recomputes conflicting {@code CONFIRMED} bookings inside the SAME write transaction, either
+ * rejects the write with a 409 (no {@code cancelOverlapping} consent) or declines every conflict
+ * (via the existing single-booking/appointment-child decline paths) immediately after calling this
+ * method. Any OTHER future caller of {@link #upsertOverride} — bypassing that orchestrator — reverts
+ * to the old unconditional-write behaviour; there is intentionally no enforcement inside this class
+ * that prevents that, exactly as there was none enforcing OQ-1 before. <b>OQ-3 (gaps).</b> An
+ * uncovered date resolves to {@link EffectiveDaySource#NO_SCHEDULE} with empty intervals.
  *
  * <p><b>No N+1.</b> {@link #resolveEffectiveRange} bulk-loads overrides and overlapping templates for the
  * whole window in two queries, then folds each date in-memory via {@link DateRange}.
@@ -134,8 +147,21 @@ public class MasterScheduleService {
     // ---- Step 3: per-date override upsert -----------------------------------------------
 
     /**
-     * Upserts a single per-date override (DAY_OFF or CUSTOM_HOURS). OQ-1: always allowed — never blocked
-     * by, nor mutating, existing bookings. Replaces the override's intervals atomically.
+     * Upserts a single per-date override (DAY_OFF or CUSTOM_HOURS): loads/authorizes the master,
+     * rejects a past date, validates kind/mode consistency, then atomically replaces the override's
+     * intervals. Always writes unconditionally — it does not itself query, cancel, or notify
+     * {@code CONFIRMED} bookings that the new intended availability no longer covers.
+     *
+     * <p><b>Former OQ-1 ("always allowed") is reversed at the endpoint level, not in this method
+     * body.</b> See the class-level javadoc's "OQ-1 — REVERSED" section:
+     * {@code ScheduleOverrideConflictService#applyOverrideWithConflictHandling} is the only
+     * production caller (via {@code MasterController}'s {@code PUT /overrides/{date}}), and it is
+     * the one that recomputes booking conflicts and either rejects the write (409, no consent) or
+     * declines the conflicting bookings right after this method returns, inside the same
+     * transaction. Calling this method directly — as the existing {@code MasterScheduleServiceIT} /
+     * {@code MasterScheduleEdgeCaseIT} / {@code MasterScheduleSecurityIT} suites still do — retains
+     * the original unconditional-write behaviour with zero conflict handling, by design (those
+     * suites exercise the override CRUD invariants in isolation from the booking-conflict feature).
      */
     @Transactional
     public ScheduleOverrideResponse upsertOverride(
@@ -163,6 +189,28 @@ public class MasterScheduleService {
         ScheduleException saved = scheduleExceptionRepository.save(override);
         evictSlotsAfterCommit(master);
         return scheduleMapper.toOverrideResponse(saved);
+    }
+
+    /**
+     * Loads the target master and verifies WRITE (schedule-management) authority — the exact
+     * {@link #loadActiveMaster} + {@link AuthorizationService#enforceCanManageMasterSchedule} pair
+     * {@link #upsertOverride} performs internally moments later. Exposed for
+     * {@code com.beautica.booking.service.ScheduleOverrideConflictService}, which must confirm the
+     * caller may manage {@code masterId}'s schedule BEFORE it runs its own booking-conflict query —
+     * a query that returns client/guest identities and must not be reachable by an unauthorized
+     * caller even though {@code MasterController}'s {@code @PreAuthorize} SpEL already gates the
+     * same endpoint (defense in depth, matching this class's own re-check pattern on every write).
+     *
+     * <p>Deliberately public rather than duplicating {@code MasterRepository} + this exact
+     * authorization call inside the booking package: cross-feature reach goes through a service's
+     * public interface, never a sibling feature's repository directly (this class already owns the
+     * "load + enforce" invariant for schedule writes; a second, drifting copy of it elsewhere would
+     * be the actual anti-pattern).
+     */
+    public Master requireScheduleManagementAuthority(UUID actorId, UUID masterId) {
+        Master master = loadActiveMaster(masterId);
+        authz.enforceCanManageMasterSchedule(actorId, master);
+        return master;
     }
 
     // ---- Step 2b: weekly-template delete ------------------------------------------------

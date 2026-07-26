@@ -2,6 +2,7 @@ package com.beautica.master.controller;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.service.ScheduleOverrideConflictService;
 import com.beautica.master.dto.AvailableSlotsResponse;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.ApiResponse;
@@ -14,6 +15,8 @@ import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterWorkingDayResponse;
+import com.beautica.master.dto.OverrideConflictPreviewResponse;
+import com.beautica.master.dto.OverrideConflictQueryRequest;
 import com.beautica.master.dto.RotateMasterRequest;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
@@ -62,6 +65,7 @@ public class MasterController {
     private final MasterService masterService;
     private final MasterScheduleService masterScheduleService;
     private final SlotCalculationService slotCalculationService;
+    private final ScheduleOverrideConflictService scheduleOverrideConflictService;
     private final UserService userService;
 
     @GetMapping("/me")
@@ -184,6 +188,14 @@ public class MasterController {
     /**
      * Idempotent upsert of a per-date override keyed by {@code {date}}. The path date is authoritative;
      * a body whose {@code date} disagrees with the path is rejected as a 400 to avoid an ambiguous write.
+     *
+     * <p><b>2026-07-26 design — booking-conflict cancellation.</b> Delegates to
+     * {@link ScheduleOverrideConflictService#applyOverrideWithConflictHandling}, not directly to
+     * {@link MasterScheduleService#upsertOverride}: the former OQ-1 "always allowed" rule is
+     * reversed here — if the intended override would leave a {@code CONFIRMED} booking without
+     * availability, the write is rejected with a 409 unless {@code request.cancelOverlapping()} is
+     * {@code true}, in which case the override is written and every conflicting booking is declined,
+     * atomically. See that service's javadoc for why the orchestration lives in the booking package.
      */
     @PutMapping("/{masterId}/overrides/{date}")
     @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
@@ -197,7 +209,31 @@ public class MasterController {
             throw new BusinessException("Path date must match the override body date");
         }
         UUID actorId = AuthenticationUtils.userId(authentication);
-        return ApiResponse.ok(masterScheduleService.upsertOverride(actorId, masterId, request));
+        return ApiResponse.ok(
+                scheduleOverrideConflictService.applyOverrideWithConflictHandling(actorId, masterId, request));
+    }
+
+    /**
+     * Read-only preview of which {@code CONFIRMED} bookings an intended override would orphan —
+     * 2026-07-26 design, "schedule override over existing bookings". Guarded by the MANAGE gate
+     * (not the read gate): this is a pre-write check, and it exposes client/guest identities, which
+     * {@code canReadMasterSchedule} (granted to a read-only {@code SALON_MASTER}) is not scoped to
+     * see. No writes, no side effects, no cache eviction — see
+     * {@link ScheduleOverrideConflictService#previewConflicts}, which ALSO re-verifies management
+     * authority inside the transaction (security audit finding 7) as defense in depth against a
+     * future internal caller losing this controller's {@code @PreAuthorize} gate.
+     */
+    @PostMapping("/{masterId}/overrides/conflicts")
+    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
+    public ApiResponse<OverrideConflictPreviewResponse> previewOverrideConflicts(
+            @PathVariable UUID masterId,
+            @Valid @RequestBody OverrideConflictQueryRequest request,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        return ApiResponse.ok(scheduleOverrideConflictService.previewConflicts(
+                actorId, masterId, request.from(), request.to(), request.kind(), request.mode(),
+                request.intervals(), request.times()));
     }
 
     @DeleteMapping("/{masterId}/overrides/{date}")
