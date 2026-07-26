@@ -751,7 +751,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * <p>A session that waits longer than {@code lock_timeout} aborts the lock wait with
      * Postgres {@code 55P03 lock_not_available}. Hibernate/Spring exception translation
      * surfaces this as {@link org.springframework.dao.CannotAcquireLockException} — mapped to
-     * a clean 409 by {@code GlobalExceptionHandler#handleCannotAcquireLock} — instead of
+     * a clean 409 by {@code GlobalExceptionHandler#handlePessimisticLockingFailure} — instead of
      * parking the connection for the full Hikari connection-timeout (20 s) or surfacing a
      * bare 500.
      */

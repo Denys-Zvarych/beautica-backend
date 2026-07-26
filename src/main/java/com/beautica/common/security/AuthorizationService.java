@@ -444,6 +444,42 @@ public class AuthorizationService {
     }
 
     /**
+     * Service-layer provider-authority guard for the WHOLE-VISIT transitions
+     * ({@code AppointmentTransitionService#declineAppointment} / {@code #completeAppointment} /
+     * {@code #notCompleteAppointment}), evaluated via the lightweight {@link BookingCompletionAccess}
+     * projection — the same projection {@link #canRescheduleAppointment} uses — instead of a full
+     * {@code Booking} entity load.
+     *
+     * <p><b>Cycle-3 audit finding 1.</b> The pre-lock authorization check in those three methods must
+     * run BEFORE {@code AppointmentTransitionService#lockHeaderForWholeVisitTransition} without
+     * loading a {@code Booking} entity into the persistence context — an entity loaded here would
+     * make the SUBSEQUENT post-lock item reload return the SAME stale cached instance instead of a
+     * fresh read (Hibernate's identity-map reconciliation never overwrites an already-managed
+     * entity's fields from a later query's resultset), silently defeating the "fresh snapshot after
+     * the lock" invariant {@code AppointmentCrossPathTransitionConcurrencyIT} depends on. A projection
+     * query never touches the entity manager, so it cannot poison that later, genuinely-fresh load.
+     *
+     * <p>No existence oracle: a missing appointment id and an itemless/foreign one both resolve to an
+     * empty projection list, mapped to the same 403 as a genuine authorization failure — mirroring
+     * {@link #canRescheduleAppointment}'s missing-visit handling.
+     *
+     * @throws ForbiddenException the appointment does not exist, has no items, or the actor lacks
+     *                            provider authority over its single master (403)
+     */
+    public void enforceCanManageAppointment(UUID actorUserId, UUID appointmentId) {
+        List<BookingCompletionAccess> access =
+                bookingRepository.findCompletionAccessByAppointmentId(appointmentId, Limit.of(1));
+        if (access.isEmpty()) {
+            throw new ForbiddenException("Access denied");
+        }
+        BookingCompletionAccess v = access.get(0);
+        Role actorRole = roleFromCurrentAuthentication();
+        if (!hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorUserId, actorRole)) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
      * Service-layer completion guard (Phase 18.4) — the entity-based twin of
      * {@link #canCompleteBooking}. See {@link #hasProviderAuthorityOverBooking(UUID, Booking)}
      * for the shared predicate.

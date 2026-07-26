@@ -5,6 +5,7 @@ import com.beautica.auth.Role;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.service.entity.CatalogCategory;
@@ -67,6 +68,9 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
 
     @Autowired
     private TestEntityManager em;
+
+    @Autowired
+    private AppointmentRepository appointmentRepository;
 
     private static final AtomicInteger SORT_ORDER_SEQ = new AtomicInteger(240_000);
 
@@ -550,6 +554,42 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
 
         assertThat(first.getId()).isNotNull();
         assertThat(second.getId()).isNotNull();
+    }
+
+    // ── consumeCancelToken (cycle-3 audit finding 2 — lock_timeout fused) ────────────────────────
+    @Test
+    @DisplayName("consumeCancelToken — flips a CONFIRMED guest visit header to CANCELLED/CLIENT_CANCELLED "
+            + "and nulls the token, in one conditional UPDATE (native-SQL rewrite regression: the query "
+            + "moved from JPQL to a native set_config-fused UPDATE for cycle-3 finding 2 — this proves the "
+            + "rewrite still updates the right row with the right values, not just that it compiles)")
+    void should_cancelHeaderAndNullToken_when_consumingAValidCancelToken() {
+        UUID token = UUID.randomUUID();
+        Appointment visit = guestVisit(BookingStatus.CONFIRMED).cancelToken(token).build();
+        em.persistAndFlush(visit);
+        em.clear();
+
+        int updated = appointmentRepository.consumeCancelToken(token);
+
+        assertThat(updated).as("exactly one header row is flipped by the winning consume").isEqualTo(1);
+        Appointment reloaded = appointmentRepository.findById(visit.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        assertThat(reloaded.getCancellationReason()).isEqualTo(CancellationReason.CLIENT_CANCELLED);
+        assertThat(reloaded.getCancelToken()).as("token is nulled so the link cannot be replayed").isNull();
+    }
+
+    @Test
+    @DisplayName("consumeCancelToken — a replayed/already-consumed token updates 0 rows (idempotent "
+            + "by consequence, same as the pre-rewrite JPQL version)")
+    void should_updateZeroRows_when_tokenAlreadyConsumed() {
+        UUID token = UUID.randomUUID();
+        Appointment visit = guestVisit(BookingStatus.CONFIRMED).cancelToken(token).build();
+        em.persistAndFlush(visit);
+        em.clear();
+        assertThat(appointmentRepository.consumeCancelToken(token)).isEqualTo(1);
+
+        int replay = appointmentRepository.consumeCancelToken(token);
+
+        assertThat(replay).as("the token is already NULL — the WHERE clause matches nothing").isEqualTo(0);
     }
 
     /**

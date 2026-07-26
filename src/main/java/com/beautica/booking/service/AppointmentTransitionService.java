@@ -92,12 +92,22 @@ public class AppointmentTransitionService {
      * visit are indistinguishable), then the same {@code CONFIRMED}-only status guard ({@code 400})
      * and the same read-only-after-elapse guard ({@code 409 BOOKING_ALREADY_ELAPSED}), evaluated on
      * the WHOLE visit (the last item's {@code endsAt} — the instant the visit window fully passes).
+     *
+     * <p><b>Cycle-3 audit finding 1 (authz-before-lock).</b> Ownership is resolved via
+     * {@link AppointmentRepository#findClientIdById} — a scalar projection, not an entity load —
+     * BEFORE {@link #lockHeaderForWholeVisitTransition} runs, so a non-owner (or a guessed/foreign
+     * id) never causes a real row lock or the item {@code JOIN FETCH} below: a missing id and a
+     * foreign visit both fail this check identically and instantly, with zero DB writes attempted.
      */
     @Transactional
     public void cancelAppointment(UUID clientId, UUID appointmentId, AppointmentCancelRequest req) {
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .filter(a -> a.getClient() != null && a.getClient().getId().equals(clientId))
+        UUID ownerClientId = appointmentRepository.findClientIdById(appointmentId)
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
+        if (!ownerClientId.equals(clientId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        Appointment appointment = lockHeaderForWholeVisitTransition(appointmentId);
         List<Booking> items = loadItemsOrThrow(appointmentId);
 
         if (appointment.getStatus() != BookingStatus.CONFIRMED) {
@@ -127,17 +137,16 @@ public class AppointmentTransitionService {
      */
     @Transactional
     public void declineAppointment(UUID actorId, UUID appointmentId, AppointmentProviderNoteRequest req) {
-        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring BookingService#declineBooking / notCompleteAppointment: a missing appointment id
-        // and an existing-but-foreign visit must be indistinguishable to the caller. A plain full load
-        // would surface a 404 for a missing id BEFORE the ownership guard runs, letting a valid provider
-        // distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing appointment
-        // short-circuits to the SAME 403 the ownership guard (enforceCanCancelBooking) throws for
-        // a foreign one. Ownership enforcement is unchanged: a foreign provider still gets 403.
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        // Cycle-3 audit finding 1 (authz-before-lock): provider authority is resolved via the
+        // lightweight BookingCompletionAccess projection (AuthorizationService#enforceCanManageAppointment)
+        // — no Booking/Appointment entity load — BEFORE lockHeaderForWholeVisitTransition runs, so a
+        // non-owner (or a guessed/foreign id) never causes a real row lock or the item JOIN FETCH
+        // below. A missing appointment id and an existing-but-foreign visit both resolve to the SAME
+        // 403, instantly, with zero DB writes attempted (Finding 8 — no existence oracle preserved).
+        authz.enforceCanManageAppointment(actorId, appointmentId);
+
+        Appointment appointment = lockHeaderForWholeVisitTransition(appointmentId);
         VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
-        authz.enforceCanCancelBooking(actorId, ctx.firstItem());
         assertHeaderTransition(ctx.appointment(), BookingStatus.DECLINED);
 
         ctx.appointment().setStatus(BookingStatus.DECLINED);
@@ -206,6 +215,16 @@ public class AppointmentTransitionService {
 
         assertItemTransition(target, BookingStatus.DECLINED);
 
+        // Canonical appointments-before-bookings lock order (cycle-2 audit finding 1): lock the
+        // header BEFORE this child row's own status change is written below — previously this ran
+        // AFTER bookingRepository.save(target), inverted relative to the order the whole-visit
+        // transition methods take after their own authorization check (lockHeaderForWholeVisitTransition
+        // — cycle-3 audit finding 1 moved that call after authz, not before item loads/mutation).
+        // The actual "does a CONFIRMED sibling remain" UPDATE still has to run AFTER the child's own
+        // status change is flushed (see collapseHeaderAfterItemTransition) — only the LOCK moves
+        // earlier, not the collapse.
+        boolean headerWasLocked = lockHeaderBeforeItemTransition(appointmentId);
+
         target.setStatus(BookingStatus.DECLINED);
         target.setCancellationReason(CancellationReason.PROVIDER_UNAVAILABLE);
         // Note on the CHILD (its own status is now DECLINED — legal per chk_provider_comment_status);
@@ -213,7 +232,8 @@ public class AppointmentTransitionService {
         target.setProviderComment(BookingComments.normalize(req == null ? null : req.providerComment()));
         bookingRepository.save(target);
 
-        recomputeHeaderAfterItemDecline(ctx.appointment(), ctx.items());
+        collapseHeaderAfterItemTransition(
+                appointmentId, headerWasLocked, BookingStatus.DECLINED, CancellationReason.PROVIDER_UNAVAILABLE, null);
 
         // Reference the DECLINED CHILD (not item 0) so the client notification names the right service.
         outboxService.enqueueStatusChanged(target.getId());
@@ -238,17 +258,16 @@ public class AppointmentTransitionService {
      */
     @Transactional
     public void completeAppointment(UUID actorId, UUID appointmentId) {
-        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring BookingService#completeBooking / notCompleteAppointment: a missing appointment id
-        // and an existing-but-foreign visit must be indistinguishable to the caller. A plain full load
-        // would surface a 404 for a missing id BEFORE the ownership guard runs, letting a valid provider
-        // distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing appointment
-        // now short-circuits to the SAME 403 the ownership guard (enforceCanCompleteBooking) throws for
-        // a foreign one. Ownership enforcement is unchanged: a foreign provider still gets 403.
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        // Cycle-3 audit finding 1 (authz-before-lock): provider authority is resolved via the
+        // lightweight BookingCompletionAccess projection (AuthorizationService#enforceCanManageAppointment)
+        // — no Booking/Appointment entity load — BEFORE lockHeaderForWholeVisitTransition runs, so a
+        // non-owner (or a guessed/foreign id) never causes a real row lock or the item JOIN FETCH
+        // below. A missing appointment id and an existing-but-foreign visit both resolve to the SAME
+        // 403, instantly, with zero DB writes attempted (Finding 8 — no existence oracle preserved).
+        authz.enforceCanManageAppointment(actorId, appointmentId);
+
+        Appointment appointment = lockHeaderForWholeVisitTransition(appointmentId);
         VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
-        authz.enforceCanCompleteBooking(actorId, ctx.firstItem());
         assertHeaderTransition(ctx.appointment(), BookingStatus.COMPLETED);
 
         ctx.appointment().setStatus(BookingStatus.COMPLETED);
@@ -275,17 +294,16 @@ public class AppointmentTransitionService {
      */
     @Transactional
     public void notCompleteAppointment(UUID actorId, UUID appointmentId, AppointmentProviderNoteRequest req) {
-        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring BookingService#notCompleteBooking / cancelAppointment: a missing appointment id
-        // and an existing-but-foreign visit must be indistinguishable to the caller. A plain full load
-        // would surface a 404 for a missing id BEFORE the ownership guard runs, letting a valid provider
-        // distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing appointment
-        // now short-circuits to the SAME 403 the ownership guard (enforceCanCancelBooking) throws for
-        // a foreign one. Ownership enforcement is unchanged: a foreign provider still gets 403.
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        // Cycle-3 audit finding 1 (authz-before-lock): provider authority is resolved via the
+        // lightweight BookingCompletionAccess projection (AuthorizationService#enforceCanManageAppointment)
+        // — no Booking/Appointment entity load — BEFORE lockHeaderForWholeVisitTransition runs, so a
+        // non-owner (or a guessed/foreign id) never causes a real row lock or the item JOIN FETCH
+        // below. A missing appointment id and an existing-but-foreign visit both resolve to the SAME
+        // 403, instantly, with zero DB writes attempted (Finding 8 — no existence oracle preserved).
+        authz.enforceCanManageAppointment(actorId, appointmentId);
+
+        Appointment appointment = lockHeaderForWholeVisitTransition(appointmentId);
         VisitContext ctx = new VisitContext(appointment, loadItemsOrThrow(appointmentId));
-        authz.enforceCanCancelBooking(actorId, ctx.firstItem());
         assertHeaderTransition(ctx.appointment(), BookingStatus.NOT_COMPLETED);
 
         ctx.appointment().setStatus(BookingStatus.NOT_COMPLETED);
@@ -445,6 +463,53 @@ public class AppointmentTransitionService {
     }
 
     /**
+     * Shared guard for the four WHOLE-VISIT transition methods (cancel/decline/complete/notComplete):
+     * unconditionally locks the header row via {@link AppointmentRepository#lockHeaderRegardlessOfStatus}
+     * — collapsing a missing appointment id to the SAME uniform 403 every caller already throws for an
+     * existing-but-foreign visit (Finding 8, no existence oracle) — then loads the now-locked entity
+     * for the caller's own status checks.
+     *
+     * <p><b>Called AFTER authorization, not before it (cycle-3 audit finding 1).</b> Every caller
+     * resolves existence/ownership FIRST — via a scalar/projection query that never hydrates a
+     * {@code Booking}/{@code Appointment} entity ({@link AppointmentRepository#findClientIdById} for
+     * {@code cancelAppointment}, {@code AuthorizationService#enforceCanManageAppointment} for the
+     * three provider transitions) — and only calls this method once that check has already thrown for
+     * a non-owner. A cycle-2 wording error had this method called at the literal top of each method,
+     * BEFORE authorization: a caller who did not own the appointment could still force a real row lock
+     * (and the item {@code JOIN FETCH} that followed) with a guessed UUID before being rejected, and
+     * created a timing oracle (a contended foreign id blocked up to the 3s {@code lock_timeout} before
+     * a 409, versus an instant 403 for a non-existent id). Fixed: no lock is taken, and no entity
+     * (including this one) is loaded, until authorization has already succeeded.
+     *
+     * <p><b>Lock order (cycle-2 audit finding 1) is unaffected by the above.</b> Still called BEFORE
+     * any chained item is loaded or mutated, preserving the canonical
+     * {@code appointments}-row-before-{@code bookings}-rows lock order shared with the per-item paths
+     * ({@link #lockHeaderBeforeItemTransition}, {@code BookingService#cancelBooking}) — see
+     * {@link AppointmentRepository#lockHeaderRegardlessOfStatus}'s Javadoc for the full deadlock-order
+     * rationale. The pre-lock authorization check reads NOTHING from {@code bookings}/{@code appointments}
+     * via an entity load (only scalar projections), so the write-lock order this method establishes is
+     * still the very first entity-level touch of either table in the transaction.
+     *
+     * <p>Package-private (not {@code private}) so
+     * {@code AppointmentCrossPathTransitionConcurrencyIT} (same package) can {@code @SpyBean} +
+     * {@code doAnswer} this EXACT method to force a whole-visit racer to rendezvous with a
+     * per-item racer at the precise instant both are about to attempt the SAME row lock — the
+     * regression test for finding 1.
+     *
+     * @return the locked, fully-loaded header entity — never {@code null}
+     * @throws ForbiddenException the appointment id does not exist (403 — no existence oracle)
+     */
+    Appointment lockHeaderForWholeVisitTransition(UUID appointmentId) {
+        if (appointmentRepository.lockHeaderRegardlessOfStatus(appointmentId).isEmpty()) {
+            throw new ForbiddenException("Access denied");
+        }
+        // The lock above already proved the row exists and is now held by this transaction, so this
+        // load cannot legitimately come back empty — the orElseThrow is defensive, not a real branch.
+        return appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+    }
+
+    /**
      * The single source of the illegal/duplicate-transition error — same {@link BusinessException}
      * ({@code 400}) with the same message shape as {@code BookingService#assertTransition}. A visit
      * that is already terminal (re-decline, cancel-after-complete, etc.) is only ever transitionable
@@ -472,20 +537,135 @@ public class AppointmentTransitionService {
     }
 
     /**
-     * Header recompute after a per-service decline (locked, safe invariant): while ≥1 child remains
-     * CONFIRMED the header stays CONFIRMED; declining the LAST CONFIRMED child collapses the header to
-     * {@code DECLINED}. No note is written to the header (it stays untouched — the note lives on the
-     * declined child), so the {@code chk_appointment_provider_comment_status} CHECK is never at risk.
-     * The header is persisted only when it actually transitions.
+     * Phase 1 of the two-phase per-item header recompute, shared by BOTH per-item paths —
+     * {@link #declineAppointmentItem} (provider decline) and
+     * {@link #lockAppointmentHeaderBeforeClientItemCancel} (client cancel, track 27.x widening).
+     * Locks the header via {@link AppointmentRepository#lockHeaderIfConfirmed}
+     * ({@code SELECT ... FOR UPDATE ... WHERE status = 'CONFIRMED'}) and reports whether it was
+     * actually CONFIRMED-and-now-locked, WITHOUT touching the collapse UPDATE yet.
+     *
+     * <p><b>Split from the collapse step (cycle-2 audit finding 1 — lock order).</b> The single
+     * combined lock-then-collapse method this replaced was called AFTER the caller's own child row
+     * was mutated/saved — inverted relative to the canonical {@code appointments}-before-
+     * {@code bookings} lock order the whole-visit methods now take explicitly
+     * ({@link #lockHeaderForWholeVisitTransition}). The LOCK half can and must move earlier (before
+     * the caller writes its child row); the COLLAPSE half (phase 2,
+     * {@link #collapseHeaderAfterItemTransition}) cannot — its {@code NOT EXISTS} sibling check is
+     * only correct once the child's OWN new status is visible, so it must stay positioned after the
+     * child save. Splitting the two is the only way to satisfy both constraints at once.
+     *
+     * @return {@code true} if the header was CONFIRMED and is now locked by this transaction —
+     *         {@link #collapseHeaderAfterItemTransition} must run later in this same transaction
+     *         iff this is {@code true}; {@code false} means the header had already left CONFIRMED
+     *         (nothing was locked, nothing needs collapsing — a harmless idempotent replay)
      */
-    private void recomputeHeaderAfterItemDecline(Appointment appointment, List<Booking> items) {
-        boolean anyConfirmed = items.stream()
-                .anyMatch(item -> item.getStatus() == BookingStatus.CONFIRMED);
-        if (!anyConfirmed) {
-            appointment.setStatus(BookingStatus.DECLINED);
-            appointment.setCancellationReason(CancellationReason.PROVIDER_UNAVAILABLE);
-            appointmentRepository.save(appointment);
+    private boolean lockHeaderBeforeItemTransition(UUID appointmentId) {
+        return appointmentRepository.lockHeaderIfConfirmed(appointmentId).isPresent();
+    }
+
+    /**
+     * Phase 2 of the two-phase per-item header recompute — must run AFTER the caller's own child row
+     * mutation is at least pending in the SAME persistence context (a prior {@code save(...)} call in
+     * this transaction), and only when {@code headerWasLocked} (the phase-1 result) is {@code true}.
+     *
+     * <p><b>Locked, safe invariant (unchanged):</b> while ≥1 child remains CONFIRMED the header stays
+     * CONFIRMED, untouched; losing the LAST CONFIRMED child collapses the header to {@code target}
+     * with {@code reason}.
+     *
+     * <p>Delegates to {@link AppointmentRepository#collapseHeaderIfNoConfirmedSiblingsRemain}, ONE
+     * conditional {@code UPDATE} whose {@code WHERE} clause folds the "no CONFIRMED sibling remains"
+     * check into the same statement that flips the header — see that method's Javadoc "Concurrency"
+     * section for why the phase-1 lock is what actually makes this atomic against a truly-concurrent
+     * sibling transition, not this UPDATE's conditional {@code WHERE} alone.
+     * {@code flushAutomatically = true} on that repository method flushes the caller's pending child
+     * UPDATE (made moments earlier via {@code bookingRepository.save(...)} in the SAME transaction)
+     * BEFORE this statement's {@code NOT EXISTS} subquery runs — the subquery reads straight from the
+     * DB and bypasses the Hibernate session, so without that flush it could still see the child's
+     * PRE-transition status.
+     *
+     * <p>{@code headerNote} is written unconditionally in the SAME {@code UPDATE} as
+     * {@code status}/{@code reason} — safe against
+     * {@code chk_appointment_client_cancellation_note_status} (V124) because Postgres evaluates a row
+     * CHECK against the row's FINAL post-statement values, never an intermediate per-column state.
+     * Pass {@code null} when the per-item note legitimately lives on the CHILD instead (the provider
+     * per-service decline shape).
+     *
+     * <p><b>Round-trip cost (cycle-2 audit finding 4 — corrected).</b> {@code headerWasLocked = false}
+     * (the header had ALREADY left CONFIRMED before phase 1 ran — an idempotent replay) is the ONLY
+     * case that skips this call entirely, saving a round trip. In the common case — one leg
+     * transitioning while ≥1 sibling remains CONFIRMED — phase 1's lock still succeeds
+     * ({@code headerWasLocked = true}), so THIS UPDATE still runs, just as a guaranteed 0-row no-op
+     * (the {@code NOT EXISTS} check correctly finds a CONFIRMED sibling and refuses to flip the
+     * header). Steady state is therefore reliably lock (phase 1) + conditional UPDATE (phase 2) — two
+     * round trips, not one; only the terminal-replay edge case is cheaper.
+     */
+    private void collapseHeaderAfterItemTransition(
+            UUID appointmentId, boolean headerWasLocked, BookingStatus target, CancellationReason reason,
+            String headerNote) {
+        if (!headerWasLocked) {
+            return;
         }
+        appointmentRepository.collapseHeaderIfNoConfirmedSiblingsRemain(
+                appointmentId, target.name(), reason.name(), headerNote);
+    }
+
+    /**
+     * Phase 1 (lock) of the header recompute for a CLIENT per-leg cancel via
+     * {@code PATCH /bookings/{id}/cancel} (track 27.x widening —
+     * {@code BookingService#cancelBooking} no longer refuses an appointment child). Called by
+     * {@code BookingService#cancelBooking} BEFORE it saves the target child's own CANCELLED status —
+     * the canonical appointments-before-bookings lock order (cycle-2 audit finding 1) — delegating to
+     * the shared {@link #lockHeaderBeforeItemTransition}.
+     *
+     * <p><b>Visibility (cycle-2 audit finding 5, resolved).</b> Package-private, not {@code public}:
+     * its only caller, {@code BookingService#cancelBooking}, already lives in this same package
+     * ({@code com.beautica.booking.service}), and {@code AppointmentClientLegCancelConcurrencyIT} —
+     * the regression test that {@code @SpyBean}s this exact method — now lives in this package too
+     * (moved from {@code com.beautica.booking} specifically to unblock this narrowing; it shares the
+     * now-{@code public} {@code com.beautica.booking.BookingTestFixtures} across the package
+     * boundary instead).
+     *
+     * <p><b>No authorization check of its own.</b> The caller MUST have already established that
+     * {@code appointmentId} is a header the acting client is authorized to mutate (as
+     * {@code BookingService#cancelBooking} does, transitively, by having already loaded and validated
+     * ownership of the CHILD booking that carries this {@code appointmentId} FK) before calling this
+     * method — it trusts that precondition unconditionally.
+     *
+     * @return see {@link #lockHeaderBeforeItemTransition} — the caller must thread this into
+     *         {@link #collapseAppointmentHeaderAfterClientItemCancel} later in the SAME transaction
+     */
+    @Transactional
+    boolean lockAppointmentHeaderBeforeClientItemCancel(UUID appointmentId) {
+        return lockHeaderBeforeItemTransition(appointmentId);
+    }
+
+    /**
+     * Phase 2 (collapse) of the header recompute for a CLIENT per-leg cancel — the client-cancel
+     * counterpart of {@link #collapseHeaderAfterItemTransition}, called by
+     * {@code BookingService#cancelBooking} AFTER it has persisted (via
+     * {@code bookingRepository.save(...)}) the target child's own CANCELLED status in the SAME
+     * transaction (this method's default REQUIRED propagation joins the caller's
+     * {@code @Transactional}). Same locked invariant as the provider per-service decline (header
+     * stays CONFIRMED while ≥1 sibling remains CONFIRMED; cancelling the LAST CONFIRMED child
+     * collapses the header to CANCELLED with reason CLIENT_CANCELLED), but — UNLIKE the decline
+     * precedent — the client's cancellation note legitimately belongs on the HEADER even for a
+     * single-leg cancel (booking-notes are visit-level, mutually visible, not per-service), so it is
+     * passed through here to be written on the transitioning branch.
+     *
+     * @param appointmentId          the visit header owning the just-cancelled child
+     * @param headerWasLocked        the result of the matching
+     *                               {@link #lockAppointmentHeaderBeforeClientItemCancel} call earlier
+     *                               in THIS transaction
+     * @param clientCancellationNote the client's already-normalized cancellation note for THIS
+     *                               cancel action, or {@code null}; written to the header only if the
+     *                               header actually transitions to CANCELLED
+     */
+    @Transactional
+    void collapseAppointmentHeaderAfterClientItemCancel(
+            UUID appointmentId, boolean headerWasLocked, String clientCancellationNote) {
+        collapseHeaderAfterItemTransition(
+                appointmentId, headerWasLocked, BookingStatus.CANCELLED, CancellationReason.CLIENT_CANCELLED,
+                clientCancellationNote);
     }
 
     /**

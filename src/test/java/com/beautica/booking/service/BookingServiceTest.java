@@ -8,6 +8,7 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -72,6 +73,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -110,6 +112,8 @@ class BookingServiceTest {
     private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     @Mock
     private ScheduleDateMath dateMath;
+    @Mock
+    private AppointmentTransitionService appointmentTransitionService;
 
     private Clock clock;
 
@@ -150,7 +154,8 @@ class BookingServiceTest {
                 // uses were the prefix scans now delegated to this evictor.)
                 new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 salonCatalogCacheEvictor,
-                dateMath
+                dateMath,
+                appointmentTransitionService
         );
 
         clientId = UUID.randomUUID();
@@ -1018,6 +1023,63 @@ class BookingServiceTest {
                 .isEqualTo(BookingStatus.CONFIRMED);
         verify(bookingRepository, never()).save(any());
         verify(outboxService, never()).enqueueStatusChanged(any());
+    }
+
+    // ── track 27.x widening — CLIENT cancel of a multi-service visit CHILD ─────────────────────
+    //
+    // Prior behaviour (pinned at IT level by BookingAppointmentChildTransitionGuardIT): an
+    // appointment child (non-null booking.getAppointment()) was refused with a 409 by
+    // assertNotAppointmentChild BEFORE the status guard ran. That call is now removed from
+    // cancelBooking specifically (declineBooking/completeBooking/notCompleteBooking still call it
+    // unchanged) — these two tests pin the widened contract: the cancel succeeds, and the visit
+    // header recompute is delegated to AppointmentTransitionService rather than reimplemented here.
+
+    @Test
+    @DisplayName("cancelling an appointment CHILD succeeds (the assertNotAppointmentChild 409 no longer "
+            + "fires for cancelBooking) and delegates the header recompute to the two-phase "
+            + "AppointmentTransitionService#lockAppointmentHeaderBeforeClientItemCancel (BEFORE this "
+            + "child's own save) / #collapseAppointmentHeaderAfterClientItemCancel (AFTER) — cycle-2 "
+            + "audit finding 1, canonical appointments-before-bookings lock order")
+    void should_cancelAppointmentChildAndDelegateHeaderRecompute_when_clientCancelsOneLegOfAVisit() {
+        UUID appointmentId = UUID.randomUUID();
+        Appointment appointment = Appointment.builder().id(appointmentId).build();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        booking.setAppointment(appointment);
+        CancelBookingRequest req = new CancelBookingRequest(
+                CancellationReason.CLIENT_CANCELLED, "одну послугу не потрібно");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        when(appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId))
+                .thenReturn(true);
+
+        bookingService.cancelBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus())
+                .as("the widened cancel must still move THIS child to CANCELLED")
+                .isEqualTo(BookingStatus.CANCELLED);
+
+        InOrder inOrder = inOrder(appointmentTransitionService, bookingRepository);
+        inOrder.verify(appointmentTransitionService).lockAppointmentHeaderBeforeClientItemCancel(appointmentId);
+        inOrder.verify(bookingRepository).save(any());
+        inOrder.verify(appointmentTransitionService)
+                .collapseAppointmentHeaderAfterClientItemCancel(appointmentId, true, "одну послугу не потрібно");
+        verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("cancelling a LEGACY standalone booking (appointment_id NULL) never touches "
+            + "AppointmentTransitionService — the widening is additive, byte-for-byte unchanged for "
+            + "the non-appointment path")
+    void should_notInteractWithAppointmentTransitionService_when_clientCancelsLegacyStandaloneBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.cancelBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        verifyNoInteractions(appointmentTransitionService);
     }
 
     // ── elapsed-client guard (track 24.x — read-only-after-elapse) ─────────────

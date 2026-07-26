@@ -86,6 +86,7 @@ public class BookingService {
     private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final ScheduleDateMath dateMath;
+    private final AppointmentTransitionService appointmentTransitionService;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -865,6 +866,35 @@ public class BookingService {
         return BookingResponse.from(saved);
     }
 
+    /**
+     * Client-initiated cancel of a single {@code CONFIRMED} booking.
+     *
+     * <p><b>Track 27.x widening (per-leg client cancel).</b> Unlike the sibling provider transitions
+     * ({@link #declineBooking}, {@link #completeBooking}, {@link #notCompleteBooking}), this path
+     * deliberately does NOT call {@link #assertNotAppointmentChild} — a multi-service visit child
+     * (non-null {@code booking.getAppointment()}) is now a legal target here. Product decision: the
+     * client's booking list renders ONE card per service, each with its own cancel action, so a
+     * client must be able to cancel exactly one leg of a visit without cancelling its siblings. The
+     * whole-visit cancel ({@code PATCH /appointments/{id}/cancel} →
+     * {@link AppointmentTransitionService#cancelAppointment}) is unchanged and stays the only way to
+     * cancel every leg atomically in one call. Every other single-booking transition
+     * (decline/complete/not-complete, all provider-initiated) still refuses an appointment child via
+     * {@link #assertNotAppointmentChild} — see that method's Javadoc.
+     *
+     * <p>Every other CLIENT guard below still applies, evaluated on THIS child row alone: ownership
+     * (403), {@code CONFIRMED}-only status (400), and the read-only-after-elapse guard (409) — a
+     * cancelled/terminal sibling never influences any of them, since each is a self-contained row.
+     *
+     * <p>When the cancelled booking is an appointment child, the visit HEADER is LOCKED before this
+     * child's own status change is written, and the header is recomputed (collapsed if this was the
+     * last CONFIRMED leg) AFTER this child is persisted CANCELLED — the two-phase
+     * {@link AppointmentTransitionService#lockAppointmentHeaderBeforeClientItemCancel} /
+     * {@link AppointmentTransitionService#collapseAppointmentHeaderAfterClientItemCancel} split
+     * (cycle-2 audit finding 1 — canonical appointments-before-bookings lock order), mirroring the
+     * existing provider per-service decline precedent: the header stays CONFIRMED while ≥1 sibling
+     * remains CONFIRMED; cancelling the LAST CONFIRMED leg collapses the header to CANCELLED (reason
+     * CLIENT_CANCELLED), carrying this cancel's note.
+     */
     @Transactional
     public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, CancelBookingRequest req) {
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle):
@@ -874,10 +904,6 @@ public class BookingService {
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .filter(b -> b.getClient() != null && b.getClient().getId().equals(clientUserId))
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
-        // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
-        // Placed before the status guard — a visit child is never individually cancellable
-        // regardless of its status, so membership is the more fundamental rejection.
-        assertNotAppointmentChild(booking);
         BookingStatus current = booking.getStatus();
         if (current != BookingStatus.CONFIRMED) {
             throw new BusinessException("Cannot cancel a booking in status %s".formatted(current));
@@ -887,6 +913,20 @@ public class BookingService {
         // mark-no-show) — the client can no longer cancel it. Checked AFTER the status guard so a
         // non-CONFIRMED booking still reports the more specific status conflict.
         assertNotElapsedForClient(booking);
+
+        // Track 27.x widening, cycle-2 audit finding 1 (lock-order inversion / deadlock risk): when
+        // this child belongs to a multi-service visit, lock the visit HEADER BEFORE this child row's
+        // own status change is written below — the canonical appointments-before-bookings lock order
+        // shared with the whole-visit transition methods (AppointmentTransitionService
+        // #lockHeaderForWholeVisitTransition). getAppointment().getId() is served off the
+        // uninitialised @ManyToOne(LAZY) proxy without a statement (same pattern
+        // BookingRepository#findByIdWithFullGraph's Javadoc documents for
+        // master.getSalon().getOwner().getId()), and appointmentId's null-check short-circuits the
+        // lock call entirely for a legacy standalone booking — ZERO extra statements on that path.
+        UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
+        boolean headerWasLocked = appointmentId != null
+                && appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId);
+
         booking.setStatus(BookingStatus.CANCELLED);
         // cancellationReason is guaranteed non-null by @NotNull on CancelBookingRequest
         booking.setCancellationReason(req.cancellationReason());
@@ -896,6 +936,14 @@ public class BookingService {
         // (see EmailNotificationService.sendClientCancelledEmail, Fix D3) never confuses the two.
         booking.setClientCancellationNote(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
+        // Phase 2 (collapse) of the header recompute — see the method Javadoc above and
+        // AppointmentTransitionService#collapseAppointmentHeaderAfterClientItemCancel. Must run AFTER
+        // the save above so the collapse UPDATE's NOT EXISTS sibling check observes this child's NEW
+        // (CANCELLED) status, not its pre-transition one.
+        if (appointmentId != null) {
+            appointmentTransitionService.collapseAppointmentHeaderAfterClientItemCancel(
+                    appointmentId, headerWasLocked, saved.getClientCancellationNote());
+        }
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
@@ -1373,14 +1421,20 @@ public class BookingService {
      * FK; its status is owned by the {@link com.beautica.booking.entity.Appointment} header,
      * which moves the header <em>and every sibling item</em> in lockstep only through the
      * {@code PATCH /appointments/{id}/...} endpoints (all-or-nothing). Transitioning a single
-     * child through {@code PATCH /bookings/{id}/cancel|decline|complete|not-complete} would
-     * desync the visit header from its items, so it is refused here with a 409.
+     * child through {@code PATCH /bookings/{id}/decline|complete|not-complete} would desync the
+     * visit header from its OTHER siblings, so it is refused here with a 409.
      *
-     * <p><b>Defense-in-depth at the service layer</b> — this is the single choke point every
-     * one of the four single-booking public transitions passes through, so no controller/API
-     * path can bypass it. It is deliberately NOT reachable from the appointment-level lockstep
-     * updates (those legitimately set item status while {@code appointment} is non-null; they
-     * never enter these {@code BookingService} entry points).
+     * <p><b>Track 27.x narrowing.</b> {@link #cancelBooking} — the fourth, CLIENT-initiated
+     * transition — deliberately stopped calling this guard: a client may now cancel exactly one
+     * leg of a visit (mobile renders one card per service), and the two-phase
+     * {@code AppointmentTransitionService#lockAppointmentHeaderBeforeClientItemCancel} /
+     * {@code #collapseAppointmentHeaderAfterClientItemCancel} pair keeps the header in sync around
+     * this method's own child-row write instead of refusing the call outright. The three
+     * PROVIDER-initiated transitions below are UNCHANGED —
+     * this remains their single choke point, so no controller/API path can bypass it for them. It
+     * is deliberately NOT reachable from the appointment-level lockstep updates (those legitimately
+     * set item status while {@code appointment} is non-null; they never enter these
+     * {@code BookingService} entry points).
      *
      * <p><b>Legacy single-service bookings</b> have {@code appointment_id = null} and pass
      * through untouched — their transition behaviour is byte-for-byte unchanged. The FK is a
