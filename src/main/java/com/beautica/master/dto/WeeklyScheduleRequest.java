@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Size;
 
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Phase 15.2: create/replace request for a master's active-window weekly template.
@@ -36,9 +37,13 @@ public record WeeklyScheduleRequest(
         // null = open-ended (subject to the service-layer horizon cap).
         LocalDate validTo,
 
+        // The element-level @NotNull is load-bearing: Hibernate Validator's @Valid cascade SKIPS null
+        // elements, so without it `{"days":[null]}` reaches isDaysUnique() below — which dereferences
+        // every element — and NPEs INSIDE the @AssertTrue getter. Hibernate Validator wraps that in a
+        // ValidationException, i.e. a 500 raised before any handler can render a 400.
         @Valid
         @Size(max = 7, message = "A weekly template may have at most 7 days")
-        List<WeeklyScheduleDayRequest> days
+        List<@NotNull(message = "A day must not be null") WeeklyScheduleDayRequest> days
 ) {
 
     @AssertTrue(message = "validTo must be on or after validFrom")
@@ -46,11 +51,22 @@ public record WeeklyScheduleRequest(
         return validTo == null || validFrom == null || !validTo.isBefore(validFrom);
     }
 
+    /**
+     * Uniqueness of {@code dayOfWeek} across the supplied days.
+     *
+     * <p>Null elements are filtered out rather than dereferenced. The element-level {@code @NotNull} on
+     * {@code days} is what reports them; this getter must not be the thing that notices, because an
+     * {@code @AssertTrue} getter runs REGARDLESS of sibling constraint outcomes or ordering — an NPE
+     * raised in here escapes as a {@code ValidationException} (500) before {@code GlobalExceptionHandler}
+     * can render the 400 the element constraint already produced. Filtering keeps each constraint
+     * reporting exactly its own concern.
+     */
     @AssertTrue(message = "dayOfWeek values must be unique")
     public boolean isDaysUnique() {
         if (days == null) {
             return true;
         }
-        return days.stream().map(WeeklyScheduleDayRequest::dayOfWeek).distinct().count() == days.size();
+        List<WeeklyScheduleDayRequest> present = days.stream().filter(Objects::nonNull).toList();
+        return present.stream().map(WeeklyScheduleDayRequest::dayOfWeek).distinct().count() == present.size();
     }
 }

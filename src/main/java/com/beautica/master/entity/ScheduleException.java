@@ -21,6 +21,7 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -88,4 +89,28 @@ public class ScheduleException extends AuditableEntity {
     )
     @Builder.Default
     private Set<OverrideDiscreteTime> discreteTimes = new LinkedHashSet<>();
+
+    /**
+     * Phase 15.12: optional, <b>display-only</b> working-window start of a {@code CUSTOM_HOURS} override —
+     * the counterpart of {@link WeeklyScheduleDayWindow} on the per-date surface. Because
+     * {@code schedule_exceptions} already IS the "one day of a schedule" row, the bounds live as two columns
+     * here rather than in a child table.
+     *
+     * <p><b>Not a source of availability.</b> The window carries no scheduling meaning: the interval list
+     * ({@link #getIntervals()}) remains the single canonical source of bookable time.
+     * {@code MasterScheduleService#resolveEffectiveDay} — and therefore
+     * {@code com.beautica.booking.service.SlotCalculationService} — never reads these columns, so a stored
+     * window can neither widen nor narrow a bookable slot.
+     *
+     * <p><b>Invariants</b> (DB CHECKs, V129): both bounds null or both set ({@code chk_exc_window_pair});
+     * {@code windowEnd > windowStart} strictly, no midnight crossing ({@code chk_exc_window_order}); set only
+     * on a {@code CUSTOM_HOURS} row ({@code chk_exc_window_kind}) — a {@code DAY_OFF} has no working window.
+     * <b>Containment</b> (the window contains every interval of the date) is a service-layer invariant.
+     */
+    @Column(name = "window_start")
+    private LocalTime windowStart;
+
+    /** Phase 15.12: display-only working-window end — see {@link #getWindowStart()} for the full contract. */
+    @Column(name = "window_end")
+    private LocalTime windowEnd;
 }

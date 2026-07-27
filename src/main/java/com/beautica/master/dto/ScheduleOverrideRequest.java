@@ -77,9 +77,13 @@ public record ScheduleOverrideRequest(
         WeekdayMode mode,
 
         // Required iff CUSTOM_HOURS + INTERVAL mode.
+        // The element-level @NotNull is load-bearing, not decoration: Hibernate Validator's @Valid cascade
+        // SKIPS null elements, so without it `{"intervals":[null]}` passes Bean Validation and NPEs in the
+        // service (assertIntervalsNonOverlapping / resolveWindow dereference each dto) — a 500 where the
+        // caller deserves a 400. Mirrors the sibling `times` list, which has always declared it.
         @Valid
         @Size(max = 6, message = "An override may have at most 6 intervals")
-        List<WorkIntervalDto> intervals,
+        List<@NotNull(message = "An interval must not be null") WorkIntervalDto> intervals,
 
         // Required iff CUSTOM_HOURS + EXPLICIT_TIMES mode (Phase 15.9).
         @Size(max = 24, message = "An override may have at most 24 discrete times")
@@ -89,26 +93,42 @@ public record ScheduleOverrideRequest(
         // never a client-supplied id list (the server always re-computes conflicts server-side).
         // No accompanying note field — see the class javadoc's D2-REVISED section: a master takes
         // a day-off/pause without justification.
-        boolean cancelOverlapping
+        boolean cancelOverlapping,
+
+        // Phase 15.12 — both null (legacy/omitted) or both set. Display-only; never widens/narrows slots.
+        LocalTime windowStart,
+
+        LocalTime windowEnd
 ) {
 
     /**
      * Pre-15.9 convenience constructor: an INTERVAL override (or DAY_OFF) with only intervals. Keeps the
      * backward-compatible call shape for callers (and the wire contract) that predate {@code mode}/{@code times}.
-     * No cancellation is requested ({@code cancelOverlapping = false}).
+     * No cancellation is requested ({@code cancelOverlapping = false}); no working window is recorded.
      */
     public ScheduleOverrideRequest(LocalDate date, ScheduleExceptionKind kind, List<WorkIntervalDto> intervals) {
-        this(date, kind, WeekdayMode.INTERVAL, intervals, null, false);
+        this(date, kind, WeekdayMode.INTERVAL, intervals, null, false, null, null);
     }
 
     /**
      * Pre-2026-07-26 convenience constructor: the full {@code mode}/{@code intervals}/{@code times}
-     * shape that predates the booking-conflict field. No cancellation is requested.
+     * shape that predates the booking-conflict field. No cancellation is requested; no working window.
      */
     public ScheduleOverrideRequest(
             LocalDate date, ScheduleExceptionKind kind, WeekdayMode mode,
             List<WorkIntervalDto> intervals, List<LocalTime> times) {
-        this(date, kind, mode, intervals, times, false);
+        this(date, kind, mode, intervals, times, false, null, null);
+    }
+
+    /**
+     * Pre-15.12 convenience constructor: the {@code cancelOverlapping} shape that predates the display-only
+     * working-window bounds. Keeps every existing caller compiling unchanged with a {@code null} window
+     * (i.e. verbatim pre-15.12 behaviour).
+     */
+    public ScheduleOverrideRequest(
+            LocalDate date, ScheduleExceptionKind kind, WeekdayMode mode,
+            List<WorkIntervalDto> intervals, List<LocalTime> times, boolean cancelOverlapping) {
+        this(date, kind, mode, intervals, times, cancelOverlapping, null, null);
     }
 
     /** The effective mode: an absent {@code mode} defaults to {@link WeekdayMode#INTERVAL}. */
@@ -121,6 +141,26 @@ public record ScheduleOverrideRequest(
                     + "or a non-empty times list (EXPLICIT_TIMES), never both")
     public boolean isKindConsistent() {
         return isKindConsistent(kind, mode, intervals, times);
+    }
+
+    /**
+     * Phase 15.12: shape of the optional working-window bounds — both omitted (legacy/absent) or both
+     * present, and strictly ordered when present (no zero-length, no midnight crossing, matching the locked
+     * Phase 15.x no-cross-midnight interval contract). Mirrors
+     * {@link WeeklyScheduleDayRequest#isWindowConsistent()} so both editor surfaces reject identically.
+     *
+     * <p>Only the SHAPE is checked here. <b>Containment</b> — the window must contain every interval of the
+     * date — needs the interval list AND the resolved kind/mode, so it lives in
+     * {@code MasterScheduleService} alongside the intra-day overlap rule. A window supplied on a
+     * {@code DAY_OFF} (or an {@code EXPLICIT_TIMES} override) is not rejected here: the working window of a
+     * closed day carries no meaning, so the service persists {@code null} and ignores it.
+     */
+    @AssertTrue(message =
+            "windowStart and windowEnd must both be provided or both omitted, and windowEnd must be "
+                    + "after windowStart")
+    public boolean isWindowConsistent() {
+        return (windowStart == null) == (windowEnd == null)
+                && (windowStart == null || windowEnd.isAfter(windowStart));
     }
 
     /**

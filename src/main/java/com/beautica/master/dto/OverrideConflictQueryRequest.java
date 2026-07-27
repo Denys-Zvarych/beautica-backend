@@ -38,9 +38,15 @@ public record OverrideConflictQueryRequest(
         // null = INTERVAL (default), mirroring ScheduleOverrideRequest#mode.
         WeekdayMode mode,
 
+        // The element-level @NotNull is load-bearing: Hibernate Validator's @Valid cascade SKIPS null
+        // elements, and isKindConsistent() only asks whether the list is non-empty — so `[null]` would
+        // validate clean. This path never reaches MasterScheduleService#assertIntervalsNonOverlapping
+        // (ScheduleOverrideConflictService#previewConflicts hands the list straight to
+        // ScheduleConflictCalculator), so there is no service-layer backstop: the null would be
+        // dereferenced in fullyCovers → NPE → 500 where the caller deserves a 400.
         @Valid
         @Size(max = 6, message = "An override may have at most 6 intervals")
-        List<WorkIntervalDto> intervals,
+        List<@NotNull(message = "An interval must not be null") WorkIntervalDto> intervals,
 
         @Size(max = 24, message = "An override may have at most 24 discrete times")
         List<@NotNull(message = "A discrete time must not be null") LocalTime> times

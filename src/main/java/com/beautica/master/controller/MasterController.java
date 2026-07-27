@@ -262,7 +262,10 @@ public class MasterController {
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
     ) {
-        return ApiResponse.ok(masterScheduleService.resolveEffectiveRange(masterId, from, to));
+        // ForDisplay: this is the surface the mobile day editor hydrates from, so it needs the Phase 15.12
+        // display-only working window to rebuild a break flush against the edge of the working day. Every
+        // other consumer of the resolver reduces to availability and calls the window-free variant.
+        return ApiResponse.ok(masterScheduleService.resolveEffectiveRangeForDisplay(masterId, from, to));
     }
 
     /**

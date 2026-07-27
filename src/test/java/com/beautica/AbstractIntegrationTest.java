@@ -75,13 +75,14 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM master_services");
         jdbcTemplate.execute("DELETE FROM service_definitions");
         jdbcTemplate.execute("DELETE FROM working_hours");
-        // Phase 15.1 / 15.8 / 15.9: schedule model. FK order — interval/discrete-time children before
-        // their parents, then weekly_schedules/schedule_exceptions before masters. working_interval_times
-        // (V84) and schedule_exception_times (V85) FK their parents with ON DELETE CASCADE, but we DELETE
-        // them explicitly here (in FK order) so cleanup does not rely on CASCADE and stays robust if that
-        // clause is ever removed.
+        // Phase 15.1 / 15.8 / 15.9 / 15.12: schedule model. FK order — interval/discrete-time/day-window
+        // children before their parents, then weekly_schedules/schedule_exceptions before masters.
+        // working_interval_times (V84), schedule_exception_times (V85) and weekly_schedule_day_windows
+        // (V129) FK their parents with ON DELETE CASCADE, but we DELETE them explicitly here (in FK order)
+        // so cleanup does not rely on CASCADE and stays robust if that clause is ever removed.
         jdbcTemplate.execute("DELETE FROM working_intervals");
         jdbcTemplate.execute("DELETE FROM working_interval_times");
+        jdbcTemplate.execute("DELETE FROM weekly_schedule_day_windows");
         jdbcTemplate.execute("DELETE FROM schedule_exception_intervals");
         jdbcTemplate.execute("DELETE FROM schedule_exception_times");
         jdbcTemplate.execute("DELETE FROM weekly_schedules");
