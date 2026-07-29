@@ -57,9 +57,21 @@ public class ServiceController {
 
     private final ServiceCatalogService serviceCatalogService;
 
-    @io.swagger.v3.oas.annotations.responses.ApiResponse(
-            responseCode = "409", description = DUPLICATE_SERVICE_409,
-            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit success response so springdoc does NOT treat the lone 409 below as the
+            // COMPLETE response set — without this it drops the auto-derived typed body and
+            // documents the endpoint with a void/empty success, which regenerates the mobile
+            // Dart client to Response<void> and breaks `res.data?.data`. useReturnTypeSchema=true
+            // makes springdoc emit the method's real return-type schema (ApiResponse<Dto>,
+            // unwrapped from ResponseEntity) under 200 — springdoc's default status for a
+            // ResponseEntity<T> return, matching the pre-regression contract the client compiles
+            // against. Annotation-only: the runtime status (201/200) is unchanged.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = DUPLICATE_SERVICE_409,
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    })
     @PostMapping("/salons/{salonId}/services")
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> addServiceToSalon(
@@ -139,9 +151,21 @@ public class ServiceController {
         return ApiResponse.ok(serviceCatalogService.getMyServices(userId));
     }
 
-    @io.swagger.v3.oas.annotations.responses.ApiResponse(
-            responseCode = "409", description = DUPLICATE_SERVICE_409,
-            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit success response so springdoc does NOT treat the lone 409 below as the
+            // COMPLETE response set — without this it drops the auto-derived typed body and
+            // documents the endpoint with a void/empty success, which regenerates the mobile
+            // Dart client to Response<void> and breaks `res.data?.data`. useReturnTypeSchema=true
+            // makes springdoc emit the method's real return-type schema (ApiResponse<Dto>,
+            // unwrapped from ResponseEntity) under 200 — springdoc's default status for a
+            // ResponseEntity<T> return, matching the pre-regression contract the client compiles
+            // against. Annotation-only: the runtime status (201/200) is unchanged.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = DUPLICATE_SERVICE_409,
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    })
     @PostMapping("/independent-masters/me/services")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> addIndependentMasterService(
@@ -166,9 +190,21 @@ public class ServiceController {
     @Operation(summary = "Bulk-create my services (first-time setup)",
             description = "Creates every selected service in one transaction. Only valid when "
                     + "the master has no active services yet (409 otherwise).")
-    @io.swagger.v3.oas.annotations.responses.ApiResponse(
-            responseCode = "409", description = DUPLICATE_SERVICE_409,
-            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit success response so springdoc does NOT treat the lone 409 below as the
+            // COMPLETE response set — without this it drops the auto-derived typed body and
+            // documents the endpoint with a void/empty success, which regenerates the mobile
+            // Dart client to Response<void> and breaks `res.data?.data`. useReturnTypeSchema=true
+            // makes springdoc emit the method's real return-type schema (ApiResponse<Dto>,
+            // unwrapped from ResponseEntity) under 200 — springdoc's default status for a
+            // ResponseEntity<T> return, matching the pre-regression contract the client compiles
+            // against. Annotation-only: the runtime status (201/200) is unchanged.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = DUPLICATE_SERVICE_409,
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    })
     @PostMapping("/independent-masters/me/services/bulk")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMyServices(
@@ -198,9 +234,21 @@ public class ServiceController {
             description = "Creates every selected service for the given master in one "
                     + "transaction. Only valid when the master has no active services yet "
                     + "(409 otherwise).")
-    @io.swagger.v3.oas.annotations.responses.ApiResponse(
-            responseCode = "409", description = DUPLICATE_SERVICE_409,
-            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit success response so springdoc does NOT treat the lone 409 below as the
+            // COMPLETE response set — without this it drops the auto-derived typed body and
+            // documents the endpoint with a void/empty success, which regenerates the mobile
+            // Dart client to Response<void> and breaks `res.data?.data`. useReturnTypeSchema=true
+            // makes springdoc emit the method's real return-type schema (ApiResponse<Dto>,
+            // unwrapped from ResponseEntity) under 200 — springdoc's default status for a
+            // ResponseEntity<T> return, matching the pre-regression contract the client compiles
+            // against. Annotation-only: the runtime status (201/200) is unchanged.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = DUPLICATE_SERVICE_409,
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    })
     @PostMapping("/salons/{salonId}/masters/{masterId}/services/bulk")
     @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMasterServices(
@@ -237,9 +285,21 @@ public class ServiceController {
      * authenticated principal. No redundant role guard is added at the controller level
      * because ownership implies the required role (anti-bug §D).
      */
-    @io.swagger.v3.oas.annotations.responses.ApiResponse(
-            responseCode = "409", description = DUPLICATE_SERVICE_409,
-            content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit success response so springdoc does NOT treat the lone 409 below as the
+            // COMPLETE response set — without this it drops the auto-derived typed body and
+            // documents the endpoint with a void/empty success, which regenerates the mobile
+            // Dart client to Response<void> and breaks `res.data?.data`. useReturnTypeSchema=true
+            // makes springdoc emit the method's real return-type schema (ApiResponse<Dto>,
+            // unwrapped from ResponseEntity) under 200 — springdoc's default status for a
+            // ResponseEntity<T> return, matching the pre-regression contract the client compiles
+            // against. Annotation-only: the runtime status (201/200) is unchanged.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = DUPLICATE_SERVICE_409,
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+    })
     @PatchMapping("/services/{serviceDefId}")
     @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> updateServiceDefinition(

@@ -384,7 +384,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 CASE WHEN s.id IS NOT NULL THEN s.locationNote ELSE mu.locationNote END,
                 sd.category,
                 CASE WHEN r.id IS NOT NULL THEN true ELSE false END,
-                b.priceMaxAtBooking
+                b.priceMaxAtBooking,
+                b.appointment.id,
+                b.client.avatarUrl
             )
             FROM Booking b
             JOIN b.client
@@ -403,7 +405,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     /**
      * <b>Guest (LINK) bookings ({@code client_id IS NULL}, V89) must resolve here too</b> —
      * {@code client} is a {@code LEFT JOIN FETCH}, not an inner join. An inner join here
-     * silently excludes every null-client row, which made {@code loadBookingOrThrow} (backing
+     * silently excludes every null-client row, which made the provider transition paths (backing
      * {@code /complete}, {@code /decline}, {@code /not-complete}) and {@code getBooking}
      * ({@code GET /bookings/{id}}) 404 for ANY guest booking — the entire provider-side guest
      * lifecycle was unreachable (CRITICAL finding, track 24.7 audit). See
@@ -422,8 +424,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      *       {@code getOwner() != null} guards never initialise it and never evaluate false.</li>
      * </ol>
      * The fetch therefore cost an extra join into {@code users} plus a full {@code User} row
-     * ({@code password_hash} included) on all six callers — {@code BookingService} (getBooking,
-     * loadBookingOrThrow and the cancel/reschedule paths) and {@code ReviewService#createReview} —
+     * ({@code password_hash} included) on all six callers — {@code BookingService} (getBooking and
+     * the decline/complete/cancel/reschedule paths) and {@code ReviewService#createReview} —
      * and bought nothing. Pinned by
      * {@code BookingPriceRangeContractIT#should_notHydrateTheSalonOwner_when_loadingABookingDetail}:
      * a statement count cannot detect a re-added fetch join (a fetch join widens an existing join
@@ -442,6 +444,31 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.id = :id
             """)
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
+
+    /**
+     * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt} so the
+     * items read back in the exact back-to-back order they were performed.
+     *
+     * <p>Naturally bounded — a visit holds at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT}
+     * (10) rows — so no {@code Pageable} is needed (§E-3). Rides the partial index
+     * {@code idx_bookings_appointment} (V125, {@code WHERE appointment_id IS NOT NULL}). Hydrates the
+     * SAME graph as {@link #findByIdWithFullGraph} ({@code master.user}, {@code master.salon},
+     * {@code masterService.serviceDefinition}) so {@code AppointmentDetailResponse.from} reads the
+     * master summary + per-item service name with no lazy load or N+1. {@code b.client} is deliberately
+     * NOT fetched — the appointment header carries the client, and the item projection does not read
+     * it.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon s
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id = :appointmentId
+            ORDER BY b.startsAt ASC
+            """)
+    List<Booking> findByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
 
     // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
@@ -577,6 +604,35 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("excludeBookingId") UUID excludeBookingId
     );
 
+    /**
+     * Overlap check that excludes an ENTIRE visit's own chained rows — the appointment-level
+     * (BE-4 reschedule) analogue of {@link #existsOverlapExcluding}. A multi-service visit
+     * occupies N {@code bookings} rows (all sharing {@code appointment_id}), so a single
+     * {@code id <> :excludeBookingId} exclusion is not enough when re-planning the WHOLE block:
+     * the new span can legitimately overlap several of the visit's OWN current rows.
+     * {@code appointment_id IS DISTINCT FROM :appointmentId} is null-safe (legacy single-service
+     * bookings carry a {@code NULL appointment_id} and are never excluded by this predicate).
+     * Same predicate otherwise as {@link #existsOverlap} (CONFIRMED rows only, half-open interval
+     * overlap). Callers must hold the per-master advisory lock (see {@link #acquireAdvisoryLock(UUID)})
+     * before invoking, identical to the single-booking reschedule flow.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+              SELECT 1 FROM bookings
+               WHERE master_id = :masterId
+                 AND appointment_id IS DISTINCT FROM :appointmentId
+                 AND status = 'CONFIRMED'
+                 AND starts_at < :requestedEndsAt
+                 AND ends_at   > :requestedStartsAt
+            )
+            """, nativeQuery = true)
+    boolean existsOverlapExcludingAppointment(
+            @Param("masterId") UUID masterId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("appointmentId") UUID appointmentId
+    );
+
     // ── Client-scoped conflict check (cross-master/salon double-booking) ─────────
     /**
      * Id of the client's earliest {@code CONFIRMED} booking — with ANY
@@ -630,6 +686,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     );
 
     /**
+     * Same as {@link #findFirstConflictingClientBookingIdExcluding} but excludes an ENTIRE visit's
+     * own chained rows via {@code appointment_id} — the appointment-level (BE-4 reschedule)
+     * analogue, used when re-planning a whole multi-service visit rather than one booking. Null-safe
+     * the same way {@link #existsOverlapExcludingAppointment} is.
+     */
+    @Query(value = """
+            SELECT id FROM bookings
+             WHERE client_id = :clientId
+               AND appointment_id IS DISTINCT FROM :appointmentId
+               AND status = 'CONFIRMED'
+               AND starts_at < :requestedEndsAt
+               AND ends_at   > :requestedStartsAt
+             ORDER BY starts_at ASC
+             LIMIT 1
+            """, nativeQuery = true)
+    Optional<UUID> findFirstConflictingClientBookingIdExcludingAppointment(
+            @Param("clientId") UUID clientId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("appointmentId") UUID appointmentId
+    );
+
+    /**
      * Fused, single-round-trip form of the per-client advisory lock: sets this transaction's
      * {@code lock_timeout} to 3s via {@code set_config('lock_timeout', '3s', true)} — the
      * {@code is_local=true} third argument makes this functionally identical to
@@ -671,7 +750,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * <p>A session that waits longer than {@code lock_timeout} aborts the lock wait with
      * Postgres {@code 55P03 lock_not_available}. Hibernate/Spring exception translation
      * surfaces this as {@link org.springframework.dao.CannotAcquireLockException} — mapped to
-     * a clean 409 by {@code GlobalExceptionHandler#handleCannotAcquireLock} — instead of
+     * a clean 409 by {@code GlobalExceptionHandler#handlePessimisticLockingFailure} — instead of
      * parking the connection for the full Hikari connection-timeout (20 s) or surfacing a
      * bare 500.
      */
@@ -739,6 +818,97 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     Optional<BookingCompletionAccess> findCompletionAccessById(@Param("bookingId") UUID bookingId);
 
+    /**
+     * All-rows visit-level (BE-4 reschedule) analogue of {@link #findCompletionAccessById}, backing
+     * BOTH {@code AuthorizationService.canRescheduleAppointment} AND {@code
+     * AuthorizationService.enforceCanManageAppointment} — the pre-lock authorization check for the
+     * whole-visit decline/complete/not-complete transitions AND the per-ITEM {@code
+     * declineAppointmentItem}. A visit is single-master (BE-1 locked design) BY CONSTRUCTION of the
+     * only writers that create chained bookings ({@code VisitPlanner.planChainedItems} resolves
+     * every item off one {@code Master}) — but that invariant has no DB constraint behind it:
+     * nothing in the schema (see {@code V124__create_appointments.sql} / {@code
+     * V125__add_bookings_appointment_id.sql}) enforces that a future writer cannot append a
+     * different-master item. This query therefore fetches EVERY row, deterministically ordered by
+     * {@code b.id}, and every caller must require provider authority over ALL of them, not just the
+     * first — trusting a single arbitrary row (the previous {@code Limit.of(1)} overload, removed)
+     * would silently authorize the whole visit off one item's master, an authorization bypass the
+     * moment a mixed-master visit exists. Cheap regardless: a visit is capped at {@code
+     * SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows, §E-3), so this is at most a 10-row
+     * projection read — no {@code JOIN FETCH}, same shape as the previous capped query. Returns
+     * empty when the appointment does not exist or has no items (fail-closed at the caller).
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingCompletionAccess(
+                bm.user.id,
+                bs.id
+            )
+            FROM Booking b
+            JOIN b.master bm
+            JOIN bm.user
+            LEFT JOIN bm.salon bs
+            WHERE b.appointment.id = :appointmentId
+            ORDER BY b.id
+            """)
+    List<BookingCompletionAccess> findAllCompletionAccessByAppointmentId(
+            @Param("appointmentId") UUID appointmentId);
+
+    // ── Schedule-override conflict check (2026-07-26 design) ──────────────────
+
+    /**
+     * Candidates for the "schedule override over existing bookings" conflict check: every
+     * {@code CONFIRMED} booking of {@code masterId} whose {@code startsAt} falls in
+     * {@code [notBefore, windowEnd)} — ONE query for the caller's WHOLE requested date range
+     * (Anti-Bug §E — never one query per expanded date), joined exactly enough to render an
+     * {@code OverrideConflictResponse} (client/guest name, service name) and to route the eventual
+     * cancellation ({@code appointmentId}, nullable — standalone vs. appointment-child decline).
+     *
+     * <p>{@code notBefore} folds BOTH lower bounds the design's conflict rule needs — "the date
+     * range starts here" and "never a booking that already started/is past on today's date" — into
+     * ONE comparison: the caller passes {@code max(rangeStart, now)}, computed once against the
+     * injected {@code Clock} (never {@code Instant.now()} — Anti-Bug §G).
+     *
+     * <p>{@code b.client} is a {@code LEFT JOIN}, not the implicit inner-join path — a guest
+     * (LINK) booking's {@code client_id} is {@code NULL} (V89), and an inner join here would
+     * silently exclude every guest conflict, the same defect class {@link #findByIdWithFullGraph}'s
+     * javadoc documents at length.
+     *
+     * <p><b>{@code pageable} (backend-perf audit finding 3, 2026-07-26 re-audit).</b> The caller
+     * passes an UNSORTED {@link Pageable} purely to cap the number of rows returned (Spring Data
+     * translates it to a plain SQL {@code LIMIT}/{@code OFFSET} — the query's own
+     * {@code ORDER BY b.startsAt ASC} above is untouched, since the {@code Pageable} carries no
+     * {@code Sort} of its own). Without this, a caller scanning a range up to 366 days wide could
+     * pull every {@code CONFIRMED} booking the master has in that whole span into memory before any
+     * filtering ever ran. See {@code ScheduleOverrideConflictService#MAX_CANDIDATES_SCANNED}'s
+     * javadoc for the caller-side cap value and rationale.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.OverrideConflictCandidate(
+                b.id,
+                b.appointment.id,
+                b.startsAt,
+                b.endsAt,
+                b.client.firstName,
+                b.client.lastName,
+                b.guestName,
+                b.guestSurname,
+                sd.name
+            )
+            FROM Booking b
+            LEFT JOIN b.client
+            JOIN b.masterService ms
+            JOIN ms.serviceDefinition sd
+            WHERE b.master.id = :masterId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt >= :notBefore
+              AND b.startsAt < :windowEnd
+            ORDER BY b.startsAt ASC
+            """)
+    List<OverrideConflictCandidate> findConfirmedCandidatesForOverrideConflictCheck(
+            @Param("masterId") UUID masterId,
+            @Param("notBefore") OffsetDateTime notBefore,
+            @Param("windowEnd") OffsetDateTime windowEnd,
+            Pageable pageable);
+
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
     // but should be revisited if the platform scales significantly.
@@ -758,8 +928,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Fused, single-round-trip form of the per-master advisory lock for callers that take
-     * ONLY the master lock (no client lock beforehand) — currently just
-     * {@code GuestBookingService#persistBooking}. Sets this transaction's {@code lock_timeout}
+     * ONLY the master lock (no client lock beforehand). Originally just
+     * {@code GuestBookingService#persistBooking}; now also used by the no-client-lock (guest
+     * visit) branch of {@code BookingService#rescheduleBooking} and
+     * {@code AppointmentTransitionService#rescheduleAppointment} (a guest booking/visit has no
+     * client account to lock or conflict-check against), and by
+     * {@code ScheduleOverrideConflictService#applyOverrideWithConflictHandling} (the
+     * schedule-override write is master-scoped only — it never takes a client lock at all,
+     * regardless of whether the conflicting bookings it may decline are guest or registered-client).
+     * Sets this transaction's {@code lock_timeout}
      * to 3s via {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent
      * to {@code SET LOCAL}) AND acquires the salt-{@code 0} advisory lock in the SAME
      * statement/round-trip — see {@link #acquireClientAdvisoryLockWithTimeout(UUID)} for the
@@ -771,9 +948,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * unbounded lock wait there is an equally viable advisory-lock DoS vector as the
      * authenticated path — hence the timeout is fused here too, not just on the client lock.
      *
-     * <p>{@code BookingService} does NOT use this method for its own master lock: it always
-     * takes the client lock first via {@link #acquireClientAdvisoryLockWithTimeout(UUID)},
-     * which already sets the transaction-scoped timeout, so its later master lock uses the
+     * <p>Every OTHER caller that takes a client lock first (e.g. {@code BookingService}'s own
+     * registered-client create/reschedule path) does NOT use this method for its master lock: the
+     * client lock already sets the transaction-scoped timeout via
+     * {@link #acquireClientAdvisoryLockWithTimeout(UUID)}, so the later master lock uses the
      * plain {@link #acquireAdvisoryLock(UUID)} — re-applying the timeout there would be a
      * redundant round trip.
      */
@@ -796,12 +974,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * job inside its transaction, so the {@code masterService}/{@code serviceDefinition}
      * graph is joined to render the reminder text without a lazy load.
      */
+    // {@code LEFT JOIN FETCH b.appointment} (BE-7): a multi-service guest visit's N item rows share one
+    // appointment_id, so the reminder sweep groups by it to send ONE reminder per visit (not one per
+    // item). The fetch hydrates the header eagerly so BookingReminderJob can read appointment id with no
+    // lazy load / N+1; legacy single guest bookings LEFT-join to a null header and each get their own
+    // reminder, unchanged.
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
             JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
+            LEFT JOIN FETCH b.appointment
             WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
               AND b.reminderSent = false
               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
@@ -810,6 +994,47 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<Booking> findGuestBookingsForReminder(
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to);
+
+    // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
+    /**
+     * Cancels every still-{@code CONFIRMED} child booking of a guest visit in ONE conditional UPDATE:
+     * flips each to {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls its per-item cancel
+     * token (V91 permits a NULL token on a terminal LINK row). Called by
+     * {@code GuestVisitCancellationService} right after {@code AppointmentRepository#consumeCancelToken}
+     * wins the header race, so the header and all N items reach {@code CANCELLED} atomically in the same
+     * transaction — freeing every item's slot (the {@code no_overlapping_bookings} EXCLUDE predicate is
+     * {@code status = 'CONFIRMED'} only). Rides the partial index {@code idx_bookings_appointment}.
+     *
+     * @return the number of item rows cancelled
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
+                   b.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
+                   b.cancelToken = null
+             WHERE b.appointment.id = :appointmentId
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    int cancelItemsByAppointmentId(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Marks every item of the given guest visits as reminded (BE-7). Called by
+     * {@code BookingReminderJob} after it sends ONE reminder per visit: this flips ALL of a visit's
+     * item rows — including any tail item whose own {@code starts_at} falls outside the sweep's 2h
+     * reminder window (a visit can span up to 10h) — so no later sweep can re-remind the visit's tail.
+     * Bounded to the visits actually reminded in one sweep.
+     *
+     * @return the number of item rows updated
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.reminderSent = true
+             WHERE b.appointment.id IN :appointmentIds
+               AND b.reminderSent = false
+            """)
+    int markVisitRemindersSentByAppointmentIds(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
     /**
@@ -822,6 +1047,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      *
      * <p>A consumed token is {@code NULL} (set by {@link #consumeCancelToken}), so a
      * replayed link returns empty → 404 (no info leak about token state).
+     *
+     * <p><b>BE-7 (guest visits).</b> The {@code b.appointment IS NULL} guard confines this legacy
+     * single-booking path to true standalone guest bookings. A multi-service visit's child item
+     * carries its own per-item {@code cancel_token} (mandated by the V91 {@code chk_bookings_guest_fields}
+     * CHECK) but MUST only be cancellable as a whole visit via the header token
+     * ({@code GuestVisitCancellationService}). Were a per-item token accepted here it would cancel one
+     * item and desync the {@code Appointment} header + siblings. Excluding {@code appointment_id IS NOT
+     * NULL} makes such a token resolve to empty → the existing 404 path, identical to an unknown token
+     * (no state oracle).
      */
     @Query("""
             SELECT b FROM Booking b
@@ -830,6 +1064,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.cancelToken = :cancelToken
+              AND b.appointment IS NULL
             """)
     Optional<Booking> findByCancelTokenWithGraph(@Param("cancelToken") UUID cancelToken);
 

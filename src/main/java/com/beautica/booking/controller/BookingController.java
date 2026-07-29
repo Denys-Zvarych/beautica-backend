@@ -191,8 +191,11 @@ public class BookingController {
         return ResponseEntity.noContent().build();
     }
 
+    // Role-only gate here + service-layer @authz.enforceCanCancelBooking ownership guard in
+    // BookingService#notCompleteBooking (§D — ownership enforced once, in the service). Mirrors
+    // the sibling AppointmentController /not-complete, which is likewise role-only.
     @PatchMapping("/{bookingId}/not-complete")
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') and @authz.canCancelBooking(authentication, #bookingId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
     public ResponseEntity<Void> notCompleteBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody StatusUpdateRequest req,
@@ -203,21 +206,26 @@ public class BookingController {
     }
 
     /**
-     * Moves the authenticated client's own booking to a new future time.
+     * Moves a booking to a new future time — the client's own booking, OR (Phase 27.2 — REVERSES
+     * the previously-locked "reschedule is client-only" decision) the provider (salon owner /
+     * assigned salon admin / independent master) with authority over it.
      *
      * <p>Actor is resolved from the security principal — never from the body. Returns the
      * existing {@link BookingDetailResponse} shape (the same view {@code GET /bookings/{id}}
-     * returns); Phase 19.3 will enrich this DTO. Errors: {@code 409} on a conflicting slot or
-     * a non-CONFIRMED source state, {@code 403} for a non-owner, {@code 400} for a bad time.
+     * returns). Errors: {@code 409} on a conflicting slot, a non-CONFIRMED source state, or
+     * (provider path) an already-elapsed current booking; {@code 403} for a non-owner/non-
+     * authorized provider; {@code 400} for a bad new time.
      */
     @PatchMapping("/{bookingId}/reschedule")
-    @PreAuthorize("hasRole('CLIENT')")
+    @PreAuthorize("hasRole('CLIENT') or (hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') "
+            + "and @authz.canRescheduleBooking(authentication, #bookingId))")
     public ApiResponse<BookingDetailResponse> rescheduleBooking(
             @PathVariable UUID bookingId,
             @Valid @RequestBody RescheduleBookingRequest req,
             Authentication auth
     ) {
-        return ApiResponse.ok(bookingService.rescheduleBooking(AuthenticationUtils.userId(auth), bookingId, req));
+        return ApiResponse.ok(bookingService.rescheduleBooking(
+                AuthenticationUtils.userId(auth), AuthenticationUtils.role(auth), bookingId, req));
     }
 
     @PatchMapping("/{bookingId}/cancel")

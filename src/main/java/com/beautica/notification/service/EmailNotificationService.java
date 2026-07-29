@@ -125,6 +125,20 @@ public class EmailNotificationService {
         send(to, "Бронювання перенесено", "email/booking-rescheduled-provider", ctx);
     }
 
+    /**
+     * Client-facing twin of {@link #sendBookingRescheduledEmail} (Phase 27.3) — sent when a
+     * PROVIDER moves a booking, mirroring that method's structure/variables exactly, re-addressed
+     * to the client with client-appropriate copy.
+     */
+    public void sendBookingRescheduledClientEmail(String to, Booking booking) {
+        var ctx = new Context();
+        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        send(to, "Бронювання перенесено", "email/booking-rescheduled-client", ctx);
+    }
+
     public void sendBookingConfirmedEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));

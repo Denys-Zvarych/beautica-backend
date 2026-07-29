@@ -49,6 +49,7 @@ class ReviewServiceCacheTest {
 
     @MockBean ReviewRepository reviewRepository;
     @MockBean BookingRepository bookingRepository;
+    @MockBean com.beautica.booking.repository.AppointmentRepository appointmentRepository;
     @MockBean SalonRepository salonRepository;
     @MockBean MasterRepository masterRepository;
     @MockBean ApplicationEventPublisher eventPublisher;

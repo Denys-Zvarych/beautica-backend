@@ -46,8 +46,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * ({@code "mbmsf-salon-master-"} vs {@code "mbbd-salon-master-"}) — that field is never read back
  * by any caller (both suites address the master purely via {@link SalonFixture#masterId()}), so it
  * was safe to unify on a single generic prefix rather than threading a caller-supplied one through.
+ *
+ * <p><b>{@code public} (cycle-2 audit finding 5).</b> The class and the handful of members below
+ * used cross-package by {@code com.beautica.booking.service.AppointmentClientLegCancelConcurrencyIT}
+ * / {@code AppointmentCrossPathTransitionConcurrencyIT} are {@code public} specifically so those
+ * two concurrency regression tests can live in {@code com.beautica.booking.service} — the same
+ * package as {@code AppointmentTransitionService} — which in turn lets the header-lock methods they
+ * {@code @SpyBean} stay package-private instead of being forced {@code public} purely for test
+ * reachability. This is test-only source ({@code src/test}), never shipped.
  */
-class BookingTestFixtures {
+public class BookingTestFixtures {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
@@ -56,7 +64,7 @@ class BookingTestFixtures {
     private final ObjectMapper objectMapper;
     private final PasswordEncoder passwordEncoder;
 
-    BookingTestFixtures(
+    public BookingTestFixtures(
             TestRestTemplate restTemplate,
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
@@ -68,7 +76,7 @@ class BookingTestFixtures {
         this.passwordEncoder = passwordEncoder;
     }
 
-    UUID createUser(String email, String role, UUID salonId) {
+    public UUID createUser(String email, String role, UUID salonId) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
@@ -77,7 +85,7 @@ class BookingTestFixtures {
         return id;
     }
 
-    UUID createIndependentMaster(String email) {
+    public UUID createIndependentMaster(String email) {
         UUID userId = createUser(email, "INDEPENDENT_MASTER", null);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -87,7 +95,7 @@ class BookingTestFixtures {
         return masterId;
     }
 
-    UUID createIndependentMasterService(UUID masterId) {
+    public UUID createIndependentMasterService(UUID masterId) {
         UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -149,7 +157,7 @@ class BookingTestFixtures {
                 UUID.class, ownerType, ownerId);
     }
 
-    String tokenFor(String email) throws Exception {
+    public String tokenFor(String email) throws Exception {
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(resp.getStatusCode()).as("login must succeed for %s", email).isEqualTo(HttpStatus.OK);
@@ -157,7 +165,7 @@ class BookingTestFixtures {
                 .data().accessToken();
     }
 
-    HttpHeaders bearerHeaders(String token) {
+    public HttpHeaders bearerHeaders(String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);

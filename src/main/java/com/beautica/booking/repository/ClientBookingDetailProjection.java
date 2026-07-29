@@ -81,6 +81,21 @@ public record ClientBookingDetailProjection(
         String locationNote,
         String categoryName,
         boolean reviewExists,
-        BigDecimal priceMaxAtBooking
+        BigDecimal priceMaxAtBooking,
+        // BE-5: the visit (appointments) this booking belongs to, or null for a legacy single-service
+        // booking. SELECT-only via the FK column (b.appointment.id), never a join — a null FK yields
+        // null here and the row is NOT filtered out, so every legacy booking still appears with a
+        // null appointmentId. Populates BookingDetailResponse.appointmentId on the CLIENT
+        // GET /bookings/me projection path.
+        UUID appointmentId,
+        // The client's own avatar, read as b.client.avatarUrl off the ALREADY-PRESENT `JOIN
+        // b.client` — no additional join, no additional query. Present here purely so the shared
+        // BookingDetailResponse does not diverge by role: the PROVIDER path populates
+        // clientAvatarUrl (that is the feature — the master timeline's client photo), so leaving
+        // it null here would make one endpoint return a field whose emptiness encodes the
+        // CALLER's role rather than the data. On this CLIENT-scoped path the value is simply the
+        // caller's own photo. Appended last, after the UUID appointmentId, for the same
+        // compile-time-slip-detection reason as priceMaxAtBooking above.
+        String clientAvatarUrl
 ) {
 }

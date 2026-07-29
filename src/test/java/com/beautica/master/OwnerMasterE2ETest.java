@@ -41,6 +41,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -256,6 +257,21 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
                 .as("booking must be CONFIRMED in DB immediately after creation")
                 .isEqualTo("CONFIRMED");
         log.debug("Step 7 complete — bookingId={} auto-confirmed", bookingId);
+
+        // ── Step 7.5: fast-forward the booking's startsAt into the past ────────
+        // BookingTemporalGuard.assertElapsedForComplete (Phase 27.1, already committed on this
+        // branch) requires startsAt <= now before a booking can be completed — this fixture books
+        // 2 days ahead (Step 7) so BookingStartsAtValidator's lead-time floor is satisfied at CREATE
+        // time, then immediately called /complete, which the guard now (correctly) rejects with 409.
+        // BookingStartsAtValidator forbids creating a booking in the past outright, so the only way
+        // to get an elapsed CONFIRMED booking is to create it in the future and fast-forward its
+        // startsAt afterwards — via a direct SQL update, never by weakening or bypassing the guard
+        // itself. Only starts_at moves; the booking has no other master booking to overlap with in
+        // this isolated test, so no exclusion constraint is at risk.
+        jdbcTemplate.update(
+                "UPDATE bookings SET starts_at = ? WHERE id = ?",
+                OffsetDateTime.now(KYIV).minusMinutes(5), bookingId);
+        log.debug("Step 7.5 complete — bookingId={} startsAt fast-forwarded into the past", bookingId);
 
         // ── Step 8: owner completes the booking ───────────────────────────────
         ResponseEntity<Void> completeResp = restTemplate.exchange(

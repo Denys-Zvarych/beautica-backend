@@ -53,6 +53,7 @@ class BookingCancellationServiceTest {
     private static final String GUEST_PHONE = "+380501234567";
     private static final OffsetDateTime NOW = OffsetDateTime.parse("2026-06-01T10:00:00Z");
 
+    @Mock private GuestVisitCancellationService guestVisitCancellationService;
     @Mock private BookingRepository bookingRepository;
     @Mock private NotificationOutboxService outboxService;
     @Mock private SmsService smsService;
@@ -64,8 +65,8 @@ class BookingCancellationServiceTest {
     @BeforeEach
     void setUp() {
         service = new BookingCancellationService(
-                bookingRepository, outboxService, smsService, slotCalculationService,
-                new BookingSmsProperties(), salonCatalogCacheEvictor,
+                guestVisitCancellationService, bookingRepository, outboxService, smsService,
+                slotCalculationService, new BookingSmsProperties(), salonCatalogCacheEvictor,
                 Clock.fixed(NOW.toInstant(), ZoneOffset.UTC));
     }
 

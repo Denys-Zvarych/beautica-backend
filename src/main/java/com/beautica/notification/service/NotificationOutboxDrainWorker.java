@@ -289,7 +289,14 @@ public class NotificationOutboxDrainWorker {
             case NEW_BOOKING      -> notificationService.notifyNewBooking(getBooking(entry, bookingCache));
             case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(getBooking(entry, bookingCache));
             case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
-            case BOOKING_RESCHEDULED -> notificationService.notifyBookingRescheduled(getBooking(entry, bookingCache));
+            case BOOKING_RESCHEDULED -> {
+                Booking booking = getBooking(entry, bookingCache);
+                if (resolveRescheduleInitiatedByProvider(entry)) {
+                    notificationService.notifyBookingRescheduledClient(booking);
+                } else {
+                    notificationService.notifyBookingRescheduled(booking);
+                }
+            }
             case REVIEW_REQUESTED -> notificationService.notifyReviewRequested(getBooking(entry, bookingCache));
             case INVITE -> {
                 Map<String, String> p = readJson(entry.getPayload());
@@ -309,6 +316,22 @@ public class NotificationOutboxDrainWorker {
                 );
             }
         }
+    }
+
+    /**
+     * Reads the {@code BOOKING_RESCHEDULED} payload's {@code initiatedBy} field (Phase 27.3).
+     * {@code true} routes the notification to the client ({@code
+     * notifyBookingRescheduledClient}); {@code false} (or an absent/null payload — a PENDING row
+     * written before this field existed) keeps the pre-27.3 provider-facing notification, the
+     * documented backward-compatible default (see {@code NotificationOutboxService
+     * #enqueueBookingRescheduled(UUID, boolean)}).
+     */
+    private boolean resolveRescheduleInitiatedByProvider(NotificationOutboxEntry entry) {
+        String payload = entry.getPayload();
+        if (payload == null || payload.isBlank()) {
+            return false;
+        }
+        return "PROVIDER".equals(readJson(payload).get("initiatedBy"));
     }
 
     private Booking getBooking(NotificationOutboxEntry entry, Map<UUID, Booking> cache) {

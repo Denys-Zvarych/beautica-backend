@@ -22,6 +22,7 @@ import com.beautica.master.entity.ScheduleExceptionInterval;
 import com.beautica.master.entity.ScheduleExceptionKind;
 import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.entity.WeeklySchedule;
+import com.beautica.master.entity.WeeklyScheduleDayWindow;
 import com.beautica.master.entity.WorkingInterval;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.repository.ScheduleExceptionRepository;
@@ -40,6 +41,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -52,9 +54,22 @@ import java.util.stream.Collectors;
  * the repository finders are intentionally unscoped, so this service is the only gate. A master can
  * never read or write another master's schedule.
  *
- * <p><b>OQ-1 (always allow).</b> No {@code BookingRepository} dependency: override/day-off writes never
- * query, cancel, or notify bookings. <b>OQ-3 (gaps).</b> An uncovered date resolves to
- * {@link EffectiveDaySource#NO_SCHEDULE} with empty intervals.
+ * <p><b>OQ-1 — REVERSED (2026-07-26 design, "schedule override over existing bookings").</b> This
+ * class itself still has no {@code BookingRepository} dependency and {@link #upsertOverride} still
+ * performs an unconditional write when called directly — it remains the low-level "just persist
+ * this override" primitive, and stays booking-agnostic on purpose (no cross-feature repository
+ * coupling in this class; see {@code AuthorizationService}/{@code hasManagementAccess} for the only
+ * kind of cross-feature reach this service makes). The former "always allowed, never blocked by nor
+ * mutating existing bookings" guarantee is what changed: {@code POST /overrides/{date}} is no
+ * longer wired to call this method directly. It is wired to
+ * {@code com.beautica.booking.service.ScheduleOverrideConflictService#applyOverrideWithConflictHandling},
+ * which recomputes conflicting {@code CONFIRMED} bookings inside the SAME write transaction, either
+ * rejects the write with a 409 (no {@code cancelOverlapping} consent) or declines every conflict
+ * (via the existing single-booking/appointment-child decline paths) immediately after calling this
+ * method. Any OTHER future caller of {@link #upsertOverride} — bypassing that orchestrator — reverts
+ * to the old unconditional-write behaviour; there is intentionally no enforcement inside this class
+ * that prevents that, exactly as there was none enforcing OQ-1 before. <b>OQ-3 (gaps).</b> An
+ * uncovered date resolves to {@link EffectiveDaySource#NO_SCHEDULE} with empty intervals.
  *
  * <p><b>No N+1.</b> {@link #resolveEffectiveRange} bulk-loads overrides and overlapping templates for the
  * whole window in two queries, then folds each date in-memory via {@link DateRange}.
@@ -134,8 +149,21 @@ public class MasterScheduleService {
     // ---- Step 3: per-date override upsert -----------------------------------------------
 
     /**
-     * Upserts a single per-date override (DAY_OFF or CUSTOM_HOURS). OQ-1: always allowed — never blocked
-     * by, nor mutating, existing bookings. Replaces the override's intervals atomically.
+     * Upserts a single per-date override (DAY_OFF or CUSTOM_HOURS): loads/authorizes the master,
+     * rejects a past date, validates kind/mode consistency, then atomically replaces the override's
+     * intervals. Always writes unconditionally — it does not itself query, cancel, or notify
+     * {@code CONFIRMED} bookings that the new intended availability no longer covers.
+     *
+     * <p><b>Former OQ-1 ("always allowed") is reversed at the endpoint level, not in this method
+     * body.</b> See the class-level javadoc's "OQ-1 — REVERSED" section:
+     * {@code ScheduleOverrideConflictService#applyOverrideWithConflictHandling} is the only
+     * production caller (via {@code MasterController}'s {@code PUT /overrides/{date}}), and it is
+     * the one that recomputes booking conflicts and either rejects the write (409, no consent) or
+     * declines the conflicting bookings right after this method returns, inside the same
+     * transaction. Calling this method directly — as the existing {@code MasterScheduleServiceIT} /
+     * {@code MasterScheduleEdgeCaseIT} / {@code MasterScheduleSecurityIT} suites still do — retains
+     * the original unconditional-write behaviour with zero conflict handling, by design (those
+     * suites exercise the override CRUD invariants in isolation from the booking-conflict feature).
      */
     @Transactional
     public ScheduleOverrideResponse upsertOverride(
@@ -156,13 +184,51 @@ public class MasterScheduleService {
         // EXPLICIT_TIMES override contributes no intervals. A DAY_OFF clears both.
         boolean explicitTimes = request.kind() == ScheduleExceptionKind.CUSTOM_HOURS
                 && request.effectiveMode() == WeekdayMode.EXPLICIT_TIMES;
-        replaceOverrideIntervals(override, request.kind() == ScheduleExceptionKind.CUSTOM_HOURS && !explicitTimes
-                ? request.intervals() : List.of());
+        List<WorkIntervalDto> overrideIntervals =
+                request.kind() == ScheduleExceptionKind.CUSTOM_HOURS && !explicitTimes
+                        ? request.intervals() : List.of();
+        // Phase 15.12: display-only working window. resolveWindow yields null for a DAY_OFF and for an
+        // EXPLICIT_TIMES override (both pass an empty interval list here), so a mode/kind flip clears the
+        // stored bounds exactly as it clears the opposite child collection.
+        //
+        // ORDER MATTERS: this must run BEFORE replaceOverrideIntervals/replaceOverrideDiscreteTimes.
+        // Both of those flush() mid-method (to force orphan DELETEs ahead of the re-INSERTs), and that
+        // flush writes the parent row too. Setting kind=DAY_OFF above while window_start/window_end still
+        // hold a previous CUSTOM_HOURS row's values would make the flushed row violate
+        // chk_exc_window_kind ("a window only exists on CUSTOM_HOURS") and fail the whole upsert. Clearing
+        // the window first keeps every intermediate flush state a legal row.
+        WindowBounds window = resolveWindow(request.windowStart(), request.windowEnd(), overrideIntervals);
+        override.setWindowStart(window != null ? window.start() : null);
+        override.setWindowEnd(window != null ? window.end() : null);
+
+        replaceOverrideIntervals(override, overrideIntervals);
         replaceOverrideDiscreteTimes(override, explicitTimes ? request.times() : List.of());
 
         ScheduleException saved = scheduleExceptionRepository.save(override);
         evictSlotsAfterCommit(master);
         return scheduleMapper.toOverrideResponse(saved);
+    }
+
+    /**
+     * Loads the target master and verifies WRITE (schedule-management) authority — the exact
+     * {@link #loadActiveMaster} + {@link AuthorizationService#enforceCanManageMasterSchedule} pair
+     * {@link #upsertOverride} performs internally moments later. Exposed for
+     * {@code com.beautica.booking.service.ScheduleOverrideConflictService}, which must confirm the
+     * caller may manage {@code masterId}'s schedule BEFORE it runs its own booking-conflict query —
+     * a query that returns client/guest identities and must not be reachable by an unauthorized
+     * caller even though {@code MasterController}'s {@code @PreAuthorize} SpEL already gates the
+     * same endpoint (defense in depth, matching this class's own re-check pattern on every write).
+     *
+     * <p>Deliberately public rather than duplicating {@code MasterRepository} + this exact
+     * authorization call inside the booking package: cross-feature reach goes through a service's
+     * public interface, never a sibling feature's repository directly (this class already owns the
+     * "load + enforce" invariant for schedule writes; a second, drifting copy of it elsewhere would
+     * be the actual anti-pattern).
+     */
+    public Master requireScheduleManagementAuthority(UUID actorId, UUID masterId) {
+        Master master = loadActiveMaster(masterId);
+        authz.enforceCanManageMasterSchedule(actorId, master);
+        return master;
     }
 
     // ---- Step 2b: weekly-template delete ------------------------------------------------
@@ -253,9 +319,43 @@ public class MasterScheduleService {
     /**
      * Effective availability for every date in {@code [from, to]} inclusive. Bulk-loads overrides and
      * overlapping templates in two queries, then folds each date in-memory — no per-date query (§E).
+     *
+     * <p><b>Phase 15.12 — window-free.</b> Does not project the display-only working window, and therefore
+     * never initializes the LAZY {@code dayWindows} collection. This is the variant every consumer that
+     * reduces the projection to availability should call: {@code SlotCalculationService} (three call
+     * sites) and {@link #getClientWorkingDays}. The one consumer that renders the window —
+     * {@code MasterController}'s {@code GET /effective-schedule} — calls
+     * {@link #resolveEffectiveRangeForDisplay} instead.
      */
     @Transactional(readOnly = true)
     public List<EffectiveDayResponse> resolveEffectiveRange(UUID masterId, LocalDate from, LocalDate to) {
+        return foldRange(masterId, from, to).stream().map(ResolvedDay::day).toList();
+    }
+
+    /**
+     * Phase 15.12: {@link #resolveEffectiveRange} plus the display-only working-window projection, for the
+     * {@code GET /effective-schedule} endpoint the mobile day editor hydrates from (it derives breaks as
+     * {@code window MINUS intervals}, which is the only way an edge-flush break survives a reload).
+     *
+     * <p><b>Not a second resolver.</b> It runs the very same {@link #foldRange} core and then maps each
+     * result through {@link #withWindow}, a purely additive step that fills two nullable fields on an
+     * already-decided day. Availability is settled before decoration begins, so the window provably cannot
+     * change {@link EffectiveDayResponse#isWorkingDay()} or any interval — there is one fold, one
+     * precedence rule, one verdict. Only this method pays the extra batched {@code dayWindows} load.
+     */
+    @Transactional(readOnly = true)
+    public List<EffectiveDayResponse> resolveEffectiveRangeForDisplay(
+            UUID masterId, LocalDate from, LocalDate to) {
+        return foldRange(masterId, from, to).stream().map(this::withWindow).toList();
+    }
+
+    /**
+     * The single range-fold core: bulk-loads overrides and overlapping templates in two queries, then
+     * resolves every date in-memory. Returns each resolved day alongside the entity that produced it, so a
+     * caller that wants the display-only window can decorate without re-querying, and a caller that does
+     * not simply drops the entity — the difference is a {@code map}, never a second fold.
+     */
+    private List<ResolvedDay> foldRange(UUID masterId, LocalDate from, LocalDate to) {
         // Read path: past dates are included (the calendar paints greyed history — Phase 15.5 Step 3),
         // so use the read-window guard rather than assertWithinBounds (which forbids a past start).
         dateMath.assertExpandable(from, to);
@@ -267,16 +367,56 @@ public class MasterScheduleService {
         List<WeeklySchedule> windows =
                 weeklyScheduleRepository.findOverlappingRangeWithIntervals(masterId, from, to);
 
-        List<EffectiveDayResponse> result = new ArrayList<>(dates.size());
+        List<ResolvedDay> result = new ArrayList<>(dates.size());
         for (LocalDate date : dates) {
             ScheduleException override = overridesByDate.get(date);
             if (override != null) {
-                result.add(resolveFromOverride(date, override));
+                result.add(new ResolvedDay(resolveFromOverride(date, override), override, null));
             } else {
-                result.add(resolveFromTemplate(date, firstCovering(windows, date)));
+                WeeklySchedule covering = firstCovering(windows, date);
+                result.add(new ResolvedDay(resolveFromTemplate(date, covering), null, covering));
             }
         }
         return result;
+    }
+
+    /**
+     * A resolved day plus the entity that produced it. The entity is carried only so
+     * {@link #withWindow} can read the display-only bounds off it without a second query; exactly one of
+     * {@code override}/{@code covering} is non-null (and both are null for a {@code NO_SCHEDULE} date).
+     */
+    private record ResolvedDay(
+            EffectiveDayResponse day, ScheduleException override, WeeklySchedule covering) {
+    }
+
+    /**
+     * Phase 15.12: fills in the display-only working-window bounds of whichever source produced the day.
+     * Purely additive — it copies an already-resolved day and sets two nullable fields; it never revisits
+     * the availability decision.
+     *
+     * <p>Returns the day untouched (window {@code null}) whenever a window would be meaningless: no
+     * intervals (day off / uncovered weekday / no schedule), or an EXPLICIT_TIMES day, whose discrete
+     * times ARE the slot set and which has no window-with-breaks affordance. Reading the template branch
+     * is what initializes the batch-fetched {@code dayWindows} collection — one query per fold, and only
+     * on this path.
+     */
+    private EffectiveDayResponse withWindow(ResolvedDay resolved) {
+        EffectiveDayResponse day = resolved.day();
+        boolean explicitTimes = day.times() != null && !day.times().isEmpty();
+        if (day.intervals().isEmpty() || explicitTimes) {
+            return day;
+        }
+        if (resolved.override() != null) {
+            return scheduleMapper.toEffectiveDayWithWindow(day.date(), day.source(), day.intervals(),
+                    resolved.override().getWindowStart(), resolved.override().getWindowEnd());
+        }
+        if (resolved.covering() == null) {
+            return day;
+        }
+        var window = scheduleMapper.findDayWindow(resolved.covering(), dateMath.isoDow(day.date()));
+        return scheduleMapper.toEffectiveDayWithWindow(day.date(), day.source(), day.intervals(),
+                window.map(WeeklyScheduleDayWindow::getWindowStart).orElse(null),
+                window.map(WeeklyScheduleDayWindow::getWindowEnd).orElse(null));
     }
 
     // ---- Step 7 (Phase 15.11): CLIENT-safe boolean working-day resolver -----------------
@@ -299,6 +439,11 @@ public class MasterScheduleService {
     @Transactional(readOnly = true)
     @Cacheable(value = "master-working-days", key = "{#masterId, #from, #to}", sync = true)
     public List<MasterWorkingDayResponse> getClientWorkingDays(UUID masterId, LocalDate from, LocalDate to) {
+        // resolveEffectiveRange (the window-FREE variant), never resolveEffectiveRangeForDisplay: this
+        // reduces to a boolean, so projecting the display-only window would load dayWindows purely to
+        // throw it away (Phase 15.12). Calling the public reducer rather than foldRange directly costs
+        // nothing — it is a one-line map over the same core — and keeps this a genuine "thin reducer over
+        // resolveEffectiveRange", which is what MasterScheduleServiceTest stubs.
         return resolveEffectiveRange(masterId, from, to).stream()
                 .map(day -> new MasterWorkingDayResponse(day.date(), day.isWorkingDay()))
                 .toList();
@@ -371,6 +516,8 @@ public class MasterScheduleService {
             return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.OVERRIDE_CUSTOM,
                     scheduleMapper.toDerivedWindow(times), times);
         }
+        // Availability only — the display-only working window is layered on afterwards by #withWindow, and
+        // only for the display path, so this core never touches the override's window columns.
         return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.OVERRIDE_CUSTOM,
                 scheduleMapper.toIntervalDtos(override.getIntervals()));
     }
@@ -387,6 +534,8 @@ public class MasterScheduleService {
             return scheduleMapper.toEffectiveDay(
                     date, EffectiveDaySource.TEMPLATE, scheduleMapper.toDerivedWindow(times), times);
         }
+        // Availability only — the display-only working window is layered on afterwards by #withWindow, and
+        // only for the display path, so this core never initializes the LAZY dayWindows collection.
         List<WorkIntervalDto> intervals = scheduleMapper.toIntervalDtosForDay(covering, isoDow);
         return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.TEMPLATE, intervals);
     }
@@ -438,15 +587,20 @@ public class MasterScheduleService {
     private void replaceDayCollections(WeeklySchedule schedule, List<WeeklyScheduleDayRequest> days) {
         schedule.getIntervals().clear();      // orphanRemoval queues DELETEs for the old interval rows
         schedule.getDiscreteTimes().clear();  // orphanRemoval queues DELETEs for the old discrete-time rows
+        schedule.getDayWindows().clear();     // orphanRemoval queues DELETEs for the old day-window rows
         // Force the orphan DELETEs to the DB before re-inserting. With hibernate.order_inserts=true the
         // ActionQueue runs all INSERTs before all DELETEs, so a re-sent row whose unique key matches a
         // surviving old row would collide (23505: uq_working_intervals_no_dup /
-        // uq_working_interval_times_no_dup). Flushing here makes it delete-before-insert.
+        // uq_working_interval_times_no_dup / uq_day_window_per_day). Flushing here makes it
+        // delete-before-insert.
         weeklyScheduleRepository.flush();
 
         for (WeeklyScheduleDayRequest day : days) {
             switch (day.effectiveMode()) {
-                case INTERVAL -> addIntervals(schedule, day);
+                case INTERVAL -> {
+                    addIntervals(schedule, day);
+                    addDayWindow(schedule, day);
+                }
                 case EXPLICIT_TIMES -> addDiscreteTimes(schedule, day);
             }
         }
@@ -464,6 +618,26 @@ public class MasterScheduleService {
                     .endTime(zeroSeconds(dto.endTime()))
                     .build());
         }
+    }
+
+    /**
+     * Phase 15.12: records the day's display-only working window, when the client sent one AND the day
+     * actually has working intervals. {@link #resolveWindow} returns {@code null} for a day off (empty
+     * interval list) and for an omitted window, so no row is written in either case — a window is never
+     * synthesized from {@code min(start)..max(end)} (that would be indistinguishable from one the user
+     * chose and would silently assert "this day has no edge-flush break").
+     */
+    private void addDayWindow(WeeklySchedule schedule, WeeklyScheduleDayRequest day) {
+        WindowBounds window = resolveWindow(day.windowStart(), day.windowEnd(), day.intervals());
+        if (window == null) {
+            return;
+        }
+        schedule.getDayWindows().add(WeeklyScheduleDayWindow.builder()
+                .schedule(schedule)
+                .dayOfWeek(day.dayOfWeek())
+                .windowStart(window.start())
+                .windowEnd(window.end())
+                .build());
     }
 
     private void addDiscreteTimes(WeeklySchedule schedule, WeeklyScheduleDayRequest day) {
@@ -518,9 +692,74 @@ public class MasterScheduleService {
      */
     private void validateDay(WeeklyScheduleDayRequest day) {
         switch (day.effectiveMode()) {
-            case INTERVAL -> assertIntervalsNonOverlapping(day.intervals());
+            case INTERVAL -> {
+                assertIntervalsNonOverlapping(day.intervals());
+                // Phase 15.12: fail before any collection is mutated. resolveWindow is pure, so
+                // addDayWindow re-derives the same value later without re-validating side effects.
+                resolveWindow(day.windowStart(), day.windowEnd(), day.intervals());
+            }
             case EXPLICIT_TIMES -> validateDayTimes(day.times());
         }
+    }
+
+    /**
+     * Phase 15.12: the validated, seconds-zeroed working window for one INTERVAL day, or {@code null} when
+     * no window is to be stored.
+     *
+     * <p>The window is <b>display-only</b> metadata that lets the mobile editor rebuild a break sitting flush
+     * against an edge of the working day (such a break leaves no gap between intervals, so gap
+     * reconstruction loses it). It is NEVER consulted when computing availability — {@code intervals} stay
+     * the single canonical source, and {@link #resolveEffectiveDay}/{@link #resolveEffectiveRange} (hence
+     * {@code SlotCalculationService}) never read it.
+     *
+     * <p>Rules:
+     * <ul>
+     *   <li><b>Day off / no intervals</b> — the window carries no meaning; any supplied value is ignored and
+     *       {@code null} is stored (never invented from {@code min(start)..max(end)}).</li>
+     *   <li><b>Both omitted</b> — {@code null}; the legacy shape, behaves exactly as before 15.12.</li>
+     *   <li><b>One of two</b> — rejected: a half-specified window is malformed input.</li>
+     *   <li><b>Ordering</b> — {@code windowEnd > windowStart} strictly. No wraparound: the window inherits
+     *       the locked no-cross-midnight interval contract (a night shift is two ISO-weekday rows).</li>
+     *   <li><b>Containment</b> — {@code windowStart <= min(interval.startTime)} and
+     *       {@code windowEnd >= max(interval.endTime)}: the window must contain every working interval,
+     *       otherwise the derived {@code window MINUS intervals} break list would be nonsense.</li>
+     * </ul>
+     *
+     * <p>This mirrors {@code WeeklyScheduleDayRequest#isWindowConsistent()} /
+     * {@code ScheduleOverrideRequest#isWindowConsistent()} defensively (a malformed payload that reached the
+     * service is still rejected) and adds the containment rule those declarative checks cannot express.
+     */
+    private WindowBounds resolveWindow(
+            LocalTime windowStart, LocalTime windowEnd, List<WorkIntervalDto> intervals) {
+        if (intervals == null || intervals.isEmpty()) {
+            return null; // day off / no working time — a "working window" is not a thing here
+        }
+        if (windowStart == null && windowEnd == null) {
+            return null;
+        }
+        if (windowStart == null || windowEnd == null) {
+            throw new BusinessException(
+                    "windowStart and windowEnd must both be provided or both omitted");
+        }
+        LocalTime start = zeroSeconds(windowStart);
+        LocalTime end = zeroSeconds(windowEnd);
+        if (!end.isAfter(start)) {
+            throw new BusinessException("Working window end must be after its start");
+        }
+        LocalTime earliest = intervals.stream()
+                .map(WorkIntervalDto::startTime).map(this::zeroSeconds)
+                .min(Comparator.naturalOrder()).orElseThrow();
+        LocalTime latest = intervals.stream()
+                .map(WorkIntervalDto::endTime).map(this::zeroSeconds)
+                .max(Comparator.naturalOrder()).orElseThrow();
+        if (start.isAfter(earliest) || end.isBefore(latest)) {
+            throw new BusinessException("Working window must contain every working interval of the day");
+        }
+        return new WindowBounds(start, end);
+    }
+
+    /** Phase 15.12: a validated, seconds-zeroed display-only working window. */
+    private record WindowBounds(LocalTime start, LocalTime end) {
     }
 
     /**
@@ -574,7 +813,12 @@ public class MasterScheduleService {
         }
         if (request.kind() == ScheduleExceptionKind.CUSTOM_HOURS) {
             switch (request.effectiveMode()) {
-                case INTERVAL -> assertIntervalsNonOverlapping(request.intervals());
+                case INTERVAL -> {
+                    assertIntervalsNonOverlapping(request.intervals());
+                    // Phase 15.12: fail before any collection is mutated. resolveWindow is pure, so
+                    // upsertOverride re-derives the same value later without re-validating side effects.
+                    resolveWindow(request.windowStart(), request.windowEnd(), request.intervals());
+                }
                 case EXPLICIT_TIMES -> validateDayTimes(request.times());
             }
         }
@@ -586,6 +830,17 @@ public class MasterScheduleService {
         }
         if (intervals.size() > MAX_INTERVALS_PER_DAY) {
             throw new BusinessException("A day may have at most " + MAX_INTERVALS_PER_DAY + " intervals");
+        }
+        // Defence in depth behind the element-level @NotNull on both request DTOs' interval lists. This
+        // method (and resolveWindow, which runs right after it on both surfaces) dereferences every entry,
+        // so a null element would NPE into a 500. The DTO constraint stops that at the HTTP boundary; this
+        // stops it for callers that construct a request in-process and bypass @Valid entirely — i.e. the
+        // schedule ITs. It is NOT what protects the conflict-preview flow: MasterController declares
+        // @Valid on ScheduleOverrideRequest, and in any case ScheduleOverrideConflictService dereferences
+        // the intervals in fullyCovers well before it calls upsertOverride, so this guard could not fire
+        // first there. That path is covered by OverrideConflictQueryRequest's own element-level @NotNull.
+        if (intervals.stream().anyMatch(Objects::isNull)) {
+            throw new BusinessException("An interval must not be null");
         }
         List<WorkIntervalDto> sorted = intervals.stream()
                 .sorted(Comparator.comparing(WorkIntervalDto::startTime))

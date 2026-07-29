@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -170,6 +171,22 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("Please wait before requesting another code"));
     }
 
+    /**
+     * 429 for the aggregate schedule-override decline budget (2026-07-26 security audit finding
+     * 1) — see {@link ScheduleOverrideDeclineBudgetExceededException}'s class javadoc for why this
+     * is thrown from the service rather than caught by a servlet filter. No conflict count or
+     * budget figure is echoed to the caller — a generic message, same posture as
+     * {@link #handleResendThrottled}.
+     */
+    @ExceptionHandler(ScheduleOverrideDeclineBudgetExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleScheduleOverrideDeclineBudgetExceeded(
+            ScheduleOverrideDeclineBudgetExceededException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many bookings declined recently — please wait before retrying"));
+    }
+
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
         // Return a generic message — do not echo ex.getMessage() which may reveal internal
@@ -301,26 +318,52 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * A DB-level lock wait exceeded {@code lock_timeout} (transaction-scoped, set via
-     * {@code set_config('lock_timeout', '3s', true)} fused into the same statement as the lock
-     * acquisition — Postgres {@code 55P03 lock_not_available}) — currently only
+     * A DB-level pessimistic lock attempt failed — either a wait exceeded {@code lock_timeout}
+     * (transaction-scoped, set via {@code set_config('lock_timeout', '3s', true)} fused into the
+     * same statement as the lock acquisition — Postgres {@code 55P03 lock_not_available}), or the
+     * lock manager aborted this transaction to break a genuine deadlock (Postgres
+     * {@code 40P01 deadlock_detected}).
+     *
+     * <p><b>Widened from {@code CannotAcquireLockException} to the common
+     * {@link PessimisticLockingFailureException} superclass</b> (cycle-2 audit finding 2) — but with
+     * a correction to the finding's premise, made after empirically reproducing a real {@code 40P01}
+     * deadlock (a genuine two-transaction race, forced deterministically via {@code @SpyBean} +
+     * {@code CyclicBarrier} against the pre-fix code) and inspecting the actual translation path: in
+     * THIS codebase, every write goes through Spring Data JPA / Hibernate, and
+     * {@code HibernateJpaDialect#convertHibernateAccessException} maps {@code
+     * org.hibernate.exception.LockAcquisitionException} — Hibernate's classification for the WHOLE
+     * Postgres lock/deadlock SQLSTATE class, {@code 40}/{@code 55}, covering BOTH a bare
+     * {@code lock_timeout} wait AND a genuine deadlock — uniformly to {@link CannotAcquireLockException}.
+     * {@link org.springframework.dao.DeadlockLoserDataAccessException} (what the finding assumed a
+     * deadlock would surface as) is produced by Spring's plain-JDBC {@code SQLErrorCodeSQLExceptionTranslator}
+     * path, which this JPA-only codebase never exercises — so the reproduced deadlock in fact mapped
+     * to a 409 via the PRE-existing {@code CannotAcquireLockException}-only handler, with zero code
+     * changes. The widening is kept anyway, as defense-in-depth against a LATENT rather than an
+     * already-reachable gap: {@code DeadlockLoserDataAccessException} is a real sibling under
+     * {@code PessimisticLockingFailureException} that a future direct {@code JdbcTemplate} call, or a
+     * Hibernate/Spring version change to this classification, could still produce — handling the
+     * shared superclass here catches that case too (and any other subtype, e.g.
+     * {@link org.springframework.dao.LockTimeoutException}) with the identical "try again" semantics,
+     * at zero cost to the currently-reachable case.
+     *
+     * <p>Lock-timeout sources: currently only
      * {@code BookingRepository.acquireClientAdvisoryLockWithTimeout} /
-     * {@code acquireAdvisoryLock} / {@code acquireAdvisoryLockWithTimeout}, so a flood of
-     * concurrent requests fails fast instead of parking a Hikari connection for the full pool
-     * connection-timeout (booking advisory-lock DoS fix). This covers both the authenticated
+     * {@code acquireAdvisoryLock} / {@code acquireAdvisoryLockWithTimeout} and
+     * {@code AppointmentRepository.lockHeaderIfConfirmed} / {@code lockHeaderRegardlessOfStatus}, so
+     * a flood of concurrent requests fails fast instead of parking a Hikari connection for the full
+     * pool connection-timeout (booking advisory-lock DoS fix). This covers the authenticated booking
      * path ({@code BookingService.acquireClientLock}, before the client/master locks in
-     * {@code doCreateBooking}/{@code rescheduleBooking}) and the public guest-booking
-     * path ({@code GuestBookingService.persistBooking}, before its master-only lock) — not an
-     * exhaustive list of every call site. Postgres SQLSTATE {@code 55P03} is translated by
-     * Hibernate/Spring's SQLState exception translation to {@link CannotAcquireLockException} —
-     * mapped here to a clean 409
-     * (the same "try again" semantics as the existing master/client-busy 409s) rather than the
-     * 500 the generic handler would otherwise produce. No internal detail (SQL state, query,
-     * timeout value) is echoed to the caller — only logged at DEBUG (§I/§N).
+     * {@code doCreateBooking}/{@code rescheduleBooking}), the public guest-booking path
+     * ({@code GuestBookingService.persistBooking}, before its master-only lock), and the visit-header
+     * locks in {@code AppointmentTransitionService} — not an exhaustive list of every call site.
+     * Mapped here to a clean 409 (the same "try again" semantics as the existing master/client-busy
+     * 409s) rather than the 500 the generic handler would otherwise produce. No internal detail (SQL
+     * state, query, timeout value) is echoed to the caller — only the exception's simple class name
+     * is logged, at DEBUG (§I/§N).
      */
-    @ExceptionHandler(CannotAcquireLockException.class)
-    public ResponseEntity<ApiResponse<Void>> handleCannotAcquireLock(CannotAcquireLockException ex) {
-        log.debug("Advisory lock wait exceeded lock_timeout: {}", ex.getClass().getSimpleName());
+    @ExceptionHandler(PessimisticLockingFailureException.class)
+    public ResponseEntity<ApiResponse<Void>> handlePessimisticLockingFailure(PessimisticLockingFailureException ex) {
+        log.debug("Pessimistic locking failure (lock_timeout wait or deadlock): {}", ex.getClass().getSimpleName());
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
                 .body(ApiResponse.error("Request could not be completed due to a conflict"));

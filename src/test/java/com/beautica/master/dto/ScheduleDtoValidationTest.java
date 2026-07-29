@@ -48,6 +48,11 @@ class ScheduleDtoValidationTest {
         return new WorkIntervalDto(LocalTime.parse(start), LocalTime.parse(end));
     }
 
+    /** Top-level wall-clock helper for the 15.12 window nests (the older nests carry their own {@code time}). */
+    private static LocalTime at(String hhmmss) {
+        return LocalTime.parse(hhmmss);
+    }
+
     private static boolean hasViolationOn(Set<? extends ConstraintViolation<?>> v, String path) {
         return v.stream().anyMatch(c -> c.getPropertyPath().toString().equals(path));
     }
@@ -449,17 +454,29 @@ class ScheduleDtoValidationTest {
         }
 
         @Test
-        @DisplayName("PINS CURRENT BEHAVIOR: days containing a null element NPEs inside isDaysUnique — backlog gap")
-        void should_pinCurrentBehavior_when_daysContainsNullElement() {
+        @DisplayName("rejects days when an element is null — a violation, NOT an NPE inside isDaysUnique")
+        void should_reject_when_daysContainsNullElement() {
             var withNull = new java.util.ArrayList<WeeklyScheduleDayRequest>();
+            withNull.add(day(1));
             withNull.add(null);
             var req = new WeeklyScheduleRequest(FUTURE, null, withNull);
 
-            // Documented LOW: isDaysUnique() maps dayOfWeek over elements without a null guard, so a
-            // null element triggers an NPE during validation. Pinned so the backlog null-guard fix is
-            // a deliberate, test-visible change.
-            assertThatThrownBy(() -> validator.validate(req))
-                    .isInstanceOf(Exception.class);
+            Set<ConstraintViolation<WeeklyScheduleRequest>> violations = validator.validate(req);
+
+            // This previously PINNED THE BUG: isDaysUnique() mapped dayOfWeek over every element with no
+            // null guard, so validation itself threw. Hibernate Validator wraps an exception escaping an
+            // @AssertTrue getter in a ValidationException — a 500 raised before GlobalExceptionHandler
+            // could render a 400. Both halves of the fix are load-bearing and are asserted here: the
+            // element-level @NotNull produces the violation, and isDaysUnique()'s Objects::nonNull filter
+            // stops the getter (which runs regardless of sibling constraint order) from throwing first.
+            assertThat(violations)
+                    .as("a null day element must be a Bean Validation rejection (400), never an NPE")
+                    .isNotEmpty();
+            assertThat(violations.stream().anyMatch(c -> c.getPropertyPath().toString().startsWith("days")))
+                    .as("the violation must be reported on the days path").isTrue();
+            assertThat(violations.stream().anyMatch(c -> c.getPropertyPath().toString().equals("daysUnique")))
+                    .as("uniqueness is not the complaint — the surviving element list has no duplicate")
+                    .isFalse();
         }
     }
 
@@ -743,6 +760,235 @@ class ScheduleDtoValidationTest {
 
             assertThat(validator.validate(req))
                     .as("a pre-15.9 (INTERVAL) override validates clean").isEmpty();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // OverrideConflictQueryRequest — the conflict-preview twin of ScheduleOverrideRequest
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * This record has NO service-layer backstop for a malformed interval list:
+     * {@code ScheduleOverrideConflictService#previewConflicts} hands {@code intervals} straight to
+     * {@code ScheduleConflictCalculator}, never through
+     * {@code MasterScheduleService#assertIntervalsNonOverlapping}. Bean Validation is the only gate, so
+     * the element-level constraint has to hold here on its own.
+     */
+    @Nested
+    @DisplayName("OverrideConflictQueryRequest")
+    class OverrideConflictQueryRequestTests {
+
+        private OverrideConflictQueryRequest query(List<WorkIntervalDto> intervals) {
+            return new OverrideConflictQueryRequest(FUTURE, FUTURE.plusDays(3),
+                    ScheduleExceptionKind.CUSTOM_HOURS, WeekdayMode.INTERVAL, intervals, null);
+        }
+
+        @Test
+        @DisplayName("accepts a well-formed CUSTOM_HOURS preview query (clean baseline)")
+        void should_accept_when_intervalsWellFormed() {
+            assertThat(validator.validate(query(List.of(interval("09:00:00", "17:00:00"))))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("rejects intervals when an element is null (@NotNull on the list element)")
+        void should_reject_when_intervalListContainsNullElement() {
+            // isKindConsistent only asks whether the list is NON-EMPTY, so `[null]` satisfies it; without
+            // the element-level @NotNull this reaches fullyCovers and NPEs → 500 for an authenticated
+            // master POSTing /masters/{id}/overrides/conflicts.
+            var withNull = new java.util.ArrayList<WorkIntervalDto>();
+            withNull.add(interval("09:00:00", "17:00:00"));
+            withNull.add(null);
+
+            Set<ConstraintViolation<OverrideConflictQueryRequest>> violations = validator.validate(query(withNull));
+
+            assertThat(violations)
+                    .as("a null interval element must be a Bean Validation rejection (400), never an NPE")
+                    .isNotEmpty();
+            assertThat(violations.stream()
+                    .anyMatch(c -> c.getPropertyPath().toString().startsWith("intervals")))
+                    .as("the violation must be reported on the intervals path").isTrue();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Phase 15.12 — optional working-window bounds (windowStart / windowEnd)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Shape rules only ({@code isWindowConsistent}): both-or-neither + strict ordering. Containment
+     * (window ⊇ every interval) needs the interval list AND the resolved mode, so it is a service-layer
+     * rule — pinned in {@code MasterScheduleWorkingWindowIT}.
+     */
+    @Nested
+    @DisplayName("Working-window bounds (15.12) — WeeklyScheduleDayRequest")
+    class WeeklyDayWindowBounds {
+
+        private WeeklyScheduleDayRequest dayWithWindow(LocalTime windowStart, LocalTime windowEnd) {
+            return new WeeklyScheduleDayRequest(1, WeekdayMode.INTERVAL,
+                    List.of(interval("10:00:00", "18:00:00")), null, windowStart, windowEnd);
+        }
+
+        @Test
+        @DisplayName("accepts a day with no window at all — the legacy shape stays valid")
+        void should_accept_when_windowOmitted() {
+            assertThat(validator.validate(dayWithWindow(null, null)))
+                    .as("both bounds null is the pre-15.12 wire shape and must keep validating clean")
+                    .isEmpty();
+        }
+
+        @Test
+        @DisplayName("accepts a well-formed window that is wider than the intervals")
+        void should_accept_when_windowOrderedAndPresent() {
+            assertThat(validator.validate(dayWithWindow(at("09:00:00"), at("18:00:00")))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("rejects (isWindowConsistent) when only windowStart is supplied")
+        void should_reject_when_onlyWindowStartSupplied() {
+            Set<ConstraintViolation<WeeklyScheduleDayRequest>> violations =
+                    validator.validate(dayWithWindow(at("09:00:00"), null));
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "windowConsistent"))
+                    .as("a half-specified window must trip @AssertTrue isWindowConsistent()").isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isWindowConsistent) when only windowEnd is supplied")
+        void should_reject_when_onlyWindowEndSupplied() {
+            Set<ConstraintViolation<WeeklyScheduleDayRequest>> violations =
+                    validator.validate(dayWithWindow(null, at("18:00:00")));
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "windowConsistent")).isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isWindowConsistent) a zero-length window")
+        void should_reject_when_windowEndEqualsStart() {
+            Set<ConstraintViolation<WeeklyScheduleDayRequest>> violations =
+                    validator.validate(dayWithWindow(at("09:00:00"), at("09:00:00")));
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "windowConsistent")).isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isWindowConsistent) a cross-midnight window — no wraparound, ever")
+        void should_reject_when_windowWrapsPastMidnight() {
+            // 22:00 → 06:00 is exactly the night-shift shape the locked Phase 15.x contract forbids:
+            // it must be modelled as two ISO-weekday rows, never one wrapping window.
+            Set<ConstraintViolation<WeeklyScheduleDayRequest>> violations =
+                    validator.validate(dayWithWindow(at("22:00:00"), at("06:00:00")));
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "windowConsistent")).isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects intervals when an element is null (@NotNull on the list element)")
+        void should_reject_when_intervalListContainsNullElement() {
+            // Hibernate Validator's @Valid cascade SKIPS null elements, so without the element-level
+            // @NotNull this payload validates clean and then NPEs in the service → 500 instead of 400.
+            var withNull = new java.util.ArrayList<WorkIntervalDto>();
+            withNull.add(interval("09:00:00", "17:00:00"));
+            withNull.add(null);
+            var day = new WeeklyScheduleDayRequest(1, WeekdayMode.INTERVAL, withNull, null, null, null);
+
+            Set<ConstraintViolation<WeeklyScheduleDayRequest>> violations = validator.validate(day);
+
+            assertThat(violations)
+                    .as("a null interval element must be a Bean Validation rejection (400), never an NPE")
+                    .isNotEmpty();
+            assertThat(violations.stream()
+                    .anyMatch(c -> c.getPropertyPath().toString().startsWith("intervals")))
+                    .as("the violation must be reported on the intervals path").isTrue();
+        }
+
+        @Test
+        @DisplayName("the pre-15.12 4-arg convenience constructor yields a null window (back-compat)")
+        void should_yieldNullWindow_when_preWindowConstructorUsed() {
+            var day = new WeeklyScheduleDayRequest(1, WeekdayMode.INTERVAL,
+                    List.of(interval("09:00:00", "17:00:00")), null);
+
+            assertThat(day.windowStart()).isNull();
+            assertThat(day.windowEnd()).isNull();
+            assertThat(validator.validate(day)).isEmpty();
+        }
+    }
+
+    @Nested
+    @DisplayName("Working-window bounds (15.12) — ScheduleOverrideRequest")
+    class OverrideWindowBounds {
+
+        private ScheduleOverrideRequest overrideWithWindow(LocalTime windowStart, LocalTime windowEnd) {
+            return new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
+                    WeekdayMode.INTERVAL, List.of(interval("10:00:00", "18:00:00")), null,
+                    false, windowStart, windowEnd);
+        }
+
+        @Test
+        @DisplayName("accepts an override with no window at all — the legacy shape stays valid")
+        void should_accept_when_windowOmitted() {
+            assertThat(validator.validate(overrideWithWindow(null, null))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("accepts a well-formed override window that is wider than the intervals")
+        void should_accept_when_windowOrderedAndPresent() {
+            assertThat(validator.validate(overrideWithWindow(at("09:00:00"), at("18:00:00")))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("rejects (isWindowConsistent) when only one bound is supplied")
+        void should_reject_when_onlyOneBoundSupplied() {
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations =
+                    validator.validate(overrideWithWindow(null, at("18:00:00")));
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "windowConsistent"))
+                    .as("both editor surfaces must reject a half-specified window identically").isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects (isWindowConsistent) a cross-midnight override window")
+        void should_reject_when_windowWrapsPastMidnight() {
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations =
+                    validator.validate(overrideWithWindow(at("22:00:00"), at("06:00:00")));
+
+            assertThat(violations).isNotEmpty();
+            assertThat(hasViolationOn(violations, "windowConsistent")).isTrue();
+        }
+
+        @Test
+        @DisplayName("rejects intervals when an element is null (@NotNull on the list element)")
+        void should_reject_when_intervalListContainsNullElement() {
+            var withNull = new java.util.ArrayList<WorkIntervalDto>();
+            withNull.add(interval("09:00:00", "17:00:00"));
+            withNull.add(null);
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
+                    WeekdayMode.INTERVAL, withNull, null, false, null, null);
+
+            Set<ConstraintViolation<ScheduleOverrideRequest>> violations = validator.validate(req);
+
+            assertThat(violations)
+                    .as("a null interval element must be a Bean Validation rejection (400), never an NPE")
+                    .isNotEmpty();
+            assertThat(violations.stream()
+                    .anyMatch(c -> c.getPropertyPath().toString().startsWith("intervals")))
+                    .as("the violation must be reported on the intervals path").isTrue();
+        }
+
+        @Test
+        @DisplayName("the pre-15.12 6-arg convenience constructor yields a null window (back-compat)")
+        void should_yieldNullWindow_when_preWindowConstructorUsed() {
+            var req = new ScheduleOverrideRequest(FUTURE, ScheduleExceptionKind.CUSTOM_HOURS,
+                    WeekdayMode.INTERVAL, List.of(interval("09:00:00", "17:00:00")), null, true);
+
+            assertThat(req.windowStart()).isNull();
+            assertThat(req.windowEnd()).isNull();
+            assertThat(req.cancelOverlapping()).isTrue();
+            assertThat(validator.validate(req)).isEmpty();
         }
     }
 }

@@ -920,6 +920,274 @@ class AuthorizationServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    // ── enforceCanRescheduleBooking (Phase 27.2 — provider reschedule) ─────────
+
+    @Test
+    @DisplayName("enforceCanRescheduleBooking does not throw when the salon owner reschedules a salon booking")
+    void should_notThrow_when_salonOwnerReschedulesSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        assertThatCode(() -> authorizationService.enforceCanRescheduleBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanRescheduleBooking does not throw when an assigned SALON_ADMIN reschedules a salon booking")
+    void should_notThrow_when_assignedSalonAdminReschedulesSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_ADMIN"));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        assertThatCode(() -> authorizationService.enforceCanRescheduleBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanRescheduleBooking does not throw when an independent master reschedules their own booking")
+    void should_notThrow_when_independentMasterReschedulesOwnBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = independentBooking(actorId);
+
+        assertThatCode(() -> authorizationService.enforceCanRescheduleBooking(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanRescheduleBooking throws ForbiddenException when a SALON_MASTER tries to reschedule a salon booking")
+    void should_throwForbidden_when_salonMasterReschedulesSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanRescheduleBooking(actorId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanRescheduleBooking throws ForbiddenException when an independent master reschedules another master's booking")
+    void should_throwForbidden_when_independentMasterReschedulesAnotherMastersBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+        Booking booking = independentBooking(otherMasterUserId);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanRescheduleBooking(actorId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── enforceCanReviewClient (Phase 27.5 — master reviews client) ────────────
+
+    @Test
+    @DisplayName("enforceCanReviewClient does not throw when the salon owner reviews the client of a salon booking")
+    void should_notThrow_when_salonOwnerReviewsClientOfSalonBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        assertThatCode(() -> authorizationService.enforceCanReviewClient(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanReviewClient does not throw when an independent master reviews the client of their own booking")
+    void should_notThrow_when_independentMasterReviewsOwnBookingClient() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = independentBooking(actorId);
+
+        assertThatCode(() -> authorizationService.enforceCanReviewClient(actorId, booking))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanReviewClient throws ForbiddenException when a SALON_MASTER tries to review a salon booking's client")
+    void should_throwForbidden_when_salonMasterReviewsSalonBookingClient() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = salonBooking(salonId);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanReviewClient(actorId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanReviewClient throws ForbiddenException when an independent master reviews another master's booking client")
+    void should_throwForbidden_when_independentMasterReviewsAnotherMastersBookingClient() {
+        UUID actorId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+        Booking booking = independentBooking(otherMasterUserId);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanReviewClient(actorId, booking))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── enforceCanManageAppointment (LOW finding fix — no longer trusts the ─────
+    // ── single-master invariant; checks EVERY chained item's authority) ────────
+
+    @Test
+    @DisplayName("enforceCanManageAppointment does not throw when the actor has provider authority "
+            + "over every chained item")
+    void should_notThrow_when_actorHasAuthorityOverEveryItem_whenEnforcingCanManageAppointment() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterUserId1 = UUID.randomUUID();
+        UUID masterUserId2 = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(
+                        new BookingCompletionAccess(masterUserId1, salonId),
+                        new BookingCompletionAccess(masterUserId2, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        assertThatCode(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointment throws ForbiddenException when the appointment has no "
+            + "items (fail-closed, no existence oracle)")
+    void should_throwForbidden_when_appointmentHasNoItems_whenEnforcingCanManageAppointment() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId)).thenReturn(List.of());
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointment throws ForbiddenException when the appointment's items "
+            + "resolve to DIFFERENT masters and the actor has authority over only one of them — "
+            + "regression for the LOW finding where the old Limit.of(1) read authorized the whole "
+            + "visit off a single arbitrary item")
+    void should_throwForbidden_when_itemsResolveToDifferentMastersAndActorAuthorizedForOnlyOne() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID salonId1 = UUID.randomUUID();
+        UUID salonId2 = UUID.randomUUID();
+        UUID masterUserId1 = UUID.randomUUID();
+        UUID masterUserId2 = UUID.randomUUID();
+        BookingCompletionAccess authorizedItem = new BookingCompletionAccess(masterUserId1, salonId1);
+        BookingCompletionAccess foreignItem = new BookingCompletionAccess(masterUserId2, salonId2);
+
+        // The old Limit.of(1) query (deterministically ordered by b.id, so its single row would
+        // have been this same first item) has been deleted from BookingRepository entirely — it
+        // would have driven the decision and the actor (authorized for item 1 only) would have
+        // been WRONGLY granted access to the whole visit. That is the exact regression this test
+        // guards against, now that enforceCanManageAppointment only ever reads the all-rows form.
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(authorizedItem, foreignItem));
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId1, actorId)).thenReturn(true);
+        when(salonRepository.existsByIdAndOwnerId(salonId2, actorId)).thenReturn(false);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── canRescheduleAppointment (Phase 27.2 SpEL predicate, visit-level — no ──
+    // ── longer trusts the single-master invariant; checks EVERY chained item) ──
+
+    @Test
+    @DisplayName("canRescheduleAppointment returns false without DB hit when actor has ROLE_SALON_MASTER")
+    void should_returnFalseWithoutDbHit_when_salonMasterCallsCanRescheduleAppointment() {
+        UUID appointmentId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canRescheduleAppointment(auth, appointmentId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findAllCompletionAccessByAppointmentId(any());
+    }
+
+    @Test
+    @DisplayName("canRescheduleAppointment returns true when the actor has provider authority "
+            + "over every chained item")
+    void should_returnTrue_when_actorHasAuthorityOverEveryItem_whenCallingCanRescheduleAppointment() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterUserId1 = UUID.randomUUID();
+        UUID masterUserId2 = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(
+                        new BookingCompletionAccess(masterUserId1, salonId),
+                        new BookingCompletionAccess(masterUserId2, salonId)));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canRescheduleAppointment(auth, appointmentId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canRescheduleAppointment returns false when the appointment has no items "
+            + "(fail-closed, no existence oracle)")
+    void should_returnFalse_when_appointmentHasNoItems_whenCallingCanRescheduleAppointment() {
+        UUID appointmentId = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId)).thenReturn(List.of());
+
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canRescheduleAppointment(auth, appointmentId);
+
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    @DisplayName("canRescheduleAppointment returns false when the appointment's items resolve to "
+            + "DIFFERENT masters and the actor has authority over only one of them — regression for "
+            + "the LOW finding where the old Limit.of(1) read authorized the whole visit off a "
+            + "single arbitrary item")
+    void should_returnFalse_when_itemsResolveToDifferentMastersAndActorAuthorizedForOnlyOne_whenCallingCanRescheduleAppointment() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID salonId1 = UUID.randomUUID();
+        UUID salonId2 = UUID.randomUUID();
+        UUID masterUserId1 = UUID.randomUUID();
+        UUID masterUserId2 = UUID.randomUUID();
+        BookingCompletionAccess authorizedItem = new BookingCompletionAccess(masterUserId1, salonId1);
+        BookingCompletionAccess foreignItem = new BookingCompletionAccess(masterUserId2, salonId2);
+
+        // The old Limit.of(1) query (deterministically ordered by b.id, so its single row would
+        // have been this same first item) has been deleted from BookingRepository entirely — it
+        // would have driven the decision and the actor (authorized for item 1 only) would have
+        // been WRONGLY granted access to reschedule the whole visit. That is the exact regression
+        // this test guards against, now that canRescheduleAppointment only ever reads the
+        // all-rows form and requires authority over every item.
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(authorizedItem, foreignItem));
+        when(salonRepository.existsByIdAndOwnerId(salonId1, actorId)).thenReturn(true);
+        when(salonRepository.existsByIdAndOwnerId(salonId2, actorId)).thenReturn(false);
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canRescheduleAppointment(auth, appointmentId);
+
+        assertThat(result).isFalse();
+    }
+
     // ── canCompleteBooking (Phase 18.4 SpEL predicate) ─────────────────────────
 
     @Test
@@ -992,6 +1260,159 @@ class AuthorizationServiceTest {
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
         boolean result = authorizationService.canCompleteBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    // ── canRescheduleBooking (Phase 27.2 SpEL predicate) ────────────────────────
+
+    @Test
+    @DisplayName("canRescheduleBooking returns false without DB hit when actor has ROLE_SALON_MASTER")
+    void should_returnFalseWithoutDbHit_when_salonMasterCallsCanRescheduleBooking() {
+        UUID bookingId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canRescheduleBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findCompletionAccessById(any());
+    }
+
+    @Test
+    @DisplayName("canRescheduleBooking returns false without DB hit when actor has ROLE_CLIENT "
+            + "(defensive only — the client arm of the union @PreAuthorize never reaches this method)")
+    void should_returnFalseWithoutDbHit_when_clientCallsCanRescheduleBooking() {
+        UUID bookingId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_CLIENT");
+
+        boolean result = authorizationService.canRescheduleBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findCompletionAccessById(any());
+    }
+
+    @Test
+    @DisplayName("canRescheduleBooking returns true when an assigned SALON_ADMIN reschedules a salon booking")
+    void should_returnTrue_when_assignedSalonAdminCallsCanRescheduleBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingCompletionAccess(masterUserId, salonId)));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
+
+        boolean result = authorizationService.canRescheduleBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canRescheduleBooking returns true when an independent master reschedules their own booking (salonId null)")
+    void should_returnTrue_when_independentMasterCallsCanRescheduleBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingCompletionAccess(actorId, null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        boolean result = authorizationService.canRescheduleBooking(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canRescheduleBooking returns false when the booking does not exist (no existence oracle)")
+    void should_returnFalse_when_rescheduleBookingMissing() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId)).thenReturn(Optional.empty());
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canRescheduleBooking(auth, bookingId);
+
+        assertThat(result).isFalse();
+    }
+
+    // ── canReviewClient (Phase 27.5 SpEL predicate) ─────────────────────────────
+
+    @Test
+    @DisplayName("canReviewClient returns false without DB hit when actor has ROLE_SALON_MASTER")
+    void should_returnFalseWithoutDbHit_when_salonMasterCallsCanReviewClient() {
+        UUID bookingId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canReviewClient(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findCompletionAccessById(any());
+    }
+
+    @Test
+    @DisplayName("canReviewClient returns false without DB hit when actor has ROLE_CLIENT")
+    void should_returnFalseWithoutDbHit_when_clientCallsCanReviewClient() {
+        UUID bookingId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_CLIENT");
+
+        boolean result = authorizationService.canReviewClient(auth, bookingId);
+
+        assertThat(result).isFalse();
+        verify(bookingRepository, never()).findCompletionAccessById(any());
+    }
+
+    @Test
+    @DisplayName("canReviewClient returns true when an assigned SALON_ADMIN reviews a salon booking's client")
+    void should_returnTrue_when_assignedSalonAdminCallsCanReviewClient() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingCompletionAccess(masterUserId, salonId)));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
+
+        boolean result = authorizationService.canReviewClient(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canReviewClient returns true when an independent master reviews their own booking's client (salonId null)")
+    void should_returnTrue_when_independentMasterCallsCanReviewClient() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingCompletionAccess(actorId, null)));
+
+        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
+
+        boolean result = authorizationService.canReviewClient(auth, bookingId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canReviewClient returns false when the booking does not exist (no existence oracle)")
+    void should_returnFalse_when_reviewClientBookingMissing() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        when(bookingRepository.findCompletionAccessById(bookingId)).thenReturn(Optional.empty());
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canReviewClient(auth, bookingId);
 
         assertThat(result).isFalse();
     }
@@ -1699,5 +2120,93 @@ class AuthorizationServiceTest {
         assertThat(result)
                 .as("SALON_OWNER actor must be able to view their own SALON_OWNER-type master booking with full data")
                 .isTrue();
+    }
+
+    // ── principalId / roleFromAuthentication — fail-closed delegation (LOW hardening) ──────────
+    // AuthorizationService.principalId and roleFromAuthentication are now thin delegates to
+    // AuthenticationUtils.userId / AuthenticationUtils.role (B14 dedup). Both are private, so they
+    // are pinned through the nearest public predicates that call them:
+    //   • canManageSalon(auth, id) calls principalId(auth) once the OWNER/ADMIN authority check passes.
+    //   • canViewBooking(auth, id) calls principalId(auth) THEN roleFromAuthentication(auth) before
+    //     any repository access, so a bad role fails closed with no stub needed.
+    // The contract these pin: a malformed principal/role surfaces as ForbiddenException (403),
+    // NEVER the raw IllegalStateException/ClassCastException that used to become a 500.
+
+    @Test
+    @DisplayName("principalId — a non-UUID token principal fails closed with ForbiddenException (403), "
+            + "not the pre-hardening IllegalStateException (500), via canManageSalon")
+    void should_throwForbiddenNotIllegalState_when_principalDetailsAreNotUuid() {
+        UUID salonId = UUID.randomUUID();
+
+        // OWNER authority so canManageSalon's role fast-path passes and it reaches principalId(auth);
+        // details is a String, not a UUID — AuthenticationUtils.userId must reject it.
+        var token = new UsernamePasswordAuthenticationToken(
+                "user@example.com", null, List.of(new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails("not-a-uuid");
+
+        assertThatThrownBy(() -> authorizationService.canManageSalon(token, salonId))
+                .as("a non-UUID principal must fail closed as 403 (ForbiddenException), never leak as a 500")
+                .isInstanceOf(ForbiddenException.class)
+                .isNotInstanceOf(IllegalStateException.class);
+        // Fail-closed means no ownership query is ever issued for a malformed principal.
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("roleFromAuthentication — a principal carrying NO recognised role authority fails "
+            + "closed with ForbiddenException (403) before any DB access, via canViewBooking")
+    void should_throwForbidden_when_noRoleAuthorityPresent() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Valid UUID principal (principalId succeeds) but no ROLE_* authority — roleFromAuthentication
+        // must throw before findViewAccessById is consulted, so no repository stub is required.
+        var token = new UsernamePasswordAuthenticationToken(
+                "user@example.com", null, List.of(new SimpleGrantedAuthority("SCOPE_read")));
+        token.setDetails(actorId);
+
+        assertThatThrownBy(() -> authorizationService.canViewBooking(token, bookingId))
+                .isInstanceOf(ForbiddenException.class);
+        verify(bookingRepository, never()).findViewAccessById(any());
+    }
+
+    @Test
+    @DisplayName("roleFromAuthentication — a principal carrying TWO distinct role authorities fails "
+            + "closed (\"Ambiguous role\") with ForbiddenException, never silently over-granting, via canViewBooking")
+    void should_throwForbidden_when_roleIsAmbiguous() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        // Two valid roles present — resolving by precedence would silently over-grant scope
+        // (e.g. {CLIENT, SALON_OWNER} → owner-wide access), so AuthenticationUtils.role rejects it.
+        var token = new UsernamePasswordAuthenticationToken(
+                "user@example.com", null,
+                List.of(new SimpleGrantedAuthority("ROLE_CLIENT"),
+                        new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails(actorId);
+
+        assertThatThrownBy(() -> authorizationService.canViewBooking(token, bookingId))
+                .as("an ambiguous multi-role principal must be rejected, not resolved to the most-privileged role")
+                .isInstanceOf(ForbiddenException.class);
+        verify(bookingRepository, never()).findViewAccessById(any());
+    }
+
+    @Test
+    @DisplayName("principalId + roleFromAuthentication — happy path (UUID principal + single ROLE_*) "
+            + "still threads the actor id and role through unchanged after the AuthenticationUtils delegation")
+    void should_resolvePrincipalAndRoleUnchanged_onHappyPath() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        // A well-formed SALON_OWNER token: principalId must resolve exactly actorId and the role must
+        // resolve to SALON_OWNER, so the ownership query is issued with the resolved actor id.
+        boolean result = authorizationService.canManageSalon(mockAuth(actorId, "ROLE_SALON_OWNER"), salonId);
+
+        assertThat(result)
+                .as("the delegation must be behaviour-identical on the happy path — owner is granted")
+                .isTrue();
+        verify(salonRepository).existsByIdAndOwnerId(salonId, actorId);
     }
 }

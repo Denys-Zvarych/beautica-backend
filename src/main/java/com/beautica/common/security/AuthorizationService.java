@@ -19,6 +19,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.UUID;
 
 @Component("authz")
@@ -415,8 +416,16 @@ public class AuthorizationService {
      * <p>Evaluation is branch-local: the in-memory owner comparison runs first and short-circuits
      * on a match; {@link #hasManagementAccess} is invoked only when it does not, so this never
      * unconditionally pays for both checks (the eager-evaluation bug this replaces).
+     *
+     * <p><b>Public since the {@code providerCanReviewClient} viewer-aware DTO field</b> (extends
+     * Phase 27.5): {@code BookingService#getBooking} calls this directly, non-throwing, to
+     * pre-compute whether the CURRENT viewer has provider review-authority over the booking being
+     * fetched — the exact same predicate {@link #enforceCanReviewClient} throws on, reused rather
+     * than re-derived so the two can never diverge. The booking is already loaded once by that
+     * caller (via {@code findByIdWithFullGraph}), so this remains a zero-extra-query call on the
+     * SALON_OWNER branch, same as every other caller of this overload.
      */
-    private boolean hasProviderAuthorityOverBooking(UUID actorId, Booking booking) {
+    public boolean hasProviderAuthorityOverBooking(UUID actorId, Booking booking) {
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
             return hasProviderAuthorityOverBooking(true, master.getUser().getId(), null, actorId, null);
@@ -431,6 +440,54 @@ public class AuthorizationService {
         // Not the (in-memory) owner — fall back to the DB-backed check, which also covers the
         // assigned SALON_ADMIN case the loaded graph cannot answer.
         return hasManagementAccess(salon.getId(), actorId, roleFromCurrentAuthentication());
+    }
+
+    /**
+     * Service-layer provider-authority guard for the WHOLE-VISIT transitions
+     * ({@code AppointmentTransitionService#declineAppointment} / {@code #completeAppointment} /
+     * {@code #notCompleteAppointment}), evaluated via the lightweight {@link BookingCompletionAccess}
+     * projection — the same projection {@link #canRescheduleAppointment} uses — instead of a full
+     * {@code Booking} entity load.
+     *
+     * <p><b>Cycle-3 audit finding 1.</b> The pre-lock authorization check in those three methods must
+     * run BEFORE {@code AppointmentTransitionService#lockHeaderForWholeVisitTransition} without
+     * loading a {@code Booking} entity into the persistence context — an entity loaded here would
+     * make the SUBSEQUENT post-lock item reload return the SAME stale cached instance instead of a
+     * fresh read (Hibernate's identity-map reconciliation never overwrites an already-managed
+     * entity's fields from a later query's resultset), silently defeating the "fresh snapshot after
+     * the lock" invariant {@code AppointmentCrossPathTransitionConcurrencyIT} depends on. A projection
+     * query never touches the entity manager, so it cannot poison that later, genuinely-fresh load.
+     *
+     * <p>No existence oracle: a missing appointment id and an itemless/foreign one both resolve to an
+     * empty projection list, mapped to the same 403 as a genuine authorization failure — mirroring
+     * {@link #canRescheduleAppointment}'s missing-visit handling.
+     *
+     * <p><b>Does not trust the single-master invariant.</b> A visit is single-master only by
+     * construction of today's writers ({@code VisitPlanner.planChainedItems} resolves every chained
+     * item off one {@code Master}) — there is no DB constraint behind it (see
+     * {@link BookingRepository#findAllCompletionAccessByAppointmentId}'s Javadoc). This method
+     * therefore fetches EVERY item's {@code (masterUserId, salonId)} pair via
+     * {@link BookingRepository#findAllCompletionAccessByAppointmentId} and requires provider
+     * authority over ALL of them; a single disagreeing row denies the whole call, with no
+     * distinguishable error from any other authorization failure. Cheap regardless of the row
+     * count: a visit is capped at {@code SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows,
+     * §E-3). {@link #canRescheduleAppointment} applies the exact same all-rows guard.
+     *
+     * @throws ForbiddenException the appointment does not exist, has no items, or the actor lacks
+     *                            provider authority over any one of its items' masters (403)
+     */
+    public void enforceCanManageAppointment(UUID actorUserId, UUID appointmentId) {
+        List<BookingCompletionAccess> access =
+                bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId);
+        if (access.isEmpty()) {
+            throw new ForbiddenException("Access denied");
+        }
+        Role actorRole = roleFromCurrentAuthentication();
+        boolean authorizedForEveryItem = access.stream().allMatch(v ->
+                hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorUserId, actorRole));
+        if (!authorizedForEveryItem) {
+            throw new ForbiddenException("Access denied");
+        }
     }
 
     /**
@@ -500,6 +557,115 @@ public class AuthorizationService {
                 .map(v -> hasProviderAuthorityOverBooking(
                         v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
                 .orElse(false);
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} provider-reschedule predicate (Phase 27.2), backing the provider
+     * arm of {@code PATCH /bookings/{id}/reschedule}'s union role check:
+     * {@code hasRole('CLIENT') or (hasAnyRole(providers) and @authz.canRescheduleBooking(...))}.
+     *
+     * <p>Reuses the exact same {@link BookingCompletionAccess} projection and
+     * {@link #hasProviderAuthorityOverBooking} predicate as {@link #canCancelBooking}/
+     * {@link #canCompleteBooking} — mirrors them verbatim, including the role fast path and the
+     * missing-booking handling.
+     *
+     * <p><b>Why this method never needs to special-case {@code ROLE_CLIENT}:</b> Spring SpEL
+     * evaluates {@code hasRole('CLIENT') or (hasAnyRole(...) and @authz.canRescheduleBooking(...))}
+     * left-to-right with short-circuiting {@code or} — for a CLIENT principal the left operand is
+     * already {@code true}, so the right operand (and therefore this method) is never evaluated at
+     * all. This method is only ever reached once {@code hasAnyRole('SALON_OWNER','SALON_ADMIN',
+     * 'INDEPENDENT_MASTER')} has already narrowed the caller to a provider role, so rejecting
+     * {@code ROLE_SALON_MASTER}/{@code ROLE_CLIENT} here (mirroring {@link #canCancelBooking}) is
+     * purely defensive — the client path structurally never reaches this method.
+     */
+    public boolean canRescheduleBooking(Authentication auth, UUID bookingId) {
+        boolean cannotReschedule = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotReschedule) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findCompletionAccessById(bookingId)
+                .map(v -> hasProviderAuthorityOverBooking(
+                        v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+                .orElse(false);
+    }
+
+    /**
+     * Service-layer provider-reschedule guard (Phase 27.2) — the entity-based twin of
+     * {@link #canRescheduleBooking}, for {@code BookingService.rescheduleBooking}'s provider
+     * branch to call after its own single load (mirrors {@link #enforceCanCancelBooking}/
+     * {@link #enforceCanCompleteBooking}).
+     */
+    public void enforceCanRescheduleBooking(UUID actorUserId, Booking booking) {
+        if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} provider-reschedule predicate for the VISIT-level analogue of
+     * {@link #canRescheduleBooking}, backing the provider arm of
+     * {@code PATCH /appointments/{id}/reschedule}'s union role check: {@code hasRole('CLIENT') or
+     * (hasAnyRole(providers) and @authz.canRescheduleAppointment(...))}.
+     *
+     * <p><b>Does not trust the single-master invariant.</b> A visit is single-master only by
+     * construction of today's writers ({@code VisitPlanner.planChainedItems} resolves every
+     * chained item off one {@code Master}) — there is no DB constraint behind it (see {@link
+     * BookingRepository#findAllCompletionAccessByAppointmentId}'s Javadoc). This method previously
+     * read a single arbitrary row via a now-deleted {@code Limit.of(1)} overload and authorized
+     * the whole visit off that one item's master — the exact bypass {@link
+     * #enforceCanManageAppointment} was fixed against. It now fetches EVERY item's {@code
+     * (masterUserId, salonId)} pair via {@link BookingRepository#findAllCompletionAccessByAppointmentId}
+     * and requires provider authority over ALL of them; a single disagreeing row returns {@code
+     * false}, indistinguishable from any other authorization failure (no existence oracle — a
+     * missing/foreign/itemless appointment id also answers {@code false}). Cheap regardless of the
+     * row count: a visit is capped at {@code SlotCalculationService.MAX_SERVICES_PER_VISIT} (10
+     * rows, §E-3). Role fast path mirrors {@link #canRescheduleBooking} exactly.
+     */
+    public boolean canRescheduleAppointment(Authentication auth, UUID appointmentId) {
+        boolean cannotReschedule = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotReschedule) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        List<BookingCompletionAccess> access =
+                bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId);
+        if (access.isEmpty()) return false;
+        return access.stream().allMatch(v ->
+                hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole));
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} predicate for {@code POST /client-reviews} (Phase 27.5 — REVERSES
+     * the previously-deferred/out-of-scope status of master&rarr;client reviews). Mirrors {@link
+     * #canCancelBooking}/{@link #canCompleteBooking}/{@link #canRescheduleBooking} verbatim — a
+     * provider may review the CLIENT of any booking they have provider authority over, the exact
+     * same authority shape as decline/complete/reschedule.
+     */
+    public boolean canReviewClient(Authentication auth, UUID bookingId) {
+        boolean cannotReview = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotReview) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return bookingRepository.findCompletionAccessById(bookingId)
+                .map(v -> hasProviderAuthorityOverBooking(
+                        v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+                .orElse(false);
+    }
+
+    /**
+     * Service-layer defense-in-depth guard (Phase 27.5) — the entity-based twin of {@link
+     * #canReviewClient}, for {@code ClientReviewService.create} to call after its own single load
+     * (mirrors {@link #enforceCanCancelBooking}/{@link #enforceCanRescheduleBooking}).
+     */
+    public void enforceCanReviewClient(UUID actorUserId, Booking booking) {
+        if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
+            throw new ForbiddenException("Access denied");
+        }
     }
 
     public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
@@ -591,30 +757,16 @@ public class AuthorizationService {
     }
 
     /**
-     * Extracts the {@link Role} from the supplied {@code Authentication} object.
-     * The JWT filter encodes the role as a {@code GrantedAuthority} with the
-     * standard {@code ROLE_} prefix.
+     * Resolves the {@link Role} of the supplied {@code Authentication}.
      *
-     * <p>Wraps {@link Role#valueOf} to prevent an unchecked
-     * {@link IllegalArgumentException} from propagating as a 500 when the token
-     * carries an unrecognised role string. Re-thrown as {@link ForbiddenException}
-     * so the global exception handler maps it to 403.
+     * <p>Delegates to {@link AuthenticationUtils#role(Authentication)} — the single
+     * canonical reader of the {@code Authentication} authorities (B14 dedup). This is the
+     * last {@code AuthorizationService}-local copy of role extraction being routed through
+     * that reader, so there is now exactly one implementation. Fails closed with
+     * {@link ForbiddenException} (403) on a missing/unrecognised/ambiguous role.
      */
     private Role roleFromAuthentication(Authentication auth) {
-        if (auth == null) {
-            throw new IllegalStateException("No authentication in security context");
-        }
-        return auth.getAuthorities().stream()
-                .map(a -> {
-                    String name = a.getAuthority().replace("ROLE_", "");
-                    try {
-                        return Role.valueOf(name);
-                    } catch (IllegalArgumentException ex) {
-                        throw new ForbiddenException("Unrecognized role in security context");
-                    }
-                })
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException("No role in security context"));
+        return AuthenticationUtils.role(auth);
     }
 
     /**
@@ -626,12 +778,17 @@ public class AuthorizationService {
         return roleFromAuthentication(SecurityContextHolder.getContext().getAuthentication());
     }
 
+    /**
+     * Resolves the authenticated principal's UUID from the supplied {@code Authentication}.
+     *
+     * <p>Delegates to {@link AuthenticationUtils#userId(Authentication)} — the single
+     * canonical reader of the token principal/details (B14 dedup). Fails closed with
+     * {@link ForbiddenException} (403) on a missing/non-UUID principal (Anti-Bug §B2),
+     * rather than the previous raw {@link IllegalStateException} that surfaced as a 500.
+     * Not exploitable today — {@code JwtAuthenticationFilter} always sets a UUID — so the
+     * happy path is behaviour-identical; only the malformed-principal error type changes.
+     */
     private UUID principalId(Authentication auth) {
-        // JwtAuthenticationFilter sets the UUID as authentication.getDetails()
-        // and the email string as the principal.
-        if (auth == null || !(auth.getDetails() instanceof UUID id)) {
-            throw new IllegalStateException("No authenticated principal UUID in security context");
-        }
-        return id;
+        return AuthenticationUtils.userId(auth);
     }
 }

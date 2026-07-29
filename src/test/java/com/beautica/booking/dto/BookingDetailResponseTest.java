@@ -90,7 +90,7 @@ class BookingDetailResponseTest {
     @Test
     @DisplayName("maps every field correctly when booking is fully populated, including PII traversal")
     void should_mapAllFields_when_bookingIsValid() {
-        var response = BookingDetailResponse.from(booking, true, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, true, true, "Київ", "Шевченківський");
 
         // shared fields
         assertThat(response.id()).isEqualTo(bookingId);
@@ -130,6 +130,9 @@ class BookingDetailResponseTest {
 
         // Phase 19.3 enrichment — passed-in canReview + resolved labels, category from service def
         assertThat(response.canReview()).isTrue();
+        // providerCanReviewClient is likewise a passed-in value, not derived here — from() trusts
+        // the caller (BookingService) the same way it trusts canReview.
+        assertThat(response.providerCanReviewClient()).isTrue();
         assertThat(response.cityLabel()).isEqualTo("Київ");
         assertThat(response.districtLabel()).isEqualTo("Шевченківський");
         assertThat(response.salonName()).isNull();
@@ -144,7 +147,7 @@ class BookingDetailResponseTest {
         when(booking.getClientComment()).thenReturn(null);
         when(booking.getProviderComment()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, null, null);
+        var response = BookingDetailResponse.from(booking, false, false, null, null);
 
         assertThat(response.clientComment()).isNull();
         assertThat(response.providerComment()).isNull();
@@ -157,7 +160,7 @@ class BookingDetailResponseTest {
         when(booking.getGuestName()).thenReturn("Оксана");
         when(booking.getGuestSurname()).thenReturn("Мельник");
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.clientId()).isNull();
         assertThat(response.clientFirstName()).isEqualTo("Оксана");
@@ -173,7 +176,7 @@ class BookingDetailResponseTest {
     void should_returnNullProfessionalTitle_when_masterHasNoTitle() {
         when(masterUser.getProfessionalTitle()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.masterProfessionalTitle()).isNull();
         // the rest of the master row is unaffected by a missing title
@@ -190,7 +193,7 @@ class BookingDetailResponseTest {
         when(masterUser.getProfessionalTitle()).thenReturn(null);
         when(masterUser.getLocationNote()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.clientId()).isNull();
         assertThat(response.masterProfessionalTitle()).isNull();
@@ -205,7 +208,7 @@ class BookingDetailResponseTest {
         when(masterUser.getLocationNote()).thenReturn("Дзвонити двічі");
         // master.getSalon() is unstubbed on this mock -> null, exercising the independent branch.
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.salonName()).isNull();
         assertThat(response.locationNote()).isEqualTo("Дзвонити двічі");
@@ -222,7 +225,7 @@ class BookingDetailResponseTest {
         var master = booking.getMaster();
         when(master.getSalon()).thenReturn(salon);
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.salonName()).isEqualTo("Glamour Studio");
         assertThat(response.locationNote()).isEqualTo("3-й поверх, код 1234");
@@ -236,7 +239,7 @@ class BookingDetailResponseTest {
     void should_returnFrozenCeiling_when_bookingHasOne() {
         when(booking.getPriceMaxAtBooking()).thenReturn(new BigDecimal("500.00"));
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
     }
@@ -246,7 +249,7 @@ class BookingDetailResponseTest {
     void should_returnNullPriceMax_when_bookingFrozeNoCeiling() {
         when(booking.getPriceMaxAtBooking()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.priceMaxAtBooking()).isNull();
     }
@@ -262,7 +265,7 @@ class BookingDetailResponseTest {
         lenient().when(serviceDef.getPriceMax()).thenReturn(new BigDecimal("9999.00"));
         lenient().when(booking.getMasterService().getPriceOverride()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.priceMaxAtBooking())
                 .as("the agreed ceiling, not the edited one")
@@ -278,8 +281,88 @@ class BookingDetailResponseTest {
         lenient().when(serviceDef.getPriceType()).thenReturn(PriceType.FIXED);
         lenient().when(serviceDef.getPriceMax()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, "Київ", "Шевченківський");
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
 
         assertThat(response.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
+    }
+
+    // ── clientAvatarUrl — deliberate client-PII widening (provider timeline photo) ────
+    //
+    // QA-authored. The field ships a provider the LIKENESS of the client who booked with them,
+    // so the three branches below are the whole contract: (1) a registered client's own photo
+    // reaches the DTO and is NOT confused with the master's, (2) a guest booking has no photo
+    // and deliberately no fallback, (3) a registered client who never uploaded one is null.
+    //
+    // Why the distinct-URL fixture in (1) matters: clientAvatarUrl and masterAvatarUrl are
+    // adjacent String reads off two different User graphs (client vs master.getUser()). The
+    // shipped mapper is `client != null ? client.getAvatarUrl() : null` — one edit away from
+    // `masterUser.getAvatarUrl()`. Every pre-existing fixture in this suite leaves the master's
+    // avatar unstubbed (null) and the client's unstubbed (null), so that swap would have been
+    // invisible: null == null. Seeding two DIFFERENT non-null URLs is what makes the swap fail.
+
+    private static final String CLIENT_AVATAR = "https://cdn.beautica.test/avatars/client-olena.jpg";
+    private static final String MASTER_AVATAR = "https://cdn.beautica.test/avatars/master-nataliia.jpg";
+
+    @Test
+    @DisplayName("clientAvatarUrl carries the CLIENT's own photo — never the master's — when the "
+            + "booking has a registered client (the two avatar fields read two different User "
+            + "graphs and must not be swapped)")
+    void should_returnClientsOwnAvatar_when_bookingHasRegisteredClient() {
+        when(clientUser.getAvatarUrl()).thenReturn(CLIENT_AVATAR);
+        when(masterUser.getAvatarUrl()).thenReturn(MASTER_AVATAR);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientAvatarUrl())
+                .as("must be booking.getClient().getAvatarUrl(); a copy-paste of the adjacent "
+                        + "masterUser.getAvatarUrl() read would show the provider their OWN photo "
+                        + "on every client card, actual=%s", response.clientAvatarUrl())
+                .isEqualTo(CLIENT_AVATAR)
+                .isNotEqualTo(MASTER_AVATAR);
+        assertThat(response.masterAvatarUrl())
+                .as("the sibling field must be unaffected — proves the assertion above is not "
+                        + "passing because both fields collapsed onto the client")
+                .isEqualTo(MASTER_AVATAR);
+    }
+
+    @Test
+    @DisplayName("clientAvatarUrl is null (not NPE, and deliberately NOT falling back to the guest "
+            + "identity the way clientFirstName/clientLastName do) on a guest (LINK) booking, while "
+            + "masterAvatarUrl is still served")
+    void should_returnNullClientAvatar_when_bookingHasNoRegisteredClient() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestName()).thenReturn("Оксана");
+        when(booking.getGuestSurname()).thenReturn("Мельник");
+        when(masterUser.getAvatarUrl()).thenReturn(MASTER_AVATAR);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientAvatarUrl())
+                .as("a guest has no account and so no photo — and unlike the name there is nothing "
+                        + "to fall back TO; the card renders the generic glyph")
+                .isNull();
+        assertThat(response.clientFirstName())
+                .as("non-vacuity: the guest identity fallback that DOES exist still fired, so the "
+                        + "null above is the avatar branch specifically, not a dead fixture")
+                .isEqualTo("Оксана");
+        assertThat(response.masterAvatarUrl())
+                .as("the master's likeness is unaffected by the client being absent — it hangs off "
+                        + "master.getUser(), never the (null) client")
+                .isEqualTo(MASTER_AVATAR);
+    }
+
+    @Test
+    @DisplayName("clientAvatarUrl is null for a registered client who never uploaded a photo — the "
+            + "second documented null case, indistinguishable from the guest case by contract")
+    void should_returnNullClientAvatar_when_registeredClientNeverUploadedOne() {
+        when(clientUser.getAvatarUrl()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський");
+
+        assertThat(response.clientAvatarUrl()).isNull();
+        assertThat(response.clientId())
+                .as("non-vacuity: this IS a registered client, so the null came from an empty "
+                        + "avatar column and not from the guest null-guard")
+                .isEqualTo(clientId);
     }
 }

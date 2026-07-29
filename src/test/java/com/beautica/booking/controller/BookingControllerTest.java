@@ -125,7 +125,15 @@ class BookingControllerTest {
                 "Kyiv", null, null, null,
                 // locationNote (additive)
                 null,
-                "MANICURE", false
+                "MANICURE", false,
+                // providerCanReviewClient (additive) — viewer-aware, always false in this
+                // controller-slice fixture (BookingService is mocked; the value never reaches
+                // real computation here)
+                false,
+                // appointmentId (BE-5 additive) — legacy single-service booking has no visit
+                null,
+                // clientAvatarUrl (additive) — the provider timeline's client photo
+                "https://cdn.test/client-avatar.png"
         );
     }
 
@@ -714,8 +722,11 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
     }
 
-    // Phase 24.2: SALON_ADMIN now passes the controller role gate — this exercises the "role
-    // admitted but @authz.canCancelBooking denies" path (an admin not assigned to the salon).
+    // Phase 24.2: SALON_ADMIN passes the controller role gate. Unlike /decline, the /not-complete
+    // annotation is role-only (§D — the redundant SpEL @authz.canCancelBooking ownership clause was
+    // dropped), so ownership for an admin NOT assigned to the booking's salon is enforced by the
+    // service-layer @authz.enforceCanCancelBooking guard in BookingService#notCompleteBooking. Here
+    // that mocked service throws ForbiddenException, which the controller propagates as 403.
     // TODO(24.7): add the assigned-SALON_ADMIN ✅ 204 case to the authz matrix.
     @Test
     @DisplayName("PATCH /{bookingId}/not-complete — 403 when SALON_ADMIN is not assigned to the booking's salon")
@@ -723,7 +734,8 @@ class BookingControllerTest {
         var adminId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(false);
+        when(bookingService.notCompleteBooking(any(), eq(bookingId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
                         .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
@@ -824,7 +836,7 @@ class BookingControllerTest {
         var bookingId = UUID.randomUUID();
         var newStartsAt = ZonedDateTime.now().plusDays(2).toOffsetDateTime();
         var body = objectMapper.writeValueAsString(new RescheduleBookingRequest(newStartsAt));
-        when(bookingService.rescheduleBooking(eq(clientId), eq(bookingId), any()))
+        when(bookingService.rescheduleBooking(eq(clientId), eq(Role.CLIENT), eq(bookingId), any()))
                 .thenReturn(stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID()));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
@@ -839,17 +851,48 @@ class BookingControllerTest {
         // Actor id handed to the service is the security principal's id — never derived from the body.
         var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
         org.mockito.Mockito.verify(bookingService)
-                .rescheduleBooking(actorCaptor.capture(), eq(bookingId), any());
+                .rescheduleBooking(actorCaptor.capture(), eq(Role.CLIENT), eq(bookingId), any());
         org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(clientId);
     }
 
+    /**
+     * Phase 27.2 (REVERSES the previously-locked "reschedule is client-only" decision): the
+     * provider arm of the union {@code @PreAuthorize} ({@code hasAnyRole(...) and
+     * @authz.canRescheduleBooking(...)}) now grants a SALON_OWNER with authority over the booking.
+     */
     @Test
-    @DisplayName("PATCH /{bookingId}/reschedule — 403 when SALON_OWNER attempts to reschedule (role guard)")
-    void should_return403_when_ownerAttemptsToReschedule() throws Exception {
+    @DisplayName("Phase 27.2: PATCH /{bookingId}/reschedule — 200 when an AUTHORIZED SALON_OWNER reschedules "
+            + "(reverses the previously-locked client-only decision)")
+    void should_return200_when_authorizedOwnerReschedules() throws Exception {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
                 new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(true);
+        when(bookingService.rescheduleBooking(eq(ownerId), eq(Role.SALON_OWNER), eq(bookingId), any()))
+                .thenReturn(stubDetailResponse(bookingId, UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        org.mockito.Mockito.verify(bookingService)
+                .rescheduleBooking(eq(ownerId), eq(Role.SALON_OWNER), eq(bookingId), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when a SALON_OWNER with NO authority over the booking "
+            + "attempts to reschedule (canRescheduleBooking denies — service is never reached)")
+    void should_return403_when_unauthorizedOwnerAttemptsToReschedule() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(false);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
@@ -859,16 +902,42 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .rescheduleBooking(any(), any(), any());
+                .rescheduleBooking(any(), any(), any(), any());
     }
 
     @Test
-    @DisplayName("PATCH /{bookingId}/reschedule — 403 when INDEPENDENT_MASTER attempts to reschedule (role guard)")
-    void should_return403_when_masterAttemptsToReschedule() throws Exception {
+    @DisplayName("Phase 27.2: PATCH /{bookingId}/reschedule — 200 when an AUTHORIZED INDEPENDENT_MASTER "
+            + "reschedules their own booking")
+    void should_return200_when_authorizedIndependentMasterReschedules() throws Exception {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
                 new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(true);
+        when(bookingService.rescheduleBooking(eq(masterId), eq(Role.INDEPENDENT_MASTER), eq(bookingId), any()))
+                .thenReturn(stubDetailResponse(bookingId, UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        org.mockito.Mockito.verify(bookingService)
+                .rescheduleBooking(eq(masterId), eq(Role.INDEPENDENT_MASTER), eq(bookingId), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when an INDEPENDENT_MASTER with NO authority over the "
+            + "booking attempts to reschedule (a foreign master's booking)")
+    void should_return403_when_unauthorizedMasterAttemptsToReschedule() throws Exception {
+        var masterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+        when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(false);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
                         .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -878,7 +947,30 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .rescheduleBooking(any(), any(), any());
+                .rescheduleBooking(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH /{bookingId}/reschedule — 403 when a SALON_MASTER (read-only role) attempts to reschedule")
+    void should_return403_when_salonMasterAttemptsToReschedule() throws Exception {
+        var salonMasterId = UUID.randomUUID();
+        var bookingId = UUID.randomUUID();
+        var body = objectMapper.writeValueAsString(
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+
+        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
+                        .with(authenticatedAs(salonMasterId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        // SALON_MASTER matches neither hasRole('CLIENT') nor the provider hasAnyRole(...) set, so
+        // the SpEL denies before @authz.canRescheduleBooking is ever evaluated.
+        org.mockito.Mockito.verify(authorizationService, org.mockito.Mockito.never())
+                .canRescheduleBooking(any(), any());
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .rescheduleBooking(any(), any(), any(), any());
     }
 
     @Test
@@ -910,7 +1002,7 @@ class BookingControllerTest {
                 .andExpect(status().isBadRequest());
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .rescheduleBooking(any(), any(), any());
+                .rescheduleBooking(any(), any(), any(), any());
     }
 
     @Test
@@ -935,7 +1027,7 @@ class BookingControllerTest {
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
                 new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
-        when(bookingService.rescheduleBooking(any(), eq(bookingId), any()))
+        when(bookingService.rescheduleBooking(any(), eq(Role.CLIENT), eq(bookingId), any()))
                 .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Slot not available"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
@@ -953,7 +1045,7 @@ class BookingControllerTest {
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
                 new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
-        when(bookingService.rescheduleBooking(any(), eq(bookingId), any()))
+        when(bookingService.rescheduleBooking(any(), eq(Role.CLIENT), eq(bookingId), any()))
                 .thenThrow(new ForbiddenException("Access denied"));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")

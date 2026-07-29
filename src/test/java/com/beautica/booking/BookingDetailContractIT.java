@@ -128,6 +128,30 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .isEqualTo("Майстер стрижки");
         assertThat(single.get("salonName").asText())
                 .isEqualTo("Contract Bare Salon");
+
+        // clientAvatarUrl non-vacuity. The reflective loop above ALREADY compares this field —
+        // it enumerates getRecordComponents(), so the component was picked up the moment it was
+        // added to the DTO, with no new hand-written assertion needed. But "both sides agree"
+        // is worthless while both sides are null, which is exactly what the unseeded fixture
+        // produced. This pins that the compared value is real on BOTH mapper paths: the entity
+        // path (client.getAvatarUrl()) and the CLIENT projection path (b.client.avatarUrl).
+        assertThat(single.get("clientAvatarUrl").asText())
+                .as("entity path (GET /bookings/{id}) must serve the client's seeded avatar, so "
+                        + "the parity loop compares a real value rather than null == null")
+                .isEqualTo(CLIENT_AVATAR_URL);
+        assertThat(listItem.get("clientAvatarUrl").asText())
+                .as("CLIENT projection path (GET /bookings/me) must serve the same real value — "
+                        + "this is the JPQL `b.client.avatarUrl` select, a physically different "
+                        + "read from the entity path's getter walk")
+                .isEqualTo(CLIENT_AVATAR_URL);
+        assertThat(single.get("clientAvatarUrl").asText())
+                .as("the client's avatar must never be the MASTER's — the two fields read two "
+                        + "different User graphs and a swap would be invisible if both were null")
+                .isNotEqualTo(MASTER_AVATAR_URL);
+        assertThat(single.get("masterAvatarUrl").asText())
+                .as("sibling field sanity — proves the master's avatar is genuinely a different "
+                        + "seeded value, not absent, so the inequality above is meaningful")
+                .isEqualTo(MASTER_AVATAR_URL);
     }
 
     /**
@@ -164,6 +188,11 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .as("fixture sanity — the booking must actually carry client PII for the absence "
                         + "assertions below to mean anything")
                 .isEqualTo(CLIENT_FIRST_NAME);
+        assertThat(legitimate.get("clientAvatarUrl").asText())
+                .as("same non-vacuity gate for the client's LIKENESS: the denial assertions below "
+                        + "only prove something if an authorized read demonstrably DOES serve this "
+                        + "URL for this booking")
+                .isEqualTo(CLIENT_AVATAR_URL);
 
         String foreignMasterEmail = seedForeignMasterAtSameSalon(fx.salonId());
 
@@ -193,9 +222,57 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                         + "smuggled through a renamed or nested field the key scan would miss")
                 .doesNotContain(CLIENT_FIRST_NAME)
                 .doesNotContain(CLIENT_LAST_NAME)
+                // The client's LIKENESS. An avatar URL is a directly dereferenceable, publicly
+                // readable R2 object — leaking it into a 403 envelope hands a denied actor the
+                // client's photo outright, which is strictly worse than leaking an opaque id.
+                .doesNotContain(CLIENT_AVATAR_URL)
                 .doesNotContain("Contract Bare Salon")
                 .doesNotContain("MasterOwnStreet")
                 .doesNotContain("Майстер стрижки");
+    }
+
+    /**
+     * The POSITIVE half of the {@code clientAvatarUrl} widening — the feature itself.
+     *
+     * <p>Everything else about this field is asserted from the CLIENT's own two read paths, where
+     * the value is simply the caller's own photo and no widening has occurred. The widening is
+     * this: a PROVIDER receives a photo of somebody else. That path is
+     * {@code listProviderBookings} → {@code findIdsByMasterIdFiltered} + {@code
+     * findAllByIdsWithGraph} → {@code BookingDetailResponse.from} — a physically different query
+     * and a different scoping branch from either client path, and it had no assertion on this
+     * field anywhere in {@code src/test/}.
+     *
+     * <p>Asserted against DISTINCT seeded avatars so this cannot pass on a mapper that serves the
+     * master their own picture: the provider must receive the CLIENT's URL, and the row's
+     * {@code masterAvatarUrl} must still independently carry the master's.
+     */
+    @Test
+    @DisplayName("GET /bookings/me (provider path) — a master's own booking row carries the "
+            + "BOOKING CLIENT's avatar URL, not the master's own; this is the widening the field "
+            + "exists for and the provider-scoped query had no assertion on it")
+    void should_serveClientAvatarToProvider_when_masterListsOwnBookings() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        UUID bookingId = insertConfirmedBooking(fx);
+
+        String masterEmail = jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, fx.masterUserId());
+        JsonNode providerRow = findInMyBookings(bookingId, tokenFor(masterEmail));
+
+        assertThat(providerRow)
+                .as("the booking's own master must see it on their provider timeline")
+                .isNotNull();
+        assertThat(providerRow.get("clientAvatarUrl").asText())
+                .as("the provider must receive the CLIENT's photo — this is the whole point of "
+                        + "the field, and the entity-graph provider query had zero coverage of it")
+                .isEqualTo(CLIENT_AVATAR_URL);
+        assertThat(providerRow.get("clientAvatarUrl").asText())
+                .as("a mapper that read masterUser.getAvatarUrl() into this slot would render the "
+                        + "master's own face on every client card — distinct seeded URLs are what "
+                        + "make that swap fail here instead of shipping")
+                .isNotEqualTo(MASTER_AVATAR_URL);
+        assertThat(providerRow.get("masterAvatarUrl").asText())
+                .as("sibling field must still independently carry the master's own avatar")
+                .isEqualTo(MASTER_AVATAR_URL);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -204,13 +281,27 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
     private static final String CLIENT_LAST_NAME = "Кравченко";
 
     /**
+     * Distinct, non-null avatar URLs for the booking's client and its master.
+     *
+     * <p>They MUST differ. {@code clientAvatarUrl} and {@code masterAvatarUrl} are adjacent String
+     * reads off two different {@code User} graphs, and every fixture in this suite previously left
+     * both columns NULL — so a mapper that read the master's avatar into the client's field would
+     * have been invisible (null == null) to the reflective parity loop AND to the raw-body PII
+     * scan. Two different non-null values is what gives both gates something to fail on.
+     */
+    private static final String CLIENT_AVATAR_URL =
+            "https://cdn.beautica.test/avatars/contract-client-likeness.jpg";
+    private static final String MASTER_AVATAR_URL =
+            "https://cdn.beautica.test/avatars/contract-master-likeness.jpg";
+
+    /**
      * Keys that must never appear in a denied booking read. {@code guestName}/{@code guestSurname}
      * are not {@link BookingDetailResponse} components today — they fold into
      * {@code clientFirstName}/{@code clientLastName} for guest (LINK) bookings — and are listed
      * anyway so a future DTO that starts surfacing them cannot slip through this gate unnoticed.
      */
     private static final Set<String> PII_FIELD_NAMES = Set.of(
-            "clientFirstName", "clientLastName", "clientId",
+            "clientFirstName", "clientLastName", "clientId", "clientAvatarUrl",
             "guestName", "guestSurname", "guestPhone",
             "street", "buildingNo", "locationNote", "salonName",
             "cityLabel", "districtLabel",
@@ -274,10 +365,10 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         // none of this must ever surface on a booking under this salon.
         jdbcTemplate.update(
                 "UPDATE users SET city_id = ?, district_id = ?, street = ?, building_no = ?, "
-                        + "location_note = ?, professional_title = ? WHERE id = ?",
+                        + "location_note = ?, professional_title = ?, avatar_url = ? WHERE id = ?",
                 masterCityDistrict[1], masterCityDistrict[0], "MasterOwnStreet", "13",
                 "Master's home door code - must NOT surface on a salon booking",
-                "Майстер стрижки", masterUserId);
+                "Майстер стрижки", MASTER_AVATAR_URL, masterUserId);
 
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -299,6 +390,11 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
 
         String clientEmail = "contract-client-" + System.nanoTime() + "@beautica.test";
         UUID clientId = createUser(clientEmail, "CLIENT", null);
+        // The client's LIKENESS — the payload of the clientAvatarUrl widening. Seeded here (not
+        // per-test) so EVERY test in this class, including the reflective parity loop, exercises
+        // a non-null value rather than agreeing vacuously on null.
+        jdbcTemplate.update("UPDATE users SET avatar_url = ? WHERE id = ?",
+                CLIENT_AVATAR_URL, clientId);
 
         return new Fixture(salonId, masterId, masterUserId, masterServiceId, clientEmail, clientId);
     }

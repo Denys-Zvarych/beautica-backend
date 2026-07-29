@@ -1282,4 +1282,183 @@ class SlotCalculationServiceTest {
 
         verifyNoInteractions(masterScheduleService);
     }
+
+    // ── BE-2: multi-service single-visit (List<UUID>) slot list + calendar day-gate ─────────────
+
+    @Test
+    @DisplayName("should size the slot to the SUM of the chained services' effective durations (D4 buffers)")
+    void should_sumEffectiveDurations_when_multipleServicesRequested() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        // Service A: 60 + 10 buffer = 70. Service B: 45 + 15 buffer = 60. D4 total = 130.
+        MasterServiceAssignment a = assignment(masterId, serviceA, 60, 10);
+        MasterServiceAssignment b = assignment(masterId, serviceB, 45, 15);
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(a));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.of(b));
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
+        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB));
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).calculateAvailableSlots(
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(130));
+    }
+
+    @Test
+    @DisplayName("should size the day-gate block to the SUM of the chained services' effective durations")
+    void should_sumEffectiveDurations_when_multipleServicesRequested_forWorkingDays() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        MasterServiceAssignment a = assignment(masterId, serviceA, 60, 0);
+        MasterServiceAssignment b = assignment(masterId, serviceB, 90, 0);
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(a));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.of(b));
+        when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
+                .thenReturn(List.of(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(true);
+
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).hasAvailableSlot(
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(150));
+    }
+
+    @Test
+    @DisplayName("should throw 400 when the SUMMED chained duration exceeds the 600-minute cap")
+    void should_throw400_when_summedDurationExceedsMaximum() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        // 400 + 0 = 400 each; summed = 800 > 600. Neither alone would exceed the cap.
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(assignment(masterId, serviceA, 400, 0)));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.of(assignment(masterId, serviceB, 400, 0)));
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB)))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("exceeds maximum");
+
+        verifyNoInteractions(masterScheduleService);
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("should throw NotFound when any chained service is unknown/foreign/inactive")
+    void should_throwNotFound_when_anyChainedServiceIsInvalid() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(assignment(masterId, serviceA, 60, 0)));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB)))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("should throw 400 when the serviceId list is empty")
+    void should_throw400_when_serviceIdListEmpty() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, List.<UUID>of()))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(masterServiceRepository);
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("should throw 400 when the chained service list exceeds the per-visit cap")
+    void should_throw400_when_serviceIdListExceedsCap() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+        List<UUID> tooMany = java.util.stream.Stream
+                .generate(UUID::randomUUID)
+                .limit(SlotCalculationService.MAX_SERVICES_PER_VISIT + 1)
+                .toList();
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, tooMany))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(masterServiceRepository);
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("1-element list routes to the identical single-service duration (byte-for-byte)")
+    void should_matchSingleService_when_listHasOneElement() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        // 60 + 30 buffer = 90 — the same value the single-arg overload would compute.
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(assignment(masterId, serviceA, 60, 30)));
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
+        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA));
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).calculateAvailableSlots(
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(90));
+    }
+
+    /** Active assignment with a caller-chosen id, so multiple chained ids can be stubbed distinctly. */
+    private static MasterServiceAssignment assignment(
+            UUID masterId, UUID serviceId, int baseMinutes, int bufferMinutes) {
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(baseMinutes)
+                .bufferMinutesAfter(bufferMinutes)
+                .isActive(true)
+                .build();
+        return MasterServiceAssignment.builder()
+                .id(serviceId)
+                .serviceDefinition(sd)
+                .master(master)
+                .isActive(true)
+                .build();
+    }
 }

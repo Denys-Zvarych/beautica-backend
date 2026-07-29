@@ -54,6 +54,7 @@ class GuestBookingServiceTest {
     @Mock private com.beautica.master.repository.MasterRepository masterRepository;
     @Mock private com.beautica.service.repository.MasterServiceRepository masterServiceRepository;
     @Mock private BookingRepository bookingRepository;
+    @Mock private com.beautica.booking.repository.AppointmentRepository appointmentRepository;
     @Mock private SlotCalculationService slotCalculationService;
     @Mock private NotificationOutboxService outboxService;
     @Mock private SmsService smsService;
@@ -68,8 +69,9 @@ class GuestBookingServiceTest {
     void setUp() {
         service = new GuestBookingService(
                 guestTokenProvider, masterRepository, masterServiceRepository, bookingRepository,
-                slotCalculationService, outboxService, smsService,
-                new BookingSmsProperties(), salonCatalogCacheEvictor, FRONTEND,
+                appointmentRepository, slotCalculationService, outboxService, smsService,
+                new BookingSmsProperties(), salonCatalogCacheEvictor,
+                new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC));
     }
 

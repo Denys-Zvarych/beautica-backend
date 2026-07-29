@@ -18,9 +18,64 @@ import java.util.UUID;
  * PII access contract: the controller MUST verify the caller is the booking's client
  * or the assigned master/owner before invoking {@code from(booking, ...)}.
  *
- * <p>{@code clientFirstName}/{@code clientLastName} are intentionally visible to SALON_MASTER
- * actors — the master needs the client's name on their calendar. No field-level role
- * differentiation is applied. If {@code canViewBooking} scope ever widens, audit this DTO.
+ * <p>{@code clientFirstName}/{@code clientLastName}/{@code clientAvatarUrl} are intentionally
+ * visible to SALON_MASTER actors — the master needs the client's name and photo on their calendar.
+ * No field-level role differentiation is applied. If {@code canViewBooking} scope ever widens,
+ * audit this DTO.
+ *
+ * <p><b>{@code clientAvatarUrl} — deliberate widening of the client-PII surface.</b> This DTO
+ * previously exposed the client's NAME to the provider; it now also exposes their LIKENESS (photo).
+ * That was a considered decision, not an incidental addition, so record the reasoning here rather
+ * than re-litigating it at each audit:
+ * <ul>
+ *   <li><b>Need.</b> The provider-side "Мої записи" timeline renders one card per booking; without
+ *       a URL it can only draw a generic person glyph. Recognising the client walking in is the
+ *       whole point of the card.</li>
+ *   <li><b>Scope.</b> Every path that builds this DTO is row-scoped to the caller BEFORE any
+ *       mapping happens, so no actor can enumerate a stranger's photo:
+ *       {@code GET /bookings/me} resolves the scope from the JWT principal alone — never a request
+ *       parameter — via {@code findIdsByMasterIdFiltered(master.getId(), …)} (master id looked up
+ *       from the authenticated user) or {@code findIdsBySalonIdsFiltered(salonIds, …)} (salon ids
+ *       from {@code findIdsByOwnerIdAndIsActiveTrue(actorUserId)}), with SALON_ADMIN rejected
+ *       outright; {@code GET /bookings/{id}} passes every row through
+ *       {@code AuthorizationService#enforceCanViewBooking}. A provider therefore only ever sees the
+ *       avatars of clients who booked with them.</li>
+ *   <li><b>Sensitivity.</b> The value is the same already-public Cloudflare R2 object URL that
+ *       {@code MasterDetailResponse}, {@code SalonResponse}, {@code MasterSearchResult} and this
+ *       DTO's own {@code masterAvatarUrl} hand out — an unauthenticated-readable bucket URL built
+ *       once at upload by {@code R2StorageService#buildPublicUrl} and stored verbatim in
+ *       {@code users.avatar_url}. It is NOT a signed URL and NOT a raw storage key, so passing it
+ *       through grants no capability the URL holder did not already have.</li>
+ *   <li><b>Why the CLIENT projection path populates it too — do NOT "optimise" this away.</b>
+ *       Only the provider timeline consumes this field, and the two {@code GET /bookings/me}
+ *       variants are served by different queries: a provider is hydrated by
+ *       {@code findAllByIdsWithGraph} (entity path, {@code from(booking, …)}), a client by
+ *       {@code hydrateClientBookingDetails} (JPQL projection, {@code b.client.avatarUrl}). So
+ *       dropping {@code b.client.avatarUrl} from that projection would NOT break the feature, and
+ *       it looks like free savings — on the client path the value is just the caller's own photo,
+ *       which their app already holds from {@code /users/me}. It was measured (backend-perf, Phase
+ *       26.x audit) at ~125–150 chars x 20 rows ≈ 3 KB per page. It is populated anyway, and the
+ *       reason is correctness, not cost:
+ *       <b>the same client fetching the same booking would otherwise get two different values for
+ *       this field depending on which endpoint served it</b> — {@code null} from
+ *       {@code GET /bookings/me}, their real photo from {@code GET /bookings/{id}}, which shares
+ *       this DTO and always reads {@code client.getAvatarUrl()}. That also breaks the
+ *       "{@code null} ⇒ render the fallback glyph" contract the {@code @Schema} below states,
+ *       because the null would no longer mean "there is no photo" but "we withheld it from you" —
+ *       a field whose emptiness encodes the CALLER'S ROLE rather than the data. Any consumer that
+ *       caches by booking id, or diffs the list row against the detail view, sees a phantom
+ *       change. Note also that the redundancy is the maximally compressible kind: on the client
+ *       path it is the SAME string on every row, so {@code server.compression} (now enabled
+ *       app-wide in {@code application.yml}: gzip, {@code min-response-size: 1KB}) collapses it to
+ *       near nothing — the real fix was there, not here. {@code BookingDetailContractIT}'s reflective entity-vs-projection parity
+ *       loop pins this: it enumerates {@code getRecordComponents()}, so stopping population here
+ *       fails that gate BY DESIGN. That failure is a true positive, not collateral — suppressing
+ *       it with a per-field carve-out would blunt the gate that exists because a COALESCE
+ *       divergence between these very two mappers once leaked the master's personal
+ *       {@code locationNote} (HIGH regression).</li>
+ * </ul>
+ * Symmetric with {@code masterAvatarUrl}, which has always exposed the provider's likeness to the
+ * client on this same DTO.
  *
  * <p><b>Guest (LINK) bookings.</b> A guest booking has no registered account —
  * {@code client_id} is {@code NULL} (V89 {@code chk_bookings_guest_fields}) — so {@code clientId}
@@ -29,7 +84,10 @@ import java.util.UUID;
  * can ever reach a guest booking's detail view — {@code enforceCanViewBooking} never admits a
  * CLIENT actor onto a null-client booking) still has a name to put on their calendar.
  * {@code guestPhone} is deliberately NOT surfaced by this DTO — it is SMS-transport PII, not
- * calendar-display PII, and has no field here to leak into.
+ * calendar-display PII, and has no field here to leak into. {@code clientAvatarUrl} has NO guest
+ * fallback and is always {@code null} for a guest booking: there is no account, hence no uploaded
+ * photo, and nothing to fall back TO — unlike the name, which falls back to the OTP-verified
+ * {@code guestName}/{@code guestSurname}. Guest cards render the generic glyph.
  *
  * <p><b>Phase 19.3 — client enrichment.</b> Adds the master's avatar/type, the (nullable)
  * salon name, the master's discovery address (district-primary locality labels + street/
@@ -68,6 +126,26 @@ import java.util.UUID;
  * genuine RANGE (no {@code priceOverride}) at the moment of booking; otherwise null, meaning
  * "single price, render {@code priceAtBooking} alone". Never re-derived on read — a later service
  * edit must not rewrite a band the client already agreed to.
+ *
+ * <p><b>{@code providerCanReviewClient}</b> (extends track 27.x / Phase 27.5) — the PROVIDER-side
+ * mirror of {@code canReview}, gating the "Залишити відгук про клієнта" CTA on
+ * {@code GET /bookings/{id}} only (NOT on any {@code GET /bookings/me} row — see below). {@code
+ * true} iff ALL of: (1) the CURRENT authenticated viewer has provider review-authority over THIS
+ * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking} — the exact
+ * predicate backing {@code @authz.canReviewClient}/{@code enforceCanReviewClient} on
+ * {@code POST /client-reviews}, so this can never disagree with what the write endpoint will
+ * actually accept; (2) {@code status == COMPLETED}; (3) the booking has a real client (not a
+ * guest/LINK booking); (4) no {@code ClientReview} already exists for this booking. A CLIENT or
+ * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
+ * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
+ * by {@code enforceCanViewBooking}) with this flag honestly {@code false}, or never reaches this
+ * DTO at all. {@code BookingService#getBooking} is the ONLY caller that computes this for real;
+ * every other construction site ({@code enrichCreated}, {@code rescheduleBooking}, the CLIENT
+ * projection path, and the provider {@code GET /bookings/me} listing) hardcodes {@code false} —
+ * a freshly-created or just-rescheduled booking is always {@code CONFIRMED} (never reviewable
+ * yet), the CLIENT projection path's viewer is always CLIENT (structurally excluded), and the
+ * provider listing was out of scope for the CTA this field backs. See each hardcoding site's own
+ * comment before "optimising" this away.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -129,13 +207,56 @@ public record BookingDetailResponse(
                         + "own note. Nullable — most providers never set one.")
         String locationNote,
         String categoryName,
-        boolean canReview
+        boolean canReview,
+        @Schema(description = "TRUE only for the CURRENT authenticated viewer, and only on "
+                + "GET /bookings/{id}: the viewer has provider review-authority over this "
+                + "booking, its status is COMPLETED, it has a real (non-guest) client, and no "
+                + "ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
+                + "unauthorized provider, or any row served by GET /bookings/me (both the "
+                + "CLIENT and provider listing paths hardcode false — see "
+                + "BookingDetailResponse's class javadoc). Gates the \"Залишити відгук про "
+                + "клієнта\" CTA; the write endpoint (POST /client-reviews) re-checks the same "
+                + "conditions server-side regardless of this value.")
+        boolean providerCanReviewClient,
+        @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
+                description = "The multi-service visit (BE-5) this booking belongs to, or null for a "
+                        + "legacy single-service booking (appointment_id IS NULL). Strictly additive; "
+                        + "when non-null the client can fetch the full visit via "
+                        + "GET /appointments/{appointmentId}. Both mapper paths (entity + CLIENT "
+                        + "projection) read the SAME appointment_id column, so they never diverge.")
+        UUID appointmentId,
+        // Appended LAST, after the UUID appointmentId, for the same reason priceMaxAtBooking sits
+        // apart from priceAtBooking (see ClientBookingDetailProjection's javadoc): the client
+        // identity block above (clientFirstName/clientLastName) is an unbroken run of Strings, so
+        // slotting another String into it would let a future reordering of either construction
+        // site silently swap the client's avatar with a name. Wedged after a UUID and at the end
+        // of the list, any such slip fails to compile instead.
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "The booking client's profile photo — the same already-public "
+                        + "Cloudflare R2 object URL served by masterAvatarUrl and every other "
+                        + "avatar field in this API (never a signed URL, never a raw storage key). "
+                        + "Lets a provider timeline render the client's photo instead of a generic "
+                        + "glyph. NULL in two cases, both of which must render the fallback glyph: "
+                        + "(1) a guest (LINK) booking, which has no registered account at all "
+                        + "(client_id IS NULL, V89 chk_bookings_guest_fields) and therefore no "
+                        + "photo and no fallback — unlike clientFirstName/clientLastName, which do "
+                        + "fall back to the OTP-verified guest name; (2) a registered client who "
+                        + "has never uploaded one. Do not distinguish the two client-side. Both "
+                        + "causes mean strictly 'this booking has no client photo' — NULL here "
+                        + "never encodes who is asking. The value depends only on the booking, so "
+                        + "the same booking yields the same value on GET /bookings/{id} and on "
+                        + "every row of GET /bookings/me, for a provider and for the client "
+                        + "themselves alike; a client reading their own booking sees their own "
+                        + "photo. Safe to cache by booking id across both endpoints.")
+        String clientAvatarUrl
 ) {
 
     /**
      * Builds the enriched detail view for the single-entity path. The caller (the service)
-     * must supply {@code canReview} (the COMPLETED + no-existing-review predicate) and the
-     * resolved discovery locality labels — neither is derivable from the entity graph.
+     * must supply {@code canReview} (the COMPLETED + no-existing-review predicate),
+     * {@code providerCanReviewClient} (the viewer-aware provider-side mirror — see this class's
+     * javadoc), and the resolved discovery locality labels — none of the three is derivable from
+     * the entity graph alone.
      *
      * <p>The caller MUST have hydrated the full graph (client, master.user, master.salon,
      * masterService.serviceDefinition) — e.g. via {@code BookingRepository.findByIdWithFullGraph}
@@ -155,6 +276,7 @@ public record BookingDetailResponse(
     public static BookingDetailResponse from(
             Booking booking,
             boolean canReview,
+            boolean providerCanReviewClient,
             String cityLabel,
             String districtLabel
     ) {
@@ -201,7 +323,19 @@ public record BookingDetailResponse(
                 resolvedBuildingNo,
                 resolvedLocationNote,
                 booking.getMasterService().getServiceDefinition().getCategory(),
-                canReview
+                canReview,
+                providerCanReviewClient,
+                // appointment is a LAZY @ManyToOne on a nullable FK — the identifier is served off
+                // the proxy (or resolved as null) from the booking row itself, so this reads with no
+                // extra SELECT and no widening of findByIdWithFullGraph / findAllByIdsWithGraph.
+                booking.getAppointment() != null ? booking.getAppointment().getId() : null,
+                // Same null-guard shape as clientId above, but with NO guest fallback — a guest
+                // booking has no account and so no photo. Costs nothing: every caller of this
+                // factory hydrates the booking through findByIdWithFullGraph /
+                // findAllByIdsWithGraph, both of which already LEFT JOIN FETCH b.client for the
+                // name reads above, so avatarUrl is a scalar off an already-materialised User row
+                // — no extra statement, no widening of either fetch graph.
+                client != null ? client.getAvatarUrl() : null
         );
     }
 }

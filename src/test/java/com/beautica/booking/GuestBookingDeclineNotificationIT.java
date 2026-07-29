@@ -187,13 +187,17 @@ class GuestBookingDeclineNotificationIT extends AbstractIntegrationTest {
                 UUID.class);
     }
 
+    /**
+     * {@code starts_at} is in the FUTURE — this fixture backs a {@code /decline} test only.
+     * Decline has no temporal guard, so a future fixture is just the conventional default here.
+     */
     private UUID insertConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, " +
                         "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
                         "booking_source, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '2 hours', NOW() - interval '1 hour', " +
+                        "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() + interval '2 hours', NOW() + interval '3 hours', " +
                         "500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, salonId);
         return bookingId;
