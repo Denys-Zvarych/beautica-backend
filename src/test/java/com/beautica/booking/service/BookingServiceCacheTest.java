@@ -136,6 +136,10 @@ class BookingServiceCacheTest {
     // Phase 26.2: BookingService now validates the optional date-range filter via this
     // collaborator's span-only guard. Not on the @SpringBootTest classes list, so mock it here.
     @MockBean ScheduleDateMath dateMath;
+    // Track 27.x: BookingService locks/collapses the appointment header when a client cancels one
+    // leg of a multi-service visit. The eviction tests below all use single, appointment-less
+    // bookings, so that branch short-circuits — this mock exists purely to satisfy the wiring.
+    @MockBean AppointmentTransitionService appointmentTransitionService;
 
     /** Fixed so a test can seed a master-calendar key that really belongs to the booking's master. */
     private static final UUID MASTER_ID = UUID.randomUUID();
