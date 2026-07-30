@@ -7,6 +7,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
+import com.beautica.search.service.SearchCacheNames;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityDistrictRepository;
@@ -256,10 +257,17 @@ public class UserService {
                 // Search results reflect INDEPENDENT_MASTER locality and profile fields
                 // directly. Clear the entire search:masters cache so the next discovery
                 // request re-queries the DB rather than serving stale data.
+                // BOTH halves of the split discovery cache (browse + free-text): a renamed
+                // master must disappear from the location-only listing AND from any cached
+                // free-text page that matched the old name. Iterating
+                // SearchCacheNames.MASTERS_ALL keeps a future third partition from being
+                // silently missed here.
                 if (searchAffected && role == Role.INDEPENDENT_MASTER) {
-                    Cache search = cacheManager.getCache("search:masters");
-                    if (search != null) {
-                        search.clear();
+                    for (String cacheName : SearchCacheNames.MASTERS_ALL) {
+                        Cache search = cacheManager.getCache(cacheName);
+                        if (search != null) {
+                            search.clear();
+                        }
                     }
                 }
             }

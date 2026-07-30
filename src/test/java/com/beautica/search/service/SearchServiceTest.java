@@ -23,6 +23,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -39,13 +40,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -84,13 +88,21 @@ class SearchServiceTest {
     @Mock
     private ServiceTypeSlugResolver serviceTypeSlugResolver;
 
+    // Filter-scoped total memo (perf follow-up): getCache(...) returns null (no cache bean
+    // registered under that name) by default, so readMemoizedTotal/writeMemoizedTotal are
+    // no-ops and every pre-existing test below exercises the exact same code path as before
+    // this feature — the memo never activates unless a test explicitly stubs a real Cache.
+    @Mock
+    private CacheManager cacheManager;
+
     private SearchService service;
 
     private ArgumentCaptor<String> sqlCaptor;
 
     @BeforeEach
     void setUp() {
-        service = new SearchService(salonRepository, discoveryLocationResolver, serviceTypeSlugResolver);
+        service = new SearchService(
+                salonRepository, discoveryLocationResolver, serviceTypeSlugResolver, cacheManager);
         ReflectionTestUtils.setField(service, "entityManager", entityManager);
         sqlCaptor = ArgumentCaptor.forClass(String.class);
         // The seam passes through the (cityId, districtId) pair by default;
@@ -103,6 +115,7 @@ class SearchServiceTest {
                 });
         lenient().when(discoveryLocationResolver.resolveLabels(any(), any()))
                 .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
+        lenient().when(cacheManager.getCache(anyString())).thenReturn(null);
     }
 
     private void stubNativeQueries(List<Object[]> rows, long total) {
@@ -321,12 +334,16 @@ class SearchServiceTest {
         when(proj.getCityId()).thenReturn(cityId);
         when(proj.getDistrictId()).thenReturn(districtId);
         when(proj.getAvatarUrl()).thenReturn(null);
+        // COUNT(*) OVER() rides on every row — the service reads the page total off
+        // the FIRST projection only, so on a multi-row stub the later rows' stubs are
+        // legitimately unused. lenient() rather than dropping the stub: every real row
+        // does carry the column, and a strict stub here would fail every multi-row test.
+        lenient().when(proj.getTotalCount()).thenReturn(1L);
         return proj;
     }
 
-    private static Page<SalonSearchProjection> oneSalonProjectionPage() {
-        SalonSearchProjection proj = stubProjection(UUID.randomUUID(), "Test Salon", CITY_ID, DISTRICT_ID);
-        return new PageImpl<>(List.of(proj), PageRequest.of(0, 20), 1);
+    private static List<SalonSearchProjection> oneSalonProjectionList() {
+        return List.of(stubProjection(UUID.randomUUID(), "Test Salon", CITY_ID, DISTRICT_ID));
     }
 
     @Test
@@ -335,19 +352,19 @@ class SearchServiceTest {
         // Build the stub page BEFORE the when(...) call — stubProjection calls
         // when(mock.getX()) internally, which Mockito would misread as an
         // unfinished stub if nested inside when(salonRepository...).
-        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByDistrictIdNoPriceAsProjection(
-                eq(DISTRICT_ID), any(), any(), any(Pageable.class)))
-                .thenReturn(stubPage);
+                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, DISTRICT_ID), PageRequest.of(0, 20));
 
         // No price bounds → no-price variant (no COUNT lateral).
         verify(salonRepository, times(1)).findActiveByDistrictIdNoPriceAsProjection(
-                eq(DISTRICT_ID), any(), any(), any(Pageable.class));
-        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any(), any(), any(), any());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any());
-        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any());
+                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
         // Must NOT touch the full-entity variants — they hydrate unnecessary columns.
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
@@ -357,18 +374,18 @@ class SearchServiceTest {
     @Test
     @DisplayName("salon search dispatches to the no-price city variant when only a city is resolved and no price bounds are supplied (HIGH PERF gate)")
     void should_dispatchToCityRepoMethod_when_onlyCityResolved() {
-        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(Pageable.class)))
-                .thenReturn(stubPage);
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
 
         verify(salonRepository, times(1)).findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(Pageable.class));
-        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any(), any(), any(), any());
-        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any());
-        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any());
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
@@ -377,16 +394,16 @@ class SearchServiceTest {
     @Test
     @DisplayName("salon search dispatches to the no-price active-only variant when no locality filter and no price bounds are supplied (HIGH PERF gate)")
     void should_dispatchToActiveOnlyRepoMethod_when_noLocalityFilter() {
-        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
-        when(salonRepository.findByIsActiveTrueNoPriceAsProjection(any(), any(), any(Pageable.class)))
-                .thenReturn(stubPage);
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
+        when(salonRepository.findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(null, null), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(Pageable.class));
-        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any(), any(), any(), any());
-        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any());
+        verify(salonRepository, times(1)).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
@@ -395,10 +412,10 @@ class SearchServiceTest {
     @Test
     @DisplayName("salon search with a price bound keeps the price-lateral variant (no-price gate applies only when both bounds are null)")
     void should_dispatchToPriceVariant_when_priceBoundSupplied() {
-        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(Pageable.class)))
-                .thenReturn(stubPage);
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, null,
                 new BigDecimal("100.00"), null, 0, 20, null);
@@ -406,8 +423,8 @@ class SearchServiceTest {
         service.searchSalons(request, PageRequest.of(0, 20));
 
         verify(salonRepository, times(1)).findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(Pageable.class));
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any());
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
     }
 
     @Test
@@ -418,8 +435,8 @@ class SearchServiceTest {
         when(proj.getAvatarUrl()).thenReturn("https://cdn.example.com/avatar.jpg");
 
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(proj), PageRequest.of(0, 20), 1));
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(List.of(proj));
         when(discoveryLocationResolver.resolveLabels(any(), any()))
                 .thenReturn(new DiscoveryLabels(
                         Map.of(CITY_ID, "Київ"),
@@ -443,8 +460,8 @@ class SearchServiceTest {
         SalonSearchProjection b = stubProjection(UUID.randomUUID(), "B", CITY_ID, DISTRICT_ID);
         SalonSearchProjection c = stubProjection(UUID.randomUUID(), "C", CITY_ID, DISTRICT_ID);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(a, b, c), PageRequest.of(0, 20), 3));
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(List.of(a, b, c));
 
         Page<SalonSearchResult> page =
                 service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
@@ -773,6 +790,212 @@ class SearchServiceTest {
         assertThat(dataSql).contains("ORDER BY m.avg_rating DESC NULLS LAST, m.id");
     }
 
+    // ── master-side owner gate — owner_type AND owner_id on EVERY service surface ──
+    //
+    // appendMasterOwnedServiceGate is the SOLE emitter of the
+    // `owner_type = 'INDEPENDENT_MASTER' AND owner_id = <master>` pair, reached from
+    // four surfaces (q pre-filter, exact group predicate, serviceNames lateral,
+    // matched-names lateral). A perf fix once silently dropped the owner_id half on
+    // the single-token path and was caught only by manual review — before these
+    // tests, deleting `AND sd.owner_id = ms.master_id` left the whole suite green.
+    //
+    // The load-bearing assertion is the PAIRING one: every owner_type gate must be
+    // accompanied by an owner_id gate. That is what fails when either half is
+    // dropped from any single surface, without hard-coding a brittle surface count.
+
+    @Test
+    @DisplayName("every owner_type gate is paired with an owner_id gate — SINGLE-token q (the path where the pre-filter is the ONLY owner enforcement)")
+    void should_pairOwnerTypeWithOwnerId_onEveryServiceSurface_when_singleTokenQ() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "кератин", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        assertThat(countOccurrences(sql, ".owner_id = "))
+                .as("owner_type without owner_id is a HALF gate: an active cross-owner "
+                        + "master_services row would then make a master discoverable by another "
+                        + "owner's service name. Every gate must carry BOTH halves.")
+                .isEqualTo(countOccurrences(sql, ".owner_type = 'INDEPENDENT_MASTER'"))
+                .isPositive();
+        assertThat(sql)
+                .as("the pre-filter spells the owner as the sub-query's own ms.master_id (inner-only "
+                        + "equality), and both post-LIMIT laterals as the derived table's t.master_id")
+                .contains("sd.owner_type = 'INDEPENDENT_MASTER' AND sd.owner_id = ms.master_id")
+                .contains("sd.owner_type = 'INDEPENDENT_MASTER' AND sd.owner_id = t.master_id");
+    }
+
+    @Test
+    @DisplayName("every owner_type gate is paired with an owner_id gate — TWO-token q (adds the exact group predicate's sdg surface)")
+    void should_pairOwnerTypeWithOwnerId_onEveryServiceSurface_when_twoTokenQ() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "ботокс волосся", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        assertThat(countOccurrences(sql, ".owner_id = "))
+                .isEqualTo(countOccurrences(sql, ".owner_type = 'INDEPENDENT_MASTER'"))
+                .isPositive();
+        assertThat(sql)
+                .as("the exact group predicate (aliases msg/sdg) is emitted for >1 token and "
+                        + "carries the gate spelled against the outer m.id")
+                .contains("sdg.owner_type = 'INDEPENDENT_MASTER' AND sdg.owner_id = m.id");
+    }
+
+    @Test
+    @DisplayName("the exact group-scoped predicate is emitted for TWO tokens and short-circuited away for ONE (the pre-filter is identical to it there)")
+    void should_emitGroupScopedPredicate_onlyWhenMoreThanOneToken() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(
+                new MasterSearchRequest(null, "кератин", null, null, null, null, null, 0, 20, null),
+                PageRequest.of(0, 20));
+        service.searchMasters(
+                new MasterSearchRequest(null, "ботокс волосся", null, null, null, null, null, 0, 20, null),
+                PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .as("single token: the pre-filter IS the group predicate (proved identity), so "
+                        + "emitting both would evaluate the same condition twice")
+                .doesNotContain("master_services msg");
+        assertThat(sqlCaptor.getAllValues().get(1))
+                .as("two tokens: the group predicate is required — it is what stops tokens being "
+                        + "satisfied by two DIFFERENT services of the same master")
+                .contains("master_services msg")
+                .contains("service_definitions sdg");
+    }
+
+    @Test
+    @DisplayName("the matched-names lateral is emitted for a free-text q even with NO serviceTypeSlugs filter")
+    void should_emitMatchedNamesLateral_when_qSuppliedWithoutSlugFilter() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(
+                new MasterSearchRequest(null, "кератин", null, null, null, null, null, 0, 20, null),
+                PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .as("matched_names now explains a free-text match too, not only a slug filter — so "
+                        + "it must come from the mn lateral, never the typed-NULL placeholder")
+                .contains("mn.matched_names")
+                .doesNotContain("CAST(NULL AS text[])");
+    }
+
+    // ── short `q` — the zero-round-trip half of the contract ──────────────────
+    //
+    // The HTTP 200 + «Введіть щонайменше 3 символи» half is pinned in the
+    // controller/IT suites. That the service issues NO statement at all is
+    // structurally true (an early return before any query) but was asserted nowhere.
+
+    @Test
+    @DisplayName("a below-minimum-length q on /search/masters issues NO database statement at all")
+    void should_notTouchDatabase_when_masterQBelowMinimumLength() {
+        // Deliberately NOT calling stubNativeQueries: any createNativeQuery call would
+        // return null and NPE, so this test fails loudly rather than silently if the
+        // early return is ever removed.
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "Ру", null, null, null, null, null, 0, 20, null);
+
+        Page<MasterSearchResult> result = service.searchMasters(request, PageRequest.of(0, 20));
+
+        assertThat(result.getContent()).isEmpty();
+        assertThat(result.getTotalElements())
+                .as("an explicit empty page, never the unfiltered set (defect B)")
+                .isZero();
+        verify(entityManager, never()).createNativeQuery(anyString());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("a below-minimum-length q on /search/salons issues NO database statement and never reaches the repository")
+    void should_notTouchDatabase_when_salonQBelowMinimumLength() {
+        SalonSearchRequest request = new SalonSearchRequest(
+                null, "Ру", null, null, null, null, 0, 20, null);
+
+        Page<SalonSearchResult> result = service.searchSalons(request, PageRequest.of(0, 20));
+
+        assertThat(result.getContent()).isEmpty();
+        assertThat(result.getTotalElements()).isZero();
+        verify(entityManager, never()).createNativeQuery(anyString());
+        verifyNoInteractions(salonRepository);
+    }
+
+    // ── out-of-range page probe — statement COUNT, not just the recovered total ──
+    //
+    // The masters and static-salon probe paths have integration coverage of the
+    // recovered total. searchSalonsWithServiceFilter had none, and nothing anywhere
+    // asserted the probe costs exactly TWO statements rather than three or more.
+
+    @Test
+    @DisplayName("an out-of-range page on the per-service-FILTERED salon path recovers the true total in exactly TWO statements")
+    void should_recoverTotalInTwoStatements_when_serviceFilteredSalonPageOutOfRange() {
+        UUID typeId = UUID.fromString("33333333-3333-3333-3333-333333333333");
+        when(serviceTypeSlugResolver.resolve(List.of("nail-service-manicure")))
+                .thenReturn(List.of(Optional.of(new ServiceTypeMatch(typeId, "Манікюр"))));
+
+        // Salon dynamic projection: SALON_TOTAL_COUNT_IDX == 12.
+        Object[] probeRow = new Object[13];
+        probeRow[0] = UUID.randomUUID();
+        probeRow[1] = "Aura";
+        probeRow[12] = 137L;
+
+        when(entityManager.createNativeQuery(sqlCaptor.capture())).thenReturn(dataQuery);
+        lenient().when(dataQuery.setParameter(anyString(), any())).thenReturn(dataQuery);
+        // First statement = the out-of-range data page (empty); second = the first-page probe.
+        when(dataQuery.getResultList())
+                .thenReturn(List.of())
+                .thenReturn(List.<Object[]>of(probeRow));
+
+        SalonSearchRequest request = new SalonSearchRequest(
+                null, null, null, null, null, null, 9, 20, List.of("nail-service-manicure"));
+
+        Page<SalonSearchResult> result = service.searchSalons(request, PageRequest.of(9, 20));
+
+        assertThat(result.getContent()).isEmpty();
+        assertThat(result.getTotalElements())
+                .as("the window count has no row to ride on when the page is empty, so the total is "
+                        + "recovered from a page-0/size-1 probe — a client on a restored deep link "
+                        + "must be told 'no results ON THIS PAGE', not 'no results'")
+                .isEqualTo(137L);
+        verify(entityManager, times(2))
+                .createNativeQuery(anyString());
+        assertThat(sqlCaptor.getAllValues().get(1))
+                .as("the probe re-runs the SAME builder at page 0 size 1 — never a second "
+                        + "hand-maintained countQuery copy of every predicate")
+                .contains("LIMIT :limit OFFSET :offset");
+        verify(dataQuery).setParameter("limit", 1);
+        verify(dataQuery).setParameter("offset", 0L);
+    }
+
+    @Test
+    @DisplayName("a genuinely empty FIRST page costs exactly ONE statement — the probe is skipped, not merely reporting 0")
+    void should_issueExactlyOneStatement_when_firstPageGenuinelyEmpty() {
+        stubNativeQueries(List.of(), 0L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(result.getTotalElements()).isZero();
+        // The pre-existing "genuinely empty first page" coverage asserted only total==0,
+        // which passed before the offset guard existed too. The statement count is what
+        // actually discriminates: without `pageable.getOffset() == 0` the common no-match
+        // request would silently cost a second probe statement.
+        verify(entityManager, times(1)).createNativeQuery(anyString());
+    }
+
+    /** Counts non-overlapping occurrences of {@code needle} in {@code haystack}. */
+    private static int countOccurrences(String haystack, String needle) {
+        int count = 0;
+        int idx = haystack.indexOf(needle);
+        while (idx >= 0) {
+            count++;
+            idx = haystack.indexOf(needle, idx + needle.length());
+        }
+        return count;
+    }
+
     // ── name / service-name search (q) ───────────────────────────────────────
 
     @Test
@@ -788,14 +1011,15 @@ class SearchServiceTest {
         // Name predicates hit u.first_name/u.last_name directly; the service-name
         // match is a correlated EXISTS on sd.name (not a main-query join), so each
         // ILIKE is served by its own trigram index with no fan-out / GROUP BY.
+        // Tokenised: one ANDed group per whitespace token, each bound to :qN.
         assertThat(dataSql)
-                .contains("u.first_name ILIKE :q OR u.last_name ILIKE :q OR EXISTS (")
-                .contains("sd.name ILIKE :q")
+                .contains("u.first_name ILIKE :q0 OR u.last_name ILIKE :q0 OR EXISTS (")
+                .contains("sd.name ILIKE :q0")
                 .doesNotContain("GROUP BY");
     }
 
     @Test
-    @DisplayName("binds :q as an escaped %term% pattern (LIKE wildcards in the term are neutralised)")
+    @DisplayName("binds :q0 as an escaped %term% pattern (LIKE wildcards in the term are neutralised)")
     void should_bindEscapedContainsPattern_when_qHasLikeWildcards() {
         stubNativeQueries(List.of(), 0L);
         MasterSearchRequest request = new MasterSearchRequest(
@@ -803,7 +1027,7 @@ class SearchServiceTest {
 
         service.searchMasters(request, PageRequest.of(0, 20));
 
-        verify(dataQuery).setParameter("q", "%50\\%\\_off%");
+        verify(dataQuery).setParameter("q0", "%50\\%\\_off%");
     }
 
     @Test
@@ -925,43 +1149,81 @@ class SearchServiceTest {
     // ── salon price filter + q forwarding ────────────────────────────────────
 
     @Test
-    @DisplayName("forwards q (escaped) and price bounds to the salon projection query")
+    @DisplayName("forwards q (escaped) into the :q0 token slot and price bounds to the salon projection query; unused token slots bind null")
     void should_forwardQAndPriceBounds_toSalonRepo() {
-        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(Pageable.class)))
-                .thenReturn(stubPage);
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), "glow", null, null,
                 new BigDecimal("100.00"), new BigDecimal("500.00"), 0, 20, null);
 
         service.searchSalons(request, PageRequest.of(0, 20));
 
+        // Signature: (cityId, category, q0, q1, q2, q3, minPrice, maxPrice, sortMode, limit, offset).
+        // A single-token query fills q0 and leaves q1..q3 null — their null-gated
+        // branch short-circuits to TRUE, reproducing the historical one-term shape.
         verify(salonRepository).findActiveByCityIdAsProjection(
                 eq(CITY_ID), any(),
-                eq("%glow%"),
+                eq("%glow%"), isNull(), isNull(), isNull(),
                 eq(new BigDecimal("100.00")),
                 eq(new BigDecimal("500.00")),
-                any(Pageable.class));
+                anyString(), anyInt(), anyLong());
     }
 
     @Test
-    @DisplayName("salon PRICE_ASC builds a Sort on the price_min select alias (caller text never reaches ORDER BY)")
-    void should_buildPriceMinSort_when_salonSortPriceAsc() {
-        Page<SalonSearchProjection> stubPage = oneSalonProjectionPage();
-        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+    @DisplayName("salon PRICE_ASC binds the allow-listed SearchSort name as :sortMode (caller text never reaches ORDER BY)")
+    void should_bindPriceAscSortMode_when_salonSortPriceAsc() {
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
+        ArgumentCaptor<String> sortModeCaptor = ArgumentCaptor.forClass(String.class);
         // No price bounds → no-price city variant (HIGH PERF gate).
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), pageableCaptor.capture()))
-                .thenReturn(stubPage);
+                eq(CITY_ID), any(), any(), any(), any(), any(),
+                sortModeCaptor.capture(), anyInt(), anyLong()))
+                .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, SearchSort.PRICE_ASC,
                 null, null, 0, 20, null);
 
         service.searchSalons(request, PageRequest.of(0, 20));
 
-        org.springframework.data.domain.Sort sort = pageableCaptor.getValue().getSort();
-        assertThat(sort.getOrderFor("price_min")).isNotNull();
-        assertThat(sort.getOrderFor("price_min").isAscending()).isTrue();
+        // The static queries no longer take a Pageable: Spring Data cannot express an
+        // inner LIMIT, so ordering is selected by a CASE on this bound enum NAME
+        // (SalonSearchSql.STATIC_ORDER_LIMIT_TAIL) and paging by :limit/:offset.
+        assertThat(sortModeCaptor.getValue()).isEqualTo(SearchSort.PRICE_ASC.name());
+    }
+
+    @Test
+    @DisplayName("salon search binds :limit/:offset from the Pageable so the LIMIT lands INSIDE the derived table (post-LIMIT name laterals)")
+    void should_bindLimitAndOffsetFromPageable_when_salonSearchPaged() {
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
+        ArgumentCaptor<Integer> limitCaptor = ArgumentCaptor.forClass(Integer.class);
+        ArgumentCaptor<Long> offsetCaptor = ArgumentCaptor.forClass(Long.class);
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(),
+                limitCaptor.capture(), offsetCaptor.capture()))
+                .thenReturn(stubRows);
+
+        service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(2, 15));
+
+        assertThat(limitCaptor.getValue()).isEqualTo(15);
+        assertThat(offsetCaptor.getValue()).isEqualTo(30L);
+    }
+
+    @Test
+    @DisplayName("salon page total comes from the COUNT(*) OVER() column, not a second countQuery statement")
+    void should_readTotalFromWindowCount_when_salonSearchReturnsRows() {
+        SalonSearchProjection proj = stubProjection(UUID.randomUUID(), "Glow", CITY_ID, DISTRICT_ID);
+        when(proj.getTotalCount()).thenReturn(137L);
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                .thenReturn(List.of(proj));
+
+        Page<SalonSearchResult> page =
+                service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements()).isEqualTo(137L);
+        assertThat(page.getContent()).hasSize(1);
     }
 }

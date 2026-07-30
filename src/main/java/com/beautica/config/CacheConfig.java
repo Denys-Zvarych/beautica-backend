@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.search.service.SearchCacheNames;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
@@ -51,6 +52,27 @@ import java.util.concurrent.TimeUnit;
 @EnableCaching(order = Ordered.HIGHEST_PRECEDENCE)
 public class CacheConfig {
 
+    /** Bounded, cross-user-shared location-only discovery pages — unchanged sizing. */
+    private static final int SEARCH_BROWSE_MAX_ENTRIES = 500;
+    private static final long SEARCH_BROWSE_TTL_SECONDS = 60;
+
+    /**
+     * Unbounded free-text discovery keys: fewer entries (lower reuse per key) and a shorter
+     * TTL (free-text results tolerate staleness better than a browse listing).
+     */
+    private static final int SEARCH_QUERY_MAX_ENTRIES = 300;
+    private static final long SEARCH_QUERY_TTL_SECONDS = 30;
+
+    /**
+     * Filter-scoped {@code totalElements} memo (perf follow-up) — see
+     * {@link com.beautica.search.service.SearchCacheNames#MASTERS_TOTAL} for the full
+     * rationale. An entry is a single {@code Long}, so 1000 entries is negligible; the TTL
+     * matches {@link #SEARCH_BROWSE_TTL_SECONDS} since a stale total is tolerated for the
+     * same window as a stale browse page.
+     */
+    private static final int SEARCH_TOTAL_MAX_ENTRIES = 1000;
+    private static final long SEARCH_TOTAL_TTL_SECONDS = 60;
+
     /**
      * Per-cache TTL configuration using individual Caffeine caches.
      *
@@ -86,8 +108,18 @@ public class CacheConfig {
      *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
      *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
-     *   search:masters      — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
-     *   search:salons       — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
+     *   search:masters:browse / search:salons:browse — location-only discovery pages, first 5
+     *                         pages only; bounded key space, shared across all callers —
+     *                         60 sec TTL, max 500 entries
+     *   search:masters:q / search:salons:q — free-text discovery pages, first 5 pages only;
+     *                         UNBOUNDED key space (one key per settled keystroke) —
+     *                         30 sec TTL, max 300 entries. Routed by SearchCacheResolver;
+     *                         split so free-text churn cannot evict shared browse pages
+     *   search:masters:total / search:salons:total — filter-scoped totalElements memo (perf
+     *                         follow-up); one entry per filter tuple (page/size excluded from
+     *                         the key), read/written directly via CacheManager inside
+     *                         SearchService (not @Cacheable) so it also covers page >= 5 —
+     *                         60 sec TTL, max 1000 entries. See SearchCacheNames#MASTERS_TOTAL
      *   portfolio           — per-entity portfolio listing, public unauthenticated GET — 5 min TTL, max 2000 entries
      *   reviews-by-master   — paginated review list per master, public endpoint — 5 min TTL, max 1000 entries
      *   reviews-by-salon    — paginated review list per salon, public endpoint — 5 min TTL, max 1000 entries
@@ -260,16 +292,72 @@ public class CacheConfig {
                         .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
-        manager.registerCustomCache("search:masters",
+        // Discovery caches, SPLIT BY KEY POPULATION (perf + security audit 2026-07-29). Both
+        // auditors raised the same defect independently: one shared 500-entry cache per surface
+        // held two structurally different populations, and the unbounded one evicted the bounded
+        // one.
+        //
+        //  * BROWSE — location-only keys (city/district × category × sort × price × page).
+        //    Bounded by that product and SHARED ACROSS EVERY VISITOR, so each entry is
+        //    high-value: one load serves everybody who opens that district's discovery screen.
+        //    Keeps the previous 500 / 60 s sizing; nothing about this population changed.
+        //
+        //  * :q — free-text keys, UNBOUNDED in cardinality. An incremental search box settles
+        //    once per keystroke, so typing «ламінування вій» mints ~13 distinct keys of which
+        //    only the last is ever read again, and the discovery screen queries masters AND
+        //    salons. On the shared cache ~40 concurrent typers churned the whole 500-entry cap
+        //    inside the TTL, and what they evicted was not their own throwaway prefixes (never
+        //    read again anyway) but the reusable browse pages — so the observable symptom of an
+        //    undersized search cache was a latency regression on BROWSE, and an unauthenticated
+        //    caller varying q converted other users' cached pages back into DB work.
+        //    Sized 300 / 30 s: lower reuse justifies fewer entries, and free-text results are
+        //    more staleness-tolerant than a browse listing, so the shorter TTL costs little.
+        //
+        // Routing is per-request (SearchCacheResolver), keyed on whether the normalised q is
+        // present — the @Cacheable declares only the browse half. This split is also what makes
+        // the two hit-rate gauges interpretable: a single meter averaged two populations with
+        // completely different expected rates, which is exactly why the 500 cap could not be
+        // tuned from it. Each half now reports its own rate.
+        //
+        // BLANKET-EVICTION CONTRACT: SalonService.deactivateSalon and UserService's
+        // INDEPENDENT_MASTER name/locality writes clear discovery wholesale and MUST clear both
+        // halves — they iterate SearchCacheNames.SALONS_ALL / MASTERS_ALL for that reason.
+        registerMetered(manager, meterRegistry, SearchCacheNames.MASTERS_BROWSE,
                 Caffeine.newBuilder()
-                        .maximumSize(500)
-                        .expireAfterWrite(60, TimeUnit.SECONDS)
-                        .build());
-        manager.registerCustomCache("search:salons",
+                        .maximumSize(SEARCH_BROWSE_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_BROWSE_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.MASTERS_QUERY,
                 Caffeine.newBuilder()
-                        .maximumSize(500)
-                        .expireAfterWrite(60, TimeUnit.SECONDS)
-                        .build());
+                        .maximumSize(SEARCH_QUERY_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_QUERY_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.SALONS_BROWSE,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_BROWSE_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_BROWSE_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.SALONS_QUERY,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_QUERY_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_QUERY_TTL_SECONDS, TimeUnit.SECONDS));
+        // Filter-scoped totalElements memo (perf follow-up, architect decision — keyset/cursor
+        // pagination REJECTED as the fix; see SearchCacheNames.MASTERS_TOTAL Javadoc). Read and
+        // written directly through CacheManager inside SearchService (NOT @Cacheable — it is a
+        // read-then-maybe-skip, not a memoized return value), so it keeps working on page >= 5,
+        // the exact population the browse/query caches' `pageNumber < 5` condition leaves
+        // uncached. One entry per filter tuple (page/size excluded from the key), so a
+        // page=5..499 sweep against the SAME filter costs one probe instead of ~990.
+        //
+        // TRADE-OFF: a memoized total can go stale for up to SEARCH_TOTAL_TTL_SECONDS. Contained
+        // by using the memo ONLY to short-circuit an out-of-range page to an EMPTY page
+        // (offset >= total) — never to serve or shape data. Worst case is a transiently-empty
+        // tail page that self-heals within the TTL.
+        registerMetered(manager, meterRegistry, SearchCacheNames.MASTERS_TOTAL,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_TOTAL_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_TOTAL_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.SALONS_TOTAL,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_TOTAL_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_TOTAL_TTL_SECONDS, TimeUnit.SECONDS));
         // Phase 7.7 — public portfolio listing is read-mostly; the 5-min TTL bounds stale
         // exposure if an eviction is missed, and 2000 entries cover the most active
         // salons + masters for current scale.

@@ -226,10 +226,11 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 + "seqscan-enabled) plan:\n{}", productionSql, naturalPlan);
 
         assertThat(productionSql)
-                .as("captured SQL must be the salons SELECT (city_id equality), not the count")
+                .as("captured SQL must be the salons data SELECT (city_id equality), paginating "
+                        + "through COUNT(*) OVER() rather than a second countQuery statement")
                 .containsIgnoringCase("from salons")
                 .containsIgnoringWhitespaces("city_id =")
-                .doesNotContainIgnoringCase("count(");
+                .containsIgnoringWhitespaces("COUNT(*) OVER()");
         assertThat(naturalPlan)
                 .as("the natural cost-based plan for the real production city-filter "
                         + "SQL must use idx_salons_city_id")
@@ -268,10 +269,11 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 + "(cost-based, seqscan-enabled) plan:\n{}", productionSql, naturalPlan);
 
         assertThat(productionSql)
-                .as("captured SQL must be the salons SELECT (district_id equality)")
+                .as("captured SQL must be the salons data SELECT (district_id equality), paginating "
+                        + "through COUNT(*) OVER() rather than a second countQuery statement")
                 .containsIgnoringCase("from salons")
                 .containsIgnoringWhitespaces("district_id =")
-                .doesNotContainIgnoringCase("count(");
+                .containsIgnoringWhitespaces("COUNT(*) OVER()");
         assertThat(naturalPlan)
                 .as("the natural cost-based plan for the real production district-filter "
                         + "SQL must use idx_salons_district_id")
@@ -486,7 +488,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         }
         String url = SALONS_URL + "?location.cityId=" + kyivCityId + "&page=0&size=20";
 
-        // Warm the JIT + connection pool + the search:salons cache miss path
+        // Warm the JIT + connection pool + the search:salons:browse cache miss path
         // (we re-time after warm-up; the cache is per (cityId,page,size) so the
         // measured calls are warm-cache — representative of steady state).
         for (int i = 0; i < 3; i++) {
@@ -543,20 +545,23 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * captured verbatim by {@link CapturingStatementInspector}.
      *
      * <p>This is the exact SQL string the prod path runs — not a hand-written
-     * proxy. The salon search emits two statements: the row {@code SELECT} and
-     * its {@code COUNT} companion (plus, on a cold cache, possibly a label
-     * {@code IN} query — those reference {@code cities}/{@code city_districts},
-     * not {@code salons}). We pick the {@code SELECT … FROM salons …} that is
-     * not a {@code COUNT}.
+     * proxy. The salon search now emits exactly ONE statement against
+     * {@code salons}: the row {@code SELECT}, which carries its own
+     * {@code COUNT(*) OVER()} pagination window (the separate {@code countQuery}
+     * companion was removed — it re-ran the whole correlated group {@code EXISTS}).
+     * On a cold cache there may also be a locality-label {@code IN} query, but
+     * that references {@code cities}/{@code city_districts}, not {@code salons}.
+     *
+     * <p>The filter therefore matches on {@code FROM salons} alone. It must NOT
+     * additionally exclude {@code count(} — that exclusion existed solely to skip
+     * the old companion statement, and now it would skip the ONLY statement, since
+     * the window count is part of it.
      */
     private String captureSalonSearchSelect(SalonSearchRequest request) {
         CAPTURED_SQL.clear();
         searchService.searchSalons(request, PageRequest.of(0, 20));
         String salonSelect = CAPTURED_SQL.stream()
-                .filter(s -> {
-                    String low = s.toLowerCase(java.util.Locale.ROOT);
-                    return low.contains("from salons") && !low.contains("count(");
-                })
+                .filter(s -> s.toLowerCase(java.util.Locale.ROOT).contains("from salons"))
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException(
                         "No salons SELECT captured from SearchService.searchSalons; "
@@ -597,59 +602,49 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * {@code cast(? as text)} wrapper is a string/category/q bind and is replaced
      * with a typed {@code NULL} (the {@code … IS NULL OR …} guards short-circuit,
      * so NULL exercises the no-filter branch — exactly the AC1 case with no
-     * category / no q). The locality {@code ?} (compared to the {@code uuid}
-     * column {@code city_id}/{@code district_id}) gets the bound UUID literal, and
-     * the trailing pagination {@code ?}s become integers. This survives any
-     * future add/remove of a {@code CAST(? AS text)} bind without edits.
+     * category / no q). The pagination binds are matched STRUCTURALLY on the
+     * literal {@code LIMIT ? OFFSET ?} tail, and the single locality {@code ?}
+     * (compared to the {@code uuid} column {@code city_id}/{@code district_id})
+     * gets the bound UUID literal. This survives any future add/remove of a
+     * {@code CAST(? AS text)} bind without edits.
+     *
+     * <p><b>Why the pagination is matched structurally.</b> This helper used to
+     * infer the pagination slots by counting the bare {@code ?}s left over and
+     * assuming an {@code offset ? rows} / {@code fetch first ? rows only} ordering
+     * appended by Spring Data at the END of the statement. The static salon queries
+     * now bind {@code LIMIT :limit OFFSET :offset} themselves, INSIDE the Top-N
+     * derived table (so the name laterals really do run post-{@code LIMIT}), which
+     * both reverses the limit/offset order and moves the binds into the middle of
+     * the statement. A count-and-guess pass mis-binds silently under that change;
+     * matching the tail literally cannot.
      *
      * @param capturedSql the verbatim Hibernate-emitted salon SELECT
      * @param localityId  the bound discovery city/district UUID
      */
     private String explainNaturalWithLiterals(String capturedSql, UUID localityId) {
         // Step 1: neutralise every string-typed bind. Hibernate renders each
-        // :category / :q bind as `cast(? as text)` (case-insensitive). Replacing
-        // the whole wrapper with a typed NULL means these `?` no longer count
-        // toward the positional pass below — only the locality UUID and the
-        // pagination integers remain as bare `?`.
+        // :category / :q / :sortMode bind as `cast(? as text)` (case-insensitive).
+        // Replacing the whole wrapper with a typed NULL exercises the no-filter
+        // branch (the `… IS NULL OR …` guards short-circuit) and takes those `?`
+        // out of the positional pass below.
         String stringBindsNeutralised =
                 capturedSql.replaceAll("(?i)cast\\(\\s*\\?\\s+as\\s+text\\)", "CAST(NULL AS text)");
 
-        int total = 0;
-        for (int i = 0; i < stringBindsNeutralised.length(); i++) {
-            if (stringBindsNeutralised.charAt(i) == '?') {
-                total++;
-            }
-        }
-        if (total < 1) {
-            throw new IllegalStateException(
-                    "Captured salon SQL has no positional locality bind after neutralising the "
-                            + "string (cast(? as text)) binds; SQL=" + capturedSql);
-        }
-        // Remaining bare `?` order: [0] the WHERE-clause locality bind
-        // (city_id / district_id = ?), then [1..] pagination — `offset ? rows`
-        // is ELIDED when the offset is 0 (PageRequest.of(0, …)), so typically
-        // only `fetch first ? rows only` remains. Build from the front: slot 0 is
-        // the locality UUID; the LAST slot is the fetch limit (20); any middle
-        // slot is the offset (0).
-        int paginationCount = total - 1;
-        List<String> literals = new ArrayList<>();
-        literals.add("'" + localityId + "'::uuid");
-        for (int i = 0; i < paginationCount; i++) {
-            // Preserving the real LIMIT lets the planner stop early on the index
-            // path — exactly the production execution shape.
-            literals.add(i == paginationCount - 1 ? "20" : "0");
-        }
+        // Step 2: pagination, matched structurally on the inner Top-N tail.
+        // Preserving the real LIMIT lets the planner stop early on the index path —
+        // exactly the production execution shape.
+        String paginationFilled = stringBindsNeutralised
+                .replaceAll("(?i)limit\\s+\\?\\s+offset\\s+\\?", "LIMIT 20 OFFSET 0");
 
-        StringBuilder filled = new StringBuilder(stringBindsNeutralised.length() + 64);
-        int paramIdx = 0;
-        for (int i = 0; i < stringBindsNeutralised.length(); i++) {
-            char c = stringBindsNeutralised.charAt(i);
-            if (c == '?') {
-                filled.append(literals.get(paramIdx++));
-            } else {
-                filled.append(c);
-            }
+        long remaining = paginationFilled.chars().filter(c -> c == '?').count();
+        if (remaining != 1) {
+            throw new IllegalStateException(
+                    "Expected exactly ONE positional locality bind after neutralising the string "
+                            + "(cast(? as text)) binds and the LIMIT/OFFSET tail, found " + remaining
+                            + "; SQL=" + capturedSql);
         }
+        String filled = paginationFilled.replace("?", "'" + localityId + "'::uuid");
+
         List<String> lines = jdbcTemplate.queryForList(
                 "EXPLAIN (ANALYZE, BUFFERS) " + filled, String.class);
         return String.join("\n", lines);

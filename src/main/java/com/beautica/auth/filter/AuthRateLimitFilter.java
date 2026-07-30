@@ -179,18 +179,43 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // this filter directly.
     private static final long CANCEL_POST_CAPACITY = 10;
     private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
-    // Per-IP cap for GET /api/v1/search/** (40 / 60 s). These permitAll() discovery reads
-    // now expose authed-only street addresses for independent masters, so without a throttle
-    // a single IP could page through every district/city and bulk-harvest home addresses.
-    // 40/min is a paging-friendly ceiling — a human filtering + paginating discovery results
-    // (each page is one request) stays well under it, while a scripted crawler sweeping the
-    // catalogue is capped. IP-keyed for consistency with every other bucket in this filter
-    // (JWT is parsed in JwtAuthenticationFilter, which runs AFTER this filter; and the search
-    // endpoints are permitAll anyway, so anonymous callers carry no principal). Built
-    // internally (not an injected @Qualifier bean) so the public 16-arg constructor — depended
-    // on by several slice/regression tests — stays unchanged.
-    private static final long SEARCH_CAPACITY = 40;
+    // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
+    // expose authed-only street addresses for independent masters, so the throttle bounds the
+    // RATE at which a single source can page through every district/city and the DB work each
+    // request costs.
+    //
+    // RAISED from 40 (perf/security audit 2026-07-29) — 40/min was an availability regression
+    // for legitimate users, not a meaningful anti-enumeration control:
+    //
+    //  * The bucket bounds rate, never total. `size` is capped at 100 and there are low
+    //    thousands of active providers, so a crawler drains the whole catalogue in a couple of
+    //    dozen requests either way — 40/min made that take ~35 s instead of ~6 s. What the cap
+    //    actually buys is a ceiling on sustained DB amplification per source, and 4 req/s is a
+    //    firm one for a query whose heaviest measured shape is tens of milliseconds.
+    //  * 40/min was below real usage. The client search box is incremental: it issues a request
+    //    per settled keystroke, and the discovery screen queries masters AND salons, so ~2
+    //    requests per settled keystroke. One user typing two queries («ламінування вій» ≈ 13
+    //    settle points) consumes the entire minute's budget on their own.
+    //  * The key makes that worse in exactly the market this serves. The rightmost
+    //    X-Forwarded-For entry is the correct spoof-resistant choice (see resolveClientIp), but
+    //    Ukrainian mobile users sit behind carrier-grade NAT, so thousands of unrelated
+    //    subscribers resolve to ONE bucket and the whole pool 429s permanently.
+    //
+    // NOT switched to principal keying. Doing so would mean parsing the JWT here, in a filter
+    // that runs BEFORE JwtAuthenticationFilter and deliberately knows nothing about the auth
+    // subsystem (see the comment on deviceTokenBuckets) — and it would not fix the case that
+    // motivates the change, since /search/** is permitAll and the CGNAT-shared callers being
+    // locked out are precisely the anonymous ones with no principal to key on. IP-keyed for
+    // consistency with every other bucket in this filter. Built internally (not an injected
+    // @Qualifier bean) so the public 16-arg constructor — depended on by several
+    // slice/regression tests — stays unchanged.
+    private static final long SEARCH_CAPACITY = 240;
     private static final Duration SEARCH_WINDOW = Duration.ofMinutes(1);
+    // Token cost per search request — see searchTokenCost() for why a deep page costs 2.
+    // The capacity above is deliberately UNCHANGED: this corrects the accounting, not the cap.
+    private static final long SEARCH_TOKENS_FIRST_PAGE = 1;
+    private static final long SEARCH_TOKENS_DEEP_PAGE = 2;
+    private static final String SEARCH_PAGE_PARAM = "page";
     // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
     // unthrottled surface. This is both the residual enumeration/timing surface left after the
     // InviteService 409->idempotent fix (the already-registered and active-invite branches do
@@ -551,10 +576,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
         // before the POST-only guard so these GET reads are covered. These permitAll() paths
         // expose authed-only independent-master street addresses, so the throttle is the
-        // IP-layer defence against bulk home-address harvesting. Cap: 40 / 60 s per IP.
+        // IP-layer ceiling on sustained scraping and DB amplification. Cap: 240 / 60 s per IP
+        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY search bucket — do
+        // not add a second one; both /search/masters and /search/salons share it by design.
         if (HttpMethod.GET.matches(method)
                 && path.startsWith(SEARCH_PATH_PREFIX)) {
-            applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS);
+            applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS,
+                    searchTokenCost(request));
             return;
         }
 
@@ -743,11 +771,58 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return StringUtils.cleanPath(MATCH_PATH_HELPER.getPathWithinApplication(request));
     }
 
+    /**
+     * Tokens a {@code GET /api/v1/search/**} request costs: {@link #SEARCH_TOKENS_FIRST_PAGE}
+     * for {@code page=0}, {@link #SEARCH_TOKENS_DEEP_PAGE} for any deeper page.
+     *
+     * <h4>Why the flat 1-token charge understated the work by 2×</h4>
+     * {@link #SEARCH_CAPACITY} was sized as "4 req/s of a query whose heaviest measured shape
+     * is tens of milliseconds". But a request with {@code offset > 0} can execute <b>two</b>
+     * statements, not one: {@code COUNT(*) OVER()} rides on the returned rows, so an
+     * out-of-range page has no row to carry the total and {@code SearchService} recovers it
+     * with a first-page probe. And {@code @Cacheable(condition = "#pageable.pageNumber < 5")}
+     * means every page ≥ 5 is an unconditional miss, so the deep pages are exactly the ones
+     * that always reach the DB. A caller sweeping page indices therefore bought up to 8
+     * statements/s against a cap sized for 4. Charging 2 for those makes the number mean what
+     * it was sized to mean, without changing the capacity — which both audits agreed is the
+     * right value for availability behind carrier-grade NAT (see {@link #SEARCH_CAPACITY}).
+     *
+     * <p>Reads the {@code page} query parameter directly. Safe here: the branch is GET-only, so
+     * {@code getParameter} cannot consume a request body, and an absent / unparsable / negative
+     * value falls back to the cheap first-page charge — the DTO's own {@code @PositiveOrZero} /
+     * {@code @Max} / result-window constraints are what reject malformed paging, not this
+     * filter. The reachable window is bounded by {@code SearchResultWindow} (10 000 rows), so
+     * the deep-page population this surcharges is itself finite.</p>
+     */
+    private static long searchTokenCost(HttpServletRequest request) {
+        String page = request.getParameter(SEARCH_PAGE_PARAM);
+        if (page == null || page.isBlank()) {
+            return SEARCH_TOKENS_FIRST_PAGE;
+        }
+        try {
+            return Long.parseLong(page.trim()) > 0
+                    ? SEARCH_TOKENS_DEEP_PAGE
+                    : SEARCH_TOKENS_FIRST_PAGE;
+        } catch (NumberFormatException ex) {
+            // Unparsable page — the request will 400 in validation; charge the base cost.
+            return SEARCH_TOKENS_FIRST_PAGE;
+        }
+    }
+
     private void applyRateLimit(HttpServletRequest request,
                                 HttpServletResponse response,
                                 FilterChain filterChain,
                                 LoadingCache<String, Bucket> cache,
                                 int retryAfterSeconds) throws ServletException, IOException {
+        applyRateLimit(request, response, filterChain, cache, retryAfterSeconds, 1L);
+    }
+
+    private void applyRateLimit(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain,
+                                LoadingCache<String, Bucket> cache,
+                                int retryAfterSeconds,
+                                long tokens) throws ServletException, IOException {
         String ip = resolveClientIp(request);
         // Clamp to max IPv6 length (45 chars) to prevent oversized Caffeine cache keys
         // crafted via a long X-Forwarded-For header value.
@@ -756,7 +831,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         }
         Bucket bucket = cache.get(ip);
 
-        if (bucket.tryConsume(1)) {
+        if (bucket.tryConsume(tokens)) {
             filterChain.doFilter(request, response);
         } else {
             response.setStatus(429);

@@ -35,7 +35,10 @@ import java.util.UUID;
  * gates a salon's services carries the salon correlation ({@code mad.salon_id = s.id} in
  * the price-band lateral, {@code mmc/mmq.salon_id = s.id} in the category/{@code ?q}
  * {@code EXISTS} sub-selects, {@code mm2.salon_id = t.id} in the {@code serviceNames}
- * preview lateral) — mirrored identically in every count query. Without it a master who
+ * preview lateral). It can no longer drift between a data and a count statement because
+ * there is no second statement: the six bodies are assembled from the shared
+ * {@code SalonSearchSql.STATIC_*} fragments and paginate through {@code COUNT(*) OVER()}
+ * plus an inner {@code LIMIT}. Without the correlation a master who
  * left the salon (or belongs to another salon) but still holds an active assignment to
  * this salon's owned definition would leak that definition's {@code serviceNames} / price
  * band into this salon's discovery card. The performing master must belong to the salon
@@ -121,7 +124,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>§E — search path MUST use the projection overload.</b>
      * {@link SearchService} must call
-     * {@link #findActiveByDistrictIdAsProjection(UUID, String, String, java.math.BigDecimal, java.math.BigDecimal, Pageable)} so
+     * {@link #findActiveByDistrictIdAsProjection} so
      * only the columns needed by {@link SalonSearchProjection} are fetched.
      * This full-entity overload remains for non-search callers that genuinely
      * need the full {@code Salon} graph.
@@ -150,253 +153,94 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * service-name gates are all restricted to <em>bookable</em> salon-owned
      * services (see the interface-level Javadoc).
      *
+     * <p><b>Free-text {@code q}:</b> the predicate is spliced in from
+     * {@link SalonSearchSql#STATIC_Q_GROUP_PREDICATE} — the single definition
+     * shared with the dynamic per-service-filtered builder in
+     * {@code SearchService}, so the two can no longer drift apart. It declares
+     * {@link SalonSearchSql#STATIC_TOKEN_PARAM_COUNT} bind slots
+     * ({@code q0}…{@code q3}), one per whitespace token of the caller's query.
+     * The tokens are <b>group-scoped</b>, not independently ANDed at the salon
+     * level: every token must be satisfied by the salon name or by ONE single
+     * bookable service — the same service for all service-satisfied tokens, so
+     * tokens can no longer be spread across two different services. Every slot
+     * must be bound; an unused slot is bound {@code null} (its branch
+     * short-circuits to TRUE). All-null disables the filter.</p>
+     *
+     * <p><b>{@code matchedServiceNames}:</b> the post-{@code LIMIT}
+     * {@link SalonSearchSql#STATIC_MATCHED_NAMES_LATERAL} adds the
+     * {@code matched_service_names} column — the bookable services whose own name
+     * explains the {@code q} match. Empty when no {@code q} was supplied or when
+     * the salon's own name carried the whole match.</p>
+     *
      * @param districtId resolved discovery district id (never {@code null})
+     * @param q0 first {@code %token%} ILIKE pattern, or {@code null}
+     * @param q1 second {@code %token%} ILIKE pattern, or {@code null}
+     * @param q2 third {@code %token%} ILIKE pattern, or {@code null}
+     * @param q3 fourth {@code %token%} ILIKE pattern, or {@code null}
+     * @param sortMode {@code SearchSort.name()} — selects the {@code ORDER BY} key
+     * @param limit page size (bound INSIDE the derived table, see the class Javadoc)
+     * @param offset row offset
      */
-    @Query(value = """
-            SELECT t.id           AS id,
-                   t.name         AS name,
-                   t.city_id      AS city_id,
-                   t.district_id  AS district_id,
-                   t.avatar_url   AS avatar_url,
-                   t.price_min    AS price_min,
-                   t.price_max    AS price_max,
-                   pn.pnames      AS service_names,
-                   t.street       AS street,
-                   t.building_no  AS building_no,
-                   t.location_note AS location_note
-            FROM (
-                SELECT s.id           AS id,
-                       s.name         AS name,
-                       s.city_id      AS city_id,
-                       s.district_id  AS district_id,
-                       s.avatar_url   AS avatar_url,
-                       pr.pmin        AS price_min,
-                       pr.pmax        AS price_max,
-                       s.street       AS street,
-                       s.building_no  AS building_no,
-                       s.location_note AS location_note
-                FROM salons s
-                LEFT JOIN LATERAL (
-                    SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                    FROM master_services ms
-                    JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                    JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                    WHERE sd.owner_type = 'SALON'
-                      AND sd.owner_id = s.id
-                      AND ms.is_active = true
-                      AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-                ) pr ON true
-                WHERE s.is_active = true
-                  AND s.district_id = :districtId
-                  AND (CAST(:category AS text) IS NULL OR EXISTS (
-                      SELECT 1 FROM service_definitions sdc
-                      WHERE sdc.owner_type = 'SALON'
-                        AND sdc.owner_id = s.id
-                        AND sdc.is_active = true
-                        AND EXISTS (SELECT 1 FROM master_services msc
-                                    JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                    WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                        AND sdc.category = CAST(:category AS text)))
-                  AND (CAST(:q AS text) IS NULL
-                       OR s.name ILIKE CAST(:q AS text)
-                       OR EXISTS (SELECT 1
-                                  FROM service_definitions sdq
-                                  WHERE sdq.owner_type = 'SALON'
-                                    AND sdq.owner_id = s.id
-                                    AND sdq.is_active = true
-                                    AND EXISTS (SELECT 1 FROM master_services msq
-                                                JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                                WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                    AND sdq.name ILIKE CAST(:q AS text)))
-                  AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
-                  AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
-            ) t
-            LEFT JOIN LATERAL (
-                SELECT array_agg(z.name) AS pnames
-                  FROM (SELECT DISTINCT sd2.name AS name
-                        FROM service_definitions sd2
-                        WHERE sd2.owner_type = 'SALON'
-                          AND sd2.owner_id = t.id
-                          AND sd2.is_active = true
-                          AND EXISTS (SELECT 1 FROM master_services ms2
-                                      JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
-                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true)
-                          AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
-                        ORDER BY sd2.name
-                        LIMIT 3) z) pn ON true
-            """,
-            countQuery = """
-            SELECT COUNT(*)
-            FROM salons s
-            LEFT JOIN LATERAL (
-                SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                       MAX(COALESCE(ms.price_override,
-                                    CASE WHEN sd.price_type = 'RANGE'
-                                         THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                FROM master_services ms
-                JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                WHERE sd.owner_type = 'SALON'
-                  AND sd.owner_id = s.id
-                  AND ms.is_active = true
-                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-            ) pr ON true
-            WHERE s.is_active = true
-              AND s.district_id = :districtId
-              AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM service_definitions sdc
-                  WHERE sdc.owner_type = 'SALON'
-                    AND sdc.owner_id = s.id
-                    AND sdc.is_active = true
-                    AND EXISTS (SELECT 1 FROM master_services msc
-                                JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                    AND sdc.category = CAST(:category AS text)))
-              AND (CAST(:q AS text) IS NULL
-                   OR s.name ILIKE CAST(:q AS text)
-                   OR EXISTS (SELECT 1
-                              FROM service_definitions sdq
-                              WHERE sdq.owner_type = 'SALON'
-                                AND sdq.owner_id = s.id
-                                AND sdq.is_active = true
-                                AND EXISTS (SELECT 1 FROM master_services msq
-                                            JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                            WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                AND sdq.name ILIKE CAST(:q AS text)))
-              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
-              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
-            """,
+    @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
+            + SalonSearchSql.STATIC_DISTRICT_PREDICATE
+            + SalonSearchSql.STATIC_CATEGORY_GATE
+            + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
+            + SalonSearchSql.STATIC_PRICE_PREDICATE
+            + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
+            + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
+            + SalonSearchSql.STATIC_MATCHED_NAMES_LATERAL
+            + SalonSearchSql.STATIC_OUTER_ORDER_BY,
             nativeQuery = true)
-    Page<SalonSearchProjection> findActiveByDistrictIdAsProjection(
+    List<SalonSearchProjection> findActiveByDistrictIdAsProjection(
             @Param("districtId") UUID districtId,
             @Param("category") String category,
-            @Param("q") String q,
+            @Param("q0") String q0,
+            @Param("q1") String q1,
+            @Param("q2") String q2,
+            @Param("q3") String q3,
             @Param("minPrice") java.math.BigDecimal minPrice,
             @Param("maxPrice") java.math.BigDecimal maxPrice,
-            Pageable pageable
+            @Param("sortMode") String sortMode,
+            @Param("limit") int limit,
+            @Param("offset") long offset
     );
 
     /**
      * No-price-bound variant of {@link #findActiveByDistrictIdAsProjection}
-     * (HIGH PERF gate). The data query is identical (the price-range LATERAL
-     * still runs because {@code priceMin}/{@code priceMax} are display columns on
-     * {@link SalonSearchProjection}), but the {@code countQuery} is a plain
-     * {@code COUNT(*)} with <b>no LATERAL</b>: when both price bounds are null
-     * the per-salon price aggregate is irrelevant to the count, and paying for it
-     * on every search was a pure regression. {@link SearchService} dispatches
-     * here when {@code minPrice == null && maxPrice == null}.
+     * (HIGH PERF gate). Identical apart from omitting the price band-overlap
+     * predicate — the price-range LATERAL still runs because
+     * {@code priceMin}/{@code priceMax} are display columns on
+     * {@link SalonSearchProjection}. {@link SearchService} dispatches here when
+     * {@code minPrice == null && maxPrice == null}.
+     *
+     * <p>The gate used to be about the separate {@code countQuery}: the priced
+     * overload's count re-ran the per-salon price LATERAL, the no-price one did not.
+     * There is no second statement any more ({@code COUNT(*) OVER()} — see
+     * {@link SalonSearchSql}), so the two overloads now differ only in the two
+     * band-overlap lines, and the gate survives purely to keep those out of the
+     * plan when no price filter was supplied.</p>
      *
      * @param districtId resolved discovery district id (never {@code null})
      */
-    @Query(value = """
-            SELECT t.id           AS id,
-                   t.name         AS name,
-                   t.city_id      AS city_id,
-                   t.district_id  AS district_id,
-                   t.avatar_url   AS avatar_url,
-                   t.price_min    AS price_min,
-                   t.price_max    AS price_max,
-                   pn.pnames      AS service_names,
-                   t.street       AS street,
-                   t.building_no  AS building_no,
-                   t.location_note AS location_note
-            FROM (
-                SELECT s.id           AS id,
-                       s.name         AS name,
-                       s.city_id      AS city_id,
-                       s.district_id  AS district_id,
-                       s.avatar_url   AS avatar_url,
-                       pr.pmin        AS price_min,
-                       pr.pmax        AS price_max,
-                       s.street       AS street,
-                       s.building_no  AS building_no,
-                       s.location_note AS location_note
-                FROM salons s
-                LEFT JOIN LATERAL (
-                    SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                    FROM master_services ms
-                    JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                    JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                    WHERE sd.owner_type = 'SALON'
-                      AND sd.owner_id = s.id
-                      AND ms.is_active = true
-                      AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-                ) pr ON true
-                WHERE s.is_active = true
-                  AND s.district_id = :districtId
-                  AND (CAST(:category AS text) IS NULL OR EXISTS (
-                      SELECT 1 FROM service_definitions sdc
-                      WHERE sdc.owner_type = 'SALON'
-                        AND sdc.owner_id = s.id
-                        AND sdc.is_active = true
-                        AND EXISTS (SELECT 1 FROM master_services msc
-                                    JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                    WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                        AND sdc.category = CAST(:category AS text)))
-                  AND (CAST(:q AS text) IS NULL
-                       OR s.name ILIKE CAST(:q AS text)
-                       OR EXISTS (SELECT 1
-                                  FROM service_definitions sdq
-                                  WHERE sdq.owner_type = 'SALON'
-                                    AND sdq.owner_id = s.id
-                                    AND sdq.is_active = true
-                                    AND EXISTS (SELECT 1 FROM master_services msq
-                                                JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                                WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                    AND sdq.name ILIKE CAST(:q AS text)))
-            ) t
-            LEFT JOIN LATERAL (
-                SELECT array_agg(z.name) AS pnames
-                  FROM (SELECT DISTINCT sd2.name AS name
-                        FROM service_definitions sd2
-                        WHERE sd2.owner_type = 'SALON'
-                          AND sd2.owner_id = t.id
-                          AND sd2.is_active = true
-                          AND EXISTS (SELECT 1 FROM master_services ms2
-                                      JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
-                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true)
-                          AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
-                        ORDER BY sd2.name
-                        LIMIT 3) z) pn ON true
-            """,
-            countQuery = """
-            SELECT COUNT(*)
-            FROM salons s
-            WHERE s.is_active = true
-              AND s.district_id = :districtId
-              AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM service_definitions sdc
-                  WHERE sdc.owner_type = 'SALON'
-                    AND sdc.owner_id = s.id
-                    AND sdc.is_active = true
-                    AND EXISTS (SELECT 1 FROM master_services msc
-                                JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                    AND sdc.category = CAST(:category AS text)))
-              AND (CAST(:q AS text) IS NULL
-                   OR s.name ILIKE CAST(:q AS text)
-                   OR EXISTS (SELECT 1
-                              FROM service_definitions sdq
-                              WHERE sdq.owner_type = 'SALON'
-                                AND sdq.owner_id = s.id
-                                AND sdq.is_active = true
-                                AND EXISTS (SELECT 1 FROM master_services msq
-                                            JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                            WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                AND sdq.name ILIKE CAST(:q AS text)))
-            """,
+    @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
+            + SalonSearchSql.STATIC_DISTRICT_PREDICATE
+            + SalonSearchSql.STATIC_CATEGORY_GATE
+            + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
+            + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
+            + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
+            + SalonSearchSql.STATIC_MATCHED_NAMES_LATERAL
+            + SalonSearchSql.STATIC_OUTER_ORDER_BY,
             nativeQuery = true)
-    Page<SalonSearchProjection> findActiveByDistrictIdNoPriceAsProjection(
+    List<SalonSearchProjection> findActiveByDistrictIdNoPriceAsProjection(
             @Param("districtId") UUID districtId,
             @Param("category") String category,
-            @Param("q") String q,
-            Pageable pageable
+            @Param("q0") String q0,
+            @Param("q1") String q1,
+            @Param("q2") String q2,
+            @Param("q3") String q3,
+            @Param("sortMode") String sortMode,
+            @Param("limit") int limit,
+            @Param("offset") long offset
     );
 
     /**
@@ -412,7 +256,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>§E — search path MUST use the projection overload.</b>
      * {@link SearchService} must call
-     * {@link #findActiveByCityIdAsProjection(UUID, String, String, java.math.BigDecimal, java.math.BigDecimal, Pageable)}.
+     * {@link #findActiveByCityIdAsProjection}.
      * This full-entity overload remains for non-search callers.
      *
      * @param cityId resolved discovery city id (never {@code null})
@@ -436,131 +280,28 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * @param cityId resolved discovery city id (never {@code null})
      */
-    @Query(value = """
-            SELECT t.id           AS id,
-                   t.name         AS name,
-                   t.city_id      AS city_id,
-                   t.district_id  AS district_id,
-                   t.avatar_url   AS avatar_url,
-                   t.price_min    AS price_min,
-                   t.price_max    AS price_max,
-                   pn.pnames      AS service_names,
-                   t.street       AS street,
-                   t.building_no  AS building_no,
-                   t.location_note AS location_note
-            FROM (
-                SELECT s.id           AS id,
-                       s.name         AS name,
-                       s.city_id      AS city_id,
-                       s.district_id  AS district_id,
-                       s.avatar_url   AS avatar_url,
-                       pr.pmin        AS price_min,
-                       pr.pmax        AS price_max,
-                       s.street       AS street,
-                       s.building_no  AS building_no,
-                       s.location_note AS location_note
-                FROM salons s
-                LEFT JOIN LATERAL (
-                    SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                    FROM master_services ms
-                    JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                    JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                    WHERE sd.owner_type = 'SALON'
-                      AND sd.owner_id = s.id
-                      AND ms.is_active = true
-                      AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-                ) pr ON true
-                WHERE s.is_active = true
-                  AND s.city_id = :cityId
-                  AND (CAST(:category AS text) IS NULL OR EXISTS (
-                      SELECT 1 FROM service_definitions sdc
-                      WHERE sdc.owner_type = 'SALON'
-                        AND sdc.owner_id = s.id
-                        AND sdc.is_active = true
-                        AND EXISTS (SELECT 1 FROM master_services msc
-                                    JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                    WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                        AND sdc.category = CAST(:category AS text)))
-                  AND (CAST(:q AS text) IS NULL
-                       OR s.name ILIKE CAST(:q AS text)
-                       OR EXISTS (SELECT 1
-                                  FROM service_definitions sdq
-                                  WHERE sdq.owner_type = 'SALON'
-                                    AND sdq.owner_id = s.id
-                                    AND sdq.is_active = true
-                                    AND EXISTS (SELECT 1 FROM master_services msq
-                                                JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                                WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                    AND sdq.name ILIKE CAST(:q AS text)))
-                  AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
-                  AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
-            ) t
-            LEFT JOIN LATERAL (
-                SELECT array_agg(z.name) AS pnames
-                  FROM (SELECT DISTINCT sd2.name AS name
-                        FROM service_definitions sd2
-                        WHERE sd2.owner_type = 'SALON'
-                          AND sd2.owner_id = t.id
-                          AND sd2.is_active = true
-                          AND EXISTS (SELECT 1 FROM master_services ms2
-                                      JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
-                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true)
-                          AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
-                        ORDER BY sd2.name
-                        LIMIT 3) z) pn ON true
-            """,
-            countQuery = """
-            SELECT COUNT(*)
-            FROM salons s
-            LEFT JOIN LATERAL (
-                SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                       MAX(COALESCE(ms.price_override,
-                                    CASE WHEN sd.price_type = 'RANGE'
-                                         THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                FROM master_services ms
-                JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                WHERE sd.owner_type = 'SALON'
-                  AND sd.owner_id = s.id
-                  AND ms.is_active = true
-                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-            ) pr ON true
-            WHERE s.is_active = true
-              AND s.city_id = :cityId
-              AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM service_definitions sdc
-                  WHERE sdc.owner_type = 'SALON'
-                    AND sdc.owner_id = s.id
-                    AND sdc.is_active = true
-                    AND EXISTS (SELECT 1 FROM master_services msc
-                                JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                    AND sdc.category = CAST(:category AS text)))
-              AND (CAST(:q AS text) IS NULL
-                   OR s.name ILIKE CAST(:q AS text)
-                   OR EXISTS (SELECT 1
-                              FROM service_definitions sdq
-                              WHERE sdq.owner_type = 'SALON'
-                                AND sdq.owner_id = s.id
-                                AND sdq.is_active = true
-                                AND EXISTS (SELECT 1 FROM master_services msq
-                                            JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                            WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                AND sdq.name ILIKE CAST(:q AS text)))
-              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
-              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
-            """,
+    @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
+            + SalonSearchSql.STATIC_CITY_PREDICATE
+            + SalonSearchSql.STATIC_CATEGORY_GATE
+            + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
+            + SalonSearchSql.STATIC_PRICE_PREDICATE
+            + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
+            + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
+            + SalonSearchSql.STATIC_MATCHED_NAMES_LATERAL
+            + SalonSearchSql.STATIC_OUTER_ORDER_BY,
             nativeQuery = true)
-    Page<SalonSearchProjection> findActiveByCityIdAsProjection(
+    List<SalonSearchProjection> findActiveByCityIdAsProjection(
             @Param("cityId") UUID cityId,
             @Param("category") String category,
-            @Param("q") String q,
+            @Param("q0") String q0,
+            @Param("q1") String q1,
+            @Param("q2") String q2,
+            @Param("q3") String q3,
             @Param("minPrice") java.math.BigDecimal minPrice,
             @Param("maxPrice") java.math.BigDecimal maxPrice,
-            Pageable pageable
+            @Param("sortMode") String sortMode,
+            @Param("limit") int limit,
+            @Param("offset") long offset
     );
 
     /**
@@ -572,112 +313,25 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * @param cityId resolved discovery city id (never {@code null})
      */
-    @Query(value = """
-            SELECT t.id           AS id,
-                   t.name         AS name,
-                   t.city_id      AS city_id,
-                   t.district_id  AS district_id,
-                   t.avatar_url   AS avatar_url,
-                   t.price_min    AS price_min,
-                   t.price_max    AS price_max,
-                   pn.pnames      AS service_names,
-                   t.street       AS street,
-                   t.building_no  AS building_no,
-                   t.location_note AS location_note
-            FROM (
-                SELECT s.id           AS id,
-                       s.name         AS name,
-                       s.city_id      AS city_id,
-                       s.district_id  AS district_id,
-                       s.avatar_url   AS avatar_url,
-                       pr.pmin        AS price_min,
-                       pr.pmax        AS price_max,
-                       s.street       AS street,
-                       s.building_no  AS building_no,
-                       s.location_note AS location_note
-                FROM salons s
-                LEFT JOIN LATERAL (
-                    SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                    FROM master_services ms
-                    JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                    JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                    WHERE sd.owner_type = 'SALON'
-                      AND sd.owner_id = s.id
-                      AND ms.is_active = true
-                      AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-                ) pr ON true
-                WHERE s.is_active = true
-                  AND s.city_id = :cityId
-                  AND (CAST(:category AS text) IS NULL OR EXISTS (
-                      SELECT 1 FROM service_definitions sdc
-                      WHERE sdc.owner_type = 'SALON'
-                        AND sdc.owner_id = s.id
-                        AND sdc.is_active = true
-                        AND EXISTS (SELECT 1 FROM master_services msc
-                                    JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                    WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                        AND sdc.category = CAST(:category AS text)))
-                  AND (CAST(:q AS text) IS NULL
-                       OR s.name ILIKE CAST(:q AS text)
-                       OR EXISTS (SELECT 1
-                                  FROM service_definitions sdq
-                                  WHERE sdq.owner_type = 'SALON'
-                                    AND sdq.owner_id = s.id
-                                    AND sdq.is_active = true
-                                    AND EXISTS (SELECT 1 FROM master_services msq
-                                                JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                                WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                    AND sdq.name ILIKE CAST(:q AS text)))
-            ) t
-            LEFT JOIN LATERAL (
-                SELECT array_agg(z.name) AS pnames
-                  FROM (SELECT DISTINCT sd2.name AS name
-                        FROM service_definitions sd2
-                        WHERE sd2.owner_type = 'SALON'
-                          AND sd2.owner_id = t.id
-                          AND sd2.is_active = true
-                          AND EXISTS (SELECT 1 FROM master_services ms2
-                                      JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
-                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true)
-                          AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
-                        ORDER BY sd2.name
-                        LIMIT 3) z) pn ON true
-            """,
-            countQuery = """
-            SELECT COUNT(*)
-            FROM salons s
-            WHERE s.is_active = true
-              AND s.city_id = :cityId
-              AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM service_definitions sdc
-                  WHERE sdc.owner_type = 'SALON'
-                    AND sdc.owner_id = s.id
-                    AND sdc.is_active = true
-                    AND EXISTS (SELECT 1 FROM master_services msc
-                                JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                    AND sdc.category = CAST(:category AS text)))
-              AND (CAST(:q AS text) IS NULL
-                   OR s.name ILIKE CAST(:q AS text)
-                   OR EXISTS (SELECT 1
-                              FROM service_definitions sdq
-                              WHERE sdq.owner_type = 'SALON'
-                                AND sdq.owner_id = s.id
-                                AND sdq.is_active = true
-                                AND EXISTS (SELECT 1 FROM master_services msq
-                                            JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                            WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                AND sdq.name ILIKE CAST(:q AS text)))
-            """,
+    @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
+            + SalonSearchSql.STATIC_CITY_PREDICATE
+            + SalonSearchSql.STATIC_CATEGORY_GATE
+            + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
+            + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
+            + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
+            + SalonSearchSql.STATIC_MATCHED_NAMES_LATERAL
+            + SalonSearchSql.STATIC_OUTER_ORDER_BY,
             nativeQuery = true)
-    Page<SalonSearchProjection> findActiveByCityIdNoPriceAsProjection(
+    List<SalonSearchProjection> findActiveByCityIdNoPriceAsProjection(
             @Param("cityId") UUID cityId,
             @Param("category") String category,
-            @Param("q") String q,
-            Pageable pageable
+            @Param("q0") String q0,
+            @Param("q1") String q1,
+            @Param("q2") String q2,
+            @Param("q3") String q3,
+            @Param("sortMode") String sortMode,
+            @Param("limit") int limit,
+            @Param("offset") long offset
     );
 
     /**
@@ -692,7 +346,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>§E — search path MUST use the projection overload.</b>
      * {@link SearchService} must call
-     * {@link #findByIsActiveTrueAsProjection(String, java.math.BigDecimal, java.math.BigDecimal, String, Pageable)}.
+     * {@link #findByIsActiveTrueAsProjection}.
      * This full-entity overload remains for non-search callers.
      */
     Page<Salon> findByIsActiveTrue(Pageable pageable);
@@ -704,128 +358,26 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p>Used exclusively by {@link SearchService#findSalonsByLocation}.
      */
-    @Query(value = """
-            SELECT t.id           AS id,
-                   t.name         AS name,
-                   t.city_id      AS city_id,
-                   t.district_id  AS district_id,
-                   t.avatar_url   AS avatar_url,
-                   t.price_min    AS price_min,
-                   t.price_max    AS price_max,
-                   pn.pnames      AS service_names,
-                   t.street       AS street,
-                   t.building_no  AS building_no,
-                   t.location_note AS location_note
-            FROM (
-                SELECT s.id           AS id,
-                       s.name         AS name,
-                       s.city_id      AS city_id,
-                       s.district_id  AS district_id,
-                       s.avatar_url   AS avatar_url,
-                       pr.pmin        AS price_min,
-                       pr.pmax        AS price_max,
-                       s.street       AS street,
-                       s.building_no  AS building_no,
-                       s.location_note AS location_note
-                FROM salons s
-                LEFT JOIN LATERAL (
-                    SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                    FROM master_services ms
-                    JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                    JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                    WHERE sd.owner_type = 'SALON'
-                      AND sd.owner_id = s.id
-                      AND ms.is_active = true
-                      AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-                ) pr ON true
-                WHERE s.is_active = true
-                  AND (CAST(:category AS text) IS NULL OR EXISTS (
-                      SELECT 1 FROM service_definitions sdc
-                      WHERE sdc.owner_type = 'SALON'
-                        AND sdc.owner_id = s.id
-                        AND sdc.is_active = true
-                        AND EXISTS (SELECT 1 FROM master_services msc
-                                    JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                    WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                        AND sdc.category = CAST(:category AS text)))
-                  AND (CAST(:q AS text) IS NULL
-                       OR s.name ILIKE CAST(:q AS text)
-                       OR EXISTS (SELECT 1
-                                  FROM service_definitions sdq
-                                  WHERE sdq.owner_type = 'SALON'
-                                    AND sdq.owner_id = s.id
-                                    AND sdq.is_active = true
-                                    AND EXISTS (SELECT 1 FROM master_services msq
-                                                JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                                WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                    AND sdq.name ILIKE CAST(:q AS text)))
-                  AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
-                  AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
-            ) t
-            LEFT JOIN LATERAL (
-                SELECT array_agg(z.name) AS pnames
-                  FROM (SELECT DISTINCT sd2.name AS name
-                        FROM service_definitions sd2
-                        WHERE sd2.owner_type = 'SALON'
-                          AND sd2.owner_id = t.id
-                          AND sd2.is_active = true
-                          AND EXISTS (SELECT 1 FROM master_services ms2
-                                      JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
-                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true)
-                          AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
-                        ORDER BY sd2.name
-                        LIMIT 3) z) pn ON true
-            """,
-            countQuery = """
-            SELECT COUNT(*)
-            FROM salons s
-            LEFT JOIN LATERAL (
-                SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                       MAX(COALESCE(ms.price_override,
-                                    CASE WHEN sd.price_type = 'RANGE'
-                                         THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                FROM master_services ms
-                JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                WHERE sd.owner_type = 'SALON'
-                  AND sd.owner_id = s.id
-                  AND ms.is_active = true
-                  AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-            ) pr ON true
-            WHERE s.is_active = true
-              AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM service_definitions sdc
-                  WHERE sdc.owner_type = 'SALON'
-                    AND sdc.owner_id = s.id
-                    AND sdc.is_active = true
-                    AND EXISTS (SELECT 1 FROM master_services msc
-                                JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                    AND sdc.category = CAST(:category AS text)))
-              AND (CAST(:q AS text) IS NULL
-                   OR s.name ILIKE CAST(:q AS text)
-                   OR EXISTS (SELECT 1
-                              FROM service_definitions sdq
-                              WHERE sdq.owner_type = 'SALON'
-                                AND sdq.owner_id = s.id
-                                AND sdq.is_active = true
-                                AND EXISTS (SELECT 1 FROM master_services msq
-                                            JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                            WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                AND sdq.name ILIKE CAST(:q AS text)))
-              AND (CAST(:minPrice AS numeric) IS NULL OR pr.pmax >= CAST(:minPrice AS numeric))
-              AND (CAST(:maxPrice AS numeric) IS NULL OR pr.pmin <= CAST(:maxPrice AS numeric))
-            """,
+    @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
+            + SalonSearchSql.STATIC_CATEGORY_GATE
+            + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
+            + SalonSearchSql.STATIC_PRICE_PREDICATE
+            + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
+            + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
+            + SalonSearchSql.STATIC_MATCHED_NAMES_LATERAL
+            + SalonSearchSql.STATIC_OUTER_ORDER_BY,
             nativeQuery = true)
-    Page<SalonSearchProjection> findByIsActiveTrueAsProjection(
-            @Param("q") String q,
+    List<SalonSearchProjection> findByIsActiveTrueAsProjection(
+            @Param("q0") String q0,
+            @Param("q1") String q1,
+            @Param("q2") String q2,
+            @Param("q3") String q3,
             @Param("minPrice") java.math.BigDecimal minPrice,
             @Param("maxPrice") java.math.BigDecimal maxPrice,
             @Param("category") String category,
-            Pageable pageable
+            @Param("sortMode") String sortMode,
+            @Param("limit") int limit,
+            @Param("offset") long offset
     );
 
     /**
@@ -835,108 +387,22 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * price band is a display column. {@link SearchService} dispatches here when
      * both price bounds are null and no locality filter was supplied.
      */
-    @Query(value = """
-            SELECT t.id           AS id,
-                   t.name         AS name,
-                   t.city_id      AS city_id,
-                   t.district_id  AS district_id,
-                   t.avatar_url   AS avatar_url,
-                   t.price_min    AS price_min,
-                   t.price_max    AS price_max,
-                   pn.pnames      AS service_names,
-                   t.street       AS street,
-                   t.building_no  AS building_no,
-                   t.location_note AS location_note
-            FROM (
-                SELECT s.id           AS id,
-                       s.name         AS name,
-                       s.city_id      AS city_id,
-                       s.district_id  AS district_id,
-                       s.avatar_url   AS avatar_url,
-                       pr.pmin        AS price_min,
-                       pr.pmax        AS price_max,
-                       s.street       AS street,
-                       s.building_no  AS building_no,
-                       s.location_note AS location_note
-                FROM salons s
-                LEFT JOIN LATERAL (
-                    SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
-                    FROM master_services ms
-                    JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
-                    JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
-                    WHERE sd.owner_type = 'SALON'
-                      AND sd.owner_id = s.id
-                      AND ms.is_active = true
-                      AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
-                ) pr ON true
-                WHERE s.is_active = true
-                  AND (CAST(:category AS text) IS NULL OR EXISTS (
-                      SELECT 1 FROM service_definitions sdc
-                      WHERE sdc.owner_type = 'SALON'
-                        AND sdc.owner_id = s.id
-                        AND sdc.is_active = true
-                        AND EXISTS (SELECT 1 FROM master_services msc
-                                    JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                    WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                        AND sdc.category = CAST(:category AS text)))
-                  AND (CAST(:q AS text) IS NULL
-                       OR s.name ILIKE CAST(:q AS text)
-                       OR EXISTS (SELECT 1
-                                  FROM service_definitions sdq
-                                  WHERE sdq.owner_type = 'SALON'
-                                    AND sdq.owner_id = s.id
-                                    AND sdq.is_active = true
-                                    AND EXISTS (SELECT 1 FROM master_services msq
-                                                JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                                WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                    AND sdq.name ILIKE CAST(:q AS text)))
-            ) t
-            LEFT JOIN LATERAL (
-                SELECT array_agg(z.name) AS pnames
-                  FROM (SELECT DISTINCT sd2.name AS name
-                        FROM service_definitions sd2
-                        WHERE sd2.owner_type = 'SALON'
-                          AND sd2.owner_id = t.id
-                          AND sd2.is_active = true
-                          AND EXISTS (SELECT 1 FROM master_services ms2
-                                      JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
-                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true)
-                          AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
-                        ORDER BY sd2.name
-                        LIMIT 3) z) pn ON true
-            """,
-            countQuery = """
-            SELECT COUNT(*)
-            FROM salons s
-            WHERE s.is_active = true
-              AND (CAST(:category AS text) IS NULL OR EXISTS (
-                  SELECT 1 FROM service_definitions sdc
-                  WHERE sdc.owner_type = 'SALON'
-                    AND sdc.owner_id = s.id
-                    AND sdc.is_active = true
-                    AND EXISTS (SELECT 1 FROM master_services msc
-                                JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                    AND sdc.category = CAST(:category AS text)))
-              AND (CAST(:q AS text) IS NULL
-                   OR s.name ILIKE CAST(:q AS text)
-                   OR EXISTS (SELECT 1
-                              FROM service_definitions sdq
-                              WHERE sdq.owner_type = 'SALON'
-                                AND sdq.owner_id = s.id
-                                AND sdq.is_active = true
-                                AND EXISTS (SELECT 1 FROM master_services msq
-                                            JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true AND mmq.salon_id = s.id
-                                            WHERE msq.service_def_id = sdq.id AND msq.is_active = true)
-                                AND sdq.name ILIKE CAST(:q AS text)))
-            """,
+    @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
+            + SalonSearchSql.STATIC_CATEGORY_GATE
+            + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
+            + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
+            + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
+            + SalonSearchSql.STATIC_MATCHED_NAMES_LATERAL
+            + SalonSearchSql.STATIC_OUTER_ORDER_BY,
             nativeQuery = true)
-    Page<SalonSearchProjection> findByIsActiveTrueNoPriceAsProjection(
-            @Param("q") String q,
+    List<SalonSearchProjection> findByIsActiveTrueNoPriceAsProjection(
+            @Param("q0") String q0,
+            @Param("q1") String q1,
+            @Param("q2") String q2,
+            @Param("q3") String q3,
             @Param("category") String category,
-            Pageable pageable
+            @Param("sortMode") String sortMode,
+            @Param("limit") int limit,
+            @Param("offset") long offset
     );
 }

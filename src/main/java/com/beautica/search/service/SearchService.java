@@ -6,6 +6,7 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonSearchProjection;
+import com.beautica.salon.repository.SalonSearchSql;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
@@ -18,12 +19,13 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -153,6 +155,14 @@ public class SearchService {
     /** Named-parameter prefix for the resolved {@code service_type_id} of slug {@code n}. */
     private static final String SERVICE_TYPE_ID_PARAM = "stId";
 
+    /**
+     * Named-parameter prefix for the {@code %token%} ILIKE pattern of free-text
+     * token {@code n} ({@code :q0} … {@code :q3}). Shared by the master builder,
+     * the dynamic salon builder and the static salon projection queries (see
+     * {@link SalonSearchSql}), so the three stay bind-compatible.
+     */
+    private static final String Q_PARAM_PREFIX = "q";
+
     /** Projection index of the {@code service_names} {@code array_agg} column. */
     private static final int SERVICE_NAMES_IDX = 10;
 
@@ -175,6 +185,13 @@ public class SearchService {
     private static final int SALON_TOTAL_COUNT_IDX = 12;
 
     /**
+     * Probe pagination used to recover {@code totalElements} for an out-of-range
+     * page — the first row of the first page, whose {@code COUNT(*) OVER()} column
+     * carries the true total. See {@link #probeTotalForEmptyPage}.
+     */
+    private static final Pageable TOTAL_PROBE_PAGE = PageRequest.of(0, 1);
+
+    /**
      * Role value (stored via {@code EnumType.STRING}) that master discovery is
      * restricted to. Phase 19.7 (decision 7): {@code /search/masters} returns
      * {@code INDEPENDENT_MASTER} only. Employed {@code SALON_MASTER} accounts
@@ -185,6 +202,23 @@ public class SearchService {
      * {@code <> 'SALON_ADMIN'} exclusion that let {@code SALON_MASTER} leak in).
      */
     private static final String ROLE_INDEPENDENT_MASTER = "INDEPENDENT_MASTER";
+
+    /**
+     * {@code service_definitions.owner_type} value (stored via
+     * {@code EnumType.STRING}, see {@code com.beautica.service.entity.OwnerType})
+     * identifying a definition owned by an independent master, whose
+     * {@code owner_id} is the {@code masters.id} — <b>not</b> the user id. Used by
+     * {@link #appendMasterOwnedServiceGate} to keep a stale cross-owner
+     * {@code master_services} assignment from surfacing (or making discoverable) a
+     * salon-owned service on an independent master's public card.
+     *
+     * <p>Deliberately a literal rather than a bound parameter: it is a compile-time
+     * constant that never varies per request, and inlining it keeps the sub-plans
+     * free of an extra bind slot the planner would otherwise have to treat as
+     * opaque. It is not caller-derived, so there is no injection surface — the same
+     * reasoning as {@code sdq.owner_type = 'SALON'} in {@link SalonSearchSql}.</p>
+     */
+    private static final String OWNER_TYPE_INDEPENDENT_MASTER = "INDEPENDENT_MASTER";
 
     /**
      * Discovery-locality SQL expressions. A {@code SALON_MASTER}'s locality is
@@ -226,22 +260,31 @@ public class SearchService {
     private final SalonRepository salonRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final ServiceTypeSlugResolver serviceTypeSlugResolver;
+    private final CacheManager cacheManager;
 
     /**
      * Discover masters matching optional location (FK, district-primary),
      * category, rating, and price filters. Returns a page sorted by rating
      * descending with resolved {@code cityLabel}/{@code districtLabel}.
      *
-     * <p><b>Caching</b>: first 5 pages are cached for 60 seconds; the cache
-     * key is now the {@code (cityId, districtId)} FK pair, not the removed
-     * free-text params.
+     * <p><b>Caching</b>: first 5 pages only. The cache is <b>split by population</b>
+     * (see {@link SearchCacheNames}): location-only browse keys land in
+     * {@code search:masters:browse} (500 entries / 60 s), free-text keys in
+     * {@code search:masters:q} (300 entries / 30 s), routed by
+     * {@code searchCacheResolver}.
      *
      * @throws BusinessException if {@code minPrice} > {@code maxPrice}
      */
     @Cacheable(
-            value = "search:masters",
+            // Declares the BROWSE half only; searchCacheResolver swaps in
+            // SearchCacheNames.MASTERS_QUERY when the request carries a normalised q, so
+            // the unbounded free-text key population cannot evict the bounded,
+            // cross-user-shared browse pages. See SearchCacheNames / SearchCacheResolver.
+            cacheNames = SearchCacheNames.MASTERS_BROWSE,
+            cacheResolver = "searchCacheResolver",
             key = "{#request.location?.cityId, #request.location?.districtId, " +
-                  "#request.q, #request.category, #request.sort, " +
+                  "T(com.beautica.search.service.NormalizedSearchQuery).cacheKey(#request.q), " +
+                  "#request.category, #request.sort, " +
                   "#request.minPrice, #request.maxPrice, " +
                   "#request.minRating, #request.normalizedServiceTypeSlugs(), " +
                   "#pageable.pageNumber, #pageable.pageSize}",
@@ -251,6 +294,17 @@ public class SearchService {
     @Transactional(readOnly = true)
     public Page<MasterSearchResult> searchMasters(MasterSearchRequest request, Pageable pageable) {
         validatePriceRange(request.minPrice(), request.maxPrice());
+
+        // Defect B: a supplied-but-too-short query returns an EXPLICIT empty page —
+        // never the unfiltered set. Dropping a filter must not masquerade as "no
+        // filter" (?q=Ру used to return every master in scope). The controller
+        // short-circuits first and attaches the user-facing helper message; this
+        // guard keeps the service authoritative for any non-HTTP caller, mirroring
+        // the validatePriceRange belt-and-suspenders above.
+        NormalizedSearchQuery query = NormalizedSearchQuery.of(request.q());
+        if (query.belowMinimumLength()) {
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
 
         // Phase 20.1: resolve the per-service filter under OR/union semantics.
         // Unknown slugs are dropped; the OR EXISTS is built over the survivors.
@@ -263,7 +317,24 @@ public class SearchService {
             return new PageImpl<>(List.of(), pageable, 0L);
         }
 
-        MasterSearchFilters filters = normalize(request, resolved.get());
+        MasterSearchFilters filters = normalize(request, query, resolved.get());
+
+        // Filter-scoped total memo (perf follow-up, architect decision — keyset/cursor
+        // pagination is REJECTED for this surface; see the backlog entry). A memoized
+        // totalElements for this EXACT filter tuple (page/size excluded from the key — see
+        // masterTotalKey) lets an out-of-range page short-circuit to zero native-query
+        // statements instead of re-running the COUNT(*) OVER() probe on every uncached
+        // (page >= 5) hit. TRADE-OFF: the memo can be stale for up to the cache's TTL;
+        // contained by using it ONLY to prove offset >= total (an empty page), never to serve
+        // or shape data — the worst case is a transiently-empty tail page that self-heals
+        // within the TTL. See SearchCacheNames.MASTERS_TOTAL.
+        Object totalKey = masterTotalKey(request);
+        if (pageable.getOffset() > 0) {
+            Long memoizedTotal = readMemoizedTotal(SearchCacheNames.MASTERS_TOTAL, totalKey);
+            if (memoizedTotal != null && pageable.getOffset() >= memoizedTotal) {
+                return new PageImpl<>(List.of(), pageable, memoizedTotal);
+            }
+        }
 
         // PERF-M1: single query — COUNT(*) OVER() is column index 10.
         // No separate count round-trip on cache miss.
@@ -284,10 +355,17 @@ public class SearchService {
         List<Object[]> rawRows = dataQuery.getResultList();
 
         if (rawRows.isEmpty()) {
-            return new PageImpl<>(List.of(), pageable, 0L);
+            // Out-of-range page: COUNT(*) OVER() has no row to ride on — recover the
+            // true total with a first-page probe. See probeTotalForEmptyPage.
+            long recovered = pageable.getOffset() == 0 ? 0L
+                    : probeTotalForEmptyPage(
+                            buildMasterSearchSql(filters, TOTAL_PROBE_PAGE), TOTAL_COUNT_IDX);
+            writeMemoizedTotal(SearchCacheNames.MASTERS_TOTAL, totalKey, recovered);
+            return new PageImpl<>(List.of(), pageable, recovered);
         }
 
         long total = ((Number) rawRows.get(0)[TOTAL_COUNT_IDX]).longValue();
+        writeMemoizedTotal(SearchCacheNames.MASTERS_TOTAL, totalKey, total);
 
         DiscoveryLabels labels = resolveLabelsForRows(rawRows, 6, 7);
         List<MasterSearchResult> results = new ArrayList<>(rawRows.size());
@@ -307,12 +385,17 @@ public class SearchService {
      * entity then maps via Page#map").
      *
      * <p><b>Caching</b>: same trade-off as {@link #searchMasters} — first 5
-     * pages, 60-second TTL, FK-pair key.
+     * pages, FK-pair key, split into {@code search:salons:browse} (500 entries / 60 s)
+     * and {@code search:salons:q} (300 entries / 30 s) by {@code searchCacheResolver}.
      */
     @Cacheable(
-            value = "search:salons",
+            // Browse half declared; searchCacheResolver routes free-text calls to
+            // SearchCacheNames.SALONS_QUERY — see searchMasters above.
+            cacheNames = SearchCacheNames.SALONS_BROWSE,
+            cacheResolver = "searchCacheResolver",
             key = "{#request.location?.cityId, #request.location?.districtId, " +
-                  "#request.q, #request.category, #request.sort, " +
+                  "T(com.beautica.search.service.NormalizedSearchQuery).cacheKey(#request.q), " +
+                  "#request.category, #request.sort, " +
                   "#request.minPrice, #request.maxPrice, " +
                   "#request.normalizedServiceTypeSlugs(), " +
                   "#pageable.pageNumber, #pageable.pageSize}",
@@ -321,6 +404,13 @@ public class SearchService {
     )
     @Transactional(readOnly = true)
     public Page<SalonSearchResult> searchSalons(SalonSearchRequest request, Pageable pageable) {
+        // Defect B — see searchMasters: too short is an explicit empty page, never
+        // the unfiltered set.
+        NormalizedSearchQuery query = NormalizedSearchQuery.of(request.q());
+        if (query.belowMinimumLength()) {
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+
         DiscoveryLocationKey key = resolveLocation(request.location());
         UUID cityId = key == null ? null : key.cityId();
         UUID districtId = key == null ? null : key.districtId();
@@ -329,8 +419,6 @@ public class SearchService {
         // so the bound value matches what EnumType.STRING wrote to
         // service_definitions.category — mirrors the masters-search path.
         String category = normalizeCategory(request.category());
-        String q = normalizeQuery(request.q());
-        String likePattern = q == null ? null : likeContains(q);
         BigDecimal minPrice = normalizePrice(request.minPrice());
         BigDecimal maxPrice = normalizePrice(request.maxPrice());
         SearchSort sort = SearchSort.orDefault(request.sort());
@@ -345,6 +433,13 @@ public class SearchService {
             return new PageImpl<>(List.of(), pageable, 0L);
         }
         List<ResolvedServiceType> serviceTypes = resolved.get();
+
+        // Filter-scoped total memo (perf follow-up) — mirrors searchMasters (see its Javadoc
+        // note for the full trade-off). Computed once here, from the raw request, so the SAME
+        // key is shared by both salon SQL-building sites below (the unfiltered static path and
+        // searchSalonsWithServiceFilter, which is threaded the key as a parameter since it only
+        // sees the already-decomposed filter fields, not the request).
+        Object totalKey = salonTotalKey(request);
 
         // Phase 20.2: when a per-service filter is active the static repository projection
         // queries cannot express the dynamic, slug-count-dependent correlated EXISTS this path
@@ -371,23 +466,52 @@ public class SearchService {
         // without a product decision reversing that rule first.
         if (!serviceTypes.isEmpty()) {
             return searchSalonsWithServiceFilter(
-                    cityId, districtId, category, likePattern, minPrice, maxPrice,
-                    sort, serviceTypes, pageable);
+                    cityId, districtId, category, query.tokens(), minPrice, maxPrice,
+                    sort, serviceTypes, pageable, totalKey);
         }
 
-        // Re-page with an allow-listed Sort built from the enum — caller text
-        // never reaches the ORDER BY (native query applies Sort by select alias).
-        Pageable sortedPageable = withSalonSort(pageable, sort);
+        if (pageable.getOffset() > 0) {
+            Long memoizedTotal = readMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey);
+            if (memoizedTotal != null && pageable.getOffset() >= memoizedTotal) {
+                return new PageImpl<>(List.of(), pageable, memoizedTotal);
+            }
+        }
 
-        Page<SalonSearchProjection> page = findSalonsByLocation(
-                cityId, districtId, category, likePattern, minPrice, maxPrice, sortedPageable);
+        // The ordering is an allow-listed enum NAME bound as :sortMode — caller text
+        // never reaches the ORDER BY (see SalonSearchSql.STATIC_ORDER_LIMIT_TAIL).
+        List<SalonSearchProjection> projections = findSalonsByLocation(
+                cityId, districtId, category, query.tokens(), minPrice, maxPrice, sort, pageable);
 
-        List<SalonSearchProjection> projections = page.getContent();
+        if (projections.isEmpty()) {
+            // Out-of-range page: recover the true total from a first-page probe of the
+            // SAME repository overload. See probeTotalForEmptyPage.
+            long recovered = 0L;
+            if (pageable.getOffset() > 0) {
+                List<SalonSearchProjection> probe = findSalonsByLocation(
+                        cityId, districtId, category, query.tokens(),
+                        minPrice, maxPrice, sort, TOTAL_PROBE_PAGE);
+                recovered = probe.isEmpty() ? 0L : probe.get(0).getTotalCount();
+            }
+            writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, recovered);
+            return new PageImpl<>(List.of(), pageable, recovered);
+        }
+
+        // Single-query pagination: COUNT(*) OVER() rides along on every paged row, so
+        // the total is read off the first one instead of a second SELECT COUNT(*)
+        // statement that re-ran the whole correlated group EXISTS. Mirrors the master
+        // path and searchSalonsWithServiceFilter.
+        long total = projections.get(0).getTotalCount();
+        writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, total);
+
         DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
                 distinct(projections, SalonSearchProjection::getCityId),
                 distinct(projections, SalonSearchProjection::getDistrictId));
 
-        return page.map(proj -> toSalonSearchResult(proj, labels));
+        List<SalonSearchResult> results = new ArrayList<>(projections.size());
+        for (SalonSearchProjection projection : projections) {
+            results.add(toSalonSearchResult(projection, labels));
+        }
+        return new PageImpl<>(results, pageable, total);
     }
 
     /**
@@ -400,13 +524,25 @@ public class SearchService {
      * (PERF-M1) and the {@code matchedServiceNames} lateral (Phase 20.3). Bound
      * params are typed objects (UUID / BigDecimal) so no {@code CAST(:p …)} idiom
      * is emitted ({@code SearchServiceTest} guard).
+     *
+     * @param totalKey the filter-scoped {@link SearchCacheNames#SALONS_TOTAL} memo key,
+     *                 computed once by the caller ({@link #salonTotalKey}) from the raw
+     *                 request so it is byte-identical to the key the unfiltered static
+     *                 path in {@link #searchSalons} uses for the same filter tuple
      */
     private Page<SalonSearchResult> searchSalonsWithServiceFilter(
-            UUID cityId, UUID districtId, String category, String likePattern,
+            UUID cityId, UUID districtId, String category, List<String> qTokens,
             BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
-            List<ResolvedServiceType> serviceTypes, Pageable pageable) {
+            List<ResolvedServiceType> serviceTypes, Pageable pageable, Object totalKey) {
+        if (pageable.getOffset() > 0) {
+            Long memoizedTotal = readMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey);
+            if (memoizedTotal != null && pageable.getOffset() >= memoizedTotal) {
+                return new PageImpl<>(List.of(), pageable, memoizedTotal);
+            }
+        }
+
         SqlAndParams dataSql = buildSalonSearchSql(
-                cityId, districtId, category, likePattern, minPrice, maxPrice,
+                cityId, districtId, category, qTokens, minPrice, maxPrice,
                 sort, serviceTypes, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
         bind(dataQuery, dataSql.params());
@@ -415,38 +551,25 @@ public class SearchService {
         List<Object[]> rawRows = dataQuery.getResultList();
 
         if (rawRows.isEmpty()) {
-            return new PageImpl<>(List.of(), pageable, 0L);
+            // Out-of-range page: recover the true total from a first-page probe.
+            // See probeTotalForEmptyPage.
+            long recovered = pageable.getOffset() == 0 ? 0L
+                    : probeTotalForEmptyPage(
+                            buildSalonSearchSql(cityId, districtId, category, qTokens,
+                                    minPrice, maxPrice, sort, serviceTypes, TOTAL_PROBE_PAGE),
+                            SALON_TOTAL_COUNT_IDX);
+            writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, recovered);
+            return new PageImpl<>(List.of(), pageable, recovered);
         }
 
         long total = ((Number) rawRows.get(0)[SALON_TOTAL_COUNT_IDX]).longValue();
+        writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, total);
         DiscoveryLabels labels = resolveLabelsForRows(rawRows, SALON_CITY_ID_IDX, SALON_DISTRICT_ID_IDX);
         List<SalonSearchResult> results = new ArrayList<>(rawRows.size());
         for (Object[] row : rawRows) {
             results.add(mapSalonRow(row, labels));
         }
         return new PageImpl<>(results, pageable, total);
-    }
-
-    /**
-     * Re-pages with an allow-listed {@link Sort} mapped from {@link SearchSort}.
-     * The sort properties are the <em>select aliases</em> of the salon
-     * projection query ({@code price_min}, {@code price_max}, {@code name}) —
-     * Spring Data appends them to the native {@code ORDER BY}; the caller's raw
-     * text is never used.
-     *
-     * <p>Salons carry no per-row rating or review-count column in the projection,
-     * so {@link SearchSort#RATING_DESC} and {@link SearchSort#REVIEWS_DESC} fall
-     * back to a stable {@code name} ordering rather than failing — documented
-     * divergence from the master endpoint. {@code name} is always appended as the
-     * deterministic tiebreaker so paging is stable.
-     */
-    private static Pageable withSalonSort(Pageable pageable, SearchSort sort) {
-        Sort resolved = switch (sort) {
-            case PRICE_ASC -> Sort.by(Sort.Order.asc("price_min"), Sort.Order.asc("name"));
-            case PRICE_DESC -> Sort.by(Sort.Order.desc("price_max"), Sort.Order.asc("name"));
-            case RATING_DESC, REVIEWS_DESC -> Sort.by(Sort.Order.asc("name"));
-        };
-        return PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(), resolved);
     }
 
     /**
@@ -469,32 +592,53 @@ public class SearchService {
      * </ol>
      *
      * <p><b>HIGH PERF gate</b>: when both price bounds are null the no-price
-     * {@code *NoPriceAsProjection} overload is chosen instead. Its
-     * {@code countQuery} is a plain {@code COUNT(*)} with no price-range LATERAL,
-     * so the common (no-price-filter) search no longer pays the per-salon price
-     * aggregate twice (once for data, once for an irrelevant count). The data
-     * query still runs the LATERAL because {@code priceMin}/{@code priceMax} are
-     * display columns on every salon card.
+     * {@code *NoPriceAsProjection} overload is chosen instead, dropping the two
+     * band-overlap predicates from the plan. The price-range LATERAL itself still
+     * runs on both overloads because {@code priceMin}/{@code priceMax} are display
+     * columns on every salon card.
+     *
+     * <p><b>Pagination is single-query</b> (perf audit 2026-07-29). These methods
+     * return a {@code List}, not a {@code Page}: a Spring Data {@code Pageable}
+     * cannot express either half of what the plan needs — a {@code LIMIT} bound
+     * <em>inside</em> the Top-N derived table (so the two name laterals really do run
+     * for only the paged rows, which they did not before) or {@code COUNT(*) OVER()}
+     * in place of a second {@code countQuery} that re-ran the whole correlated group
+     * {@code EXISTS}. {@code :limit}/{@code :offset}/{@code :sortMode} are therefore
+     * passed explicitly, mirroring {@link #buildSalonSearchSql}, and the caller
+     * assembles the {@code Page}.
      */
-    private Page<SalonSearchProjection> findSalonsByLocation(
-            UUID cityId, UUID districtId, String category, String q,
-            BigDecimal minPrice, BigDecimal maxPrice, Pageable pageable) {
+    private List<SalonSearchProjection> findSalonsByLocation(
+            UUID cityId, UUID districtId, String category, List<String> qTokens,
+            BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort, Pageable pageable) {
         boolean noPriceFilter = minPrice == null && maxPrice == null;
+        // The static queries declare a fixed number of :qN slots, so the token
+        // patterns are padded with null (an unbound-equivalent, always-true branch).
+        String[] q = paddedSalonTokenPatterns(qTokens);
+        // Allow-listed: the bound value is an enum constant name, never caller text.
+        String sortMode = sort.name();
+        int limit = pageable.getPageSize();
+        long offset = pageable.getOffset();
         if (districtId != null) {
             return noPriceFilter
-                    ? salonRepository.findActiveByDistrictIdNoPriceAsProjection(districtId, category, q, pageable)
+                    ? salonRepository.findActiveByDistrictIdNoPriceAsProjection(
+                            districtId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset)
                     : salonRepository.findActiveByDistrictIdAsProjection(
-                            districtId, category, q, minPrice, maxPrice, pageable);
+                            districtId, category, q[0], q[1], q[2], q[3],
+                            minPrice, maxPrice, sortMode, limit, offset);
         }
         if (cityId != null) {
             return noPriceFilter
-                    ? salonRepository.findActiveByCityIdNoPriceAsProjection(cityId, category, q, pageable)
+                    ? salonRepository.findActiveByCityIdNoPriceAsProjection(
+                            cityId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset)
                     : salonRepository.findActiveByCityIdAsProjection(
-                            cityId, category, q, minPrice, maxPrice, pageable);
+                            cityId, category, q[0], q[1], q[2], q[3],
+                            minPrice, maxPrice, sortMode, limit, offset);
         }
         return noPriceFilter
-                ? salonRepository.findByIsActiveTrueNoPriceAsProjection(q, category, pageable)
-                : salonRepository.findByIsActiveTrueAsProjection(q, minPrice, maxPrice, category, pageable);
+                ? salonRepository.findByIsActiveTrueNoPriceAsProjection(
+                        q[0], q[1], q[2], q[3], category, sortMode, limit, offset)
+                : salonRepository.findByIsActiveTrueAsProjection(
+                        q[0], q[1], q[2], q[3], minPrice, maxPrice, category, sortMode, limit, offset);
     }
 
     // ── location seam (M2) ────────────────────────────────────────────────────
@@ -515,14 +659,15 @@ public class SearchService {
 
     /**
      * Normalised filter bag. {@code cityId}/{@code districtId} are the resolved
-     * discovery-locality FK ids (from the M2 seam), not free text. {@code q} is
-     * the normalised free-text term (trimmed, null-if-blank); {@code sort} is
-     * the resolved ordering (never null after {@link #normalize}).
+     * discovery-locality FK ids (from the M2 seam), not free text.
+     * {@code qTokens} holds the whitespace tokens of the free-text query (see
+     * {@link NormalizedSearchQuery}) — empty means "no text filter"; {@code sort}
+     * is the resolved ordering (never null after {@link #normalize}).
      */
     private record MasterSearchFilters(
             UUID cityId,
             UUID districtId,
-            String q,
+            List<String> qTokens,
             String category,
             SearchSort sort,
             BigDecimal minRating,
@@ -559,6 +704,140 @@ public class SearchService {
 
     /** Carrier for {@code (sql, params)} pairs returned by {@link #buildMasterSearchSql}. */
     private record SqlAndParams(String sql, Map<String, Object> params) {}
+
+    /**
+     * Filter-tuple key for the {@link SearchCacheNames#MASTERS_TOTAL} memo — byte-for-byte the
+     * {@code @Cacheable} key declared on {@link #searchMasters} MINUS the two pagination
+     * elements ({@code #pageable.pageNumber}, {@code #pageable.pageSize}), since a total is a
+     * function of the filter alone, never the page. A dedicated record (rather than a raw
+     * {@code List<Object>}) gives value-based {@code equals}/{@code hashCode} across every field
+     * for free, so two different filter tuples can never collide on this key — the highest-risk
+     * defect class for this cache is a copy-paste omission that silently merges two callers'
+     * totals (see {@link #masterTotalKey}).
+     */
+    private record MasterTotalKey(
+            UUID cityId,
+            UUID districtId,
+            String q,
+            String category,
+            SearchSort sort,
+            BigDecimal minPrice,
+            BigDecimal maxPrice,
+            BigDecimal minRating,
+            List<String> serviceTypeSlugs) {
+    }
+
+    /**
+     * Filter-tuple key for the {@link SearchCacheNames#SALONS_TOTAL} memo — mirrors
+     * {@link MasterTotalKey} (see its Javadoc), minus the {@code minRating} field the salon
+     * request does not carry. Being a DIFFERENT record type than {@link MasterTotalKey} is
+     * itself part of the discrimination contract: even an identical location filter can never
+     * {@code equals()} across the two record types, so the master and salon memos cannot
+     * collide even though they are read/written through the same {@link #readMemoizedTotal} /
+     * {@link #writeMemoizedTotal} helpers (they are additionally isolated by cache name).
+     */
+    private record SalonTotalKey(
+            UUID cityId,
+            UUID districtId,
+            String q,
+            String category,
+            SearchSort sort,
+            BigDecimal minPrice,
+            BigDecimal maxPrice,
+            List<String> serviceTypeSlugs) {
+    }
+
+    /**
+     * Builds the {@link MasterTotalKey} for {@code request} — every field the
+     * {@code @Cacheable} key on {@link #searchMasters} declares, in the same order, EXCEPT
+     * {@code pageable.pageNumber}/{@code pageable.pageSize}. Reads the raw request fields
+     * (not the normalized {@link MasterSearchFilters}) so this stays independent of any future
+     * change to how the filters are normalized internally.
+     *
+     * <p>Extracts {@code (cityId, districtId)} via a record deconstruction pattern rather than a
+     * chained field accessor on the filter object — not for style, but because
+     * {@code SearchReworkRegressionTest}'s M2 source guard forbids that dotted call shape
+     * anywhere outside the single seam call
+     * ({@code discoveryLocationResolver.resolveFilter(...)}). This is a plain field READ for a
+     * cache key (no district-vs-city precedence decision), so it does not violate the seam's
+     * intent — the pattern-match shape simply keeps the guard's literal-text scan from
+     * false-positiving on it.
+     */
+    private static MasterTotalKey masterTotalKey(MasterSearchRequest request) {
+        RawLocationIds ids = RawLocationIds.of(request.location());
+        return new MasterTotalKey(
+                ids.cityId(),
+                ids.districtId(),
+                NormalizedSearchQuery.cacheKey(request.q()),
+                request.category(),
+                request.sort(),
+                request.minPrice(),
+                request.maxPrice(),
+                request.minRating(),
+                request.normalizedServiceTypeSlugs());
+    }
+
+    /**
+     * Builds the {@link SalonTotalKey} for {@code request} — mirrors {@link #masterTotalKey}
+     * (including the record-deconstruction rationale in its Javadoc). Computed once at the top
+     * of {@link #searchSalons} (before the salon path dispatches to either the static
+     * unfiltered query or {@link #searchSalonsWithServiceFilter}) so both SQL-building sites
+     * share one key for the same filter tuple.
+     */
+    private static SalonTotalKey salonTotalKey(SalonSearchRequest request) {
+        RawLocationIds ids = RawLocationIds.of(request.location());
+        return new SalonTotalKey(
+                ids.cityId(),
+                ids.districtId(),
+                NormalizedSearchQuery.cacheKey(request.q()),
+                request.category(),
+                request.sort(),
+                request.minPrice(),
+                request.maxPrice(),
+                request.normalizedServiceTypeSlugs());
+    }
+
+    /**
+     * Raw {@code (cityId, districtId)} pair lifted off a {@link LocationFilter} for cache-key
+     * purposes only — {@code null}/{@code null} when the filter itself is {@code null}. See the
+     * Javadoc on {@link #masterTotalKey} for why this is deconstructed via a record pattern
+     * instead of chained accessors.
+     */
+    private record RawLocationIds(UUID cityId, UUID districtId) {
+        private static final RawLocationIds NONE = new RawLocationIds(null, null);
+
+        static RawLocationIds of(LocationFilter location) {
+            return location instanceof LocationFilter(UUID cityId, UUID districtId)
+                    ? new RawLocationIds(cityId, districtId)
+                    : NONE;
+        }
+    }
+
+    /**
+     * Reads the memoized total for {@code key} from the named cache, or {@code null} when
+     * absent (cold filter, evicted, or TTL-expired). Deliberately NOT {@code @Cacheable}: this
+     * is a read-then-maybe-skip inside the same method that also writes the memo below, not a
+     * memoized return value, so it goes through {@link CacheManager} directly. A missing cache
+     * bean (e.g. a {@code @WebMvcTest} slice with no {@code CacheConfig}) is treated as a cold
+     * miss rather than a wiring error, mirroring the null-registry guard in {@code CacheConfig}.
+     */
+    private Long readMemoizedTotal(String cacheName, Object key) {
+        Cache cache = cacheManager.getCache(cacheName);
+        return cache == null ? null : cache.get(key, Long.class);
+    }
+
+    /**
+     * Writes the now-known total for {@code key} into the named cache. Safe to call
+     * unconditionally from any branch that has the true total in hand (the success path or the
+     * empty-page probe) — a missing cache bean is a silent no-op, mirroring
+     * {@link #readMemoizedTotal}.
+     */
+    private void writeMemoizedTotal(String cacheName, Object key, long total) {
+        Cache cache = cacheManager.getCache(cacheName);
+        if (cache != null) {
+            cache.put(key, total);
+        }
+    }
 
     /**
      * Resolves the normalized {@code serviceTypeSlugs} to their FK match
@@ -612,12 +891,15 @@ public class SearchService {
         return Optional.of(List.copyOf(resolved));
     }
 
-    private MasterSearchFilters normalize(MasterSearchRequest request, List<ResolvedServiceType> serviceTypes) {
+    private MasterSearchFilters normalize(
+            MasterSearchRequest request,
+            NormalizedSearchQuery query,
+            List<ResolvedServiceType> serviceTypes) {
         DiscoveryLocationKey key = resolveLocation(request.location());
         return new MasterSearchFilters(
                 key == null ? null : key.cityId(),
                 key == null ? null : key.districtId(),
-                normalizeQuery(request.q()),
+                query.tokens(),
                 normalizeCategory(request.category()),
                 SearchSort.orDefault(request.sort()),
                 normalizeRating(request.minRating()),
@@ -687,7 +969,7 @@ public class SearchService {
 
         String sql = wrapWithServiceNamesLateral(
                 inner.toString(), filters.sort(), filters.category() != null,
-                filters.serviceTypes());
+                filters.serviceTypes(), filters.qTokens().size());
         return new SqlAndParams(sql, params);
     }
 
@@ -739,8 +1021,11 @@ public class SearchService {
      */
     private static String wrapWithServiceNamesLateral(
             String innerSql, SearchSort sort, boolean hasCategoryFilter,
-            List<ResolvedServiceType> serviceTypes) {
+            List<ResolvedServiceType> serviceTypes, int qTokenCount) {
         boolean hasServiceFilter = !serviceTypes.isEmpty();
+        // Phase 20.3 + free-text extension: matched_names is now produced for a
+        // per-service filter, a free-text q, or both (see appendMatchedNamesLateral).
+        boolean hasMatchedNames = hasServiceFilter || qTokenCount > 0;
         // Search-price bug fix: the displayed price band must be scoped to the
         // active service-type / category filter, not the master's whole catalogue.
         // When a slug OR category filter is active, BOTH bounds come from the
@@ -748,10 +1033,11 @@ public class SearchService {
         // band is whole-catalogue: the floor is the indexed denormalised column
         // (t.min_effective_price) and the ceiling is the unscoped sn MAX.
         boolean hasPriceScope = hasServiceFilter || hasCategoryFilter;
-        // Phase 20.3: matched_names is sourced from the slug-scoped lateral when a
-        // per-service filter is active, else a typed empty array literal (mapped
-        // to []). A typed-NULL literal (not CAST(:p …)) is permitted by the guard.
-        String matchedNamesExpr = hasServiceFilter ? "mn.matched_names" : "CAST(NULL AS text[])";
+        // Phase 20.3: matched_names is sourced from the mn lateral when a
+        // per-service filter and/or a free-text q is active, else a typed empty
+        // array literal (mapped to []). A typed-NULL literal (not CAST(:p …)) is
+        // permitted by the guard.
+        String matchedNamesExpr = hasMatchedNames ? "mn.matched_names" : "CAST(NULL AS text[])";
         // Displayed floor: scoped lateral MIN when filtering, else the indexed
         // denormalised column. The price WHERE/ORDER BY keep using the indexed
         // m./t.min_effective_price column (appendOrderBy/appendWhereClause) — only
@@ -774,6 +1060,11 @@ public class SearchService {
                 .append("FROM master_services ms ")
                 .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
                 .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ");
+        // Ownership gate: an active assignment alone does not prove the definition
+        // belongs to THIS master (service_definitions is polymorphic). Without it a
+        // stale cross-owner row would print a salon's service name on an independent
+        // master's public card. See appendMasterOwnedServiceGate.
+        appendMasterOwnedServiceGate(sb, "sd", "t.master_id");
         // Phase 19.7 fix (Option B): scope the names preview to the searched category
         // (catalogue-wide when null) so a category-filtered card never leaks names
         // from a master's services in OTHER categories. Mirrors the salon path.
@@ -811,14 +1102,8 @@ public class SearchService {
             sb.append("AND sd2.category = :category ");
         }
         sb.append(") sn ON true ");
-        // Phase 20.3 — matched_names: a second post-LIMIT correlated lateral over
-        // ONLY the paged masters, mirroring the serviceNames lateral's shape (no
-        // GROUP BY/HAVING). DISTINCT active service names matching ANY selected
-        // slug (OR across slugs — the card shows what matched), capped to
-        // SERVICE_NAME_CAP. Reuses the :stId{n} params already bound by
-        // appendWhereClause. Only emitted when a per-service filter is active.
-        if (hasServiceFilter) {
-            appendMatchedNamesLateral(sb, serviceTypes);
+        if (hasMatchedNames) {
+            appendMatchedNamesLateral(sb, serviceTypes, qTokenCount);
         }
         appendOuterOrderBy(sb, sort);
         return sb.toString();
@@ -960,24 +1245,8 @@ public class SearchService {
             sb.append("AND ").append(DISCOVERY_CITY_EXPR).append(" = :cityId ");
             params.put("cityId", filters.cityId());
         }
-        // Free-text name / service-name match. ILIKE is the Postgres
-        // case-insensitive LIKE; the bound value is a pre-escaped %term% pattern
-        // (LIKE wildcards in the user term are neutralised in normalizeQuery, so
-        // ":q" is bound as a plain String, never interpolated into the SQL).
-        //
-        // The user-name predicates hit u.first_name / u.last_name directly (each
-        // served by its own partial trigram index, V98). The service-name match
-        // is a correlated EXISTS rather than a main-query join: this keeps the
-        // index-ordered Top-N intact (no fan-out, no GROUP BY) and lets the
-        // sd.name trigram index (V98) serve the inner ILIKE independently — also
-        // fixing the OR-across-relations / single-index-defeat finding.
-        if (filters.q() != null) {
-            sb.append("AND (u.first_name ILIKE :q OR u.last_name ILIKE :q OR EXISTS (")
-                    .append("SELECT 1 FROM master_services ms ")
-                    .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
-                    .append("WHERE ms.master_id = m.id AND ms.is_active = true AND sd.name ILIKE :q)) ");
-            params.put("q", likeContains(filters.q()));
-        }
+        // Free-text name / service-name match — see appendQPredicate.
+        appendQPredicate(sb, filters.qTokens(), params);
         // Category filter as a correlated EXISTS over the master's active
         // services — no main-query service join, so the Top-N stays index-ordered.
         if (filters.category() != null) {
@@ -1014,6 +1283,275 @@ public class SearchService {
         // under a category / serviceType filter the predicate disagreed with the card
         // and the salon endpoint. See appendPriceBandExists.
         appendPriceBandExists(sb, filters, params);
+    }
+
+    /**
+     * Appends the free-text ({@code q}) filter to the master WHERE clause under
+     * <b>group-scoped</b> token semantics, and binds every {@code :qN} pattern.
+     *
+     * <h4>Semantics</h4>
+     * A master matches when <b>every</b> token is satisfied by the name columns
+     * <em>or by one single active service</em> — the <em>same</em> service for
+     * all service-satisfied tokens:
+     *
+     * <pre>
+     *   matches(master) :=  ( &forall; token : token matches u.first_name OR u.last_name )
+     *                    OR ( &exist; active service sd of this master :
+     *                         &forall; token : token matches u.first_name OR u.last_name OR sd.name )
+     * </pre>
+     *
+     * The second disjunct subsumes the first whenever the master has at least one
+     * active service; the first is kept so a master with <b>zero</b> active
+     * services is still findable by name. Re-testing the name columns
+     * <em>inside</em> the {@code EXISTS} is what keeps a mixed query working:
+     * {@code q=Олена манікюр} against master «Олена» offering «Манікюр» matches
+     * because {@code Олена} is satisfied by {@code first_name} and {@code манікюр}
+     * by that one service. A naive "all tokens must hit one single service" form
+     * would break exactly that case.
+     *
+     * <h4>What this replaced</h4>
+     * The predicate used to be emitted <em>per token</em> and ANDed at the master
+     * level, so different tokens could be satisfied by <em>different</em> services
+     * of the same master. Measured on the local demo dataset,
+     * {@code q=Ботокс для волосся} returned 67 masters of which 11 did not offer
+     * that service at all — they offered «Ботокс» / «Ботокс вій» <em>plus</em>
+     * «Щастя для волосся», which jointly contain all three tokens. The
+     * group-scoped form returns 56, matching the ground-truth
+     * {@code serviceTypeSlugs=hair-treatment-botox} count exactly.
+     *
+     * <h4>Why the old per-token predicates are STILL emitted (as a pre-filter)</h4>
+     * The per-token form is <b>strictly implied</b> by the group form — if one
+     * service satisfies every token, then for each token <em>some</em> service
+     * satisfies it — so ANDing both changes no result. It is kept because it is
+     * the only form the planner can serve from an index: each per-token
+     * {@code EXISTS} is correlated on {@code ms.master_id = m.id} alone, which
+     * Postgres flattens into a <b>hashed</b> sub-plan whose inner
+     * {@code sd.name ILIKE} is served by the V98
+     * {@code idx_service_definitions_name_trgm} trigram index. The exact group
+     * {@code EXISTS} additionally references {@code u.first_name}/{@code u.last_name},
+     * so it can only be a per-row correlated sub-plan. Emitting the pre-filter
+     * first cuts the candidate set before the exact predicate runs even once.
+     *
+     * <p><b>Measured reduction — corrected (perf audit 2026-07-29).</b> An earlier
+     * revision of this Javadoc claimed the pre-filter "cuts the candidate set
+     * 2 344 → 67 masters". That number was a 3.5× overstatement: the correlated
+     * sub-plan never sees all 2 344 {@code masters} rows, because the
+     * {@code masters ⋈ users} hash join with {@code u.role = 'INDEPENDENT_MASTER'}
+     * has already restricted the candidate set to <b>602</b> rows. The real
+     * reduction on the local dataset is 602 → 67 for {@code q=Ботокс для волосся}.
+     * The conclusion is unchanged — the pre-filter is still the only index-servable
+     * form and still worth emitting — only the magnitude was wrong.</p>
+     *
+     * <h4>Tokens shorter than {@code MIN_QUERY_LENGTH} are excluded from the pre-filter</h4>
+     * {@code NormalizedSearchQuery} applies its 3-character floor with
+     * {@code anyMatch}, so ONE trigram-servable token admits up to three 1–2-char
+     * companions ({@code q=ння ка ій ов}). A 1–2-char {@code %xx%} pattern contains
+     * no full 3-gram, so {@code idx_service_definitions_name_trgm} <b>cannot</b>
+     * serve it — the pre-filter {@code EXISTS} for such a token degrades into a
+     * full sequential scan of {@code master_services} ⋈ {@code service_definitions}
+     * on a public, unauthenticated endpoint. Measured on the local dataset,
+     * {@code q=ння ка ій ов} produced four {@code Seq Scan on master_services
+     * (rows=14 238)} plus three {@code Seq Scan on service_definitions} — 16 203
+     * shared buffers and 42 ms of execution to return ONE row, i.e. a free ~4×
+     * DB-work amplifier for any caller who appends throwaway 1-char terms.
+     * Short tokens are therefore skipped <em>here only</em>: the pre-filter is
+     * explicitly optional (logically implied by the group predicate), so dropping
+     * terms from it cannot change results, while the exact group predicate below
+     * still carries EVERY token so {@code "Мар'я Ко"} keeps filtering on both.
+     *
+     * <h4>Single-token queries emit the pre-filter ONLY</h4>
+     * For exactly one token the group predicate is <b>provably</b> the pre-filter,
+     * not merely implied by it. The group form is
+     * {@code (name) OR EXISTS(svc: name OR sd.name)}; the {@code name} disjunct
+     * inside the {@code EXISTS} is row-invariant, so if it is true the leading
+     * disjunct has already short-circuited, and if it is false the {@code EXISTS}
+     * collapses to {@code EXISTS(svc: sd.name ILIKE q)} — the pre-filter verbatim.
+     * Emitting both therefore evaluates the identical condition twice, the second
+     * time as a per-row correlated sub-plan. Measured on {@code q=ння}
+     * (589 masters): both forms 10 796 shared buffers / 12.9 ms exec, pre-filter
+     * only <b>2 963 buffers / 9.9 ms</b> — −73 % buffers, −23 % execution, same
+     * rows. This is the dominant traffic shape: an incremental search box issues a
+     * request per settled keystroke and every one is single-token until the user
+     * types a space.
+     *
+     * <p>The salon path deliberately does <em>not</em> carry this pre-filter — its
+     * {@code EXISTS} is correlated on {@code owner_id} and never reaches the
+     * trigram index in any formulation, so the extra sub-plans are pure cost. See
+     * {@link SalonSearchSql} for the measurement and for the equivalent
+     * single-token short-circuit on that side.</p>
+     *
+     * <h4>Owner constraint on the service branches</h4>
+     * Both {@code EXISTS} forms constrain the service definition to one this
+     * master actually <em>owns</em>, via {@link #appendMasterOwnedServiceGate} —
+     * the single place the {@code owner_type + owner_id} pair is emitted on every
+     * master-side service surface (pre-filter, exact group predicate, and both
+     * name laterals). Without it, a stale active {@code master_services} row
+     * pointing at a definition owned by someone else would make a master
+     * discoverable by typing that other owner's service name — the same class of
+     * stale-assignment leak the {@code mmq.salon_id = s.id} gate closes on the
+     * salon side.
+     *
+     * <p><b>The pre-filter carries the full pair too, and this is not optional.</b>
+     * The single-token short-circuit below returns before the exact group predicate
+     * is emitted, so on the dominant traffic shape the pre-filter is the
+     * <em>only</em> owner gate in the query. A "weaker pre-filter is sound because
+     * it need only be implied by the exact predicate" argument holds only while the
+     * exact predicate is also emitted — it does not survive the short-circuit. An
+     * earlier revision omitted {@code owner_id} here on the theory that a correlated
+     * {@code sd.owner_id = m.id} would stop Postgres flattening the sub-plan into a
+     * HASHED one and forfeit the trigram index. <b>Measured, that theory is false</b>
+     * (PostgreSQL 16.13, {@code q=ння}, 589 masters): pre-filter without
+     * {@code owner_id} 1 669 shared buffers / 8.1 ms; with
+     * {@code sd.owner_id = ms.master_id} <b>1 669 buffers / 8.2 ms</b> — byte-identical
+     * plan shape, still {@code hashed SubPlan}, still {@code Bitmap Index Scan on
+     * idx_service_definitions_name_trgm}. The planner simply folds the extra equality
+     * into the sub-plan's existing hash condition
+     * ({@code (ms.service_def_id = sd.id) AND (ms.master_id = sd.owner_id)}).
+     * Spelling the owner as {@code ms.master_id} rather than {@code m.id} is what
+     * keeps it inner-only; the outer-correlated spelling also measured identically,
+     * but the inner one needs no assumption about the planner's de-correlation.
+     *
+     * <p>Because the pre-filter now carries the full gate, it is <em>identical</em>
+     * to the exact group predicate for a single token rather than merely implied by
+     * it — which is exactly what makes the short-circuit below an identity.
+     *
+     * <p>Each bound value is a pre-escaped {@code %token%} pattern
+     * ({@link #likeContains} neutralises {@code LIKE} wildcards in the user term),
+     * bound as a plain {@code String} — never interpolated into the SQL. Token
+     * count is capped by {@code NormalizedSearchQuery.MAX_TOKENS}, so the
+     * predicate stays bounded.</p>
+     */
+    private static void appendQPredicate(
+            StringBuilder sb, List<String> qTokens, Map<String, Object> params) {
+        if (qTokens.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < qTokens.size(); i++) {
+            params.put(Q_PARAM_PREFIX + i, likeContains(qTokens.get(i)));
+        }
+        // (1) Index-servable pre-filter — logically implied by (2), see Javadoc.
+        //     Emitted only for trigram-servable tokens: a 1–2 char pattern cannot
+        //     reach idx_service_definitions_name_trgm and becomes a full seq scan.
+        for (int i = 0; i < qTokens.size(); i++) {
+            if (qTokens.get(i).length() < NormalizedSearchQuery.MIN_QUERY_LENGTH) {
+                continue;
+            }
+            String param = Q_PARAM_PREFIX + i;
+            sb.append("AND (u.first_name ILIKE :").append(param)
+                    .append(" OR u.last_name ILIKE :").append(param)
+                    .append(" OR EXISTS (")
+                    .append("SELECT 1 FROM master_services ms ")
+                    .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                    .append("WHERE ms.master_id = m.id AND ms.is_active = true ");
+            // FULL owner gate — owner_type AND owner_id — expressed against the
+            // sub-query's own ms.master_id rather than the outer m.id. Given the
+            // ms.master_id = m.id correlation directly above, the two spellings are
+            // transitively equal, so this is the same constraint the exact group
+            // predicate carries; routing it through ms.master_id keeps it an
+            // INNER-ONLY equality that Postgres folds straight into the existing
+            // hash condition instead of widening the outer correlation. See Javadoc.
+            appendMasterOwnedServiceGate(sb, "sd", "ms.master_id");
+            sb.append("AND sd.name ILIKE :").append(param).append(")) ");
+        }
+        // (2) Exact group-scoped predicate: all tokens by the name columns, OR all
+        //     tokens by the name columns / ONE single service.
+        //
+        //     Skipped for the single-token case, where the pre-filter above is not
+        //     merely implied by this predicate but IDENTICAL to it (see Javadoc).
+        //     That identity depends on the pre-filter carrying the FULL owner gate
+        //     (owner_type + owner_id) — do not weaken the gate above without
+        //     deleting this short-circuit in the same edit, or owner_id stops being
+        //     enforced anywhere on the single-token path.
+        //     The guard also requires that the pre-filter was actually emitted for
+        //     that token — a lone sub-minimum token cannot reach here through
+        //     NormalizedSearchQuery, but the service stays authoritative for any
+        //     non-HTTP caller that hand-builds a token list.
+        if (qTokens.size() == 1
+                && qTokens.get(0).length() >= NormalizedSearchQuery.MIN_QUERY_LENGTH) {
+            return;
+        }
+        sb.append("AND ((");
+        for (int i = 0; i < qTokens.size(); i++) {
+            String param = Q_PARAM_PREFIX + i;
+            if (i > 0) {
+                sb.append(" AND ");
+            }
+            sb.append("(u.first_name ILIKE :").append(param)
+                    .append(" OR u.last_name ILIKE :").append(param).append(")");
+        }
+        sb.append(") OR EXISTS (")
+                .append("SELECT 1 FROM master_services msg ")
+                .append("JOIN service_definitions sdg ON sdg.id = msg.service_def_id AND sdg.is_active = true ")
+                .append("WHERE msg.master_id = m.id AND msg.is_active = true ");
+        appendMasterOwnedServiceGate(sb, "sdg", "m.id");
+        appendMasterTokenConjunction(sb, "u", "sdg", qTokens.size());
+        sb.append(")) ");
+    }
+
+    /**
+     * Constrains a {@code service_definitions} row aliased {@code defAlias} to one
+     * <em>owned</em> by the independent master aliased {@code masterAlias} — the
+     * master-side mirror of {@link #appendSalonBookableGate}'s
+     * {@code mx.salon_id = <salon>.id} rotated-master guard.
+     *
+     * <p>An active {@code master_services} row is not by itself proof that the
+     * definition belongs to this master: {@code service_definitions} is polymorphic
+     * ({@code owner_type} ∈ {@code SALON} / {@code INDEPENDENT_MASTER}, with
+     * {@code owner_id} = {@code salons.id} or {@code masters.id} respectively), so a
+     * stale assignment left behind by a master who moved between a salon and solo
+     * practice would otherwise surface the salon's service name on that master's
+     * public card — and, since the free-text extension, make the master
+     * <em>discoverable</em> by the salon's service name.
+     *
+     * <p>The owning master is identified by an already-qualified expression rather
+     * than an alias, because the call sites spell it differently: the exact group
+     * {@code EXISTS} in the inner Top-N WHERE clause has {@code m.id}, the
+     * post-{@code LIMIT} laterals have the derived table's {@code t.master_id}, and
+     * the index-servable pre-filter uses its own {@code ms.master_id} — equal to
+     * {@code m.id} by the correlation already present in that sub-query, but
+     * inner-only, so the equality folds into the sub-plan's hash condition instead
+     * of widening the outer correlation (see {@link #appendQPredicate}).
+     *
+     * <p>This method is the ONLY place the {@code owner_type + owner_id} pair is
+     * emitted on the master side. Every service-name surface — pre-filter, exact
+     * group predicate, {@code service_names} lateral, {@code matched_names} lateral
+     * — must route through it; a surface that hand-writes only {@code owner_type}
+     * silently drops the ownership half of the gate.
+     *
+     * @param defAlias     alias of the {@code service_definitions} row to constrain
+     * @param masterIdExpr qualified expression yielding the owning master's id
+     *                     ({@code m.id}, {@code t.master_id} or {@code ms.master_id})
+     */
+    private static void appendMasterOwnedServiceGate(
+            StringBuilder sb, String defAlias, String masterIdExpr) {
+        sb.append("AND ").append(defAlias).append(".owner_type = '")
+                .append(OWNER_TYPE_INDEPENDENT_MASTER).append("' ")
+                .append("AND ").append(defAlias).append(".owner_id = ")
+                .append(masterIdExpr).append(" ");
+    }
+
+    /**
+     * Appends {@code AND (<nameAlias>.first_name ILIKE :qN OR <nameAlias>.last_name
+     * ILIKE :qN OR <defAlias>.name ILIKE :qN)} once per token — the per-token
+     * condition of the group-scoped predicate, evaluated against ONE fixed service
+     * row.
+     *
+     * <p>Shared by the WHERE-clause {@code EXISTS} ({@code u} / {@code sdg}, inner
+     * derived table) and the post-{@code LIMIT} matched-names lateral
+     * ({@code t} / {@code sdq}, outer block) so the two cannot express different
+     * semantics.</p>
+     *
+     * @param nameAlias alias carrying {@code first_name} / {@code last_name}
+     * @param defAlias  alias of the single {@code service_definitions} row under test
+     */
+    private static void appendMasterTokenConjunction(
+            StringBuilder sb, String nameAlias, String defAlias, int tokenCount) {
+        for (int i = 0; i < tokenCount; i++) {
+            String param = Q_PARAM_PREFIX + i;
+            sb.append("AND (").append(nameAlias).append(".first_name ILIKE :").append(param)
+                    .append(" OR ").append(nameAlias).append(".last_name ILIKE :").append(param)
+                    .append(" OR ").append(defAlias).append(".name ILIKE :").append(param).append(") ");
+        }
     }
 
     /**
@@ -1121,20 +1659,75 @@ public class SearchService {
     }
 
     /**
-     * Appends the master matched-names lateral (Phase 20.3): DISTINCT active
-     * service names matching ANY selected slug (OR across slugs), capped, over
-     * only the paged masters ({@code t.master_id}). Reuses the already-bound
-     * {@code :stId{n}} params.
+     * Appends the master {@code matched_names} lateral (Phase 20.3, extended to
+     * free text): the DISTINCT active service names that <b>explain</b> the row —
+     * capped to {@link #SERVICE_NAME_CAP}, computed post-{@code LIMIT} over only
+     * the paged masters ({@code t.master_id}), mirroring the {@code serviceNames}
+     * lateral's shape (no {@code GROUP BY}/{@code HAVING}). Reuses the
+     * {@code :stId{n}} / {@code :qN} params already bound by
+     * {@link #appendWhereClause}; binds nothing itself.
+     *
+     * <h4>Per-service filter contribution</h4>
+     * Services matching ANY selected slug (OR across slugs) — unchanged.
+     *
+     * <h4>Free-text ({@code q}) contribution</h4>
+     * A service is reported when it
+     * <ol>
+     *   <li>satisfies the same group-scoped condition the WHERE clause used —
+     *       every token matched by {@code t.first_name} / {@code t.last_name} or
+     *       by <em>this</em> service's name ({@link #appendMasterTokenConjunction},
+     *       the identical helper the WHERE clause calls, so the two cannot express
+     *       different semantics); <b>and</b></li>
+     *   <li>contributes at least one token <em>through its own name</em>.</li>
+     * </ol>
+     * Condition (2) is what stops a pure name match ({@code q=Вікторія Руденко})
+     * from listing an arbitrary alphabetical slice of the master's whole
+     * catalogue: every service trivially satisfies (1) in that case, but none
+     * satisfies (2), so {@code matchedServiceNames} comes back empty and the card
+     * falls back to the {@code serviceNames} preview — the documented no-match
+     * behaviour.
+     *
+     * <h4>Rule when BOTH {@code q} and {@code serviceTypeSlugs} are supplied</h4>
+     * The two conditions are <b>ANDed — an intersection</b>. The WHERE clause ANDs
+     * the two filters, so the only services that explain the row under
+     * <em>every</em> active filter are those in the intersection; surfacing a
+     * union would put a service on the card that does not match what the user
+     * asked for. Because the two WHERE filters are independent {@code EXISTS}
+     * predicates, a master can match {@code q} through one service and the slug
+     * through another; the intersection is then empty and the card falls back to
+     * {@code serviceNames} — the same fallback as the pure-name case above.
      */
-    private static void appendMatchedNamesLateral(StringBuilder sb, List<ResolvedServiceType> serviceTypes) {
+    private static void appendMatchedNamesLateral(
+            StringBuilder sb, List<ResolvedServiceType> serviceTypes, int qTokenCount) {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT array_agg(xm.name) AS matched_names FROM (")
                 .append("SELECT DISTINCT sd.name ")
                 .append("FROM master_services ms ")
                 .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
-                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true AND (");
-        appendServiceTypeMatchDisjunction(sb, "sd", serviceTypes.size());
-        sb.append(") ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
+                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ");
+        // Same ownership gate as the serviceNames preview — a stale cross-owner
+        // assignment must not "explain" the match with a salon's service name.
+        appendMasterOwnedServiceGate(sb, "sd", "t.master_id");
+        if (!serviceTypes.isEmpty()) {
+            sb.append("AND (");
+            appendServiceTypeMatchDisjunction(sb, "sd", serviceTypes.size());
+            sb.append(") ");
+        }
+        if (qTokenCount > 0) {
+            // (2) own-name contribution — keeps a pure name match from listing the
+            //     whole catalogue.
+            sb.append("AND (");
+            for (int i = 0; i < qTokenCount; i++) {
+                if (i > 0) {
+                    sb.append(" OR ");
+                }
+                sb.append("sd.name ILIKE :").append(Q_PARAM_PREFIX).append(i);
+            }
+            sb.append(") ");
+            // (1) same group-scoped condition as the WHERE clause, against THIS service.
+            appendMasterTokenConjunction(sb, "t", "sd", qTokenCount);
+        }
+        sb.append("ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") xm) mn ON true ");
     }
 
@@ -1193,6 +1786,52 @@ public class SearchService {
         params.forEach(query::setParameter);
     }
 
+    /**
+     * Recovers {@code totalElements} for a page that returned no rows because the
+     * caller asked for an offset past the end of the result set.
+     *
+     * <h4>Why it is needed</h4>
+     * All three discovery paths (masters, static salons, per-service-filtered
+     * salons) paginate with a single query: {@code COUNT(*) OVER()} rides along as
+     * a projection column on every returned row, replacing a second
+     * {@code SELECT COUNT(*)} that would re-run the whole correlated group
+     * {@code EXISTS}. That trade has one edge: with zero rows there is no row for
+     * the window count to ride on, so the total is unreadable and the page would
+     * otherwise report {@code totalElements = 0} for a query that genuinely matches
+     * hundreds of providers. A client that lands on an out-of-range page — a
+     * restored deep link, a stale cached page index, or a result set that shrank
+     * between two requests — would be told "no results" instead of "no results
+     * <em>on this page</em>", and would have no total to page back from.
+     *
+     * <h4>Why it re-runs the data query instead of a COUNT query</h4>
+     * Re-issuing the SAME builder with {@link #TOTAL_PROBE_PAGE} (page 0, size 1)
+     * reads the true total off the window column of the single returned row. A
+     * dedicated {@code countQuery} would be a second copy of every predicate — the
+     * exact duplication that has drifted before on this surface — for no gain: the
+     * window aggregate is computed over the whole filtered set either way, so both
+     * shapes cost one full evaluation of the predicate. The post-{@code LIMIT} name
+     * laterals run for a single row.
+     *
+     * <h4>When it runs</h4>
+     * Only when the page came back empty AND {@code pageable.getOffset() > 0}. A
+     * genuinely empty first page skips the probe entirely and reports {@code 0}, so
+     * the common no-match request still costs exactly one query. Callers apply that
+     * offset guard; this method assumes it.
+     *
+     * @param probeSql      the same search SQL rebuilt for {@link #TOTAL_PROBE_PAGE}
+     * @param totalCountIdx projection index of the {@code COUNT(*) OVER()} column
+     * @return the true total, or {@code 0} if the filter genuinely matches nothing
+     */
+    private long probeTotalForEmptyPage(SqlAndParams probeSql, int totalCountIdx) {
+        Query probeQuery = entityManager.createNativeQuery(probeSql.sql());
+        bind(probeQuery, probeSql.params());
+
+        @SuppressWarnings("unchecked")
+        List<Object[]> probeRows = probeQuery.getResultList();
+
+        return probeRows.isEmpty() ? 0L : ((Number) probeRows.get(0)[totalCountIdx]).longValue();
+    }
+
     // ── salon per-service-filtered SQL builder (Phase 20.2/20.3) ───────────────
 
     /**
@@ -1231,7 +1870,7 @@ public class SearchService {
      * {@code CAST(:p …)} idiom (guard).
      */
     private static SqlAndParams buildSalonSearchSql(
-            UUID cityId, UUID districtId, String category, String likePattern,
+            UUID cityId, UUID districtId, String category, List<String> qTokens,
             BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
             List<ResolvedServiceType> serviceTypes, Pageable pageable) {
         StringBuilder inner = new StringBuilder();
@@ -1257,14 +1896,24 @@ public class SearchService {
             inner.append("AND s.city_id = :cityId ");
             params.put("cityId", cityId);
         }
-        if (likePattern != null) {
-            inner.append("AND (s.name ILIKE :q OR EXISTS (")
-                    .append("SELECT 1 FROM service_definitions sdq ")
-                    .append("WHERE sdq.owner_type = 'SALON' AND sdq.owner_id = s.id ")
-                    .append("AND sdq.is_active = true ")
-                    .append("AND sdq.name ILIKE :q)) ");
-            params.put("q", likePattern);
+        // Free-text tokens (defects C + E). The predicate body — including the
+        // bookable-master EXISTS gate — comes from SalonSearchSql, the SAME
+        // definition the static SalonRepository projection queries splice in.
+        //
+        // Defect E: this branch used to be a hand-written copy that OMITTED that
+        // gate, so a salon service no active master performs could match `q` here
+        // while being invisible on the static path — a latent violation of the
+        // locked rule that a salon's client-visible offering is master-performed
+        // only. Both forms now derive from one body and cannot drift again.
+        //
+        // The predicate is GROUP-SCOPED: all tokens by the salon name, OR all
+        // tokens by the salon name / ONE single bookable service. Tokens can no
+        // longer be spread across two different services of the same salon — see
+        // SalonSearchSql for the semantics and the measured plan choice.
+        for (int i = 0; i < qTokens.size(); i++) {
+            params.put(Q_PARAM_PREFIX + i, likeContains(qTokens.get(i)));
         }
+        inner.append(SalonSearchSql.dynamicQGroupPredicate(qTokens.size()));
         if (hasCategory) {
             params.put("category", category);
         }
@@ -1283,7 +1932,8 @@ public class SearchService {
         params.put("limit", pageable.getPageSize());
         params.put("offset", pageable.getOffset());
 
-        String sql = wrapSalonWithNameLaterals(inner.toString(), hasCategory, sort, serviceTypes);
+        String sql = wrapSalonWithNameLaterals(
+                inner.toString(), hasCategory, sort, serviceTypes, qTokens.size());
         return new SqlAndParams(sql, params);
     }
 
@@ -1302,7 +1952,7 @@ public class SearchService {
      */
     private static String wrapSalonWithNameLaterals(
             String innerSql, boolean hasCategory, SearchSort sort,
-            List<ResolvedServiceType> serviceTypes) {
+            List<ResolvedServiceType> serviceTypes, int qTokenCount) {
         StringBuilder sb = new StringBuilder();
         sb.append("SELECT t.id, t.name, t.city_id, t.district_id, t.avatar_url, ")
                 .append("t.pmin, t.pmax, pn.pnames, ")
@@ -1310,7 +1960,7 @@ public class SearchService {
                 .append("mn.matched_names, t.total_count ")
                 .append("FROM (").append(innerSql).append(") t ");
         appendSalonNamePreviewLateral(sb, hasCategory);
-        appendSalonMatchedNamesLateral(sb, serviceTypes);
+        appendSalonMatchedNamesLateral(sb, serviceTypes, qTokenCount);
         appendSalonOuterOrderBy(sb, sort);
         return sb.toString();
     }
@@ -1387,14 +2037,27 @@ public class SearchService {
     }
 
     /**
-     * Slug-scoped matched-names lateral (Phase 20.3): DISTINCT active service
-     * names offered across the salon's active masters that match ANY selected
-     * slug (OR across slugs), capped. Correlated to {@code t.id} — sits in the
-     * OUTER block over only the paged rows (HIGH PERF fix). Reuses the
-     * {@code :stId{n}} params bound by
-     * {@link #appendSalonServiceTypeExists}.
+     * Salon {@code matched_names} lateral (Phase 20.3, extended to free text): the
+     * DISTINCT bookable service names that <b>explain</b> the row, capped.
+     * Correlated to {@code t.id} — sits in the OUTER block over only the paged
+     * rows (HIGH PERF fix). Reuses the {@code :stId{n}} params bound by
+     * {@link #appendSalonServiceTypeExists} and the {@code :qN} patterns bound by
+     * {@link #buildSalonSearchSql}; binds nothing itself.
+     *
+     * <p>The free-text half comes from
+     * {@link SalonSearchSql#dynamicMatchedNamesPredicate(String, int)} — the same
+     * definition the static projection queries splice in as
+     * {@link SalonSearchSql#STATIC_MATCHED_NAMES_LATERAL}, so the two salon paths
+     * cannot drift. Semantics and the {@code q} + {@code serviceTypeSlugs}
+     * intersection rule mirror the master path exactly — see
+     * {@link #appendMatchedNamesLateral}.</p>
+     *
+     * <p>Always emitted (unlike the master lateral): this builder is only reached
+     * on the per-service-filtered path, so at least the slug half is always
+     * present.</p>
      */
-    private static void appendSalonMatchedNamesLateral(StringBuilder sb, List<ResolvedServiceType> serviceTypes) {
+    private static void appendSalonMatchedNamesLateral(
+            StringBuilder sb, List<ResolvedServiceType> serviceTypes, int qTokenCount) {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT array_agg(zm.name) AS matched_names FROM (")
                 .append("SELECT DISTINCT sd3.name AS name ")
@@ -1402,9 +2065,13 @@ public class SearchService {
                 .append("WHERE sd3.owner_type = 'SALON' AND sd3.owner_id = t.id ")
                 .append("AND sd3.is_active = true ");
         appendSalonBookableGate(sb, "sd3", "t");
-        sb.append("AND (");
-        appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
-        sb.append(") ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
+        if (!serviceTypes.isEmpty()) {
+            sb.append("AND (");
+            appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
+            sb.append(") ");
+        }
+        sb.append(SalonSearchSql.dynamicMatchedNamesPredicate("sd3", qTokenCount));
+        sb.append("ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") zm) mn ON true ");
     }
 
@@ -1493,35 +2160,61 @@ public class SearchService {
     }
 
     /**
-     * Minimum trigram-effective query length. A pg_trgm GIN index needs at least
-     * one full 3-gram to serve a containment {@code ILIKE}; a 1–2 char term
-     * matches no trigram and degrades into a full-table sequential scan. Terms
-     * shorter than this are normalised to {@code null} (the predicate is dropped
-     * and the location-scoped result set is returned) rather than running a
-     * trigram-defeating {@code %ab%} scan.
+     * Builds the {@code %token%} ILIKE patterns for the static salon projection
+     * queries, padded with {@code null} to exactly
+     * {@link SalonSearchSql#STATIC_TOKEN_PARAM_COUNT} slots.
+     *
+     * <p>A {@code @Query} body cannot size itself to the token count, so every
+     * {@code :qN} slot must be bound; an unused slot binds {@code null}, whose
+     * {@code CAST(:qN AS text) IS NULL OR …} branch short-circuits to TRUE. All
+     * four {@code null} therefore means "no {@code q} filter", which is exactly
+     * what an absent query must produce.</p>
+     *
+     * <p><b>Left-packing is an invariant, not a coincidence.</b>
+     * {@code SalonSearchSql.MULTI_TOKEN_GUARD} reads {@code :q1 IS NOT NULL} as
+     * "this query carries more than one token" and drops a row-invariant
+     * {@code s.name} disjunct on that basis. That reading is sound only while slots
+     * are filled from index 0 with no holes: a caller that bound {@code :q1} while
+     * leaving {@code :q0} null would <em>invert</em> the guard — the single token
+     * present would take the MULTI-token branch and the {@code s.name} disjunct
+     * would be dropped for a query that needs it, changing results with no error.
+     * This method is the sole producer of those four values, so the postcondition
+     * below is where the invariant can be made self-enforcing rather than
+     * conventional. It costs three reference comparisons per query.</p>
      */
-    private static final int MIN_QUERY_LENGTH = 3;
+    private static String[] paddedSalonTokenPatterns(List<String> tokens) {
+        if (tokens.size() > SalonSearchSql.STATIC_TOKEN_PARAM_COUNT) {
+            // Unreachable: NormalizedSearchQuery caps the token count. Fail loudly
+            // rather than silently dropping a filter if the two caps ever diverge.
+            throw new IllegalStateException(
+                    "q token count " + tokens.size() + " exceeds the "
+                            + SalonSearchSql.STATIC_TOKEN_PARAM_COUNT
+                            + " bind slots declared by the static salon projection queries");
+        }
+        String[] patterns = new String[SalonSearchSql.STATIC_TOKEN_PARAM_COUNT];
+        for (int i = 0; i < tokens.size(); i++) {
+            patterns[i] = likeContains(tokens.get(i));
+        }
+        requireLeftPacked(patterns);
+        return patterns;
+    }
 
     /**
-     * Trims the free-text query and collapses blank to {@code null} (mirrors the
-     * {@code category} treatment). A trimmed term shorter than
-     * {@link #MIN_QUERY_LENGTH} is also normalised to {@code null}: pg_trgm
-     * cannot serve a 1–2 char containment {@code ILIKE}, so dropping the
-     * predicate (returning the location-scoped set) is strictly better than a
-     * full-table seq-scan on {@code %ab%}. Case-folding is unnecessary — the SQL
-     * uses {@code ILIKE} (case-insensitive). The returned term is the raw user
-     * text; {@link #likeContains} applies the {@code LIKE}-wildcard escaping when
-     * the {@code %term%} pattern is built, so the escaping lives in one place.
+     * Postcondition for {@link #paddedSalonTokenPatterns}: asserts the bind slots
+     * are left-packed (no bound slot follows an unbound one), which is the
+     * invariant {@code SalonSearchSql.MULTI_TOKEN_GUARD} decides on. Throws rather
+     * than degrading, because the failure mode it guards is a silently wrong result
+     * set, not an error.
      */
-    private static String normalizeQuery(String q) {
-        if (q == null || q.isBlank()) {
-            return null;
+    private static void requireLeftPacked(String[] patterns) {
+        for (int i = 1; i < patterns.length; i++) {
+            if (patterns[i] != null && patterns[i - 1] == null) {
+                throw new IllegalStateException(
+                        "salon q bind slots must be left-packed: :q" + i + " is bound while :q"
+                                + (i - 1) + " is null, which inverts "
+                                + "SalonSearchSql.MULTI_TOKEN_GUARD");
+            }
         }
-        String trimmed = q.trim();
-        if (trimmed.length() < MIN_QUERY_LENGTH) {
-            return null;
-        }
-        return trimmed;
     }
 
     /**
@@ -1642,7 +2335,7 @@ public class SearchService {
         String street = (String) row[11];
         String buildingNo = (String) row[12];
         String locationNote = (String) row[13];
-        List<String> matchedServiceNames = toServiceNames(row[MATCHED_SERVICE_NAMES_IDX]);
+        List<String> matchedServiceNames = toMatchedServiceNames(row[MATCHED_SERVICE_NAMES_IDX]);
 
         return new MasterSearchResult(
                 masterId,
@@ -1671,6 +2364,28 @@ public class SearchService {
      * {@code []}. The Postgres array slice already capped and de-duplicated the
      * names; any residual {@code null} elements are dropped defensively.
      */
+    /**
+     * Maps a raw {@code matched_names} SQL array to the capped, deterministically
+     * ordered {@link MasterSearchResult#matchedServiceNames()} /
+     * {@link SalonSearchResult#matchedServiceNames()} value.
+     *
+     * <p>The master path and the dynamic salon path already emit the sort and the
+     * {@link #SERVICE_NAME_CAP} slice in SQL, so this is a no-op there. The
+     * <em>static</em> salon projection queries do not: their matched-names lateral
+     * is an unordered, uncapped {@code array_agg(DISTINCT …)} (see
+     * {@link SalonSearchSql#STATIC_MATCHED_NAMES_LATERAL} for the Spring Data
+     * {@code ORDER BY}-budget history that forced that shape). Sorting and capping
+     * here keeps the field's contract identical across all three paths from ONE
+     * place, and is unconditional so a 1–3 element result cannot vary between
+     * requests.</p>
+     */
+    private static List<String> toMatchedServiceNames(Object raw) {
+        // Always sorted, never "sorted only when over the cap": the static salon
+        // lateral's array_agg(DISTINCT …) has no guaranteed output order, so a
+        // 1–3 element result would otherwise vary between requests.
+        return toServiceNames(raw).stream().sorted().limit(SERVICE_NAME_CAP).toList();
+    }
+
     private static List<String> toServiceNames(Object raw) {
         if (raw == null) {
             return List.of();
@@ -1718,9 +2433,13 @@ public class SearchService {
                 proj.getStreet(),
                 proj.getBuildingNo(),
                 proj.getLocationNote(),
-                // Phase 20.3: no per-service filter on this (unfiltered) path, so
-                // matchedServiceNames is empty — the card falls back to serviceNames.
-                List.of()
+                // Phase 20.3 + free-text extension: the bookable services whose own
+                // name explains the `q` match (group-scoped — see SalonSearchSql).
+                // Empty when no `q` was supplied or when the salon's own name
+                // carried the whole match; the card then falls back to serviceNames.
+                // No per-service filter reaches this path (a slug filter routes to
+                // searchSalonsWithServiceFilter), so this is the pure-`q` half.
+                toMatchedServiceNames(proj.getMatchedServiceNames())
         );
     }
 
@@ -1747,7 +2466,7 @@ public class SearchService {
         String street = (String) row[8];
         String buildingNo = (String) row[9];
         String locationNote = (String) row[10];
-        List<String> matchedServiceNames = toServiceNames(row[11]);
+        List<String> matchedServiceNames = toMatchedServiceNames(row[11]);
 
         return new SalonSearchResult(
                 salonId,

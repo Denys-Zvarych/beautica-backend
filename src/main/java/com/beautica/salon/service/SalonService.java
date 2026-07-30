@@ -21,6 +21,7 @@ import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.search.service.SearchCacheNames;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -155,7 +156,13 @@ public class SalonService {
     }
 
     /**
-     * Evicts the entire {@code search:salons} cache after commit.
+     * Evicts <b>both halves</b> of the salon discovery cache after commit —
+     * {@code search:salons:browse} and {@code search:salons:q}.
+     *
+     * <p>Iterates {@link SearchCacheNames#SALONS_ALL} rather than naming the caches
+     * inline: the population split (browse vs free-text) is a caching-layer concern
+     * and clearing only one half would leave the deactivated salon reachable through
+     * the other, which no test on this path would notice.</p>
      *
      * <p>Blanket eviction (not per-key) is intentional: search results are a filtered subset of
      * all active salons. When a salon is deactivated the cached page may contain it, and the only
@@ -170,9 +177,11 @@ public class SalonService {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                Cache cache = cacheManager.getCache("search:salons");
-                if (cache != null) {
-                    cache.clear();
+                for (String cacheName : SearchCacheNames.SALONS_ALL) {
+                    Cache cache = cacheManager.getCache(cacheName);
+                    if (cache != null) {
+                        cache.clear();
+                    }
                 }
             }
         });

@@ -50,10 +50,17 @@ import java.util.Objects;
  *       {@link MasterSearchRequest#category()}) rather than the
  *       {@code ServiceCategory} enum — enum binding fails with an opaque 400
  *       that leaks the full enum surface.</li>
- *   <li>{@code q} — free-text query matched case-insensitively
- *       ({@code ILIKE %term%}) against the salon name. Same cap / control-char
- *       {@code @Pattern} as {@code category}; the service escapes the
- *       {@code LIKE} wildcards in the term. Optional.</li>
+ *   <li>{@code q} — free-text query, whitespace-tokenised and matched
+ *       case-insensitively ({@code ILIKE %token%}) against the salon name and
+ *       the names of the salon's <em>bookable</em> services (an owned service
+ *       an active master actually performs). Every token must match one of
+ *       those, so word order does not matter. Capped at 100 chars; the
+ *       {@code @Pattern} bans control characters only (the {@code < > " '} ban
+ *       rejected Ukrainian apostrophe names — see
+ *       {@link MasterSearchRequest#q()}). The service escapes the {@code LIKE}
+ *       wildcards in each token. Optional; a term whose longest token is under
+ *       3 characters returns an explicit empty page plus a helper
+ *       {@code message} rather than silently dropping the filter.</li>
  *   <li>{@code sort} — allow-listed ordering; see {@link SearchSort}. Bound to
  *       an enum so caller text never reaches the {@code ORDER BY}. Salons have
  *       no per-row price/review column to sort by cheaply, so {@code PRICE_*}
@@ -91,13 +98,26 @@ public record SalonSearchRequest(
         @Valid
         LocationFilter location,
 
+        // Control characters ONLY — the `< > " '` ban was removed because it
+        // rejected every Ukrainian apostrophe name (В'ячеслав, Мар'яна) with a
+        // 400 while buying nothing: q is bound as a JDBC parameter (:q0…:q3),
+        // never interpolated into SQL, and never reflected into HTML.
+        // Mirrors MasterSearchRequest#q — see its Javadoc for the full rationale.
+        // Unicode categories, not the ASCII-only \p{Cntrl} — see the identical
+        // comment on MasterSearchRequest#q for the full reasoning (U+0085, C1,
+        // U+200B, U+2028/9 and U+202E used to pass; \p{C} would over-reject Cn).
         @Size(max = 100, message = "q must be at most 100 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
-                 message = "q must not contain control characters or HTML special characters")
+        @Pattern(regexp = "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]*$",
+                 message = "q must not contain control characters")
         String q,
 
+        // Unicode categories, not the ASCII-only \p{Cntrl} — mirrors
+        // MasterSearchRequest#category, see its comment for the full reasoning
+        // (U+0085, C1, U+200B, U+2028/9 and U+202E used to pass). The `< > " '` ban
+        // is deliberately RETAINED here (unlike on q): category is a fixed
+        // vocabulary, so this pattern is strictly stricter than q's.
         @Size(max = 100, message = "category must be at most 100 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+        @Pattern(regexp = "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}<>\"']*$",
                  message = "category must not contain control characters or HTML special characters")
         String category,
 
@@ -112,11 +132,11 @@ public record SalonSearchRequest(
         BigDecimal maxPrice,
 
         @PositiveOrZero(message = "page must be zero or positive")
-        @Max(value = 500, message = "page must be at most 500")
+        @Max(value = SearchResultWindow.MAX_PAGE_INDEX, message = "page must be at most 500")
         Integer page,
 
         @Positive(message = "size must be a positive number")
-        @Max(value = 100, message = "size must be at most 100")
+        @Max(value = SearchResultWindow.MAX_PAGE_SIZE, message = "size must be at most 100")
         Integer size,
 
         @Size(max = 20, message = "serviceTypeSlugs must contain at most 20 entries")
@@ -125,7 +145,7 @@ public record SalonSearchRequest(
                 @Pattern(regexp = "^[a-z0-9]+(?:-[a-z0-9]+)*$",
                          message = "each serviceTypeSlug must be a lowercase hyphenated slug")
                 String> serviceTypeSlugs
-) {
+) implements FreeTextSearchRequest {
 
     /**
      * Compact constructor — normalizes the scale of both {@code @Digits}-bound
@@ -166,6 +186,19 @@ public record SalonSearchRequest(
             return true;
         }
         return minPrice.compareTo(maxPrice) <= 0;
+    }
+
+    /**
+     * Reachable-result-window guard mirroring
+     * {@link MasterSearchRequest#isWithinResultWindow()} — {@code page * size + size}
+     * must not exceed {@link SearchResultWindow#MAX_RESULT_WINDOW} (10 000 rows). This
+     * path is the more expensive of the two (the salon {@code q} EXISTS is correlated),
+     * so the window matters more here. See {@link SearchResultWindow}.
+     */
+    @AssertTrue(message = "page and size together request results beyond the 10000-result window "
+            + "(page * size + size must not exceed 10000); narrow your filters or request a lower page")
+    public boolean isWithinResultWindow() {
+        return SearchResultWindow.isWithinWindow(page, size);
     }
 
     /**

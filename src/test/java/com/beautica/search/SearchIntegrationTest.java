@@ -200,6 +200,67 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("GET /search/masters — an out-of-range page reports the TRUE total, not 0")
+    void should_reportTrueTotal_when_masterPageIsPastTheEnd() throws Exception {
+        ensureHttpClient();
+        for (int i = 0; i < 7; i++) {
+            seedMasterWithCity("Київ", "4.00");
+        }
+
+        // Single-query pagination reads totalElements off COUNT(*) OVER() on the
+        // first returned row; with zero rows there is no row to read it from, so the
+        // service falls back to a first-page probe. Without that probe this reports 0
+        // and the client is told "no results" for a query matching 7 providers.
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=9&size=3",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size()).isZero();
+        assertThat(data.path("totalElements").asLong())
+                .as("out-of-range page must still report the true match count")
+                .isEqualTo(7L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — an out-of-range page reports the TRUE total, not 0")
+    void should_reportTrueTotal_when_salonPageIsPastTheEnd() throws Exception {
+        ensureHttpClient();
+        for (int i = 0; i < 3; i++) {
+            seedActiveSalon("Київ", null);
+        }
+
+        // Static (unfiltered) salon path — same single-query pagination trade as the
+        // master path above, same first-page probe fallback.
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=9&size=2",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("data").size()).isZero();
+        assertThat(data.path("totalElements").asLong())
+                .as("out-of-range page must still report the true match count")
+                .isEqualTo(3L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — a genuinely empty FIRST page still reports 0 (no probe)")
+    void should_reportZeroTotal_when_firstPageGenuinelyMatchesNothing() throws Exception {
+        ensureHttpClient();
+        seedMasterWithCity("Київ", "4.00");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityIdByName("Одеса") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong()).isZero();
+    }
+
+    @Test
     @DisplayName("GET /search/masters — empty content when city has no masters")
     void should_returnEmptyList_when_noCityMatch() throws Exception {
         ensureHttpClient();
@@ -593,11 +654,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     // ── Phase 6.5 — caching ──────────────────────────────────────────────────
 
     @Test
-    @DisplayName("GET /search/masters — first 5 pages populate the search:masters cache")
+    @DisplayName("GET /search/masters — first 5 pages populate the search:masters:browse cache")
     void should_populateCache_when_firstPagesQueried() {
         ensureHttpClient();
-        Cache cache = cacheManager.getCache("search:masters");
-        assertThat(cache).as("search:masters cache must be registered").isNotNull();
+        Cache cache = cacheManager.getCache("search:masters:browse");
+        assertThat(cache).as("search:masters:browse cache must be registered").isNotNull();
         cache.clear();
 
         seedMasterWithCity("Київ", "4.00");
@@ -610,7 +671,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         long cachedEntries = countNativeEntries(cache);
         assertThat(cachedEntries)
-                .as("first call must populate exactly one entry in search:masters")
+                .as("first call must populate exactly one entry in search:masters:browse")
                 .isEqualTo(1L);
     }
 
@@ -620,7 +681,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         ensureHttpClient();
         seedMasterWithCity("Київ", "4.00");
 
-        Cache cache = cacheManager.getCache("search:masters");
+        Cache cache = cacheManager.getCache("search:masters:browse");
         assertThat(cache).isNotNull();
         cache.clear();
         long before = countNativeEntries(cache);
@@ -688,8 +749,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters — second identical call hits cache without growing entry count")
     void should_returnCachedResultWithoutHittingDb_when_secondIdenticalCall() throws Exception {
         ensureHttpClient();
-        Cache cache = cacheManager.getCache("search:masters");
-        assertThat(cache).as("search:masters cache must be registered").isNotNull();
+        Cache cache = cacheManager.getCache("search:masters:browse");
+        assertThat(cache).as("search:masters:browse cache must be registered").isNotNull();
         cache.clear();
 
         seedMasterWithCity("Київ", "4.00");
@@ -720,8 +781,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters — distinct cache keys produced when requests differ by a single filter")
     void should_useDistinctCacheKeys_when_requestsDifferByOnlyOneFilter() {
         ensureHttpClient();
-        Cache cache = cacheManager.getCache("search:masters");
-        assertThat(cache).as("search:masters cache must be registered").isNotNull();
+        Cache cache = cacheManager.getCache("search:masters:browse");
+        assertThat(cache).as("search:masters:browse cache must be registered").isNotNull();
         cache.clear();
 
         seedMasterWithCity("Київ", "4.00");
@@ -811,11 +872,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — first 5 pages populate the search:salons cache")
+    @DisplayName("GET /search/salons — first 5 pages populate the search:salons:browse cache")
     void should_populateSalonCache_when_firstPagesQueried() {
         ensureHttpClient();
-        Cache cache = cacheManager.getCache("search:salons");
-        assertThat(cache).as("search:salons cache must be registered").isNotNull();
+        Cache cache = cacheManager.getCache("search:salons:browse");
+        assertThat(cache).as("search:salons:browse cache must be registered").isNotNull();
         cache.clear();
 
         seedActiveSalon("Київ", null);
@@ -831,11 +892,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — page index >= 5 skips the search:salons cache")
+    @DisplayName("GET /search/salons — page index >= 5 skips the search:salons:browse cache")
     void should_skipSalonCache_when_pageIndexIsAtOrAboveFive() {
         ensureHttpClient();
-        Cache cache = cacheManager.getCache("search:salons");
-        assertThat(cache).as("search:salons cache must be registered").isNotNull();
+        Cache cache = cacheManager.getCache("search:salons:browse");
+        assertThat(cache).as("search:salons:browse cache must be registered").isNotNull();
         cache.clear();
 
         seedActiveSalon("Київ", null);
@@ -2103,25 +2164,56 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(cheap.toString());
     }
 
-    // ── QA additions — short ?q normalize-to-null (coordinate with perf fix) ──
+    // ── short ?q → explicit empty page + helper message (defect B) ────────────
+    //
+    // BEHAVIOUR REVERSAL (locked product decision). This test used to assert that
+    // a 1-2 char ?q "normalises to null and returns the full location-scoped
+    // result set". That was the defect: ?q=Ру returned all 602 masters, i.e. a
+    // DROPPED filter masquerading as "no filter". The 3-char floor stays (a 1-2
+    // char term matches no pg_trgm 3-gram and seq-scans a permitAll endpoint) but
+    // it is now HONEST — an explicit empty page plus a helper message the mobile
+    // client renders. Do not restore the old expectation.
 
     @Test
-    @DisplayName("GET /search/masters — a 1-2 char ?q normalises to null and returns the full location-scoped result set (not an ILIKE on the short term)")
-    void should_normalizeShortQToNull_andReturnLocationScopedResults() throws Exception {
+    @DisplayName("GET /search/masters — a 1-2 char ?q returns an EXPLICIT empty page + the Ukrainian helper message, never the unfiltered location-scoped set")
+    void should_returnEmptyPageWithHelperMessage_when_qBelowMinimumLength() throws Exception {
         ensureHttpClient();
-        // Master in Київ whose name does NOT contain the short term "zz".
-        UUID inKyiv = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
+        // Master in Київ whose name does NOT contain the short term "zz". Under the
+        // old normalize-to-null behaviour this row leaked into the response.
+        seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
 
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&q=zz&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(response.getStatusCode())
+                .as("a short query is a UX affordance, not malformed input — 200, not 400")
+                .isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.path("message").asText())
+                .as("frozen wire contract — the mobile client renders this string verbatim")
+                .isEqualTo("Введіть щонайменше 3 символи");
+        JsonNode data = body.path("data");
         assertThat(data.path("totalElements").asLong())
-                .as("short q is normalised to null → the city-scoped master is returned despite its name not containing 'zz'")
-                .isEqualTo(1L);
-        assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(inKyiv.toString());
+                .as("the dropped filter must NOT masquerade as 'no filter' — nothing is returned")
+                .isEqualTo(0L);
+        assertThat(data.path("data")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons — a 1-2 char ?q returns the same explicit empty page + helper message (both endpoints share the contract)")
+    void should_returnEmptyPageWithHelperMessage_when_salonQBelowMinimumLength() throws Exception {
+        ensureHttpClient();
+        seedActiveSalon("Київ", null);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&q=zz&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.path("message").asText()).isEqualTo("Введіть щонайменше 3 символи");
+        assertThat(body.path("data").path("totalElements").asLong()).isEqualTo(0L);
     }
 
     // ── Phase 20.1 — master per-service filter (FK-only, OR/union) ──────────
@@ -2296,10 +2388,15 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .doesNotHaveDuplicates()
                 .isSubsetOf("Догляд Альфа", "Догляд Бета", "Догляд Гамма", "Догляд Дельта");
 
-        // No serviceTypeSlugs → matchedServiceNames empty (card falls back to serviceNames).
+        // Neither serviceTypeSlugs NOR q → matchedServiceNames empty (card falls back
+        // to serviceNames). Scope note: a free-text `q` ALSO populates this field (see
+        // should_populateMatchedServiceNames_when_masterQMatchesServiceName), so this
+        // request must omit BOTH filters — it is not the "no serviceTypeSlugs" case
+        // alone, and the assertion below deliberately does not claim to be.
         JsonNode unfiltered = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
         assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
-                .as("matchedServiceNames is empty when no service filter is active")
+                .as("matchedServiceNames is empty when NO explaining filter is active — neither a "
+                        + "serviceTypeSlugs filter nor a free-text q")
                 .isZero();
     }
 
@@ -2663,9 +2760,13 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .as("matched names span BOTH masters of the salon, distinct and capped at 3")
                 .containsExactlyInAnyOrder("Догляд М1", "Догляд М2");
 
+        // Scope note: a free-text `q` ALSO populates this field on the salon side (see
+        // should_populateSalonMatchedServiceNames_when_qMatchesServiceName), so this
+        // request must omit BOTH the slug filter and `q`.
         JsonNode unfiltered = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
         assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
-                .as("matchedServiceNames is empty when no service filter is active")
+                .as("matchedServiceNames is empty when NO explaining filter is active — neither a "
+                        + "serviceTypeSlugs filter nor a free-text q")
                 .isZero();
     }
 
@@ -3150,7 +3251,693 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .doesNotContain("Кератин недоступний");
     }
 
+    // ── master-side owner gate — a cross-owner assignment must not make a master
+    //    discoverable (appendMasterOwnedServiceGate: owner_type AND owner_id) ──────
+    //
+    // Every OTHER fixture in this class passes masterId == ownerId when seeding a
+    // service definition, so no other test can ever build the owner/assignment
+    // MISMATCH this gate exists to reject — deleting `AND sd.owner_id = ms.master_id`
+    // left the whole suite green. These four tests are the master-side mirror of the
+    // salon rotated-master tests above (should_excludeRotatedMasterSalon_*).
+
+    @Test
+    @DisplayName("GET /search/masters?q=… (SINGLE token) — an ACTIVE cross-owner assignment to a SALON-owned definition must NOT make an independent master discoverable by that definition's name")
+    void should_notDiscoverIndependentMaster_when_singleTokenQMatchesSalonOwnedDefViaStaleAssignment()
+            throws Exception {
+        ensureHttpClient();
+
+        // The master owns its OWN active service, so it is genuinely searchable —
+        // without this an empty result would be vacuous (a serviceless master is
+        // absent for unrelated reasons).
+        UUID masterId = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Стальна");
+        seedNamedServiceForMaster(masterId, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
+
+        // A SALON owns this definition; the independent master keeps an ACTIVE
+        // master_services row pointing at it — the stale assignment left behind by a
+        // master who moved between a salon and solo practice.
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID salonDefId = seedTypedSalonOwnedDef(salonId, "Ексклюзивсалон догляд", "HAIRCUT",
+                "FIXED", new BigDecimal("900.00"), null, null, true);
+        linkMasterToOwnedDef(masterId, salonDefId, null, true);
+
+        // SINGLE token is the path with NO second gate: appendQPredicate returns
+        // before emitting the exact group predicate, so the pre-filter's owner gate
+        // is the ONLY owner enforcement in the query.
+        JsonNode leaked = masterSearchRaw("?q=" + enc("Ексклюзивсалон") + "&page=0&size=20");
+
+        assertThat(masterIds(leaked))
+                .as("a SALON-owned definition reached through a stale cross-owner assignment must "
+                        + "not make an INDEPENDENT_MASTER discoverable by that definition's name")
+                .isEmpty();
+        assertThat(leaked.path("totalElements").asLong())
+                .as("totalElements must be 0, not merely an empty page")
+                .isZero();
+
+        // Discriminator: the SAME master IS reachable through a service it actually
+        // owns, so the empty page above is the owner gate — not an unsearchable fixture.
+        assertThat(masterIds(masterSearchRaw("?q=" + enc("Педикюр") + "&page=0&size=20")))
+                .as("control — the master is discoverable through its OWN service name")
+                .containsExactly(masterId.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… (SINGLE token) — an ACTIVE assignment to ANOTHER independent master's definition must NOT make this master discoverable (owner_type alone is not enough)")
+    void should_notDiscoverIndependentMaster_when_singleTokenQMatchesAnotherMastersOwnedDef()
+            throws Exception {
+        ensureHttpClient();
+
+        UUID borrower = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Стальна");
+        seedNamedServiceForMaster(borrower, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
+
+        // owner_type is 'INDEPENDENT_MASTER' here, so the owner_TYPE half of the gate
+        // passes for BOTH masters. Only the owner_ID half (sd.owner_id = ms.master_id)
+        // can tell them apart — this is precisely the case a gate that checks
+        // owner_type alone would leak.
+        UUID owner = seedNamedIndependentMaster("Київ", "4.00", "Олег", "Власник");
+        UUID ownedByOwner = seedIndependentOwnedDefNoLink(
+                owner, "Унікальнечуже плетіння", "HAIRCUT", new BigDecimal("700.00"));
+
+        // The two masters carry an IDENTICAL active assignment to the SAME definition.
+        // Ownership is the only difference between them, so the assertion below isolates
+        // the owner_id half of the gate and nothing else.
+        linkMasterToOwnedDef(owner, ownedByOwner, null, true);
+        linkMasterToOwnedDef(borrower, ownedByOwner, null, true);
+
+        JsonNode data = masterSearchRaw("?q=" + enc("Унікальнечуже") + "&page=0&size=20");
+
+        assertThat(masterIds(data))
+                .as("both masters have an active assignment to this definition and both are "
+                        + "INDEPENDENT_MASTER, so only owner_id can exclude the borrower — the "
+                        + "OWNING master alone may be discovered by its definition's name")
+                .containsExactly(owner.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… (MULTI token) — the exact group predicate's owner gate must reject a cross-owner definition that alone satisfies every token")
+    void should_notDiscoverIndependentMaster_when_multiTokenQIsSatisfiedOnlyByCrossOwnerDef()
+            throws Exception {
+        ensureHttpClient();
+
+        // This fixture is built so the index-servable PRE-FILTER admits the master on
+        // its own services (each token is individually carried by one of them), and
+        // ONLY the exact group predicate can reject it. That isolates the group
+        // predicate's owner gate (appendMasterOwnedServiceGate on alias sdg) — the
+        // single-token tests above cannot reach it, because the short-circuit returns
+        // before it is emitted.
+        UUID masterId = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Ковальська");
+        seedNamedServiceForMaster(masterId, "Ботокс вій", "LASHES", new BigDecimal("500.00"));
+        seedNamedServiceForMaster(masterId, "Щастя для волосся", "HAIRCUT", new BigDecimal("600.00"));
+
+        // A SALON-owned definition that single-handedly satisfies all three tokens,
+        // reached only through a stale active assignment.
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID salonDefId = seedTypedSalonOwnedDef(salonId, "Ботокс для волосся", "HAIRCUT",
+                "FIXED", new BigDecimal("800.00"), null, null, true);
+        linkMasterToOwnedDef(masterId, salonDefId, null, true);
+
+        JsonNode data = masterSearchRaw("?q=" + enc("Ботокс для волосся") + "&page=0&size=20");
+
+        assertThat(masterIds(data))
+                .as("no OWNED service of this master carries all three tokens; the cross-owner "
+                        + "definition that does must be excluded by the group predicate's owner gate")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters (unfiltered) — serviceNames must not print a cross-owner definition's name on an independent master's card")
+    void should_notLeakCrossOwnerServiceName_inMasterServiceNamesPreview() throws Exception {
+        ensureHttpClient();
+
+        UUID masterId = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Стальна");
+        seedNamedServiceForMaster(masterId, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
+
+        UUID salonId = seedActiveSalon("Київ", null);
+        UUID salonDefId = seedTypedSalonOwnedDef(salonId, "Ексклюзивсалон догляд", "HAIRCUT",
+                "FIXED", new BigDecimal("900.00"), null, null, true);
+        linkMasterToOwnedDef(masterId, salonDefId, null, true);
+
+        JsonNode data = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        JsonNode row = data.path("data").get(0);
+
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("serviceNames").forEach(n -> names.add(n.asText()));
+
+        assertThat(row.path("masterId").asText()).isEqualTo(masterId.toString());
+        assertThat(names)
+                .as("the serviceNames lateral carries the same owner gate — a salon's service "
+                        + "name must never print on an independent master's public card")
+                .containsExactly("Педикюр класичний");
+    }
+
+    // ── group-scoped multi-token semantics ────────────────────────────────────────
+    //
+    // Before these tests EVERY `?q=` in the whole test tree was single-token, so
+    // group-scoped vs per-token semantics were indistinguishable by construction.
+    // The locked demo-dataset counts («Ботокс для волосся» → 56 masters, not 67)
+    // are NOT reproducible here — the ITs seed their own data (see the report note)
+    // — so the SEMANTICS are pinned directly instead, on hand-built fixtures that
+    // reproduce the exact false-positive shape those counts measured.
+
+    @Test
+    @DisplayName("GET /search/masters?q=… — tokens satisfied by TWO DIFFERENT services of one master must NOT match (group-scoped precision fix)")
+    void should_notMatchMaster_when_tokensAreSpreadAcrossTwoDifferentServices() throws Exception {
+        ensureHttpClient();
+
+        // The false positive the group-scoped rewrite removed: «Ботокс вій» carries
+        // "Ботокс", «Щастя для волосся» carries "для"+"волосся", so the OLD per-token
+        // predicate matched this master although it does not offer the service asked for.
+        UUID falsePositive = seedNamedIndependentMaster("Київ", "4.90", "Ольга", "Хибна");
+        seedNamedServiceForMaster(falsePositive, "Ботокс вій", "LASHES", new BigDecimal("500.00"));
+        seedNamedServiceForMaster(falsePositive, "Щастя для волосся", "HAIRCUT", new BigDecimal("600.00"));
+
+        // The true positive: ONE service carries every token.
+        UUID truePositive = seedNamedIndependentMaster("Київ", "4.10", "Ніна", "Справжня");
+        seedNamedServiceForMaster(truePositive, "Ботокс для волосся", "HAIRCUT", new BigDecimal("700.00"));
+
+        JsonNode data = masterSearchRaw("?q=" + enc("Ботокс для волосся") + "&page=0&size=20");
+
+        assertThat(masterIds(data))
+                .as("all tokens must be carried by ONE single service (or the name columns) — a "
+                        + "master whose tokens are spread across two services is a false positive")
+                .containsExactly(truePositive.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… — two tokens spanning the NAME column and an offered SERVICE name match, and narrow the result vs either token alone")
+    void should_matchAndNarrow_when_twoTokensSpanNameAndServiceName() throws Exception {
+        ensureHttpClient();
+
+        // Both masters are called «Олена»; only one offers a manicure.
+        UUID manicurist = seedNamedIndependentMaster("Київ", "4.80", "Олена", "Мороз");
+        seedNamedServiceForMaster(manicurist, "Манікюр гелевий", "MANICURE", new BigDecimal("450.00"));
+        UUID pedicurist = seedNamedIndependentMaster("Київ", "4.70", "Олена", "Бойко");
+        seedNamedServiceForMaster(pedicurist, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
+
+        JsonNode nameOnly = masterSearchRaw("?q=" + enc("Олена") + "&page=0&size=20");
+        assertThat(masterIds(nameOnly))
+                .as("one token by first name alone matches BOTH masters")
+                .containsExactlyInAnyOrder(manicurist.toString(), pedicurist.toString());
+
+        JsonNode mixed = masterSearchRaw("?q=" + enc("Олена манікюр") + "&page=0&size=20");
+        assertThat(masterIds(mixed))
+                .as("adding a service token NARROWS the set — the name token is satisfied by "
+                        + "first_name and the service token by that one service (mixed query)")
+                .containsExactly(manicurist.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… — two tokens both in NAME columns match the one master carrying both; single-token decoys are excluded")
+    void should_matchOnlyMasterCarryingBothNameTokens_when_fullNameQueried() throws Exception {
+        ensureHttpClient();
+
+        UUID target = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
+        // Decoys: each carries exactly ONE of the two tokens. Under group-scoped ANDed
+        // token semantics neither may match.
+        seedNamedIndependentMaster("Київ", "4.80", "Вікторія", "Панченко");
+        seedNamedIndependentMaster("Київ", "4.70", "Олег", "Руденко");
+
+        JsonNode data = masterSearchRaw("?q=" + enc("Вікторія Руденко") + "&page=0&size=20");
+
+        assertThat(masterIds(data))
+                .as("every token must match — first_name OR last_name per token, ANDed across "
+                        + "tokens; a master carrying only one token is not a match")
+                .containsExactly(target.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… — reversing token ORDER and flipping CASE returns the identical row set")
+    void should_returnIdenticalRows_when_tokenOrderReversedAndCaseFlipped() throws Exception {
+        ensureHttpClient();
+
+        UUID target = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
+        seedNamedIndependentMaster("Київ", "4.80", "Вікторія", "Панченко");
+
+        java.util.List<String> natural =
+                masterIds(masterSearchRaw("?q=" + enc("Вікторія Руденко") + "&page=0&size=20"));
+        java.util.List<String> reversed =
+                masterIds(masterSearchRaw("?q=" + enc("Руденко Вікторія") + "&page=0&size=20"));
+        java.util.List<String> caseFlipped =
+                masterIds(masterSearchRaw("?q=" + enc("руденко ВІКТОРІЯ") + "&page=0&size=20"));
+
+        assertThat(natural).as("baseline").containsExactly(target.toString());
+        assertThat(reversed)
+                .as("tokens are ANDed, so word order is irrelevant")
+                .isEqualTo(natural);
+        assertThat(caseFlipped)
+                .as("ILIKE is case-insensitive for Cyrillic in both directions")
+                .isEqualTo(natural);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… — beyond MAX_TOKENS=4 the extra tokens are DROPPED, which can only widen the match, never wrongly empty it")
+    void should_dropTokensBeyondCap_when_queryCarriesMoreThanFourTokens() throws Exception {
+        ensureHttpClient();
+
+        // The master satisfies the first FOUR tokens only. A 5th token it cannot
+        // satisfy must be discarded by the MAX_TOKENS cap rather than emptying the page.
+        UUID target = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
+        seedNamedServiceForMaster(target, "Ботокс для волосся", "HAIRCUT", new BigDecimal("700.00"));
+
+        java.util.List<String> fourTokens = masterIds(
+                masterSearchRaw("?q=" + enc("Вікторія Руденко Вікторія Руденко") + "&page=0&size=20"));
+        java.util.List<String> sixTokens = masterIds(masterSearchRaw(
+                "?q=" + enc("Вікторія Руденко Вікторія Руденко НЕМАЄТАКОГО ТАКОЖНЕМАЄ")
+                        + "&page=0&size=20"));
+
+        assertThat(fourTokens)
+                .as("the four retained tokens are all satisfied by the name columns")
+                .containsExactly(target.toString());
+        assertThat(sixTokens)
+                .as("tokens past the MAX_TOKENS=4 cap are dropped, so the unsatisfiable 5th/6th "
+                        + "terms widen rather than empty the result — identical to the 4-token page")
+                .isEqualTo(fourTokens);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… — the curly apostrophe U+2019 is folded onto U+0027, so both keyboard forms match the same row")
+    void should_matchSameRow_when_apostropheIsStraightOrCurly() throws Exception {
+        ensureHttpClient();
+
+        // Stored names use the straight U+0027 (write-side normalisation).
+        UUID target = seedNamedIndependentMaster("Київ", "4.90", "В'ячеслав", "Мар'яненко");
+        seedNamedIndependentMaster("Київ", "4.80", "Олег", "Безапострофа");
+
+        java.util.List<String> straight =
+                masterIds(masterSearchRaw("?q=" + enc("В'ячеслав") + "&page=0&size=20"));
+        java.util.List<String> curly =
+                masterIds(masterSearchRaw("?q=" + enc("В’ячеслав") + "&page=0&size=20"));
+
+        assertThat(straight)
+                .as("U+0027 matches the stored straight apostrophe")
+                .containsExactly(target.toString());
+        assertThat(curly)
+                .as("U+2019 RIGHT SINGLE QUOTATION MARK (the iOS/Android default) is folded onto "
+                        + "U+0027 and must reach the identical row")
+                .isEqualTo(straight);
+    }
+
+    // ── salon `q` + `serviceTypeSlugs` COMBINED (the dynamic salon path) ──────────
+    //
+    // No test combined the two before, so SalonSearchSql.dynamicQGroupPredicate,
+    // .dynamicMatchedNamesPredicate and SearchService.appendSalonMatchedNamesLateral
+    // executed in NO test at all — the exact path that previously drifted and
+    // violated the locked "salon offering = master-performed only" rule (defect E).
+
+    @Test
+    @DisplayName("GET /search/salons?q=…&serviceTypeSlugs=… — the COMBINED filter ANDs both conditions (dynamic q group predicate)")
+    void should_applyBothFilters_when_salonQCombinedWithServiceTypeSlugs() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+
+        // Matches BOTH: bookable type-A service whose name carries the token.
+        UUID both = seedActiveSalon("Київ", null);
+        UUID bothDef = seedTypedSalonOwnedDef(both, "Кератин глибокий", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        linkMasterToOwnedDef(seedSalonMasterFor(both, "Київ", "4.00"), bothDef, null, true);
+
+        // Right slug, WRONG name → excluded by q.
+        UUID slugOnly = seedActiveSalon("Київ", null);
+        UUID slugOnlyDef = seedTypedSalonOwnedDef(slugOnly, "Ботокс волосся", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        linkMasterToOwnedDef(seedSalonMasterFor(slugOnly, "Київ", "4.00"), slugOnlyDef, null, true);
+
+        // Right name, WRONG slug → excluded by the service-type filter.
+        UUID qOnly = seedActiveSalon("Київ", null);
+        UUID qOnlyDef = seedTypedSalonOwnedDef(qOnly, "Кератин поверхневий", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdB, true);
+        linkMasterToOwnedDef(seedSalonMasterFor(qOnly, "Київ", "4.00"), qOnlyDef, null, true);
+
+        JsonNode data = salonSearchRaw(
+                "?q=" + enc("Кератин") + "&serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("the two filters are ANDed — a salon must satisfy the free text AND offer a "
+                        + "bookable service of the selected type")
+                .containsExactly(both.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?q=… — an ORPHAN salon service (no active master performs it) must be invisible on BOTH the static (q-only) and dynamic (q + slug) paths")
+    void should_hideOrphanSalonService_onBothStaticAndDynamicQPaths() throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+
+        // Active SALON-owned definition with NO active master performing it — the
+        // locked rule is that it is hidden EVERYWHERE, so it must never satisfy `q`.
+        UUID orphanSalon = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(orphanSalon, "Кератинсирота відновлення", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+
+        // Control: the SAME service name, but genuinely bookable.
+        UUID bookableSalon = seedActiveSalon("Київ", null);
+        UUID bookableDef = seedTypedSalonOwnedDef(bookableSalon, "Кератинсирота глибокий", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        linkMasterToOwnedDef(seedSalonMasterFor(bookableSalon, "Київ", "4.00"), bookableDef, null, true);
+
+        // Static path — `q` only (no slug filter → the repository projection queries).
+        assertThat(salonIds(salonSearchRaw("?q=" + enc("Кератинсирота") + "&page=0&size=20")))
+                .as("STATIC path: an orphan salon service must not make its salon findable by `q`")
+                .containsExactly(bookableSalon.toString());
+
+        // Dynamic path — `q` + slug (SearchService.buildSalonSearchSql).
+        assertThat(salonIds(salonSearchRaw(
+                "?q=" + enc("Кератинсирота") + "&serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")))
+                .as("DYNAMIC path (q + serviceTypeSlugs): the bookable-master gate must be present "
+                        + "here too — this is the drift that violated the locked rule before")
+                .containsExactly(bookableSalon.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?q=… (MULTI token) — tokens spread across TWO different bookable services of one salon must NOT match")
+    void should_notMatchSalon_when_tokensAreSpreadAcrossTwoDifferentServices() throws Exception {
+        ensureHttpClient();
+
+        UUID falsePositive = seedActiveSalon("Київ", null);
+        UUID fpMaster = seedSalonMasterFor(falsePositive, "Київ", "4.00");
+        UUID fpDefOne = seedTypedSalonOwnedDef(falsePositive, "Ботокс вій", "LASHES",
+                "FIXED", new BigDecimal("300.00"), null, null, true);
+        UUID fpDefTwo = seedTypedSalonOwnedDef(falsePositive, "Щастя для волосся", "HAIRCUT",
+                "FIXED", new BigDecimal("400.00"), null, null, true);
+        linkMasterToOwnedDef(fpMaster, fpDefOne, null, true);
+        linkMasterToOwnedDef(fpMaster, fpDefTwo, null, true);
+
+        UUID truePositive = seedActiveSalon("Київ", null);
+        UUID tpDef = seedTypedSalonOwnedDef(truePositive, "Ботокс для волосся", "HAIRCUT",
+                "FIXED", new BigDecimal("500.00"), null, null, true);
+        linkMasterToOwnedDef(seedSalonMasterFor(truePositive, "Київ", "4.00"), tpDef, null, true);
+
+        JsonNode data = salonSearchRaw("?q=" + enc("Ботокс для волосся") + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("salon-side group scoping: all tokens must be carried by the salon name or by "
+                        + "ONE single bookable service, never jointly by two")
+                .containsExactly(truePositive.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?q=… — a mixed query (one token by SALON NAME, one by a bookable service) matches")
+    void should_matchSalon_when_oneTokenByNameAndOneByService() throws Exception {
+        ensureHttpClient();
+
+        UUID salonId = seedNamedSalon("Київ", "Aura Corner");
+        UUID def = seedTypedSalonOwnedDef(salonId, "Манікюр гелевий", "MANICURE",
+                "FIXED", new BigDecimal("300.00"), null, null, true);
+        linkMasterToOwnedDef(seedSalonMasterFor(salonId, "Київ", "4.00"), def, null, true);
+
+        // Decoy carrying the service token but not the name token.
+        UUID decoy = seedNamedSalon("Київ", "Shine Bar");
+        UUID decoyDef = seedTypedSalonOwnedDef(decoy, "Манікюр класичний", "MANICURE",
+                "FIXED", new BigDecimal("300.00"), null, null, true);
+        linkMasterToOwnedDef(seedSalonMasterFor(decoy, "Київ", "4.00"), decoyDef, null, true);
+
+        JsonNode data = salonSearchRaw("?q=" + enc("Aura манікюр") + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("the salon name is re-tested INSIDE the bookable-service EXISTS, which is what "
+                        + "makes a mixed name+service query match (MULTI_TOKEN_GUARD is TRUE here)")
+                .containsExactly(salonId.toString());
+    }
+
+    // ── matchedServiceNames[] for FREE TEXT ───────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /search/masters?q=<service name> — matchedServiceNames names the service that EXPLAINS the match, for a single AND a multi token query")
+    void should_populateMatchedServiceNames_when_masterQMatchesServiceName() throws Exception {
+        ensureHttpClient();
+
+        UUID masterId = seedNamedIndependentMaster("Київ", "4.90", "Ірина", "Пояснена");
+        seedNamedServiceForMaster(masterId, "Ботокс для волосся", "HAIRCUT", new BigDecimal("700.00"));
+        seedNamedServiceForMaster(masterId, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
+
+        assertThat(matchedServiceNames(
+                masterSearchRaw("?q=" + enc("Ботокс") + "&page=0&size=20").path("data").get(0)))
+                .as("single-token service match — only the service whose OWN name carries the "
+                        + "token explains the row; the unrelated pedicure must not be listed")
+                .containsExactly("Ботокс для волосся");
+
+        assertThat(matchedServiceNames(
+                masterSearchRaw("?q=" + enc("Ботокс волосся") + "&page=0&size=20").path("data").get(0)))
+                .as("multi-token service match resolves to the same explaining service")
+                .containsExactly("Ботокс для волосся");
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=<person name> — matchedServiceNames is EMPTY for a pure NAME match (a service must contribute >=1 token through its own name)")
+    void should_leaveMatchedServiceNamesEmpty_when_masterQMatchesNameOnly() throws Exception {
+        ensureHttpClient();
+
+        UUID masterId = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
+        seedNamedServiceForMaster(masterId, "Ботокс для волосся", "HAIRCUT", new BigDecimal("700.00"));
+        seedNamedServiceForMaster(masterId, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
+
+        JsonNode row = masterSearchRaw("?q=" + enc("Вікторія Руденко") + "&page=0&size=20")
+                .path("data").get(0);
+
+        assertThat(row.path("masterId").asText()).isEqualTo(masterId.toString());
+        assertThat(matchedServiceNames(row))
+                .as("a pure name match is explained by the NAME, not by services — every service "
+                        + "trivially satisfies the group condition, so without the own-name "
+                        + "contribution rule the card would list an alphabetical catalogue slice")
+                .isEmpty();
+        assertThat(row.path("serviceNames").size())
+                .as("the card still falls back to the serviceNames preview")
+                .isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=…&serviceTypeSlugs=… — matchedServiceNames is the INTERSECTION of both filters, and EMPTY when the intersection is empty")
+    void should_intersectMatchedServiceNames_when_masterQCombinedWithServiceTypeSlugs()
+            throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+
+        UUID masterId = seedNamedIndependentMaster("Київ", "4.90", "Ірина", "Перетин");
+        // Carries the q token AND the selected slug → in the intersection.
+        seedTypedServiceForMaster(masterId, "Кератин відновлення", "HAIRCUT",
+                new BigDecimal("500.00"), typeIdA, true, true);
+        // Carries the q token but the OTHER slug → outside the intersection.
+        seedTypedServiceForMaster(masterId, "Кератин догляд", "HAIRCUT",
+                new BigDecimal("600.00"), typeIdB, true, true);
+
+        assertThat(matchedServiceNames(masterSearchRaw(
+                "?q=" + enc("Кератин") + "&serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0)))
+                .as("both filters are ANDed in the WHERE clause, so only services in the "
+                        + "INTERSECTION explain the row — surfacing a union would show a service "
+                        + "the user did not ask for")
+                .containsExactly("Кератин відновлення");
+
+        // Empty intersection: q is satisfied through the type-B service, the slug
+        // through the type-A service, so the master matches but nothing explains it
+        // under EVERY active filter.
+        JsonNode disjoint = masterSearchRaw(
+                "?q=" + enc("догляд") + "&serviceTypeSlugs=" + SLUG_A + "&page=0&size=20");
+        assertThat(masterIds(disjoint))
+                .as("the master still matches — the two WHERE filters are independent EXISTS")
+                .containsExactly(masterId.toString());
+        assertThat(matchedServiceNames(disjoint.path("data").get(0)))
+                .as("empty intersection falls back to the serviceNames preview")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=… — matchedServiceNames is capped at 3 and deterministically ordered")
+    void should_capMatchedServiceNamesAtThree_when_masterQMatchesManyServices() throws Exception {
+        ensureHttpClient();
+
+        UUID masterId = seedNamedIndependentMaster("Київ", "4.90", "Ірина", "Багата");
+        seedNamedServiceForMaster(masterId, "Догляд Альфа", "HAIRCUT", new BigDecimal("300.00"));
+        seedNamedServiceForMaster(masterId, "Догляд Бета", "HAIRCUT", new BigDecimal("400.00"));
+        seedNamedServiceForMaster(masterId, "Догляд Гамма", "HAIRCUT", new BigDecimal("500.00"));
+        seedNamedServiceForMaster(masterId, "Догляд Дельта", "HAIRCUT", new BigDecimal("600.00"));
+
+        assertThat(matchedServiceNames(
+                masterSearchRaw("?q=" + enc("Догляд") + "&page=0&size=20").path("data").get(0)))
+                .as("four services carry the token; the field is capped at SERVICE_NAME_CAP=3 and "
+                        + "sorted, so the page is deterministic across requests")
+                .containsExactly("Догляд Альфа", "Догляд Бета", "Догляд Гамма");
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?q=<service name> — matchedServiceNames names the explaining bookable service (static path), and is EMPTY for a pure salon-name match")
+    void should_populateSalonMatchedServiceNames_when_qMatchesServiceName() throws Exception {
+        ensureHttpClient();
+
+        UUID salonId = seedNamedSalon("Київ", "Aura Corner");
+        UUID master = seedSalonMasterFor(salonId, "Київ", "4.00");
+        UUID keratin = seedTypedSalonOwnedDef(salonId, "Кератин глибокий", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, null, true);
+        UUID manicure = seedTypedSalonOwnedDef(salonId, "Манікюр гелевий", "MANICURE",
+                "FIXED", new BigDecimal("400.00"), null, null, true);
+        linkMasterToOwnedDef(master, keratin, null, true);
+        linkMasterToOwnedDef(master, manicure, null, true);
+
+        assertThat(matchedServiceNames(
+                salonSearchRaw("?q=" + enc("Кератин") + "&page=0&size=20").path("data").get(0)))
+                .as("only the bookable service whose OWN name carries the token explains the row")
+                .containsExactly("Кератин глибокий");
+
+        assertThat(matchedServiceNames(
+                salonSearchRaw("?q=" + enc("Aura") + "&page=0&size=20").path("data").get(0)))
+                .as("a pure salon-NAME match is explained by the name — matchedServiceNames stays "
+                        + "empty and the card falls back to serviceNames")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?q=…&serviceTypeSlugs=… — matchedServiceNames on the DYNAMIC path is the intersection of free text and slug")
+    void should_intersectSalonMatchedServiceNames_when_qCombinedWithServiceTypeSlugs()
+            throws Exception {
+        ensureHttpClient();
+        UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
+        UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
+
+        UUID salonId = seedNamedSalon("Київ", "Aura Corner");
+        UUID master = seedSalonMasterFor(salonId, "Київ", "4.00");
+        UUID inBoth = seedTypedSalonOwnedDef(salonId, "Кератин відновлення", "HAIRCUT",
+                "FIXED", new BigDecimal("300.00"), null, typeIdA, true);
+        UUID qOnly = seedTypedSalonOwnedDef(salonId, "Кератин догляд", "HAIRCUT",
+                "FIXED", new BigDecimal("400.00"), null, typeIdB, true);
+        linkMasterToOwnedDef(master, inBoth, null, true);
+        linkMasterToOwnedDef(master, qOnly, null, true);
+
+        assertThat(matchedServiceNames(salonSearchRaw(
+                "?q=" + enc("Кератин") + "&serviceTypeSlugs=" + SLUG_A + "&page=0&size=20")
+                .path("data").get(0)))
+                .as("dynamicMatchedNamesPredicate ANDed with the slug disjunction — the type-B "
+                        + "service carries the token but is not in the selected type")
+                .containsExactly("Кератин відновлення");
+    }
+
+    // ── :sortMode ordering across TWO pages (paging disjointness + NULLS LAST) ────
+    //
+    // Every pre-existing ordering test fetched page=0&size=20 only, so a broken
+    // inner/outer ORDER BY pair that returns the RIGHT rows in the WRONG order — or
+    // the same row on both pages — would have passed. These fetch two pages.
+
+    @Test
+    @DisplayName("GET /search/masters — two pages under each sort mode are DISJOINT and globally ordered (inner Top-N and outer ORDER BY agree)")
+    void should_returnDisjointOrderedPages_when_pagingUnderEachSortMode() throws Exception {
+        ensureHttpClient();
+        UUID cityId = cityIdByName("Київ");
+
+        // Five masters, each with a DISTINCT avg_rating, review_count and price, so
+        // every sort mode has a total order with no ties to mask a paging defect.
+        record Fixture(String rating, int reviews, String price) {}
+        java.util.List<Fixture> fixtures = java.util.List.of(
+                new Fixture("4.90", 50, "100.00"),
+                new Fixture("4.70", 40, "200.00"),
+                new Fixture("4.50", 30, "300.00"),
+                new Fixture("4.30", 20, "400.00"),
+                new Fixture("4.10", 10, "500.00"));
+        for (Fixture fixture : fixtures) {
+            UUID masterId = seedMasterWithReviewCount("Київ", fixture.rating(), fixture.reviews());
+            seedServiceWithCategory(masterId, masterId, "HAIRCUT",
+                    new BigDecimal(fixture.price()), true, true);
+        }
+
+        for (String sort : java.util.List.of("RATING_DESC", "PRICE_ASC", "PRICE_DESC", "REVIEWS_DESC")) {
+            String base = "?location.cityId=" + cityId + "&sort=" + sort + "&size=2&page=";
+            java.util.List<String> first = masterIds(masterSearch(base + "0"));
+            java.util.List<String> second = masterIds(masterSearch(base + "1"));
+            java.util.List<String> whole = masterIds(
+                    masterSearch("?location.cityId=" + cityId + "&sort=" + sort + "&size=20&page=0"));
+
+            assertThat(first).as("sort=%s page 0 is a full page", sort).hasSize(2);
+            assertThat(second).as("sort=%s page 1 is a full page", sort).hasSize(2);
+            assertThat(first)
+                    .as("sort=%s — page 0 and page 1 must share NO row; a row on both pages means "
+                            + "the inner Top-N ordering is unstable or disagrees with the outer one", sort)
+                    .doesNotContainAnyElementsOf(second);
+            assertThat(new java.util.ArrayList<>(first) {{ addAll(second); }})
+                    .as("sort=%s — the two pages concatenated must equal the first four rows of the "
+                            + "single-page ordering (ordering is stable across paging)", sort)
+                    .isEqualTo(whole.subList(0, 4));
+        }
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?sort=PRICE_DESC — an unpriced master sorts LAST (explicit NULLS LAST), not first")
+    void should_sortUnpricedMasterLast_when_priceDescOrdering() throws Exception {
+        ensureHttpClient();
+        UUID cityId = cityIdByName("Київ");
+
+        UUID priced = seedMaster("Київ", "4.50");
+        seedServiceWithCategory(priced, priced, "HAIRCUT", new BigDecimal("300.00"), true, true);
+        // No services at all → min_effective_price stays NULL.
+        UUID unpriced = seedMasterWithoutServices("Київ", "4.90");
+
+        assertThat(masterIds(masterSearch(
+                "?location.cityId=" + cityId + "&sort=PRICE_DESC&page=0&size=20")))
+                .as("PRICE_DESC carries an explicit NULLS LAST — without it Postgres sorts NULLs "
+                        + "FIRST on a DESC ordering and every unpriced master would head the grid")
+                .containsExactly(priced.toString(), unpriced.toString());
+
+        assertThat(masterIds(masterSearch(
+                "?location.cityId=" + cityId + "&sort=PRICE_ASC&page=0&size=20")))
+                .as("PRICE_ASC keeps the unpriced master last too")
+                .containsExactly(priced.toString(), unpriced.toString());
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Seeds an INDEPENDENT_MASTER-owned {@code service_definitions} row and returns
+     * its id, with <b>NO {@code master_services} row</b> — so a DIFFERENT master can
+     * be cross-linked to it via {@link #linkMasterToOwnedDef}.
+     *
+     * <p>Every other service seeder in this class writes {@code owner_id == masterId}
+     * and links that same master, which is why no other fixture can build the
+     * owner/assignment MISMATCH that {@code appendMasterOwnedServiceGate} exists to
+     * reject. This one exists purely to build it: the definition is owned by
+     * {@code ownerMasterId} while the caller links some other master to it.</p>
+     */
+    private UUID seedIndependentOwnedDefNoLink(UUID ownerMasterId, String serviceName,
+                                               String category, BigDecimal basePrice) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions " +
+                        "(id, owner_type, owner_id, name, category, service_type_id, base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) " +
+                        "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 60, ?, 0, true, NOW(), NOW())",
+                serviceDefId, ownerMasterId, serviceName, category,
+                unrelatedServiceTypeId(), basePrice);
+        return serviceDefId;
+    }
+
+    /**
+     * Issues an anonymous master search against an ALREADY-ENCODED query string,
+     * bypassing {@link TestRestTemplate}'s URI-template expansion.
+     *
+     * <p>Required for every multi-token {@code ?q=} test: a literal space in a URI
+     * template is not encoded the same way across Spring versions, and a
+     * pre-encoded {@code %20} would be re-encoded to {@code %2520}. Same reasoning
+     * as {@link #rawUri} for the literal-{@code %} tests.</p>
+     */
+    private JsonNode masterSearchRaw(String encodedQuery) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(MASTERS_URL + encodedQuery), HttpMethod.GET, anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    /** Salon counterpart of {@link #masterSearchRaw}. */
+    private JsonNode salonSearchRaw(String encodedQuery) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                rawUri(SALONS_URL + encodedQuery), HttpMethod.GET, anonymous(), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    /** Reads the {@code matchedServiceNames} array of a single search result row. */
+    private static java.util.List<String> matchedServiceNames(JsonNode row) {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        row.path("matchedServiceNames").forEach(n -> names.add(n.asText()));
+        return names;
+    }
 
     /**
      * Seeds a SALON-owned {@code service_definitions} row (FIXED or RANGE) and
