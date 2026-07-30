@@ -1,5 +1,7 @@
 package com.beautica.review.dto;
 
+import com.beautica.common.RatingBucket;
+
 import java.math.BigDecimal;
 import java.util.List;
 
@@ -23,5 +25,4 @@ public record SalonReviewSummaryResponse(
         int reviewCount,
         List<RatingBucket> ratingDistribution
 ) {
-    public record RatingBucket(int rating, long count) {}
 }

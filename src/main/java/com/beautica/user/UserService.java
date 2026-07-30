@@ -1,6 +1,7 @@
 package com.beautica.user;
 
 import com.beautica.auth.Role;
+import com.beautica.common.RatingBucket;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -12,6 +13,8 @@ import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
+import com.beautica.review.repository.ClientReviewRepository;
+import com.beautica.review.repository.RatingCountProjection;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -20,8 +23,13 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 @Slf4j
 @Service
@@ -32,31 +40,50 @@ public class UserService {
     private final CityRepository cityRepository;
     private final CityDistrictRepository cityDistrictRepository;
     private final CacheManager cacheManager;
+    private final ClientReviewRepository clientReviewRepository;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
                        CityRepository cityRepository,
                        CityDistrictRepository cityDistrictRepository,
-                       CacheManager cacheManager) {
+                       CacheManager cacheManager,
+                       ClientReviewRepository clientReviewRepository) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
         this.cityRepository = cityRepository;
         this.cityDistrictRepository = cityDistrictRepository;
         this.cacheManager = cacheManager;
+        this.clientReviewRepository = clientReviewRepository;
     }
 
     /**
-     * The caller's own aggregate client rating (Phase 27.6). Reads the narrow {@link
-     * UserRatingProjection} — never the full {@link User} entity — so this endpoint cannot leak
-     * anything beyond the two rating columns, even in-memory. {@code client_reviews} rows
-     * themselves (comments, author identity) are never surfaced here or anywhere on the CLIENT
-     * side — see {@link UserRatingResponse}'s javadoc.
+     * The caller's own aggregate client rating (Phase 27.6), extended in Phase 27.x with a
+     * per-star {@code ratingDistribution}. Reads the narrow {@link UserRatingProjection} for the
+     * two scalar columns — never the full {@link User} entity — and a separate {@code GROUP BY}
+     * over {@code client_reviews} for the bucket counts, zero-filling ratings 5 down to 1 so a
+     * never-reviewed caller still gets all-zero buckets rather than an empty list. {@code
+     * client_reviews} rows themselves (comments, author identity, timestamps) are never surfaced
+     * here or anywhere on the CLIENT side — see {@link UserRatingResponse}'s javadoc.
      */
     @Transactional(readOnly = true)
     public UserRatingResponse getMyRating(UUID userId) {
         UserRatingProjection projection = userRepository.findRatingById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
-        return UserRatingResponse.from(projection);
+
+        List<RatingCountProjection> rows = clientReviewRepository.countBySubjectClientIdGroupByRating(userId);
+        Map<Integer, Long> countsByRating = rows.stream()
+                .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount));
+
+        // Zero-fill every bucket from 5 down to 1 — a rating with zero reviews must still
+        // appear in the response, never be silently omitted (mirrors ReviewService's
+        // getMasterReviewSummary/getSalonReviewSummary zero-fill exactly).
+        List<RatingBucket> distribution = IntStream.rangeClosed(1, 5)
+                .boxed()
+                .sorted(Comparator.reverseOrder())
+                .map(rating -> new RatingBucket(rating, countsByRating.getOrDefault(rating, 0L)))
+                .toList();
+
+        return UserRatingResponse.from(projection, distribution);
     }
 
     @Transactional(readOnly = true)

@@ -18,9 +18,10 @@ import org.springframework.transaction.event.TransactionalEventListener;
  * already-committed review).
  *
  * <p>No cache eviction here (unlike {@link ReviewEventListener}): there is no {@code
- * reviews-by-client} cache, and {@code GET /users/me/rating} is not cached (a single primary-key
- * projection read, cheap enough that a dedicated cache would only add eviction-wiring surface —
- * same rationale as {@code ReviewService#getMasterReviewSummary}).
+ * reviews-by-client} cache, and {@code GET /users/me/rating} is not cached (a primary-key
+ * projection read plus one indexed {@code GROUP BY} for the rating distribution — still cheap
+ * enough that a dedicated cache would only add eviction-wiring surface — same rationale as
+ * {@code ReviewService#getMasterReviewSummary}).
  *
  * <p>No notification/outbox row is enqueued (locked product decision — a client is never told a
  * master reviewed them).

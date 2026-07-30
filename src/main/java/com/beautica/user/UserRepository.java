@@ -22,9 +22,13 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
 
     /**
-     * Narrow projection backing {@code GET /users/me/rating} (Phase 27.6) — reads only the two
-     * rating aggregate columns, never the full {@link User} entity (which carries
-     * {@code passwordHash} and other PII this endpoint must never touch, even in-memory).
+     * Narrow projection backing the scalar half of {@code GET /users/me/rating} (Phase 27.6) —
+     * reads only the two rating aggregate columns, never the full {@link User} entity (which
+     * carries {@code passwordHash} and other PII this endpoint must never touch, even in-memory).
+     *
+     * <p>The endpoint's per-star {@code ratingDistribution} (Phase 27.x) is fetched separately via
+     * {@code ClientReviewRepository#countBySubjectClientIdGroupByRating} and zero-filled by
+     * {@code UserService.getMyRating} — this query is not widened to cover it.
      */
     @Query("SELECT u.avgRating AS avgRating, u.reviewCount AS reviewCount FROM User u WHERE u.id = :userId")
     Optional<UserRatingProjection> findRatingById(@Param("userId") UUID userId);

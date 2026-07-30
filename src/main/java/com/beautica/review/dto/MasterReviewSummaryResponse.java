@@ -1,6 +1,6 @@
 package com.beautica.review.dto;
 
-import com.beautica.review.dto.SalonReviewSummaryResponse.RatingBucket;
+import com.beautica.common.RatingBucket;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -11,9 +11,10 @@ import java.util.List;
  *
  * <p>Structural clone of {@link SalonReviewSummaryResponse} — deliberately a separate record
  * rather than a shared/renamed type so the shipped salon OpenAPI contract and mobile
- * {@code SalonReviewMapper} are untouched (Phase 8.10 decision 1). It reuses the existing
- * {@link RatingBucket} record instead of declaring its own, so the two summary DTOs share one
- * bucket shape.
+ * {@code SalonReviewMapper} are untouched (Phase 8.10 decision 1). It reuses the shared
+ * {@link RatingBucket} record (in {@code common}) instead of declaring its own, so every
+ * ratingDistribution response — this one, {@link SalonReviewSummaryResponse}, and
+ * {@code UserRatingResponse} — shares one bucket shape and one emitted OpenAPI schema.
  *
  * <p>{@code avgRating}/{@code reviewCount} are read from the persisted {@code masters.avg_rating}
  * / {@code masters.review_count} columns (via {@code MasterRepository.findById}) — no live

@@ -3,6 +3,7 @@ package com.beautica.review.service;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.RatingBucket;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -672,10 +673,10 @@ class ReviewServiceTest {
 
         assertThat(result.ratingDistribution())
                 .as("distribution must always carry exactly 5 buckets, ratings 5..1")
-                .extracting(SalonReviewSummaryResponse.RatingBucket::rating)
+                .extracting(RatingBucket::rating)
                 .containsExactly(5, 4, 3, 2, 1);
         assertThat(result.ratingDistribution())
-                .extracting(SalonReviewSummaryResponse.RatingBucket::count)
+                .extracting(RatingBucket::count)
                 .containsExactly(2L, 1L, 0L, 0L, 0L);
     }
 
